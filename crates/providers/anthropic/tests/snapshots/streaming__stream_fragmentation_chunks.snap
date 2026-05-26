@@ -1,0 +1,70 @@
+---
+source: crates/providers/anthropic/tests/streaming.rs
+expression: "&chunks"
+---
+[
+  {
+    "id": "msg_02",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "role": "assistant"
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "msg_02",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "content": "Frag"
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "msg_02",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "content": "mented"
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "msg_02",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {},
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 5,
+      "completion_tokens": 2,
+      "total_tokens": 7,
+      "cached_tokens": 0
+    }
+  }
+]

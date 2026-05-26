@@ -1,0 +1,410 @@
+//! `POST /v1/chat/completions` — OpenAI-compatible chat completion.
+//!
+//! Dispatch pipeline:
+//!   1. Resolve provider from `request.model` via the registry.
+//!   2. Build a synthetic [`RequestContext`] (real auth lands in Week 7).
+//!   3. For `stream: false` (Week 12 +): try L2 semantic cache lookup; on hit
+//!      return the cached response with `X-TokenTrimmer-Cache: hit-l2`.
+//!   4. Otherwise dispatch to provider, then best-effort insert into L2 cache.
+//!   5. For `stream: true`: dispatch streaming directly (fake-stream from
+//!      cache is `w7-fake-stream-cache`, blocked).
+//!
+//! Deferred:
+//!   - Real auth middleware populating `RequestContext` org_id (W7).
+//!   - Routing rule engine (W4).
+//!   - L1 exact-match lookup (W7 cache middleware).
+//!   - Telemetry / audit row write (W7 telemetry pipeline).
+
+use std::time::Duration;
+
+use axum::{
+    extract::{Extension, State},
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    Json,
+};
+use chrono::Utc;
+use tt_cache::CacheEntry;
+use uuid::Uuid;
+
+use tt_shared::{
+    context::{ProviderCredentials, SecretString},
+    messages::Choice,
+    ChatCompletionRequest, ChatCompletionResponse, Message, MessageContent, ModelPricing,
+    RequestContext, Usage,
+};
+
+use crate::{
+    middleware::trace::TraceId, routes::sse, state::L2Config, ApiError, ApiResult, AppState,
+};
+
+/// L2 cache TTL for newly-inserted entries. Spec §8.4 caps this per-tier
+/// (24h / 7d / 30d); the gateway-level default is conservative until the
+/// auth layer surfaces the caller's tier.
+const L2_DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Handler for `POST /v1/chat/completions`.
+///
+/// Resolves the provider for `req.model`, builds a synthetic [`RequestContext`],
+/// then dispatches to either the streaming or non-streaming provider path.
+pub async fn handler(
+    State(state): State<AppState>,
+    Extension(trace): Extension<TraceId>,
+    headers: HeaderMap,
+    Json(req): Json<ChatCompletionRequest>,
+) -> ApiResult<Response> {
+    // 1. Resolve provider — 404 for unknown models.
+    let provider = state
+        .registry
+        .by_model(&req.model)
+        .ok_or_else(|| ApiError::ModelNotFound {
+            model: req.model.clone(),
+        })?;
+
+    // 2. Build synthetic RequestContext until real auth middleware lands (Week 7).
+    //    Pull api_key from "Authorization: Bearer <key>" if present.
+    let api_key = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_string();
+
+    // 2a. Sandbox short-circuit: `tt_test_*` keys return a deterministic
+    //     synthetic response without contacting any real provider — for
+    //     E2E test suites and customer integration testing without spend.
+    if api_key.starts_with("tt_test_") {
+        return Ok(sandbox_response(&req, trace.0.as_str()));
+    }
+
+    // Prefer the TraceId extension set by trace middleware; fall back to header
+    // (for callers that pre-supply it) or a fresh UUID.
+    let trace_id = if !trace.0.is_empty() {
+        Uuid::parse_str(&trace.0).unwrap_or_else(|_| Uuid::now_v7())
+    } else {
+        headers
+            .get("x-tokentrimmer-trace-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or_else(Uuid::now_v7)
+    };
+
+    let ctx = RequestContext {
+        trace_id,
+        org_id: Uuid::nil(),      // Wired in Week 7 auth middleware.
+        api_key_id: Uuid::nil(),  // Wired in Week 7 auth middleware.
+        credentials: ProviderCredentials {
+            api_key: SecretString::new(api_key),
+            base_url: None,
+            extra_headers: Vec::new(),
+        },
+        tag: headers
+            .get("x-tokentrimmer-tag")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from),
+        deadline: None,
+    };
+
+    // 3. Branch: streaming vs non-streaming.
+    if req.stream {
+        // L2 fake-stream from cache is w7-fake-stream-cache (blocked) — bypass
+        // cache entirely on stream:true and dispatch live.
+        let stream = provider.chat_completion_stream(req, &ctx).await?;
+        Ok(sse::stream_response(stream, &provider, trace_id))
+    } else {
+        // 3a. Try L2 semantic cache lookup before dispatching to the provider.
+        //     Best-effort: any embedding or lookup error falls through to a
+        //     normal provider call — we never fail a user request because the
+        //     cache is unhealthy.
+        if let Some(l2) = state.l2.as_ref() {
+            if let Some(query_text) = last_user_message_text(&req) {
+                if let Ok(query_vec) = l2.embedder.embed(query_text).await {
+                    if let Ok(Some((entry, similarity))) = l2
+                        .cache
+                        .lookup(ctx.org_id, &query_vec, l2.threshold)
+                        .await
+                    {
+                        // Cache hit — best-effort bump and return.
+                        let _ = l2.cache.bump_hit_count(entry.id).await;
+                        return build_hit_l2_response(entry, similarity, trace_id);
+                    }
+                }
+            }
+        }
+
+        // 3b. No L2 hit — dispatch to provider.
+        let response = provider.chat_completion(req.clone(), &ctx).await?;
+
+        // 3c. Best-effort L2 insert. Errors are logged but never block the request.
+        if let Some(l2) = state.l2.as_ref() {
+            if let Some(query_text) = last_user_message_text(&req) {
+                let provider_id = provider.id().to_string();
+                let model_used = response.model.clone();
+                let response_clone = response.clone();
+                let l2_clone = l2.clone();
+                let org_id = ctx.org_id;
+                let query_text_owned = query_text.to_string();
+                tokio::spawn(async move {
+                    insert_into_l2(
+                        l2_clone,
+                        org_id,
+                        &query_text_owned,
+                        response_clone,
+                        provider_id,
+                        model_used,
+                    )
+                    .await;
+                });
+            }
+        }
+
+        // 4. Compute cost via provider pricing table.
+        let pricing = provider.pricing(&response.model);
+        let (cost_usd, baseline_cost_usd) =
+            compute_cost(&response.usage, pricing.as_ref(), &req.model);
+        let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
+
+        let provider_id = provider.id().to_string();
+        let model_used = response.model.clone();
+
+        // 5. Serialize body and attach TokenTrimmer extension headers.
+        let mut http_response = Json(response).into_response();
+        attach_cost_headers(
+            http_response.headers_mut(),
+            trace_id,
+            &provider_id,
+            &model_used,
+            cost_usd,
+            baseline_cost_usd,
+            saved_usd,
+        );
+        // Cache state: miss when L2 is configured but didn't hit; none when L2 is disabled.
+        let cache_state = if state.l2.is_some() { "miss" } else { "none" };
+        if let Ok(v) = cache_state.parse() {
+            http_response
+                .headers_mut()
+                .insert("x-tokentrimmer-cache", v);
+        }
+        Ok(http_response)
+    }
+}
+
+/// Extract the trailing user message's text content for embedding. Returns
+/// `None` if the request has no user messages or the last user message is
+/// multimodal-only (no text parts).
+fn last_user_message_text(req: &ChatCompletionRequest) -> Option<&str> {
+    for msg in req.messages.iter().rev() {
+        if let Message::User { content, .. } = msg {
+            return match content {
+                MessageContent::Text(s) => Some(s.as_str()),
+                MessageContent::Parts(parts) => parts.iter().find_map(|p| match p {
+                    tt_shared::ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }),
+            };
+        }
+    }
+    None
+}
+
+/// Build the response for an L2 cache hit. Re-deserializes the cached body
+/// and stamps the standard X-TokenTrimmer-* headers, with `Cache: hit-l2`.
+fn build_hit_l2_response(
+    entry: CacheEntry,
+    _similarity: f32,
+    trace_id: Uuid,
+) -> ApiResult<Response> {
+    let response: ChatCompletionResponse = serde_json::from_slice(&entry.response)
+        .map_err(|e| ApiError::Internal(format!("l2 cache deserialize: {e}")))?;
+
+    // Cost is zero on cache hit (no provider call). Baseline reflects what the
+    // request would have cost without our cache.
+    // Use the cached response's own pricing-derivable usage to fill baseline —
+    // the model field on the entry is the provider model that originally served it.
+    let baseline_cost_usd = synthetic_baseline_from_entry(&entry);
+    let saved_usd = baseline_cost_usd; // 100% savings on a clean hit
+
+    let provider_id = "cache".to_string();
+    let model_used = entry.model.clone();
+    let mut http_response = Json(response).into_response();
+    attach_cost_headers(
+        http_response.headers_mut(),
+        trace_id,
+        &provider_id,
+        &model_used,
+        0.0,
+        baseline_cost_usd,
+        saved_usd,
+    );
+    if let Ok(v) = "hit-l2".parse() {
+        http_response
+            .headers_mut()
+            .insert("x-tokentrimmer-cache", v);
+    }
+    Ok(http_response)
+}
+
+/// Build a deterministic synthetic response for a `tt_test_*` sandbox key.
+///
+/// Skips provider dispatch entirely — useful for customer E2E tests that need
+/// the full Gateway response shape (headers + body) without burning real LLM
+/// tokens. The response body echoes a fixed sentence that includes the
+/// requested model name so test assertions can verify routing.
+fn sandbox_response(req: &ChatCompletionRequest, trace_id_str: &str) -> Response {
+    let response = ChatCompletionResponse {
+        id: format!("chatcmpl-sandbox-{}", Uuid::now_v7()),
+        object: "chat.completion".into(),
+        created: chrono::Utc::now().timestamp(),
+        model: req.model.clone(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message::Assistant {
+                content: Some(MessageContent::Text(format!(
+                    "[sandbox] TokenTrimmer test response for model={}",
+                    req.model
+                ))),
+                tool_calls: vec![],
+                name: None,
+            },
+            finish_reason: Some("stop".into()),
+        }],
+        usage: Usage {
+            prompt_tokens: 10,
+            completion_tokens: 12,
+            total_tokens: 22,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        },
+    };
+
+    let trace_id = Uuid::parse_str(trace_id_str).unwrap_or_else(|_| Uuid::now_v7());
+    let mut http_response = Json(response).into_response();
+    attach_cost_headers(
+        http_response.headers_mut(),
+        trace_id,
+        "sandbox",
+        &req.model,
+        0.0,
+        0.0,
+        0.0,
+    );
+    if let Ok(v) = "sandbox".parse() {
+        http_response
+            .headers_mut()
+            .insert("x-tokentrimmer-cache", v);
+    }
+    http_response
+}
+
+/// Reconstruct a rough baseline cost for a cached entry. We don't have the
+/// pricing table for `entry.model` here (no Provider reference), so use a
+/// conservative default that produces non-zero savings without claiming more
+/// than the cached call would have actually cost. This is a placeholder until
+/// the L2 row carries its own original cost in a later schema migration.
+fn synthetic_baseline_from_entry(entry: &CacheEntry) -> f64 {
+    // Default to $1/M input, $2/M output — within an order of magnitude of
+    // most chat models. Conservative; real per-model pricing is wired when
+    // the L2 schema gains a `baseline_cost_usd` column.
+    let input = entry.input_tokens as f64 * 1.0 / 1_000_000.0;
+    let output = entry.output_tokens as f64 * 2.0 / 1_000_000.0;
+    input + output
+}
+
+/// Background L2 insert. Swallows errors with a tracing log — never blocks
+/// the user request.
+async fn insert_into_l2(
+    l2: L2Config,
+    org_id: Uuid,
+    query_text: &str,
+    response: ChatCompletionResponse,
+    _provider_id: String,
+    model_used: String,
+) {
+    let embed = match l2.embedder.embed(query_text).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "l2 embed during insert failed");
+            return;
+        }
+    };
+    let response_bytes = match serde_json::to_vec(&response) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "l2 response serialization failed");
+            return;
+        }
+    };
+    let now = Utc::now();
+    let entry = CacheEntry {
+        id: Uuid::now_v7(),
+        org_id,
+        embedding: embed,
+        response: response_bytes,
+        model: model_used,
+        input_tokens: response.usage.prompt_tokens,
+        output_tokens: response.usage.completion_tokens,
+        hit_count: 0,
+        created_at: now,
+        expires_at: now + chrono::Duration::from_std(L2_DEFAULT_TTL).unwrap_or_default(),
+    };
+    if let Err(e) = l2.cache.insert(entry).await {
+        tracing::warn!(error = %e, "l2 cache insert failed");
+    }
+}
+
+/// Compute `(actual_cost_usd, baseline_cost_usd)` from token usage and pricing.
+///
+/// `baseline_cost_usd` is what the request would have cost without any
+/// TokenTrimmer optimisations (cache discount, model routing, etc.).
+///
+/// `actual_cost_usd` applies the cached-token discount when `usage.cached_tokens > 0`.
+fn compute_cost(usage: &Usage, pricing: Option<&ModelPricing>, _requested_model: &str) -> (f64, f64) {
+    let Some(pricing) = pricing else {
+        return (0.0, 0.0);
+    };
+
+    let cached = usage.cached_tokens.min(usage.prompt_tokens);
+    let non_cached_input = usage.prompt_tokens.saturating_sub(cached);
+
+    // Use cached rate when available; fall back to regular input rate.
+    let cached_rate = pricing
+        .cached_input_per_million
+        .unwrap_or(pricing.input_per_million);
+
+    let cost_usd = (non_cached_input as f64) * pricing.input_per_million / 1_000_000.0
+        + (cached as f64) * cached_rate / 1_000_000.0
+        + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
+
+    // Baseline: full input × input rate + output × output rate (no cache discount, no routing).
+    // `_requested_model` reserved for routing-aware baseline once routing lands (Week 4).
+    let baseline_cost_usd = (usage.prompt_tokens as f64) * pricing.input_per_million / 1_000_000.0
+        + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
+
+    (cost_usd, baseline_cost_usd)
+}
+
+/// Insert all six required `X-TokenTrimmer-*` response headers.
+fn attach_cost_headers(
+    headers: &mut axum::http::HeaderMap,
+    trace_id: Uuid,
+    provider_id: &str,
+    model_used: &str,
+    cost_usd: f64,
+    baseline_cost_usd: f64,
+    saved_usd: f64,
+) {
+    let pairs: &[(&str, String)] = &[
+        ("x-tokentrimmer-trace-id", trace_id.to_string()),
+        ("x-tokentrimmer-provider", provider_id.to_string()),
+        ("x-tokentrimmer-model-used", model_used.to_string()),
+        ("x-tokentrimmer-cost-usd", format!("{cost_usd:.6}")),
+        ("x-tokentrimmer-baseline-cost-usd", format!("{baseline_cost_usd:.6}")),
+        ("x-tokentrimmer-saved-usd", format!("{saved_usd:.6}")),
+    ];
+
+    for (name, value) in pairs {
+        if let Ok(v) = value.parse() {
+            headers.insert(*name, v);
+        }
+    }
+}

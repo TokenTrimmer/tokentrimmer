@@ -1,0 +1,10 @@
+# CODEOWNERS — automatic review assignment.
+# At solo-founder stage everything routes to the founder; updated when team grows.
+
+* @iansimon
+
+# Particularly sensitive paths get an explicit second-look reminder via PR description template.
+/crates/auth/         @iansimon
+/crates/telemetry/    @iansimon
+/.github/workflows/   @iansimon
+/.claude/             @iansimon

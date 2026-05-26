@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: mailto:security@tokentrimmer.com
+    about: Report a vulnerability privately. Do NOT open a public issue.
+  - name: Community / questions
+    url: https://discord.gg/tokentrimmer
+    about: Ask questions and chat with maintainers and users.

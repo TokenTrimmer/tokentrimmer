@@ -1,0 +1,14 @@
+---
+source: crates/providers/openai/tests/translate.rs
+expression: "&body"
+---
+{
+  "model": "o3",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Prove P=NP."
+    }
+  ],
+  "max_completion_tokens": 8192
+}

@@ -1,0 +1,55 @@
+//! The `Provider` trait every adapter implements. See
+//! `docs/02-provider-adapter-guide.md` for the contract and the worked Anthropic example.
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+
+use crate::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
+    EmbeddingsResponse, ModelInfo, ModelPricing, ProviderError, RequestContext,
+};
+
+/// Adapters are stateless beyond their HTTP client and pricing table.
+/// All authentication, telemetry, and routing concerns live in the core layer.
+#[async_trait]
+pub trait Provider: Send + Sync {
+    /// Unique provider ID (e.g. "openai", "anthropic", "gemini").
+    fn id(&self) -> &'static str;
+
+    /// All models supported by this adapter, with capabilities.
+    fn models(&self) -> Vec<ModelInfo>;
+
+    /// Pricing for a model. Cached; refreshed daily.
+    fn pricing(&self, model: &str) -> Option<ModelPricing>;
+
+    /// Non-streaming chat completion.
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError>;
+
+    /// Streaming chat completion.
+    async fn chat_completion_stream(
+        &self,
+        req: ChatCompletionRequest,
+        ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>;
+
+    /// Embeddings. Returns Unsupported if the provider doesn't offer them.
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported(format!(
+            "{} does not support embeddings",
+            self.id()
+        )))
+    }
+
+    /// Liveness check. Should not call the provider's pricey endpoints.
+    async fn health_check(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}

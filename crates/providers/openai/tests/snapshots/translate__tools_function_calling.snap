@@ -1,0 +1,42 @@
+---
+source: crates/providers/openai/tests/translate.rs
+expression: "&body"
+---
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Search for Rust news."
+    }
+  ],
+  "temperature": 1.0,
+  "max_tokens": 1024,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "search_web",
+        "description": "Search the web for current information.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "Search query",
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "function",
+    "function": {
+      "name": "search_web"
+    }
+  }
+}

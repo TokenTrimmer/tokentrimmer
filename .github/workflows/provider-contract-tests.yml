@@ -1,0 +1,61 @@
+name: provider contract tests (weekly, $-capped)
+
+# Hits real provider APIs to catch upstream drift. Weekly $5 cap enforced by
+# the test harness reading prior-run cost from artifacts.
+
+on:
+  schedule:
+    - cron: '0 8 * * 1' # Monday 08:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PROVIDER_WEEKLY_USD_CAP: '5'
+
+jobs:
+  contract:
+    name: provider ${{ matrix.provider }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [openai, anthropic, gemini, mistral, groq, together, openrouter]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run contract tests
+        env:
+          PROVIDER: ${{ matrix.provider }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          cargo test -p "tt-provider-${PROVIDER}" --features contract -- --ignored --include-ignored
+
+  open-issue-on-failure:
+    name: open issue if any provider broke
+    needs: contract
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open provider-broken issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TODAY: ${{ github.run_number }}
+        run: |
+          today_date=$(date -u +%Y-%m-%d)
+          gh issue create \
+            --title "provider contract tests failing (${today_date})" \
+            --label "provider-broken" \
+            --body "Weekly provider contract test run failed. See: ${RUN_URL}"

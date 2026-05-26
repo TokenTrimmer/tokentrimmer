@@ -1,0 +1,53 @@
+# Keep the build context small and reproducible.
+
+# Build artifacts
+target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Nix
+result
+result-*
+
+# Frontend (not built by Dockerfile)
+node_modules/
+.pnpm-store/
+dist/
+.astro/
+.solid/
+
+# Claude Code session state (never ship)
+.claude/
+.cursor/
+
+# Secrets / env
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Git noise
+.git/
+.gitignore
+.github/
+
+# Docs (kept in repo, not needed for runtime image)
+docs/
+
+# Tests fixtures unused at runtime
+**/tests/
+**/snapshots/
+**/*.snap
+**/*.snap.new
+
+# Logs / coverage
+*.log
+coverage/
+*.profraw

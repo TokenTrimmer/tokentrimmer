@@ -1,0 +1,26 @@
+name: inspect-self (dogfood)
+
+# Required check as of Week 14 — 10 P0 rules ship and the repo self-scans clean.
+# Any new HIGH or CRITICAL finding blocks merge to main.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  inspect:
+    name: tt inspect .
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build -p tt-cli --release
+      - name: Run Inspect on self (gate at HIGH severity)
+        run: ./target/release/tt inspect . --fail-on=high

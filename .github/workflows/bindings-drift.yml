@@ -1,0 +1,31 @@
+name: bindings drift check
+
+# Regenerates TS bindings from Rust types and fails if differs from committed.
+# Catches the most common failure mode of the two-language stack.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bindings:
+    name: TS bindings drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate bindings
+        run: cargo test -p tt-ts-types
+      - name: Fail if bindings drifted
+        run: |
+          if ! git diff --quiet; then
+            echo "::error::TS bindings drifted. Run 'cargo test -p tt-ts-types' locally, commit the result."
+            git diff
+            exit 1
+          fi

@@ -1,0 +1,26 @@
+---
+source: crates/providers/gemini/tests/translate.rs
+expression: "&body"
+---
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Describe this image."
+        },
+        {
+          "fileData": {
+            "mimeType": "image/jpeg",
+            "fileUri": "https://example.com/cat.jpg"
+          }
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "temperature": 0.7,
+    "maxOutputTokens": 1024
+  }
+}

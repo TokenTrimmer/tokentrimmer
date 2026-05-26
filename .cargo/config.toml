@@ -1,0 +1,12 @@
+# Workspace-level cargo config. Keep CI parity with local.
+
+[build]
+# Use the same target dir across crates for incremental cache reuse.
+incremental = true
+
+[net]
+git-fetch-with-cli = true
+
+[term]
+verbose = false
+color = "auto"

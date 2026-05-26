@@ -1,0 +1,60 @@
+---
+source: crates/plan-core/tests/replay.rs
+expression: result
+---
+{
+  "plan_id": "00000000-0000-0000-0000-0000000a11ce",
+  "org_id": "00000000-0000-0000-0000-feedfacecafe",
+  "window_start": "2026-04-30T23:59:59Z",
+  "window_end": "2026-05-12T13:46:40Z",
+  "sample_size": 50,
+  "aggregates": {
+    "total_baseline_cost_usd": 0.07454999999999999,
+    "total_projected_cost_usd": 0.0062125,
+    "projected_savings_usd": 0.0683375,
+    "projected_savings_pct": 91.66666666666667,
+    "cache_hit_rate_projected": 0.2,
+    "p50_latency_ms_projected": 125.0,
+    "p95_latency_ms_projected": 147.0,
+    "requests_rerouted": 50,
+    "requests_unchanged": 0,
+    "requests_unprice_able": 0,
+    "l2_projections": [],
+    "l2_poisoning_candidates": 0
+  },
+  "confidence_intervals": {
+    "savings_usd_95": [
+      0.06541699999999998,
+      0.071555
+    ],
+    "savings_pct_95": [
+      91.66666666666666,
+      91.66666666666667
+    ],
+    "cache_hit_rate_95": [
+      0.1,
+      0.32
+    ],
+    "p50_latency_ms_95": [
+      118.0,
+      133.0
+    ],
+    "p95_latency_ms_95": [
+      143.0,
+      149.0
+    ]
+  },
+  "per_route_breakdown": [
+    {
+      "route_id": "00000000-0000-0000-0000-00000000beef",
+      "route_name": "cheap-for-short",
+      "matched": 50,
+      "baseline_cost_usd": 0.07454999999999999,
+      "projected_cost_usd": 0.0062125,
+      "savings_usd": 0.0683375
+    }
+  ],
+  "caveats": [
+    "Small sample size (50 requests) — confidence intervals are wide."
+  ]
+}

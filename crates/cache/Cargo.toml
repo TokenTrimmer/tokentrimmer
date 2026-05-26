@@ -1,0 +1,23 @@
+[package]
+name = "tt-cache"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "L1 (exact-match Redis) cache and L2 (pgvector semantic) cache layer."
+
+[dependencies]
+tt-shared.workspace = true
+async-trait.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+dashmap.workspace = true
+sqlx.workspace = true
+pgvector.workspace = true
+uuid.workspace = true
+chrono.workspace = true

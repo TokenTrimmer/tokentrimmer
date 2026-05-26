@@ -1,0 +1,57 @@
+---
+source: crates/providers/gemini/tests/streaming.rs
+expression: "&chunks"
+---
+[
+  {
+    "id": "[id]",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "gemini-3.1-pro",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "role": "assistant"
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "[id]",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "gemini-3.1-pro",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "content": "Frag"
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "[id]",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "gemini-3.1-pro",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "content": "mented"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 5,
+      "completion_tokens": 2,
+      "total_tokens": 7,
+      "cached_tokens": 0
+    }
+  }
+]

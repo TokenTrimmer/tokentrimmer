@@ -1,0 +1,20 @@
+---
+source: crates/providers/gemini/tests/translate.rs
+expression: "&body"
+---
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "What is 2+2?"
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "temperature": 0.7,
+    "maxOutputTokens": 1024
+  }
+}

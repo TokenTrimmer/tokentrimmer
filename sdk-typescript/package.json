@@ -1,0 +1,42 @@
+{
+  "name": "@tokentrimmer/client",
+  "version": "0.1.0",
+  "description": "Thin wrapper around the OpenAI Node SDK that routes through TokenTrimmer Gateway.",
+  "keywords": ["llm", "openai", "anthropic", "gateway", "cost-optimization"],
+  "homepage": "https://tokentrimmer.com",
+  "bugs": "https://github.com/tokentrimmer/tokentrimmer/issues",
+  "license": "Apache-2.0",
+  "author": "TokenTrimmer Contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tokentrimmer/tokentrimmer.git",
+    "directory": "sdk-typescript"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "openai": "^4.0.0 || ^5.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^2.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

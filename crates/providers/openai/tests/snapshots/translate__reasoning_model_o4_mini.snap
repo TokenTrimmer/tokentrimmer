@@ -1,0 +1,14 @@
+---
+source: crates/providers/openai/tests/translate.rs
+expression: "&body"
+---
+{
+  "model": "o4-mini",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Solve this integral."
+    }
+  ],
+  "max_completion_tokens": 50000
+}

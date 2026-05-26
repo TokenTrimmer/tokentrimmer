@@ -1,0 +1,136 @@
+---
+source: crates/providers/anthropic/tests/streaming.rs
+expression: "&chunks"
+---
+[
+  {
+    "id": "msg_04",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "role": "assistant"
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "msg_04",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "tool_calls": [
+            {
+              "id": "toolu_01",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"loc"
+              }
+            }
+          ]
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "msg_04",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "tool_calls": [
+            {
+              "id": "toolu_01",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\":"
+              }
+            }
+          ]
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "msg_04",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "tool_calls": [
+            {
+              "id": "toolu_01",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\":\"London\""
+              }
+            }
+          ]
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "msg_04",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "tool_calls": [
+            {
+              "id": "toolu_01",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\":\"London\"}"
+              }
+            }
+          ]
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "msg_04",
+    "object": "chat.completion.chunk",
+    "created": "[timestamp]",
+    "model": "claude-sonnet-4-6",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {},
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 20,
+      "completion_tokens": 15,
+      "total_tokens": 35,
+      "cached_tokens": 0
+    }
+  }
+]

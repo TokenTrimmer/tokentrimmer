@@ -1,0 +1,14 @@
+//! OpenTelemetry init + audit-log primitives.
+//!
+//! The audit log is hash-chained (BLAKE3) and signed (Ed25519) per-org.
+//! `tt audit verify` (in `crates/cli`) walks the chain.
+//!
+//! ## Key public items
+//!
+//! - [`audit::AuditWriter`] — trait for storage backends.
+//! - [`audit::InMemoryAuditWriter`] — in-process writer for tests and CLI.
+//! - [`audit::verify_chain`] — standalone chain verifier.
+//! - [`audit::AuditEntry`] / [`audit::Actor`] — wire types.
+
+pub mod audit;
+pub mod tracing;

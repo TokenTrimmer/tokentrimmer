@@ -1,0 +1,92 @@
+name: TokenTrimmer Inspect
+description: Scan a codebase for LLM token-waste patterns. Outputs markdown to the PR check.
+author: TokenTrimmer Contributors
+branding:
+  icon: search
+  color: blue
+
+inputs:
+  path:
+    description: Path to scan (relative to repo root).
+    required: false
+    default: .
+  fail-on:
+    description: Severity that fails the action. One of low, medium, high, critical.
+    required: false
+    default: high
+  output:
+    description: Output file path. Default writes markdown to a step summary; pass a .json suffix for JSON.
+    required: false
+    default: ''
+  token:
+    description: |
+      Optional TokenTrimmer hosted API key (`tt_live_*`). When set, the action uploads
+      results to the hosted dashboard for trend tracking. Leave blank to run fully local
+      and free — Inspect itself does not require a hosted account.
+    required: false
+    default: ''
+  tt-version:
+    description: tt-cli version to use, e.g. "0.1.0" or "latest". Default pins to a known-good release.
+    required: false
+    default: latest
+
+runs:
+  using: composite
+  steps:
+    - name: Install tt-cli
+      shell: bash
+      env:
+        TT_VERSION: ${{ inputs.tt-version }}
+      run: |
+        # Install the tt binary. For now we build from source — once we publish
+        # to crates.io / GHCR release artifacts, swap to a direct download.
+        if ! command -v tt >/dev/null 2>&1; then
+          if [ "$TT_VERSION" = "latest" ]; then
+            cargo install --locked --git https://github.com/tokentrimmer/tokentrimmer --branch main tt-cli
+          else
+            cargo install --locked --git https://github.com/tokentrimmer/tokentrimmer --tag "v$TT_VERSION" tt-cli
+          fi
+        fi
+        tt --version
+
+    - name: Run tt inspect
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        OUTPUT: ${{ inputs.output }}
+      run: |
+        outfile="$OUTPUT"
+        if [ -z "$outfile" ]; then
+          outfile="$(mktemp -t tt-inspect.XXXXXX.md)"
+        fi
+        # Capture exit status without aborting (we want to append to summary even on failures).
+        if tt inspect "$SCAN_PATH" --fail-on "$FAIL_ON" --output "$outfile"; then
+          echo "tt-inspect-status=passed" >> "$GITHUB_OUTPUT"
+        else
+          echo "tt-inspect-status=failed" >> "$GITHUB_OUTPUT"
+          INSPECT_FAILED=1
+        fi
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "$outfile" ]; then
+          {
+            echo "## TokenTrimmer Inspect"
+            echo ""
+            cat "$outfile"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [ -n "${INSPECT_FAILED:-}" ]; then exit 1; fi
+
+    - name: Upload to hosted dashboard
+      if: inputs.token != ''
+      shell: bash
+      env:
+        TT_TOKEN: ${{ inputs.token }}
+      run: |
+        # Hosted upload is implemented when the cloud repo's hosted Inspect
+        # backend ships. For now we just note that a token was supplied.
+        echo "tt-cli hosted upload: not yet wired (cloud backend pending)"
+
+outputs:
+  status:
+    description: passed or failed based on findings vs fail-on threshold
+    value: ${{ steps.run.outputs.tt-inspect-status }}

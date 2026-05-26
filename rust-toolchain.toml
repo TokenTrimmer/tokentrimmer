@@ -1,0 +1,6 @@
+[toolchain]
+# 1.85 is the floor: stable edition2024 lands here, and several recent
+# crates in the workspace dep tree require it. Bump in lockstep with CI.
+channel = "1.86.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "minimal"

@@ -1,0 +1,49 @@
+---
+source: crates/providers/openai/tests/streaming.rs
+expression: "&chunks"
+---
+[
+  {
+    "id": "chatcmpl-3",
+    "object": "chat.completion.chunk",
+    "created": 1716681600,
+    "model": "gpt-4o",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "content": "A"
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "chatcmpl-3",
+    "object": "chat.completion.chunk",
+    "created": 1716681600,
+    "model": "gpt-4o",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "content": "B"
+        },
+        "finish_reason": "stop"
+      }
+    ]
+  },
+  {
+    "id": "chatcmpl-3",
+    "object": "chat.completion.chunk",
+    "created": 1716681600,
+    "model": "gpt-4o",
+    "choices": [],
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 2,
+      "total_tokens": 12,
+      "cached_tokens": 0
+    }
+  }
+]

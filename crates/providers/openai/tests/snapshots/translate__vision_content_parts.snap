@@ -1,0 +1,27 @@
+---
+source: crates/providers/openai/tests/translate.rs
+expression: "&body"
+---
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What's in this image?"
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "https://example.com/cat.jpg",
+            "detail": "high"
+          }
+        }
+      ]
+    }
+  ],
+  "temperature": 1.0,
+  "max_tokens": 1024
+}

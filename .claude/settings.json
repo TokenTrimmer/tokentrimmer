@@ -1,0 +1,116 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(cargo test -p *)",
+      "Bash(cargo clippy -p *)",
+      "Bash(cargo clippy --workspace -- -D warnings)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo audit:*)",
+      "Bash(cargo deny:*)",
+      "Bash(cargo doc:*)",
+      "Bash(cargo build -p *)",
+      "Bash(cargo metadata:*)",
+      "Bash(cargo tree:*)",
+      "Bash(pnpm install:*)",
+      "Bash(pnpm --filter * typecheck)",
+      "Bash(pnpm --filter * build)",
+      "Bash(pnpm --filter * test)",
+      "Bash(pnpm test:*)",
+      "Bash(pnpm typecheck:*)",
+      "Bash(git status)",
+      "Bash(git status --short)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git switch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git stash:*)",
+      "Bash(rg:*)",
+      "Bash(fd:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(mkdir -p *)",
+      "Bash(tree:*)",
+      "Bash(./scripts/tt-inspect-self.sh:*)",
+      "Bash(./scripts/audit-log.sh:*)",
+      "Bash(./scripts/cost-ledger.sh:*)",
+      "Bash(./scripts/ci-local.sh:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh issue view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr create:*)",
+      "Bash(nix develop:*)",
+      "Bash(docker compose -f docker-compose.dev.yml:*)",
+      "WebSearch",
+      "WebFetch"
+    ],
+    "deny": [
+      "Bash(cargo test --workspace)",
+      "Bash(cargo build --release)",
+      "Bash(cargo build --workspace)",
+      "Bash(rm -rf *)",
+      "Bash(rm -rf /)",
+      "Bash(git push *)",
+      "Bash(git push --force *)",
+      "Bash(git reset --hard *)",
+      "Bash(git checkout --:*)",
+      "Bash(git restore --:*)",
+      "Bash(git clean -f*)",
+      "Bash(git branch -D *)",
+      "Bash(git commit --no-verify*)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(sudo *)",
+      "Bash(chmod 777 *)",
+      "Bash(npm publish*)",
+      "Bash(cargo publish*)",
+      "Bash(pnpm publish*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session-start.sh" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/inject-agents-md-once.sh" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-edit-guard.sh" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/post-edit-scoped-check.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/audit-line.sh" },
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/cost-cap-check.sh" }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,124 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared",
+    "crates/core",
+    "crates/cache",
+    "crates/routing",
+    "crates/auth",
+    "crates/telemetry",
+    "crates/config",
+    "crates/inspect-core",
+    "crates/inspect-rules-tier1",
+    "crates/plan-core",
+    "crates/cli",
+    "crates/ts-types",
+    "crates/providers/openai",
+    "crates/providers/anthropic",
+    "crates/providers/gemini",
+    "crates/providers/mistral",
+    "crates/providers/groq",
+    "crates/providers/together",
+    "crates/providers/openrouter",
+    "crates/providers/local",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/tokentrimmer/tokentrimmer"
+authors = ["TokenTrimmer Contributors"]
+
+[workspace.dependencies]
+# Async runtime + HTTP
+async-trait = "0.1"
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
+hyper = "1.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+
+# Error handling + tracing
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.27"
+opentelemetry = "0.26"
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+
+# Crypto + auth
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+blake3 = "1.5"
+hex = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# DB + cache
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono", "json"] }
+redis = { version = "0.27", features = ["tokio-rustls-comp", "connection-manager"] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+dashmap = "6"
+
+# Streaming + utilities
+futures = "0.3"
+async-stream = "0.3"
+bytes = "1.7"
+uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+
+# Tests
+insta = { version = "1.40", features = ["json", "yaml", "redactions"] }
+httpmock = "0.7"
+tokio-test = "0.4"
+rstest = "0.23"
+tempfile = "3"
+criterion = { version = "0.5", default-features = false }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Static analysis (Inspect)
+tree-sitter = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+walkdir = "2"
+regex = "1"
+
+# Internal crate refs
+tt-shared = { path = "crates/shared" }
+tt-cache = { path = "crates/cache" }
+tt-routing = { path = "crates/routing" }
+tt-auth = { path = "crates/auth" }
+tt-telemetry = { path = "crates/telemetry" }
+tt-config = { path = "crates/config" }
+tt-inspect-core = { path = "crates/inspect-core" }
+tt-inspect-rules-tier1 = { path = "crates/inspect-rules-tier1" }
+tt-plan-core = { path = "crates/plan-core" }
+tt-provider-openai = { path = "crates/providers/openai" }
+tt-provider-anthropic = { path = "crates/providers/anthropic" }
+tt-provider-gemini = { path = "crates/providers/gemini" }
+tt-provider-mistral = { path = "crates/providers/mistral" }
+tt-provider-groq = { path = "crates/providers/groq" }
+tt-provider-together = { path = "crates/providers/together" }
+tt-provider-openrouter = { path = "crates/providers/openrouter" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = 1

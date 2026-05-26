@@ -1,0 +1,36 @@
+---
+source: crates/providers/anthropic/tests/translate.rs
+expression: "&resp"
+---
+{
+  "id": "msg_01",
+  "object": "chat.completion",
+  "created": "[timestamp]",
+  "model": "claude-sonnet-4-6-20251022",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "toolu_01",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"location\":\"London\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 50,
+    "completion_tokens": 20,
+    "total_tokens": 70,
+    "cached_tokens": 0,
+    "cache_creation_input_tokens": 0
+  }
+}

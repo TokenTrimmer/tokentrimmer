@@ -1,0 +1,15 @@
+---
+source: crates/providers/openai/tests/translate.rs
+expression: "&body"
+---
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello."
+    }
+  ],
+  "temperature": 1.0,
+  "max_tokens": 1024
+}

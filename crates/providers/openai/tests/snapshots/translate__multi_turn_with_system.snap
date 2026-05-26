@@ -1,0 +1,45 @@
+---
+source: crates/providers/openai/tests/translate.rs
+expression: "&body"
+---
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "Call the weather tool for London."
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_abc123",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"location\":\"London\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "{\"temp\":15,\"unit\":\"C\"}",
+      "tool_call_id": "call_abc123"
+    },
+    {
+      "role": "assistant",
+      "content": "The weather in London is 15°C."
+    },
+    {
+      "role": "user",
+      "content": "Thanks!"
+    }
+  ],
+  "temperature": 1.0,
+  "max_tokens": 1024
+}

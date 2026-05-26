@@ -1,0 +1,34 @@
+---
+source: crates/providers/gemini/tests/translate.rs
+expression: "&body"
+---
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Generate JSON."
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "temperature": 0.9,
+    "topP": 0.95,
+    "maxOutputTokens": 2048,
+    "stopSequences": [
+      "STOP",
+      "END"
+    ],
+    "responseMimeType": "application/json",
+    "responseSchema": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

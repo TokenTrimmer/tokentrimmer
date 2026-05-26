@@ -1,0 +1,44 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Nix
+result
+result-*
+
+# pnpm/Node
+node_modules/
+.pnpm-store/
+dist/
+.astro/
+.solid/
+
+# Local env + secrets
+.env
+.env.local
+.env.*.local
+
+# Claude Code session state (gitignored except the harness itself)
+.claude/AUDIT.log
+.claude/PAUSED
+.claude/cost-ledger.jsonl
+.claude/sessions/
+.claude/settings.local.json
+.claude/STATE.md
+
+# Logs / coverage
+*.log
+coverage/
+*.profraw
+
+# Build artifacts
+*.pdb

@@ -1,0 +1,26 @@
+[package]
+name = "tt-provider-groq"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Groq provider adapter (OpenAI-compatible)."
+
+[dependencies]
+tt-shared.workspace = true
+tt-provider-openai.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+httpmock.workspace = true
+tokio-test.workspace = true
+uuid.workspace = true

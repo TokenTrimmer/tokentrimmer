@@ -1,0 +1,54 @@
+---
+source: crates/providers/openai/tests/streaming.rs
+expression: "&chunks"
+---
+[
+  {
+    "id": "chatcmpl-7",
+    "object": "chat.completion.chunk",
+    "created": 1716681600,
+    "model": "gpt-4o",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "tool_calls": [
+            {
+              "id": "call_abc",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": ""
+              }
+            }
+          ]
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "chatcmpl-7",
+    "object": "chat.completion.chunk",
+    "created": 1716681600,
+    "model": "gpt-4o",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "tool_calls": [
+            {
+              "id": "call_abc",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"NYC\"}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ]
+  }
+]

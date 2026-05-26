@@ -1,0 +1,26 @@
+---
+source: crates/providers/gemini/tests/translate.rs
+expression: "&resp"
+---
+{
+  "id": "[id]",
+  "object": "chat.completion",
+  "created": "[timestamp]",
+  "model": "gemini-3.1-pro",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": ""
+      },
+      "finish_reason": "content_filter"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 5,
+    "completion_tokens": 0,
+    "total_tokens": 5,
+    "cached_tokens": 0
+  }
+}

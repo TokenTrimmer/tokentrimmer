@@ -1,0 +1,20 @@
+---
+source: crates/providers/anthropic/tests/translate.rs
+expression: "&body"
+---
+{
+  "model": "claude-sonnet-4-6",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What is 2+2?"
+        }
+      ]
+    }
+  ],
+  "max_tokens": 1024,
+  "temperature": 0.7
+}

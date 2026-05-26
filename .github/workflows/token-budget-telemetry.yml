@@ -1,0 +1,41 @@
+name: token budget telemetry (advisory)
+
+# Reads .claude/AUDIT.log entries on the PR branch and posts a comment with
+# cumulative AI-assisted cost. Informational only; never blocks merge.
+
+on:
+  pull_request:
+
+jobs:
+  comment:
+    name: post token budget comment
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Summarize AI cost from AUDIT.log
+        id: summary
+        run: |
+          if [[ ! -f .claude/AUDIT.log ]]; then
+            echo "summary=No AUDIT.log present." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          count=$(wc -l < .claude/AUDIT.log | tr -d ' ')
+          echo "summary=AI-assisted sessions on this branch: ${count} entries in .claude/AUDIT.log." >> "$GITHUB_OUTPUT"
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        env:
+          SUMMARY: ${{ steps.summary.outputs.summary }}
+        with:
+          script: |
+            const summary = process.env.SUMMARY || '';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### Token budget telemetry\n\n${summary}\n\n_Informational; never blocks merge._`
+            });

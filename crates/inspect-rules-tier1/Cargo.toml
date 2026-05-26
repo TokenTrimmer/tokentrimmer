@@ -1,0 +1,17 @@
+[package]
+name = "tt-inspect-rules-tier1"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The 10 launch-day P0 Inspect rules (deterministic, Tier 1)."
+
+[dependencies]
+tt-inspect-core.workspace = true
+serde.workspace = true
+tracing.workspace = true
+regex.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

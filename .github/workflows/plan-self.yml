@@ -1,0 +1,25 @@
+name: plan-self (dogfood)
+
+# Required check as of Week 17 — replay engine is live and the snapshot test
+# guards against deterministic-output drift. Any change to the replay math
+# that perturbs the canned-input snapshot fails this check.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: plan replay determinism
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Plan engine — determinism + snapshot + bootstrap CI coverage
+        run: cargo test -p tt-plan-core

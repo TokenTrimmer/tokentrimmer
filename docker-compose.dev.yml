@@ -1,0 +1,77 @@
+name: tokentrimmer-dev
+
+# Local development services. Brought up via `make dev` (or directly).
+# Mirrors production architecture without hosted dependencies — works offline.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tt
+      POSTGRES_PASSWORD: tt_dev
+      POSTGRES_DB: tokentrimmer
+    ports:
+      - "5432:5432"
+    volumes:
+      - tt_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tt -d tokentrimmer"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: tt_dev
+      MINIO_ROOT_PASSWORD: tt_dev_password
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Console
+    volumes:
+      - tt_minio:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # Web UI
+    environment:
+      MP_MAX_MESSAGES: 5000
+
+  # Optional: local Ollama for end-to-end testing of the local provider adapter.
+  # Enable via: docker compose --profile local-llm up
+  ollama:
+    profiles: ["local-llm"]
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - tt_ollama:/root/.ollama
+
+volumes:
+  tt_pgdata:
+  tt_minio:
+  tt_ollama:

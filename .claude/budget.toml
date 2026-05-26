@@ -1,0 +1,9 @@
+# Cost circuit-breaker config for autonomous loops. Read by .claude/hooks/cost-cap-check.sh.
+# Edit these only after deciding the spike was justified — the whole point of the
+# circuit breaker is that the model can't talk itself into raising the cap mid-loop.
+
+daily_cap_usd = 25
+weekly_cap_usd = 100
+
+# Per-iteration cap is enforced by scripts/ralph-iteration.sh, not here.
+# Default: $1.00 per autonomous iteration.
