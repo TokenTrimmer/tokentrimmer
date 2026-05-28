@@ -190,6 +190,17 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 
 - [ ] [P2] [w17-plan-reconciliation-worker] rust-crate-builder: 7d/30d reconciliation report worker — Apalis job comparing projected vs actual metrics; writes back to plan_runs.actual_* columns + computes trust_score. [BLOCKED — needs cloud worker] (est: $0.80)
 
+## Six-track expansion (2026-05-28 brainstorm)
+
+Six tracks scoped to evolve TokenTrimmer from "runtime API gateway" → "dev-tool layer + self-driving business". Each track gets its own spec → plan cycle before execution. Items marked `[NEEDS-SPEC]` are placeholders only — do NOT pick via autopilot until a spec lives in `docs/superpowers/specs/` and a plan in `.claude/plans/`.
+
+- [ ] [P1] [trackF-self-driving-backlog] rust-crate-builder: Self-driving autopilot backlog generator. Daily GHA runs `tt backlog generate` → Sentry + tt-api signals + inspect-self + gh-triage + Tier-3 LLM. Three-label scheme: `autopilot` / `autopilot-triaged` / `autopilot-proposed`. Spec: `docs/superpowers/specs/2026-05-28-self-driving-backlog-design.md`. Plan: TODO via writing-plans. (est: ~$3.50)
+- [ ] [P2] [trackA-mcp-server] rust-crate-builder: MCP server exposing TokenTrimmer intelligence (cost preview, route suggestions, semantic cache lookup, inspect findings, plan projections) as tools/resources/prompts to Claude Code, Cursor, and any MCP client. New crate `crates/mcp/`. [NEEDS-SPEC]
+- [ ] [P2] [trackB-claude-code-codex-proxy] rust-crate-builder: Claude Code / Codex proxy mode. `tt proxy --for claude-code` runs a local OpenAI-/Anthropic-compatible endpoint that forwards to the hosted Gateway, injects cost-preview headers (`X-TT-Cost-Preview-Usd`, `X-TT-Suggested-Route`), and writes session-level cost rollups. Anthropic SDK respects `ANTHROPIC_BASE_URL` so flip is `export ANTHROPIC_BASE_URL=http://localhost:3001`. [NEEDS-SPEC]
+- [ ] [P2] [trackC-cost-preview-api] rust-crate-builder: `POST /v1/preview` endpoint — accepts a chat-completion request, returns projected cost (current model), cheapest-equivalent (Plan engine quality projection), savings if cached (L1+L2 hit-rate-weighted), and suggested route. Reusable surface for MCP (A), proxy (B), CLI (D). [NEEDS-SPEC]
+- [ ] [P3] [trackD-tt-init-installer] rust-crate-builder: `tt init` subcommand drops `AGENTS.md`, hooks (pre-edit-guard, cost-cap-check, audit-line), `.claude/skills/`, an Inspect baseline run, and cost-cap config into any user repo. Templates in `crates/cli/templates/init/`. Bundles existing assets as a product. [NEEDS-SPEC]
+- [ ] [P3] [trackE-rag-context-compression] rust-crate-builder: RAG / context-compression pillar. New crate `crates/retrieval/` — corpus ingestion via OpenAI embeddings, HNSW lookup over user codebase + docs, prompt-prefix swap that replaces verbose context with retrieved snippets. Dashboard `/context` page. Distinct from L2 semantic cache (which caches responses; this retrieves context). [NEEDS-SPEC]
+
 ## Completed
 
 - [x] [w0-pre-flight] Harness scaffolding (hooks, agents, Cargo workspace, CI, scripts, governance docs). 2026-05-25.
