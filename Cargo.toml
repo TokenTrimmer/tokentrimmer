@@ -25,7 +25,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/tokentrimmer/tokentrimmer"
 authors = ["TokenTrimmer Contributors"]
@@ -88,6 +88,9 @@ criterion = { version = "0.5", default-features = false }
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
+# Observability — rustls transport so we match the workspace TLS choice.
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+
 # Static analysis (Inspect)
 tree-sitter = "0.24"
 tree-sitter-python = "0.23"
@@ -96,8 +99,15 @@ tree-sitter-javascript = "0.23"
 walkdir = "2"
 regex = "1"
 
+# tt init installer
+tera = "1.20"
+include_dir = "0.7"
+dialoguer = "0.11"
+toml = "0.8"
+
 # Internal crate refs
 tt-shared = { path = "crates/shared" }
+tt-core = { path = "crates/core" }
 tt-cache = { path = "crates/cache" }
 tt-routing = { path = "crates/routing" }
 tt-auth = { path = "crates/auth" }

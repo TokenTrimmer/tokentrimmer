@@ -10,13 +10,24 @@ description = "The `tt` CLI binary — gateway, inspect, plan, audit subcommands
 name = "tt"
 path = "src/main.rs"
 
+[lib]
+name = "tt_cli"
+path = "src/lib.rs"
+
 [dependencies]
 tt-shared.workspace = true
+tt-core.workspace = true
+tt-cache.workspace = true
+tt-routing = { workspace = true, features = ["postgres"] }
+tt-auth = { workspace = true, features = ["postgres"] }
+tt-telemetry = { workspace = true, features = ["postgres"] }
+tt-config.workspace = true
+sqlx.workspace = true
 tt-inspect-core.workspace = true
 tt-inspect-rules-tier1.workspace = true
 tt-plan-core.workspace = true
-tt-telemetry.workspace = true
 
+axum.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
@@ -26,3 +37,15 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true
+sentry.workspace = true
+tera.workspace = true
+include_dir.workspace = true
+walkdir.workspace = true
+sha2.workspace = true
+dialoguer.workspace = true
+toml.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+insta = { workspace = true }
