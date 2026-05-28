@@ -74,9 +74,9 @@ case "${cmd}" in
       exit 1
     fi
     existing=$(gh issue list --label autopilot --state open --limit 100 --json title --jq '.[].title' 2>/dev/null || echo "")
-    grep -E '^\- \[ \] \[P[0-3]\]' "${BACKLOG}" | while IFS= read -r line; do
+    grep -E '^\- \[ \] \[P[0-3]\]' "${BACKLOG}" | grep -Ev '\[BLOCKED|\[DEFERRED|\[NEEDS-SPEC|\[NEEDS-PLAN' | while IFS= read -r line; do
       task_id=$(echo "${line}" | sed -E 's/^\- \[ \] \[P[0-3]\] \[([a-zA-Z0-9-]+)\].*/\1/')
-      desc=$(echo "${line}" | sed -E 's/^\- \[ \] \[P[0-3]\] \[[a-z0-9-]+\] [a-z-]+: (.*) \(est:.*/\1/')
+      desc=$(echo "${line}" | sed -E 's/^\- \[ \] \[P[0-3]\] \[[a-zA-Z0-9-]+\] [a-z-]+: (.*) \(est:.*/\1/')
       title="[${task_id}] ${desc}"
       if printf '%s\n' "${existing}" | grep -qF "[${task_id}]"; then
         echo "skip (exists): ${title}"
