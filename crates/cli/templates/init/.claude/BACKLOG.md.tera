@@ -1,0 +1,11 @@
+# Backlog
+
+Single source of truth for actionable work. Entries are checkboxes; flip to `[x]` when done.
+
+**Format**: `- [PRIORITY] [task-id] subagent: brief description`
+
+- `PRIORITY` ∈ {P0 (blocker), P1 (next), P2 (soon), P3 (whenever)}
+
+## Initial
+
+- [ ] [P3] [first-task] Edit this file. Add a real backlog item. Delete this one.

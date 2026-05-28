@@ -1,0 +1,47 @@
+# AGENTS.md — {{ project_name }}
+
+This file is the working-tree convention guide for AI assistants and human contributors.
+
+## What this repo is
+
+(Customize this section. Brief: what does this codebase do, who uses it, what's the runtime, what's the source of truth?)
+
+## Stack
+
+- Primary language: {{ language }}
+{% if frameworks_csv %}- Known LLM dependencies: {{ frameworks_csv }}
+{% endif %}
+
+## Conventions
+
+- Errors: propagate, don't swallow.
+- Logging: structured. Never `print` or `console.log` in library code.
+- Test before claiming done.
+- 800-line file cap. Split before you grow beyond it.
+
+## Build / test / lint
+
+(Fill in your project's commands here. Example:)
+
+```
+{% if language == "Python" %}pytest -q
+ruff check .
+mypy{% elif language == "TypeScript" %}pnpm typecheck
+pnpm test{% elif language == "Rust" %}cargo test
+cargo clippy -- -D warnings{% else %}# your test command here{% endif %}
+```
+
+## Do NOT
+
+- Commit secrets. Hooks block; CI is the second line.
+- Push to main without review.
+- Skip pre-commit hooks (--no-verify) without justification.
+
+## TokenTrimmer integration
+
+This repo was initialized with `tt init {{ tt_cli_version }}` on {{ initialized_at }}.
+
+- Cost optimization is enforced via `.claude/hooks/cost-cap-check.sh`.
+- Pre-edit guard is at `.claude/hooks/pre-edit-guard.sh`.
+- Inspect baseline at `.claude/inspect-baseline.json` — re-run `tt inspect --output .claude/inspect-baseline.json` to refresh.
+- Read more: https://tokentrimmer.com/docs/init
