@@ -15,6 +15,7 @@ Execute the steps in order. Bail on the first failure.
 - If `.claude/PAUSED` exists, print its contents, **STOP** — do NOT schedule the next iteration.
 - If `.claude/STOP-CHAIN` exists, print "Chain stopped by user request" and delete the file, **STOP** — do NOT schedule the next iteration.
 - Run `./scripts/backlog.sh take`. If no open items, run `./scripts/session-end.sh "Backlog drained — chain ending" --task "(idle)" --next "Add items to .claude/BACKLOG.md, then say 'start the autopilot' to resume"` and **STOP**.
+- **Skip placeholder items.** If the parsed backlog line body contains `[DEFERRED` or `[NEEDS-SPEC]`, that item is a placeholder (deferred decision or unwritten spec). Do NOT dispatch a subagent against it. Instead, call `./scripts/backlog.sh take` again to advance to the next item. If every open item is a placeholder, treat the same as backlog-drained: write a one-line HANDOFF noting "all open items placeholder" and **STOP** without scheduling the next iteration.
 
 ### 2. Find context cheaply
 
