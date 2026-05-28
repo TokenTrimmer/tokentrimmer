@@ -35,7 +35,7 @@ For each gate, run and verify:
 - `cargo test -p <changed-crate>` — exit 0
 - `cargo clippy -p <changed-crate> -- -D warnings` — exit 0
 - `./scripts/tt-inspect-self.sh` — exit 0 (zero NEW high/critical findings vs main)
-- Iteration cost so far — if `> $1.00`, bail
+- Iteration cost so far — if `> $5.00`, bail (raised 2026-05-28 to fit larger plan-driven items; runaway protection still in place via daily/weekly budget.toml caps)
 
 ### 5. Resolve outcome
 

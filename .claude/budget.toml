@@ -2,8 +2,10 @@
 # Edit these only after deciding the spike was justified — the whole point of the
 # circuit breaker is that the model can't talk itself into raising the cap mid-loop.
 
-daily_cap_usd = 25
-weekly_cap_usd = 100
+daily_cap_usd = 100
+weekly_cap_usd = 500
 
-# Per-iteration cap is enforced by scripts/ralph-iteration.sh, not here.
-# Default: $1.00 per autonomous iteration.
+# Per-iteration cap is enforced by AUTOPILOT_PROMPT.md (step 4 gates),
+# not here. Currently $5.00 per autonomous iteration (raised 2026-05-28 from
+# $1.00 to fit larger plan-driven items like trackA-E).
+# Daily/weekly caps act as runaway-loop protection regardless of iteration cap.
