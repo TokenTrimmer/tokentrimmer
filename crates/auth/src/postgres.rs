@@ -86,7 +86,8 @@ impl From<CredentialStoreError> for CredentialError {
 #[derive(Clone)]
 pub struct PostgresProviderCredentialStore {
     pool: PgPool,
-    /// 32-byte root key from `TT_MASTER_KEY`. Per-row keys are HKDF-derived.
+    /// 32-byte root key from `TT_MASTER_KEY`. Per-row keys are derived via a
+    /// SHA-256 one-shot KDF (see `derive_key`), not HKDF.
     master_key: [u8; 32],
 }
 
