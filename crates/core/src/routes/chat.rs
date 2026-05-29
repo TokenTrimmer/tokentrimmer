@@ -239,22 +239,51 @@ pub async fn handler(
             })
             .sum::<usize>() as i32;
 
+        // Establish the stream. When the matched route declares fallbacks, fail
+        // over across the candidate chain (initial establishment only — a
+        // mid-stream error cannot move to another provider); otherwise retry
+        // the single provider. `provider`/`served_model` are rebound to whoever
+        // actually served so cost/telemetry attribute correctly.
+        let (provider, served_model, stream) = if route_fallbacks.is_empty() {
+            // Retry the initial stream establishment on transient errors (before
+            // any chunk is yielded); mid-stream errors are not retried.
+            let stream = with_retry(&RetryPolicy::default(), || {
+                provider.chat_completion_stream(req.clone(), &ctx)
+            })
+            .await?;
+            (provider, req.model.clone(), stream)
+        } else {
+            let candidates: Vec<String> = std::iter::once(req.model.clone())
+                .chain(route_fallbacks.iter().cloned())
+                .collect();
+            crate::failover::dispatch_stream_with_failover(
+                &state.registry,
+                &state.breaker,
+                &RetryPolicy::default(),
+                &candidates,
+                &req,
+                &ctx,
+                Utc::now(),
+            )
+            .await?
+        };
+
         let log_ctx = state.request_log_writer.as_ref().map(|w| StreamLogContext {
             writer: w.clone(),
             org_id: ctx.org_id,
             api_key_id: ctx.api_key_id,
             trace_id,
             provider_id: provider.id().to_string(),
-            model: req.model.clone(),
+            model: served_model.clone(),
             input_tokens: estimated_input_tokens,
             cached_tokens: 0,
-            pricing: provider.pricing(&req.model),
+            pricing: provider.pricing(&served_model),
             // Baseline against the originally-requested model when routed, so
             // the streamed request_logs row carries the real routing saving.
             baseline_pricing: if matched_route_id.is_some() {
                 requested_pricing.clone()
             } else {
-                provider.pricing(&req.model)
+                provider.pricing(&served_model)
             },
             route_id: matched_route_id,
             tag: ctx.tag.clone(),
@@ -262,12 +291,6 @@ pub async fn handler(
             budget: state.budget.clone(),
         });
 
-        // Retry the initial stream establishment on transient errors (before
-        // any chunk is yielded); mid-stream errors are not retried.
-        let stream = with_retry(&RetryPolicy::default(), || {
-            provider.chat_completion_stream(req.clone(), &ctx)
-        })
-        .await?;
         Ok(sse::stream_response(stream, &provider, trace_id, log_ctx))
     } else {
         // 3a. L1 exact-match cache. Cheapest lookup — try first. Best-effort:

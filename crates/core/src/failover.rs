@@ -14,9 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
 
 use tt_shared::{
-    ChatCompletionRequest, ChatCompletionResponse, Provider, ProviderError, RequestContext,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Provider, ProviderError,
+    RequestContext,
 };
 
 use crate::registry::ProviderRegistry;
@@ -122,6 +124,59 @@ pub async fn dispatch_with_failover(
                 last_err = Some(e);
             }
             // Not fallback-eligible (bad request, unsupported, …) — surface now.
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or(ProviderError::ProviderUpstream {
+        status: 503,
+        message: "no candidate provider available (unknown models or open circuits)".to_string(),
+    }))
+}
+
+/// Streaming sibling of [`dispatch_with_failover`]: establish a chat-completion
+/// stream across `candidates` in order. Failover happens only on the *initial*
+/// stream establishment (before any chunk is yielded) — once bytes are
+/// streaming a mid-stream error cannot be retried on another provider. Returns
+/// the serving provider, the model it served, and the stream.
+pub async fn dispatch_stream_with_failover(
+    registry: &ProviderRegistry,
+    breaker: &CircuitBreaker,
+    retry: &RetryPolicy,
+    candidates: &[String],
+    req: &ChatCompletionRequest,
+    ctx: &RequestContext,
+    now: DateTime<Utc>,
+) -> Result<
+    (
+        Arc<dyn Provider>,
+        String,
+        BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+    ),
+    ProviderError,
+> {
+    let mut last_err: Option<ProviderError> = None;
+    for model in candidates {
+        let Some(provider) = registry.resolve(model) else {
+            continue;
+        };
+        if breaker.is_open(provider.id(), now) {
+            continue;
+        }
+        let mut attempt_req = req.clone();
+        attempt_req.model = model.clone();
+        let result = with_retry(retry, || {
+            provider.chat_completion_stream(attempt_req.clone(), ctx)
+        })
+        .await;
+        match result {
+            Ok(stream) => {
+                breaker.record_success(provider.id());
+                return Ok((provider, model.clone(), stream));
+            }
+            Err(e) if e.is_fallback_eligible() => {
+                breaker.record_failure(provider.id(), now);
+                last_err = Some(e);
+            }
             Err(e) => return Err(e),
         }
     }
@@ -244,7 +299,16 @@ mod tests {
             _: &RequestContext,
         ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
         {
-            Err(ProviderError::Unsupported("n/a".into()))
+            match self.behavior {
+                Behavior::Ok => Ok(Box::pin(futures::stream::iter(Vec::<
+                    Result<ChatCompletionChunk, ProviderError>,
+                >::new()))),
+                Behavior::Fail5xx => Err(ProviderError::ProviderUpstream {
+                    status: 503,
+                    message: "down".into(),
+                }),
+                Behavior::Invalid => Err(ProviderError::InvalidRequest("bad".into())),
+            }
         }
         async fn embeddings(
             &self,
@@ -340,6 +404,64 @@ mod tests {
             matches!(r, Err(ProviderError::InvalidRequest(_))),
             "must not fall over on a non-fallback-eligible error"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_falls_over_to_next_candidate_on_5xx() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(MockProvider {
+            id: "pa",
+            model: "model-a",
+            behavior: Behavior::Fail5xx,
+        }));
+        reg.register(Arc::new(MockProvider {
+            id: "pb",
+            model: "model-b",
+            behavior: Behavior::Ok,
+        }));
+        let breaker = CircuitBreaker::default();
+        let candidates = vec!["model-a".to_string(), "model-b".to_string()];
+        let (provider, served, _stream) = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            now(),
+        )
+        .await
+        .expect("fallback should establish the stream");
+        assert_eq!(provider.id(), "pb");
+        assert_eq!(served, "model-b");
+    }
+
+    #[tokio::test]
+    async fn stream_non_fallback_eligible_error_short_circuits() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(MockProvider {
+            id: "pa",
+            model: "model-a",
+            behavior: Behavior::Invalid,
+        }));
+        reg.register(Arc::new(MockProvider {
+            id: "pb",
+            model: "model-b",
+            behavior: Behavior::Ok,
+        }));
+        let breaker = CircuitBreaker::default();
+        let candidates = vec!["model-a".to_string(), "model-b".to_string()];
+        let r = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            now(),
+        )
+        .await;
+        assert!(matches!(r, Err(ProviderError::InvalidRequest(_))));
     }
 
     #[tokio::test]
