@@ -36,7 +36,10 @@ use axum::{
     response::Response,
 };
 
-use crate::{ApiError, AppState};
+use tt_auth::ApiKeyContext;
+use uuid::Uuid;
+
+use crate::{ApiError, AppState, DOGFOOD_ORG_ID};
 
 /// Axum `from_fn_with_state`-compatible middleware function.
 pub async fn middleware(
@@ -76,6 +79,14 @@ pub async fn middleware(
             }
         }
         // Any other token format passes through unchallenged — forward-compat.
+    } else if state.dogfood_enabled {
+        // No bearer token + dogfood mode: stamp the fixed dogfood org id so
+        // the routing engine can match the pre-seeded dogfood route. This is
+        // internal-only; production requests always carry a tt_live_* key.
+        req.extensions_mut().insert(ApiKeyContext {
+            key_id: Uuid::nil(),
+            org_id: DOGFOOD_ORG_ID,
+        });
     }
     Ok(next.run(req).await)
 }

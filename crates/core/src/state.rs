@@ -65,6 +65,10 @@ pub struct AppState {
     /// rewrites `req.model` and stamps `request_logs.route_id`. `None`
     /// disables routing entirely (tests, dev mode, free-tier orgs).
     pub routing_store: Option<Arc<CachingRoutingStore>>,
+    /// When `true`, the auth middleware injects a dogfood [`ApiKeyContext`]
+    /// for unauthenticated requests so the dogfood routing route fires.
+    /// Enabled by setting `TT_DOGFOOD_GROQ_ROUTING=1` at startup.
+    pub dogfood_enabled: bool,
 }
 
 impl AppState {
@@ -80,6 +84,7 @@ impl AppState {
             credential_store: None,
             request_log_writer: None,
             routing_store: None,
+            dogfood_enabled: false,
         }
     }
 
@@ -138,6 +143,14 @@ impl AppState {
     /// Builder-style attach: enable per-org routing.
     pub fn with_routing_store(mut self, store: Arc<CachingRoutingStore>) -> Self {
         self.routing_store = Some(store);
+        self
+    }
+
+    /// Builder-style: enable dogfood routing mode. The auth middleware will
+    /// inject a [`crate::DOGFOOD_ORG_ID`] identity for unauthenticated
+    /// requests so the pre-seeded dogfood route fires.
+    pub fn with_dogfood_enabled(mut self) -> Self {
+        self.dogfood_enabled = true;
         self
     }
 }

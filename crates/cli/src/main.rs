@@ -628,6 +628,39 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
             Arc::new(tt_routing::PostgresRoutingStore::new(pool.clone()));
         state = state.with_routing_store(Arc::new(tt_routing::CachingRoutingStore::new(backing)));
         tracing::info!("routing store: Postgres-backed (60s per-org cache)");
+    } else if std::env::var("TT_DOGFOOD_GROQ_ROUTING").as_deref() == Ok("1") {
+        // Dogfood mode: seed an in-memory route that redirects short flagship
+        // model prompts to Groq's llama-3.1-8b-instant for internal testing.
+        let backing = Arc::new(tt_routing::InMemoryRoutingStore::new());
+        backing.set_routes(
+            tt_core::DOGFOOD_ORG_ID,
+            vec![tt_routing::Route {
+                id: uuid::Uuid::now_v7(),
+                name: "dogfood-short-prompts-to-groq".into(),
+                priority: 100,
+                enabled: true,
+                when: tt_routing::RouteConditions {
+                    model_in: vec![
+                        "claude-sonnet-4-6".into(),
+                        "claude-opus-4-7".into(),
+                        "gpt-4o".into(),
+                        "gpt-4-turbo".into(),
+                    ],
+                    input_tokens_lt: Some(200),
+                    ..Default::default()
+                },
+                then: tt_routing::RouteAction {
+                    target_model: "llama-3.1-8b-instant".into(),
+                },
+            }],
+        );
+        let caching: Arc<dyn tt_routing::RoutingStore> = backing;
+        state = state
+            .with_routing_store(Arc::new(tt_routing::CachingRoutingStore::new(caching)))
+            .with_dogfood_enabled();
+        tracing::info!(
+            "dogfood routing: short prompts on flagship models → llama-3.1-8b-instant (Groq)"
+        );
     } else {
         tracing::warn!("no DB pool; routing disabled (chat requests pass through unrouted)");
     }
