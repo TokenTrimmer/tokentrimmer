@@ -52,3 +52,6 @@ reqwest.workspace = true
 [[bench]]
 name = "streaming"
 harness = false
+
+[lints]
+workspace = true

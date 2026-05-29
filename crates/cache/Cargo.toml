@@ -21,3 +21,6 @@ sqlx.workspace = true
 pgvector.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[lints]
+workspace = true

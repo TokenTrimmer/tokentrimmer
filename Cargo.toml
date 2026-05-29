@@ -138,3 +138,9 @@ strip = "symbols"
 [profile.dev]
 opt-level = 0
 debug = 1
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+uninlined_format_args = "deny"

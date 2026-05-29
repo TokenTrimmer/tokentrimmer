@@ -26,3 +26,6 @@ insta.workspace = true
 tokio-test.workspace = true
 rstest.workspace = true
 uuid.workspace = true
+
+[lints]
+workspace = true

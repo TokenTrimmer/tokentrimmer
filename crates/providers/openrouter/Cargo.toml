@@ -24,3 +24,6 @@ chrono.workspace = true
 httpmock.workspace = true
 tokio-test.workspace = true
 uuid.workspace = true
+
+[lints]
+workspace = true

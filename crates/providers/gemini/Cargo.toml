@@ -26,3 +26,6 @@ httpmock.workspace = true
 insta.workspace = true
 tokio-test.workspace = true
 uuid = { workspace = true }
+
+[lints]
+workspace = true

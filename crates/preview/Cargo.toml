@@ -28,3 +28,6 @@ uuid.workspace = true
 httpmock = "0.7"
 insta = { version = "1.39", features = ["json"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
