@@ -70,6 +70,9 @@ pub async fn post_chat_completions(
                     .get("x-tokentrimmer-trace-id")
                     .and_then(|v| v.to_str().ok()),
             });
+            if !state.config.no_tui {
+                crate::proxy::tui::print_live_line(&state.log.snapshot());
+            }
             let mut response_headers = resp.headers.clone();
             preview::decorate_headers(&mut response_headers, preview_headers.as_ref());
             let body = forward::into_axum_body(resp.body);

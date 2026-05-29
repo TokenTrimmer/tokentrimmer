@@ -75,6 +75,9 @@ pub async fn post_messages(
                     .get("x-tokentrimmer-trace-id")
                     .and_then(|v| v.to_str().ok()),
             });
+            if !state.config.no_tui {
+                crate::proxy::tui::print_live_line(&state.log.snapshot());
+            }
             let mut response_headers = resp.headers.clone();
             response_headers.insert(
                 "x-tt-proxy-mode",
