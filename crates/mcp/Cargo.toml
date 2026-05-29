@@ -21,6 +21,10 @@ async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 tempfile = { workspace = true }
 url = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 [features]
 default = ["preview"]
@@ -31,3 +35,4 @@ httpmock = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }

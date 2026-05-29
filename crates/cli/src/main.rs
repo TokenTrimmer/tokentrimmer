@@ -71,6 +71,9 @@ enum Command {
         tt_api_key: Option<String>,
         #[arg(long, default_value = "https://tokentrimmer.fly.dev")]
         tt_api_base: String,
+        /// Port to bind when using --transport sse (default 31416).
+        #[arg(long, default_value_t = 31416)]
+        sse_port: u16,
     },
     /// Install TokenTrimmer best-practices into the current repo.
     Init {
@@ -230,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
             transport,
             tt_api_key,
             tt_api_base,
+            sse_port,
         } => {
             use tt_mcp::{
                 auth,
@@ -283,7 +287,18 @@ async fn main() -> anyhow::Result<()> {
                         .build()?
                         .block_on(server.run_stdio())?;
                 }
-                other => anyhow::bail!("unsupported MCP transport `{other}` (v1: stdio only)"),
+                "sse" => {
+                    let addr: std::net::SocketAddr = format!("127.0.0.1:{sse_port}")
+                        .parse()
+                        .context("invalid SSE bind address")?;
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(server.run_sse(addr))?;
+                }
+                other => {
+                    anyhow::bail!("unsupported MCP transport `{other}` (supported: stdio, sse)")
+                }
             }
         }
         Command::Init {

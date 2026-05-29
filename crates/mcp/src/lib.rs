@@ -18,4 +18,12 @@ impl Server {
     pub async fn run_stdio(self) -> Result<(), McpError> {
         crate::transport::stdio::run(self).await
     }
+
+    /// Boot the MCP server over SSE (Axum-based HTTP).
+    ///
+    /// Binds to `addr` and serves `GET /sse` + `POST /messages?sessionId=…`
+    /// until a shutdown signal is received.
+    pub async fn run_sse(self, addr: std::net::SocketAddr) -> Result<(), McpError> {
+        crate::transport::sse::run(self, addr).await
+    }
 }
