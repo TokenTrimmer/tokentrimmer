@@ -4,6 +4,8 @@
 //! that involve LLM tool calls but have no visible iteration cap or break
 //! condition. Runaway loops are a critical cost risk.
 
+use tt_inspect_core::ast::infinite_loop_lines;
+use tt_inspect_core::parse::parse_cached;
 use tt_inspect_core::{Finding, Language, Rule, Severity};
 
 /// Fires when an agent loop pattern is found without a clear termination
@@ -22,22 +24,6 @@ impl Default for AgentNoTerminationConditionRule {
         Self::new()
     }
 }
-
-/// Patterns indicating an unbounded agent loop.
-const LOOP_PATTERNS: &[&str] = &[
-    "while True:",
-    "while true {",
-    "while(true)",
-    "for _ in itertools.count(",
-    "for(;;)",
-    "while not done:",
-    "while not finished:",
-    "while not complete:",
-    "while not stop:",
-    "while is_running",
-    "while running:",
-    "while agent_running",
-];
 
 /// Patterns indicating agent / tool-call usage.
 const AGENT_PATTERNS: &[&str] = &[
@@ -96,7 +82,7 @@ impl Rule for AgentNoTerminationConditionRule {
         &[Language::Python, Language::Typescript, Language::Javascript]
     }
 
-    fn check(&self, source: &str, _language: Language, path: &str) -> Vec<Finding> {
+    fn check(&self, source: &str, language: Language, path: &str) -> Vec<Finding> {
         if is_test_fixture(path) {
             return vec![];
         }
@@ -107,26 +93,24 @@ impl Rule for AgentNoTerminationConditionRule {
             return vec![];
         }
 
-        // Find the first unbounded loop pattern.
-        let loop_line = LOOP_PATTERNS.iter().find_map(|p| {
-            source
-                .lines()
-                .enumerate()
-                .find(|(_, l)| l.contains(p))
-                .map(|(i, _)| i)
-        });
-        let Some(loop_line_idx) = loop_line else {
+        // AST-backed loop detection: find real unbounded loops (`while True`,
+        // `for(;;)`, `itertools.count()`) — a `while True` in a comment/string
+        // no longer triggers, and the reported line is the actual loop.
+        let Ok(tree) = parse_cached(source, language) else {
+            return vec![];
+        };
+        let Some(&loop_line) = infinite_loop_lines(&tree, source).first() else {
             return vec![];
         };
 
-        // Check for termination safeguards in the entire file.
+        // Termination safeguards are lexical/semantic (counter names, budget /
+        // timeout guards), so they stay text-based over the whole file. A bare
+        // `break` does NOT count — a model-decided exit can still run away;
+        // only a counter-based cap or explicit limit is a safeguard.
         let has_termination = TERMINATION_PATTERNS.iter().any(|p| source.contains(p));
         if has_termination {
             return vec![];
         }
-
-        // Also accept a `break` that has a counter reference nearby.
-        // Simple heuristic: any `break` with a counter variable.
         let has_break_with_count = source.lines().any(|l| {
             l.contains("break") && (l.contains("count") || l.contains("iter") || l.contains("step"))
         });
@@ -138,7 +122,7 @@ impl Rule for AgentNoTerminationConditionRule {
             rule_id: self.id().to_string(),
             severity: self.severity(),
             file: path.to_string(),
-            line: (loop_line_idx + 1) as u32,
+            line: loop_line,
             message: "Agent loop detected without a visible iteration cap or termination \
                        condition. An unbounded agent loop can run indefinitely and accumulate \
                        significant LLM costs."

@@ -45,6 +45,52 @@ pub fn is_llm_create_callee(callee: &str) -> bool {
         || callee.ends_with("generateContent")
 }
 
+/// Lines (1-based, ascending) of every *unbounded* loop construct in `tree`:
+/// a `while` whose condition is the literal `true`/`True`, a C-style
+/// `for (;;)`, or a Python `for … in itertools.count(…)`. Detection is on real
+/// loop nodes, so a `while True` written in a comment or string is ignored.
+pub fn infinite_loop_lines(tree: &Tree, source: &str) -> Vec<u32> {
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "while_statement" => {
+                if let Some(cond) = node.child_by_field_name("condition") {
+                    let norm = cond
+                        .utf8_text(src)
+                        .unwrap_or("")
+                        .trim()
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .trim()
+                        .to_ascii_lowercase();
+                    if norm == "true" {
+                        out.push(node.start_position().row as u32 + 1);
+                    }
+                }
+            }
+            "for_statement" => {
+                let text = node.utf8_text(src).unwrap_or("");
+                let header = text.lines().next().unwrap_or("");
+                let compact: String = header.chars().filter(|c| !c.is_whitespace()).collect();
+                // Python `itertools.count()` iterable, or C-style empty `for(;;)`.
+                if text.contains("itertools.count(") || compact.contains("(;;)") {
+                    out.push(node.start_position().row as u32 + 1);
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Walk `tree` and return every call site (Python `call`, JS/TS
 /// `call_expression`). Order follows a depth-first traversal.
 pub fn call_sites(tree: &Tree, source: &str) -> Vec<CallSite> {
@@ -95,6 +141,28 @@ mod tests {
         let tree = parse_cached(src, Language::Typescript).unwrap();
         let calls = call_sites(&tree, src);
         assert!(calls.iter().any(|c| c.callee.ends_with("messages.create")));
+    }
+
+    #[test]
+    fn detects_infinite_loops_only() {
+        let py = "while True:\n    work()\nfor i in range(3):\n    pass\nwhile done:\n    pass\n";
+        let tree = parse_cached(py, Language::Python).unwrap();
+        // Only the `while True:` on line 1 is unbounded.
+        assert_eq!(infinite_loop_lines(&tree, py), vec![1]);
+    }
+
+    #[test]
+    fn detects_itertools_count_and_ignores_comment() {
+        let py = "# while True is fine in a comment\nfor _ in itertools.count():\n    step()\n";
+        let tree = parse_cached(py, Language::Python).unwrap();
+        assert_eq!(infinite_loop_lines(&tree, py), vec![2]);
+    }
+
+    #[test]
+    fn detects_js_while_true() {
+        let js = "while (true) {\n  tick();\n}\n";
+        let tree = parse_cached(js, Language::Javascript).unwrap();
+        assert_eq!(infinite_loop_lines(&tree, js), vec![1]);
     }
 
     #[test]
