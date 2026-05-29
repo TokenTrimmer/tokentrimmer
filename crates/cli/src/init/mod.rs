@@ -48,6 +48,7 @@ pub struct RunOptions {
     pub tt_cli_version: String,
 }
 
+#[derive(Debug)]
 pub struct RunReport {
     pub files_written: u32,
     pub files_skipped: u32,
