@@ -22,6 +22,13 @@ pub trait Provider: Send + Sync {
     /// Pricing for a model. Cached; refreshed daily.
     fn pricing(&self, model: &str) -> Option<ModelPricing>;
 
+    /// Multiplier applied to computed cost/baseline to account for a provider
+    /// surcharge on top of the underlying model cost (e.g. OpenRouter's 5% BYOK
+    /// fee). Default `1.0` (no surcharge).
+    fn fee_multiplier(&self) -> f64 {
+        1.0
+    }
+
     /// Non-streaming chat completion.
     async fn chat_completion(
         &self,

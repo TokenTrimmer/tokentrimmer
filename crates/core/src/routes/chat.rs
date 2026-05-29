@@ -335,8 +335,12 @@ pub async fn handler(
         } else {
             pricing.clone()
         };
-        let (cost_usd, baseline_cost_usd) =
-            compute_cost(&response.usage, pricing.as_ref(), baseline_pricing.as_ref());
+        let (cost_usd, baseline_cost_usd) = compute_cost(
+            &response.usage,
+            pricing.as_ref(),
+            baseline_pricing.as_ref(),
+            provider.fee_multiplier(),
+        );
         let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
 
         let provider_id = provider.id().to_string();
@@ -669,6 +673,7 @@ fn compute_cost(
     usage: &Usage,
     pricing: Option<&ModelPricing>,
     baseline_pricing: Option<&ModelPricing>,
+    fee_multiplier: f64,
 ) -> (f64, f64) {
     let Some(pricing) = pricing else {
         return (0.0, 0.0);
@@ -693,7 +698,48 @@ fn compute_cost(
         / 1_000_000.0
         + (usage.completion_tokens as f64) * baseline_pricing.output_per_million / 1_000_000.0;
 
-    (cost_usd, baseline_cost_usd)
+    // Apply the provider surcharge (e.g. OpenRouter's 5% BYOK fee) to both cost
+    // and baseline so saved_usd stays consistent (it scales by the same factor).
+    (
+        cost_usd * fee_multiplier,
+        baseline_cost_usd * fee_multiplier,
+    )
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    fn flat_pricing() -> ModelPricing {
+        ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn fee_multiplier_scales_cost_and_baseline() {
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        };
+        let p = flat_pricing();
+        let (cost, base) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        let (cost_fee, base_fee) = compute_cost(&usage, Some(&p), Some(&p), 1.05);
+        // 1M input @ $1/M = $1.00 with no fee.
+        assert!((cost - 1.0).abs() < 1e-9, "cost = {cost}");
+        // OpenRouter's 5% BYOK fee scales cost and baseline by 1.05.
+        assert!((cost_fee - 1.05).abs() < 1e-9, "cost_fee = {cost_fee}");
+        assert!(
+            (base_fee - base * 1.05).abs() < 1e-12,
+            "base_fee = {base_fee}"
+        );
+    }
 }
 
 /// Insert all six required `X-TokenTrimmer-*` response headers.

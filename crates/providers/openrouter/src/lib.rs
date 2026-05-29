@@ -98,6 +98,10 @@ impl Provider for OpenRouterProvider {
         self.inner.pricing(model)
     }
 
+    fn fee_multiplier(&self) -> f64 {
+        self.inner.fee_multiplier()
+    }
+
     async fn chat_completion(
         &self,
         req: ChatCompletionRequest,
