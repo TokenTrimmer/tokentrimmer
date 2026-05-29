@@ -97,6 +97,23 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run a local OpenAI/Anthropic-compatible proxy on port 31415.
+    Proxy {
+        #[arg(long, default_value_t = 31415)]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value = "gateway")]
+        mode: String,
+        #[arg(long)]
+        tt_api_key: Option<String>,
+        #[arg(long)]
+        no_tui: bool,
+        #[arg(long)]
+        no_preview: bool,
+        #[arg(long)]
+        session_log: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -267,6 +284,42 @@ async fn main() -> anyhow::Result<()> {
                 "Done. {} written, {} skipped.",
                 report.files_written, report.files_skipped
             );
+        }
+        Command::Proxy {
+            port,
+            bind,
+            mode,
+            tt_api_key,
+            no_tui,
+            no_preview,
+            session_log,
+        } => {
+            use tt_cli::proxy::{
+                config::{Config, Mode},
+                listener::run as run_listener,
+            };
+            let bind_addr: std::net::IpAddr =
+                bind.parse().context("invalid --bind address")?;
+            let mode = Mode::parse(&mode).context("invalid --mode (gateway|bypass|hybrid)")?;
+            let api_key = tt_api_key.or_else(|| std::env::var("TT_API_KEY").ok());
+            if mode == Mode::Gateway && api_key.is_none() {
+                anyhow::bail!("--mode gateway requires --tt-api-key or TT_API_KEY env");
+            }
+            let cfg = Config::build(
+                port,
+                bind_addr,
+                mode,
+                api_key,
+                no_tui,
+                no_preview,
+                session_log.map(std::path::PathBuf::from),
+            );
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("tokio runtime")?
+                .block_on(run_listener(cfg))
+                .context("tt proxy listener")?;
         }
     }
     Ok(())

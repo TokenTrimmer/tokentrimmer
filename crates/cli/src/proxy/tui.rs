@@ -22,8 +22,8 @@ pub fn print_summary(r: &Rollup, log_path: &Path) {
         "",
         w = 27usize.saturating_sub(format!("{} ({:.0}%)", r.cache_hits, hit_rate).len())
     );
-    eprintln!("│  Cache savings:      ${:<27.4}│", cache_savings);
-    eprintln!("│  Suggested savings:  ${:<27.4}│", net_potential);
+    eprintln!("│  Cache savings:      ${cache_savings:<27.4}│");
+    eprintln!("│  Suggested savings:  ${net_potential:<27.4}│");
     eprintln!("│                                                    │");
     eprintln!(
         "│  Session log: {:<37}│",
