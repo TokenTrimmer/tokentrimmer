@@ -21,7 +21,7 @@ The second-most-important gap is **presentation**: the marketing site is a liter
 
 ## Implementation status — updated 2026-05-29
 
-Since this review was written, **28 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
+Since this review was written, **29 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
 
 **✅ Shipped this session**
 - _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
@@ -35,9 +35,10 @@ Since this review was written, **28 of its items have shipped** — all inline, 
 - _Layering:_ `compat-crate-split` — extracted `tt-provider-compat` (OpenAI-wire machinery); the 4 BYOK adapters no longer depend on the full OpenAI crate; config-aware registration (`TT_PROVIDERS` allowlist) + sorted `/v1/models`
 - _Accuracy:_ `token-estimator-shared` — new `tt-tokenize` crate (cached tiktoken + heuristic); preview and the live routing estimate share it, so route thresholds match what `/v1/preview` reports
 - _Recall:_ `hnsw-org-recall` — L2 lookups raise `hnsw.ef_search` (per-tx `SET LOCAL`, default 100) so org-filtered semantic search keeps high recall under multi-tenant load; 50-org recall + cross-tenant isolation regression tests
+- _Inspect:_ `inspect-new-rules` — 4 new cost/cache rules (19/19 P0): anthropic-tools-not-cached, output-n>1, reasoning-effort-default-high, dynamic-prefix-breaks-cache; each with ≥5/≥10 fixtures
 - _Ops:_ `cloud-repo-remote` — cloud monorepo baselined + pushed to private `TokenTrimmer/cloud`
 
-**◻ Remaining — public, doable:** `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
+**◻ Remaining — public, doable:** `inspect-ast-migration`, `inspect-corpora-seed`
 
 **◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `marketing-site-build`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore`, `cloud-backlog-sync`
 
@@ -290,7 +291,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 - [x] [P1] [inspect-5-missing-rules] ✅ **shipped `e168859`** — all 5 (`model-deprecated`, `prompt-bloated-system`, `prompt-verbose-few-shot`, `prompt-no-output-constraint`, `config-agents-md-too-long`) + fixtures; 15/15 P0 rules now ship.
 - [ ] [P1] [inspect-corpora-seed] rust-crate-builder: Vendor 5–10 pinned permissive OSS LLM samples into `corpora/` (independent of rule author), run `measure-fp-rate.sh`, record per-rule precision/recall. Unblocks the w24 FP gate. (est: ~$0.50)
 - [ ] [P2] [inspect-ast-migration] inspect-rule-author: Migrate the structural rules (cache_control/max_tokens/model-arg/loop-termination) from regex to the existing tree-sitter harness + a rule-level AST cache. (est: ~$1.20)
-- [ ] [P2] [inspect-new-rules] inspect-rule-author: `cache-anthropic-tools-not-cached`, `output-n-greater-than-one`, `model-reasoning-effort-default-high`, `prompt-dynamic-prefix-breaks-cache`. (est: ~$0.80)
+- [x] [P2] [inspect-new-rules] ✅ **shipped** — 4 new cost/cache rules (now **19/19** P0 rules): `cache-anthropic-tools-not-cached` (tools array with no `cache_control`), `output-n-greater-than-one` (`n`/`candidate_count` > 1 multiplies output cost), `model-reasoning-effort-default-high` (reasoning model with high/defaulted-high effort), `prompt-dynamic-prefix-breaks-cache` (timestamp/uuid/now() at the *start* of a system prompt invalidates prefix caching). Each ships with ≥5 should-detect + ≥10 should-not-detect fixtures; the fixture harness (counts, per-fixture detect/no-detect, id stability) is green.
 
 ### Architecture scalability — _public_
 - [x] [P1] [pricing-externalize] ✅ **shipped** — model *rates* moved out of Rust source into a versioned, embedded data file (`crates/shared/data/pricing.toml`, `include_str!`-loaded once into `tt_shared::pricing::PricingCatalog` via `OnceLock`). A rate refresh is now a data edit, not a release. Real `effective_at` per row + per-model price *history*: `catalog().latest(provider, model)` for live pricing, `catalog().at(provider, model, ts)` for historical replay. All 7 paid providers delegate to it (openai/anthropic/gemini via `pricing_for`; groq/mistral/openrouter/together via `pricing_table` → `latest_for_provider`); local stays zero. 32 models; each provider's existing `pricing_values_match_spec`/`pricing_table_correct_rates` test verifies the TOML transcription is exact. _Scope note:_ model **descriptors** (capabilities/limits) stay typed in Rust; `tt-plan-core` keeps its own `ModelPricing` (separate replay catalog) — externalizing that + a live refresh/Postgres path are follow-ups.

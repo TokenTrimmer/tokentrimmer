@@ -1,9 +1,10 @@
-//! The 15 P0 rules that ship at launch. See `docs/01-inspect-rule-catalog.md`.
+//! The 19 P0 rules that ship at launch. See `docs/01-inspect-rule-catalog.md`.
 
 pub mod rules;
 
 pub use rules::AgentNoTerminationConditionRule;
 pub use rules::CacheAnthropicPromptCacheMissingRule;
+pub use rules::CacheAnthropicToolsNotCachedRule;
 pub use rules::CacheOpenaiPromptCacheEligibleRule;
 pub use rules::ConfigAgentsMdContainsSecretsRule;
 pub use rules::ConfigAgentsMdTooLongRule;
@@ -13,8 +14,11 @@ pub use rules::LibAnthropicSdkNoCacheControlRule;
 pub use rules::ModelDeprecatedRule;
 pub use rules::ModelFlagshipForClassificationRule;
 pub use rules::ModelFlagshipForExtractionRule;
+pub use rules::ModelReasoningEffortDefaultHighRule;
+pub use rules::OutputNGreaterThanOneRule;
 pub use rules::OutputNoMaxTokensRule;
 pub use rules::PromptBloatedSystemRule;
+pub use rules::PromptDynamicPrefixBreaksCacheRule;
 pub use rules::PromptNoOutputConstraintRule;
 pub use rules::PromptVerboseFewShotRule;
 
@@ -41,6 +45,11 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(ConfigNoAgentsMdRule::new()),
         Box::new(ConfigAgentsMdContainsSecretsRule::new()),
         Box::new(ConfigAgentsMdTooLongRule::new()),
+        // Cost/cache rules added in inspect-new-rules.
+        Box::new(CacheAnthropicToolsNotCachedRule::new()),
+        Box::new(OutputNGreaterThanOneRule::new()),
+        Box::new(ModelReasoningEffortDefaultHighRule::new()),
+        Box::new(PromptDynamicPrefixBreaksCacheRule::new()),
     ]
 }
 
