@@ -25,7 +25,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 ## Week 0 follow-ups (not blocking, but worth doing)
 
 - [x] [P2] [w0-cargo-resolves] verify cargo workspace resolves once Rust 1.85 is installed locally.
-- [ ] [P1] [w0-fp-rate-script] write `scripts/measure-fp-rate.sh` for Inspect rule FP measurement (used by inspect-rule-author). Runs each rule against its `should-detect` / `should-not-detect` fixtures in `crates/inspect-rules-tier1/tests/rules/`, computes per-rule precision / recall / FP rate, exits non-zero if any rule >5%. Rules + fixtures all shipped — script is pure bash + jq. (est: $0.30)
+- [x] [P1] [w0-fp-rate-script] write `scripts/measure-fp-rate.sh` for Inspect rule FP measurement (used by inspect-rule-author). Runs each rule against its `should-detect` / `should-not-detect` fixtures in `crates/inspect-rules-tier1/tests/rules/`, computes per-rule precision / recall / FP rate, exits non-zero if any rule >5%. Rules + fixtures all shipped — script is pure bash + jq. (est: $0.30)
 - [ ] [P2] [w0-corpora-seed] add `corpora/` directory with small open-source LangChain/Vercel-AI samples for Inspect FP measurement. [BLOCKED — defer to Week 14 prep]
 - [x] [P3] [w0-pr-template] add `.github/pull_request_template.md` enforcing handoff format. _(done in this session)_
 - [x] [P3] [w0-issue-templates] add `.github/ISSUE_TEMPLATE/` for autopilot/bug/feature. _(done in this session)_
