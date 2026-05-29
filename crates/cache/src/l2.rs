@@ -249,14 +249,44 @@ impl L2Cache for InMemoryL2Cache {
 /// We use the un-macro `sqlx::query(...)` form throughout to avoid the
 /// compile-time `DATABASE_URL` requirement. This means type-checking of SQL
 /// happens at runtime rather than compile time.
+/// HNSW `ef_search` applied to org-filtered lookups.
+///
+/// pgvector's default is 40. With a `WHERE org_id = $1` filter, the HNSW graph
+/// walk explores neighbours by vector distance and only *then* discards rows
+/// that belong to other tenants — so under multi-tenant load the 40-candidate
+/// list fills with other orgs' near vectors and the querying org's own nearest
+/// neighbour can fall outside it, producing a false cache miss (poor recall).
+/// Raising `ef_search` widens the candidate list so the org's vectors reliably
+/// make the cut. 100 restores high recall at a small latency cost; tune via
+/// [`PostgresL2Cache::with_ef_search`].
+pub const DEFAULT_EF_SEARCH: i64 = 100;
+
 pub struct PostgresL2Cache {
     pool: sqlx::PgPool,
+    ef_search: i64,
 }
 
 impl PostgresL2Cache {
-    /// Wrap an existing connected pool.
+    /// Wrap an existing connected pool, using [`DEFAULT_EF_SEARCH`].
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            ef_search: DEFAULT_EF_SEARCH,
+        }
+    }
+
+    /// Builder-style override of the HNSW `ef_search` used per lookup. Clamped
+    /// to at least 1. Higher = better recall under multi-tenant load, slightly
+    /// more work per query.
+    #[must_use]
+    pub fn with_ef_search(mut self, ef_search: i64) -> Self {
+        self.ef_search = ef_search.max(1);
+        self
+    }
+
+    /// The HNSW `ef_search` this cache applies per lookup.
+    pub fn ef_search(&self) -> i64 {
+        self.ef_search
     }
 }
 
@@ -312,6 +342,17 @@ impl L2Cache for PostgresL2Cache {
     ) -> Result<Option<(CacheEntry, f32)>, CacheError> {
         let vec = pgvector::Vector::from(query_embedding.to_vec());
 
+        // Run inside a transaction so `SET LOCAL hnsw.ef_search` scopes to this
+        // query only. The raised ef_search keeps recall high once the org
+        // filter discards other tenants' candidates (see [`DEFAULT_EF_SEARCH`]).
+        // `SET` does not accept bind parameters, so the value is formatted in —
+        // it is an `i64` we own (never user input), so this is injection-safe.
+        let mut tx = self.pool.begin().await.map_err(CacheError::Sqlx)?;
+        sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", self.ef_search))
+            .execute(&mut *tx)
+            .await
+            .map_err(CacheError::Sqlx)?;
+
         let row = sqlx::query(
             r#"
             SELECT id, org_id, embedding, response, model,
@@ -328,9 +369,11 @@ impl L2Cache for PostgresL2Cache {
         .bind(org_id)
         .bind(vec)
         .bind(threshold)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(CacheError::Sqlx)?;
+
+        tx.commit().await.map_err(CacheError::Sqlx)?;
 
         let Some(row) = row else {
             return Ok(None);
@@ -410,5 +453,92 @@ mod tests {
         let b = vec![1.0_f32, 0.0];
         assert_eq!(cosine(&a, &b), 0.0);
         assert_eq!(cosine(&b, &a), 0.0);
+    }
+
+    fn entry_at(id: Uuid, org_id: Uuid, embedding: Vec<f32>, now: DateTime<Utc>) -> CacheEntry {
+        CacheEntry {
+            id,
+            org_id,
+            embedding,
+            response: b"{}".to_vec(),
+            model: "gpt-4o".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            hit_count: 0,
+            created_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+        }
+    }
+
+    /// Recall regression under multi-tenant load: with N orgs each holding a
+    /// planted near-duplicate of the query (plus noise), every org's lookup
+    /// must recall ITS OWN planted entry — never another tenant's, even though
+    /// every org stores an identical match vector. This is the contract the
+    /// Postgres HNSW path must also uphold (which is why `PostgresL2Cache`
+    /// raises `hnsw.ef_search` so the org filter doesn't starve recall).
+    #[tokio::test]
+    async fn multi_tenant_recall_each_org_finds_its_own_match() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let query = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let noise = vec![0.0_f32, 1.0, 0.0, 0.0]; // orthogonal → sim 0
+
+        const N_ORGS: usize = 50;
+        let mut orgs = Vec::new();
+        let mut match_ids = Vec::new();
+        for _ in 0..N_ORGS {
+            let org = Uuid::new_v4();
+            let match_id = Uuid::new_v4();
+            // Planted near-duplicate of the query for this org.
+            cache
+                .insert(entry_at(match_id, org, query.clone(), now))
+                .await
+                .unwrap();
+            // Noise entries for the same org that must never out-rank the match.
+            for _ in 0..3 {
+                cache
+                    .insert(entry_at(Uuid::new_v4(), org, noise.clone(), now))
+                    .await
+                    .unwrap();
+            }
+            orgs.push(org);
+            match_ids.push(match_id);
+        }
+
+        for (k, org) in orgs.iter().enumerate() {
+            let (hit, sim) = cache
+                .lookup(*org, &query, 0.9)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("org {k} should recall its planted match"));
+            assert_eq!(hit.id, match_ids[k], "org {k} recalled the wrong entry");
+            assert_eq!(hit.org_id, *org, "lookup must never cross tenants");
+            assert!(sim > 0.99, "org {k} similarity too low: {sim}");
+        }
+    }
+
+    /// Tenant isolation: an org with NO matching entry must miss, even when a
+    /// different org holds a perfect match for the same vector.
+    #[tokio::test]
+    async fn lookup_does_not_leak_across_orgs() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let q = vec![1.0_f32, 0.0];
+        let org_with_match = Uuid::new_v4();
+        let org_without = Uuid::new_v4();
+        cache
+            .insert(entry_at(Uuid::new_v4(), org_with_match, q.clone(), now))
+            .await
+            .unwrap();
+
+        assert!(cache
+            .lookup(org_with_match, &q, 0.9)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            cache.lookup(org_without, &q, 0.9).await.unwrap().is_none(),
+            "an org must not see another org's cached entry"
+        );
     }
 }
