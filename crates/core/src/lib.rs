@@ -7,6 +7,7 @@ pub mod db;
 pub mod error;
 pub mod middleware;
 pub mod registry;
+pub mod retry;
 pub mod routes;
 pub mod server;
 pub mod state;
@@ -16,6 +17,7 @@ pub use db::{connect, migrate, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use middleware::retrieval::RetrievalState;
 pub use registry::ProviderRegistry;
+pub use retry::{with_retry, RetryPolicy};
 pub use server::{build_router, build_router_with_retrieval};
 pub use state::AppState;
 

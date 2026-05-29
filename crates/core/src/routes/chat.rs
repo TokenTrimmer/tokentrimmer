@@ -38,6 +38,7 @@ use tt_shared::{
 
 use crate::{
     middleware::trace::TraceId,
+    retry::{with_retry, RetryPolicy},
     routes::sse::{self, StreamLogContext},
     state::L2Config,
     ApiError, ApiResult, AppState,
@@ -258,7 +259,12 @@ pub async fn handler(
             budget: state.budget.clone(),
         });
 
-        let stream = provider.chat_completion_stream(req, &ctx).await?;
+        // Retry the initial stream establishment on transient errors (before
+        // any chunk is yielded); mid-stream errors are not retried.
+        let stream = with_retry(&RetryPolicy::default(), || {
+            provider.chat_completion_stream(req.clone(), &ctx)
+        })
+        .await?;
         Ok(sse::stream_response(stream, &provider, trace_id, log_ctx))
     } else {
         // 3a. L1 exact-match cache. Cheapest lookup — try first. Best-effort:
@@ -322,7 +328,10 @@ pub async fn handler(
         }
 
         // 3c. No cache hit — dispatch to provider.
-        let response = provider.chat_completion(req.clone(), &ctx).await?;
+        let response = with_retry(&RetryPolicy::default(), || {
+            provider.chat_completion(req.clone(), &ctx)
+        })
+        .await?;
 
         // 3d. Compute cost via provider pricing table BEFORE caching — the L1
         //     envelope carries baseline_cost_usd so hit responses can report
