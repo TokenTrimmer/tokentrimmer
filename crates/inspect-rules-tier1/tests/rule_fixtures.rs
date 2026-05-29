@@ -245,14 +245,14 @@ fn every_rule_has_min_fixtures_and_detects_correctly() {
     check_config_no_agents_md();
 }
 
-/// Verify `all_rules()` returns exactly 10 rules.
+/// Verify `all_rules()` returns exactly 15 rules.
 #[test]
-fn all_rules_count_is_10() {
+fn all_rules_count_is_15() {
     let rules = all_rules();
     assert_eq!(
         rules.len(),
-        10,
-        "all_rules() should return 10 rules, got {}",
+        15,
+        "all_rules() should return 15 rules, got {}",
         rules.len()
     );
 }
@@ -266,11 +266,16 @@ fn rule_ids_are_stable() {
         "lib-anthropic-sdk-no-cache-control",
         "model-flagship-for-classification",
         "model-flagship-for-extraction",
+        "model-deprecated",
         "output-no-max-tokens",
+        "prompt-no-output-constraint",
+        "prompt-bloated-system",
+        "prompt-verbose-few-shot",
         "conversation-unbounded-history",
         "agent-no-termination-condition",
         "config-no-agents-md",
         "config-agents-md-contains-secrets",
+        "config-agents-md-too-long",
     ];
     let rule_ids: Vec<&str> = all_rules().iter().map(|r| r.id()).collect();
     // Check all expected IDs are present.
