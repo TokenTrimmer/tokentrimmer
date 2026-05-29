@@ -49,7 +49,7 @@ impl BudgetLimits {
         Self {
             monthly_cap_usd: None,
             max_requests_per_min: Some(60),
-            monthly_request_cap: Some(5_000),
+            monthly_request_cap: Some(10_000),
         }
     }
 }
@@ -333,10 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn free_tier_shape_is_60_per_min_and_5000_per_month() {
+    fn free_tier_shape_is_60_per_min_and_10000_per_month() {
         let l = BudgetLimits::free_tier();
         assert_eq!(l.max_requests_per_min, Some(60));
-        assert_eq!(l.monthly_request_cap, Some(5_000));
+        assert_eq!(l.monthly_request_cap, Some(10_000));
         assert_eq!(l.monthly_cap_usd, None);
     }
 
