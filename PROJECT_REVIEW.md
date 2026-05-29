@@ -13,7 +13,7 @@ But there is **one systemic gap that strikes directly at the mission**, and it i
 > **TokenTrimmer delivers more savings than it can currently prove or show.**
 > Exact-cache savings are real and measured. Provider prompt-cache savings are real and measured for OpenAI. **Model-routing savings are real on the customer's provider bill but report as ~$0** because the baseline is priced against the cheaper routed-to model. The **L2 semantic cache is fully built and tested but never wired into any production gateway** (zero savings in prod). Anthropic prompt-cache savings are **mis-measured (non-stream) and zeroed (stream).**
 
-The second-most-important gap is **presentation**: the marketing site is a literal placeholder (`<h1>` + `<p>`), and the dashboard — while functionally rich — has **no design system** (empty token package, 16 pages of duplicated inline CSS, no brand, no dark mode). This is the largest distance between the product's premium ambition and what a prospect actually sees.
+The second-most-important gap is **presentation**. _Update (2026-05-29): the marketing site has since been built — a shared `Layout` plus landing / pricing / changelog / blog pages in `cloud/apps/web` — so the front door is no longer a placeholder._ The remaining gap is the **dashboard**, which — while functionally rich — still has **no design system** (empty token package, 16 pages of duplicated inline CSS, no brand, no dark mode), plus a little marketing polish (a live savings-proof widget and a dashboard preview). That is now the largest distance between the product's premium ambition and what a prospect actually sees.
 
 **Neither gap is hard to close.** The savings-measurement fixes are mostly small and surgical (the highest-leverage one is a few lines in `chat.rs`). The design uplift is well-scoped (tokens → shared Layout → marketing build). Closing both is the difference between "a good gateway" and "a product that visibly, provably saves money the moment you use it."
 
@@ -21,7 +21,9 @@ The second-most-important gap is **presentation**: the marketing site is a liter
 
 ## Implementation status — updated 2026-05-29
 
-Since this review was written, **31 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
+Since this review was written, **33 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
+
+> **Update — later 2026-05-29 (cloud-side session).** Two more review items shipped: **`marketing-site-build`** (`cloud/apps/web` now has a shared `Layout` + landing/pricing/changelog/blog; `astro check` 0/0/0, `astro build` emits 5 static pages) and **`cloud-backlog-sync`** (the cloud backlog is now 51 done / 15 open — the stale "open-but-shipped" items were flipped). Alongside those, several **cloud-only backlog** items (not original review findings, so not §6/§7 checkboxes) also landed: `post-team-rbac`, `post-enterprise-docker-compose` (self-host Compose bundle), `w21-typst-pdf` (monthly executive PDF), `w23` tier→budget caps, and **`w25-pro-tier-live` in TEST mode** (Stripe test prices minted + wired; live-mode flip deferred to the operator). The remaining review gap is the **dashboard** design system + a couple of marketing polish items.
 
 **✅ Shipped this session**
 - _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
@@ -42,7 +44,7 @@ Since this review was written, **31 of its items have shipped** — all inline, 
 
 **◻ Remaining — public, doable:** _none in this review's scope — all shipped._ Open backlog work is now CLOUD-repo or BLOCKED on external accounts/migrations. All review-scope follow-ups are shipped too; the only network-gated step left is *running* `scripts/vendor-corpora.sh` to populate `corpora/vendor/` with real OSS (the tooling + manifest are in place).
 
-**◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `marketing-site-build`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore`, `cloud-backlog-sync`
+**◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore` _(`marketing-site-build` + `cloud-backlog-sync` shipped 2026-05-29)_
 
 **◻ Remaining — human-gated:** `env-secret-split-rotate` (rotate the live keys read this session; prod secrets → `fly secrets`)
 
@@ -100,7 +102,7 @@ Until the fixes land, the defensible public claim is: **"15–30% measured savin
 | Inspect | **B−** | 10/15 rules ship, all regex (AST harness unused), FP gate on self-authored fixtures. |
 | Plan | **B+** | Excellent engine; cache-savings + latency projection + reconciliation are gaps. |
 | Value visualization | **C+** | Dashboard strong; **moment-of-use** (streaming headers, proxy banner) broken. |
-| Design & brand | **D** | Functional but no design system; marketing site is a placeholder. |
+| Design & brand | **D+** | Marketing site now built (landing/pricing/changelog/blog); dashboard still has no design system, brand, or dark mode. |
 | Onboarding & docs | **C+** | CLI self-documents; no unified guide; README quickstart is inaccurate. |
 | Security & crypto | **A−** | Strong core; ops hygiene (prod secrets on disk) + harness least-privilege to fix. |
 | Backlog hygiene | **B** | Public near-drained & honest; cloud backlog stale; one cheap unblock gates ~10 P0s. |
@@ -111,7 +113,7 @@ Until the fixes land, the defensible public claim is: **"15–30% measured savin
 
 If you do nothing else, do these, in this order. The first cluster makes the product **provably** save money; the second makes it **look** like the premium product it is; the third unblocks the launch chain.
 
-> **Status (2026-05-29):** clusters 1, 2 and 4 below are **done** — the savings-measurement fixes, moment-of-use surfacing, and the cloud-repo unblock all shipped (see the Implementation-status section above). The big remaining piece is cluster 3 (**design/marketing — cloud repo**), plus `wire-l2-cache-production` and `env-secret-split-rotate`.
+> **Status (2026-05-29):** clusters 1, 2 and 4 below are **done** — the savings-measurement fixes (incl. `wire-l2-cache-production`), moment-of-use surfacing, and the cloud-repo unblock all shipped (see the Implementation-status section above). In cluster 3, **`marketing-site-build` is now done**; the remaining piece is `design-system-foundation` (the **dashboard** token layer + shared shell). `env-secret-split-rotate` is still human-gated.
 
 1. **Prove the savings you already deliver** (small, surgical, highest ROI):
    - `fix-routing-baseline-savings` — price baseline against the *original* model. **(P0, S)**
@@ -122,8 +124,8 @@ If you do nothing else, do these, in this order. The first cluster makes the pro
    - `fix-proxy-savings-banner` — the Ctrl-C banner always prints `$0.0000`; wire the values already in scope. **(P1, S)**
    - `stream-cost-headers` — emit cost/saved on streaming responses (terminal SSE event). **(P1, M)**
 3. **Look premium:**
-   - `design-system-foundation` — tokens + shared Layout (kills 16× duplicated CSS). **(P0, L)**
-   - `marketing-site-build` — replace the placeholder front door. **(P0, L)**
+   - `design-system-foundation` — tokens + shared Layout for the **dashboard** (kills 16× duplicated CSS). **(P0, L)** — _still open._
+   - `marketing-site-build` — replace the placeholder front door. **(P0, L)** — _**done 2026-05-29** (`cloud/apps/web`: Layout + landing/pricing/changelog/blog). Remaining polish: live savings-proof widget + dashboard preview._
 4. **Unblock the launch chain (near-free):**
    - `cloud-repo-remote` — create the private GitHub repo + push; unblocks ~10 P0 launch gates in minutes. **(P0, S)**
    - `cloud-backlog-sync` — ~9 "open" cloud items are already shipped; flip them. **(P1, S)**
@@ -186,7 +188,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 
 ### 5.6 Design & brand (premium / luxury / modern bar)
 - **Strengths:** sound IA (Overview/Costs/Cache/Plan/Reports/Routes/Inspect/Audit/Settings); thoughtful empty/onboarding states; chart loading/error states; consistent numeric formatting; Astro+Solid+uPlot is the right premium-capable stack.
-- **[P0] Marketing site is a bare placeholder** — `apps/web/src/pages/index.astro` is `<h1>` + `<p>`, no CSS, no head, no nav/pricing/proof. The product's front door has no design. → Build a real site (hero + live savings proof, See/Plan/Optimize, dashboard preview, drop-in snippet, pricing, footer).
+- **[P0] Marketing site is a bare placeholder** — ✅ **RESOLVED 2026-05-29.** `cloud/apps/web` now has a shared `Layout` (nav, footer, brand mark, responsive CSS) and real pages: landing (hero + drop-in snippet + feature grid + CTA), pricing (Free/Pro/Team/Scale + FAQ), changelog, and a blog (index + launch post). `astro check` 0/0/0; `astro build` emits 5 static pages. _Remaining polish (not blocking): a live savings-proof widget, a dashboard-preview image, and migrating the site onto the shared design tokens once `design-system-foundation` lands (today it uses self-contained CSS)._
 - **[P0] No design system** — `packages/ui/src/styles.css` is one comment, `index.ts` is `export {}`, 16 pages duplicate inline CSS, `#06c` hardcoded 24×, no shared Layout. → Author real tokens (color/type/space/radius/shadow/z) + a shared `<Layout>`; migrate all pages.
 - **[P1] No brand identity** — no logo, favicon, or custom type; `system-ui` everywhere. → A wordmark+mark, favicon set, a typeface pairing (grotesk/geometric + mono for numerics), self-hosted woff2.
 - **[P1] No dark mode** — table stakes for a developer/cost tool; zero `prefers-color-scheme`/`data-theme`. → Light+dark token sets + a persisted toggle.
@@ -259,7 +261,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 
 **Backlog hygiene / unblocks**
 - [x] `cloud-repo-remote` **[P0/S]** ✅ — cloud baseline committed + pushed to private `TokenTrimmer/cloud`; unblocks the launch gates.
-- [ ] `cloud-backlog-sync` **[P1/S]** — flip ~9 already-shipped cloud items to `[x]`. **(cloud repo.)**
+- [x] `cloud-backlog-sync` **[P1/S]** ✅ — cloud backlog reconciled against disk (now 51 done / 15 open); the stale "open-but-shipped" items were flipped so the real launch gates stand out. **(cloud repo.)**
 - [x] `perms-least-privilege-cleanup` **[P1]** ✅ — `settings.local.json` tightened (§9).
 
 ---
@@ -270,7 +272,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 
 ### Design & brand (premium uplift) — _cloud repo_
 - [ ] [P0] [design-system-foundation] astro-page-builder: Real token layer in `packages/ui/src/styles.css` (color/type-scale/8px-space/radius/shadow/z) + shared `<Layout>`/`<DashboardShell>` owning `<head>`, fonts, favicon, nav; migrate all 16 dashboard pages off inline CSS. (est: ~$2.50)
-- [ ] [P0] [marketing-site-build] astro-page-builder: Build `apps/web` — hero + live savings proof, See/Plan/Optimize features, dashboard preview, drop-in snippet, pricing, social proof, footer; consume the new tokens. (est: ~$2.50)
+- [x] [P0] [marketing-site-build] ✅ **shipped 2026-05-29** — `cloud/apps/web` built out: shared `Layout` (nav/footer/brand mark, dependency-free responsive CSS) + landing (hero, drop-in code snippet, feature grid, CTA band), `pricing` (Free/Pro/Team/Scale from `tier.rs` + the Stripe catalog, with FAQ), `changelog`, and `blog` (index + launch post). Plus `docs/launch/launch-posts.md` (Show HN / Reddit / IH / PH drafts). `astro check` 0/0/0 (8 files); `astro build` emits 5 static pages. _Remaining (deferred, non-blocking): a live savings-proof widget, a dashboard-preview image/social-proof, and consuming the shared design tokens once `design-system-foundation` lands (the site currently ships self-contained CSS)._ (est: ~$2.50)
 - [ ] [P1] [brand-kit] astro-page-builder: Wordmark + mark (SVG), favicon/apple-touch set, typeface pairing (UI grotesk + numeric mono), self-hosted woff2; wire via Layout. (est: ~$1.00)
 - [ ] [P1] [dark-mode] astro-page-builder: Light+dark token sets on `[data-theme]` + persisted toggle; theme uPlot from tokens. (est: ~$0.80)
 - [ ] [P2] [chart-theming] astro-page-builder: Brand-themed uPlot (area fill, semantic green savings), compact currency axis, styled tooltips, skeleton loaders, shared Chart wrapper. (est: ~$0.80)
@@ -335,5 +337,5 @@ Independently re-verified against source before publishing (not taken on the rev
 - Anthropic stream: `stream.rs:549 cached_tokens: 0`, `:550 cache_creation_input_tokens: None`. **Confirmed.**
 - Proxy banner: `routes/anthropic.rs:63` + `routes/openai.rs:58` `suggested_savings_usd: None`; `session.rs:65` sums it; `tui.rs:13` reads it. **Confirmed always $0.**
 - `fee_multiplier`: zero consumers in `crates/core` or `crates/cli`; defined only in shared/providers/tests. **Confirmed no-op.**
-- Marketing placeholder: `cloud/apps/web/src/pages/index.astro` = `<h1>` + `<p>`, comment admits "placeholder to keep the build green." **Confirmed.**
+- Marketing placeholder: `cloud/apps/web/src/pages/index.astro` was `<h1>` + `<p>` ("placeholder to keep the build green"). **Confirmed at review time; since superseded** — `apps/web` was built out 2026-05-29 (Layout + landing/pricing/changelog/blog).
 - Cloud git remote: `git -C cloud remote -v` empty. **Confirmed.**
