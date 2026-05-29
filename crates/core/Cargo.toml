@@ -45,6 +45,9 @@ criterion.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
 serde_json.workspace = true
+httpmock.workspace = true
+tt-retrieval.workspace = true
+reqwest.workspace = true
 
 [[bench]]
 name = "streaming"

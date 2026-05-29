@@ -19,8 +19,21 @@ use tower_http::{
 use crate::{middleware, routes, AppState};
 
 /// Build the public router. Returns a fully composed `Router` ready to bind.
+///
+/// Retrieval middleware is activated when `TT_RETRIEVAL_STORE` and
+/// `TT_OPENAI_EMBED_KEY` are set in the process environment.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    build_router_with_retrieval(state, middleware::retrieval::build_retrieval_state())
+}
+
+/// Internal constructor that accepts an explicit (possibly `None`) retrieval
+/// state. Used in integration tests to inject a pre-built `RetrievalState`
+/// without relying on process-level env vars.
+pub fn build_router_with_retrieval(
+    state: AppState,
+    retrieval: Option<middleware::retrieval::RetrievalState>,
+) -> Router {
+    let base = Router::new()
         .route("/health", get(routes::health::handler))
         .route("/v1/models", get(routes::models::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
@@ -28,24 +41,35 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/preview",
             axum::routing::post(crate::routes::preview::post_preview),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::auth::middleware,
-        ))
-        .layer(axum::middleware::from_fn(middleware::trace::middleware))
-        .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(600),
-        ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .with_state(state)
+        );
+
+    let base = match retrieval {
+        Some(rs) => base.layer(axum::middleware::from_fn_with_state(
+            rs,
+            middleware::retrieval::maybe_substitute,
+        )),
+        None => base.layer(axum::middleware::from_fn(
+            middleware::retrieval::maybe_substitute_disabled,
+        )),
+    };
+
+    base.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        middleware::auth::middleware,
+    ))
+    .layer(axum::middleware::from_fn(middleware::trace::middleware))
+    .layer(TraceLayer::new_for_http())
+    .layer(TimeoutLayer::with_status_code(
+        StatusCode::GATEWAY_TIMEOUT,
+        std::time::Duration::from_secs(600),
+    ))
+    .layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+    .with_state(state)
 }
 
 #[cfg(test)]
@@ -208,19 +232,19 @@ mod tests {
 
     /// Empty-registry app for tests that don't care about providers.
     fn app() -> Router {
-        build_router(AppState::new(ProviderRegistry::new()))
+        build_router_with_retrieval(AppState::new(ProviderRegistry::new()), None)
     }
 
     /// Default-providers app for tests that exercise the model catalog.
     fn app_with_defaults() -> Router {
-        build_router(AppState::with_default_providers())
+        build_router_with_retrieval(AppState::with_default_providers(), None)
     }
 
     /// App pre-wired with `MockProvider`.
     fn app_with_mock() -> Router {
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(MockProvider));
-        build_router(AppState::new(registry))
+        build_router_with_retrieval(AppState::new(registry), None)
     }
 
     fn chat_request(model: &str, stream: bool) -> Request<Body> {

@@ -12,6 +12,7 @@ pub mod state;
 
 pub use db::{connect, migrate, MIGRATOR};
 pub use error::{ApiError, ApiResult};
+pub use middleware::retrieval::RetrievalState;
 pub use registry::ProviderRegistry;
-pub use server::build_router;
+pub use server::{build_router, build_router_with_retrieval};
 pub use state::AppState;
