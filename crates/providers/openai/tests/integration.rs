@@ -340,12 +340,18 @@ async fn error_400_invalid_request() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Streaming for reasoning models returns Unsupported (no HTTP call)
+// 9. Streaming for reasoning models is supported (o3 / o4-mini)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn streaming_reasoning_models_unsupported() {
+async fn streaming_reasoning_models_supported() {
     let server = MockServer::start();
+    let _mock = server.mock(|when, then| {
+        when.method(POST).path("/chat/completions");
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body("data: [DONE]\n\n");
+    });
     let ctx = make_ctx(&server.base_url());
 
     for model in ["o3", "o4-mini"] {
@@ -354,11 +360,11 @@ async fn streaming_reasoning_models_unsupported() {
 
         let result = provider().chat_completion_stream(req, &ctx).await;
 
-        assert!(result.is_err(), "model {model} should return Unsupported");
-        match result.err().expect("error") {
-            ProviderError::Unsupported(_) => {}
-            other => panic!("model {model}: expected Unsupported, got {other:?}"),
-        }
+        assert!(
+            result.is_ok(),
+            "model {model} should now stream, got {:?}",
+            result.err()
+        );
     }
 }
 

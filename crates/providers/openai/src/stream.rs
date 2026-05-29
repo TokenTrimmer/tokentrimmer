@@ -57,12 +57,10 @@ pub type ChunkStream =
 
 /// Build and execute a streaming chat completion request.
 ///
-/// Returns `Err` immediately (before any HTTP call) if:
-/// - `req.model` is a reasoning model (`o3`, `o4-mini`), which OpenAI does not
-///   support for streaming.
-///
 /// Returns `Err` after the HTTP call (but before yielding any chunk) if the
-/// response status is ≥ 400.
+/// response status is ≥ 400. Reasoning models (`o3`, `o4-mini`) stream like any
+/// other model; `translate_request` handles their parameter quirks
+/// (max_completion_tokens rename, temperature drop).
 ///
 /// On success, returns a `BoxStream` that yields deserialized
 /// [`ChatCompletionChunk`] values. Mid-stream errors (network drops, malformed
@@ -73,13 +71,6 @@ pub async fn stream_chat_completion(
     req: ChatCompletionRequest,
     ctx: &RequestContext,
 ) -> Result<ChunkStream, ProviderError> {
-    // Reasoning models do not support streaming.
-    if crate::pricing::is_reasoning_model(&req.model) {
-        return Err(ProviderError::Unsupported(
-            "streaming is not supported for OpenAI reasoning models (o3, o4-mini)".to_string(),
-        ));
-    }
-
     let url = format!("{base_url}/chat/completions");
     let api_key = ctx.credentials.api_key.expose().to_string();
     let extra_headers: Vec<(String, String)> = ctx.credentials.extra_headers.clone();

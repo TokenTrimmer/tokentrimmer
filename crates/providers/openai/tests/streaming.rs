@@ -444,32 +444,38 @@ async fn stream_tool_call_delta() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: Reasoning model rejected without HTTP call
+// Test 8: Reasoning models (o3 / o4-mini) stream like any other model
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn stream_reasoning_model_rejected() {
+async fn stream_reasoning_models_supported() {
+    // o3 / o4-mini DO support streaming via the chat-completions API — the
+    // adapter must no longer short-circuit them with Unsupported.
     let server = MockServer::start();
-
-    // No HTTP mock registered — if the adapter makes a call, the test will
-    // panic (httpmock panics on unregistered requests when assertions run).
+    let body = format!(
+        "{}{}{}data: [DONE]\n\n",
+        role_chunk_event("chatcmpl-o3"),
+        chunk_event("chatcmpl-o3", "Hi", Some("stop")),
+        usage_chunk_event("chatcmpl-o3"),
+    );
+    let _mock = server.mock(|when, then| {
+        when.method(POST).path("/chat/completions");
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body(&body);
+    });
     let ctx = make_ctx(&server.base_url());
 
     for model in ["o3", "o4-mini"] {
-        let result = provider()
+        let stream = provider()
             .chat_completion_stream(stream_request(model), &ctx)
-            .await;
-
-        assert!(result.is_err(), "model {model} should be rejected");
-        match result.err().expect("error") {
-            ProviderError::Unsupported(msg) => {
-                assert!(
-                    msg.contains("reasoning"),
-                    "error should mention reasoning models, got: {msg}"
-                );
-            }
-            other => panic!("model {model}: expected Unsupported, got {other:?}"),
-        }
+            .await
+            .unwrap_or_else(|e| panic!("model {model} should stream, got {e:?}"));
+        let chunks: Vec<_> = stream.collect().await;
+        assert!(
+            chunks.iter().any(std::result::Result::is_ok),
+            "model {model} should yield at least one chunk"
+        );
     }
 }
 
