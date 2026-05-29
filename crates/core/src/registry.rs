@@ -27,7 +27,8 @@ impl ProviderRegistry {
     pub fn register(&mut self, provider: Arc<dyn Provider>) {
         let id = provider.id();
         for model in provider.models() {
-            self.by_model.insert(model.id.clone(), Arc::clone(&provider));
+            self.by_model
+                .insert(model.id.clone(), Arc::clone(&provider));
         }
         self.by_id.insert(id, provider);
     }

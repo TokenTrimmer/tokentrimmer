@@ -67,6 +67,16 @@ Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 | Adjusting merge strategy for an existing file | `crates/cli/src/init/merge.rs` |
 | Spec | `docs/superpowers/specs/2026-05-28-trackD-tt-init-installer-design.md` |
 
+### Cost preview
+
+| If you're doing | Read |
+|---|---|
+| Adding a model to pricing | the provider crate's `pricing.rs` (NOT `tt-preview`) |
+| Adjusting cache-hit defaults | `crates/preview/src/cache_projection.rs::DEFAULT_*` |
+| Adding a task class | `crates/preview/src/classifier.rs` |
+| API reference | `docs/04-cost-preview-api-reference.md` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackC-cost-preview-api-design.md` |
+
 ---
 
 ## Cross-cutting concerns

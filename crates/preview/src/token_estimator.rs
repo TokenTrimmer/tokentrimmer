@@ -19,16 +19,21 @@ pub fn estimate(
 ) -> EstimateResult {
     let text = concat_message_text(messages);
     let (input, confidence) = match provider {
-        "openai" | "anthropic" => {
-            match tiktoken_rs::cl100k_base() {
-                Ok(bpe) => (bpe.encode_with_special_tokens(&text).len() as u32, EstimationConfidence::High),
-                Err(_) => (char_count_estimate(&text), EstimationConfidence::Low),
-            }
-        }
+        "openai" | "anthropic" => match tiktoken_rs::cl100k_base() {
+            Ok(bpe) => (
+                bpe.encode_with_special_tokens(&text).len() as u32,
+                EstimationConfidence::High,
+            ),
+            Err(_) => (char_count_estimate(&text), EstimationConfidence::Low),
+        },
         _ => (char_count_estimate(&text), EstimationConfidence::Medium),
     };
     let output = max_tokens_hint.unwrap_or(512).min(4096);
-    EstimateResult { input_tokens: input, output_tokens: output, confidence }
+    EstimateResult {
+        input_tokens: input,
+        output_tokens: output,
+        confidence,
+    }
 }
 
 fn concat_message_text(messages: &[Message]) -> String {
@@ -59,7 +64,10 @@ mod tests {
     use serde_json::json;
 
     fn user(text: &str) -> Message {
-        Message { role: "user".into(), content: json!(text) }
+        Message {
+            role: "user".into(),
+            content: json!(text),
+        }
     }
 
     #[test]

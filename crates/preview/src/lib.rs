@@ -12,8 +12,8 @@ pub mod types;
 
 pub use error::PreviewError;
 pub use types::{
-    CacheProjections, CurrentEstimate, EstimationConfidence, PreviewRequest,
-    PreviewResponse, QualityRiskBand, RouteSuggestion, Suggestion,
+    CacheProjections, CurrentEstimate, EstimationConfidence, PreviewRequest, PreviewResponse,
+    QualityRiskBand, RouteSuggestion, Suggestion,
 };
 
 use uuid::Uuid;
@@ -38,7 +38,11 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
     );
 
     let suggestions = route_suggestions::suggest(
-        &req.model, cost, est.input_tokens, est.output_tokens, task_class,
+        &req.model,
+        cost,
+        est.input_tokens,
+        est.output_tokens,
+        task_class,
     );
     if suggestions.is_empty() && !matches!(task_class, classifier::TaskClass::Agent) {
         warnings.push(format!(

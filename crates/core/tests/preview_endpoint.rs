@@ -26,7 +26,12 @@ async fn preview_returns_shape_for_known_model() {
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["current"]["model"], "claude-haiku-4-5");
     assert!(value["current"]["cost_usd"].as_f64().unwrap() > 0.0);
-    assert!(value["cache_projections"]["weighted_savings_usd"].as_f64().unwrap() >= 0.0);
+    assert!(
+        value["cache_projections"]["weighted_savings_usd"]
+            .as_f64()
+            .unwrap()
+            >= 0.0
+    );
 }
 
 #[tokio::test]

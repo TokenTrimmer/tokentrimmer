@@ -11,24 +11,10 @@ use crate::types::{QualityRiskBand, RouteSuggestion};
 /// Candidate cheaper models per task class. Ordered by preference.
 fn candidates_for(class: TaskClass) -> &'static [&'static str] {
     match class {
-        TaskClass::Classification => &[
-            "claude-haiku-4-5",
-            "gpt-4o-mini",
-            "gemini-2-5-flash-lite",
-        ],
-        TaskClass::Extraction => &[
-            "claude-haiku-4-5",
-            "gpt-4o-mini",
-            "gemini-2-5-flash",
-        ],
-        TaskClass::Chat => &[
-            "claude-haiku-4-5",
-            "gpt-4o-mini",
-        ],
-        TaskClass::Code => &[
-            "claude-haiku-4-5",
-            "gpt-4o-mini",
-        ],
+        TaskClass::Classification => &["claude-haiku-4-5", "gpt-4o-mini", "gemini-2-5-flash-lite"],
+        TaskClass::Extraction => &["claude-haiku-4-5", "gpt-4o-mini", "gemini-2-5-flash"],
+        TaskClass::Chat => &["claude-haiku-4-5", "gpt-4o-mini"],
+        TaskClass::Code => &["claude-haiku-4-5", "gpt-4o-mini"],
         TaskClass::Agent => &[],
     }
 }
@@ -42,10 +28,16 @@ pub fn suggest(
 ) -> Vec<RouteSuggestion> {
     let mut out = Vec::new();
     for &candidate in candidates_for(task_class) {
-        if candidate == current_model { continue; }
-        let Ok(hit) = crate::pricing::lookup(candidate) else { continue; };
+        if candidate == current_model {
+            continue;
+        }
+        let Ok(hit) = crate::pricing::lookup(candidate) else {
+            continue;
+        };
         let cost = cost_usd(input_tokens, output_tokens, &hit);
-        if cost >= current_cost_usd { continue; }
+        if cost >= current_cost_usd {
+            continue;
+        }
         out.push(RouteSuggestion {
             route: format!("swap-to-{candidate}"),
             model: candidate.into(),
@@ -60,7 +52,9 @@ pub fn suggest(
             ),
             applicable: true,
         });
-        if out.len() >= 3 { break; }
+        if out.len() >= 3 {
+            break;
+        }
     }
     out
 }
@@ -77,7 +71,13 @@ mod tests {
 
     #[test]
     fn excludes_current_model() {
-        let v = suggest("claude-haiku-4-5", 0.001, 100, 100, TaskClass::Classification);
+        let v = suggest(
+            "claude-haiku-4-5",
+            0.001,
+            100,
+            100,
+            TaskClass::Classification,
+        );
         assert!(!v.iter().any(|s| s.model == "claude-haiku-4-5"));
     }
 

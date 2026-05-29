@@ -16,7 +16,9 @@ pub enum PreviewError {
 impl PreviewError {
     pub fn as_warning(&self) -> String {
         match self {
-            Self::UnknownModel(m) => format!("model {m} not in pricing table; falling back to heuristic"),
+            Self::UnknownModel(m) => {
+                format!("model {m} not in pricing table; falling back to heuristic")
+            }
             Self::Malformed(s) => format!("malformed input: {s}"),
             Self::Tokenizer(s) => format!("tokenizer failed: {s} — using char-count heuristic"),
         }

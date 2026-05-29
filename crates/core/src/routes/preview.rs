@@ -13,9 +13,11 @@ pub async fn post_preview(
     State(_state): State<AppState>,
     Json(req): Json<PreviewRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let resp = tt_preview::preview(&req).map_err(|e| (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": e.to_string() })),
-    ))?;
+    let resp = tt_preview::preview(&req).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
     Ok(Json(serde_json::to_value(resp).unwrap()))
 }

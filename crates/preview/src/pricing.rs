@@ -53,7 +53,11 @@ mod tests {
 
     #[test]
     fn cost_math_basics() {
-        let hit = LookupHit { provider: "x", input_per_m: 3.0, output_per_m: 15.0 };
+        let hit = LookupHit {
+            provider: "x",
+            input_per_m: 3.0,
+            output_per_m: 15.0,
+        };
         // 1000 in @ $3/M = $0.003; 100 out @ $15/M = $0.0015 → total $0.0045
         let c = cost_usd(1000, 100, &hit);
         assert!((c - 0.0045).abs() < 1e-9, "cost = {c}");
