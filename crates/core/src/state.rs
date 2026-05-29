@@ -12,6 +12,7 @@ use tt_routing::CachingRoutingStore;
 use tt_telemetry::request_logs::RequestLogWriter;
 
 use crate::budget::BudgetEnforcer;
+use crate::failover::CircuitBreaker;
 use crate::registry::{register_default_providers, ProviderRegistry};
 
 /// Default L2 cosine-similarity threshold per ADR-008 / spec §4.4.
@@ -74,6 +75,12 @@ pub struct AppState {
     /// checks it pre-flight (429 on deny) and the chat handler records realized
     /// spend. `None` disables budget enforcement (tests, dev, unmetered orgs).
     pub budget: Option<Arc<dyn BudgetEnforcer>>,
+    /// Per-provider circuit breaker shared across requests. Used by the chat
+    /// handler when a matched route declares `fallbacks`: a provider that
+    /// trips the breaker is skipped during failover until its cooldown
+    /// elapses. Always present (default thresholds); failover is a no-op when
+    /// no route declares fallbacks.
+    pub breaker: Arc<CircuitBreaker>,
 }
 
 impl AppState {
@@ -91,6 +98,7 @@ impl AppState {
             routing_store: None,
             dogfood_enabled: false,
             budget: None,
+            breaker: Arc::new(CircuitBreaker::default()),
         }
     }
 

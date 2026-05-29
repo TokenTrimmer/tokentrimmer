@@ -21,18 +21,18 @@ The second-most-important gap is **presentation**: the marketing site is a liter
 
 ## Implementation status — updated 2026-05-29
 
-Since this review was written, **22 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, and the L2 cache + retry resilience are live.
+Since this review was written, **23 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, and the L2 cache + retry/failover resilience are live.
 
 **✅ Shipped this session**
 - _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
-- _Gateway:_ `registry-model-passthrough` (unlisted models dispatch, no 404), `streaming-client-timeout` (read-idle), `openai-reasoning-stream-unblock`, `retry-fallback-layer` (bounded retry/backoff on transient 429/5xx), `wire-l2-cache-production` (L2 semantic cache live behind `TT_L2_SEMANTIC_CACHE=1`)
+- _Gateway:_ `registry-model-passthrough` (unlisted models dispatch, no 404), `streaming-client-timeout` (read-idle), `openai-reasoning-stream-unblock`, `retry-fallback-layer` (bounded retry/backoff on transient 429/5xx), `wire-l2-cache-production` (L2 semantic cache live behind `TT_L2_SEMANTIC_CACHE=1`), `provider-failover` (per-provider circuit breaker + ordered fallback chain on a route's `fallbacks`; non-stream dispatch fails over on 5xx/timeout)
 - _Moment-of-use:_ `fix-proxy-savings-banner`, `stream-cost-headers` (terminal `tokentrimmer.usage` event), `live-cli-savings-ticker`
 - _Headline feature:_ **`budget-caps-quota`** — per-org monthly spend cap + per-minute rate, enforced in auth middleware → 429 + `X-TT-Budget-Remaining-Usd`
 - _Inspect / quality:_ `inspect-5-missing-rules` (15/15 P0 rules now ship), `preview-pricing-all-providers`, `retrieval-orgid-isolation`
 - _Docs / hygiene:_ `getting-started-guide` (`GETTING_STARTED.md`), `docs-readme-quickstart-fix`, `kdf-doc-align`, `workspace-lints-align`, `perms-least-privilege-cleanup`, `.gitignore` hardening
 - _Ops:_ `cloud-repo-remote` — cloud monorepo baselined + pushed to private `TokenTrimmer/cloud`
 
-**◻ Remaining — public, doable:** `pricing-externalize` (P1), `provider-failover`, `cost-diff-ci-lint`, `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
+**◻ Remaining — public, doable:** `pricing-externalize` (P1), `cost-diff-ci-lint`, `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
 
 **◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `marketing-site-build`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore`, `cloud-backlog-sync`
 
@@ -230,7 +230,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 
 **Gateway correctness / resilience**
 - [x] `registry-model-passthrough` **[P0/M]** ✅ — `registry.resolve()` falls back to `infer_provider → by_id` (`9317b76`).
-- [x] `retry-fallback-layer` **[P1/M]** ✅ — bounded retry/backoff on transient errors (honors `retry_after_ms`), wired into non-stream + initial-stream dispatch (`691a055`). Alternate-provider fallback chain → `provider-failover`.
+- [x] `retry-fallback-layer` **[P1/M]** ✅ — bounded retry/backoff on transient errors (honors `retry_after_ms`), wired into non-stream + initial-stream dispatch (`691a055`). Alternate-provider fallback chain shipped in `provider-failover` (below).
 - [x] `streaming-client-timeout` **[P1/S]** ✅ — read-idle timeout so long streams aren't cut at 120s (`05e048e`).
 - [x] `openai-reasoning-stream-unblock` **[P3/S]** ✅ — o3/o4-mini stream; `Streaming` capability added (`a60f1ff`).
 
@@ -271,7 +271,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 
 ### Cost-layer capabilities (the mission) — _public + cloud_
 - [x] [P1] [budget-caps-quota] ✅ **shipped `afc7f68`** — `BudgetEnforcer` trait + `InMemoryBudgetEnforcer` in tt-core; per-org monthly cap + per-minute rate; auth middleware → 429 + `X-TT-Budget-Remaining-Usd` + `Retry-After`; record in chat handler + SSE guard. Postgres-backed limits remain a cloud follow-up.
-- [ ] [P2] [provider-failover] rust-crate-builder: Ordered fallback chain + per-provider circuit breaker in `crates/routing` (primary → fallback on 429/5xx). Turns "cost layer" into "cost + reliability layer." (est: ~$1.20)
+- [x] [P2] [provider-failover] ✅ **shipped** — ordered fallback chain + per-provider circuit breaker. `RouteAction.fallbacks: Vec<String>` (serde-default, cloud-populated) drives `dispatch_with_failover` in `tt-core::failover`: tries `[primary, …fallbacks]`, skips providers whose `CircuitBreaker` is open (5 consecutive failures → 30s cooldown), fails over on fallback-eligible errors (5xx/timeout/model-not-found), short-circuits on non-eligible (bad request). Non-stream dispatch only; the serving provider is rebound so cost/headers/telemetry attribute correctly. 5 unit + 2 integration tests. Turns "cost layer" into "cost + reliability layer."
 - [ ] [P2] [alert-dispatcher-slack] rust-crate-builder: Outbound webhook + Slack sink firing on budget thresholds (50/80/100%), `anomaly.detected`, reconciliation drift >2%. Reuses existing signals. (est: ~$0.80)
 - [ ] [P2] [cost-diff-ci-lint] rust-crate-builder: `tt inspect --cost-diff` (or extend the GitHub Action) estimating projected per-call cost change of a PR's LLM-call edits, posted as a check-run. Reuses `crates/preview`; no cloud dep. A sticky surface no competitor occupies. (est: ~$1.00)
 - [ ] [P3] [finops-export] rust-crate-builder: FOCUS-aligned export format on the existing export endpoint for Cloudability/Vantage ingestion. (est: ~$0.50)

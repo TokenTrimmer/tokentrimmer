@@ -65,12 +65,19 @@ pub struct RouteConditions {
 }
 
 /// What a matching [`Route`] does to the request before dispatch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteAction {
     /// Rewrite to this model on the same provider as the request (v1 is
     /// same-provider only — see ADR-007 / Plan design for the cross-provider
     /// constraint).
     pub target_model: String,
+    /// Ordered fallback model ids, tried in order when the primary dispatch
+    /// fails with a fallback-eligible error (provider down / 5xx / timeout).
+    /// Empty = no failover. The gateway resolves each via the registry, so a
+    /// fallback may cross providers. Populated by the cloud routes schema;
+    /// `#[serde(default)]` keeps older rows / payloads compatible.
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
 }
 
 /// Rule engine. Hold routes sorted by descending priority; iterate to find
@@ -173,6 +180,7 @@ mod tests {
             },
             then: RouteAction {
                 target_model: target.into(),
+                fallbacks: Vec::new(),
             },
         }
     }

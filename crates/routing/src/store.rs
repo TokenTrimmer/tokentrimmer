@@ -170,6 +170,7 @@ mod tests {
             when: RouteConditions::default(),
             then: RouteAction {
                 target_model: target.into(),
+                fallbacks: Vec::new(),
             },
         }
     }

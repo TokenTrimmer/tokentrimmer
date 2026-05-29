@@ -5,6 +5,7 @@
 pub mod budget;
 pub mod db;
 pub mod error;
+pub mod failover;
 pub mod middleware;
 pub mod registry;
 pub mod retry;
@@ -15,6 +16,7 @@ pub mod state;
 pub use budget::{BudgetDecision, BudgetEnforcer, BudgetLimits, InMemoryBudgetEnforcer};
 pub use db::{connect, migrate, MIGRATOR};
 pub use error::{ApiError, ApiResult};
+pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use middleware::retrieval::RetrievalState;
 pub use registry::ProviderRegistry;
 pub use retry::{with_retry, RetryPolicy};

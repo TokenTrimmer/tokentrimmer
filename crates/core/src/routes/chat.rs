@@ -149,7 +149,10 @@ pub async fn handler(
     // of collapsing to ~0 (which happens when baseline is priced against the
     // cheap routed-to model).
     let requested_pricing = provider.pricing(&req.model);
-    let matched_route_id = apply_routing(&state, &ctx, &mut req).await;
+    let route_match = apply_routing(&state, &ctx, &mut req).await;
+    let matched_route_id = route_match.as_ref().map(|m| m.route_id);
+    // Ordered fallback model ids from the matched route (empty = no failover).
+    let route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
     if matched_route_id.is_some() {
         // Provider may have changed if the rewrite crossed providers (v1
         // routes are same-provider, but the registry is the source of truth).
@@ -327,11 +330,33 @@ pub async fn handler(
             }
         }
 
-        // 3c. No cache hit — dispatch to provider.
-        let response = with_retry(&RetryPolicy::default(), || {
-            provider.chat_completion(req.clone(), &ctx)
-        })
-        .await?;
+        // 3c. No cache hit — dispatch to provider. When the matched route
+        //     declared fallbacks, fail over across the candidate chain
+        //     (primary first, then each fallback) skipping providers whose
+        //     circuit breaker is open; otherwise dispatch the single provider
+        //     with retry. `provider` is rebound to whichever provider actually
+        //     served the request so cost/headers/telemetry below reflect it.
+        let (provider, response) = if route_fallbacks.is_empty() {
+            let resp = with_retry(&RetryPolicy::default(), || {
+                provider.chat_completion(req.clone(), &ctx)
+            })
+            .await?;
+            (provider, resp)
+        } else {
+            let candidates: Vec<String> = std::iter::once(req.model.clone())
+                .chain(route_fallbacks.iter().cloned())
+                .collect();
+            crate::failover::dispatch_with_failover(
+                &state.registry,
+                &state.breaker,
+                &RetryPolicy::default(),
+                &candidates,
+                &req,
+                &ctx,
+                Utc::now(),
+            )
+            .await?
+        };
 
         // 3d. Compute cost via provider pricing table BEFORE caching — the L1
         //     envelope carries baseline_cost_usd so hit responses can report
@@ -724,42 +749,6 @@ fn compute_cost(
     )
 }
 
-#[cfg(test)]
-mod fee_tests {
-    use super::*;
-
-    fn flat_pricing() -> ModelPricing {
-        ModelPricing {
-            input_per_million: 1.0,
-            output_per_million: 2.0,
-            cached_input_per_million: None,
-            effective_at: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn fee_multiplier_scales_cost_and_baseline() {
-        let usage = Usage {
-            prompt_tokens: 1_000_000,
-            completion_tokens: 0,
-            total_tokens: 1_000_000,
-            cached_tokens: 0,
-            cache_creation_input_tokens: None,
-        };
-        let p = flat_pricing();
-        let (cost, base) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
-        let (cost_fee, base_fee) = compute_cost(&usage, Some(&p), Some(&p), 1.05);
-        // 1M input @ $1/M = $1.00 with no fee.
-        assert!((cost - 1.0).abs() < 1e-9, "cost = {cost}");
-        // OpenRouter's 5% BYOK fee scales cost and baseline by 1.05.
-        assert!((cost_fee - 1.05).abs() < 1e-9, "cost_fee = {cost_fee}");
-        assert!(
-            (base_fee - base * 1.05).abs() < 1e-12,
-            "base_fee = {base_fee}"
-        );
-    }
-}
-
 /// Insert all six required `X-TokenTrimmer-*` response headers.
 fn attach_cost_headers(
     headers: &mut axum::http::HeaderMap,
@@ -920,10 +909,20 @@ fn clamp_latency_ms(started: Instant) -> i32 {
     started.elapsed().as_millis().min(i32::MAX as u128) as i32
 }
 
+/// Outcome of evaluating the routing engine against a request: the matched
+/// route's id (for `request_logs.route_id` attribution) plus its ordered
+/// fallback model ids (for failover dispatch). Empty `fallbacks` = the route
+/// declared no failover targets.
+struct RouteMatch {
+    route_id: Uuid,
+    fallbacks: Vec<String>,
+}
+
 /// Look up the org's routing engine (cached ~60s) and evaluate it against
 /// the incoming request. On a match, rewrites `req.model` in place and
-/// returns the matched route id so callers can stamp it on the request_logs
-/// row. Returns `None` (and does not modify `req`) when:
+/// returns the matched route (id + fallbacks) so callers can stamp the id on
+/// the request_logs row and fail over across the fallback chain. Returns
+/// `None` (and does not modify `req`) when:
 ///
 /// - no routing store is configured (dev / free tier),
 /// - the request has no resolvable org (synthetic context),
@@ -933,7 +932,7 @@ async fn apply_routing(
     state: &AppState,
     ctx: &RequestContext,
     req: &mut ChatCompletionRequest,
-) -> Option<Uuid> {
+) -> Option<RouteMatch> {
     let store = state.routing_store.as_ref()?;
     if ctx.org_id == Uuid::nil() {
         return None;
@@ -955,13 +954,55 @@ async fn apply_routing(
         .unwrap_or(0);
 
     let m = engine.evaluate(req, ctx, input_tokens)?;
+    let route_id = m.id;
+    let fallbacks = m.then.fallbacks.clone();
     let original = std::mem::replace(&mut req.model, m.then.target_model.clone());
     tracing::debug!(
         org_id = %ctx.org_id,
-        route_id = %m.id,
+        route_id = %route_id,
         from = %original,
         to = %req.model,
+        fallbacks = ?fallbacks,
         "routing rewrite"
     );
-    Some(m.id)
+    Some(RouteMatch {
+        route_id,
+        fallbacks,
+    })
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    fn flat_pricing() -> ModelPricing {
+        ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn fee_multiplier_scales_cost_and_baseline() {
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        };
+        let p = flat_pricing();
+        let (cost, base) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        let (cost_fee, base_fee) = compute_cost(&usage, Some(&p), Some(&p), 1.05);
+        // 1M input @ $1/M = $1.00 with no fee.
+        assert!((cost - 1.0).abs() < 1e-9, "cost = {cost}");
+        // OpenRouter's 5% BYOK fee scales cost and baseline by 1.05.
+        assert!((cost_fee - 1.05).abs() < 1e-9, "cost_fee = {cost_fee}");
+        assert!(
+            (base_fee - base * 1.05).abs() < 1e-12,
+            "base_fee = {base_fee}"
+        );
+    }
 }
