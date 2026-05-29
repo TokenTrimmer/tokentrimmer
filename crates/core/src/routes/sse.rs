@@ -32,6 +32,8 @@ use tt_shared::{
 };
 use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
 
+use crate::budget::BudgetEnforcer;
+
 // ─── PartialUsage ─────────────────────────────────────────────────────────────
 
 /// Token counts accumulated while the SSE stream is in flight.
@@ -170,6 +172,9 @@ pub struct StreamLogContext {
     pub route_id: Option<Uuid>,
     pub tag: Option<String>,
     pub request_started: Instant,
+    /// Optional budget enforcer — realized streamed spend is recorded against
+    /// the org on stream completion/abort (identified orgs only).
+    pub budget: Option<std::sync::Arc<dyn BudgetEnforcer>>,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -346,6 +351,7 @@ pub fn stream_response(
             let tag = ctx.tag.clone();
             let request_started = ctx.request_started;
             let log_trace_id = ctx.trace_id;
+            let budget = ctx.budget.clone();
 
             let guard = DropGuard::new(move || {
                 let inner = shared_for_guard
@@ -358,6 +364,13 @@ pub fn stream_response(
                 let cost_usd = compute_streaming_cost(&usage, pricing.as_ref());
                 let baseline_cost_usd =
                     compute_streaming_baseline(&usage, baseline_pricing.as_ref());
+
+                // Record realized streamed spend against the org's budget.
+                if let Some(b) = &budget {
+                    if org_id != Uuid::nil() {
+                        b.record(org_id, cost_usd, Utc::now());
+                    }
+                }
 
                 let row = RequestLogRow {
                     id: Uuid::now_v7(),

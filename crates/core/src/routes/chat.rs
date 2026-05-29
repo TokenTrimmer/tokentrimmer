@@ -255,6 +255,7 @@ pub async fn handler(
             route_id: matched_route_id,
             tag: ctx.tag.clone(),
             request_started,
+            budget: state.budget.clone(),
         });
 
         let stream = provider.chat_completion_stream(req, &ctx).await?;
@@ -342,6 +343,14 @@ pub async fn handler(
             provider.fee_multiplier(),
         );
         let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
+
+        // Record realized spend against the org's budget (identified orgs
+        // only; the per-minute rate was already counted in the auth middleware).
+        if let Some(budget) = state.budget.as_ref() {
+            if ctx.org_id != Uuid::nil() {
+                budget.record(ctx.org_id, cost_usd, Utc::now());
+            }
+        }
 
         let provider_id = provider.id().to_string();
         let model_used = response.model.clone();

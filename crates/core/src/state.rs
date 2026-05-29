@@ -11,6 +11,7 @@ use tt_cache::{EmbeddingProvider, L1Cache, L2Cache};
 use tt_routing::CachingRoutingStore;
 use tt_telemetry::request_logs::RequestLogWriter;
 
+use crate::budget::BudgetEnforcer;
 use crate::registry::{register_default_providers, ProviderRegistry};
 
 /// Default L2 cosine-similarity threshold per ADR-008 / spec §4.4.
@@ -69,6 +70,10 @@ pub struct AppState {
     /// for unauthenticated requests so the dogfood routing route fires.
     /// Enabled by setting `TT_DOGFOOD_GROQ_ROUTING=1` at startup.
     pub dogfood_enabled: bool,
+    /// Optional per-org spend cap + request-rate enforcer. The auth middleware
+    /// checks it pre-flight (429 on deny) and the chat handler records realized
+    /// spend. `None` disables budget enforcement (tests, dev, unmetered orgs).
+    pub budget: Option<Arc<dyn BudgetEnforcer>>,
 }
 
 impl AppState {
@@ -85,6 +90,7 @@ impl AppState {
             request_log_writer: None,
             routing_store: None,
             dogfood_enabled: false,
+            budget: None,
         }
     }
 
@@ -151,6 +157,12 @@ impl AppState {
     /// requests so the pre-seeded dogfood route fires.
     pub fn with_dogfood_enabled(mut self) -> Self {
         self.dogfood_enabled = true;
+        self
+    }
+
+    /// Builder-style attach: enable per-org spend cap + rate enforcement.
+    pub fn with_budget(mut self, enforcer: Arc<dyn BudgetEnforcer>) -> Self {
+        self.budget = Some(enforcer);
         self
     }
 }

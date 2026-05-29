@@ -2,6 +2,7 @@
 //!
 //! See `docs/04-gateway-api-reference.md` for the public API contract.
 
+pub mod budget;
 pub mod db;
 pub mod error;
 pub mod middleware;
@@ -10,6 +11,7 @@ pub mod routes;
 pub mod server;
 pub mod state;
 
+pub use budget::{BudgetDecision, BudgetEnforcer, BudgetLimits, InMemoryBudgetEnforcer};
 pub use db::{connect, migrate, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use middleware::retrieval::RetrievalState;

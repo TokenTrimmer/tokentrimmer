@@ -138,6 +138,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         route_id: None,
         tag: None,
         request_started: std::time::Instant::now(),
+        budget: None,
     }
 }
 

@@ -33,12 +33,14 @@
 use axum::{
     extract::{Request, State},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 
 use tt_auth::ApiKeyContext;
 use uuid::Uuid;
 
+use crate::budget::BudgetDecision;
 use crate::{ApiError, AppState, DOGFOOD_ORG_ID};
 
 /// Axum `from_fn_with_state`-compatible middleware function.
@@ -47,6 +49,10 @@ pub async fn middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // Identity resolved below (when the request carries one) so the budget
+    // gate can run against the org before dispatch.
+    let mut org_id: Option<Uuid> = None;
+
     if let Some(token) = extract_bearer(&req) {
         // tt_test_* short-circuits to sandbox in the chat handler. No verify needed.
         if token.starts_with("tt_test_") {
@@ -73,6 +79,7 @@ pub async fn middleware(
                             tracing::warn!(error = %e, "touch_last_used failed");
                         }
                     });
+                    org_id = Some(ctx.org_id);
                     req.extensions_mut().insert(ctx);
                 }
                 Err(_) => return Err(ApiError::Unauthorized),
@@ -87,8 +94,68 @@ pub async fn middleware(
             key_id: Uuid::nil(),
             org_id: DOGFOOD_ORG_ID,
         });
+        org_id = Some(DOGFOOD_ORG_ID);
     }
-    Ok(next.run(req).await)
+
+    // Pre-flight budget gate for identified orgs. Anonymous/dev requests
+    // (no org_id) and the sandbox path are not metered.
+    let mut spend_remaining: Option<f64> = None;
+    if let (Some(org), Some(budget)) = (org_id, state.budget.as_ref()) {
+        match budget.check(org, chrono::Utc::now()) {
+            BudgetDecision::Allow {
+                spend_remaining_usd,
+            } => spend_remaining = spend_remaining_usd,
+            BudgetDecision::DenySpend => {
+                return Ok(budget_denied_response(
+                    "Monthly spend cap reached for this org.",
+                    "budget_exceeded",
+                    Some(0.0),
+                    None,
+                ));
+            }
+            BudgetDecision::DenyRate { retry_after_secs } => {
+                return Ok(budget_denied_response(
+                    "Request rate limit exceeded for this org.",
+                    "rate_limit_exceeded",
+                    None,
+                    Some(retry_after_secs),
+                ));
+            }
+        }
+    }
+
+    let mut resp = next.run(req).await;
+    // Surface remaining monthly headroom on successful responses too.
+    if let Some(rem) = spend_remaining {
+        if let Ok(v) = format!("{rem:.6}").parse() {
+            resp.headers_mut().insert("x-tt-budget-remaining-usd", v);
+        }
+    }
+    Ok(resp)
+}
+
+/// Build a `429 Too Many Requests` response for a budget/rate denial, with the
+/// `X-TT-Budget-Remaining-Usd` and (for rate limits) `Retry-After` headers.
+fn budget_denied_response(
+    message: &str,
+    kind: &str,
+    remaining_usd: Option<f64>,
+    retry_after_secs: Option<u64>,
+) -> Response {
+    let body = serde_json::json!({ "error": { "message": message, "type": kind } });
+    let mut resp = (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    let headers = resp.headers_mut();
+    if let Some(rem) = remaining_usd {
+        if let Ok(v) = format!("{rem:.6}").parse() {
+            headers.insert("x-tt-budget-remaining-usd", v);
+        }
+    }
+    if let Some(secs) = retry_after_secs {
+        if let Ok(v) = secs.to_string().parse() {
+            headers.insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    resp
 }
 
 /// Pull the bearer string out of `Authorization: Bearer <token>` if present.
