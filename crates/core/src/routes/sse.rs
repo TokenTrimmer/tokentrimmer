@@ -163,6 +163,10 @@ pub struct StreamLogContext {
     pub input_tokens: i32,
     pub cached_tokens: i32,
     pub pricing: Option<ModelPricing>,
+    /// Pricing of the originally-requested model, used for `baseline_cost_usd`.
+    /// When routing did not rewrite the model this equals `pricing`. Falls back
+    /// to `pricing` when `None`.
+    pub baseline_pricing: Option<ModelPricing>,
     pub route_id: Option<Uuid>,
     pub tag: Option<String>,
     pub request_started: Instant,
@@ -277,6 +281,9 @@ pub fn stream_response(
             let provider_id_log = ctx.provider_id.clone();
             let model = ctx.model.clone();
             let pricing = ctx.pricing.clone();
+            // Baseline against the originally-requested model; falls back to the
+            // served model's pricing when no separate baseline was supplied.
+            let baseline_pricing = ctx.baseline_pricing.clone().or_else(|| pricing.clone());
             let route_id = ctx.route_id;
             let tag = ctx.tag.clone();
             let request_started = ctx.request_started;
@@ -291,7 +298,8 @@ pub fn stream_response(
                 drop(inner);
 
                 let cost_usd = compute_streaming_cost(&usage, pricing.as_ref());
-                let baseline_cost_usd = compute_streaming_baseline(&usage, pricing.as_ref());
+                let baseline_cost_usd =
+                    compute_streaming_baseline(&usage, baseline_pricing.as_ref());
 
                 let row = RequestLogRow {
                     id: Uuid::now_v7(),

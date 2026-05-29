@@ -120,6 +120,14 @@ pub trait KeyStore: Send + Sync {
     ///
     /// Returns `true` if found and updated, `false` if not found.
     async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError>;
+
+    /// Stamp `last_used_at = at` on the row with the given `id`. Default
+    /// impl is a no-op so stores that don't track usage (e.g., simple
+    /// in-memory test stores that don't care) can opt out trivially.
+    /// The Postgres impl overrides to `UPDATE … SET last_used_at = $1`.
+    async fn touch_last_used(&self, _id: Uuid, _at: DateTime<Utc>) -> Result<(), KeyError> {
+        Ok(())
+    }
 }
 
 /// In-memory key store. Suitable for tests and CLI demos; production uses Postgres.
@@ -168,6 +176,13 @@ impl KeyStore for InMemoryKeyStore {
             .map_err(|e| KeyError::Store(e.to_string()))?;
         for v in g.values_mut() {
             if v.id == id {
+                if v.revoked_at.is_some() {
+                    // Idempotent: revoking an already-revoked key is a
+                    // no-op. Matches the Postgres impl's `WHERE revoked_at
+                    // IS NULL` semantics so callers see the same
+                    // was-already-active signal regardless of store.
+                    return Ok(false);
+                }
                 v.revoked_at = Some(at);
                 return Ok(true);
             }
@@ -184,7 +199,7 @@ impl KeyStore for InMemoryKeyStore {
 ///
 /// The audit payload includes the key `id`, `prefix`, `label`, and
 /// `environment` — it deliberately excludes the plaintext.
-pub async fn issue<S: KeyStore, A: AuditWriter>(
+pub async fn issue<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
     store: &S,
     audit_writer: &A,
     org_id: Uuid,
@@ -256,7 +271,10 @@ pub async fn issue<S: KeyStore, A: AuditWriter>(
 /// - [`KeyError::NotFound`] — no row matches the prefix, or argon2 verify
 ///   failed (collapsed to `NotFound` to avoid leaking "key exists but wrong").
 /// - [`KeyError::Revoked`] — key has been revoked.
-pub async fn verify<S: KeyStore>(store: &S, presented: &str) -> Result<ApiKeyContext, KeyError> {
+pub async fn verify<S: KeyStore + ?Sized>(
+    store: &S,
+    presented: &str,
+) -> Result<ApiKeyContext, KeyError> {
     if presented.len() < PREFIX_DISPLAY_LEN
         || !(presented.starts_with("tt_live_") || presented.starts_with("tt_test_"))
     {
@@ -296,7 +314,7 @@ pub async fn verify<S: KeyStore>(store: &S, presented: &str) -> Result<ApiKeyCon
 ///   to write. The key IS revoked when this occurs; the caller should
 ///   re-attempt the audit emission out-of-band.
 /// - [`KeyError::Store`] — underlying store error.
-pub async fn revoke_key<S: KeyStore, A: AuditWriter>(
+pub async fn revoke_key<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
     store: &S,
     audit_writer: &A,
     org_id: Uuid,

@@ -9,8 +9,6 @@ pub fn print_summary(r: &Rollup, log_path: &Path) {
     } else {
         0.0
     };
-    let cache_savings = r.total_cost_usd * (hit_rate / 100.0);
-    let net_potential = r.suggested_savings_usd;
     eprintln!();
     eprintln!("┌─ tokentrimmer session summary ─────────────────────┐");
     eprintln!("│  Requests:           {:<28}│", r.requests);
@@ -22,8 +20,10 @@ pub fn print_summary(r: &Rollup, log_path: &Path) {
         "",
         w = 27usize.saturating_sub(format!("{} ({:.0}%)", r.cache_hits, hit_rate).len())
     );
-    eprintln!("│  Cache savings:      ${cache_savings:<27.4}│");
-    eprintln!("│  Suggested savings:  ${net_potential:<27.4}│");
+    // Realized savings reported by the gateway (cache discount + routing
+    // downgrade), summed across the session — not a heuristic.
+    eprintln!("│  Saved (realized):   ${:<27.4}│", r.total_savings_usd);
+    eprintln!("│  Suggested savings:  ${:<27.4}│", r.suggested_savings_usd);
     eprintln!("│                                                    │");
     eprintln!("│  Session log: {:<37}│", log_path.display().to_string());
     eprintln!("└────────────────────────────────────────────────────┘");

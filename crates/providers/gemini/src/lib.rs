@@ -57,8 +57,8 @@ impl GeminiProvider {
     /// Panics if the underlying [`reqwest::Client`] cannot be constructed (very
     /// rare — only happens with invalid TLS configuration).
     pub fn new(cfg: ClientConfig) -> Self {
-        let client = client::build_client(&cfg)
-            .expect("failed to build reqwest::Client for Gemini adapter");
+        let client =
+            client::build_client(&cfg).expect("failed to build reqwest::Client for Gemini adapter");
         Self { client }
     }
 
@@ -100,9 +100,7 @@ impl Provider for GeminiProvider {
         let api_key = ctx.credentials.api_key.expose().to_string();
         let model = req.model.clone();
 
-        let url = format!(
-            "{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
-        );
+        let url = format!("{base_url}/v1beta/models/{model}:generateContent?key={api_key}");
 
         let body = translate::translate_request(req)?;
 
@@ -122,10 +120,7 @@ impl Provider for GeminiProvider {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(errors::map_reqwest_error)?;
+        let response_text = response.text().await.map_err(errors::map_reqwest_error)?;
 
         if status >= 400 {
             return Err(errors::map_response_error(

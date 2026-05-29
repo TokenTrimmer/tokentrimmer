@@ -346,20 +346,18 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 **Files:** `crates/preview/src/pricing.rs`
 
-- [ ] **Step 1: Find the existing pricing API surface**
+- [ ] **Step 1: Confirm the existing pricing API surface**
 
-Run: `grep -rn 'pub fn.*pricing\|pub.*ModelPricing\|input_per_million\|output_per_million' crates/providers/anthropic/src/pricing.rs crates/providers/openai/src/pricing.rs crates/providers/gemini/src/pricing.rs | head -20`
+Each provider exposes `pub fn pricing_for(model: &str) -> Option<ModelPricing>` (verified against `crates/providers/{anthropic,openai,gemini}/src/pricing.rs` on 2026-05-28). The fields are `input_per_million: f64`, `output_per_million: f64`, and `cached_input_per_million: Option<f64>` — note **no `_usd` suffix** on the field names. Use this exact API; do not invent variants.
 
-The repo has `pub fn for_model(name: &str) -> Option<ModelPricing>` (or similar) in each provider's `pricing.rs`. Use whatever the actual signature is — do NOT invent a different API.
-
-- [ ] **Step 2: Write `pricing.rs` against the discovered API**
+- [ ] **Step 2: Write `pricing.rs` against the confirmed API**
 
 ```rust
 //! Wrapper over per-provider pricing tables.
 //!
-//! Each provider crate exposes its own `for_model(&str) -> Option<ModelPricing>`
-//! (or equivalent). We probe all three; first hit wins. Returns the pricing
-//! plus the provider name so the response can populate `current.provider`.
+//! Each provider crate exposes `pricing_for(&str) -> Option<ModelPricing>`.
+//! We probe all three; first hit wins. Returns the pricing plus the
+//! provider name so the response can populate `current.provider`.
 
 use crate::error::PreviewError;
 
@@ -372,30 +370,26 @@ pub struct LookupHit {
     pub output_per_m: f64,
 }
 
-/// Probe per-provider pricing tables. Adapt the bodies below if the actual
-/// crate API differs — the worked example in `crates/cli/src/main.rs`
-/// shows the canonical call pattern for `tt_inspect_core`; do the same kind
-/// of mirror here for `tt_provider_*::pricing::for_model`.
 pub fn lookup(model: &str) -> Result<LookupHit, PreviewError> {
-    if let Some(p) = tt_provider_anthropic::pricing::for_model(model) {
+    if let Some(p) = tt_provider_anthropic::pricing::pricing_for(model) {
         return Ok(LookupHit {
             provider: "anthropic",
-            input_per_m: p.input_per_million_usd,
-            output_per_m: p.output_per_million_usd,
+            input_per_m: p.input_per_million,
+            output_per_m: p.output_per_million,
         });
     }
-    if let Some(p) = tt_provider_openai::pricing::for_model(model) {
+    if let Some(p) = tt_provider_openai::pricing::pricing_for(model) {
         return Ok(LookupHit {
             provider: "openai",
-            input_per_m: p.input_per_million_usd,
-            output_per_m: p.output_per_million_usd,
+            input_per_m: p.input_per_million,
+            output_per_m: p.output_per_million,
         });
     }
-    if let Some(p) = tt_provider_gemini::pricing::for_model(model) {
+    if let Some(p) = tt_provider_gemini::pricing::pricing_for(model) {
         return Ok(LookupHit {
             provider: "gemini",
-            input_per_m: p.input_per_million_usd,
-            output_per_m: p.output_per_million_usd,
+            input_per_m: p.input_per_million,
+            output_per_m: p.output_per_million,
         });
     }
     Err(PreviewError::UnknownModel(model.to_string()))

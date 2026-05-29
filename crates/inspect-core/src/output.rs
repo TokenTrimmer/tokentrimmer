@@ -25,7 +25,12 @@ pub fn format_markdown(findings: &[Finding]) -> String {
     out.push_str(&format!("Found **{}** finding(s).\n\n", findings.len()));
 
     // Emit groups in descending severity order.
-    for sev in [Severity::Critical, Severity::High, Severity::Medium, Severity::Low] {
+    for sev in [
+        Severity::Critical,
+        Severity::High,
+        Severity::Medium,
+        Severity::Low,
+    ] {
         let bucket: Vec<&Finding> = findings.iter().filter(|f| f.severity == sev).collect();
         if bucket.is_empty() {
             continue;

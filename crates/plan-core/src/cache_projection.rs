@@ -118,10 +118,7 @@ mod tests {
 
     #[test]
     fn no_ttl_means_zero_hits() {
-        let reqs = vec![
-            make_req(0, "m", 100, None),
-            make_req(1, "m", 100, None),
-        ];
+        let reqs = vec![make_req(0, "m", 100, None), make_req(1, "m", 100, None)];
         let cfg = PlanConfig::default();
         let p = project_l1_hits(&reqs, &cfg);
         assert_eq!(p.total, 2);
@@ -130,10 +127,7 @@ mod tests {
 
     #[test]
     fn second_identical_request_within_ttl_is_a_hit() {
-        let reqs = vec![
-            make_req(0, "m", 100, None),
-            make_req(30, "m", 100, None),
-        ];
+        let reqs = vec![make_req(0, "m", 100, None), make_req(30, "m", 100, None)];
         let cfg = PlanConfig {
             l1_ttl_seconds: Some(60),
             ..PlanConfig::default()
@@ -145,10 +139,7 @@ mod tests {
 
     #[test]
     fn request_outside_ttl_is_a_miss() {
-        let reqs = vec![
-            make_req(0, "m", 100, None),
-            make_req(120, "m", 100, None),
-        ];
+        let reqs = vec![make_req(0, "m", 100, None), make_req(120, "m", 100, None)];
         let cfg = PlanConfig {
             l1_ttl_seconds: Some(60),
             ..PlanConfig::default()
@@ -159,10 +150,7 @@ mod tests {
 
     #[test]
     fn different_shape_no_hit() {
-        let reqs = vec![
-            make_req(0, "m", 100, None),
-            make_req(1, "m", 101, None),
-        ];
+        let reqs = vec![make_req(0, "m", 100, None), make_req(1, "m", 101, None)];
         let cfg = PlanConfig {
             l1_ttl_seconds: Some(60),
             ..PlanConfig::default()

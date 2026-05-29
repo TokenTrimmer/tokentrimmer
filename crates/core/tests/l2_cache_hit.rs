@@ -302,10 +302,7 @@ async fn streaming_request_bypasses_l2_cache() {
     let state = AppState::new(registry).with_l2(cache.clone(), embedder, None);
     let app = build_router(state);
 
-    let response = app
-        .oneshot(chat_request("counting-1", true))
-        .await
-        .unwrap();
+    let response = app.oneshot(chat_request("counting-1", true)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     // SSE response — no cache header is set on the stream path (fake-stream
     // from cache is w7-fake-stream-cache).

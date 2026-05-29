@@ -281,12 +281,8 @@ fn compute_cis(p: &Projection, seed: u64, iterations: u32) -> ConfidenceInterval
         .zip(p.per_request_projected.iter())
         .map(|(b, pr)| (b - pr).max(0.0))
         .collect();
-    let (sv_lo_mean, sv_hi_mean) = bootstrap::bootstrap_ci(
-        &savings_per_req,
-        seed,
-        iterations,
-        (0.025, 0.975),
-    );
+    let (sv_lo_mean, sv_hi_mean) =
+        bootstrap::bootstrap_ci(&savings_per_req, seed, iterations, (0.025, 0.975));
     let savings_usd_95 = (sv_lo_mean * n, sv_hi_mean * n);
 
     // Savings pct: must bootstrap baseline + projected jointly because

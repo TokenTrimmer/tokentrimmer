@@ -5,7 +5,18 @@
 
 use uuid::Uuid;
 
+pub mod credentials;
 pub mod keys;
+
+/// Postgres-backed [`ProviderCredentialStore`] — gated behind the
+/// `postgres` feature so default builds stay free of sqlx and
+/// XChaCha20-Poly1305.
+#[cfg(feature = "postgres")]
+pub mod postgres;
+pub use credentials::{
+    ChainedProviderCredentialStore, CredentialError, EnvProviderCredentialStore,
+    InMemoryProviderCredentialStore, ProviderCredentialStore,
+};
 pub use keys::{
     issue, revoke_key, verify, ApiKey, Environment, InMemoryKeyStore, IssuedKey, KeyError, KeyStore,
 };

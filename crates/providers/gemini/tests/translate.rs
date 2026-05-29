@@ -253,7 +253,10 @@ fn translate_tool_choice_auto() {
 
     let body = translate_request(req).expect("translate ok");
 
-    let tc = body.tool_config.as_ref().expect("toolConfig should be present");
+    let tc = body
+        .tool_config
+        .as_ref()
+        .expect("toolConfig should be present");
     assert_eq!(tc.function_calling_config.mode, "AUTO");
     assert!(tc.function_calling_config.allowed_function_names.is_empty());
 
@@ -272,7 +275,10 @@ fn translate_tool_choice_specific_function() {
 
     let body = translate_request(req).expect("translate ok");
 
-    let tc = body.tool_config.as_ref().expect("toolConfig should be present");
+    let tc = body
+        .tool_config
+        .as_ref()
+        .expect("toolConfig should be present");
     assert_eq!(tc.function_calling_config.mode, "ANY");
     assert_eq!(
         tc.function_calling_config.allowed_function_names,
@@ -289,7 +295,10 @@ fn translate_tool_choice_none() {
 
     let body = translate_request(req).expect("translate ok");
 
-    let tc = body.tool_config.as_ref().expect("toolConfig should be present");
+    let tc = body
+        .tool_config
+        .as_ref()
+        .expect("toolConfig should be present");
     assert_eq!(tc.function_calling_config.mode, "NONE");
 
     insta::assert_json_snapshot!("tool_choice_none", &body);
@@ -439,10 +448,7 @@ fn translate_response_function_call_to_tool_calls() {
     let resp = deserialize_response(response_body, "gemini-3.1-pro").expect("deserialize ok");
 
     // finish_reason should be overridden to "tool_calls" since functionCall is present.
-    assert_eq!(
-        resp.choices[0].finish_reason.as_deref(),
-        Some("tool_calls")
-    );
+    assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("tool_calls"));
 
     // Message should have tool_calls in OpenAI format.
     match &resp.choices[0].message {

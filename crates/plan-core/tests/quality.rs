@@ -132,10 +132,7 @@ impl JudgeProvider for SequencedJudge {
     ) -> Result<(JudgeVerdict, String), QualityError> {
         let idx = self.cursor.fetch_add(1, Ordering::SeqCst);
         let seq = self.sequence.lock().expect("mutex poisoned");
-        let v = seq
-            .get(idx)
-            .copied()
-            .unwrap_or(JudgeVerdict::Acceptable);
+        let v = seq.get(idx).copied().unwrap_or(JudgeVerdict::Acceptable);
         Ok((v, format!("verdict #{idx}")))
     }
 }
@@ -262,13 +259,7 @@ fn stratified_sample_is_proportional() {
     // round(100/300 × 30) = 10 large = 30 total.
     let mut reqs: Vec<RequestLog> = Vec::new();
     for i in 0u32..200 {
-        reqs.push(req(
-            u128::from(i) + 1,
-            200,
-            Some("x"),
-            Some("p"),
-            Some("r"),
-        ));
+        reqs.push(req(u128::from(i) + 1, 200, Some("x"), Some("p"), Some("r")));
     }
     for i in 0u32..100 {
         reqs.push(req(
@@ -328,10 +319,7 @@ async fn high_unclear_share_surfaces_caveat() {
     // degraded_pct is 0 (no classified samples) → Low band.
     assert_eq!(result.risk_band, RiskBand::Low);
     assert!(
-        result
-            .caveats
-            .iter()
-            .any(|c| c.contains("Unclear")),
+        result.caveats.iter().any(|c| c.contains("Unclear")),
         "expected Unclear caveat, got {:?}",
         result.caveats
     );
@@ -357,7 +345,11 @@ async fn reason_truncated_to_200_chars() {
         );
     }
     // And exactly 200 when input was longer.
-    let lens: Vec<usize> = result.sampled_examples.iter().map(|s| s.reason.len()).collect();
+    let lens: Vec<usize> = result
+        .sampled_examples
+        .iter()
+        .map(|s| s.reason.len())
+        .collect();
     assert!(
         lens.iter().all(|&l| l == 200),
         "all reasons should be truncated to 200, got {lens:?}"
@@ -371,10 +363,7 @@ async fn small_sample_caveat_surfaces_under_30() {
     let result = score_quality(&reqs, &cfg, &judge_ok(), proposed_constant)
         .await
         .expect("score must succeed");
-    assert!(
-        result.sample_size < 30,
-        "precondition for the caveat test"
-    );
+    assert!(result.sample_size < 30, "precondition for the caveat test");
     assert!(
         result
             .caveats
@@ -388,7 +377,9 @@ async fn small_sample_caveat_surfaces_under_30() {
 #[tokio::test]
 async fn replay_with_quality_attaches_quality_field() {
     use chrono::TimeZone;
-    use tt_plan_core::{replay_with_quality, PlanInput, ProposedRoute, RouteAction, RouteConditions};
+    use tt_plan_core::{
+        replay_with_quality, PlanInput, ProposedRoute, RouteAction, RouteConditions,
+    };
 
     let requests = scorable_pop(40);
     let route = ProposedRoute {

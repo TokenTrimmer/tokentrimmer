@@ -13,3 +13,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+sqlx = { workspace = true, optional = true }
+
+[features]
+default = []
+postgres = ["sqlx"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

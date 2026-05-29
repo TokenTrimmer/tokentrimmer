@@ -1,0 +1,328 @@
+//! Per-org provider credential lookup.
+//!
+//! The gateway needs to know which upstream API key to send with each request:
+//! a customer presents a TokenTrimmer key (`tt_live_*`); we look up the org
+//! that key belongs to; the org has one credential row per provider
+//! (`openai`, `anthropic`, …) carrying the API key plus optional `base_url`
+//! and `extra_headers`. The middleware fetches that row and stamps it into
+//! [`tt_shared::context::RequestContext::credentials`] so the provider
+//! adapter authenticates upstream as the customer.
+//!
+//! This module ships two production-ready stores:
+//!
+//! * [`InMemoryProviderCredentialStore`] — process-local map, useful for tests
+//!   and demo configs.
+//! * [`EnvProviderCredentialStore`] — reads `OPENAI_API_KEY`,
+//!   `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, etc. from process environment.
+//!   Returns the same credential to **every** org, which is what you want
+//!   for single-tenant dogfooding (one team, one set of upstream keys)
+//!   until the cloud-repo dashboard lands a credential-entry UI.
+//!
+//! The DB-backed store (XChaCha20-Poly1305 encrypted, `TT_MASTER_KEY` derived
+//! per-row) is `w7-auth-credentials-postgres`, blocked on the cloud repo.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use thiserror::Error;
+use tt_shared::context::{ProviderCredentials, SecretString};
+use uuid::Uuid;
+
+/// Errors a [`ProviderCredentialStore`] may return.
+#[derive(Debug, Error)]
+pub enum CredentialError {
+    /// Backing store failed (DB error, lock poisoned, etc.).
+    #[error("credential store: {0}")]
+    Store(String),
+}
+
+/// Lookup + persistence of upstream provider credentials.
+///
+/// Implementors must be `Send + Sync` so the gateway can share one instance
+/// across all request-handler tasks.
+///
+/// `put` writes are admin/UI-driven: an operator (or the dashboard's
+/// credential-entry page) calls it through `POST /v1/admin/credentials`.
+/// Read-only stores (the env-var fallback) refuse writes with
+/// [`CredentialError::Store`].
+#[async_trait]
+pub trait ProviderCredentialStore: Send + Sync {
+    /// Return the credential, or `None` if the org has not configured one for
+    /// this provider. `provider_id` is the lowercase string matching
+    /// [`tt_shared::Provider::id`], e.g. `"openai"`, `"anthropic"`.
+    async fn get(
+        &self,
+        org_id: Uuid,
+        provider_id: &str,
+    ) -> Result<Option<ProviderCredentials>, CredentialError>;
+
+    /// Insert or upsert a credential for `(org_id, provider_id)`. Default impl
+    /// rejects with [`CredentialError::Store`] — read-only stores like
+    /// [`EnvProviderCredentialStore`] inherit that default. Stores that
+    /// support writes (in-memory, Postgres) override it.
+    async fn put(
+        &self,
+        _org_id: Uuid,
+        _provider_id: &str,
+        _label: &str,
+        _credentials: ProviderCredentials,
+    ) -> Result<(), CredentialError> {
+        Err(CredentialError::Store("store is read-only".into()))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// In-memory store
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Process-local credential map. Cheap to clone — the inner map is
+/// reference-counted.
+///
+/// Suitable for tests and demo configs. Production deployments either compose
+/// with [`EnvProviderCredentialStore`] or wait for the DB-backed store.
+#[derive(Clone, Default)]
+pub struct InMemoryProviderCredentialStore {
+    inner: Arc<Mutex<HashMap<(Uuid, String), ProviderCredentials>>>,
+}
+
+impl InMemoryProviderCredentialStore {
+    /// Empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert or replace the credential for `(org_id, provider_id)`.
+    pub fn insert(
+        &self,
+        org_id: Uuid,
+        provider_id: impl Into<String>,
+        credentials: ProviderCredentials,
+    ) {
+        // unwrap is fine: poison can only happen if a previous holder panicked
+        // mid-write, which only happens in tests where we'd want to surface.
+        let mut g = self.inner.lock().expect("credential store mutex poisoned");
+        g.insert((org_id, provider_id.into()), credentials);
+    }
+}
+
+#[async_trait]
+impl ProviderCredentialStore for InMemoryProviderCredentialStore {
+    async fn get(
+        &self,
+        org_id: Uuid,
+        provider_id: &str,
+    ) -> Result<Option<ProviderCredentials>, CredentialError> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|e| CredentialError::Store(e.to_string()))?;
+        Ok(g.get(&(org_id, provider_id.to_string())).cloned())
+    }
+
+    async fn put(
+        &self,
+        org_id: Uuid,
+        provider_id: &str,
+        _label: &str,
+        credentials: ProviderCredentials,
+    ) -> Result<(), CredentialError> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|e| CredentialError::Store(e.to_string()))?;
+        g.insert((org_id, provider_id.to_string()), credentials);
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Env-var store
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reads upstream API keys from process environment variables.
+///
+/// One credential set, shared across all orgs. This is the single-tenant
+/// dogfooding fallback: you set `OPENAI_API_KEY` etc. in `fly secrets`
+/// and the gateway forwards them on every request regardless of which
+/// TokenTrimmer key was presented.
+///
+/// Recognized env vars (each one optional — the store returns `None` for
+/// providers whose env var is unset):
+///
+/// | provider_id      | env var               |
+/// | ---------------- | --------------------- |
+/// | `openai`         | `OPENAI_API_KEY`      |
+/// | `anthropic`      | `ANTHROPIC_API_KEY`   |
+/// | `gemini`         | `GEMINI_API_KEY`      |
+/// | `mistral`        | `MISTRAL_API_KEY`     |
+/// | `groq`           | `GROQ_API_KEY`        |
+/// | `together`       | `TOGETHER_API_KEY`    |
+/// | `openrouter`     | `OPENROUTER_API_KEY`  |
+///
+/// Unknown providers always return `None`.
+#[derive(Clone, Default)]
+pub struct EnvProviderCredentialStore;
+
+impl EnvProviderCredentialStore {
+    /// New store. Env is read on every `get` call, so updates to process env
+    /// (rare) are picked up without a restart.
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn env_var_for(provider_id: &str) -> Option<&'static str> {
+        Some(match provider_id {
+            "openai" => "OPENAI_API_KEY",
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "gemini" => "GEMINI_API_KEY",
+            "mistral" => "MISTRAL_API_KEY",
+            "groq" => "GROQ_API_KEY",
+            "together" => "TOGETHER_API_KEY",
+            "openrouter" => "OPENROUTER_API_KEY",
+            _ => return None,
+        })
+    }
+}
+
+#[async_trait]
+impl ProviderCredentialStore for EnvProviderCredentialStore {
+    async fn get(
+        &self,
+        _org_id: Uuid,
+        provider_id: &str,
+    ) -> Result<Option<ProviderCredentials>, CredentialError> {
+        let Some(var) = Self::env_var_for(provider_id) else {
+            return Ok(None);
+        };
+        match std::env::var(var) {
+            Ok(v) if !v.is_empty() => Ok(Some(ProviderCredentials {
+                api_key: SecretString::new(v),
+                base_url: None,
+                extra_headers: Vec::new(),
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composite store
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Try a primary store first; fall back to a secondary if the primary returns
+/// `None`. Useful for "DB if the org has set up creds, otherwise the
+/// process env" without bolting policy into either concrete store.
+pub struct ChainedProviderCredentialStore<A, B> {
+    pub primary: A,
+    pub fallback: B,
+}
+
+impl<A, B> ChainedProviderCredentialStore<A, B> {
+    pub fn new(primary: A, fallback: B) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+#[async_trait]
+impl<A, B> ProviderCredentialStore for ChainedProviderCredentialStore<A, B>
+where
+    A: ProviderCredentialStore,
+    B: ProviderCredentialStore,
+{
+    async fn get(
+        &self,
+        org_id: Uuid,
+        provider_id: &str,
+    ) -> Result<Option<ProviderCredentials>, CredentialError> {
+        match self.primary.get(org_id, provider_id).await? {
+            Some(c) => Ok(Some(c)),
+            None => self.fallback.get(org_id, provider_id).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn creds(key: &str) -> ProviderCredentials {
+        ProviderCredentials {
+            api_key: SecretString::new(key),
+            base_url: None,
+            extra_headers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_returns_inserted_credential() {
+        let store = InMemoryProviderCredentialStore::new();
+        let org = Uuid::now_v7();
+        store.insert(org, "openai", creds("sk-abc"));
+        let got = store.get(org, "openai").await.unwrap().unwrap();
+        assert_eq!(got.api_key.expose(), "sk-abc");
+    }
+
+    #[tokio::test]
+    async fn in_memory_returns_none_for_unknown_org_or_provider() {
+        let store = InMemoryProviderCredentialStore::new();
+        let org = Uuid::now_v7();
+        store.insert(org, "openai", creds("sk-abc"));
+        assert!(store.get(org, "anthropic").await.unwrap().is_none());
+        assert!(store.get(Uuid::now_v7(), "openai").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn env_store_reads_recognized_var() {
+        // Use a UNIQUE var to avoid clobbering real env in concurrent tests.
+        // We can't actually rename — the store reads OPENAI_API_KEY specifically.
+        // Test runs are serialized via #[cfg(test)] in this file alone.
+        std::env::set_var("OPENAI_API_KEY", "sk-env-test");
+        let store = EnvProviderCredentialStore::new();
+        let got = store.get(Uuid::nil(), "openai").await.unwrap().unwrap();
+        assert_eq!(got.api_key.expose(), "sk-env-test");
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn env_store_returns_none_for_unknown_provider() {
+        let store = EnvProviderCredentialStore::new();
+        assert!(store
+            .get(Uuid::nil(), "no-such-provider")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn env_store_returns_none_when_var_unset_or_empty() {
+        std::env::remove_var("MISTRAL_API_KEY");
+        let store = EnvProviderCredentialStore::new();
+        assert!(store.get(Uuid::nil(), "mistral").await.unwrap().is_none());
+        std::env::set_var("MISTRAL_API_KEY", "");
+        assert!(store.get(Uuid::nil(), "mistral").await.unwrap().is_none());
+        std::env::remove_var("MISTRAL_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn chained_prefers_primary_then_fallback() {
+        let primary = InMemoryProviderCredentialStore::new();
+        let fallback = InMemoryProviderCredentialStore::new();
+        let org = Uuid::now_v7();
+        primary.insert(org, "openai", creds("from-primary"));
+        fallback.insert(org, "openai", creds("from-fallback"));
+        fallback.insert(org, "anthropic", creds("only-fallback"));
+        let chain = ChainedProviderCredentialStore::new(primary, fallback);
+
+        // Primary hit wins.
+        let g = chain.get(org, "openai").await.unwrap().unwrap();
+        assert_eq!(g.api_key.expose(), "from-primary");
+
+        // Falls through to fallback for keys only there.
+        let g = chain.get(org, "anthropic").await.unwrap().unwrap();
+        assert_eq!(g.api_key.expose(), "only-fallback");
+
+        // Neither has it → None.
+        assert!(chain.get(org, "gemini").await.unwrap().is_none());
+    }
+}

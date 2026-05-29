@@ -152,7 +152,8 @@ mod tests {
 
     #[test]
     fn map_401_unauthorized() {
-        let body = r#"{"error":{"code":401,"message":"Invalid API key","status":"UNAUTHENTICATED"}}"#;
+        let body =
+            r#"{"error":{"code":401,"message":"Invalid API key","status":"UNAUTHENTICATED"}}"#;
         let err = map_response_error(401, body, None, "gemini-3.1-pro");
         assert!(matches!(err, ProviderError::Unauthorized(_)));
     }
@@ -167,8 +168,7 @@ mod tests {
 
     #[test]
     fn map_429_with_retry_after() {
-        let body =
-            r#"{"error":{"code":429,"message":"Rate limit exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
+        let body = r#"{"error":{"code":429,"message":"Rate limit exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
         let err = map_response_error(429, body, Some("3"), "gemini-3.1-pro");
         assert!(matches!(
             err,
@@ -180,8 +180,7 @@ mod tests {
 
     #[test]
     fn map_429_without_retry_after() {
-        let body =
-            r#"{"error":{"code":429,"message":"Rate limit exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
+        let body = r#"{"error":{"code":429,"message":"Rate limit exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
         let err = map_response_error(429, body, None, "gemini-3.1-pro");
         assert!(matches!(
             err,
@@ -218,7 +217,8 @@ mod tests {
 
     #[test]
     fn map_503_unavailable() {
-        let body = r#"{"error":{"code":503,"message":"Service unavailable","status":"UNAVAILABLE"}}"#;
+        let body =
+            r#"{"error":{"code":503,"message":"Service unavailable","status":"UNAVAILABLE"}}"#;
         let err = map_response_error(503, body, None, "gemini-3.1-pro");
         assert!(matches!(
             err,

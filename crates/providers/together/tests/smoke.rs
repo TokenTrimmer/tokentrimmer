@@ -131,7 +131,12 @@ async fn smoke_429_rate_limited() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 7_000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 7_000
+            }
+        ),
         "expected RateLimited{{7000}}, got {err:?}"
     );
 }

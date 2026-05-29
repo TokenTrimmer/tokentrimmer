@@ -82,7 +82,10 @@ async fn test_delete_removes_key() {
     assert!(cache.get(key).await.unwrap().is_some());
 
     cache.delete(key).await.expect("delete should succeed");
-    let result = cache.get(key).await.expect("get after delete should succeed");
+    let result = cache
+        .get(key)
+        .await
+        .expect("get after delete should succeed");
     assert_eq!(result, None);
 }
 
@@ -107,7 +110,10 @@ async fn test_ttl_eviction() {
     // Sleep slightly longer than the TTL.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
-    let result = cache.get(key).await.expect("get after expiry should succeed");
+    let result = cache
+        .get(key)
+        .await
+        .expect("get after expiry should succeed");
     assert_eq!(result, None, "entry should have expired");
 }
 
@@ -197,7 +203,13 @@ async fn test_redis_round_trip() {
     let result = cache.get(key).await.expect("Redis get should succeed");
     assert_eq!(result, Some(value.to_vec()));
 
-    cache.delete(key).await.expect("Redis delete should succeed");
-    let after_delete = cache.get(key).await.expect("get after delete should succeed");
+    cache
+        .delete(key)
+        .await
+        .expect("Redis delete should succeed");
+    let after_delete = cache
+        .get(key)
+        .await
+        .expect("get after delete should succeed");
     assert_eq!(after_delete, None);
 }

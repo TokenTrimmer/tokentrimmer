@@ -52,7 +52,8 @@ struct OpenAiStreamBody {
 }
 
 /// A `BoxStream` alias used by this module.
-pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, ProviderError>> + Send>>;
+pub type ChunkStream =
+    Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, ProviderError>> + Send>>;
 
 /// Build and execute a streaming chat completion request.
 ///
@@ -89,7 +90,9 @@ pub async fn stream_chat_completion(
 
     let body = OpenAiStreamBody {
         inner: translated,
-        stream_options: StreamOptions { include_usage: true },
+        stream_options: StreamOptions {
+            include_usage: true,
+        },
     };
 
     let body_bytes = serde_json::to_vec(&body)
@@ -137,7 +140,9 @@ pub async fn stream_chat_completion(
 /// - Empty lines between events.
 /// - Malformed JSON — yields `Err(ProviderError::Deserialize)` and continues.
 /// - Network errors — yields `Err(ProviderError::Network)` and closes.
-fn build_sse_stream<S>(bytes_stream: S) -> impl Stream<Item = Result<ChatCompletionChunk, ProviderError>> + Send
+fn build_sse_stream<S>(
+    bytes_stream: S,
+) -> impl Stream<Item = Result<ChatCompletionChunk, ProviderError>> + Send
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
@@ -220,9 +225,11 @@ enum SseEvent {
 fn parse_sse_event(event_bytes: &[u8]) -> Vec<SseEvent> {
     let text = match std::str::from_utf8(event_bytes) {
         Ok(t) => t,
-        Err(_) => return vec![SseEvent::Err(ProviderError::Deserialize(
-            "SSE event contained invalid UTF-8".to_string(),
-        ))],
+        Err(_) => {
+            return vec![SseEvent::Err(ProviderError::Deserialize(
+                "SSE event contained invalid UTF-8".to_string(),
+            ))]
+        }
     };
 
     let mut results = Vec::new();
@@ -269,8 +276,7 @@ fn parse_sse_event(event_bytes: &[u8]) -> Vec<SseEvent> {
 /// Returns the index of the *first* `\n` in the pair so that
 /// `buf.drain(..idx + 2)` removes the entire event including the separator.
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2)
-        .position(|w| w == b"\n\n")
+    buf.windows(2).position(|w| w == b"\n\n")
 }
 
 // ---------------------------------------------------------------------------

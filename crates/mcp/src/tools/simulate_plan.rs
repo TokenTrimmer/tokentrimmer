@@ -120,10 +120,7 @@ mod tests {
             })
             .await;
         let t = make_tool(server.base_url());
-        let err = t
-            .call(json!({ "proposed_config": {} }))
-            .await
-            .unwrap_err();
+        let err = t.call(json!({ "proposed_config": {} })).await.unwrap_err();
         assert!(matches!(err, McpError::Internal(_)));
     }
 }

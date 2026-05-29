@@ -302,7 +302,10 @@ fn determinism_with_nontrivial_bootstrap_iterations() {
     let b = replay(deterministic_input(100, 1000)).unwrap();
     let ja = serde_json::to_string(&a).unwrap();
     let jb = serde_json::to_string(&b).unwrap();
-    assert_eq!(ja, jb, "bootstrap with iterations=1000 must be deterministic");
+    assert_eq!(
+        ja, jb,
+        "bootstrap with iterations=1000 must be deterministic"
+    );
 }
 
 #[test]
@@ -323,8 +326,8 @@ fn per_route_breakdown_sums_match_aggregates() {
     // unchanged cost. Easier to assert: per-route baseline+projected sums
     // equal the rerouted slice of the aggregates.
     let rerouted = u64::from(result.aggregates.requests_rerouted);
-    let total_count: u64 =
-        rerouted + u64::from(result.aggregates.requests_unchanged + result.aggregates.requests_unprice_able);
+    let total_count: u64 = rerouted
+        + u64::from(result.aggregates.requests_unchanged + result.aggregates.requests_unprice_able);
     assert_eq!(total_count, u64::from(result.sample_size));
 
     // Per-route baseline + projected must be subsets of the aggregates totals.
@@ -335,8 +338,11 @@ fn per_route_breakdown_sums_match_aggregates() {
 
     // Per-route savings sum equals top-line savings when every matched
     // request's baseline cost was strictly greater than its projected cost.
-    let per_route_savings: f64 =
-        result.per_route_breakdown.iter().map(|b| b.savings_usd).sum();
+    let per_route_savings: f64 = result
+        .per_route_breakdown
+        .iter()
+        .map(|b| b.savings_usd)
+        .sum();
     assert!((per_route_savings - result.aggregates.projected_savings_usd).abs() < 1e-9);
 }
 

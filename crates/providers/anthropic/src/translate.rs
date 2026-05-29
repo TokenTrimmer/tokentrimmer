@@ -19,9 +19,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tt_shared::{
-    messages::{
-        ContentPart, Message, MessageContent, ToolCall, ToolCallFunction, ToolChoice,
-    },
+    messages::{ContentPart, Message, MessageContent, ToolCall, ToolCallFunction, ToolChoice},
     usage::Usage,
     ChatCompletionResponse, Choice, ProviderError,
 };
@@ -253,8 +251,8 @@ pub fn translate_request(
                     blocks.extend(translate_content_blocks(c)?);
                 }
                 for tc in tool_calls {
-                    let input: serde_json::Value =
-                        serde_json::from_str(&tc.function.arguments).map_err(|e| {
+                    let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                        .map_err(|e| {
                             ProviderError::Deserialize(format!(
                                 "tool_call arguments not valid JSON: {e}"
                             ))
@@ -613,14 +611,7 @@ mod tests {
             system[0].cache_control.is_some(),
             "long system should have cache_control"
         );
-        assert_eq!(
-            system[0]
-                .cache_control
-                .as_ref()
-                .unwrap()
-                .ctype,
-            "ephemeral"
-        );
+        assert_eq!(system[0].cache_control.as_ref().unwrap().ctype, "ephemeral");
     }
 
     #[test]

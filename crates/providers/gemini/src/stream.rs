@@ -68,9 +68,8 @@ pub async fn stream_chat_completion(
     // Translate to the Gemini wire shape.
     let body = translate::translate_request(req)?;
 
-    let url = format!(
-        "{base_url}/v1beta/models/{model}:streamGenerateContent?key={api_key}&alt=sse"
-    );
+    let url =
+        format!("{base_url}/v1beta/models/{model}:streamGenerateContent?key={api_key}&alt=sse");
 
     let body_bytes = serde_json::to_vec(&body)
         .map_err(|e| ProviderError::Internal(format!("failed to serialize stream body: {e}")))?;
@@ -251,10 +250,7 @@ fn process_sse_event(
             .map(translate::map_finish_reason)
             .map(str::to_string);
 
-        let content_parts = candidate
-            .content
-            .map(|c| c.parts)
-            .unwrap_or_default();
+        let content_parts = candidate.content.map(|c| c.parts).unwrap_or_default();
 
         // Separate text parts and function call parts.
         let mut text_content: Option<String> = None;
@@ -437,10 +433,7 @@ mod tests {
         // Should have one content+finish chunk
         assert!(!outcomes.is_empty());
         if let SseOutcome::Chunk(chunk) = &outcomes[0] {
-            assert_eq!(
-                chunk.choices[0].finish_reason.as_deref(),
-                Some("stop")
-            );
+            assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
             assert!(chunk.usage.is_some());
         }
     }

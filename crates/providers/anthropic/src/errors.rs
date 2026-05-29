@@ -195,7 +195,8 @@ mod tests {
 
     #[test]
     fn map_500_server_error() {
-        let body = r#"{"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#;
+        let body =
+            r#"{"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#;
         let err = map_response_error(500, body, None);
         assert!(matches!(
             err,

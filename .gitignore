@@ -24,8 +24,8 @@ dist/
 
 # Local env + secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Claude Code session state (gitignored except the harness itself)
 .claude/AUDIT.log

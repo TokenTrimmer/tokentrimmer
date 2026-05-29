@@ -67,7 +67,11 @@ fn engine_walks_and_runs_rules_on_supported_languages() {
 
     let findings = engine.scan(tmp.path());
     // py-only fires on a.py, ts-only fires on b.ts → exactly 2 findings.
-    assert_eq!(findings.len(), 2, "expected one py-only + one ts-only finding");
+    assert_eq!(
+        findings.len(),
+        2,
+        "expected one py-only + one ts-only finding"
+    );
 }
 
 #[test]
@@ -89,9 +93,15 @@ fn engine_skips_skipped_dirs_and_oversized_files() {
     // A rule that matches all Python files.
     struct AllPy;
     impl Rule for AllPy {
-        fn id(&self) -> &'static str { "all-py" }
-        fn severity(&self) -> Severity { Severity::Low }
-        fn supported_languages(&self) -> &'static [Language] { &[Language::Python] }
+        fn id(&self) -> &'static str {
+            "all-py"
+        }
+        fn severity(&self) -> Severity {
+            Severity::Low
+        }
+        fn supported_languages(&self) -> &'static [Language] {
+            &[Language::Python]
+        }
         fn check(&self, _s: &str, _l: Language, path: &str) -> Vec<Finding> {
             vec![Finding {
                 rule_id: "all-py".into(),
@@ -124,9 +134,15 @@ fn engine_continues_through_unreadable_files() {
 
     struct PanicOnEmpty;
     impl Rule for PanicOnEmpty {
-        fn id(&self) -> &'static str { "panic-on-empty" }
-        fn severity(&self) -> Severity { Severity::Low }
-        fn supported_languages(&self) -> &'static [Language] { &[Language::Python] }
+        fn id(&self) -> &'static str {
+            "panic-on-empty"
+        }
+        fn severity(&self) -> Severity {
+            Severity::Low
+        }
+        fn supported_languages(&self) -> &'static [Language] {
+            &[Language::Python]
+        }
         fn check(&self, src: &str, _l: Language, path: &str) -> Vec<Finding> {
             if src.is_empty() {
                 return vec![];

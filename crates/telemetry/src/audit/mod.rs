@@ -12,6 +12,8 @@
 //! - [`verify_chain`] — standalone verifier; used by `tt audit verify`.
 //! - [`AuditError`] / [`VerifyError`] — error enums.
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod writer;
 
 use chrono::{DateTime, Utc};
@@ -138,7 +140,9 @@ pub fn canonical_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
 ///
 /// Keys are a fixed set; the output is then passed through [`canonical_bytes`]
 /// before being hashed.
-pub fn canonical_payload_bytes(entry_fields: &PayloadFields<'_>) -> Result<Vec<u8>, serde_json::Error> {
+pub fn canonical_payload_bytes(
+    entry_fields: &PayloadFields<'_>,
+) -> Result<Vec<u8>, serde_json::Error> {
     let obj = serde_json::json!({
         "id": entry_fields.id.to_string(),
         "org_id": entry_fields.org_id.to_string(),
@@ -248,9 +252,9 @@ pub fn verify_chain(
         // ── 3. Signature check ────────────────────────────────────────────────
         let sig_bytes =
             hex::decode(&entry.signature).map_err(|e| VerifyError::Hex(i, e.to_string()))?;
-        let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-            VerifyError::BadSignature(i, "signature is not 64 bytes".to_string())
-        })?;
+        let sig_array: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| VerifyError::BadSignature(i, "signature is not 64 bytes".to_string()))?;
         let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
 
         verifying_key

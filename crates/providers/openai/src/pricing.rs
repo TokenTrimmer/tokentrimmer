@@ -2,9 +2,7 @@
 //! `effective_at` is a placeholder; the pricing-fetcher service will backfill this field daily.
 
 use chrono::Utc;
-use tt_shared::{
-    pricing::{Capability, ModelInfo, ModelPricing},
-};
+use tt_shared::pricing::{Capability, ModelInfo, ModelPricing};
 
 /// Return the pricing entry for a known OpenAI model, or `None` if unrecognized.
 ///

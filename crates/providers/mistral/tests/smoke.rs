@@ -131,7 +131,12 @@ async fn smoke_429_rate_limited() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 3_000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 3_000
+            }
+        ),
         "expected RateLimited{{3000}}, got {err:?}"
     );
 }
@@ -184,11 +189,26 @@ fn models_list_contains_expected_models() {
     assert_eq!(models.len(), 5, "expected 5 Mistral models");
 
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert!(ids.contains(&"mistral-large-latest"), "missing mistral-large-latest");
-    assert!(ids.contains(&"mistral-medium-latest"), "missing mistral-medium-latest");
-    assert!(ids.contains(&"mistral-small-latest"), "missing mistral-small-latest");
-    assert!(ids.contains(&"codestral-latest"), "missing codestral-latest");
-    assert!(ids.contains(&"pixtral-large-latest"), "missing pixtral-large-latest");
+    assert!(
+        ids.contains(&"mistral-large-latest"),
+        "missing mistral-large-latest"
+    );
+    assert!(
+        ids.contains(&"mistral-medium-latest"),
+        "missing mistral-medium-latest"
+    );
+    assert!(
+        ids.contains(&"mistral-small-latest"),
+        "missing mistral-small-latest"
+    );
+    assert!(
+        ids.contains(&"codestral-latest"),
+        "missing codestral-latest"
+    );
+    assert!(
+        ids.contains(&"pixtral-large-latest"),
+        "missing pixtral-large-latest"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -199,19 +219,27 @@ fn models_list_contains_expected_models() {
 fn pricing_table_correct_rates() {
     let p = provider();
 
-    let large = p.pricing("mistral-large-latest").expect("pricing for large");
+    let large = p
+        .pricing("mistral-large-latest")
+        .expect("pricing for large");
     assert_eq!(large.input_per_million, 2.00);
     assert_eq!(large.output_per_million, 6.00);
 
-    let small = p.pricing("mistral-small-latest").expect("pricing for small");
+    let small = p
+        .pricing("mistral-small-latest")
+        .expect("pricing for small");
     assert_eq!(small.input_per_million, 0.20);
     assert_eq!(small.output_per_million, 0.60);
 
-    let codestral = p.pricing("codestral-latest").expect("pricing for codestral");
+    let codestral = p
+        .pricing("codestral-latest")
+        .expect("pricing for codestral");
     assert_eq!(codestral.input_per_million, 0.30);
     assert_eq!(codestral.output_per_million, 0.90);
 
-    let pixtral = p.pricing("pixtral-large-latest").expect("pricing for pixtral");
+    let pixtral = p
+        .pricing("pixtral-large-latest")
+        .expect("pricing for pixtral");
     assert_eq!(pixtral.input_per_million, 2.00);
     assert_eq!(pixtral.output_per_million, 6.00);
 
@@ -228,7 +256,9 @@ fn pixtral_has_vision_capability() {
 
     let p = provider();
     let models = p.models();
-    let pixtral = models.iter().find(|m| m.id == "pixtral-large-latest")
+    let pixtral = models
+        .iter()
+        .find(|m| m.id == "pixtral-large-latest")
         .expect("pixtral-large-latest should be in models");
 
     assert!(

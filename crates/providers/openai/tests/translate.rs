@@ -3,11 +3,11 @@
 
 use std::collections::HashMap;
 
-use tt_provider_openai::translate::{translate_request, extract_usage};
+use tt_provider_openai::translate::{extract_usage, translate_request};
 use tt_shared::{
     messages::{
-        Message, MessageContent, ContentPart, ImageUrl, ResponseFormat,
-        Tool, ToolCall, ToolCallFunction, ToolFunction, ToolChoice, ToolChoiceFunction,
+        ContentPart, ImageUrl, Message, MessageContent, ResponseFormat, Tool, ToolCall,
+        ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
     },
     ChatCompletionRequest,
 };
@@ -201,10 +201,8 @@ fn translate_reasoning_model_o3() {
 #[test]
 fn translate_tt_extras_stripped() {
     let mut req = make_request("gpt-4o", vec![user_text("Hello.")]);
-    req.tt_extras.insert(
-        "route_hint".to_string(),
-        serde_json::json!("us-east-1"),
-    );
+    req.tt_extras
+        .insert("route_hint".to_string(), serde_json::json!("us-east-1"));
     req.tt_extras.insert(
         "cache_strategy".to_string(),
         serde_json::json!({"ttl": 3600}),
@@ -254,22 +252,20 @@ fn translate_reasoning_model_o4_mini() {
 
 #[test]
 fn translate_vision_content_parts() {
-    let messages = vec![
-        Message::User {
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "What's in this image?".to_string(),
+    let messages = vec![Message::User {
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "What's in this image?".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/cat.jpg".to_string(),
+                    detail: Some("high".to_string()),
                 },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/cat.jpg".to_string(),
-                        detail: Some("high".to_string()),
-                    },
-                },
-            ]),
-            name: None,
-        },
-    ];
+            },
+        ]),
+        name: None,
+    }];
 
     let req = make_request("gpt-4o", messages);
     let body = translate_request(req).expect("translate ok");

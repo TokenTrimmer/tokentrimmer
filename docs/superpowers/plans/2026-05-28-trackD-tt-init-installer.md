@@ -973,13 +973,15 @@ use thiserror::Error;
 pub enum BaselineError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("inspect: {0}")]
-    Inspect(String),
 }
 
 pub fn run_baseline(root: &Path) -> Result<usize, BaselineError> {
-    let findings = tt_inspect_core::scan_path(root)
-        .map_err(|e| BaselineError::Inspect(e.to_string()))?;
+    // Mirrors the invocation in crates/cli/src/main.rs::run_inspect.
+    let mut engine = tt_inspect_core::Engine::new();
+    for rule in tt_inspect_rules_tier1::all_rules() {
+        engine.add_rule(rule);
+    }
+    let findings = engine.scan(root);
     let dest = root.join(".claude").join("inspect-baseline.json");
     std::fs::create_dir_all(dest.parent().unwrap())?;
     let body = serde_json::json!({

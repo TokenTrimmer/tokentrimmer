@@ -176,7 +176,12 @@ async fn error_429_rate_limited_default_retry_after() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 1000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 1000
+            }
+        ),
         "expected RateLimited{{1000}}, got {err:?}"
     );
 }

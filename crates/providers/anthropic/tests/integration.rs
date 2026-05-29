@@ -164,7 +164,12 @@ async fn error_429_with_retry_after() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 3000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 3000
+            }
+        ),
         "expected RateLimited{{3000}}, got {err:?}"
     );
 }
@@ -191,7 +196,12 @@ async fn error_429_without_retry_after_defaults_1000ms() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 1000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 1000
+            }
+        ),
         "expected RateLimited{{1000}}, got {err:?}"
     );
 }

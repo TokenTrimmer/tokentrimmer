@@ -118,10 +118,7 @@ impl Provider for AnthropicProvider {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(errors::map_reqwest_error)?;
+        let response_text = response.text().await.map_err(errors::map_reqwest_error)?;
 
         if status >= 400 {
             return Err(errors::map_response_error(

@@ -140,6 +140,12 @@ pub async fn handler(
     //     and L2 lookups use the routed model) and BEFORE provider
     //     dispatch. The cache is per-org with a ~60s TTL, so this is cheap.
     //     Unknown-org / no-store / no-match all fall through unchanged.
+    // Capture the originally-requested model's pricing BEFORE routing may
+    // rewrite `req.model`. `baseline_cost_usd` is priced against this so a
+    // downgrade route's saving shows up in saved_usd / request_logs instead
+    // of collapsing to ~0 (which happens when baseline is priced against the
+    // cheap routed-to model).
+    let requested_pricing = provider.pricing(&req.model);
     let matched_route_id = apply_routing(&state, &ctx, &mut req).await;
     if matched_route_id.is_some() {
         // Provider may have changed if the rewrite crossed providers (v1
@@ -237,6 +243,13 @@ pub async fn handler(
             input_tokens: estimated_input_tokens,
             cached_tokens: 0,
             pricing: provider.pricing(&req.model),
+            // Baseline against the originally-requested model when routed, so
+            // the streamed request_logs row carries the real routing saving.
+            baseline_pricing: if matched_route_id.is_some() {
+                requested_pricing.clone()
+            } else {
+                provider.pricing(&req.model)
+            },
             route_id: matched_route_id,
             tag: ctx.tag.clone(),
             request_started,
@@ -312,8 +325,16 @@ pub async fn handler(
         //     envelope carries baseline_cost_usd so hit responses can report
         //     accurate savings without re-running pricing later.
         let pricing = provider.pricing(&response.model);
+        // Baseline is priced against the originally-requested model when a route
+        // rewrote it; otherwise against the served model (same pricing → no
+        // routing saving, only cache/discount savings).
+        let baseline_pricing = if matched_route_id.is_some() {
+            requested_pricing.clone()
+        } else {
+            pricing.clone()
+        };
         let (cost_usd, baseline_cost_usd) =
-            compute_cost(&response.usage, pricing.as_ref(), &req.model);
+            compute_cost(&response.usage, pricing.as_ref(), baseline_pricing.as_ref());
         let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
 
         let provider_id = provider.id().to_string();
@@ -633,14 +654,19 @@ async fn insert_into_l2(
 
 /// Compute `(actual_cost_usd, baseline_cost_usd)` from token usage and pricing.
 ///
-/// `baseline_cost_usd` is what the request would have cost without any
-/// TokenTrimmer optimisations (cache discount, model routing, etc.).
+/// `pricing` is the served model's rate; `actual_cost_usd` applies the
+/// cached-token discount when `usage.cached_tokens > 0`.
 ///
-/// `actual_cost_usd` applies the cached-token discount when `usage.cached_tokens > 0`.
+/// `baseline_pricing` is the rate the request WOULD have paid without any
+/// TokenTrimmer optimisation — i.e. the originally-requested model's rate at
+/// full input price with no cache discount. When routing did not rewrite the
+/// model, callers pass the same pricing for both so the baseline reflects the
+/// served model's pre-discount cost. If `baseline_pricing` is `None`, it
+/// falls back to `pricing` (conservative: reports no routing saving).
 fn compute_cost(
     usage: &Usage,
     pricing: Option<&ModelPricing>,
-    _requested_model: &str,
+    baseline_pricing: Option<&ModelPricing>,
 ) -> (f64, f64) {
     let Some(pricing) = pricing else {
         return (0.0, 0.0);
@@ -658,10 +684,12 @@ fn compute_cost(
         + (cached as f64) * cached_rate / 1_000_000.0
         + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
 
-    // Baseline: full input × input rate + output × output rate (no cache discount, no routing).
-    // `_requested_model` reserved for routing-aware baseline once routing lands (Week 4).
-    let baseline_cost_usd = (usage.prompt_tokens as f64) * pricing.input_per_million / 1_000_000.0
-        + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
+    // Baseline: full input × input rate + output × output rate (no cache
+    // discount), priced against the originally-requested model.
+    let baseline_pricing = baseline_pricing.unwrap_or(pricing);
+    let baseline_cost_usd = (usage.prompt_tokens as f64) * baseline_pricing.input_per_million
+        / 1_000_000.0
+        + (usage.completion_tokens as f64) * baseline_pricing.output_per_million / 1_000_000.0;
 
     (cost_usd, baseline_cost_usd)
 }

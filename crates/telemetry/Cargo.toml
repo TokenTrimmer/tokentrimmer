@@ -25,5 +25,13 @@ async-trait.workspace = true
 hex.workspace = true
 rand_core.workspace = true
 
+# Optional — gated behind `postgres` so OSS distributions that don't run
+# the request-log writer stay sqlx-free.
+sqlx = { workspace = true, optional = true }
+
+[features]
+default = []
+postgres = ["dep:sqlx"]
+
 [dev-dependencies]
 tokio = { workspace = true }

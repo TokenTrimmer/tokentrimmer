@@ -210,7 +210,12 @@ async fn error_429_with_retry_after() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 5000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 5000
+            }
+        ),
         "expected RateLimited{{5000}}, got {err:?}"
     );
 }
@@ -239,7 +244,12 @@ async fn error_429_without_retry_after_defaults_1000ms() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 1000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 1000
+            }
+        ),
         "expected RateLimited{{1000}}, got {err:?}"
     );
 }
@@ -503,13 +513,19 @@ async fn embeddings_401_unauthorized() {
 fn embeddings_pricing_present() {
     let p = provider();
     let pricing = p.pricing("text-embedding-3-small");
-    assert!(pricing.is_some(), "text-embedding-3-small should have pricing");
+    assert!(
+        pricing.is_some(),
+        "text-embedding-3-small should have pricing"
+    );
     let pricing = pricing.unwrap();
     assert_eq!(pricing.input_per_million, 0.02, "should be $0.02/1M");
     assert_eq!(pricing.output_per_million, 0.00);
 
     let large = p.pricing("text-embedding-3-large");
-    assert!(large.is_some(), "text-embedding-3-large should have pricing");
+    assert!(
+        large.is_some(),
+        "text-embedding-3-large should have pricing"
+    );
     assert_eq!(large.unwrap().input_per_million, 0.13, "should be $0.13/1M");
 }
 
@@ -540,12 +556,16 @@ fn provider_id_and_models() {
 fn pricing_table_all_models_present() {
     let p = provider();
 
-    for model in ["gpt-5.5", "gpt-5.4", "gpt-4o", "gpt-4o-mini", "o3", "o4-mini"] {
+    for model in [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o3",
+        "o4-mini",
+    ] {
         let pricing = p.pricing(model);
-        assert!(
-            pricing.is_some(),
-            "missing pricing for model '{model}'"
-        );
+        assert!(pricing.is_some(), "missing pricing for model '{model}'");
     }
 
     // Unknown model returns None.

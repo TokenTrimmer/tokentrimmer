@@ -120,10 +120,9 @@ mod tests {
             "role": "user",
             "content": "Summarize <retrievable corpus=\"docs\" k=\"1\">raw payload that the LLM never sees</retrievable> for the team."
         })];
-        let report =
-            substitute_in_messages(&mut messages, org, &store, &embedder)
-                .await
-                .unwrap();
+        let report = substitute_in_messages(&mut messages, org, &store, &embedder)
+            .await
+            .unwrap();
         assert_eq!(report.substitutions, 1);
         let new_content = messages[0]["content"].as_str().unwrap();
         assert!(new_content.contains("Retrieved-A"));

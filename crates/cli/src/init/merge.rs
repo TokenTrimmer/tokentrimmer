@@ -46,7 +46,8 @@ pub fn merge_settings_json(existing: &str, additions: &str) -> Result<String, Me
 }
 
 fn deep_merge(into: &mut serde_json::Value, from: &serde_json::Value) {
-    if let (serde_json::Value::Object(into_map), serde_json::Value::Object(from_map)) = (into, from) {
+    if let (serde_json::Value::Object(into_map), serde_json::Value::Object(from_map)) = (into, from)
+    {
         for (k, v) in from_map {
             if let Some(existing_v) = into_map.get_mut(k) {
                 deep_merge(existing_v, v);

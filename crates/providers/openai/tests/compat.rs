@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use httpmock::prelude::*;
-use tt_provider_openai::{CompatConfig, ClientConfig, OpenAICompatibleProvider};
+use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     context::{ProviderCredentials, RequestContext, SecretString},
     messages::{Message, MessageContent},
@@ -187,7 +187,12 @@ async fn compat_mistral_429_rate_limited() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 10_000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 10_000
+            }
+        ),
         "expected RateLimited{{10000}}, got {err:?}"
     );
 }
@@ -212,7 +217,12 @@ async fn compat_groq_429_rate_limited() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 1_000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 1_000
+            }
+        ),
         "expected RateLimited{{1000}} (no header → default), got {err:?}"
     );
 }

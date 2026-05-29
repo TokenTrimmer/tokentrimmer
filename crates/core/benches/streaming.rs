@@ -63,8 +63,7 @@ impl Provider for FastMock {
         &self,
         _req: ChatCompletionRequest,
         _ctx: &RequestContext,
-    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
-    {
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
         let n = self.chunks;
         let v: Vec<Result<ChatCompletionChunk, ProviderError>> = (0..n)
             .map(|i| {
@@ -76,11 +75,19 @@ impl Provider for FastMock {
                     choices: vec![ChunkChoice {
                         index: 0,
                         delta: ChunkDelta {
-                            role: if i == 0 { Some("assistant".into()) } else { None },
+                            role: if i == 0 {
+                                Some("assistant".into())
+                            } else {
+                                None
+                            },
                             content: Some("x".into()),
                             tool_calls: vec![],
                         },
-                        finish_reason: if i == n - 1 { Some("stop".into()) } else { None },
+                        finish_reason: if i == n - 1 {
+                            Some("stop".into())
+                        } else {
+                            None
+                        },
                     }],
                     usage: None,
                 })

@@ -13,6 +13,14 @@
 //!
 //! Rules are stored sorted descending by priority. First match wins.
 
+pub mod cache;
+pub mod store;
+
+pub use cache::CachingRoutingStore;
+#[cfg(feature = "postgres")]
+pub use store::PostgresRoutingStore;
+pub use store::{InMemoryRoutingStore, RoutingStore, RoutingStoreError};
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -198,7 +206,9 @@ mod tests {
     #[test]
     fn empty_engine_matches_nothing() {
         let eng = RoutingEngine::new();
-        assert!(eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 100).is_none());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_none());
     }
 
     #[test]
@@ -222,7 +232,9 @@ mod tests {
             make_route("high", 100, vec!["gpt-4o"], "high-target"),
             make_route("mid", 50, vec!["gpt-4o"], "mid-target"),
         ]);
-        let m = eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 100).unwrap();
+        let m = eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .unwrap();
         assert_eq!(m.then.target_model, "high-target");
     }
 
@@ -234,7 +246,9 @@ mod tests {
             route,
             make_route("enabled", 10, vec!["gpt-4o"], "winner"),
         ]);
-        let m = eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 100).unwrap();
+        let m = eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .unwrap();
         assert_eq!(m.then.target_model, "winner");
     }
 
@@ -249,8 +263,12 @@ mod tests {
             ..make_route("short-only", 10, vec!["gpt-4o"], "gpt-4o-mini")
         };
         let eng = RoutingEngine::with_routes(vec![route]);
-        assert!(eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 100).is_some());
-        assert!(eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 600).is_none());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_some());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 600)
+            .is_none());
     }
 
     #[test]
@@ -264,8 +282,12 @@ mod tests {
             ..make_route("long-only", 10, vec!["gpt-4o"], "claude-opus-4-7")
         };
         let eng = RoutingEngine::with_routes(vec![route]);
-        assert!(eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 500).is_none());
-        assert!(eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 1500).is_some());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 500)
+            .is_none());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 1500)
+            .is_some());
     }
 
     #[test]
@@ -278,15 +300,23 @@ mod tests {
             ..make_route("bg-only", 10, vec![], "cheap-model")
         };
         let eng = RoutingEngine::with_routes(vec![route]);
-        assert!(eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 100).is_none());
-        assert!(eng.evaluate(&make_req("gpt-4o"), &make_ctx(Some("background")), 100).is_some());
-        assert!(eng.evaluate(&make_req("gpt-4o"), &make_ctx(Some("foreground")), 100).is_none());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_none());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(Some("background")), 100)
+            .is_some());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(Some("foreground")), 100)
+            .is_none());
     }
 
     #[test]
     fn empty_model_in_matches_any_model() {
         let route = make_route("any", 10, vec![], "target");
         let eng = RoutingEngine::with_routes(vec![route]);
-        assert!(eng.evaluate(&make_req("claude-sonnet-4-6"), &make_ctx(None), 100).is_some());
+        assert!(eng
+            .evaluate(&make_req("claude-sonnet-4-6"), &make_ctx(None), 100)
+            .is_some());
     }
 }

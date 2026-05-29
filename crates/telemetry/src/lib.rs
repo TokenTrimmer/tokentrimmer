@@ -11,4 +11,5 @@
 //! - [`audit::AuditEntry`] / [`audit::Actor`] — wire types.
 
 pub mod audit;
+pub mod request_logs;
 pub mod tracing;

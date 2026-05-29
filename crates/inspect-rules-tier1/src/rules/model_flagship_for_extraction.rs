@@ -122,9 +122,7 @@ impl Rule for ModelFlagshipForExtractionRule {
 
             let lower_ctx = context.to_lowercase();
 
-            let has_extraction = EXTRACTION_KEYWORDS
-                .iter()
-                .any(|kw| lower_ctx.contains(kw));
+            let has_extraction = EXTRACTION_KEYWORDS.iter().any(|kw| lower_ctx.contains(kw));
             if !has_extraction {
                 continue;
             }

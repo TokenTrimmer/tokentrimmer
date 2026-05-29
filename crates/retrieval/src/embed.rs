@@ -43,10 +43,7 @@ impl EmbeddingClient {
             .await
             .map_err(|e| RetrievalError::Embedding(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(RetrievalError::Embedding(format!(
-                "HTTP {}",
-                resp.status()
-            )));
+            return Err(RetrievalError::Embedding(format!("HTTP {}", resp.status())));
         }
         #[derive(Deserialize)]
         struct R {

@@ -70,9 +70,7 @@ impl Rule for OutputNoMaxTokensRule {
         let mut findings = Vec::new();
 
         for (line_idx, line) in source.lines().enumerate() {
-            let matched_pattern = LLM_CREATE_PATTERNS
-                .iter()
-                .find(|p| line.contains(*p));
+            let matched_pattern = LLM_CREATE_PATTERNS.iter().find(|p| line.contains(*p));
             let Some(_pattern) = matched_pattern else {
                 continue;
             };
@@ -86,9 +84,7 @@ impl Rule for OutputNoMaxTokensRule {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let has_max_tokens = MAX_TOKENS_PATTERNS
-                .iter()
-                .any(|mp| call_block.contains(mp));
+            let has_max_tokens = MAX_TOKENS_PATTERNS.iter().any(|mp| call_block.contains(mp));
             if has_max_tokens {
                 continue;
             }

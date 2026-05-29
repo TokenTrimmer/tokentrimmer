@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::BoxStream;
-use tt_provider_openai::{CompatConfig, ClientConfig, OpenAICompatibleProvider};
+use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     pricing::{Capability, ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,

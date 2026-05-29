@@ -211,12 +211,16 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Cache-poisoning heuristic. See the module-level docs for the policy.
 fn outcomes_diverged(source: &LiveEntry, req: &RequestLog) -> bool {
-    let finish_diverged = match (source.finish_reason.as_deref(), req.finish_reason.as_deref()) {
+    let finish_diverged = match (
+        source.finish_reason.as_deref(),
+        req.finish_reason.as_deref(),
+    ) {
         (Some(a), Some(b)) => a != b,
         _ => false,
     };
     let tolerance = std::cmp::max(20, req.output_tokens / 4);
-    let token_delta = (i64::from(source.output_tokens) - i64::from(req.output_tokens)).unsigned_abs();
+    let token_delta =
+        (i64::from(source.output_tokens) - i64::from(req.output_tokens)).unsigned_abs();
     let tokens_diverged = token_delta > u64::from(tolerance);
     finish_diverged || tokens_diverged
 }
@@ -323,7 +327,10 @@ mod tests {
 
     #[test]
     fn empty_sweep_when_no_embeddings() {
-        let reqs = vec![req_with(1, 0, None, None, 10), req_with(2, 1, None, None, 10)];
+        let reqs = vec![
+            req_with(1, 0, None, None, 10),
+            req_with(2, 1, None, None, 10),
+        ];
         let cfg = PlanConfig {
             l2_ttl_seconds: Some(60),
             ..PlanConfig::default()

@@ -135,7 +135,9 @@ mod tests {
         let server = MockServer::start_async().await;
         let _m = server
             .mock_async(|when, then| {
-                when.method(GET).path("/v1/admin/plans").query_param("last", "10");
+                when.method(GET)
+                    .path("/v1/admin/plans")
+                    .query_param("last", "10");
                 then.status(200).json_body(json!([
                     { "plan_id": "abc", "projected_savings_usd": 1.23 }
                 ]));

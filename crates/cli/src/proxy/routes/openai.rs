@@ -54,8 +54,17 @@ pub async fn post_chat_completions(
                     .headers
                     .get("x-tokentrimmer-cache")
                     .and_then(|v| v.to_str().ok()),
-                suggested_route: None,
-                suggested_savings_usd: None,
+                suggested_route: preview_headers
+                    .as_ref()
+                    .and_then(|p| p.suggested_route.as_deref()),
+                suggested_savings_usd: preview_headers
+                    .as_ref()
+                    .and_then(|p| p.suggested_savings_usd),
+                realized_savings_usd: resp
+                    .headers
+                    .get("x-tokentrimmer-saved-usd")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok()),
                 trace_id: resp
                     .headers
                     .get("x-tokentrimmer-trace-id")

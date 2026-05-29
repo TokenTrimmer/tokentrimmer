@@ -27,8 +27,7 @@ pub fn cache_key(req: &ChatCompletionRequest) -> String {
     let canonical = build_canonical(req);
     // serde_json::to_vec with sorted keys is not built-in; we serialize our
     // carefully constructed Value whose keys are already in a defined order.
-    let bytes = serde_json::to_vec(&canonical)
-        .expect("canonical Value is always serializable");
+    let bytes = serde_json::to_vec(&canonical).expect("canonical Value is always serializable");
     let digest = Sha256::digest(&bytes);
     hex::encode(digest)
 }
@@ -48,8 +47,8 @@ fn build_canonical(req: &ChatCompletionRequest) -> serde_json::Value {
     use serde_json::{json, Value};
 
     // Serialize messages via serde so complex enum variants are handled correctly.
-    let messages: Value = serde_json::to_value(&req.messages)
-        .expect("messages always serializable");
+    let messages: Value =
+        serde_json::to_value(&req.messages).expect("messages always serializable");
 
     // Tools — empty vec becomes JSON null so it is omitted consistently.
     let tools: Value = if req.tools.is_empty() {
@@ -58,11 +57,11 @@ fn build_canonical(req: &ChatCompletionRequest) -> serde_json::Value {
         serde_json::to_value(&req.tools).expect("tools always serializable")
     };
 
-    let tool_choice: Value = serde_json::to_value(&req.tool_choice)
-        .expect("tool_choice always serializable");
+    let tool_choice: Value =
+        serde_json::to_value(&req.tool_choice).expect("tool_choice always serializable");
 
-    let response_format: Value = serde_json::to_value(&req.response_format)
-        .expect("response_format always serializable");
+    let response_format: Value =
+        serde_json::to_value(&req.response_format).expect("response_format always serializable");
 
     // Sort stop sequences for stability.
     let mut stop = req.stop.clone();

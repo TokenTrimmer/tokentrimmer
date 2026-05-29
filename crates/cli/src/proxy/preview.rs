@@ -153,14 +153,18 @@ mod tests {
     async fn fetch_returns_none_in_bypass_mode() {
         let cfg = make_cfg("http://nope".into(), Mode::Bypass, false);
         let body = json!({"model": "x", "messages": []}).to_string();
-        assert!(fetch(&reqwest::Client::new(), &cfg, body.as_bytes()).await.is_none());
+        assert!(fetch(&reqwest::Client::new(), &cfg, body.as_bytes())
+            .await
+            .is_none());
     }
 
     #[tokio::test]
     async fn fetch_returns_none_when_no_preview_flag() {
         let cfg = make_cfg("http://nope".into(), Mode::Gateway, true);
         let body = json!({"model": "x", "messages": []}).to_string();
-        assert!(fetch(&reqwest::Client::new(), &cfg, body.as_bytes()).await.is_none());
+        assert!(fetch(&reqwest::Client::new(), &cfg, body.as_bytes())
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -168,7 +172,9 @@ mod tests {
         let cfg = make_cfg("http://nope".into(), Mode::Gateway, false);
         // Missing `model` field.
         let body = json!({"messages": []}).to_string();
-        assert!(fetch(&reqwest::Client::new(), &cfg, body.as_bytes()).await.is_none());
+        assert!(fetch(&reqwest::Client::new(), &cfg, body.as_bytes())
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -187,7 +193,9 @@ mod tests {
             .await;
         let cfg = make_cfg(server.base_url(), Mode::Gateway, false);
         let body = json!({"model": "claude-sonnet-4-6", "messages": []}).to_string();
-        let result = fetch(&reqwest::Client::new(), &cfg, body.as_bytes()).await.unwrap();
+        let result = fetch(&reqwest::Client::new(), &cfg, body.as_bytes())
+            .await
+            .unwrap();
         assert_eq!(result.cost_usd, Some(0.000189));
         assert_eq!(result.suggested_route.as_deref(), Some("swap-to-haiku-4-5"));
     }
@@ -203,7 +211,9 @@ mod tests {
             .await;
         let cfg = make_cfg(server.base_url(), Mode::Gateway, false);
         let body = json!({"model": "x", "messages": []}).to_string();
-        assert!(fetch(&reqwest::Client::new(), &cfg, body.as_bytes()).await.is_none());
+        assert!(fetch(&reqwest::Client::new(), &cfg, body.as_bytes())
+            .await
+            .is_none());
     }
 
     #[test]

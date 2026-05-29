@@ -55,9 +55,7 @@ fn compiled_patterns() -> &'static Vec<(&'static str, Regex)> {
     COMPILED.get_or_init(|| {
         SECRET_PATTERNS
             .iter()
-            .map(|(label, pattern)| {
-                (*label, Regex::new(pattern).expect("invalid secret regex"))
-            })
+            .map(|(label, pattern)| (*label, Regex::new(pattern).expect("invalid secret regex")))
             .collect()
     })
 }

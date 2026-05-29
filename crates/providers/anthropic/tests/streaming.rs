@@ -138,7 +138,11 @@ async fn stream_happy_path() {
     }
 
     // Expected: message_start chunk + 3 text delta chunks + message_delta chunk = 5
-    assert!(chunks.len() >= 4, "expected at least 4 chunks, got {}", chunks.len());
+    assert!(
+        chunks.len() >= 4,
+        "expected at least 4 chunks, got {}",
+        chunks.len()
+    );
 
     // First chunk carries role=assistant.
     let first_delta = &chunks[0].choices[0].delta;
@@ -365,8 +369,13 @@ async fn stream_tool_use_input_json_accumulation() {
 
     // The last tool chunk's arguments should contain all the JSON.
     let last_tool_chunk = tool_chunks.last().unwrap();
-    let args = &last_tool_chunk.choices[0].delta.tool_calls[0].function.arguments;
-    assert!(args.contains("London"), "arguments should contain 'London', got: {args}");
+    let args = &last_tool_chunk.choices[0].delta.tool_calls[0]
+        .function
+        .arguments;
+    assert!(
+        args.contains("London"),
+        "arguments should contain 'London', got: {args}"
+    );
 
     // The message_delta chunk should have finish_reason = tool_calls.
     let finish_chunk = chunks

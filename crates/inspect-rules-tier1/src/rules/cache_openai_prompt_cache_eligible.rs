@@ -123,12 +123,7 @@ fn has_long_system_in_messages(block: &str) -> bool {
         // Look for content after the role key.
         let after_role = &block[role_pos..];
         // Find "content" key following the role.
-        let content_markers = [
-            "\"content\":",
-            "'content':",
-            "content:",
-            "content =",
-        ];
+        let content_markers = ["\"content\":", "'content':", "content:", "content ="];
         for cm in &content_markers {
             let Some(content_pos) = after_role.find(cm) else {
                 continue;

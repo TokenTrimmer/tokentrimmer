@@ -289,11 +289,7 @@ async fn l2_returns_highest_similarity_match() {
     let entry_exact = make_entry(org_id, unit_vec(0, 3));
     let entry_near = make_entry(
         org_id,
-        vec![
-            (1.0_f32 / 2.0_f32.sqrt()),
-            (1.0_f32 / 2.0_f32.sqrt()),
-            0.0,
-        ],
+        vec![(1.0_f32 / 2.0_f32.sqrt()), (1.0_f32 / 2.0_f32.sqrt()), 0.0],
     );
 
     let exact_id = entry_exact.id;
@@ -328,7 +324,11 @@ async fn mock_embedder_fixed_vec() {
     let embedder = mock_embedder(fixed.clone());
 
     // Call embed() with different inputs — all should return fixed_vec.
-    for input in ["hello", "world", "this is a much longer sentence with many words"] {
+    for input in [
+        "hello",
+        "world",
+        "this is a much longer sentence with many words",
+    ] {
         let result = embedder.embed(input).await.expect("embed should succeed");
         assert_eq!(
             result, fixed,
@@ -376,7 +376,10 @@ async fn postgres_l2_round_trip() {
     };
     let entry_id = entry.id;
 
-    cache.insert(entry).await.expect("Postgres insert should succeed");
+    cache
+        .insert(entry)
+        .await
+        .expect("Postgres insert should succeed");
 
     let result = cache
         .lookup(org_id, &embedding, 0.99)

@@ -138,7 +138,10 @@ async fn stream_happy_path() {
     assert_eq!(chunks.len(), 5, "expected 5 chunks, got {}", chunks.len());
 
     // First chunk has role delta.
-    assert_eq!(chunks[0].choices[0].delta.role.as_deref(), Some("assistant"));
+    assert_eq!(
+        chunks[0].choices[0].delta.role.as_deref(),
+        Some("assistant")
+    );
 
     // Second chunk has first content.
     assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("Hello"));
@@ -178,7 +181,11 @@ async fn stream_chunk_fragmentation() {
     // Two events that we will split manually in a unit style assertion,
     // but here we verify the HTTP round-trip correctly reconstitutes both events.
     let part1 = chunk_event("chatcmpl-2", "Frag", None);
-    let part2 = format!("{}{}", chunk_event("chatcmpl-2", "mented", Some("stop")), done_event());
+    let part2 = format!(
+        "{}{}",
+        chunk_event("chatcmpl-2", "mented", Some("stop")),
+        done_event()
+    );
 
     let sse_body = format!("{part1}{part2}");
 
@@ -206,10 +213,7 @@ async fn stream_chunk_fragmentation() {
         chunks[1].choices[0].delta.content.as_deref(),
         Some("mented")
     );
-    assert_eq!(
-        chunks[1].choices[0].finish_reason.as_deref(),
-        Some("stop")
-    );
+    assert_eq!(chunks[1].choices[0].finish_reason.as_deref(), Some("stop"));
 }
 
 // ---------------------------------------------------------------------------
@@ -366,8 +370,15 @@ async fn stream_midstream_malformed_json_continues() {
     // Should have received: "Before" chunk, one Deserialize error, "After" chunk.
     assert_eq!(chunks.len(), 2, "expected 2 valid chunks");
     assert_eq!(errors.len(), 1, "expected 1 deserialize error");
-    assert!(errors[0].contains("deserialize"), "error should mention deserialize: {}", errors[0]);
-    assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("Before"));
+    assert!(
+        errors[0].contains("deserialize"),
+        "error should mention deserialize: {}",
+        errors[0]
+    );
+    assert_eq!(
+        chunks[0].choices[0].delta.content.as_deref(),
+        Some("Before")
+    );
     assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("After"));
 }
 

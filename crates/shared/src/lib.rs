@@ -8,6 +8,7 @@ pub mod error;
 pub mod messages;
 pub mod pricing;
 pub mod provider;
+pub mod providers;
 pub mod usage;
 
 pub use context::RequestContext;

@@ -131,7 +131,12 @@ async fn smoke_429_rate_limited() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 5_000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 5_000
+            }
+        ),
         "expected RateLimited{{5000}}, got {err:?}"
     );
 }
@@ -179,7 +184,11 @@ fn provider_id_is_openrouter() {
 fn models_list_contains_expected_models() {
     let p = provider();
     let models = p.models();
-    assert_eq!(models.len(), 5, "expected 5 OpenRouter models in static set");
+    assert_eq!(
+        models.len(),
+        5,
+        "expected 5 OpenRouter models in static set"
+    );
 
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert!(ids.contains(&"anthropic/claude-sonnet-4-6"));

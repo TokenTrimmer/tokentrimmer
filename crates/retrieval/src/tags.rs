@@ -8,10 +8,9 @@ use crate::types::RetrievableTag;
 
 pub fn parse(text: &str) -> Result<Vec<RetrievableTag>, RetrievalError> {
     // Non-greedy match of the open tag + payload + close tag.
-    let re = Regex::new(
-        r#"(?ms)<retrievable\s+corpus="([^"]+)"(?:\s+k="(\d+)")?>(.*?)</retrievable>"#,
-    )
-    .map_err(|e| RetrievalError::Tag(e.to_string()))?;
+    let re =
+        Regex::new(r#"(?ms)<retrievable\s+corpus="([^"]+)"(?:\s+k="(\d+)")?>(.*?)</retrievable>"#)
+            .map_err(|e| RetrievalError::Tag(e.to_string()))?;
     let mut out = Vec::new();
     for m in re.captures_iter(text) {
         let full = m.get(0).unwrap();
@@ -35,8 +34,7 @@ mod tests {
 
     #[test]
     fn single_tag() {
-        let t =
-            parse(r#"Pre<retrievable corpus="docs" k="3">payload</retrievable>Post"#).unwrap();
+        let t = parse(r#"Pre<retrievable corpus="docs" k="3">payload</retrievable>Post"#).unwrap();
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].corpus, "docs");
         assert_eq!(t[0].k, 3);
@@ -50,7 +48,8 @@ mod tests {
 
     #[test]
     fn multiple_tags_in_order() {
-        let body = r#"a<retrievable corpus="x">1</retrievable>b<retrievable corpus="y">2</retrievable>c"#;
+        let body =
+            r#"a<retrievable corpus="x">1</retrievable>b<retrievable corpus="y">2</retrievable>c"#;
         let t = parse(body).unwrap();
         assert_eq!(t.len(), 2);
         assert!(t[0].span.0 < t[1].span.0);

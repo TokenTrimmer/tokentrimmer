@@ -22,9 +22,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use tt_shared::{
-    messages::{
-        ContentPart, Message, MessageContent, ToolCall, ToolCallFunction, ToolChoice,
-    },
+    messages::{ContentPart, Message, MessageContent, ToolCall, ToolCallFunction, ToolChoice},
     usage::Usage,
     ChatCompletionResponse, Choice, ProviderError,
 };
@@ -369,8 +367,8 @@ pub fn translate_request(
                     parts.extend(translate_user_content(c)?);
                 }
                 for tc in tool_calls {
-                    let args: serde_json::Value =
-                        serde_json::from_str(&tc.function.arguments).map_err(|e| {
+                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                        .map_err(|e| {
                             ProviderError::Deserialize(format!(
                                 "tool_call arguments not valid JSON: {e}"
                             ))
@@ -589,10 +587,7 @@ fn translate_response_format(
         None => (None, None),
         Some(fmt) => {
             if fmt.r#type == "json_schema" || fmt.r#type == "json_object" {
-                (
-                    Some("application/json".to_string()),
-                    fmt.json_schema,
-                )
+                (Some("application/json".to_string()), fmt.json_schema)
             } else {
                 (None, None)
             }
@@ -647,10 +642,7 @@ pub fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatCo
         .model_version
         .unwrap_or_else(|| requested_model.to_string());
 
-    let usage = resp
-        .usage_metadata
-        .map(translate_usage)
-        .unwrap_or_default();
+    let usage = resp.usage_metadata.map(translate_usage).unwrap_or_default();
 
     // Log bracket warning if prompt tokens exceed threshold.
     if usage.prompt_tokens > BRACKET_THRESHOLD_TOKENS {

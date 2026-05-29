@@ -138,6 +138,10 @@ struct StreamState {
     created: i64,
     /// Input tokens from `message_start`.
     input_tokens: u64,
+    /// Prompt-cache read tokens from `message_start` (billed at the cached rate).
+    cache_read_input_tokens: u64,
+    /// Prompt-cache creation tokens from `message_start`.
+    cache_creation_input_tokens: Option<u64>,
     /// Output tokens accumulated from `message_delta`.
     output_tokens: u64,
     /// The tool call currently being assembled (index → partial).
@@ -341,11 +345,9 @@ fn process_sse_event(event_bytes: &[u8], state: &mut Option<StreamState>) -> Sse
         "content_block_stop" => handle_content_block_stop(state),
         "message_delta" => handle_message_delta(data, state),
         "message_stop" => SseOutcome::Done,
-        "error" => {
-            SseOutcome::Err(ProviderError::Deserialize(format!(
-                "mid-stream error event: {data}"
-            )))
-        }
+        "error" => SseOutcome::Err(ProviderError::Deserialize(format!(
+            "mid-stream error event: {data}"
+        ))),
         _ => SseOutcome::Skip,
     }
 }
@@ -364,18 +366,18 @@ fn handle_message_start(data: &str, state: &mut Option<StreamState>) -> SseOutco
         }
     };
 
-    let input_tokens = ev
-        .message
-        .usage
-        .as_ref()
-        .map(|u| u.input_tokens)
-        .unwrap_or(0);
+    let usage = ev.message.usage.as_ref();
+    let input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0);
+    let cache_read_input_tokens = usage.and_then(|u| u.cache_read_input_tokens).unwrap_or(0);
+    let cache_creation_input_tokens = usage.and_then(|u| u.cache_creation_input_tokens);
 
     let new_state = StreamState {
         id: ev.message.id.clone(),
         model: ev.message.model.clone(),
         created: chrono::Utc::now().timestamp(),
         input_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
         output_tokens: 0,
         current_tool: None,
         stop_reason: None,
@@ -542,12 +544,15 @@ fn handle_message_delta(data: &str, state: &mut Option<StreamState>) -> SseOutco
         .map(translate::map_stop_reason)
         .map(str::to_string);
 
+    // Mirror the non-streaming `translate::translate_usage` mapping so streamed
+    // and non-streamed Claude calls report identical usage: cache reads surface
+    // as `cached_tokens` (billed at the cached rate) instead of being zeroed.
     let usage = Usage {
         prompt_tokens: st.input_tokens,
         completion_tokens: st.output_tokens,
         total_tokens: st.input_tokens + st.output_tokens,
-        cached_tokens: 0,
-        cache_creation_input_tokens: None,
+        cached_tokens: st.cache_read_input_tokens,
+        cache_creation_input_tokens: st.cache_creation_input_tokens,
     };
 
     let chunk = ChatCompletionChunk {
@@ -623,6 +628,8 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             created: 0,
             input_tokens: 10,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: None,
             output_tokens: 0,
             current_tool: None,
             stop_reason: None,
@@ -637,5 +644,30 @@ mod tests {
         let mut state = None;
         let outcome = process_sse_event(event, &mut state);
         assert!(matches!(outcome, SseOutcome::Done));
+    }
+
+    #[test]
+    fn message_delta_reports_cache_tokens_from_message_start() {
+        // Anthropic reports prompt-cache reads/creations in the `message_start`
+        // usage block. The terminal usage must surface them — previously
+        // `cached_tokens` was hardcoded to 0, zeroing cache savings on every
+        // streamed Claude call.
+        let start = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"role\":\"assistant\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":20}}}\n\n";
+        let mut state = None;
+        let _ = process_sse_event(start, &mut state);
+
+        let delta = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n";
+        let outcome = process_sse_event(delta, &mut state);
+        let chunk = if let SseOutcome::Chunk(c) = outcome {
+            c
+        } else {
+            panic!("expected terminal chunk from message_delta");
+        };
+        let usage = chunk.usage.expect("terminal chunk carries usage");
+        assert_eq!(
+            usage.cached_tokens, 80,
+            "cache reads must be reported, not zeroed"
+        );
+        assert_eq!(usage.cache_creation_input_tokens, Some(20));
     }
 }

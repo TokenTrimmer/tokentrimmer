@@ -12,7 +12,7 @@
 #
 # Deploy: `fly deploy`
 
-app            = "tokentrimmer-gateway"
+app            = "tokentrimmer"
 primary_region = "iad"
 
 [build]
@@ -22,6 +22,7 @@ primary_region = "iad"
   internal_port      = 8080
   force_https        = true
   # Gateway is always-on — sub-30ms p50 latency budget requires no cold starts.
+  # See ADR-016 in .claude/DECISIONS.md for the tradeoff vs scale-to-zero.
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1

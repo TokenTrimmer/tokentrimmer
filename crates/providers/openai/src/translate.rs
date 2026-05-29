@@ -154,9 +154,8 @@ pub fn extract_usage(raw: &Value) -> Result<Usage, ProviderError> {
     let usage_val = raw
         .get("usage")
         .ok_or_else(|| ProviderError::Deserialize("missing 'usage' field".to_string()))?;
-    let openai_usage: OpenAiUsage =
-        serde_json::from_value(usage_val.clone())
-            .map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+    let openai_usage: OpenAiUsage = serde_json::from_value(usage_val.clone())
+        .map_err(|e| ProviderError::Deserialize(e.to_string()))?;
     Ok(openai_usage.into())
 }
 

@@ -156,13 +156,23 @@ mod tests {
     fn map_429_with_retry_after() {
         let body = r#"{"error":{"message":"Rate limit exceeded","type":"requests","code":null,"param":null}}"#;
         let err = map_response_error(429, body, Some("5"));
-        assert!(matches!(err, ProviderError::RateLimited { retry_after_ms: 5000 }));
+        assert!(matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 5000
+            }
+        ));
     }
 
     #[test]
     fn map_429_without_retry_after() {
         let body = r#"{"error":{"message":"Rate limit exceeded","type":"requests","code":null,"param":null}}"#;
         let err = map_response_error(429, body, None);
-        assert!(matches!(err, ProviderError::RateLimited { retry_after_ms: 1000 }));
+        assert!(matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 1000
+            }
+        ));
     }
 }

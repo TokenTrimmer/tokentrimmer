@@ -3,9 +3,7 @@
 //! Tests exercise the full write + verify round-trip, chain linkage invariants,
 //! tamper detection, and multi-org isolation.
 
-use tt_telemetry::audit::{
-    Actor, AuditWriter, InMemoryAuditWriter, VerifyError, verify_chain,
-};
+use tt_telemetry::audit::{verify_chain, Actor, AuditWriter, InMemoryAuditWriter, VerifyError};
 use uuid::Uuid;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -76,7 +74,12 @@ async fn test_prev_hash_linkage() {
 
     for i in 0..4u32 {
         writer
-            .write(org, system(), format!("e{i}"), serde_json::json!({ "i": i }))
+            .write(
+                org,
+                system(),
+                format!("e{i}"),
+                serde_json::json!({ "i": i }),
+            )
             .await
             .expect("write should succeed");
     }
@@ -84,7 +87,8 @@ async fn test_prev_hash_linkage() {
     let entries = writer.list(org).await.expect("list should succeed");
     for i in 1..entries.len() {
         assert_eq!(
-            entries[i].prev_hash, entries[i - 1].hash,
+            entries[i].prev_hash,
+            entries[i - 1].hash,
             "entry {i} prev_hash must equal entry {} hash",
             i - 1
         );
@@ -120,7 +124,12 @@ async fn test_tamper_payload_mutation_detected() {
 
     for i in 0..3u32 {
         writer
-            .write(org, system(), format!("e{i}"), serde_json::json!({ "i": i }))
+            .write(
+                org,
+                system(),
+                format!("e{i}"),
+                serde_json::json!({ "i": i }),
+            )
             .await
             .expect("write should succeed");
     }
@@ -146,7 +155,12 @@ async fn test_tamper_prev_hash_mutation_detected() {
 
     for i in 0..3u32 {
         writer
-            .write(org, system(), format!("e{i}"), serde_json::json!({ "i": i }))
+            .write(
+                org,
+                system(),
+                format!("e{i}"),
+                serde_json::json!({ "i": i }),
+            )
             .await
             .expect("write should succeed");
     }
@@ -172,7 +186,12 @@ async fn test_tamper_signature_mutation_detected() {
 
     for i in 0..3u32 {
         writer
-            .write(org, system(), format!("e{i}"), serde_json::json!({ "i": i }))
+            .write(
+                org,
+                system(),
+                format!("e{i}"),
+                serde_json::json!({ "i": i }),
+            )
             .await
             .expect("write should succeed");
     }

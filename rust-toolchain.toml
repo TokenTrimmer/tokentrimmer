@@ -1,6 +1,6 @@
 [toolchain]
-# 1.85 is the floor: stable edition2024 lands here, and several recent
-# crates in the workspace dep tree require it. Bump in lockstep with CI.
-channel = "1.86.0"
+# 1.88 is the floor: `cargo-platform 0.3.2` (transitive through cargo-chef)
+# requires it. Bump in lockstep with CI and the Dockerfile chef stage.
+channel = "1.88.0"
 components = ["rustfmt", "clippy", "rust-src"]
 profile = "minimal"

@@ -282,7 +282,10 @@ impl L2Cache for PostgresL2Cache {
         .bind(entry.id)
         .bind(entry.org_id)
         .bind(vec)
-        .bind(serde_json::from_slice::<serde_json::Value>(&entry.response).map_err(CacheError::Serde)?)
+        .bind(
+            serde_json::from_slice::<serde_json::Value>(&entry.response)
+                .map_err(CacheError::Serde)?,
+        )
         .bind(&entry.model)
         .bind(entry.input_tokens as i64)
         .bind(entry.output_tokens as i64)
@@ -346,8 +349,7 @@ impl L2Cache for PostgresL2Cache {
         let expires_at: DateTime<Utc> = row.try_get("expires_at").map_err(CacheError::Sqlx)?;
         let similarity: f32 = row.try_get("similarity").map_err(CacheError::Sqlx)?;
 
-        let response_bytes =
-            serde_json::to_vec(&response_json).map_err(CacheError::Serde)?;
+        let response_bytes = serde_json::to_vec(&response_json).map_err(CacheError::Serde)?;
 
         let entry = CacheEntry {
             id,

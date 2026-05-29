@@ -31,6 +31,9 @@ pub struct LogLine<'a> {
     pub cache_layer: Option<&'a str>,
     pub suggested_route: Option<&'a str>,
     pub suggested_savings_usd: Option<f64>,
+    /// Realized savings the gateway reported on `x-tokentrimmer-saved-usd`
+    /// (cache discount + routing downgrade). Summed into the session rollup.
+    pub realized_savings_usd: Option<f64>,
     pub trace_id: Option<&'a str>,
 }
 
@@ -63,6 +66,7 @@ impl SessionLog {
             r.cache_hits += 1;
         }
         r.suggested_savings_usd += line.suggested_savings_usd.unwrap_or(0.0);
+        r.total_savings_usd += line.realized_savings_usd.unwrap_or(0.0);
         Ok(())
     }
 
@@ -95,12 +99,14 @@ mod tests {
             cache_layer: Some("hit-l1"),
             suggested_route: None,
             suggested_savings_usd: None,
+            realized_savings_usd: Some(0.0003),
             trace_id: Some("t"),
         })
         .unwrap();
         let r = log.snapshot();
         assert_eq!(r.requests, 1);
         assert_eq!(r.cache_hits, 1);
+        assert!((r.total_savings_usd - 0.0003).abs() < 1e-9);
         let body = std::fs::read_to_string(log.path()).unwrap();
         assert!(body.contains("claude-haiku-4-5"));
     }

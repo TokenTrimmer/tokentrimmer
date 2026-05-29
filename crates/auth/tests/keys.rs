@@ -23,9 +23,16 @@ async fn test_issue_verify_roundtrip_live() {
     let audit = InMemoryAuditWriter::new();
     let org_id = org();
 
-    let issued = issue(&store, &audit, org_id, "test key", Environment::Live, actor())
-        .await
-        .expect("issue should succeed");
+    let issued = issue(
+        &store,
+        &audit,
+        org_id,
+        "test key",
+        Environment::Live,
+        actor(),
+    )
+    .await
+    .expect("issue should succeed");
 
     let ctx = verify(&store, &issued.plaintext)
         .await
@@ -43,9 +50,16 @@ async fn test_issue_verify_roundtrip_test_env() {
     let audit = InMemoryAuditWriter::new();
     let org_id = org();
 
-    let issued = issue(&store, &audit, org_id, "sandbox key", Environment::Test, actor())
-        .await
-        .expect("issue should succeed");
+    let issued = issue(
+        &store,
+        &audit,
+        org_id,
+        "sandbox key",
+        Environment::Test,
+        actor(),
+    )
+    .await
+    .expect("issue should succeed");
 
     assert!(
         issued.plaintext.starts_with("tt_test_"),
@@ -254,7 +268,9 @@ async fn test_plaintext_format_live() {
     let hex_part = &issued.plaintext[8..];
     assert_eq!(hex_part.len(), 32, "hex portion must be 32 chars");
     assert!(
-        hex_part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        hex_part
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "hex portion must be lowercase hex digits"
     );
 }
@@ -298,9 +314,16 @@ async fn test_revoke_emits_audit_row_and_chain_verifies() {
     let org_id = org();
 
     // Issue then revoke.
-    let issued = issue(&store, &audit, org_id, "to-revoke", Environment::Live, actor())
-        .await
-        .expect("issue ok");
+    let issued = issue(
+        &store,
+        &audit,
+        org_id,
+        "to-revoke",
+        Environment::Live,
+        actor(),
+    )
+    .await
+    .expect("issue ok");
     revoke_key(&store, &audit, org_id, issued.record.id, actor())
         .await
         .expect("revoke ok");

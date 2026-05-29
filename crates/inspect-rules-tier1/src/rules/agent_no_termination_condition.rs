@@ -120,9 +120,7 @@ impl Rule for AgentNoTerminationConditionRule {
         };
 
         // Check for termination safeguards in the entire file.
-        let has_termination = TERMINATION_PATTERNS
-            .iter()
-            .any(|p| source.contains(p));
+        let has_termination = TERMINATION_PATTERNS.iter().any(|p| source.contains(p));
         if has_termination {
             return vec![];
         }

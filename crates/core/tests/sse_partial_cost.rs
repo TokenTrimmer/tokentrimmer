@@ -129,6 +129,12 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
             cached_input_per_million: None,
             effective_at: chrono::Utc::now(),
         }),
+        baseline_pricing: Some(ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 6.0,
+            cached_input_per_million: None,
+            effective_at: chrono::Utc::now(),
+        }),
         route_id: None,
         tag: None,
         request_started: std::time::Instant::now(),
@@ -239,6 +245,54 @@ async fn sse_clean_completion_writes_row_with_truncated_false_and_authoritative_
     );
     assert_eq!(row.input_tokens, 20);
     assert_eq!(row.cached_tokens, 0);
+}
+
+// ─── Test 4: routed stream prices baseline against the original model ─────────
+
+#[tokio::test]
+async fn sse_routed_stream_logs_baseline_against_original_model() {
+    // A streamed request that was routed gpt-4o → gpt-4o-mini must log a
+    // baseline priced against the ORIGINAL (expensive) model, so the row shows
+    // the real routing saving. Before the fix the drop guard priced baseline
+    // against `pricing` (the cheap routed model) → baseline == cost → saving 0.
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+
+    let cheap = ModelPricing {
+        input_per_million: 0.15,
+        output_per_million: 0.6,
+        cached_input_per_million: None,
+        effective_at: chrono::Utc::now(),
+    };
+    let expensive = ModelPricing {
+        input_per_million: 5.0,
+        output_per_million: 15.0,
+        cached_input_per_million: None,
+        effective_at: chrono::Utc::now(),
+    };
+    let mut ctx = make_log_ctx(Arc::clone(&writer));
+    ctx.model = "gpt-4o-mini".into();
+    ctx.pricing = Some(cheap);
+    ctx.baseline_pricing = Some(expensive);
+    ctx.route_id = Some(Uuid::now_v7());
+
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("hi")), Ok(finish_chunk(42))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(stream, &provider, Uuid::nil(), Some(ctx));
+    drain_response(response).await;
+    wait_for_rows(&writer, 1).await;
+
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(
+        row.baseline_cost_usd > row.cost_usd,
+        "routed stream baseline ({}) should exceed routed cost ({})",
+        row.baseline_cost_usd,
+        row.cost_usd
+    );
 }
 
 // ─── Test 3: zero-chunk immediate abort ──────────────────────────────────────

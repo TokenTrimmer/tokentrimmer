@@ -165,10 +165,7 @@ fn translate_long_system_gets_cache_control() {
 
 #[test]
 fn translate_short_system_no_cache_control() {
-    let messages = vec![
-        system_text("Be helpful."),
-        user_text("Hi"),
-    ];
+    let messages = vec![system_text("Be helpful."), user_text("Hi")];
 
     let req = make_request("claude-sonnet-4-6", messages);
     let body = translate_request(req).expect("translate ok");
