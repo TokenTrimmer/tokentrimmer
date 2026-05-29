@@ -95,6 +95,17 @@ Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 | Session rollup math | `crates/cli/src/proxy/session.rs` + `crates/cli/src/proxy/tui.rs` |
 | Spec | `docs/superpowers/specs/2026-05-28-trackB-claude-code-codex-proxy-design.md` |
 
+### tt retrieval (RAG)
+
+| If you're doing | Read |
+|---|---|
+| Chunking strategy | `crates/retrieval/src/chunking.rs` |
+| Embedding model swap | `crates/retrieval/src/embed.rs::EmbeddingClient` |
+| Custom store backend | `crates/retrieval/src/store/mod.rs::RetrievalStore` trait |
+| Tag parser | `crates/retrieval/src/tags.rs` |
+| Substitution orchestrator | `crates/retrieval/src/substitute.rs` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackE-rag-context-compression-design.md` |
+
 ---
 
 ## Cross-cutting concerns
