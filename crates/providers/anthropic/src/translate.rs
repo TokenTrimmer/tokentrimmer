@@ -491,7 +491,10 @@ pub fn translate_usage(u: AnthropicUsage) -> Usage {
     // `input_tokens` EXCLUSIVE of cache reads, so add them back — otherwise
     // compute_cost bills only the fresh tokens and drops the cache-read cost.
     let cached = u.cache_read_input_tokens.unwrap_or(0);
-    let prompt_tokens = u.input_tokens + cached;
+    let created = u.cache_creation_input_tokens.unwrap_or(0);
+    // Full prompt = fresh input + cache reads + cache creation, so total_tokens
+    // reflects the real prompt size and total == prompt + completion holds.
+    let prompt_tokens = u.input_tokens + cached + created;
     Usage {
         prompt_tokens,
         completion_tokens: u.output_tokens,
@@ -691,11 +694,11 @@ mod tests {
             cache_read_input_tokens: Some(80),
         };
         let usage = translate_usage(u);
-        // OpenAI subset convention: prompt_tokens INCLUDES cache reads (100+80),
-        // cached_tokens is the cache-read subset.
-        assert_eq!(usage.prompt_tokens, 180);
+        // prompt_tokens is the FULL input: fresh + cache reads + cache creation
+        // (100 + 80 + 20 = 200); cached_tokens is the cache-read subset.
+        assert_eq!(usage.prompt_tokens, 200);
         assert_eq!(usage.completion_tokens, 50);
-        assert_eq!(usage.total_tokens, 230);
+        assert_eq!(usage.total_tokens, 250);
         assert_eq!(usage.cached_tokens, 80);
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
     }
