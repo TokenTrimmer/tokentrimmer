@@ -485,12 +485,18 @@ pub fn map_stop_reason(stop_reason: &str) -> &'static str {
 
 /// Convert [`AnthropicUsage`] into canonical [`Usage`].
 pub fn translate_usage(u: AnthropicUsage) -> Usage {
-    let total = u.input_tokens + u.output_tokens;
+    // OpenAI subset convention (what `tt-core::compute_cost` assumes):
+    // `prompt_tokens` is the TOTAL input INCLUDING cache reads, and
+    // `cached_tokens` is the cache-read subset. Anthropic reports
+    // `input_tokens` EXCLUSIVE of cache reads, so add them back — otherwise
+    // compute_cost bills only the fresh tokens and drops the cache-read cost.
+    let cached = u.cache_read_input_tokens.unwrap_or(0);
+    let prompt_tokens = u.input_tokens + cached;
     Usage {
-        prompt_tokens: u.input_tokens,
+        prompt_tokens,
         completion_tokens: u.output_tokens,
-        total_tokens: total,
-        cached_tokens: u.cache_read_input_tokens.unwrap_or(0),
+        total_tokens: prompt_tokens + u.output_tokens,
+        cached_tokens: cached,
         cache_creation_input_tokens: u.cache_creation_input_tokens,
     }
 }
@@ -685,9 +691,11 @@ mod tests {
             cache_read_input_tokens: Some(80),
         };
         let usage = translate_usage(u);
-        assert_eq!(usage.prompt_tokens, 100);
+        // OpenAI subset convention: prompt_tokens INCLUDES cache reads (100+80),
+        // cached_tokens is the cache-read subset.
+        assert_eq!(usage.prompt_tokens, 180);
         assert_eq!(usage.completion_tokens, 50);
-        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.total_tokens, 230);
         assert_eq!(usage.cached_tokens, 80);
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
     }

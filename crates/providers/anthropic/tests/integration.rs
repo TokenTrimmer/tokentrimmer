@@ -105,9 +105,10 @@ async fn success_200_with_cached_tokens() {
         .expect("should succeed");
 
     assert_eq!(resp.id, "msg_01abc");
-    assert_eq!(resp.usage.prompt_tokens, 10);
+    // prompt_tokens INCLUDES cache reads (10 fresh + 80 cached = 90).
+    assert_eq!(resp.usage.prompt_tokens, 90);
     assert_eq!(resp.usage.completion_tokens, 5);
-    assert_eq!(resp.usage.total_tokens, 15);
+    assert_eq!(resp.usage.total_tokens, 95);
     assert_eq!(resp.usage.cached_tokens, 80);
     assert_eq!(resp.usage.cache_creation_input_tokens, Some(20));
     assert_eq!(resp.choices.len(), 1);

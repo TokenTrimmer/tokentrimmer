@@ -545,12 +545,14 @@ fn handle_message_delta(data: &str, state: &mut Option<StreamState>) -> SseOutco
         .map(str::to_string);
 
     // Mirror the non-streaming `translate::translate_usage` mapping so streamed
-    // and non-streamed Claude calls report identical usage: cache reads surface
-    // as `cached_tokens` (billed at the cached rate) instead of being zeroed.
+    // and non-streamed Claude calls report identical usage: prompt_tokens
+    // INCLUDES cache reads (OpenAI subset convention) and cached_tokens is the
+    // cache-read subset — instead of input_tokens-only with cache reads zeroed.
+    let prompt_tokens = st.input_tokens + st.cache_read_input_tokens;
     let usage = Usage {
-        prompt_tokens: st.input_tokens,
+        prompt_tokens,
         completion_tokens: st.output_tokens,
-        total_tokens: st.input_tokens + st.output_tokens,
+        total_tokens: prompt_tokens + st.output_tokens,
         cached_tokens: st.cache_read_input_tokens,
         cache_creation_input_tokens: st.cache_creation_input_tokens,
     };
@@ -669,5 +671,7 @@ mod tests {
             "cache reads must be reported, not zeroed"
         );
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
+        // prompt_tokens INCLUDES cache reads (10 fresh + 80 cached = 90).
+        assert_eq!(usage.prompt_tokens, 90);
     }
 }

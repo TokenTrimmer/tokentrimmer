@@ -365,9 +365,10 @@ fn usage_round_trip_with_cache_fields() {
 
     let usage = translate_usage(u);
 
-    assert_eq!(usage.prompt_tokens, 200);
+    // prompt_tokens INCLUDES cache reads (200 + 150); cached_tokens is the subset.
+    assert_eq!(usage.prompt_tokens, 350);
     assert_eq!(usage.completion_tokens, 80);
-    assert_eq!(usage.total_tokens, 280);
+    assert_eq!(usage.total_tokens, 430);
     assert_eq!(usage.cached_tokens, 150);
     assert_eq!(usage.cache_creation_input_tokens, Some(50));
 }
