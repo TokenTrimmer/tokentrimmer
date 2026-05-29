@@ -19,7 +19,32 @@ The second-most-important gap is **presentation**: the marketing site is a liter
 
 ---
 
+## Implementation status — updated 2026-05-29
+
+Since this review was written, **20 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now largely closed.
+
+**✅ Shipped this session**
+- _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
+- _Gateway:_ `registry-model-passthrough` (unlisted models dispatch, no 404), `streaming-client-timeout` (read-idle), `openai-reasoning-stream-unblock`
+- _Moment-of-use:_ `fix-proxy-savings-banner`, `stream-cost-headers` (terminal `tokentrimmer.usage` event), `live-cli-savings-ticker`
+- _Headline feature:_ **`budget-caps-quota`** — per-org monthly spend cap + per-minute rate, enforced in auth middleware → 429 + `X-TT-Budget-Remaining-Usd`
+- _Inspect / quality:_ `inspect-5-missing-rules` (15/15 P0 rules now ship), `preview-pricing-all-providers`, `retrieval-orgid-isolation`
+- _Docs / hygiene:_ `getting-started-guide` (`GETTING_STARTED.md`), `docs-readme-quickstart-fix`, `kdf-doc-align`, `workspace-lints-align`, `perms-least-privilege-cleanup`, `.gitignore` hardening
+- _Ops:_ `cloud-repo-remote` — cloud monorepo baselined + pushed to private `TokenTrimmer/cloud`
+
+**◻ Remaining — public, doable:** `wire-l2-cache-production` (P0), `retry-fallback-layer` (P1), `pricing-externalize` (P1), `provider-failover`, `cost-diff-ci-lint`, `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
+
+**◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `marketing-site-build`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore`, `cloud-backlog-sync`
+
+**◻ Remaining — human-gated:** `env-secret-split-rotate` (rotate the live keys read this session; prod secrets → `fly secrets`)
+
+The §6 / §7 checklists below are annotated `✅` where shipped.
+
+---
+
 ## 2. Does it actually save tokens? — The savings reality
+
+> **Update (2026-05-29):** the measurement gaps below are now largely **fixed** — routing `saved_usd` is priced against the original model, Anthropic prompt-cache usage is mapped correctly (non-stream + stream), and streaming responses emit a terminal `tokentrimmer.usage` event. So the **provable** savings now approach the **delivered** savings. The one remaining true gap is **L2 semantic cache, still unwired in production** (`wire-l2-cache-production`). The original analysis below is preserved for context.
 
 **This is the question that matters most, so it goes first.** Here is the honest mechanism-by-mechanism scorecard, traced through real code:
 
@@ -77,6 +102,8 @@ Until the fixes land, the defensible public claim is: **"15–30% measured savin
 ## 4. The critical path — what to work on next (ranked)
 
 If you do nothing else, do these, in this order. The first cluster makes the product **provably** save money; the second makes it **look** like the premium product it is; the third unblocks the launch chain.
+
+> **Status (2026-05-29):** clusters 1, 2 and 4 below are **done** — the savings-measurement fixes, moment-of-use surfacing, and the cloud-repo unblock all shipped (see the Implementation-status section above). The big remaining piece is cluster 3 (**design/marketing — cloud repo**), plus `wire-l2-cache-production` and `env-secret-split-rotate`.
 
 1. **Prove the savings you already deliver** (small, surgical, highest ROI):
    - `fix-routing-baseline-savings` — price baseline against the *original* model. **(P0, S)**
@@ -189,43 +216,43 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 > Fixes to things that already exist — correctness, measurement, docs, security. Roughly ordered by leverage.
 
 **Savings correctness (make the mission provable)**
-- [x] `fix-routing-baseline-savings` **[P0/S]** — ✅ _shipped 2026-05-29._ Baseline now priced against the original requested model (captured before `apply_routing`), non-stream **and** streaming paths; `route_rewrite.rs` + `sse_partial_cost.rs` assert `saved_usd>0` on downgrade. _(`chat.rs`, `sse.rs`)_
-- [x] `fix-anthropic-stream-cached-tokens` **[P0/S]** — ✅ _shipped 2026-05-29._ `cache_read/creation` threaded through `StreamState`; streamed Claude calls report real `cached_tokens` (test `message_delta_reports_cache_tokens_from_message_start`). _(`stream.rs`)_
-- [ ] `wire-l2-cache-production` **[P0/M]** — attach L2 in the CLI gateway behind a flag + real per-row baseline, or remove L2 from "live features." _(`cli/main.rs`, `state.rs:111`, `chat.rs:583-590`)_
-- [ ] `fix-anthropic-cache-usage-mapping` **[P1/S]** — `prompt_tokens = input + cache_read`; add a cache-read cost test. _(`translate.rs:489-498`)_ — _still open; streaming now mirrors non-stream, but both share this convention gap._
-- [ ] `fee-multiplier-apply` **[P1/S]** — apply OpenRouter's 5% fee in `compute_cost` (or drop the field). _(`compat.rs`, `chat.rs:640-667`)_
-- [ ] `anthropic-total-tokens-fix` **[P2/S]** — include cache tokens in `total_tokens`. _(`translate.rs:489-498`)_
-- [ ] `preview-pricing-all-providers` **[P3/S]** — probe all 8 provider pricing tables. _(`preview/src/pricing.rs:18-41`)_
+- [x] `fix-routing-baseline-savings` **[P0/S]** ✅ — baseline priced against the original requested model (non-stream + streaming); asserts `saved_usd>0` on downgrade.
+- [x] `fix-anthropic-stream-cached-tokens` **[P0/S]** ✅ — `cache_read/creation` threaded through `StreamState`; streamed Claude calls report real `cached_tokens`.
+- [ ] `wire-l2-cache-production` **[P0/M]** — attach L2 in the CLI gateway behind a flag + real per-row baseline, or remove L2 from "live features." **(still open — the one real measurement gap left.)** _(`cli/main.rs`, `state.rs`, `chat.rs`)_
+- [x] `fix-anthropic-cache-usage-mapping` **[P1/S]** ✅ — `prompt_tokens = input + cache_read (+ creation)`; cost/savings now correct (`669506c`, `5a53298`).
+- [x] `fee-multiplier-apply` **[P1/S]** ✅ — `Provider::fee_multiplier()` applied to cost+baseline; OpenRouter 5% BYOK (`cb0909b`).
+- [x] `anthropic-total-tokens-fix` **[P2/S]** ✅ — cache-creation folded into `prompt_tokens`/`total_tokens` (`5a53298`).
+- [x] `preview-pricing-all-providers` **[P3/S]** ✅ — `lookup()` probes all compat providers (`7d6e226`).
 
 **Moment-of-use visibility**
-- [x] `fix-proxy-savings-banner` **[P1/S]** — ✅ _shipped 2026-05-29._ Both handlers now populate `LogLine` from preview headers + read `x-tokentrimmer-saved-usd` into a new `realized_savings_usd`; `session.rs` sums it into `total_savings_usd`; `tui.rs` prints "Saved (realized)" instead of the `total_cost × hit_rate` heuristic. Test `anthropic_route_records_realized_savings_from_header`. _(`proxy/routes/{anthropic,openai}.rs`, `session.rs`, `tui.rs`)_
-- [ ] `stream-cost-headers` **[P1/M]** — emit a terminal `tokentrimmer.usage` SSE event with cost/saved before `[DONE]`. _(`sse.rs:364-373`)_
+- [x] `fix-proxy-savings-banner` **[P1/S]** ✅ — banner shows real realized savings (was `$0.0000`).
+- [x] `stream-cost-headers` **[P1/M]** ✅ — terminal `tokentrimmer.usage` SSE event before `[DONE]` (`deec5bf`).
 
 **Gateway correctness / resilience**
-- [ ] `registry-model-passthrough` **[P0/M]** — fall back to `infer_provider → by_id` so valid unlisted models don't 404. _(`registry.rs`, `chat.rs:71-77`)_
-- [ ] `retry-fallback-layer` **[P1/M]** — wire `is_retriable`/`is_fallback_eligible` into a backoff+fallback policy. _(`error.rs:39-60`, `chat.rs:309`)_
-- [ ] `streaming-client-timeout` **[P1/S]** — separate streaming client so 120s total timeout doesn't cut long streams; honor or drop `deadline`. _(`client.rs:13-27`)_
-- [ ] `openai-reasoning-stream-unblock` **[P3/S]** — remove the stale o3/o4-mini streaming guard. _(`stream.rs:75-80`)_
+- [x] `registry-model-passthrough` **[P0/M]** ✅ — `registry.resolve()` falls back to `infer_provider → by_id` (`9317b76`).
+- [ ] `retry-fallback-layer` **[P1/M]** — wire `is_retriable`/`is_fallback_eligible` into a backoff+fallback policy. _(`error.rs`, `chat.rs`)_
+- [x] `streaming-client-timeout` **[P1/S]** ✅ — read-idle timeout so long streams aren't cut at 120s (`05e048e`).
+- [x] `openai-reasoning-stream-unblock` **[P3/S]** ✅ — o3/o4-mini stream; `Streaming` capability added (`a60f1ff`).
 
 **Plan correctness**
-- [ ] `plan-cache-savings-wire` **[P1/M]** — zero per-request cost on projected cache hits. _(`replay.rs:189-224`)_
-- [ ] `plan-latency-projection` **[P1/M]** — project latency from per-model history or mark "not projected." _(`replay.rs:191`)_
-- [ ] `plan-reconciliation-trustscore` **[P1/L]** — build the projected-vs-actual reconcile loop feeding the trust score.
+- [x] `plan-cache-savings-wire` **[P1/M]** ✅ — projected cache hits zero per-request cost (`fbeafd0`).
+- [x] `plan-latency-projection` **[P1/M]** ✅ — latency projected from the target model's window history (`7c3c2ec`).
+- [ ] `plan-reconciliation-trustscore` **[P1/L]** — projected-vs-actual reconcile loop feeding the trust score. **(cloud-side — deferred.)**
 
 **Security & hygiene**
-- [ ] `env-secret-split-rotate` **[P1/M]** — split dev/prod secret sets; prod only in `fly secrets`; rotate `TT_MASTER_KEY`/`TT_ADMIN_TOKEN`/Fly/Stripe (read into this env).
-- [ ] `retrieval-orgid-isolation` **[P1/S]** — thread real `org_id` from `ApiKeyContext`; add isolation test. _(`retrieval.rs:159-163`)_
-- [ ] `kdf-doc-align` **[P3/S]** — call it SHA-256 KDF everywhere, or switch to real HKDF.
+- [ ] `env-secret-split-rotate` **[P1/M]** — **needs you:** split dev/prod secret sets; prod only in `fly secrets`; rotate `TT_MASTER_KEY`/`TT_ADMIN_TOKEN`/Fly/Stripe (read into this env).
+- [x] `retrieval-orgid-isolation` **[P1/S]** ✅ — real `org_id` from `ApiKeyContext`; cross-org isolation test (`8e43137`).
+- [x] `kdf-doc-align` **[P3/S]** ✅ — corrected to "SHA-256 KDF" (`38a7faf`).
 
 **Docs & onboarding**
-- [x] `getting-started-guide` **[P1]** — `GETTING_STARTED.md` created this session.
-- [ ] `docs-readme-quickstart-fix` **[P1/S]** — real Docker image + env-only config; one Rust version (1.88); fix `examples/` claim. _(`README.md:24-46,77`)_
-- [ ] `link-getting-started-from-readme` **[P1/XS]** — add a prominent link.
+- [x] `getting-started-guide` **[P1]** ✅ — `GETTING_STARTED.md`.
+- [x] `docs-readme-quickstart-fix` **[P1/S]** ✅ — real image + env config, Rust 1.88, `examples/` fixed (`58a0d01`).
+- [x] `link-getting-started-from-readme` **[P1/XS]** ✅ — prominent link added in `58a0d01`.
 
 **Backlog hygiene / unblocks**
-- [ ] `cloud-repo-remote` **[P0/S]** — create private GitHub repo + push; unblocks ~10 P0 launch gates.
-- [ ] `cloud-backlog-sync` **[P1/S]** — flip ~9 already-shipped cloud items to `[x]`.
-- [x] `perms-least-privilege-cleanup` **[P1]** — `settings.local.json` tightened this session (§9).
+- [x] `cloud-repo-remote` **[P0/S]** ✅ — cloud baseline committed + pushed to private `TokenTrimmer/cloud`; unblocks the launch gates.
+- [ ] `cloud-backlog-sync` **[P1/S]** — flip ~9 already-shipped cloud items to `[x]`. **(cloud repo.)**
+- [x] `perms-least-privilege-cleanup` **[P1]** ✅ — `settings.local.json` tightened (§9).
 
 ---
 
@@ -243,7 +270,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 - [ ] [P3] [docs-site-theme] astro-page-builder: Theme Starlight to brand + land docs content sync. (est: ~$0.50)
 
 ### Cost-layer capabilities (the mission) — _public + cloud_
-- [ ] [P1] [budget-caps-quota] rust-crate-builder: Spend/quota enforcement primitive (per-org monthly cap + per-minute window) in auth middleware → 429 + `X-TT-Budget-Remaining`; org-agnostic trait + in-memory impl in public, Postgres limits in cloud. Foundational for tier caps AND a headline "hard spend cap" feature. (est: ~$1.50)
+- [x] [P1] [budget-caps-quota] ✅ **shipped `afc7f68`** — `BudgetEnforcer` trait + `InMemoryBudgetEnforcer` in tt-core; per-org monthly cap + per-minute rate; auth middleware → 429 + `X-TT-Budget-Remaining-Usd` + `Retry-After`; record in chat handler + SSE guard. Postgres-backed limits remain a cloud follow-up.
 - [ ] [P2] [provider-failover] rust-crate-builder: Ordered fallback chain + per-provider circuit breaker in `crates/routing` (primary → fallback on 429/5xx). Turns "cost layer" into "cost + reliability layer." (est: ~$1.20)
 - [ ] [P2] [alert-dispatcher-slack] rust-crate-builder: Outbound webhook + Slack sink firing on budget thresholds (50/80/100%), `anomaly.detected`, reconciliation drift >2%. Reuses existing signals. (est: ~$0.80)
 - [ ] [P2] [cost-diff-ci-lint] rust-crate-builder: `tt inspect --cost-diff` (or extend the GitHub Action) estimating projected per-call cost change of a PR's LLM-call edits, posted as a check-run. Reuses `crates/preview`; no cloud dep. A sticky surface no competitor occupies. (est: ~$1.00)
@@ -251,11 +278,11 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 
 ### Value visualization
 - [ ] [P2] [savings-badge] rust-crate-builder: `GET /v1/badges/savings?org_id&expires&sig` SVG via the existing HMAC signed-URL plumbing; "$X saved this month" README/Slack badge + copy snippet on /reports. (est: ~$0.40)
-- [ ] [P2] [live-cli-savings-ticker] rust-crate-builder: Rewriting stderr status line in `tt proxy` (gated by `--no-tui`): `tt · N req · $X saved · Y% cached`. (est: ~$0.50)
+- [x] [P2] [live-cli-savings-ticker] ✅ **shipped `7bcaea2`** — rewriting stderr status line in `tt proxy`: `tt · N req · $X saved · Y% cached`.
 - [ ] [P3] [forgone-savings-view] rust-crate-builder: Aggregate preview `suggested_savings_usd` into a "potential additional savings" card (after the banner fix). (est: ~$0.60)
 
 ### Inspect & Plan depth — _public_
-- [ ] [P1] [inspect-5-missing-rules] inspect-rule-author: Implement the 5 documented-but-missing P0 rules (`model-deprecated`, `prompt-bloated-system`, `prompt-verbose-few-shot`, `prompt-no-output-constraint`, `config-agents-md-too-long`). (est: ~$1.00)
+- [x] [P1] [inspect-5-missing-rules] ✅ **shipped `e168859`** — all 5 (`model-deprecated`, `prompt-bloated-system`, `prompt-verbose-few-shot`, `prompt-no-output-constraint`, `config-agents-md-too-long`) + fixtures; 15/15 P0 rules now ship.
 - [ ] [P1] [inspect-corpora-seed] rust-crate-builder: Vendor 5–10 pinned permissive OSS LLM samples into `corpora/` (independent of rule author), run `measure-fp-rate.sh`, record per-rule precision/recall. Unblocks the w24 FP gate. (est: ~$0.50)
 - [ ] [P2] [inspect-ast-migration] inspect-rule-author: Migrate the structural rules (cache_control/max_tokens/model-arg/loop-termination) from regex to the existing tree-sitter harness + a rule-level AST cache. (est: ~$1.20)
 - [ ] [P2] [inspect-new-rules] inspect-rule-author: `cache-anthropic-tools-not-cached`, `output-n-greater-than-one`, `model-reasoning-effort-default-high`, `prompt-dynamic-prefix-breaks-cache`. (est: ~$0.80)
@@ -265,7 +292,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 - [ ] [P2] [token-estimator-shared] rust-crate-builder: Extract `tt-tokenize` (tiktoken) shared by preview, dispatch, routing so routing rewrites use the accurate estimate. (est: ~$0.60)
 - [ ] [P2] [compat-crate-split] rust-crate-builder: Split `OpenAICompatibleProvider` into `tt-provider-compat`; make registry registration config-aware; sort `/v1/models`. (est: ~$0.80)
 - [ ] [P2] [hnsw-org-recall] rust-crate-builder: Fix L2 recall under multi-tenant load (tune `ef_search` for org-filtered query or partition `cache_entries` by org); add a recall regression test. (est: ~$0.80)
-- [ ] [P3] [workspace-lints-align] rust-crate-builder: Add `[workspace.lints]` to public mirroring cloud; keep axum/hyper out of shared crates (cargo-deny ban); align tokio/uuid pins. (est: ~$0.30)
+- [x] [P3] [workspace-lints-align] ✅ **shipped `6d99465`** — `[workspace.lints]` (forbid unsafe, deny `uninlined_format_args`) propagated to all 23 crates, mirroring cloud. (axum/hyper-out-of-shared remains a convention — not cleanly a cargo-deny ban.)
 
 ---
 
