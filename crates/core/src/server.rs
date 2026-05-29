@@ -25,6 +25,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/models", get(routes::models::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))
+        .route("/v1/preview", axum::routing::post(crate::routes::preview::post_preview))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth::middleware,
+        ))
         .layer(axum::middleware::from_fn(middleware::trace::middleware))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(

@@ -9,6 +9,7 @@ description = "Axum HTTP server, routing engine, middleware, and provider regist
 [dependencies]
 tt-shared.workspace = true
 tt-cache.workspace = true
+tt-preview.workspace = true
 tt-routing.workspace = true
 tt-auth.workspace = true
 tt-telemetry.workspace = true
