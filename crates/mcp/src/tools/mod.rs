@@ -17,18 +17,30 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn new() -> Self { Self { tools: Vec::new() } }
-    pub fn register(&mut self, t: Box<dyn Tool>) { self.tools.push(t); }
-    pub fn list(&self) -> Vec<ToolDef> { self.tools.iter().map(|t| t.def()).collect() }
+    pub fn new() -> Self {
+        Self { tools: Vec::new() }
+    }
+    pub fn register(&mut self, t: Box<dyn Tool>) {
+        self.tools.push(t);
+    }
+    pub fn list(&self) -> Vec<ToolDef> {
+        self.tools.iter().map(|t| t.def()).collect()
+    }
     pub async fn call(&self, name: &str, params: Value) -> Result<Value, McpError> {
         for t in &self.tools {
-            if t.def().name == name { return t.call(params).await; }
+            if t.def().name == name {
+                return t.call(params).await;
+            }
         }
         Err(McpError::MethodNotFound(format!("tool {name}")))
     }
 }
 
-impl Default for Registry { fn default() -> Self { Self::new() } }
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub mod find_route_for;
 pub mod inspect_diff;

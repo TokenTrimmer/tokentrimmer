@@ -24,13 +24,22 @@ pub struct JsonRpcResponse {
 
 impl JsonRpcResponse {
     pub fn ok(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0", result: Some(result), error: None, id }
+        Self {
+            jsonrpc: "2.0",
+            result: Some(result),
+            error: None,
+            id,
+        }
     }
     pub fn err(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0",
             result: None,
-            error: Some(JsonRpcError { code, message: message.into(), data: None }),
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
             id,
         }
     }

@@ -14,7 +14,10 @@ pub struct Server {
 
 impl Server {
     pub fn new() -> Self {
-        Self { tools: ToolRegistry::new(), resources: ResourceRegistry::new() }
+        Self {
+            tools: ToolRegistry::new(),
+            resources: ResourceRegistry::new(),
+        }
     }
     pub async fn dispatch(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         let id = req.id.clone();
@@ -38,17 +41,25 @@ impl Server {
     }
 
     async fn tools_call(&self, params: Value) -> Result<Value, McpError> {
-        let name = params.get("name").and_then(|v| v.as_str())
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::InvalidParams("missing tool name".into()))?;
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
         self.tools.call(name, args).await
     }
 
     async fn resources_read(&self, params: Value) -> Result<Value, McpError> {
-        let uri = params.get("uri").and_then(|v| v.as_str())
+        let uri = params
+            .get("uri")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::InvalidParams("missing uri".into()))?;
         self.resources.read(uri).await
     }
 }
 
-impl Default for Server { fn default() -> Self { Self::new() } }
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
+    }
+}

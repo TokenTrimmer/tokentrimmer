@@ -17,12 +17,18 @@ mod tests {
 
     #[test]
     fn rejects_missing_key() {
-        assert!(matches!(validate_api_key(None).unwrap_err(), McpError::Unauthorized(_)));
+        assert!(matches!(
+            validate_api_key(None).unwrap_err(),
+            McpError::Unauthorized(_)
+        ));
     }
 
     #[test]
     fn rejects_bad_prefix() {
-        assert!(matches!(validate_api_key(Some("nope".into())).unwrap_err(), McpError::Unauthorized(_)));
+        assert!(matches!(
+            validate_api_key(Some("nope".into())).unwrap_err(),
+            McpError::Unauthorized(_)
+        ));
     }
 
     #[test]

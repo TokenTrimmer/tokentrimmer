@@ -29,14 +29,18 @@ impl Tool for FindRouteForTool {
         }
     }
     async fn call(&self, params: Value) -> Result<Value, McpError> {
-        let inp: Input = serde_json::from_value(params)
-            .map_err(|e| McpError::InvalidParams(e.to_string()))?;
+        let inp: Input =
+            serde_json::from_value(params).map_err(|e| McpError::InvalidParams(e.to_string()))?;
         let lower = inp.task_description.to_lowercase();
         let (model, rationale) = if lower.contains("classify") || lower.contains("yes or no") {
-            ("claude-haiku-4-5", "classification — Haiku is the cheapest model with high quality on yes/no tasks.")
+            (
+                "claude-haiku-4-5",
+                "classification — Haiku is the cheapest model with high quality on yes/no tasks.",
+            )
         } else if lower.contains("extract") || lower.contains("parse") || lower.contains("json") {
             ("claude-haiku-4-5", "extraction — Haiku with explicit max_tokens is the cheapest model with reliable structured output.")
-        } else if lower.contains("code") || lower.contains("function") || lower.contains("refactor") {
+        } else if lower.contains("code") || lower.contains("function") || lower.contains("refactor")
+        {
             ("claude-haiku-4-5", "code — Haiku handles small refactors; escalate to Sonnet if the diff is multi-file.")
         } else {
             ("claude-haiku-4-5", "chat — Haiku is the cost-discipline default; escalate only when you actually need Sonnet/Opus reasoning.")

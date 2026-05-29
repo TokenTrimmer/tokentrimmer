@@ -77,6 +77,15 @@ Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 | API reference | `docs/04-cost-preview-api-reference.md` |
 | Spec | `docs/superpowers/specs/2026-05-28-trackC-cost-preview-api-design.md` |
 
+### tt mcp
+
+| If you're doing | Read |
+|---|---|
+| Adding a tool | `crates/mcp/src/tools/find_route_for.rs` (worked example) + `tools/mod.rs::Tool` trait |
+| Adding a resource | `crates/mcp/src/resources/inspect_baseline.rs` + `resources/mod.rs::Resource` trait |
+| Adding a transport | `crates/mcp/src/transport/stdio.rs` (worked example) |
+| Spec | `docs/superpowers/specs/2026-05-28-trackA-mcp-server-design.md` |
+
 ---
 
 ## Cross-cutting concerns

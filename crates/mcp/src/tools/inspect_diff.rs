@@ -33,10 +33,12 @@ impl Tool for InspectDiffTool {
         }
     }
     async fn call(&self, params: Value) -> Result<Value, McpError> {
-        let inp: Input = serde_json::from_value(params)
-            .map_err(|e| McpError::InvalidParams(e.to_string()))?;
+        let inp: Input =
+            serde_json::from_value(params).map_err(|e| McpError::InvalidParams(e.to_string()))?;
         let ext = std::path::Path::new(&inp.file_path)
-            .extension().and_then(|x| x.to_str()).unwrap_or("");
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("");
         let suffix = format!(".{ext}");
         let mut tmp = tempfile::Builder::new()
             .suffix(&suffix)

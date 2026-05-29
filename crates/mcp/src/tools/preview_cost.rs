@@ -33,14 +33,15 @@ impl Tool for PreviewCostTool {
         {
             let req: tt_preview::PreviewRequest = serde_json::from_value(params)
                 .map_err(|e| McpError::InvalidParams(e.to_string()))?;
-            let resp = tt_preview::preview(&req)
-                .map_err(|e| McpError::Internal(e.to_string()))?;
+            let resp = tt_preview::preview(&req).map_err(|e| McpError::Internal(e.to_string()))?;
             return Ok(serde_json::to_value(resp).unwrap());
         }
         #[cfg(not(feature = "preview"))]
         {
             let _ = params;
-            return Err(McpError::Internal("preview feature disabled at build time".into()));
+            return Err(McpError::Internal(
+                "preview feature disabled at build time".into(),
+            ));
         }
     }
 }

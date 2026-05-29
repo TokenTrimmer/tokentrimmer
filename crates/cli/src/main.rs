@@ -184,24 +184,48 @@ async fn main() -> anyhow::Result<()> {
                 key_hex.as_deref(),
             )?;
         }
-        Command::Mcp { transport, tt_api_key, tt_api_base } => {
-            use tt_mcp::{auth, tools::{find_route_for, inspect_diff, lookup_semantic_cache, preview_cost}, resources::{cost_ledger, inspect_baseline}, Server};
+        Command::Mcp {
+            transport,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            use tt_mcp::{
+                auth,
+                resources::{cost_ledger, inspect_baseline},
+                tools::{find_route_for, inspect_diff, lookup_semantic_cache, preview_cost},
+                Server,
+            };
             let api_key = tt_api_key.or_else(|| std::env::var("TT_API_KEY").ok());
             let api_key = auth::validate_api_key(api_key)?;
             let mut server = Server::new();
-            server.tools.register(Box::new(preview_cost::PreviewCostTool));
-            server.tools.register(Box::new(find_route_for::FindRouteForTool));
-            server.tools.register(Box::new(inspect_diff::InspectDiffTool));
-            server.tools.register(Box::new(lookup_semantic_cache::LookupSemanticCacheTool {
-                base_url: tt_api_base.clone(),
-                api_key: api_key.clone(),
-                http: reqwest::Client::new(),
-            }));
-            server.resources.register(Box::new(cost_ledger::CostLedgerResource));
-            server.resources.register(Box::new(inspect_baseline::InspectBaselineResource));
+            server
+                .tools
+                .register(Box::new(preview_cost::PreviewCostTool));
+            server
+                .tools
+                .register(Box::new(find_route_for::FindRouteForTool));
+            server
+                .tools
+                .register(Box::new(inspect_diff::InspectDiffTool));
+            server
+                .tools
+                .register(Box::new(lookup_semantic_cache::LookupSemanticCacheTool {
+                    base_url: tt_api_base.clone(),
+                    api_key: api_key.clone(),
+                    http: reqwest::Client::new(),
+                }));
+            server
+                .resources
+                .register(Box::new(cost_ledger::CostLedgerResource));
+            server
+                .resources
+                .register(Box::new(inspect_baseline::InspectBaselineResource));
             match transport.as_str() {
                 "stdio" => {
-                    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(server.run_stdio())?;
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(server.run_stdio())?;
                 }
                 other => anyhow::bail!("unsupported MCP transport `{other}` (v1: stdio only)"),
             }
