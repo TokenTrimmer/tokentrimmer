@@ -174,20 +174,66 @@ pub struct StreamLogContext {
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
 
+/// Terminal-sequence state for [`TrackedEventStream`].
+enum Phase {
+    /// Forwarding provider chunks.
+    Streaming,
+    /// Inner stream exhausted; next poll emits the `[DONE]` sentinel.
+    EmitDone,
+    /// All terminal events emitted.
+    Finished,
+}
+
 /// Drives the `Arc<Mutex<UsageTrackingStream>>` as a stream of SSE events.
-/// Emits `[DONE]` as the final item when the inner stream is exhausted.
+/// On clean completion it emits a terminal `tokentrimmer.usage` event carrying
+/// cost/baseline/saved (so streaming clients can surface per-request savings,
+/// which response headers can't), then the `[DONE]` sentinel.
 struct TrackedEventStream {
     inner: Arc<std::sync::Mutex<UsageTrackingStream>>,
-    /// Set to true after we have emitted the `[DONE]` sentinel.
-    done: bool,
+    /// Served-model pricing for the terminal usage event (`None` ⇒ skip it).
+    pricing: Option<ModelPricing>,
+    /// Originally-requested-model pricing for the baseline in the usage event.
+    baseline_pricing: Option<ModelPricing>,
+    phase: Phase,
+}
+
+impl TrackedEventStream {
+    /// Build the terminal `tokentrimmer.usage` SSE event from the accumulated
+    /// usage. Returns `None` when there is no pricing to compute cost from.
+    fn usage_event(&self) -> Option<Event> {
+        let pricing = self.pricing.as_ref()?;
+        let usage = {
+            let guard = self.inner.lock().expect("tracking stream mutex poisoned");
+            guard.snapshot()
+        };
+        let cost_usd = compute_streaming_cost(&usage, Some(pricing));
+        let baseline_cost_usd =
+            compute_streaming_baseline(&usage, self.baseline_pricing.as_ref().or(Some(pricing)));
+        let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
+        let json = serde_json::json!({
+            "cost_usd": cost_usd,
+            "baseline_cost_usd": baseline_cost_usd,
+            "saved_usd": saved_usd,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cached_tokens": usage.cached_tokens,
+        })
+        .to_string();
+        Some(Event::default().event("tokentrimmer.usage").data(json))
+    }
 }
 
 impl Stream for TrackedEventStream {
     type Item = Result<Event, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.done {
-            return Poll::Ready(None);
+        match self.phase {
+            Phase::Finished => return Poll::Ready(None),
+            Phase::EmitDone => {
+                self.phase = Phase::Finished;
+                return Poll::Ready(Some(Ok(Event::default().data("[DONE]"))));
+            }
+            Phase::Streaming => {}
         }
         let poll = {
             let mut guard = self.inner.lock().expect("tracking stream mutex poisoned");
@@ -196,8 +242,16 @@ impl Stream for TrackedEventStream {
         match poll {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                self.done = true;
-                Poll::Ready(Some(Ok(Event::default().data("[DONE]"))))
+                // Clean completion: emit the terminal usage event (when we can
+                // price it), then `[DONE]` on the next poll.
+                self.phase = Phase::EmitDone;
+                match self.usage_event() {
+                    Some(ev) => Poll::Ready(Some(Ok(ev))),
+                    None => {
+                        self.phase = Phase::Finished;
+                        Poll::Ready(Some(Ok(Event::default().data("[DONE]"))))
+                    }
+                }
             }
             Poll::Ready(Some(result)) => {
                 let json = match result {
@@ -269,9 +323,17 @@ pub fn stream_response(
             let shared = Arc::new(std::sync::Mutex::new(tracking));
             let shared_for_guard = Arc::clone(&shared);
 
+            // Pricing drives both the terminal usage event and the request_logs row.
+            let pricing = ctx.pricing.clone();
+            // Baseline against the originally-requested model; falls back to the
+            // served model's pricing when no separate baseline was supplied.
+            let baseline_pricing = ctx.baseline_pricing.clone().or_else(|| pricing.clone());
+
             let event_stream = TrackedEventStream {
                 inner: Arc::clone(&shared),
-                done: false,
+                pricing: pricing.clone(),
+                baseline_pricing: baseline_pricing.clone(),
+                phase: Phase::Streaming,
             };
 
             // Capture everything the guard closure needs.
@@ -280,10 +342,6 @@ pub fn stream_response(
             let api_key_id = ctx.api_key_id;
             let provider_id_log = ctx.provider_id.clone();
             let model = ctx.model.clone();
-            let pricing = ctx.pricing.clone();
-            // Baseline against the originally-requested model; falls back to the
-            // served model's pricing when no separate baseline was supplied.
-            let baseline_pricing = ctx.baseline_pricing.clone().or_else(|| pricing.clone());
             let route_id = ctx.route_id;
             let tag = ctx.tag.clone();
             let request_started = ctx.request_started;

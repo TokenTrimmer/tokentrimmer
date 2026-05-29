@@ -295,6 +295,48 @@ async fn sse_routed_stream_logs_baseline_against_original_model() {
     );
 }
 
+// ─── Test 5: terminal usage event before [DONE] ──────────────────────────────
+
+#[tokio::test]
+async fn sse_emits_terminal_usage_event_before_done() {
+    // On clean completion the stream must emit a `tokentrimmer.usage` SSE event
+    // carrying cost/baseline/saved BEFORE the [DONE] sentinel, so streaming
+    // clients can surface per-request savings (which response headers can't).
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("Hi")), Ok(finish_chunk(5))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(make_log_ctx(Arc::clone(&writer))),
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+
+    assert!(
+        text.contains("tokentrimmer.usage"),
+        "should emit a tokentrimmer.usage event; body:\n{text}"
+    );
+    assert!(
+        text.contains("saved_usd"),
+        "usage event should carry saved_usd"
+    );
+    let usage_pos = text
+        .find("tokentrimmer.usage")
+        .expect("usage event present");
+    let done_pos = text.find("[DONE]").expect("[DONE] present");
+    assert!(
+        usage_pos < done_pos,
+        "usage event must precede [DONE]; body:\n{text}"
+    );
+}
+
 // ─── Test 3: zero-chunk immediate abort ──────────────────────────────────────
 
 #[tokio::test]
