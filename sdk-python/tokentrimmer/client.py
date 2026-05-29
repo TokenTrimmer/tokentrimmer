@@ -8,6 +8,9 @@ Wraps the official ``openai.OpenAI`` client. Override points:
   the parsed response object via the ``.tt`` attribute.
 - ``chat.completions.create`` is wrapped to lift the ``tt_tag=`` keyword
   into the ``X-TokenTrimmer-Tag`` request header.
+- A default ``max_tokens=4096`` is injected when the caller does not supply
+  one (or an equivalent ``max_completion_tokens`` / ``max_output_tokens``).
+  Pass an explicit value to override.
 """
 
 from __future__ import annotations
@@ -117,6 +120,13 @@ class TokenTrimmer(OpenAI):
         original_create = self.chat.completions.create
 
         def create(*args: Any, **kwargs: Any) -> Any:
+            # Sensible default to prevent unbounded output. User-provided
+            # max_tokens / max_completion_tokens / max_output_tokens win.
+            if not any(
+                k in kwargs
+                for k in ("max_tokens", "max_completion_tokens", "max_output_tokens")
+            ):
+                kwargs["max_tokens"] = 4096
             tt_tag = kwargs.pop("tt_tag", None)
             extra_headers = dict(kwargs.pop("extra_headers", {}) or {})
             if tt_tag is not None:
@@ -136,4 +146,4 @@ class TokenTrimmer(OpenAI):
             return result
 
         # Monkey-patch the bound method.
-        self.chat.completions.create = create  # type: ignore[method-assign]
+        self.chat.completions.create = create  # type: ignore[method-assign]  # default max_tokens=4096 set in `create` above

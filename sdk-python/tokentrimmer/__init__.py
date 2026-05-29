@@ -21,6 +21,7 @@ Usage::
     response = client.chat.completions.create(
         model="claude-sonnet-4-6",
         messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=1024,
         tt_tag="feature=chat-support",
     )
 
