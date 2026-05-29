@@ -37,7 +37,10 @@ use tt_shared::{
 };
 
 use crate::{
-    middleware::trace::TraceId, routes::sse, state::L2Config, ApiError, ApiResult, AppState,
+    middleware::trace::TraceId,
+    routes::sse::{self, StreamLogContext},
+    state::L2Config,
+    ApiError, ApiResult, AppState,
 };
 
 /// L2 cache TTL for newly-inserted entries. Spec §8.4 caps this per-tier
@@ -175,14 +178,72 @@ pub async fn handler(
                         ),
                     );
                     let fake = sse::fake_stream_from_response(entry.response);
-                    return Ok(sse::stream_response(fake, &provider, trace_id));
+                    // L1 hit already logged above; no need for a second row.
+                    return Ok(sse::stream_response(fake, &provider, trace_id, None));
                 }
             }
         }
 
         // No cache hit (or no L1 wired) — dispatch live to the provider.
+        // Estimate input tokens from the request messages (byte heuristic: len/4).
+        let estimated_input_tokens = req
+            .messages
+            .iter()
+            .map(|m| {
+                let text_len = match m {
+                    Message::User { content, .. } | Message::System { content } => match content {
+                        MessageContent::Text(s) => s.len(),
+                        MessageContent::Parts(parts) => parts
+                            .iter()
+                            .map(|p| match p {
+                                tt_shared::ContentPart::Text { text } => text.len(),
+                                _ => 0,
+                            })
+                            .sum(),
+                    },
+                    Message::Assistant { content, .. } => match content {
+                        Some(MessageContent::Text(s)) => s.len(),
+                        Some(MessageContent::Parts(parts)) => parts
+                            .iter()
+                            .map(|p| match p {
+                                tt_shared::ContentPart::Text { text } => text.len(),
+                                _ => 0,
+                            })
+                            .sum(),
+                        None => 0,
+                    },
+                    Message::Tool { content, .. } => match content {
+                        MessageContent::Text(s) => s.len(),
+                        MessageContent::Parts(parts) => parts
+                            .iter()
+                            .map(|p| match p {
+                                tt_shared::ContentPart::Text { text } => text.len(),
+                                _ => 0,
+                            })
+                            .sum(),
+                    },
+                };
+                text_len / 4
+            })
+            .sum::<usize>() as i32;
+
+        let log_ctx = state.request_log_writer.as_ref().map(|w| StreamLogContext {
+            writer: w.clone(),
+            org_id: ctx.org_id,
+            api_key_id: ctx.api_key_id,
+            trace_id,
+            provider_id: provider.id().to_string(),
+            model: req.model.clone(),
+            input_tokens: estimated_input_tokens,
+            cached_tokens: 0,
+            pricing: provider.pricing(&req.model),
+            route_id: matched_route_id,
+            tag: ctx.tag.clone(),
+            request_started,
+        });
+
         let stream = provider.chat_completion_stream(req, &ctx).await?;
-        Ok(sse::stream_response(stream, &provider, trace_id))
+        Ok(sse::stream_response(stream, &provider, trace_id, log_ctx))
     } else {
         // 3a. L1 exact-match cache. Cheapest lookup — try first. Best-effort:
         //     any Redis error falls through to L2/provider — we never fail a
@@ -328,6 +389,7 @@ pub async fn handler(
                 tag: ctx.tag.clone(),
                 error_class: None,
                 trace_id: Some(trace_id.to_string()),
+                truncated: false,
             },
         );
 
@@ -722,6 +784,7 @@ fn request_log_for_l1_hit(
         tag: ctx.tag.clone(),
         error_class: None,
         trace_id: Some(trace_id.to_string()),
+        truncated: false,
     }
 }
 
@@ -755,6 +818,7 @@ fn request_log_for_l2_hit(
         tag: ctx.tag.clone(),
         error_class: None,
         trace_id: Some(trace_id.to_string()),
+        truncated: false,
     }
 }
 
