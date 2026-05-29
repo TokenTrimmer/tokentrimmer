@@ -67,11 +67,13 @@ pub async fn handler(
     let request_started = Instant::now();
 
     // 1. Resolve provider — 404 for unknown models. (May be re-resolved after
-    //    routing rewrites req.model below.)
+    //    routing rewrites req.model below.) `resolve` falls back to provider
+    //    inference for valid-but-unlisted model ids so they dispatch instead
+    //    of 404ing.
     let mut provider =
         state
             .registry
-            .by_model(&req.model)
+            .resolve(&req.model)
             .ok_or_else(|| ApiError::ModelNotFound {
                 model: req.model.clone(),
             })?;
@@ -152,7 +154,7 @@ pub async fn handler(
         // routes are same-provider, but the registry is the source of truth).
         provider = state
             .registry
-            .by_model(&req.model)
+            .resolve(&req.model)
             .ok_or_else(|| ApiError::ModelNotFound {
                 model: req.model.clone(),
             })?;

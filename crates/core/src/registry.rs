@@ -41,6 +41,19 @@ impl ProviderRegistry {
         self.by_model.get(model).cloned()
     }
 
+    /// Resolve a model to a provider for DISPATCH. Tries the exact static
+    /// `by_model` table first; on miss, falls back to
+    /// [`tt_shared::providers::infer_provider`] + [`Self::by_id`] so a
+    /// valid-but-unlisted model (a newly-released id, or an aggregator
+    /// passthrough) still dispatches instead of 404ing. Pricing then falls
+    /// back to `None`, which the cost path already tolerates. The static table
+    /// stays the source of truth for pricing/capabilities — this only widens
+    /// dispatch.
+    pub fn resolve(&self, model: &str) -> Option<Arc<dyn Provider>> {
+        self.by_model(model)
+            .or_else(|| tt_shared::providers::infer_provider(model).and_then(|id| self.by_id(id)))
+    }
+
     /// Iterate all registered providers as `(id, provider)` pairs.
     /// Used by `/v1/models` to enumerate the model catalog.
     pub fn iter(&self) -> impl Iterator<Item = (&'static str, &Arc<dyn Provider>)> {
