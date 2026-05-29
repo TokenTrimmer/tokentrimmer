@@ -115,9 +115,3 @@ pub fn all_models() -> Vec<ModelInfo> {
         },
     ]
 }
-
-/// True if `model` is an OpenAI reasoning model (o3, o4-mini, etc.) with
-/// different parameter constraints (no temperature, `max_completion_tokens`).
-pub fn is_reasoning_model(model: &str) -> bool {
-    matches!(model, "o3" | "o4-mini")
-}

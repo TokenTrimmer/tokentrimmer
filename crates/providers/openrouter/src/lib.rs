@@ -1,6 +1,6 @@
 //! OpenRouter provider adapter (OpenAI-compatible).
 //!
-//! Thin wrapper over [`tt_provider_openai::OpenAICompatibleProvider`] with
+//! Thin wrapper over [`tt_provider_compat::OpenAICompatibleProvider`] with
 //! OpenRouter's models, pricing, and default endpoint baked in.
 //!
 //! OpenRouter is a pass-through gateway aggregating 300+ models. This v1
@@ -24,7 +24,7 @@
 //!
 //! ```rust,no_run
 //! use tt_provider_openrouter::OpenRouterProvider;
-//! use tt_provider_openai::ClientConfig;
+//! use tt_provider_compat::ClientConfig;
 //!
 //! let provider = OpenRouterProvider::new(ClientConfig::default());
 //! ```
@@ -33,7 +33,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
+use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     pricing::{Capability, ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,

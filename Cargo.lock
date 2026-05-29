@@ -5027,6 +5027,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tt-provider-compat"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "httpmock",
+ "insta",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tt-shared",
+ "uuid",
+]
+
+[[package]]
 name = "tt-provider-gemini"
 version = "0.1.0"
 dependencies = [
@@ -5064,7 +5085,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "tt-provider-openai",
+ "tt-provider-compat",
  "tt-shared",
  "uuid",
 ]
@@ -5106,7 +5127,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "tt-provider-openai",
+ "tt-provider-compat",
  "tt-shared",
  "uuid",
 ]
@@ -5115,21 +5136,17 @@ dependencies = [
 name = "tt-provider-openai"
 version = "0.1.0"
 dependencies = [
- "async-stream",
  "async-trait",
- "bytes",
- "chrono",
  "futures",
  "httpmock",
  "insta",
  "reqwest",
  "rstest",
- "serde",
  "serde_json",
- "thiserror 1.0.69",
  "tokio",
  "tokio-test",
  "tracing",
+ "tt-provider-compat",
  "tt-shared",
  "uuid",
 ]
@@ -5150,7 +5167,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "tt-provider-openai",
+ "tt-provider-compat",
  "tt-shared",
  "uuid",
 ]
@@ -5171,7 +5188,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "tt-provider-openai",
+ "tt-provider-compat",
  "tt-shared",
  "uuid",
 ]

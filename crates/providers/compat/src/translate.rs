@@ -17,7 +17,13 @@ use tt_shared::{
     ProviderError,
 };
 
-use crate::pricing::is_reasoning_model;
+/// True for OpenAI reasoning models (`o3`, `o4-mini`, …), which take
+/// `max_completion_tokens` instead of `max_tokens` and reject `temperature`.
+/// This is part of the OpenAI wire request shape, so it lives in the compat
+/// translation layer rather than in any provider's pricing table.
+pub fn is_reasoning_model(model: &str) -> bool {
+    matches!(model, "o3" | "o4-mini")
+}
 
 // ---------------------------------------------------------------------------
 // Outbound request

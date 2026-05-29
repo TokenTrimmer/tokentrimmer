@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use tt_provider_openai::translate::{extract_usage, translate_request};
+use tt_provider_compat::translate::{extract_usage, translate_request};
 use tt_shared::{
     messages::{
         ContentPart, ImageUrl, Message, MessageContent, ResponseFormat, Tool, ToolCall,

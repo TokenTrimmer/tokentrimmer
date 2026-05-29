@@ -15,6 +15,7 @@ members = [
     "crates/cli",
     "crates/mcp",
     "crates/ts-types",
+    "crates/providers/compat",
     "crates/providers/openai",
     "crates/providers/anthropic",
     "crates/providers/gemini",
@@ -119,6 +120,7 @@ tt-config = { path = "crates/config" }
 tt-inspect-core = { path = "crates/inspect-core" }
 tt-inspect-rules-tier1 = { path = "crates/inspect-rules-tier1" }
 tt-plan-core = { path = "crates/plan-core" }
+tt-provider-compat = { path = "crates/providers/compat" }
 tt-provider-openai = { path = "crates/providers/openai" }
 tt-provider-anthropic = { path = "crates/providers/anthropic" }
 tt-provider-gemini = { path = "crates/providers/gemini" }

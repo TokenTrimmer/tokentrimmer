@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use httpmock::prelude::*;
-use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
+use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     context::{ProviderCredentials, RequestContext, SecretString},
     messages::{Message, MessageContent},

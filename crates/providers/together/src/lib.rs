@@ -1,13 +1,13 @@
 //! Together AI provider adapter (OpenAI-compatible).
 //!
-//! Thin wrapper over [`tt_provider_openai::OpenAICompatibleProvider`] with
+//! Thin wrapper over [`tt_provider_compat::OpenAICompatibleProvider`] with
 //! Together AI's models, pricing, and default endpoint baked in.
 //!
 //! # Usage
 //!
 //! ```rust,no_run
 //! use tt_provider_together::TogetherProvider;
-//! use tt_provider_openai::ClientConfig;
+//! use tt_provider_compat::ClientConfig;
 //!
 //! let provider = TogetherProvider::new(ClientConfig::default());
 //! ```
@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
+use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     pricing::{Capability, ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,

@@ -13,14 +13,16 @@
 //! let provider = OpenAiProvider::new(ClientConfig::default());
 //! ```
 
-pub mod client;
-pub mod compat;
-pub mod errors;
 pub mod pricing;
-pub mod stream;
-pub mod translate;
 
-pub use compat::{CompatConfig, OpenAICompatibleProvider};
+// The OpenAI-wire machinery now lives in `tt-provider-compat`. The native
+// adapter builds on it; these re-exports preserve the historical
+// `tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider}`
+// and `tt_provider_openai::{translate, errors, stream, client}` paths so
+// dependents need not change import sites.
+pub use tt_provider_compat::{
+    client, errors, stream, translate, ClientConfig, CompatConfig, OpenAICompatibleProvider,
+};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -30,8 +32,6 @@ use tt_shared::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
 };
-
-pub use client::ClientConfig;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 

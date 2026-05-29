@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use httpmock::prelude::*;
+use tt_provider_compat::ClientConfig;
 use tt_provider_groq::GroqProvider;
-use tt_provider_openai::ClientConfig;
 use tt_shared::{
     context::{ProviderCredentials, RequestContext, SecretString},
     messages::{Message, MessageContent},

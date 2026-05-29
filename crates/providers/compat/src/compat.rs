@@ -19,7 +19,7 @@
 //!
 //! ```rust,no_run
 //! use std::collections::HashMap;
-//! use tt_provider_openai::{CompatConfig, OpenAICompatibleProvider, ClientConfig};
+//! use tt_provider_compat::{CompatConfig, OpenAICompatibleProvider, ClientConfig};
 //! use tt_shared::pricing::{Capability, ModelInfo, ModelPricing};
 //! use chrono::Utc;
 //!
