@@ -13,10 +13,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest.workspace = true
 tiktoken-rs = "0.5"
 regex = "1.11"
-uuid = { version = "1.10", features = ["v4"] }
+uuid.workspace = true
 async-trait = "0.1"
 
 [features]
@@ -25,7 +25,7 @@ postgres = ["dep:sqlx"]
 
 [dependencies.sqlx]
 workspace = true
-features = ["postgres", "runtime-tokio", "tls-rustls"]
+features = ["postgres", "runtime-tokio-rustls"]
 optional = true
 
 [dev-dependencies]
