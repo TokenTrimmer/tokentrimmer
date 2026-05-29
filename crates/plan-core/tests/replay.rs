@@ -248,6 +248,64 @@ fn conservative_when_pricing_missing() {
         .any(|c| c.contains("no pricing entry")));
 }
 
+#[test]
+fn rerouted_latency_projected_from_target_model_history() {
+    // 3 premium (900ms) + 3 cheap (100ms) requests; route premium -> cheap.
+    // The cheap model HAS history in the window, so rerouted premium requests
+    // should project the cheap model's latency (~100ms), not echo 900ms.
+    let mut requests = Vec::new();
+    for i in 0..3u128 {
+        requests.push(RequestLog {
+            latency_ms: 900,
+            ..make_req(i * 2 + 1, i as i64, "premium-model", 1000, 100, 0.01, false)
+        });
+    }
+    for i in 0..3u128 {
+        requests.push(RequestLog {
+            latency_ms: 100,
+            ..make_req(
+                i * 2 + 2,
+                (i as i64) + 10,
+                "cheap-model",
+                1000,
+                100,
+                0.001,
+                false,
+            )
+        });
+    }
+    let route = ProposedRoute {
+        id: det_uuid(100),
+        name: "premium-to-cheap".into(),
+        priority: 100,
+        enabled: true,
+        when: RouteConditions {
+            model_in: vec!["premium-model".into()],
+            ..Default::default()
+        },
+        then: RouteAction {
+            target_model: "cheap-model".into(),
+            force_cache_layer: None,
+        },
+    };
+    let mut pricing = HashMap::new();
+    let (k1, v1) = pricing_with("anthropic", "premium-model", 10.0, 30.0);
+    let (k2, v2) = pricing_with("anthropic", "cheap-model", 0.5, 1.5);
+    pricing.insert(k1, v1);
+    pricing.insert(k2, v2);
+
+    let input = input_with_routes(requests, vec![route], pricing, 100);
+    let result = replay(input).unwrap();
+    assert_eq!(result.aggregates.requests_rerouted, 3);
+    // Rerouted requests now carry the target model's (~100ms) latency, so the
+    // projected p50 is ~100ms, not the premium model's 900ms.
+    assert!(
+        result.aggregates.p50_latency_ms_projected <= 150.0,
+        "p50 projected latency should reflect the cheap target model (~100ms), got {}",
+        result.aggregates.p50_latency_ms_projected
+    );
+}
+
 fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
     let mut requests = Vec::with_capacity(n as usize);
     for i in 0..n {

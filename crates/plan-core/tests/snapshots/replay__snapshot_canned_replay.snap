@@ -55,6 +55,7 @@ expression: result
     }
   ],
   "caveats": [
-    "Small sample size (50 requests) — confidence intervals are wide."
+    "Small sample size (50 requests) — confidence intervals are wide.",
+    "50 rerouted request(s) had no latency history for the target model — their latency is shown unchanged, not projected."
   ]
 }
