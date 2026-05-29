@@ -81,8 +81,7 @@ fn text_sse_stream(text_chunks: &[&str], finish_reason: &str, usage_tokens: (u64
             ));
         } else {
             sse.push_str(&format!(
-                "data: {{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"{}\"}}]}},\"index\":0}}]}}\n\n",
-                text
+                "data: {{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"{text}\"}}]}},\"index\":0}}]}}\n\n"
             ));
         }
     }

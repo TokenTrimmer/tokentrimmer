@@ -101,8 +101,7 @@ impl Provider for GeminiProvider {
         let model = req.model.clone();
 
         let url = format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            base_url, model, api_key
+            "{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
         );
 
         let body = translate::translate_request(req)?;

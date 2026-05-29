@@ -69,8 +69,7 @@ pub async fn stream_chat_completion(
     let body = translate::translate_request(req)?;
 
     let url = format!(
-        "{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
-        base_url, model, api_key
+        "{base_url}/v1beta/models/{model}:streamGenerateContent?key={api_key}&alt=sse"
     );
 
     let body_bytes = serde_json::to_vec(&body)

@@ -45,10 +45,9 @@ pub fn suggest(
             savings_usd: current_cost_usd - cost,
             quality_risk_band: QualityRiskBand::Unknown,
             rationale: format!(
-                "{candidate} historically handles {:?} tasks at lower cost. Quality \
+                "{candidate} historically handles {task_class:?} tasks at lower cost. Quality \
                  band not yet computed for your org (UNKNOWN); enable Plan engine \
                  quality scoring to upgrade to LOW/MEDIUM/HIGH.",
-                task_class,
             ),
             applicable: true,
         });

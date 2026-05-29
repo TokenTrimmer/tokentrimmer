@@ -173,7 +173,7 @@ pub async fn stream_chat_completion(
     req: ChatCompletionRequest,
     ctx: &RequestContext,
 ) -> Result<ChunkStream, ProviderError> {
-    let url = format!("{}/v1/messages", base_url);
+    let url = format!("{base_url}/v1/messages");
     let api_key = ctx.credentials.api_key.expose().to_string();
     let extra_headers: Vec<(String, String)> = ctx.credentials.extra_headers.clone();
 

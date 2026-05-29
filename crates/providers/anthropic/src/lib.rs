@@ -90,7 +90,7 @@ impl Provider for AnthropicProvider {
         ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         let base_url = self.base_url(ctx);
-        let url = format!("{}/v1/messages", base_url);
+        let url = format!("{base_url}/v1/messages");
 
         let body = translate::translate_request(req)?;
 

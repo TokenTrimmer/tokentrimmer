@@ -84,8 +84,7 @@ fn text_stream(text_chunks: &[&str], stop_reason: &str, output_tokens: u64) -> S
     for text in text_chunks {
         sse.push_str("event: content_block_delta\n");
         sse.push_str(&format!(
-            r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{}"}}}}"#,
-            text
+            r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}"#
         ));
         sse.push_str("\n\n");
     }

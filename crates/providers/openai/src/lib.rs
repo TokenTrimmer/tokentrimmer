@@ -89,7 +89,7 @@ impl Provider for OpenAiProvider {
         ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         let base_url = self.base_url(ctx);
-        let url = format!("{}/chat/completions", base_url);
+        let url = format!("{base_url}/chat/completions");
 
         let body = translate::translate_request(req)?;
 
@@ -170,7 +170,7 @@ impl Provider for OpenAiProvider {
         ctx: &RequestContext,
     ) -> Result<EmbeddingsResponse, ProviderError> {
         let base_url = self.base_url(ctx);
-        let url = format!("{}/embeddings", base_url);
+        let url = format!("{base_url}/embeddings");
 
         let body = translate::translate_embeddings_request(req)?;
 
