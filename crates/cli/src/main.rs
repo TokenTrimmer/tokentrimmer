@@ -97,6 +97,11 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// RAG corpus management.
+    Retrieval {
+        #[command(subcommand)]
+        action: RetrievalAction,
+    },
     /// Run a local OpenAI/Anthropic-compatible proxy on port 31415.
     Proxy {
         #[arg(long, default_value_t = 31415)]
@@ -113,6 +118,26 @@ enum Command {
         no_preview: bool,
         #[arg(long)]
         session_log: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RetrievalAction {
+    /// Add a doc to a corpus (in-process; not yet persisted).
+    DocAdd {
+        corpus: String,
+        path: String,
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: String,
+    },
+    /// Ad-hoc search.
+    Search {
+        corpus: String,
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: String,
     },
 }
 
@@ -284,6 +309,34 @@ async fn main() -> anyhow::Result<()> {
                 "Done. {} written, {} skipped.",
                 report.files_written, report.files_skipped
             );
+        }
+        Command::Retrieval { action } => {
+            use tt_cli::retrieval as cli_retrieval;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    match action {
+                        RetrievalAction::DocAdd {
+                            corpus,
+                            path,
+                            openai_key,
+                        } => {
+                            cli_retrieval::add_doc(
+                                &corpus,
+                                std::path::Path::new(&path),
+                                &openai_key,
+                            )
+                            .await
+                        }
+                        RetrievalAction::Search {
+                            corpus,
+                            query,
+                            k,
+                            openai_key,
+                        } => cli_retrieval::search(&corpus, &query, k, &openai_key).await,
+                    }
+                })?;
         }
         Command::Proxy {
             port,

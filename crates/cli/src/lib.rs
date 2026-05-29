@@ -1,4 +1,5 @@
-//! `tt-cli` library — exposes `init` and `proxy` modules for integration tests.
+//! `tt-cli` library — exposes `init`, `proxy`, and `retrieval` modules for integration tests.
 
 pub mod init;
 pub mod proxy;
+pub mod retrieval;
