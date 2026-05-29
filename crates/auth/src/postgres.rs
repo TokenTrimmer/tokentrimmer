@@ -292,7 +292,7 @@ impl ProviderCredentialStore for PostgresProviderCredentialStore {
 // The argon2 hash is computed by `tt_auth::keys::issue` and verified by
 // `tt_auth::keys::verify`; this store is the thin Postgres adapter.
 
-use crate::keys::{ApiKey, Environment, KeyError, KeyStore};
+use crate::keys::{ApiKey, ApiKeySummary, Environment, KeyError, KeyStore};
 use chrono::{DateTime, Utc};
 
 /// Postgres-backed implementation of [`KeyStore`].
@@ -390,6 +390,43 @@ impl KeyStore for PostgresKeyStore {
             created_at,
             revoked_at,
         }))
+    }
+
+    async fn list_active(&self, org_id: Uuid) -> Result<Vec<ApiKeySummary>, KeyError> {
+        let rows: Vec<(
+            Uuid,
+            Uuid,
+            String,
+            String,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            r#"SELECT id, org_id, prefix, label, environment, created_at, last_used_at
+               FROM api_keys
+               WHERE org_id = $1 AND revoked_at IS NULL
+               ORDER BY created_at DESC"#,
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| KeyError::Store(e.to_string()))?;
+
+        rows.into_iter()
+            .map(
+                |(id, org_id, prefix, label, env_str, created_at, last_used_at)| {
+                    Ok(ApiKeySummary {
+                        id,
+                        org_id,
+                        prefix,
+                        label,
+                        environment: env_from_str(&env_str)?,
+                        created_at,
+                        last_used_at,
+                    })
+                },
+            )
+            .collect()
     }
 
     async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {

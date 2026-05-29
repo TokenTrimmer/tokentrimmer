@@ -104,6 +104,36 @@ pub enum KeyError {
     Store(String),
 }
 
+/// A secret-free view of an API key, for listing endpoints. Never carries the
+/// argon2 hash or the plaintext — safe to return over the admin API.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeySummary {
+    pub id: Uuid,
+    pub org_id: Uuid,
+    pub prefix: String,
+    pub label: String,
+    pub environment: Environment,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+impl From<&ApiKey> for ApiKeySummary {
+    fn from(k: &ApiKey) -> Self {
+        Self {
+            id: k.id,
+            org_id: k.org_id,
+            prefix: k.prefix.clone(),
+            label: k.label.clone(),
+            environment: k.environment,
+            created_at: k.created_at,
+            // `ApiKey` doesn't carry last_used_at; stores that track it (Postgres)
+            // populate this directly in their `list_active`.
+            last_used_at: None,
+        }
+    }
+}
+
 /// Persistence contract for API key storage.
 ///
 /// Implementations: [`InMemoryKeyStore`] (this file),
@@ -112,6 +142,14 @@ pub enum KeyError {
 pub trait KeyStore: Send + Sync {
     /// Insert a new key row.
     async fn insert(&self, key: ApiKey) -> Result<(), KeyError>;
+
+    /// List active (non-revoked) keys for `org_id`, newest first, WITHOUT any
+    /// secret material. Default impl returns empty so stores that don't support
+    /// listing opt out trivially; [`InMemoryKeyStore`] and `PostgresKeyStore`
+    /// override it.
+    async fn list_active(&self, _org_id: Uuid) -> Result<Vec<ApiKeySummary>, KeyError> {
+        Ok(Vec::new())
+    }
 
     /// Look up by prefix (the [`PREFIX_DISPLAY_LEN`]-char display prefix).
     async fn find_by_prefix(&self, prefix: &str) -> Result<Option<ApiKey>, KeyError>;
@@ -167,6 +205,20 @@ impl KeyStore for InMemoryKeyStore {
             .lock()
             .map_err(|e| KeyError::Store(e.to_string()))?;
         Ok(g.get(prefix).cloned())
+    }
+
+    async fn list_active(&self, org_id: Uuid) -> Result<Vec<ApiKeySummary>, KeyError> {
+        let g = self
+            .by_prefix
+            .lock()
+            .map_err(|e| KeyError::Store(e.to_string()))?;
+        let mut out: Vec<ApiKeySummary> = g
+            .values()
+            .filter(|k| k.org_id == org_id && k.revoked_at.is_none())
+            .map(ApiKeySummary::from)
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at)); // newest first
+        Ok(out)
     }
 
     async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
@@ -334,4 +386,54 @@ pub async fn revoke_key<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
         .write(org_id, actor, "apikey.revoked".to_string(), payload)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod list_active_tests {
+    use super::*;
+
+    fn sample(org: Uuid, prefix: &str, revoked: bool) -> ApiKey {
+        ApiKey {
+            id: Uuid::now_v7(),
+            org_id: org,
+            prefix: prefix.to_string(),
+            hash: "argon2-phc-string".to_string(),
+            label: "test key".to_string(),
+            environment: Environment::Live,
+            created_at: Utc::now(),
+            revoked_at: if revoked { Some(Utc::now()) } else { None },
+        }
+    }
+
+    #[tokio::test]
+    async fn list_active_excludes_revoked_other_orgs_and_secrets() {
+        let store = InMemoryKeyStore::new();
+        let org = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        store
+            .insert(sample(org, "tt_live_aaaa", false))
+            .await
+            .unwrap();
+        store
+            .insert(sample(org, "tt_live_bbbb", true))
+            .await
+            .unwrap(); // revoked
+        store
+            .insert(sample(other, "tt_live_cccc", false))
+            .await
+            .unwrap(); // other org
+
+        let active = store.list_active(org).await.unwrap();
+        assert_eq!(active.len(), 1, "only the org's non-revoked key");
+        assert_eq!(active[0].prefix, "tt_live_aaaa");
+        // The secret-free summary must never serialize the argon2 hash.
+        let json = serde_json::to_string(&active[0]).unwrap();
+        assert!(!json.contains("argon2"), "summary leaked the hash: {json}");
+    }
+
+    #[tokio::test]
+    async fn list_active_empty_for_unknown_org() {
+        let store = InMemoryKeyStore::new();
+        assert!(store.list_active(Uuid::now_v7()).await.unwrap().is_empty());
+    }
 }
