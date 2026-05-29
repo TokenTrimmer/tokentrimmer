@@ -70,6 +70,14 @@ pub trait ProviderCredentialStore: Send + Sync {
     ) -> Result<(), CredentialError> {
         Err(CredentialError::Store("store is read-only".into()))
     }
+
+    /// Number of distinct providers `org_id` has stored credentials for.
+    /// Default `0` — read-only / env stores don't track per-org counts;
+    /// InMemory and Postgres override. Used to enforce per-tier credential
+    /// caps at write time.
+    async fn count_for_org(&self, _org_id: Uuid) -> Result<u32, CredentialError> {
+        Ok(0)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +141,14 @@ impl ProviderCredentialStore for InMemoryProviderCredentialStore {
             .map_err(|e| CredentialError::Store(e.to_string()))?;
         g.insert((org_id, provider_id.to_string()), credentials);
         Ok(())
+    }
+
+    async fn count_for_org(&self, org_id: Uuid) -> Result<u32, CredentialError> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|e| CredentialError::Store(e.to_string()))?;
+        Ok(g.keys().filter(|(o, _)| *o == org_id).count() as u32)
     }
 }
 
@@ -240,6 +256,12 @@ where
             None => self.fallback.get(org_id, provider_id).await,
         }
     }
+
+    async fn count_for_org(&self, org_id: Uuid) -> Result<u32, CredentialError> {
+        // The writable primary store is the source of truth for the count;
+        // the fallback (env) holds no per-org rows.
+        self.primary.count_for_org(org_id).await
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +283,18 @@ mod tests {
         store.insert(org, "openai", creds("sk-abc"));
         let got = store.get(org, "openai").await.unwrap().unwrap();
         assert_eq!(got.api_key.expose(), "sk-abc");
+    }
+
+    #[tokio::test]
+    async fn in_memory_count_for_org_counts_distinct_providers() {
+        let store = InMemoryProviderCredentialStore::new();
+        let org = Uuid::now_v7();
+        assert_eq!(store.count_for_org(org).await.unwrap(), 0);
+        store.insert(org, "openai", creds("a"));
+        store.insert(org, "anthropic", creds("b"));
+        store.insert(org, "openai", creds("a2")); // upsert — still one provider
+        store.insert(Uuid::now_v7(), "openai", creds("c")); // other org
+        assert_eq!(store.count_for_org(org).await.unwrap(), 2);
     }
 
     #[tokio::test]

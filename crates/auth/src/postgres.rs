@@ -283,6 +283,16 @@ impl ProviderCredentialStore for PostgresProviderCredentialStore {
             extra_headers,
         }))
     }
+
+    async fn count_for_org(&self, org_id: Uuid) -> Result<u32, CredentialError> {
+        let n: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM provider_credentials WHERE org_id = $1"#)
+                .bind(org_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(CredentialStoreError::Sql)?;
+        Ok(n as u32)
+    }
 }
 
 // ─── Postgres-backed API key store ─────────────────────────────────────────
