@@ -11,8 +11,8 @@ use crate::types::{QualityRiskBand, RouteSuggestion};
 /// Candidate cheaper models per task class. Ordered by preference.
 fn candidates_for(class: TaskClass) -> &'static [&'static str] {
     match class {
-        TaskClass::Classification => &["claude-haiku-4-5", "gpt-4o-mini", "gemini-2-5-flash-lite"],
-        TaskClass::Extraction => &["claude-haiku-4-5", "gpt-4o-mini", "gemini-2-5-flash"],
+        TaskClass::Classification => &["claude-haiku-4-5", "gpt-4o-mini", "gemini-3.1-flash-lite"],
+        TaskClass::Extraction => &["claude-haiku-4-5", "gpt-4o-mini", "gemini-3.5-flash"],
         TaskClass::Chat => &["claude-haiku-4-5", "gpt-4o-mini"],
         TaskClass::Code => &["claude-haiku-4-5", "gpt-4o-mini"],
         TaskClass::Agent => &[],
