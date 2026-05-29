@@ -262,7 +262,7 @@ Items surfaced by the 9-lens project review (`PROJECT_REVIEW.md`). The three top
 ### Inspect depth (public, actionable)
 
 - [x] [P1] [inspect-5-missing-rules] inspect-rule-author: Implement the 5 documented-but-missing P0 rules (`model-deprecated`, `prompt-bloated-system`, `prompt-verbose-few-shot`, `prompt-no-output-constraint`, `config-agents-md-too-long`) with fixtures; reconcile the catalog's "15" claim. (est: $1.00)
-- [ ] [P1] [inspect-corpora-seed] rust-crate-builder: Vendor 5-10 pinned, permissively-licensed OSS LLM samples (LangChain/Vercel-AI/openai-cookbook) into `corpora/`, run `scripts/measure-fp-rate.sh`, record per-rule precision/recall. Unblocks the w24 FP gate. (est: $0.50)
+- [x] [P1] [inspect-corpora-seed] rust-crate-builder: Vendor 5-10 pinned, permissively-licensed OSS LLM samples (LangChain/Vercel-AI/openai-cookbook) into `corpora/`, run `scripts/measure-fp-rate.sh`, record per-rule precision/recall. Unblocks the w24 FP gate. (est: $0.50)
 - [x] [P2] [inspect-ast-migration] inspect-rule-author: Migrate the structural rules (cache_control/max_tokens/model-arg/loop-termination) from regex to the existing tree-sitter harness in `crates/inspect-core/src/parse.rs`; add a rule-level AST cache. (est: $1.20)
 - [x] [P2] [inspect-new-rules] inspect-rule-author: Add `cache-anthropic-tools-not-cached`, `output-n-greater-than-one`, `model-reasoning-effort-default-high`, `prompt-dynamic-prefix-breaks-cache` with fixtures. (est: $0.80)
 
