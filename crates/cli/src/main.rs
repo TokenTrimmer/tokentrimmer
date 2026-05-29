@@ -1,7 +1,9 @@
 //! `tt` — TokenTrimmer CLI.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -61,28 +63,78 @@ enum Command {
         #[command(subcommand)]
         action: AuditAction,
     },
+    /// Install TokenTrimmer best-practices into the current repo.
+    Init {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        framework: Option<String>,
+        #[arg(long)]
+        interactive: bool,
+        #[arg(long)]
+        upgrade: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        diff: bool,
+        #[arg(long)]
+        skip_baseline: bool,
+        #[arg(long)]
+        skip_hooks: bool,
+        #[arg(long)]
+        skip_workflows: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum AuditAction {
-    /// Verify the integrity of the local audit log hash chain.
+    /// Verify the integrity of an audit log hash chain.
     ///
-    /// Reads entries from `.claude/AUDIT-CHAIN.jsonl` (one JSON object per
-    /// line). This path is a placeholder until the Postgres audit writer ships
-    /// in Week 7.  Pass `--key <hex-file>` with the hex-encoded Ed25519
-    /// verifying key that was used to sign the chain.
+    /// Reads JSONL entries from `[PATH]` (default `.claude/AUDIT-CHAIN.jsonl`).
+    /// When the first line is the tt-api export preamble
+    /// `{"meta":true,"verifying_key":"<hex>",…}` the verifying key is
+    /// extracted automatically. Otherwise pass `--key <hex-file>` with the
+    /// hex-encoded Ed25519 verifying key (or `--key-hex <hex>` inline).
     Verify {
+        /// Path to the JSONL chain. Defaults to `.claude/AUDIT-CHAIN.jsonl`.
+        path: Option<String>,
         /// Filter to a specific org UUID (recorded but not yet enforced — all
         /// entries in the file are verified regardless).
         #[arg(long)]
         org: Option<String>,
         /// Path to a file containing the hex-encoded Ed25519 verifying key.
+        /// Overrides the preamble key when both are present.
         #[arg(long)]
         key: Option<String>,
+        /// Hex-encoded Ed25519 verifying key inline. Overrides `--key` and the
+        /// preamble when present.
+        #[arg(long)]
+        key_hex: Option<String>,
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = tt_config::Config::from_env().map_err(|e| anyhow::anyhow!("config: {e}"))?;
+
+    // Init Sentry before tracing. Guard is bound to the function's lifetime;
+    // dropping it on shutdown flushes pending events.
+    let _sentry_guard = config.sentry_dsn.as_deref().map(|dsn| {
+        sentry::init((
+            dsn,
+            sentry::ClientOptions {
+                release: sentry::release_name!(),
+                send_default_pii: false,
+                before_send: Some(std::sync::Arc::new(scrub_sensitive_event)),
+                ..Default::default()
+            },
+        ))
+    });
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -90,7 +142,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Gateway => {
-            println!("tt gateway: not yet implemented (Week 2-5)");
+            run_gateway(config).await?;
         }
         Command::Inspect {
             path,
@@ -108,12 +160,345 @@ fn main() -> anyhow::Result<()> {
             run_plan(input.as_deref(), output.as_deref(), example, apply)?;
         }
         Command::Audit {
-            action: AuditAction::Verify { org, key },
+            action: AuditAction::Verify {
+                path,
+                org,
+                key,
+                key_hex,
+            },
         } => {
-            run_audit_verify(org.as_deref(), key.as_deref())?;
+            run_audit_verify(
+                path.as_deref(),
+                org.as_deref(),
+                key.as_deref(),
+                key_hex.as_deref(),
+            )?;
+        }
+        Command::Init {
+            path, language, framework, interactive, upgrade, force, diff,
+            skip_baseline, skip_hooks, skip_workflows, dry_run,
+        } => {
+            use tt_cli::init::{run, RunOptions};
+            let root = path.map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap());
+            let opts = RunOptions {
+                root,
+                language_override: language,
+                framework_override: framework,
+                interactive,
+                upgrade,
+                force,
+                diff_only: diff,
+                skip_baseline,
+                skip_hooks,
+                skip_workflows,
+                dry_run,
+                tt_cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            let report = run(opts).context("tt init failed")?;
+            println!();
+            println!("Done. {} written, {} skipped.", report.files_written, report.files_skipped);
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sentry event scrubbing — runs before any event is sent upstream.
+// ---------------------------------------------------------------------------
+
+/// Names that may carry secrets when a panic captures locals or request data.
+/// Matched case-insensitively against header names, frame variable names, and
+/// extra-field keys before the event leaves the process.
+const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
+    "authorization",
+    "api_key",
+    "apikey",
+    "api-key",
+    "token",
+    "secret",
+    "password",
+    "cookie",
+    "tt_master_key",
+    "tt_live_",
+    "tt_test_",
+    "sk_live_",
+    "sk_test_",
+    "bearer",
+    "database_url",
+    "redis_url",
+    "sentry_dsn",
+];
+
+const SCRUB_PLACEHOLDER: &str = "[Filtered]";
+
+fn key_is_sensitive(k: &str) -> bool {
+    let lower = k.to_ascii_lowercase();
+    SENSITIVE_KEY_FRAGMENTS.iter().any(|f| lower.contains(f))
+}
+
+/// Strip sensitive values from an Event before Sentry uploads it.
+///
+/// Conservative: we redact whole fields whose name *looks* sensitive rather
+/// than trying to detect secrets in arbitrary value bodies. False positives
+/// (scrubbing something that wasn't actually a secret) are vastly preferable
+/// to false negatives.
+fn scrub_sensitive_event(
+    mut event: sentry::protocol::Event<'static>,
+) -> Option<sentry::protocol::Event<'static>> {
+    // Request headers / cookies / query string are the most common leak path.
+    if let Some(req) = event.request.as_mut() {
+        req.cookies = None;
+        req.query_string = None;
+        for (k, v) in req.headers.iter_mut() {
+            if key_is_sensitive(k) {
+                *v = SCRUB_PLACEHOLDER.to_string();
+            }
+        }
+        for (k, v) in req.env.iter_mut() {
+            if key_is_sensitive(k) {
+                *v = SCRUB_PLACEHOLDER.to_string();
+            }
+        }
+    }
+
+    // Exception stacktraces can carry captured locals.
+    for ex in event.exception.iter_mut() {
+        if let Some(st) = ex.stacktrace.as_mut() {
+            for frame in st.frames.iter_mut() {
+                for (k, v) in frame.vars.iter_mut() {
+                    if key_is_sensitive(k) {
+                        *v = serde_json::Value::String(SCRUB_PLACEHOLDER.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(st) = event.stacktrace.as_mut() {
+        for frame in st.frames.iter_mut() {
+            for (k, v) in frame.vars.iter_mut() {
+                if key_is_sensitive(k) {
+                    *v = serde_json::Value::String(SCRUB_PLACEHOLDER.to_string());
+                }
+            }
+        }
+    }
+
+    // Extras and tags that downstream code attached.
+    for (k, v) in event.extra.iter_mut() {
+        if key_is_sensitive(k) {
+            *v = serde_json::Value::String(SCRUB_PLACEHOLDER.to_string());
+        }
+    }
+    for (k, v) in event.tags.iter_mut() {
+        if key_is_sensitive(k) {
+            *v = SCRUB_PLACEHOLDER.to_string();
+        }
+    }
+
+    Some(event)
+}
+
+// ---------------------------------------------------------------------------
+// `tt gateway` implementation
+// ---------------------------------------------------------------------------
+
+/// Boot the Gateway HTTP server.
+///
+/// Reads config from env (see [`tt_config::Config::from_env`]). Every external
+/// dependency (DB, Redis) is best-effort at boot: a failure logs + continues
+/// rather than crash-looping the process. Bind / serve are fatal.
+async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
+    let bind = format!("0.0.0.0:{}", config.port);
+
+    // Every external connect is wrapped in a 5s budget so a misconfigured
+    // hostname can't hang the process past Fly's health-check grace window.
+    let boot_timeout = std::time::Duration::from_secs(5);
+
+    // DB best-effort: keep the pool around for downstream wiring
+    // (Postgres credential store, request_logs writer when that lands).
+    // Serverless Postgres (Neon scale-to-zero) can exceed sqlx's default
+    // acquire timeout on first connect, so the connect is guarded by a
+    // boot-time budget.
+    let db_pool: Option<sqlx::PgPool> = match config.database_url.as_deref() {
+        Some(url) => {
+            tracing::info!("connecting to database");
+            match tokio::time::timeout(boot_timeout, tt_core::connect(url, 10)).await {
+                Ok(Ok(pool)) => {
+                    match tt_core::migrate(&pool).await {
+                        Ok(()) => tracing::info!("migrations applied"),
+                        Err(e) => tracing::error!(error = %e, "migrations failed; continuing"),
+                    }
+                    Some(pool)
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "db connect failed; continuing without persistence");
+                    None
+                }
+                Err(_) => {
+                    tracing::error!(
+                        timeout_secs = boot_timeout.as_secs(),
+                        "db connect timed out; continuing without persistence"
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::warn!("DATABASE_URL not set; gateway running without persistence");
+            None
+        }
+    };
+
+    // L1 Redis best-effort. Same timeout budget — a HTTP-REST URL passed
+    // where a `rediss://` URL belongs will hang `ConnectionManager::new`.
+    let l1_cache: Option<Arc<dyn tt_cache::L1Cache>> = match config.redis_url.as_deref() {
+        Some(url) => {
+            tracing::info!("connecting to redis (L1 cache)");
+            match tokio::time::timeout(
+                boot_timeout,
+                tt_cache::redis_impl::RedisL1Cache::connect(url, "tt:l1"),
+            )
+            .await
+            {
+                Ok(Ok(c)) => {
+                    tracing::info!("L1 cache enabled");
+                    Some(Arc::new(c))
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "redis connect failed; L1 cache disabled");
+                    None
+                }
+                Err(_) => {
+                    tracing::error!(
+                        timeout_secs = boot_timeout.as_secs(),
+                        "redis connect timed out; L1 cache disabled (check URL format — needs rediss:// native, not https:// REST)"
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::warn!("REDIS_URL not set; L1 cache disabled");
+            None
+        }
+    };
+
+    let mut state = tt_core::AppState::with_default_providers();
+    if let Some(l1) = l1_cache {
+        state = state.with_l1(l1, None);
+    }
+
+    // Provider credentials: chained store — Postgres primary (when DB +
+    // `TT_MASTER_KEY` are configured), env-backed fallback (single-tenant
+    // dogfooding from the operator's own `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
+    // / etc. in Fly secrets). The chain means org-specific credentials win,
+    // and orgs that haven't onboarded yet fall back to the operator's keys.
+    let env_store = tt_auth::EnvProviderCredentialStore::new();
+    let credential_store: Arc<dyn tt_auth::ProviderCredentialStore> = match db_pool.as_ref() {
+        Some(pool) => match tt_auth::postgres::PostgresProviderCredentialStore::from_env(
+            pool.clone(),
+        ) {
+            Ok(pg) => {
+                tracing::info!("provider credentials: Postgres primary + env fallback");
+                Arc::new(tt_auth::ChainedProviderCredentialStore::new(pg, env_store))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Postgres credential store unavailable (TT_MASTER_KEY missing / bad); env-only"
+                );
+                Arc::new(env_store)
+            }
+        },
+        None => {
+            tracing::warn!("no DB pool; provider credentials are env-only");
+            Arc::new(env_store)
+        }
+    };
+    state = state.with_credential_store(credential_store);
+
+    // Key store: Postgres when a DB pool is available. Without a key store
+    // the auth middleware passes `tt_live_*` through unchallenged (dev mode);
+    // with the Postgres store it does real argon2 verify against the
+    // `api_keys` table populated by the cloud-repo dashboard (or the
+    // forthcoming hosted issuance endpoint).
+    if let Some(pool) = db_pool.as_ref() {
+        state = state.with_key_store(Arc::new(
+            tt_auth::postgres::PostgresKeyStore::new(pool.clone()),
+        ));
+        tracing::info!("key store: Postgres-backed (tt_live_* verification enabled)");
+    } else {
+        tracing::warn!(
+            "no DB pool; tt_live_* keys pass through without verification (dev mode)"
+        );
+    }
+
+    // Request-log writer: Postgres when available. The dashboard's
+    // `/api/telemetry` endpoint reads from this table for spend / savings
+    // / cache hit rate cards.
+    if let Some(pool) = db_pool.as_ref() {
+        state = state.with_request_log_writer(Arc::new(
+            tt_telemetry::request_logs::postgres::PostgresRequestLogWriter::new(
+                pool.clone(),
+            ),
+        ));
+        tracing::info!("request_logs writer: Postgres-backed");
+    } else {
+        tracing::warn!("no DB pool; request_logs writes disabled");
+    }
+
+    // Routing store: Postgres when available. Reads the `routes` table that
+    // the cloud dashboard writes (cloud schema migration 0002). Wrapped in
+    // the 60s per-org cache so the chat hot path doesn't hit the DB on
+    // every request — the dashboard surfaces this latency budget as
+    // "routes refresh every ~60 seconds".
+    if let Some(pool) = db_pool.as_ref() {
+        let backing: Arc<dyn tt_routing::RoutingStore> = Arc::new(
+            tt_routing::PostgresRoutingStore::new(pool.clone()),
+        );
+        state = state.with_routing_store(Arc::new(
+            tt_routing::CachingRoutingStore::new(backing),
+        ));
+        tracing::info!("routing store: Postgres-backed (60s per-org cache)");
+    } else {
+        tracing::warn!("no DB pool; routing disabled (chat requests pass through unrouted)");
+    }
+
+    let app = tt_core::build_router(state);
+
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("bind {bind} failed"))?;
+    tracing::info!(addr = %bind, "gateway listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
+
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("shutdown: SIGINT"),
+        _ = terminate => tracing::info!("shutdown: SIGTERM"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -380,28 +765,52 @@ fn print_plan_example() {
 
 /// Implement `tt audit verify`.
 ///
-/// v1 reads from `.claude/AUDIT-CHAIN.jsonl` (placeholder until the Postgres
-/// audit writer ships in Week 7).  Each line must be a JSON object that
-/// deserializes as [`tt_telemetry::audit::AuditEntry`].
-fn run_audit_verify(org: Option<&str>, key_path: Option<&str>) -> anyhow::Result<()> {
-    println!(
-        "v1 audit verify reads from .claude/AUDIT-CHAIN.jsonl (placeholder until Postgres \
-         audit writer ships in Week 7)."
-    );
-
-    let key_path = match key_path {
-        Some(p) => p,
-        None => {
-            anyhow::bail!(
-                "must provide --key <path> for verification: \
-                 pass a file containing the hex-encoded Ed25519 verifying key"
-            );
+/// Loads JSONL entries from `path` (default `.claude/AUDIT-CHAIN.jsonl`).
+/// When the first line is the tt-api export preamble
+/// (`{"meta":true,"verifying_key":"<hex>",…}`), the verifying key is
+/// extracted automatically. Override sources, in priority order:
+///
+/// 1. `--key-hex <hex>` (inline)
+/// 2. `--key <path>` (file containing hex)
+/// 3. preamble line
+fn run_audit_verify(
+    path: Option<&str>,
+    org: Option<&str>,
+    key_path: Option<&str>,
+    key_hex_inline: Option<&str>,
+) -> anyhow::Result<()> {
+    let chain_path_str = path.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
+    let chain_path = Path::new(chain_path_str);
+    if !chain_path.exists() {
+        println!("no chain to verify ({chain_path_str} not found)");
+        if let Some(o) = org {
+            println!("(org filter --org={o} noted; no entries to filter)");
         }
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(chain_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", chain_path.display()))?;
+
+    let parsed = parse_chain_jsonl(&content)?;
+
+    let key_hex = if let Some(h) = key_hex_inline {
+        h.trim().to_string()
+    } else if let Some(p) = key_path {
+        std::fs::read_to_string(p)
+            .map_err(|e| anyhow::anyhow!("failed to read key file {p}: {e}"))?
+            .trim()
+            .to_string()
+    } else if let Some(h) = parsed.preamble_verifying_key {
+        println!("verifying-key sourced from export preamble");
+        h
+    } else {
+        anyhow::bail!(
+            "no verifying key found: pass --key <path>, --key-hex <hex>, or use an \
+             export with a preamble line"
+        );
     };
 
-    // Load the verifying key from a hex-encoded file.
-    let key_hex = std::fs::read_to_string(key_path)
-        .map_err(|e| anyhow::anyhow!("failed to read key file {key_path}: {e}"))?;
     let key_bytes =
         hex::decode(key_hex.trim()).map_err(|e| anyhow::anyhow!("key hex decode failed: {e}"))?;
     let key_array: [u8; 32] = key_bytes
@@ -410,39 +819,18 @@ fn run_audit_verify(org: Option<&str>, key_path: Option<&str>) -> anyhow::Result
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
         .map_err(|e| anyhow::anyhow!("invalid Ed25519 verifying key: {e}"))?;
 
-    let chain_path = Path::new(".claude/AUDIT-CHAIN.jsonl");
-    if !chain_path.exists() {
-        println!("no chain to verify (.claude/AUDIT-CHAIN.jsonl not found)");
-        if let Some(o) = org {
-            println!("(org filter --org={o} noted; no entries to filter)");
-        }
-        return Ok(());
-    }
-
-    // Parse entries line-by-line.
-    let content = std::fs::read_to_string(chain_path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", chain_path.display()))?;
-
-    let entries: Vec<tt_telemetry::audit::AuditEntry> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .enumerate()
-        .map(|(i, line)| {
-            serde_json::from_str(line).map_err(|e| {
-                anyhow::anyhow!("failed to parse line {}: {e}", i + 1)
-            })
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    println!("loaded {} entries", entries.len());
+    println!("loaded {} entries", parsed.entries.len());
 
     if let Some(o) = org {
-        println!("(--org={o} noted; filtering is deferred to Week 7 Postgres writer)");
+        println!("(--org={o} noted; filtering is deferred — verifies full chain)");
     }
 
-    match tt_telemetry::audit::verify_chain(&entries, &verifying_key) {
+    match tt_telemetry::audit::verify_chain(&parsed.entries, &verifying_key) {
         Ok(()) => {
-            println!("chain OK — all {} entries verified", entries.len());
+            println!(
+                "chain OK — all {} entries verified",
+                parsed.entries.len()
+            );
         }
         Err(e) => {
             anyhow::bail!("chain verification FAILED: {e}");
@@ -450,4 +838,207 @@ fn run_audit_verify(org: Option<&str>, key_path: Option<&str>) -> anyhow::Result
     }
 
     Ok(())
+}
+
+/// Result of parsing a JSONL chain file. The preamble line (if present) is
+/// stripped out — only real audit entries land in `entries`.
+struct ParsedChain {
+    entries: Vec<tt_telemetry::audit::AuditEntry>,
+    preamble_verifying_key: Option<String>,
+}
+
+fn parse_chain_jsonl(content: &str) -> anyhow::Result<ParsedChain> {
+    let mut preamble_verifying_key: Option<String> = None;
+    let mut entries: Vec<tt_telemetry::audit::AuditEntry> = Vec::new();
+
+    for (i, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Try the preamble shape first when we're on the first non-empty
+        // line. The preamble carries `"meta": true` so it never collides
+        // with a real `AuditEntry`.
+        if entries.is_empty() && preamble_verifying_key.is_none() {
+            let v: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                anyhow::anyhow!("failed to parse line {} as JSON: {e}", i + 1)
+            })?;
+            if v.get("meta").and_then(|m| m.as_bool()) == Some(true) {
+                preamble_verifying_key = v
+                    .get("verifying_key")
+                    .and_then(|k| k.as_str())
+                    .map(String::from);
+                continue;
+            }
+            // Fall through — not a preamble, parse as entry.
+            let entry: tt_telemetry::audit::AuditEntry =
+                serde_json::from_value(v).map_err(|e| {
+                    anyhow::anyhow!("failed to parse line {} as entry: {e}", i + 1)
+                })?;
+            entries.push(entry);
+            continue;
+        }
+        let entry: tt_telemetry::audit::AuditEntry = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::anyhow!("failed to parse line {} as entry: {e}", i + 1))?;
+        entries.push(entry);
+    }
+
+    Ok(ParsedChain {
+        entries,
+        preamble_verifying_key,
+    })
+}
+
+#[cfg(test)]
+mod audit_verify_tests {
+    use super::*;
+
+    #[test]
+    fn parses_preamble_line() {
+        let content = r#"{"meta":true,"verifying_key":"aa","entry_count":0}"#;
+        let parsed = parse_chain_jsonl(content).unwrap();
+        assert_eq!(parsed.preamble_verifying_key.as_deref(), Some("aa"));
+        assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn handles_chain_without_preamble() {
+        let entry = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "org_id": "00000000-0000-0000-0000-000000000002",
+            "timestamp": "2026-05-27T00:00:00Z",
+            "actor": {"type": "system"},
+            "event": "x",
+            "payload": {},
+            "prev_hash": "0".repeat(64),
+            "hash": "f".repeat(64),
+            "signature": "a".repeat(128),
+        });
+        let content = serde_json::to_string(&entry).unwrap();
+        let parsed = parse_chain_jsonl(&content).unwrap();
+        assert!(parsed.preamble_verifying_key.is_none());
+        assert_eq!(parsed.entries.len(), 1);
+    }
+
+    #[test]
+    fn ignores_blank_lines() {
+        let content = "\n\n";
+        let parsed = parse_chain_jsonl(content).unwrap();
+        assert!(parsed.preamble_verifying_key.is_none());
+        assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn preamble_then_entries() {
+        let entry = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "org_id": "00000000-0000-0000-0000-000000000002",
+            "timestamp": "2026-05-27T00:00:00Z",
+            "actor": {"type": "system"},
+            "event": "x",
+            "payload": {},
+            "prev_hash": "0".repeat(64),
+            "hash": "f".repeat(64),
+            "signature": "a".repeat(128),
+        });
+        let content = format!(
+            r#"{{"meta":true,"verifying_key":"deadbeef"}}{}{}"#,
+            "\n",
+            serde_json::to_string(&entry).unwrap()
+        );
+        let parsed = parse_chain_jsonl(&content).unwrap();
+        assert_eq!(
+            parsed.preamble_verifying_key.as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(parsed.entries.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod sentry_scrub_tests {
+    use super::*;
+    use sentry::protocol::{Event, Exception, Frame, Request, Stacktrace};
+
+    fn frame_with_var(var_name: &str, value: &str) -> Frame {
+        let mut f = Frame::default();
+        f.vars
+            .insert(var_name.into(), serde_json::Value::String(value.into()));
+        f
+    }
+
+    #[test]
+    fn scrubs_request_headers_and_cookies() {
+        let mut req = Request::default();
+        req.headers
+            .insert("authorization".into(), "Bearer tt_live_abc".into());
+        req.headers
+            .insert("Content-Type".into(), "application/json".into());
+        req.cookies = Some("session=xyz".into());
+        req.query_string = Some("api_key=foo".into());
+        let event = Event {
+            request: Some(req),
+            ..Default::default()
+        };
+        let out = scrub_sensitive_event(event).unwrap();
+        let r = out.request.unwrap();
+        assert_eq!(r.headers.get("authorization").unwrap(), SCRUB_PLACEHOLDER);
+        assert_eq!(r.headers.get("Content-Type").unwrap(), "application/json");
+        assert!(r.cookies.is_none());
+        assert!(r.query_string.is_none());
+    }
+
+    #[test]
+    fn scrubs_exception_frame_locals() {
+        let frame = frame_with_var("api_key", "sk-secret");
+        let other = frame_with_var("user_id", "abc");
+        let ex = Exception {
+            ty: "panic".into(),
+            value: Some("boom".into()),
+            stacktrace: Some(Stacktrace {
+                frames: vec![frame, other],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let event = Event {
+            exception: vec![ex].into(),
+            ..Default::default()
+        };
+        let out = scrub_sensitive_event(event).unwrap();
+        let frames = &out.exception.values[0].stacktrace.as_ref().unwrap().frames;
+        assert_eq!(
+            frames[0].vars.get("api_key").unwrap(),
+            &serde_json::Value::String(SCRUB_PLACEHOLDER.into())
+        );
+        assert_eq!(
+            frames[1].vars.get("user_id").unwrap(),
+            &serde_json::Value::String("abc".into())
+        );
+    }
+
+    #[test]
+    fn scrubs_extras_and_tags_by_name() {
+        let mut event = Event::default();
+        event.extra.insert(
+            "TT_MASTER_KEY".into(),
+            serde_json::Value::String("xyz".into()),
+        );
+        event
+            .extra
+            .insert("model".into(), serde_json::Value::String("gpt-4o".into()));
+        event.tags.insert("bearer-prefix".into(), "tt_live".into());
+        event.tags.insert("provider".into(), "openai".into());
+        let out = scrub_sensitive_event(event).unwrap();
+        assert_eq!(
+            out.extra.get("TT_MASTER_KEY").unwrap(),
+            &serde_json::Value::String(SCRUB_PLACEHOLDER.into())
+        );
+        assert_eq!(
+            out.extra.get("model").unwrap(),
+            &serde_json::Value::String("gpt-4o".into())
+        );
+        assert_eq!(out.tags.get("bearer-prefix").unwrap(), SCRUB_PLACEHOLDER);
+        assert_eq!(out.tags.get("provider").unwrap(), "openai");
+    }
 }
