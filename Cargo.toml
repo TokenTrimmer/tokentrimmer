@@ -15,6 +15,7 @@ members = [
     "crates/cli",
     "crates/mcp",
     "crates/ts-types",
+    "crates/tokenize",
     "crates/providers/compat",
     "crates/providers/openai",
     "crates/providers/anthropic",
@@ -102,6 +103,7 @@ tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
 walkdir = "2"
 regex = "1"
+tiktoken-rs = "0.5"
 
 # tt init installer
 tera = "1.20"
@@ -111,6 +113,7 @@ toml = "0.8"
 
 # Internal crate refs
 tt-shared = { path = "crates/shared" }
+tt-tokenize = { path = "crates/tokenize" }
 tt-core = { path = "crates/core" }
 tt-cache = { path = "crates/cache" }
 tt-routing = { path = "crates/routing" }

@@ -4903,6 +4903,7 @@ dependencies = [
  "tt-routing",
  "tt-shared",
  "tt-telemetry",
+ "tt-tokenize",
  "uuid",
 ]
 
@@ -4989,7 +4990,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tiktoken-rs",
  "tokio",
  "tracing",
  "tt-provider-anthropic",
@@ -5000,6 +5000,7 @@ dependencies = [
  "tt-provider-openrouter",
  "tt-provider-together",
  "tt-shared",
+ "tt-tokenize",
  "uuid",
 ]
 
@@ -5272,6 +5273,13 @@ dependencies = [
  "tracing-subscriber",
  "tt-shared",
  "uuid",
+]
+
+[[package]]
+name = "tt-tokenize"
+version = "0.1.0"
+dependencies = [
+ "tiktoken-rs",
 ]
 
 [[package]]

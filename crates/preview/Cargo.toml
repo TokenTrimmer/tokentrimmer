@@ -20,7 +20,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
-tiktoken-rs = "0.5"
+tt-tokenize.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
 

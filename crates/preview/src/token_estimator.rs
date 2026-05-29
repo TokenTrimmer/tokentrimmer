@@ -1,8 +1,9 @@
 //! Per-model token estimation.
 //!
-//! - OpenAI / Anthropic → tiktoken-rs `cl100k_base` (close enough; final
-//!   billing uses provider report).
-//! - Gemini / local → char-count / 4.0 heuristic.
+//! The actual counting now lives in the shared [`tt_tokenize`] crate so
+//! `/v1/preview`, live dispatch, and routing all agree on the estimate. This
+//! module just adapts preview's [`Message`] shape into text and maps the
+//! shared confidence onto preview's public [`EstimationConfidence`].
 
 use crate::types::{EstimationConfidence, Message};
 
@@ -18,21 +19,20 @@ pub fn estimate(
     max_tokens_hint: Option<u32>,
 ) -> EstimateResult {
     let text = concat_message_text(messages);
-    let (input, confidence) = match provider {
-        "openai" | "anthropic" => match tiktoken_rs::cl100k_base() {
-            Ok(bpe) => (
-                bpe.encode_with_special_tokens(&text).len() as u32,
-                EstimationConfidence::High,
-            ),
-            Err(_) => (char_count_estimate(&text), EstimationConfidence::Low),
-        },
-        _ => (char_count_estimate(&text), EstimationConfidence::Medium),
-    };
+    let est = tt_tokenize::estimate_input_tokens(provider, &text);
     let output = max_tokens_hint.unwrap_or(512).min(4096);
     EstimateResult {
-        input_tokens: input,
+        input_tokens: est.tokens,
         output_tokens: output,
-        confidence,
+        confidence: map_confidence(est.confidence),
+    }
+}
+
+fn map_confidence(c: tt_tokenize::Confidence) -> EstimationConfidence {
+    match c {
+        tt_tokenize::Confidence::High => EstimationConfidence::High,
+        tt_tokenize::Confidence::Medium => EstimationConfidence::Medium,
+        tt_tokenize::Confidence::Low => EstimationConfidence::Low,
     }
 }
 
@@ -52,10 +52,6 @@ fn concat_message_text(messages: &[Message]) -> String {
         }
     }
     out
-}
-
-fn char_count_estimate(s: &str) -> u32 {
-    ((s.chars().count() as f64) / 4.0).ceil() as u32
 }
 
 #[cfg(test)]

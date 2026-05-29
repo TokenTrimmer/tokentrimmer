@@ -946,11 +946,19 @@ async fn apply_routing(
         }
     };
 
-    // Cheap input-tokens estimate: len(last user text)/4, clamped to u32.
-    // The engine docs explicitly leave tokenization to callers; this
-    // heuristic matches what we use elsewhere on the hot path.
+    // Input-tokens estimate for the route conditions. The engine deliberately
+    // leaves tokenization to callers; we delegate to the shared `tt-tokenize`
+    // estimator so routing decisions use the SAME count `/v1/preview` reports
+    // (tiktoken for openai/anthropic, chars/4 elsewhere) instead of a separate
+    // heuristic. Tokenizer choice is keyed on the originally-requested model's
+    // provider (resolved before any rewrite).
+    let provider_id = state
+        .registry
+        .resolve(&req.model)
+        .map(|p| p.id())
+        .unwrap_or("");
     let input_tokens = last_user_message_text(req)
-        .map(|s| (s.len() / 4).min(u32::MAX as usize) as u32)
+        .map(|s| tt_tokenize::estimate_tokens(provider_id, s))
         .unwrap_or(0);
 
     let m = engine.evaluate(req, ctx, input_tokens)?;
