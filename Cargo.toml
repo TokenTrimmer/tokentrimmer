@@ -23,6 +23,7 @@ members = [
     "crates/providers/together",
     "crates/providers/openrouter",
     "crates/providers/local",
+    "crates/retrieval",
 ]
 
 [workspace.package]
@@ -127,6 +128,7 @@ tt-provider-together = { path = "crates/providers/together" }
 tt-provider-openrouter = { path = "crates/providers/openrouter" }
 tt-preview = { path = "crates/preview" }
 tt-mcp = { path = "crates/mcp" }
+tt-retrieval = { path = "crates/retrieval" }
 
 [profile.release]
 lto = "thin"

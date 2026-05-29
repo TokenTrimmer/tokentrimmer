@@ -1,0 +1,1 @@
+//! tt-retrieval — `types` (scaffold)

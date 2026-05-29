@@ -1,0 +1,1 @@
+//! tt-retrieval — `error` (scaffold)
