@@ -4,6 +4,7 @@ members = [
     "crates/shared",
     "crates/core",
     "crates/cache",
+    "crates/preview",
     "crates/routing",
     "crates/auth",
     "crates/telemetry",
@@ -123,6 +124,7 @@ tt-provider-mistral = { path = "crates/providers/mistral" }
 tt-provider-groq = { path = "crates/providers/groq" }
 tt-provider-together = { path = "crates/providers/together" }
 tt-provider-openrouter = { path = "crates/providers/openrouter" }
+tt-preview = { path = "crates/preview" }
 
 [profile.release]
 lto = "thin"
