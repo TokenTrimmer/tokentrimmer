@@ -647,6 +647,37 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         tracing::warn!("no DB pool; request_logs writes disabled");
     }
 
+    // L2 semantic cache — opt-in via TT_L2_SEMANTIC_CACHE=1. Needs a pgvector
+    // DB pool and an OpenAI embedding key (TT_OPENAI_EMBED_KEY); the embedder
+    // reuses the registered OpenAI provider. A misconfig (flag on, dependency
+    // missing) degrades to a warning + L2 off rather than failing boot.
+    // NOTE: L2-hit savings currently use a synthetic baseline (chat.rs); an
+    // honest per-row baseline needs a `cache_entries.baseline_cost_usd` column
+    // (cloud migration) — tracked separately.
+    if std::env::var("TT_L2_SEMANTIC_CACHE").as_deref() == Ok("1") {
+        match (
+            db_pool.as_ref(),
+            std::env::var("TT_OPENAI_EMBED_KEY").ok(),
+            state.registry.by_id("openai"),
+        ) {
+            (Some(pool), Some(key), Some(openai)) => {
+                let creds = tt_shared::context::ProviderCredentials {
+                    api_key: tt_shared::context::SecretString::new(key),
+                    base_url: None,
+                    extra_headers: Vec::new(),
+                };
+                let embedder =
+                    Arc::new(tt_cache::OpenAIEmbedder::new(openai, "text-embedding-3-small", creds));
+                let l2 = Arc::new(tt_cache::PostgresL2Cache::new(pool.clone()));
+                state = state.with_l2(l2, embedder, None);
+                tracing::info!("L2 semantic cache enabled (pgvector + text-embedding-3-small)");
+            }
+            _ => tracing::warn!(
+                "TT_L2_SEMANTIC_CACHE=1 but DATABASE_URL / TT_OPENAI_EMBED_KEY missing — L2 disabled"
+            ),
+        }
+    }
+
     // Routing store: Postgres when available. Reads the `routes` table that
     // the cloud dashboard writes (cloud schema migration 0002). Wrapped in
     // the 60s per-org cache so the chat hot path doesn't hit the DB on
