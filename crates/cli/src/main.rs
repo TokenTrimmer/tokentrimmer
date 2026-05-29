@@ -298,8 +298,7 @@ async fn main() -> anyhow::Result<()> {
                 config::{Config, Mode},
                 listener::run as run_listener,
             };
-            let bind_addr: std::net::IpAddr =
-                bind.parse().context("invalid --bind address")?;
+            let bind_addr: std::net::IpAddr = bind.parse().context("invalid --bind address")?;
             let mode = Mode::parse(&mode).context("invalid --mode (gateway|bypass|hybrid)")?;
             let api_key = tt_api_key.or_else(|| std::env::var("TT_API_KEY").ok());
             if mode == Mode::Gateway && api_key.is_none() {

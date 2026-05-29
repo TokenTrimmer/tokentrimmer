@@ -25,9 +25,6 @@ pub fn print_summary(r: &Rollup, log_path: &Path) {
     eprintln!("│  Cache savings:      ${cache_savings:<27.4}│");
     eprintln!("│  Suggested savings:  ${net_potential:<27.4}│");
     eprintln!("│                                                    │");
-    eprintln!(
-        "│  Session log: {:<37}│",
-        log_path.display().to_string()
-    );
+    eprintln!("│  Session log: {:<37}│", log_path.display().to_string());
     eprintln!("└────────────────────────────────────────────────────┘");
 }

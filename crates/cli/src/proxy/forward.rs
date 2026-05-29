@@ -37,8 +37,7 @@ pub async fn forward_post(
         }
     }
     let resp = req.send().await?;
-    let status =
-        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut hm = HeaderMap::new();
     for (k, v) in resp.headers().iter() {
         hm.insert(k.clone(), v.clone());

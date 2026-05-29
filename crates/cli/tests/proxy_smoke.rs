@@ -44,9 +44,13 @@ async fn anthropic_route_forwards_to_upstream_and_logs() {
         log: log.clone(),
     };
     let headers = axum::http::HeaderMap::new();
-    let resp = post_messages(axum::extract::State(state), headers, Bytes::from_static(b"req"))
-        .await
-        .into_response();
+    let resp = post_messages(
+        axum::extract::State(state),
+        headers,
+        Bytes::from_static(b"req"),
+    )
+    .await
+    .into_response();
     assert_eq!(resp.status(), 200);
     // Give the appender a moment if it spawns.
     tokio::time::sleep(Duration::from_millis(10)).await;

@@ -86,6 +86,15 @@ Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 | Adding a transport | `crates/mcp/src/transport/stdio.rs` (worked example) |
 | Spec | `docs/superpowers/specs/2026-05-28-trackA-mcp-server-design.md` |
 
+### tt proxy
+
+| If you're doing | Read |
+|---|---|
+| Adding a route | `crates/cli/src/proxy/routes/` (worked example: `anthropic.rs`) |
+| Adjusting Mode behavior | `crates/cli/src/proxy/config.rs::Mode` |
+| Session rollup math | `crates/cli/src/proxy/session.rs` + `crates/cli/src/proxy/tui.rs` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackB-claude-code-codex-proxy-design.md` |
+
 ---
 
 ## Cross-cutting concerns
