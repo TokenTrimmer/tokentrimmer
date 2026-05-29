@@ -39,7 +39,13 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     let mut requests = input.requests.clone();
     requests.sort_by_key(|r| r.id);
 
-    let projection = project_requests(&requests, &routes, &input.pricing);
+    // Project L1 cache hits (exact-match) under the proposed TTL. A projected
+    // hit serves the response for free, so its projected cost is zeroed in the
+    // cost loop — otherwise a cache-adding diff would show $0 savings.
+    // (L2 semantic-hit cost-zeroing is a follow-up: it needs a per-request hit
+    // set at the chosen threshold, and L2 isn't wired in the live gateway yet.)
+    let cache_hit_ids = crate::cache_projection::project_l1_hit_ids(&requests, &input.config);
+    let projection = project_requests(&requests, &routes, &input.pricing, &cache_hit_ids);
 
     let mut aggregates = aggregate(&projection);
 
@@ -175,6 +181,7 @@ fn project_requests(
     requests: &[RequestLog],
     routes: &[ProposedRoute],
     pricing: &crate::types::PricingTable,
+    cache_hit_ids: &std::collections::HashSet<Uuid>,
 ) -> Projection {
     let cap = requests.len();
     let mut per_request_baseline = Vec::with_capacity(cap);
@@ -191,13 +198,22 @@ fn project_requests(
         per_request_latency.push(f64::from(req.latency_ms));
         per_request_cache_hit.push(if req.cached { 1.0 } else { 0.0 });
 
+        // A projected cache hit serves the response for free regardless of
+        // routing, so its projected cost is 0.
+        let is_cache_hit = cache_hit_ids.contains(&req.id);
+
         let matched = routing::match_route(req, routes);
         match matched {
             Some(route) => {
                 let target_key = crate::types::pricing_key(&req.provider, &route.then.target_model);
                 if let Some(p) = pricing.get(&target_key) {
                     let projected = cost::project_cost(req, &route.then.target_model, p);
-                    per_request_projected.push(projected.cost_usd);
+                    let projected_cost = if is_cache_hit {
+                        0.0
+                    } else {
+                        projected.cost_usd
+                    };
+                    per_request_projected.push(projected_cost);
                     let bucket = per_route.entry(route.id).or_insert_with(|| PerRouteBucket {
                         route_id: route.id,
                         route_name: route.name.clone(),
@@ -207,17 +223,17 @@ fn project_requests(
                     });
                     bucket.matched += 1;
                     bucket.baseline_cost_usd += req.baseline_cost_usd;
-                    bucket.projected_cost_usd += projected.cost_usd;
+                    bucket.projected_cost_usd += projected_cost;
                     requests_rerouted += 1;
                 } else {
                     // No pricing for the target model — count as unchanged.
                     // Conservative invariant: never fabricate savings.
-                    per_request_projected.push(req.cost_usd);
+                    per_request_projected.push(if is_cache_hit { 0.0 } else { req.cost_usd });
                     requests_unprice_able += 1;
                 }
             }
             None => {
-                per_request_projected.push(req.cost_usd);
+                per_request_projected.push(if is_cache_hit { 0.0 } else { req.cost_usd });
                 requests_unchanged += 1;
             }
         }

@@ -142,6 +142,41 @@ fn zero_iterations_errors() {
 }
 
 #[test]
+fn cache_only_diff_yields_savings() {
+    // Two identical requests within the proposed L1 TTL: the second is a
+    // projected cache hit. Adding caching with NO model change must therefore
+    // yield projected savings > 0. Before cache hits were wired into the cost
+    // loop this reported $0 (hits updated only the hit-rate, never the cost).
+    let r1 = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    let r2 = make_req(2, 30, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    let input = PlanInput {
+        plan_id: det_uuid(0xa11ce),
+        org_id: det_uuid(0xfeed_face_cafe),
+        window_start: ts(-1),
+        window_end: ts(10_000),
+        requests: vec![r1, r2],
+        proposed_routes: vec![],
+        pricing: HashMap::new(),
+        config: tt_plan_core::PlanConfig {
+            l1_ttl_seconds: Some(60),
+            ..Default::default()
+        },
+        seed: 42,
+        bootstrap_iterations: 100,
+    };
+    let result = replay(input).unwrap();
+    assert!(
+        result.aggregates.cache_hit_rate_projected > 0.0,
+        "expected a projected cache hit"
+    );
+    assert!(
+        result.aggregates.projected_savings_usd > 0.0,
+        "cache-only diff should yield savings > 0, got {}",
+        result.aggregates.projected_savings_usd
+    );
+}
+
+#[test]
 fn single_request_no_route_match_zero_savings() {
     let req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.005, false);
     let input = input_with_routes(vec![req], vec![], HashMap::new(), 100);
