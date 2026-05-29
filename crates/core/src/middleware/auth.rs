@@ -113,6 +113,14 @@ pub async fn middleware(
                     None,
                 ));
             }
+            BudgetDecision::DenyMonthlyRequests => {
+                return Ok(budget_denied_response(
+                    "Monthly request quota reached for this org.",
+                    "monthly_quota_exceeded",
+                    None,
+                    None,
+                ));
+            }
             BudgetDecision::DenyRate { retry_after_secs } => {
                 return Ok(budget_denied_response(
                     "Request rate limit exceeded for this org.",

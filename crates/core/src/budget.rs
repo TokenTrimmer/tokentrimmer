@@ -33,6 +33,25 @@ pub struct BudgetLimits {
     pub monthly_cap_usd: Option<f64>,
     /// Max requests per rolling 60s window. `None` = unlimited rate.
     pub max_requests_per_min: Option<u32>,
+    /// Max requests per calendar month. `None` = unlimited monthly volume.
+    /// Resets with the spend accumulator at the month boundary.
+    pub monthly_request_cap: Option<u32>,
+}
+
+impl BudgetLimits {
+    /// The Free-tier shape: 60 requests/minute, 5 000 requests/month, no USD
+    /// cap (Free is metered by volume, not spend). Mirrors
+    /// `tt_api::tier::limits_for("free")` so the gateway enforces the same caps
+    /// the cloud advertises. (Per-org tier→limits resolution — applying this to
+    /// the right orgs — is the remaining cloud wire-up; the primitive is here.)
+    #[must_use]
+    pub fn free_tier() -> Self {
+        Self {
+            monthly_cap_usd: None,
+            max_requests_per_min: Some(60),
+            monthly_request_cap: Some(5_000),
+        }
+    }
 }
 
 /// Outcome of a pre-flight budget check.
@@ -43,6 +62,8 @@ pub enum BudgetDecision {
     Allow { spend_remaining_usd: Option<f64> },
     /// Monthly spend cap reached — no headroom left this month.
     DenySpend,
+    /// Monthly request-count cap reached — no requests left this month.
+    DenyMonthlyRequests,
     /// Per-minute request rate exceeded; client should retry after the given
     /// number of seconds (when the window rolls over).
     DenyRate { retry_after_secs: u64 },
@@ -76,9 +97,11 @@ pub struct InMemoryBudgetEnforcer {
 }
 
 struct OrgState {
-    /// `(year, month)` the spend accumulator belongs to; resets across months.
+    /// `(year, month)` the monthly accumulators belong to; reset across months.
     month: (i32, u32),
     spend_usd: f64,
+    /// Requests counted this calendar month (for `monthly_request_cap`).
+    month_request_count: u32,
     /// Start of the current rate window.
     window_start: DateTime<Utc>,
     window_count: u32,
@@ -89,17 +112,20 @@ impl OrgState {
         Self {
             month: (now.year(), now.month()),
             spend_usd: 0.0,
+            month_request_count: 0,
             window_start: now,
             window_count: 0,
         }
     }
 
-    /// Reset the spend accumulator when `now` falls in a new month.
+    /// Reset the monthly accumulators (spend + request count) when `now` falls
+    /// in a new month.
     fn roll_month(&mut self, now: DateTime<Utc>) {
         let ym = (now.year(), now.month());
         if self.month != ym {
             self.month = ym;
             self.spend_usd = 0.0;
+            self.month_request_count = 0;
         }
     }
 }
@@ -127,6 +153,13 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
             }
         }
 
+        // Monthly request-count cap — pre-flight on attempts this month.
+        if let Some(mcap) = self.limits.monthly_request_cap {
+            if st.month_request_count >= mcap {
+                return BudgetDecision::DenyMonthlyRequests;
+            }
+        }
+
         // Per-minute rate window (also counts this attempt).
         if let Some(rpm) = self.limits.max_requests_per_min {
             let elapsed = now.signed_duration_since(st.window_start).num_seconds();
@@ -142,6 +175,9 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
                 st.window_count += 1;
             }
         }
+
+        // The request passed every gate — count it toward the monthly volume.
+        st.month_request_count = st.month_request_count.saturating_add(1);
 
         BudgetDecision::Allow {
             spend_remaining_usd: self
@@ -191,6 +227,7 @@ mod tests {
         let e = InMemoryBudgetEnforcer::new(BudgetLimits {
             monthly_cap_usd: Some(10.0),
             max_requests_per_min: None,
+            monthly_request_cap: None,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         e.record(org(), 4.0, now);
@@ -207,6 +244,7 @@ mod tests {
         let e = InMemoryBudgetEnforcer::new(BudgetLimits {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
+            monthly_request_cap: None,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -219,6 +257,7 @@ mod tests {
         let e = InMemoryBudgetEnforcer::new(BudgetLimits {
             monthly_cap_usd: None,
             max_requests_per_min: Some(2),
+            monthly_request_cap: None,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -236,6 +275,7 @@ mod tests {
         let e = InMemoryBudgetEnforcer::new(BudgetLimits {
             monthly_cap_usd: None,
             max_requests_per_min: Some(1),
+            monthly_request_cap: None,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -253,6 +293,7 @@ mod tests {
         let e = InMemoryBudgetEnforcer::new(BudgetLimits {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
+            monthly_request_cap: None,
         });
         let may = t(2026, 5, 31, 23, 0, 0);
         e.record(org(), 2.0, may);
@@ -263,10 +304,48 @@ mod tests {
     }
 
     #[test]
+    fn monthly_request_cap_denies_after_limit() {
+        let e = InMemoryBudgetEnforcer::new(BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: None,
+            monthly_request_cap: Some(3),
+        });
+        let now = t(2026, 5, 1, 0, 0, 0);
+        for _ in 0..3 {
+            assert!(e.check(org(), now).is_allowed());
+        }
+        assert_eq!(e.check(org(), now), BudgetDecision::DenyMonthlyRequests);
+    }
+
+    #[test]
+    fn monthly_request_cap_resets_next_month() {
+        let e = InMemoryBudgetEnforcer::new(BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: None,
+            monthly_request_cap: Some(1),
+        });
+        let may = t(2026, 5, 31, 23, 0, 0);
+        assert!(e.check(org(), may).is_allowed());
+        assert_eq!(e.check(org(), may), BudgetDecision::DenyMonthlyRequests);
+        // June → monthly counter resets, allowed again.
+        let june = t(2026, 6, 1, 0, 0, 0);
+        assert!(e.check(org(), june).is_allowed());
+    }
+
+    #[test]
+    fn free_tier_shape_is_60_per_min_and_5000_per_month() {
+        let l = BudgetLimits::free_tier();
+        assert_eq!(l.max_requests_per_min, Some(60));
+        assert_eq!(l.monthly_request_cap, Some(5_000));
+        assert_eq!(l.monthly_cap_usd, None);
+    }
+
+    #[test]
     fn orgs_are_isolated() {
         let e = InMemoryBudgetEnforcer::new(BudgetLimits {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
+            monthly_request_cap: None,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         let a = Uuid::from_u128(1);
