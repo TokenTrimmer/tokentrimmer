@@ -6,6 +6,8 @@
 //! re-billed at full input price on every call. Marking the last tool (or the
 //! system block) cacheable cuts that repeated cost by up to ~90%.
 
+use tt_inspect_core::ast::call_sites;
+use tt_inspect_core::parse::parse_cached;
 use tt_inspect_core::{Finding, Language, Rule, Severity};
 
 /// Fires on an Anthropic `messages.create` call that declares tools but never
@@ -50,15 +52,12 @@ impl Rule for CacheAnthropicToolsNotCachedRule {
         &[Language::Python, Language::Typescript, Language::Javascript]
     }
 
-    fn check(&self, source: &str, _language: Language, path: &str) -> Vec<Finding> {
+    fn check(&self, source: &str, language: Language, path: &str) -> Vec<Finding> {
         if is_test_fixture(path) {
             return vec![];
         }
 
-        // Quick reject: must be an Anthropic SDK call site.
-        if !source.contains("messages.create") {
-            return vec![];
-        }
+        // Quick reject: must be an Anthropic SDK module.
         let is_anthropic = source.contains("import anthropic")
             || source.contains("from anthropic")
             || source.contains("@anthropic-ai/sdk")
@@ -68,22 +67,21 @@ impl Rule for CacheAnthropicToolsNotCachedRule {
             return vec![];
         }
 
-        let mut findings = Vec::new();
-        for (line_idx, line) in source.lines().enumerate() {
-            if !line.contains("messages.create") {
-                continue;
-            }
-            let call_block: String = source
-                .lines()
-                .skip(line_idx)
-                .take(200)
-                .collect::<Vec<_>>()
-                .join("\n");
+        // AST-backed: examine real `…messages.create(...)` call nodes and scope
+        // the tools / cache_control checks to each call's own argument span.
+        let Ok(tree) = parse_cached(source, language) else {
+            return vec![];
+        };
 
-            if !declares_tools(&call_block) {
+        let mut findings = Vec::new();
+        for call in call_sites(&tree, source) {
+            if !call.callee.ends_with("messages.create") {
                 continue;
             }
-            if call_block.contains("cache_control") {
+            if !declares_tools(&call.text) {
+                continue;
+            }
+            if call.arg_contains("cache_control") {
                 continue;
             }
 
@@ -91,7 +89,7 @@ impl Rule for CacheAnthropicToolsNotCachedRule {
                 rule_id: self.id().to_string(),
                 severity: self.severity(),
                 file: path.to_string(),
-                line: (line_idx + 1) as u32,
+                line: call.line,
                 message: "Anthropic messages.create() passes a `tools` array but no \
                           cache_control. Tool definitions are static and large; without a \
                           cache breakpoint they are re-billed at full input price every call."

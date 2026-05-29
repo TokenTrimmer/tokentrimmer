@@ -4,6 +4,8 @@
 //! (OpenAI, Anthropic, Google) that are either sunset or no longer recommended.
 //! Deprecated models may be more expensive or have degraded performance.
 
+use tt_inspect_core::ast::{call_sites, is_llm_create_callee};
+use tt_inspect_core::parse::parse_cached;
 use tt_inspect_core::{Finding, Language, Rule, Severity};
 
 /// Fires when a deprecated model identifier is found in an LLM API call.
@@ -70,12 +72,18 @@ impl Rule for ModelDeprecatedRule {
         &[Language::Python, Language::Typescript, Language::Javascript]
     }
 
-    fn check(&self, source: &str, _language: Language, path: &str) -> Vec<Finding> {
+    fn check(&self, source: &str, language: Language, path: &str) -> Vec<Finding> {
         if is_test_fixture(path) {
             return vec![];
         }
 
-        let mut findings = Vec::new();
+        // AST-backed: only flag a deprecated model id that appears as a quoted
+        // argument inside a real LLM create call, so a deprecated id mentioned
+        // in a comment or unrelated string no longer false-positives.
+        let Ok(tree) = parse_cached(source, language) else {
+            return vec![];
+        };
+
         let all_deprecated = [
             DEPRECATED_OPENAI_MODELS,
             DEPRECATED_ANTHROPIC_MODELS,
@@ -83,51 +91,45 @@ impl Rule for ModelDeprecatedRule {
         ]
         .concat();
 
-        for (line_idx, line) in source.lines().enumerate() {
-            // Look for model= or model: patterns with quoted strings
+        let mut findings = Vec::new();
+        for call in call_sites(&tree, source) {
+            if !is_llm_create_callee(&call.callee) {
+                continue;
+            }
             for deprecated_model in &all_deprecated {
-                // Check for patterns like:
-                // - model="gpt-4-0314"
-                // - model='gpt-4-0314'
-                // - model: "gpt-4-0314"
-                let patterns = [
-                    format!("model=\"{deprecated_model}\""),
-                    format!("model='{deprecated_model}' "),
-                    format!("model:\"{deprecated_model}\""),
-                    format!("model: \"{deprecated_model}\""),
-                ];
-
-                let found = patterns.iter().any(|p| line.contains(p));
-                if found {
-                    findings.push(Finding {
-                        rule_id: self.id().to_string(),
-                        severity: self.severity(),
-                        file: path.to_string(),
-                        line: (line_idx + 1) as u32,
-                        message: format!(
-                            "Model '{deprecated_model}' is deprecated. Older models may be sunset or have degraded performance."
-                        ),
-                        confidence: 0.95,
-                        fix_hint: Some(format!(
-                            "Migrate to a current model. For {} models, consider using a current {} version.",
-                            if DEPRECATED_OPENAI_MODELS.contains(deprecated_model) {
-                                "OpenAI"
-                            } else if DEPRECATED_ANTHROPIC_MODELS.contains(deprecated_model) {
-                                "Anthropic"
-                            } else {
-                                "Google"
-                            },
-                            if DEPRECATED_OPENAI_MODELS.contains(deprecated_model) {
-                                "gpt-4"
-                            } else if DEPRECATED_ANTHROPIC_MODELS.contains(deprecated_model) {
-                                "claude-3"
-                            } else {
-                                "gemini"
-                            }
-                        )),
-                    });
-                    break; // Only report once per line
+                let quoted_double = format!("\"{deprecated_model}\"");
+                let quoted_single = format!("'{deprecated_model}'");
+                if !(call.arg_contains(&quoted_double) || call.arg_contains(&quoted_single)) {
+                    continue;
                 }
+                findings.push(Finding {
+                    rule_id: self.id().to_string(),
+                    severity: self.severity(),
+                    file: path.to_string(),
+                    line: call.line,
+                    message: format!(
+                        "Model '{deprecated_model}' is deprecated. Older models may be sunset or have degraded performance."
+                    ),
+                    confidence: 0.95,
+                    fix_hint: Some(format!(
+                        "Migrate to a current model. For {} models, consider using a current {} version.",
+                        if DEPRECATED_OPENAI_MODELS.contains(deprecated_model) {
+                            "OpenAI"
+                        } else if DEPRECATED_ANTHROPIC_MODELS.contains(deprecated_model) {
+                            "Anthropic"
+                        } else {
+                            "Google"
+                        },
+                        if DEPRECATED_OPENAI_MODELS.contains(deprecated_model) {
+                            "gpt-4"
+                        } else if DEPRECATED_ANTHROPIC_MODELS.contains(deprecated_model) {
+                            "claude-3"
+                        } else {
+                            "gemini"
+                        }
+                    )),
+                });
+                break; // Only report once per call.
             }
         }
 

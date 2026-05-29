@@ -5,6 +5,8 @@
 //! or `max_output_tokens`). Without such a limit, models may produce
 //! arbitrarily long — and expensive — outputs.
 
+use tt_inspect_core::ast::{call_sites, is_llm_create_callee};
+use tt_inspect_core::parse::parse_cached;
 use tt_inspect_core::{Finding, Language, Rule, Severity};
 
 /// Fires when an LLM API call is found without any `max_tokens`-family
@@ -23,15 +25,6 @@ impl Default for OutputNoMaxTokensRule {
         Self::new()
     }
 }
-
-/// Patterns that indicate an LLM create call.
-const LLM_CREATE_PATTERNS: &[&str] = &[
-    "chat.completions.create",
-    "completions.create",
-    "messages.create",
-    "generate_content(",
-    "generateContent(",
-];
 
 /// Patterns that indicate an output-length constraint is present.
 const MAX_TOKENS_PATTERNS: &[&str] = &[
@@ -62,38 +55,31 @@ impl Rule for OutputNoMaxTokensRule {
         &[Language::Python, Language::Typescript, Language::Javascript]
     }
 
-    fn check(&self, source: &str, _language: Language, path: &str) -> Vec<Finding> {
+    fn check(&self, source: &str, language: Language, path: &str) -> Vec<Finding> {
         if is_test_fixture(path) {
             return vec![];
         }
 
+        // AST-backed: only real call expressions are considered, so an LLM
+        // create mentioned in a comment/string no longer triggers, and the
+        // `max_tokens` check is scoped to the call's own argument span.
+        let Ok(tree) = parse_cached(source, language) else {
+            return vec![];
+        };
+
         let mut findings = Vec::new();
-
-        for (line_idx, line) in source.lines().enumerate() {
-            let matched_pattern = LLM_CREATE_PATTERNS.iter().find(|p| line.contains(*p));
-            let Some(_pattern) = matched_pattern else {
-                continue;
-            };
-
-            // Collect the call block (up to 60 lines) to search for
-            // max_tokens parameters.
-            let call_block: String = source
-                .lines()
-                .skip(line_idx)
-                .take(60)
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let has_max_tokens = MAX_TOKENS_PATTERNS.iter().any(|mp| call_block.contains(mp));
-            if has_max_tokens {
+        for call in call_sites(&tree, source) {
+            if !is_llm_create_callee(&call.callee) {
                 continue;
             }
-
+            if MAX_TOKENS_PATTERNS.iter().any(|mp| call.arg_contains(mp)) {
+                continue;
+            }
             findings.push(Finding {
                 rule_id: self.id().to_string(),
                 severity: self.severity(),
                 file: path.to_string(),
-                line: (line_idx + 1) as u32,
+                line: call.line,
                 message: "LLM API call is missing an output-length constraint \
                            (max_tokens / max_completion_tokens / max_output_tokens). \
                            Without this, the model may produce unbounded — and costly — output."

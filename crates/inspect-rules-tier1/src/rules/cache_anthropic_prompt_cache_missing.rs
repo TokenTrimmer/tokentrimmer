@@ -4,6 +4,8 @@
 //! prompt (≥ 1 024 estimated tokens, proxied as ≥ 4 096 chars) but no
 //! `cache_control` annotation anywhere in the same call site.
 
+use tt_inspect_core::ast::call_sites;
+use tt_inspect_core::parse::parse_cached;
 use tt_inspect_core::{Finding, Language, Rule, Severity};
 
 /// Fires when an Anthropic `messages.create` call carries a long system prompt
@@ -45,15 +47,12 @@ impl Rule for CacheAnthropicPromptCacheMissingRule {
         &[Language::Python, Language::Typescript, Language::Javascript]
     }
 
-    fn check(&self, source: &str, _language: Language, path: &str) -> Vec<Finding> {
+    fn check(&self, source: &str, language: Language, path: &str) -> Vec<Finding> {
         if is_test_fixture(path) {
             return vec![];
         }
 
-        // Quick reject: must import anthropic and call messages.create.
-        if !source.contains("messages.create") {
-            return vec![];
-        }
+        // Quick reject: must be an Anthropic SDK module.
         let is_anthropic = source.contains("import anthropic")
             || source.contains("from anthropic")
             || source.contains("@anthropic-ai/sdk")
@@ -63,32 +62,21 @@ impl Rule for CacheAnthropicPromptCacheMissingRule {
             return vec![];
         }
 
+        // AST-backed: inspect real `…messages.create(...)` call nodes, scoping
+        // the cache_control / long-system checks to each call's argument span.
+        let Ok(tree) = parse_cached(source, language) else {
+            return vec![];
+        };
+
         let mut findings = Vec::new();
-
-        // Scan for `messages.create` call lines.
-        for (line_idx, line) in source.lines().enumerate() {
-            if !line.contains("messages.create") {
+        for call in call_sites(&tree, source) {
+            if !call.callee.ends_with("messages.create") {
                 continue;
             }
-
-            // Collect the call block: from this line forward until we see a
-            // matching close paren (rough heuristic: grab up to 200 lines).
-            let call_block: String = source
-                .lines()
-                .skip(line_idx)
-                .take(200)
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            // Check for cache_control anywhere in the block.
-            if call_block.contains("cache_control") {
+            if call.arg_contains("cache_control") {
                 continue;
             }
-
-            // Check for a long system string. We look for system= or "system":
-            // followed eventually by a long string literal.
-            let has_long_system = has_long_system_literal(&call_block);
-            if !has_long_system {
+            if !has_long_system_literal(&call.text) {
                 continue;
             }
 
@@ -96,7 +84,7 @@ impl Rule for CacheAnthropicPromptCacheMissingRule {
                 rule_id: self.id().to_string(),
                 severity: self.severity(),
                 file: path.to_string(),
-                line: (line_idx + 1) as u32,
+                line: call.line,
                 message: "Anthropic messages.create() has a long system prompt (≥1024 estimated \
                            tokens) but no cache_control annotation. Add \
                            cache_control: {{\"type\": \"ephemeral\"}} to reduce input cost by \

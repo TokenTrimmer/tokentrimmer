@@ -21,7 +21,7 @@ The second-most-important gap is **presentation**: the marketing site is a liter
 
 ## Implementation status — updated 2026-05-29
 
-Since this review was written, **29 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
+Since this review was written, **30 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
 
 **✅ Shipped this session**
 - _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
@@ -36,9 +36,10 @@ Since this review was written, **29 of its items have shipped** — all inline, 
 - _Accuracy:_ `token-estimator-shared` — new `tt-tokenize` crate (cached tiktoken + heuristic); preview and the live routing estimate share it, so route thresholds match what `/v1/preview` reports
 - _Recall:_ `hnsw-org-recall` — L2 lookups raise `hnsw.ef_search` (per-tx `SET LOCAL`, default 100) so org-filtered semantic search keeps high recall under multi-tenant load; 50-org recall + cross-tenant isolation regression tests
 - _Inspect:_ `inspect-new-rules` — 4 new cost/cache rules (19/19 P0): anthropic-tools-not-cached, output-n>1, reasoning-effort-default-high, dynamic-prefix-breaks-cache; each with ≥5/≥10 fixtures
+- _Inspect (AST):_ `inspect-ast-migration` — rule-level AST cache (`parse_cached`) + a shared `call_sites` helper; migrated the max_tokens/cache_control/model-arg rules off regex onto real call nodes (ignores comments/strings)
 - _Ops:_ `cloud-repo-remote` — cloud monorepo baselined + pushed to private `TokenTrimmer/cloud`
 
-**◻ Remaining — public, doable:** `inspect-ast-migration`, `inspect-corpora-seed`
+**◻ Remaining — public, doable:** `inspect-corpora-seed`
 
 **◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `marketing-site-build`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore`, `cloud-backlog-sync`
 
@@ -290,7 +291,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 ### Inspect & Plan depth — _public_
 - [x] [P1] [inspect-5-missing-rules] ✅ **shipped `e168859`** — all 5 (`model-deprecated`, `prompt-bloated-system`, `prompt-verbose-few-shot`, `prompt-no-output-constraint`, `config-agents-md-too-long`) + fixtures; 15/15 P0 rules now ship.
 - [ ] [P1] [inspect-corpora-seed] rust-crate-builder: Vendor 5–10 pinned permissive OSS LLM samples into `corpora/` (independent of rule author), run `measure-fp-rate.sh`, record per-rule precision/recall. Unblocks the w24 FP gate. (est: ~$0.50)
-- [ ] [P2] [inspect-ast-migration] inspect-rule-author: Migrate the structural rules (cache_control/max_tokens/model-arg/loop-termination) from regex to the existing tree-sitter harness + a rule-level AST cache. (est: ~$1.20)
+- [x] [P2] [inspect-ast-migration] ✅ **shipped** — added the rule-level AST cache (`tt_inspect_core::parse::parse_cached`: memoized `Arc<Tree>` keyed on `(language, source)`, bounded, so a file is parsed once and shared across every AST rule in a scan) + a reusable `tt_inspect_core::ast::{call_sites, is_llm_create_callee}` helper that scopes detection to real `call`/`call_expression` nodes (a create-call or `max_tokens` mentioned in a comment/string no longer triggers). Migrated 3 of the 4 named structural clusters off regex onto it: **max_tokens** (`output-no-max-tokens`), **cache_control** (`cache-anthropic-tools-not-cached`, `cache-anthropic-prompt-cache-missing`), **model-arg** (`model-deprecated`). All fixtures green. _Remaining:_ the **loop-termination** cluster (`agent-no-termination-condition`) stays on control-flow heuristics for now — it's a larger AST control-flow analysis and the cache/helper are in place to do it next.
 - [x] [P2] [inspect-new-rules] ✅ **shipped** — 4 new cost/cache rules (now **19/19** P0 rules): `cache-anthropic-tools-not-cached` (tools array with no `cache_control`), `output-n-greater-than-one` (`n`/`candidate_count` > 1 multiplies output cost), `model-reasoning-effort-default-high` (reasoning model with high/defaulted-high effort), `prompt-dynamic-prefix-breaks-cache` (timestamp/uuid/now() at the *start* of a system prompt invalidates prefix caching). Each ships with ≥5 should-detect + ≥10 should-not-detect fixtures; the fixture harness (counts, per-fixture detect/no-detect, id stability) is green.
 
 ### Architecture scalability — _public_
