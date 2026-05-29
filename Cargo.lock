@@ -4992,7 +4992,11 @@ dependencies = [
  "tracing",
  "tt-provider-anthropic",
  "tt-provider-gemini",
+ "tt-provider-groq",
+ "tt-provider-mistral",
  "tt-provider-openai",
+ "tt-provider-openrouter",
+ "tt-provider-together",
  "tt-shared",
  "uuid",
 ]

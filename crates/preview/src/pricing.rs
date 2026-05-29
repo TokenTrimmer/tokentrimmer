@@ -1,10 +1,17 @@
 //! Wrapper over per-provider pricing tables.
 //!
-//! Each provider crate exposes `pricing_for(&str) -> Option<ModelPricing>`.
-//! We probe all three; first hit wins. Returns the pricing plus the
-//! provider name so the response can populate `current.provider`.
+//! Native providers (anthropic/openai/gemini) expose a free
+//! `pricing_for(&str) -> Option<ModelPricing>`. OpenAI-compatible providers
+//! (groq/mistral/together/openrouter) carry pricing in their adapter, so we
+//! probe them via the `Provider::pricing` trait method (a cheap struct init,
+//! no network). First hit wins; the provider name is returned so the response
+//! can populate `current.provider`. `local` is intentionally NOT probed — its
+//! pricing is a $0 catch-all for arbitrary self-hosted models, which would
+//! mask genuinely-unknown models behind a free price.
 
 use crate::error::PreviewError;
+use tt_provider_openai::ClientConfig;
+use tt_shared::{ModelPricing, Provider};
 
 #[derive(Debug, Clone)]
 pub struct LookupHit {
@@ -15,27 +22,38 @@ pub struct LookupHit {
     pub output_per_m: f64,
 }
 
+fn hit(provider: &'static str, p: &ModelPricing) -> LookupHit {
+    LookupHit {
+        provider,
+        input_per_m: p.input_per_million,
+        output_per_m: p.output_per_million,
+    }
+}
+
 pub fn lookup(model: &str) -> Result<LookupHit, PreviewError> {
+    // Native providers — free pricing_for() lookup.
     if let Some(p) = tt_provider_anthropic::pricing::pricing_for(model) {
-        return Ok(LookupHit {
-            provider: "anthropic",
-            input_per_m: p.input_per_million,
-            output_per_m: p.output_per_million,
-        });
+        return Ok(hit("anthropic", &p));
     }
     if let Some(p) = tt_provider_openai::pricing::pricing_for(model) {
-        return Ok(LookupHit {
-            provider: "openai",
-            input_per_m: p.input_per_million,
-            output_per_m: p.output_per_million,
-        });
+        return Ok(hit("openai", &p));
     }
     if let Some(p) = tt_provider_gemini::pricing::pricing_for(model) {
-        return Ok(LookupHit {
-            provider: "gemini",
-            input_per_m: p.input_per_million,
-            output_per_m: p.output_per_million,
-        });
+        return Ok(hit("gemini", &p));
+    }
+    // OpenAI-compatible providers — probe via the Provider trait.
+    let cfg = ClientConfig::default;
+    if let Some(p) = tt_provider_groq::GroqProvider::new(cfg()).pricing(model) {
+        return Ok(hit("groq", &p));
+    }
+    if let Some(p) = tt_provider_mistral::MistralProvider::new(cfg()).pricing(model) {
+        return Ok(hit("mistral", &p));
+    }
+    if let Some(p) = tt_provider_together::TogetherProvider::new(cfg()).pricing(model) {
+        return Ok(hit("together", &p));
+    }
+    if let Some(p) = tt_provider_openrouter::OpenRouterProvider::new(cfg()).pricing(model) {
+        return Ok(hit("openrouter", &p));
     }
     Err(PreviewError::UnknownModel(model.to_string()))
 }
@@ -67,5 +85,14 @@ mod tests {
     fn lookup_unknown_model_errors() {
         let err = lookup("does-not-exist-model").unwrap_err();
         assert!(matches!(err, PreviewError::UnknownModel(_)));
+    }
+
+    #[test]
+    fn lookup_resolves_compat_provider_models() {
+        // Groq (the dogfood routing target) must resolve via the compat probe,
+        // not just the three native providers.
+        let hit = lookup("llama-3.1-8b-instant").expect("groq model should resolve");
+        assert_eq!(hit.provider, "groq");
+        assert!(hit.input_per_m > 0.0, "groq pricing should be > 0");
     }
 }
