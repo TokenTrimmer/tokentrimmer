@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::proxy::config::Mode;
 use crate::proxy::forward;
+use crate::proxy::preview;
 use crate::proxy::routes::anthropic::AppState;
 use crate::proxy::session::LogLine;
 
@@ -27,6 +28,9 @@ pub async fn post_chat_completions(
             h.insert("authorization", format!("Bearer {k}").parse().unwrap());
         }
     }
+    // Best-effort cost preview (bounded by PREVIEW_TIMEOUT_MS). On failure
+    // the proxy forwards unannotated — never block the user request.
+    let preview_headers = preview::fetch(&state.http, &state.config, &body).await;
     match forward::forward_post(&state.http, &upstream, h, body).await {
         Ok(resp) => {
             let _ = state.log.append(&LogLine {
@@ -57,8 +61,10 @@ pub async fn post_chat_completions(
                     .get("x-tokentrimmer-trace-id")
                     .and_then(|v| v.to_str().ok()),
             });
+            let mut response_headers = resp.headers.clone();
+            preview::decorate_headers(&mut response_headers, preview_headers.as_ref());
             let body = forward::into_axum_body(resp.body);
-            (resp.status, resp.headers, body).into_response()
+            (resp.status, response_headers, body).into_response()
         }
         Err(e) => {
             let mut h = HeaderMap::new();

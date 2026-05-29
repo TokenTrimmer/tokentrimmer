@@ -5,6 +5,7 @@
 pub mod config;
 pub mod forward;
 pub mod listener;
+pub mod preview;
 pub mod routes;
 pub mod session;
 pub mod tui;

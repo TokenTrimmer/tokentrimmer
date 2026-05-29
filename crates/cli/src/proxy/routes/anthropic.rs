@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::proxy::config::{Config, Mode};
 use crate::proxy::forward;
+use crate::proxy::preview;
 use crate::proxy::session::{LogLine, SessionLog};
 
 #[derive(Clone)]
@@ -31,6 +32,10 @@ pub async fn post_messages(
             h.insert("authorization", format!("Bearer {k}").parse().unwrap());
         }
     }
+    // Best-effort cost preview. Bounded by PREVIEW_TIMEOUT_MS (500 ms) so we
+    // never delay the user request by more than that even when the gateway
+    // is slow. Failure → None → no header injection.
+    let preview_headers = preview::fetch(&state.http, &state.config, &body).await;
     match forward::forward_post(&state.http, &upstream, h, body).await {
         Ok(resp) => {
             let _ = state.log.append(&LogLine {
@@ -70,6 +75,7 @@ pub async fn post_messages(
                     Mode::Hybrid => "hybrid".parse().unwrap(),
                 },
             );
+            preview::decorate_headers(&mut response_headers, preview_headers.as_ref());
             let body = forward::into_axum_body(resp.body);
             (resp.status, response_headers, body).into_response()
         }
