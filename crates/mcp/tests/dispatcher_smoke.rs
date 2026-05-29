@@ -19,8 +19,10 @@ async fn lifecycle_initialize_list_call() {
     assert_eq!(v["result"]["serverInfo"]["name"], "tt-mcp");
 
     let list = JsonRpcRequest {
-        jsonrpc: "2.0".into(), method: "tools/list".into(),
-        params: json!({}), id: Some(json!(2)),
+        jsonrpc: "2.0".into(),
+        method: "tools/list".into(),
+        params: json!({}),
+        id: Some(json!(2)),
     };
     let r = server.dispatch(list).await;
     let v = serde_json::to_value(&r).unwrap();
@@ -29,7 +31,8 @@ async fn lifecycle_initialize_list_call() {
     assert_eq!(tools[0]["name"], "find_route_for");
 
     let call = JsonRpcRequest {
-        jsonrpc: "2.0".into(), method: "tools/call".into(),
+        jsonrpc: "2.0".into(),
+        method: "tools/call".into(),
         params: json!({ "name": "find_route_for", "arguments": { "task_description": "classify this email as spam" } }),
         id: Some(json!(3)),
     };

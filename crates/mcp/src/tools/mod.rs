@@ -46,3 +46,4 @@ pub mod find_route_for;
 pub mod inspect_diff;
 pub mod lookup_semantic_cache;
 pub mod preview_cost;
+pub mod simulate_plan;

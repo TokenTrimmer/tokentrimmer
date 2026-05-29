@@ -257,11 +257,25 @@ async fn main() -> anyhow::Result<()> {
                     http: reqwest::Client::new(),
                 }));
             server
+                .tools
+                .register(Box::new(tt_mcp::tools::simulate_plan::SimulatePlanTool {
+                    base_url: tt_api_base.clone(),
+                    api_key: api_key.clone(),
+                    http: reqwest::Client::new(),
+                }));
+            server
                 .resources
                 .register(Box::new(cost_ledger::CostLedgerResource));
             server
                 .resources
                 .register(Box::new(inspect_baseline::InspectBaselineResource));
+            server.resources.register(Box::new(
+                tt_mcp::resources::plan_history::PlanHistoryResource {
+                    base_url: tt_api_base.clone(),
+                    api_key: api_key.clone(),
+                    http: reqwest::Client::new(),
+                },
+            ));
             match transport.as_str() {
                 "stdio" => {
                     tokio::runtime::Builder::new_multi_thread()
