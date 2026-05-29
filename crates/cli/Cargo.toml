@@ -48,7 +48,11 @@ sha2.workspace = true
 dialoguer.workspace = true
 toml.workspace = true
 chrono.workspace = true
+crossterm = "0.28"
+dirs = "5.0"
+bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+httpmock.workspace = true
 insta = { workspace = true }
