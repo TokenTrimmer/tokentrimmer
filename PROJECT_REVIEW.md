@@ -21,18 +21,18 @@ The second-most-important gap is **presentation**: the marketing site is a liter
 
 ## Implementation status — updated 2026-05-29
 
-Since this review was written, **20 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now largely closed.
+Since this review was written, **22 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, and the L2 cache + retry resilience are live.
 
 **✅ Shipped this session**
 - _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
-- _Gateway:_ `registry-model-passthrough` (unlisted models dispatch, no 404), `streaming-client-timeout` (read-idle), `openai-reasoning-stream-unblock`
+- _Gateway:_ `registry-model-passthrough` (unlisted models dispatch, no 404), `streaming-client-timeout` (read-idle), `openai-reasoning-stream-unblock`, `retry-fallback-layer` (bounded retry/backoff on transient 429/5xx), `wire-l2-cache-production` (L2 semantic cache live behind `TT_L2_SEMANTIC_CACHE=1`)
 - _Moment-of-use:_ `fix-proxy-savings-banner`, `stream-cost-headers` (terminal `tokentrimmer.usage` event), `live-cli-savings-ticker`
 - _Headline feature:_ **`budget-caps-quota`** — per-org monthly spend cap + per-minute rate, enforced in auth middleware → 429 + `X-TT-Budget-Remaining-Usd`
 - _Inspect / quality:_ `inspect-5-missing-rules` (15/15 P0 rules now ship), `preview-pricing-all-providers`, `retrieval-orgid-isolation`
 - _Docs / hygiene:_ `getting-started-guide` (`GETTING_STARTED.md`), `docs-readme-quickstart-fix`, `kdf-doc-align`, `workspace-lints-align`, `perms-least-privilege-cleanup`, `.gitignore` hardening
 - _Ops:_ `cloud-repo-remote` — cloud monorepo baselined + pushed to private `TokenTrimmer/cloud`
 
-**◻ Remaining — public, doable:** `wire-l2-cache-production` (P0), `retry-fallback-layer` (P1), `pricing-externalize` (P1), `provider-failover`, `cost-diff-ci-lint`, `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
+**◻ Remaining — public, doable:** `pricing-externalize` (P1), `provider-failover`, `cost-diff-ci-lint`, `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
 
 **◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `marketing-site-build`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore`, `cloud-backlog-sync`
 
@@ -44,7 +44,7 @@ The §6 / §7 checklists below are annotated `✅` where shipped.
 
 ## 2. Does it actually save tokens? — The savings reality
 
-> **Update (2026-05-29):** the measurement gaps below are now largely **fixed** — routing `saved_usd` is priced against the original model, Anthropic prompt-cache usage is mapped correctly (non-stream + stream), and streaming responses emit a terminal `tokentrimmer.usage` event. So the **provable** savings now approach the **delivered** savings. The one remaining true gap is **L2 semantic cache, still unwired in production** (`wire-l2-cache-production`). The original analysis below is preserved for context.
+> **Update (2026-05-29):** the measurement gaps below are now largely **fixed** — routing `saved_usd` is priced against the original model, Anthropic prompt-cache usage is mapped correctly (non-stream + stream), and streaming responses emit a terminal `tokentrimmer.usage` event. So the **provable** savings now approach the **delivered** savings. **L2 semantic cache is now wired** (behind `TT_L2_SEMANTIC_CACHE=1`); its hit-savings still use a synthetic baseline pending a `cache_entries.baseline_cost_usd` column (cloud migration). The original analysis below is preserved for context.
 
 **This is the question that matters most, so it goes first.** Here is the honest mechanism-by-mechanism scorecard, traced through real code:
 
@@ -218,7 +218,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 **Savings correctness (make the mission provable)**
 - [x] `fix-routing-baseline-savings` **[P0/S]** ✅ — baseline priced against the original requested model (non-stream + streaming); asserts `saved_usd>0` on downgrade.
 - [x] `fix-anthropic-stream-cached-tokens` **[P0/S]** ✅ — `cache_read/creation` threaded through `StreamState`; streamed Claude calls report real `cached_tokens`.
-- [ ] `wire-l2-cache-production` **[P0/M]** — attach L2 in the CLI gateway behind a flag + real per-row baseline, or remove L2 from "live features." **(still open — the one real measurement gap left.)** _(`cli/main.rs`, `state.rs`, `chat.rs`)_
+- [x] `wire-l2-cache-production` **[P0/M]** ✅ — L2 wired into gateway boot behind `TT_L2_SEMANTIC_CACHE=1` (PostgresL2Cache + OpenAI embedder) (`29a5b0a`). Honest per-row baseline still needs a `cache_entries.baseline_cost_usd` column (cloud).
 - [x] `fix-anthropic-cache-usage-mapping` **[P1/S]** ✅ — `prompt_tokens = input + cache_read (+ creation)`; cost/savings now correct (`669506c`, `5a53298`).
 - [x] `fee-multiplier-apply` **[P1/S]** ✅ — `Provider::fee_multiplier()` applied to cost+baseline; OpenRouter 5% BYOK (`cb0909b`).
 - [x] `anthropic-total-tokens-fix` **[P2/S]** ✅ — cache-creation folded into `prompt_tokens`/`total_tokens` (`5a53298`).
@@ -230,7 +230,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 
 **Gateway correctness / resilience**
 - [x] `registry-model-passthrough` **[P0/M]** ✅ — `registry.resolve()` falls back to `infer_provider → by_id` (`9317b76`).
-- [ ] `retry-fallback-layer` **[P1/M]** — wire `is_retriable`/`is_fallback_eligible` into a backoff+fallback policy. _(`error.rs`, `chat.rs`)_
+- [x] `retry-fallback-layer` **[P1/M]** ✅ — bounded retry/backoff on transient errors (honors `retry_after_ms`), wired into non-stream + initial-stream dispatch (`691a055`). Alternate-provider fallback chain → `provider-failover`.
 - [x] `streaming-client-timeout` **[P1/S]** ✅ — read-idle timeout so long streams aren't cut at 120s (`05e048e`).
 - [x] `openai-reasoning-stream-unblock` **[P3/S]** ✅ — o3/o4-mini stream; `Streaming` capability added (`a60f1ff`).
 
