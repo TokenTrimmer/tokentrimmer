@@ -13,6 +13,7 @@ members = [
     "crates/inspect-rules-tier1",
     "crates/plan-core",
     "crates/cli",
+    "crates/mcp",
     "crates/ts-types",
     "crates/providers/openai",
     "crates/providers/anthropic",
@@ -125,6 +126,7 @@ tt-provider-groq = { path = "crates/providers/groq" }
 tt-provider-together = { path = "crates/providers/together" }
 tt-provider-openrouter = { path = "crates/providers/openrouter" }
 tt-preview = { path = "crates/preview" }
+tt-mcp = { path = "crates/mcp" }
 
 [profile.release]
 lto = "thin"
