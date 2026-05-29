@@ -69,9 +69,9 @@ create_tier() {
 PRO=$(create_tier "TokenTrimmer Pro" 9900 pro \
   "Up to 500K req/mo, 90d retention, CSV/JSON export, L1 + L2 cache")
 TEAM=$(create_tier "TokenTrimmer Team" 39900 team \
-  "Pro features + RBAC, SSO (Google + GitHub), PR bot on up to 10 repos, 25 seats")
+  "Pro features + RBAC, SSO (Google + GitHub), PR bot on up to 10 repos, unlimited seats")
 SCALE=$(create_tier "TokenTrimmer Scale" 149900 scale \
-  "Team features + S3 Object Lock audit, signed monthly SLO PDFs, dedicated support")
+  "Team features + S3 Object Lock audit, signed monthly SLO PDFs, email support")
 
 cat <<EOF
 
