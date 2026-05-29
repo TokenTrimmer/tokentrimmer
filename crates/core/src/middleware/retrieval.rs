@@ -18,8 +18,8 @@ use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::Response;
 use tracing::{debug, warn};
-use uuid::Uuid;
 
+use tt_auth::ApiKeyContext;
 use tt_retrieval::embed::EmbeddingClient;
 use tt_retrieval::store::memory::MemoryStore;
 use tt_retrieval::store::RetrievalStore;
@@ -156,8 +156,28 @@ pub async fn maybe_substitute(
         }
     };
 
-    // Placeholder org_id until auth middleware integration.
-    let org_id = Uuid::nil();
+    // Read org_id from the ApiKeyContext extension set by the auth middleware.
+    // Authenticated requests use the caller's real org_id, guaranteeing
+    // per-tenant isolation in the retrieval store: org A's stored documents
+    // are never surfaced to org B and vice versa.
+    //
+    // When no ApiKeyContext is present (unauthenticated or dev-mode requests
+    // without a key store wired), fall back to Uuid::nil() — the shared
+    // unauthenticated namespace — and emit a debug trace. This preserves
+    // the legacy behaviour for local development and integration tests that
+    // don't wire the auth middleware. Authenticated production traffic never
+    // reaches this branch.
+    let org_id = parts
+        .extensions
+        .get::<ApiKeyContext>()
+        .map(|ctx| ctx.org_id)
+        .unwrap_or_else(|| {
+            tracing::debug!(
+                "retrieval: no ApiKeyContext present — \
+                 using nil org (unauthenticated / dev path)"
+            );
+            uuid::Uuid::nil()
+        });
 
     // Run substitution.
     match substitute_in_messages(messages, org_id, state.store.as_ref(), &state.embedder).await {
