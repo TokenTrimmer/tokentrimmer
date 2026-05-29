@@ -139,6 +139,13 @@ impl PricingCatalog {
             .collect()
     }
 
+    /// Every `(provider, model)` pair in the catalog. Order is unspecified.
+    /// Pair with [`latest`](Self::latest) / [`at`](Self::at) to materialize a
+    /// full rate table (e.g. for the Plan replay engine).
+    pub fn pairs(&self) -> Vec<(String, String)> {
+        self.by_model.keys().cloned().collect()
+    }
+
     /// Number of distinct `(provider, model)` pairs in the catalog.
     pub fn len(&self) -> usize {
         self.by_model.len()
