@@ -27,7 +27,7 @@ case "${cmd}" in
     # Highest priority open item that is NOT tagged [BLOCKED ...].
     line=""
     for prio in P0 P1 P2 P3; do
-      line=$(grep -E "^\- \[ \] \[${prio}\]" "${BACKLOG}" | grep -Ev '\[BLOCKED|\[DEFERRED|\[NEEDS-SPEC|\[NEEDS-PLAN' | head -1 || true)
+      line=$(grep -E "^\- \[ \] \[${prio}\]" "${BACKLOG}" | grep -Ev '\[BLOCKED|\[DEFERRED|\[NEEDS-SPEC|\[NEEDS-PLAN|\[CLOUD-REPO' | head -1 || true)
       [[ -n "${line}" ]] && break
     done
     if [[ -z "${line}" ]]; then
@@ -74,7 +74,7 @@ case "${cmd}" in
       exit 1
     fi
     existing=$(gh issue list --label autopilot --state open --limit 100 --json title --jq '.[].title' 2>/dev/null || echo "")
-    grep -E '^\- \[ \] \[P[0-3]\]' "${BACKLOG}" | grep -Ev '\[BLOCKED|\[DEFERRED|\[NEEDS-SPEC|\[NEEDS-PLAN' | while IFS= read -r line; do
+    grep -E '^\- \[ \] \[P[0-3]\]' "${BACKLOG}" | grep -Ev '\[BLOCKED|\[DEFERRED|\[NEEDS-SPEC|\[NEEDS-PLAN|\[CLOUD-REPO' | while IFS= read -r line; do
       task_id=$(echo "${line}" | sed -E 's/^\- \[ \] \[P[0-3]\] \[([a-zA-Z0-9-]+)\].*/\1/')
       desc=$(echo "${line}" | sed -E 's/^\- \[ \] \[P[0-3]\] \[[a-zA-Z0-9-]+\] [a-z-]+: (.*) \(est:.*/\1/')
       title="[${task_id}] ${desc}"
