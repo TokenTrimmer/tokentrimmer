@@ -32,7 +32,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use futures::stream::BoxStream;
 use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
@@ -198,55 +197,13 @@ fn models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Build the OpenRouter model→rate map from the shared versioned pricing
+/// catalog. These are upstream list prices; OpenRouter's 5% BYOK fee is applied
+/// separately via `fee_multiplier`, not baked into the rate. Fed into the
+/// OpenAI-compatible inner client at construction.
 fn pricing_table() -> HashMap<String, ModelPricing> {
-    let now = Utc::now();
-    let mut table = HashMap::new();
-
-    table.insert(
-        "anthropic/claude-sonnet-4-6".to_string(),
-        ModelPricing {
-            input_per_million: 3.00,
-            output_per_million: 15.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "openai/gpt-5.5".to_string(),
-        ModelPricing {
-            input_per_million: 5.00,
-            output_per_million: 30.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "google/gemini-3.1-pro".to_string(),
-        ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 12.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "meta-llama/llama-3.3-70b-instruct".to_string(),
-        ModelPricing {
-            input_per_million: 0.59,
-            output_per_million: 0.79,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "mistralai/mistral-large".to_string(),
-        ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 6.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-
-    table
+    tt_shared::pricing::catalog()
+        .latest_for_provider("openrouter")
+        .into_iter()
+        .collect()
 }

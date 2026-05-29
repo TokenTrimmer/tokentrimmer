@@ -21,7 +21,7 @@ The second-most-important gap is **presentation**: the marketing site is a liter
 
 ## Implementation status — updated 2026-05-29
 
-Since this review was written, **23 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, and the L2 cache + retry/failover resilience are live.
+Since this review was written, **24 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
 
 **✅ Shipped this session**
 - _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
@@ -30,9 +30,10 @@ Since this review was written, **23 of its items have shipped** — all inline, 
 - _Headline feature:_ **`budget-caps-quota`** — per-org monthly spend cap + per-minute rate, enforced in auth middleware → 429 + `X-TT-Budget-Remaining-Usd`
 - _Inspect / quality:_ `inspect-5-missing-rules` (15/15 P0 rules now ship), `preview-pricing-all-providers`, `retrieval-orgid-isolation`
 - _Docs / hygiene:_ `getting-started-guide` (`GETTING_STARTED.md`), `docs-readme-quickstart-fix`, `kdf-doc-align`, `workspace-lints-align`, `perms-least-privilege-cleanup`, `.gitignore` hardening
+- _Architecture:_ `pricing-externalize` — per-model rates moved to a versioned, embedded `data/pricing.toml` (real `effective_at` + price history; live + historical-replay lookups); all 7 paid providers delegate to the shared catalog
 - _Ops:_ `cloud-repo-remote` — cloud monorepo baselined + pushed to private `TokenTrimmer/cloud`
 
-**◻ Remaining — public, doable:** `pricing-externalize` (P1), `cost-diff-ci-lint`, `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
+**◻ Remaining — public, doable:** `cost-diff-ci-lint`, `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
 
 **◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `marketing-site-build`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore`, `cloud-backlog-sync`
 
@@ -288,7 +289,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 - [ ] [P2] [inspect-new-rules] inspect-rule-author: `cache-anthropic-tools-not-cached`, `output-n-greater-than-one`, `model-reasoning-effort-default-high`, `prompt-dynamic-prefix-breaks-cache`. (est: ~$0.80)
 
 ### Architecture scalability — _public_
-- [ ] [P1] [pricing-externalize] rust-crate-builder: Move pricing/model catalogs to versioned data (`include_dir` + refresh path or Postgres table) with real `effective_at`; decouples a 50-provider catalog from releases and fixes historical replay. (est: ~$1.50)
+- [x] [P1] [pricing-externalize] ✅ **shipped** — model *rates* moved out of Rust source into a versioned, embedded data file (`crates/shared/data/pricing.toml`, `include_str!`-loaded once into `tt_shared::pricing::PricingCatalog` via `OnceLock`). A rate refresh is now a data edit, not a release. Real `effective_at` per row + per-model price *history*: `catalog().latest(provider, model)` for live pricing, `catalog().at(provider, model, ts)` for historical replay. All 7 paid providers delegate to it (openai/anthropic/gemini via `pricing_for`; groq/mistral/openrouter/together via `pricing_table` → `latest_for_provider`); local stays zero. 32 models; each provider's existing `pricing_values_match_spec`/`pricing_table_correct_rates` test verifies the TOML transcription is exact. _Scope note:_ model **descriptors** (capabilities/limits) stay typed in Rust; `tt-plan-core` keeps its own `ModelPricing` (separate replay catalog) — externalizing that + a live refresh/Postgres path are follow-ups.
 - [ ] [P2] [token-estimator-shared] rust-crate-builder: Extract `tt-tokenize` (tiktoken) shared by preview, dispatch, routing so routing rewrites use the accurate estimate. (est: ~$0.60)
 - [ ] [P2] [compat-crate-split] rust-crate-builder: Split `OpenAICompatibleProvider` into `tt-provider-compat`; make registry registration config-aware; sort `/v1/models`. (est: ~$0.80)
 - [ ] [P2] [hnsw-org-recall] rust-crate-builder: Fix L2 recall under multi-tenant load (tune `ef_search` for org-filtered query or partition `cache_entries` by org); add a recall regression test. (est: ~$0.80)

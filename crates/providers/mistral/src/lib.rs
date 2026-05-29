@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use futures::stream::BoxStream;
 use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
@@ -164,55 +163,11 @@ fn models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Build the Mistral model→rate map from the shared versioned pricing catalog.
+/// Fed into the OpenAI-compatible inner client at construction.
 fn pricing_table() -> HashMap<String, ModelPricing> {
-    let now = Utc::now();
-    let mut table = HashMap::new();
-
-    table.insert(
-        "mistral-large-latest".to_string(),
-        ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 6.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "mistral-medium-latest".to_string(),
-        ModelPricing {
-            input_per_million: 0.70,
-            output_per_million: 2.10,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "mistral-small-latest".to_string(),
-        ModelPricing {
-            input_per_million: 0.20,
-            output_per_million: 0.60,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "codestral-latest".to_string(),
-        ModelPricing {
-            input_per_million: 0.30,
-            output_per_million: 0.90,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "pixtral-large-latest".to_string(),
-        ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 6.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-
-    table
+    tt_shared::pricing::catalog()
+        .latest_for_provider("mistral")
+        .into_iter()
+        .collect()
 }

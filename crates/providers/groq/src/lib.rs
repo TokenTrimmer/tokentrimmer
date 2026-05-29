@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use futures::stream::BoxStream;
 use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
@@ -152,46 +151,11 @@ fn models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Build the Groq model→rate map from the shared versioned pricing catalog.
+/// Fed into the OpenAI-compatible inner client at construction.
 fn pricing_table() -> HashMap<String, ModelPricing> {
-    let now = Utc::now();
-    let mut table = HashMap::new();
-
-    table.insert(
-        "llama-3.3-70b-versatile".to_string(),
-        ModelPricing {
-            input_per_million: 0.59,
-            output_per_million: 0.79,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "llama-3.1-8b-instant".to_string(),
-        ModelPricing {
-            input_per_million: 0.05,
-            output_per_million: 0.08,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "deepseek-r1-distill-llama-70b".to_string(),
-        ModelPricing {
-            input_per_million: 0.75,
-            output_per_million: 0.99,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "mixtral-8x7b-32768".to_string(),
-        ModelPricing {
-            input_per_million: 0.24,
-            output_per_million: 0.24,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-
-    table
+    tt_shared::pricing::catalog()
+        .latest_for_provider("groq")
+        .into_iter()
+        .collect()
 }

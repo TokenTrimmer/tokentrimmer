@@ -1,37 +1,14 @@
-//! Pricing table for Anthropic models (May 2026 baseline).
-//!
-//! Values sourced from Anthropic pricing page. `cached_input_per_million` uses
-//! the cache **read** rate (10% of standard input). Cache-write surcharges are
-//! not exposed here because they are recovered on second use.
+//! Anthropic model catalog. Rates come from the versioned, embedded pricing
+//! catalog (`tt_shared::pricing`); `cached_input_per_million` there is the
+//! cache **read** rate (~10% of standard input). Cache-write surcharges are
+//! not modeled (recovered on second use). Model descriptors stay typed below.
 
-use chrono::Utc;
-use tt_shared::pricing::{Capability, ModelInfo, ModelPricing};
+use tt_shared::pricing::{catalog, Capability, ModelInfo, ModelPricing};
 
 /// Return the pricing entry for a known Anthropic model, or `None` if
-/// unrecognized.
+/// unrecognized. Delegates to the shared catalog's current rate.
 pub fn pricing_for(model: &str) -> Option<ModelPricing> {
-    let now = Utc::now();
-    match model {
-        "claude-haiku-4-5" => Some(ModelPricing {
-            input_per_million: 1.00,
-            output_per_million: 5.00,
-            cached_input_per_million: Some(0.10),
-            effective_at: now,
-        }),
-        "claude-sonnet-4-6" => Some(ModelPricing {
-            input_per_million: 3.00,
-            output_per_million: 15.00,
-            cached_input_per_million: Some(0.30),
-            effective_at: now,
-        }),
-        "claude-opus-4-7" => Some(ModelPricing {
-            input_per_million: 5.00,
-            output_per_million: 25.00,
-            cached_input_per_million: Some(0.50),
-            effective_at: now,
-        }),
-        _ => None,
-    }
+    catalog().latest("anthropic", model)
 }
 
 /// Return all supported Anthropic model descriptors.

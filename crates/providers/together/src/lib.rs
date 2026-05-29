@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use futures::stream::BoxStream;
 use tt_provider_openai::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
@@ -151,46 +150,11 @@ fn models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Build the Together model→rate map from the shared versioned pricing
+/// catalog. Fed into the OpenAI-compatible inner client at construction.
 fn pricing_table() -> HashMap<String, ModelPricing> {
-    let now = Utc::now();
-    let mut table = HashMap::new();
-
-    table.insert(
-        "meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo".to_string(),
-        ModelPricing {
-            input_per_million: 0.88,
-            output_per_million: 0.88,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo".to_string(),
-        ModelPricing {
-            input_per_million: 3.50,
-            output_per_million: 3.50,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "Qwen/Qwen2.5-72B-Instruct-Turbo".to_string(),
-        ModelPricing {
-            input_per_million: 1.20,
-            output_per_million: 1.20,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "deepseek-ai/DeepSeek-V3".to_string(),
-        ModelPricing {
-            input_per_million: 1.25,
-            output_per_million: 1.25,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-
-    table
+    tt_shared::pricing::catalog()
+        .latest_for_provider("together")
+        .into_iter()
+        .collect()
 }
