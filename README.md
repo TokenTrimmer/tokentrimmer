@@ -14,6 +14,8 @@ TokenTrimmer is four products that ship together:
 
 This repo is the **open-source core** (Apache 2.0): Gateway, Inspect CLI, Plan engine, and SDKs. The closed-source hosted product lives at `tokentrimmer/cloud`.
 
+> **New here?** Start with **[`GETTING_STARTED.md`](GETTING_STARTED.md)** — a 5-minute hosted quickstart plus a copy-paste example for every surface (gateway, inspect, plan, init, mcp, proxy, retrieval, SDKs).
+
 ## Status
 
 Pre-alpha. Week 0 pre-flight is complete; Gateway implementation starts Week 1. See [`/Users/iansimon/.claude/plans/please-review-all-files-linked-tulip.md`](../../.claude/plans/please-review-all-files-linked-tulip.md) for the 26-week solo-founder buildout plan.
@@ -21,9 +23,8 @@ Pre-alpha. Week 0 pre-flight is complete; Gateway implementation starts Week 1. 
 ### Prerequisites for local build
 
 ```bash
-# Toolchain (rust-toolchain.toml pins; rustup auto-installs)
-rustup install 1.85.0       # required: a transitive dep needs edition2024
-rustup default 1.85.0
+# Toolchain: rust-toolchain.toml pins 1.88.0 and rustup auto-installs it on
+# the first cargo command — no manual install needed. (Manual: rustup install 1.88.0)
 
 # Services for end-to-end testing
 make dev                     # brings up Postgres+pgvector, Redis, MinIO, mailpit
@@ -37,10 +38,11 @@ export OPENAI_API_KEY=$(echo $TT_KEY)  # tt_live_... key
 # Then change one line in your OpenAI SDK init:
 #   base_url="https://api.tokentrimmer.com/v1"
 
-# Self-host
+# Self-host — the image's entrypoint is `tt`, default command `gateway`
+# (binds :8080). Configuration is env-only; there is no YAML config file.
 docker run -p 8080:8080 \
-  -v $PWD/tokentrimmer.yaml:/etc/tokentrimmer.yaml \
-  ghcr.io/tokentrimmer/gateway:latest
+  -e OPENAI_API_KEY=sk-... -e ANTHROPIC_API_KEY=sk-ant-... \
+  ghcr.io/tokentrimmer/tt-cli:latest
 
 # Inspect a codebase
 cargo install tt-cli
@@ -74,7 +76,6 @@ crates/
     └── local/                 Ollama / vLLM / LM Studio
 sdk-python/                    Python SDK
 sdk-typescript/                TypeScript SDK
-examples/                      docker-compose, configs
 ```
 
 ## Architecture
