@@ -29,7 +29,11 @@ fn fresh_install_writes_baseline_files() {
         tt_cli_version: "0.1.0".into(),
     };
     let report = run(opts).unwrap();
-    assert!(report.files_written >= 5, "report = {:?}", (report.files_written, report.files_skipped));
+    assert!(
+        report.files_written >= 5,
+        "report = {:?}",
+        (report.files_written, report.files_skipped)
+    );
     assert!(d.path().join("AGENTS.md").exists());
     assert!(d.path().join(".claude/settings.json").exists());
     assert!(d.path().join(".claude/BACKLOG.md").exists());
@@ -61,7 +65,10 @@ fn idempotent_rerun_is_noop_when_unchanged() {
     // Second run: every file is now "user-modified" by the perspective of
     // a fresh-install path, OR a no-op if classify routes through the manifest.
     // We assert no NEW files are written (manifest path holds).
-    assert_eq!(r2.files_written + r2.files_skipped, r1.files_written + r1.files_skipped);
+    assert_eq!(
+        r2.files_written + r2.files_skipped,
+        r1.files_written + r1.files_skipped
+    );
 }
 
 #[test]

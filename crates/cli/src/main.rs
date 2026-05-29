@@ -160,12 +160,13 @@ async fn main() -> anyhow::Result<()> {
             run_plan(input.as_deref(), output.as_deref(), example, apply)?;
         }
         Command::Audit {
-            action: AuditAction::Verify {
-                path,
-                org,
-                key,
-                key_hex,
-            },
+            action:
+                AuditAction::Verify {
+                    path,
+                    org,
+                    key,
+                    key_hex,
+                },
         } => {
             run_audit_verify(
                 path.as_deref(),
@@ -175,11 +176,22 @@ async fn main() -> anyhow::Result<()> {
             )?;
         }
         Command::Init {
-            path, language, framework, interactive, upgrade, force, diff,
-            skip_baseline, skip_hooks, skip_workflows, dry_run,
+            path,
+            language,
+            framework,
+            interactive,
+            upgrade,
+            force,
+            diff,
+            skip_baseline,
+            skip_hooks,
+            skip_workflows,
+            dry_run,
         } => {
             use tt_cli::init::{run, RunOptions};
-            let root = path.map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap());
+            let root = path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
             let opts = RunOptions {
                 root,
                 language_override: language,
@@ -196,7 +208,10 @@ async fn main() -> anyhow::Result<()> {
             };
             let report = run(opts).context("tt init failed")?;
             println!();
-            println!("Done. {} written, {} skipped.", report.files_written, report.files_skipped);
+            println!(
+                "Done. {} written, {} skipped.",
+                report.files_written, report.files_skipped
+            );
         }
     }
     Ok(())
@@ -395,21 +410,21 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // and orgs that haven't onboarded yet fall back to the operator's keys.
     let env_store = tt_auth::EnvProviderCredentialStore::new();
     let credential_store: Arc<dyn tt_auth::ProviderCredentialStore> = match db_pool.as_ref() {
-        Some(pool) => match tt_auth::postgres::PostgresProviderCredentialStore::from_env(
-            pool.clone(),
-        ) {
-            Ok(pg) => {
-                tracing::info!("provider credentials: Postgres primary + env fallback");
-                Arc::new(tt_auth::ChainedProviderCredentialStore::new(pg, env_store))
+        Some(pool) => {
+            match tt_auth::postgres::PostgresProviderCredentialStore::from_env(pool.clone()) {
+                Ok(pg) => {
+                    tracing::info!("provider credentials: Postgres primary + env fallback");
+                    Arc::new(tt_auth::ChainedProviderCredentialStore::new(pg, env_store))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Postgres credential store unavailable (TT_MASTER_KEY missing / bad); env-only"
+                    );
+                    Arc::new(env_store)
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Postgres credential store unavailable (TT_MASTER_KEY missing / bad); env-only"
-                );
-                Arc::new(env_store)
-            }
-        },
+        }
         None => {
             tracing::warn!("no DB pool; provider credentials are env-only");
             Arc::new(env_store)
@@ -423,14 +438,12 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // `api_keys` table populated by the cloud-repo dashboard (or the
     // forthcoming hosted issuance endpoint).
     if let Some(pool) = db_pool.as_ref() {
-        state = state.with_key_store(Arc::new(
-            tt_auth::postgres::PostgresKeyStore::new(pool.clone()),
-        ));
+        state = state.with_key_store(Arc::new(tt_auth::postgres::PostgresKeyStore::new(
+            pool.clone(),
+        )));
         tracing::info!("key store: Postgres-backed (tt_live_* verification enabled)");
     } else {
-        tracing::warn!(
-            "no DB pool; tt_live_* keys pass through without verification (dev mode)"
-        );
+        tracing::warn!("no DB pool; tt_live_* keys pass through without verification (dev mode)");
     }
 
     // Request-log writer: Postgres when available. The dashboard's
@@ -438,9 +451,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // / cache hit rate cards.
     if let Some(pool) = db_pool.as_ref() {
         state = state.with_request_log_writer(Arc::new(
-            tt_telemetry::request_logs::postgres::PostgresRequestLogWriter::new(
-                pool.clone(),
-            ),
+            tt_telemetry::request_logs::postgres::PostgresRequestLogWriter::new(pool.clone()),
         ));
         tracing::info!("request_logs writer: Postgres-backed");
     } else {
@@ -453,12 +464,9 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // every request — the dashboard surfaces this latency budget as
     // "routes refresh every ~60 seconds".
     if let Some(pool) = db_pool.as_ref() {
-        let backing: Arc<dyn tt_routing::RoutingStore> = Arc::new(
-            tt_routing::PostgresRoutingStore::new(pool.clone()),
-        );
-        state = state.with_routing_store(Arc::new(
-            tt_routing::CachingRoutingStore::new(backing),
-        ));
+        let backing: Arc<dyn tt_routing::RoutingStore> =
+            Arc::new(tt_routing::PostgresRoutingStore::new(pool.clone()));
+        state = state.with_routing_store(Arc::new(tt_routing::CachingRoutingStore::new(backing)));
         tracing::info!("routing store: Postgres-backed (60s per-org cache)");
     } else {
         tracing::warn!("no DB pool; routing disabled (chat requests pass through unrouted)");
@@ -602,16 +610,17 @@ fn run_plan(
              For now, review the projection here and apply via the dashboard once it ships."
         );
     }
-    let input_path = input
-        .ok_or_else(|| anyhow::anyhow!("usage: tt plan --input <plan_input.json>  (or --example)"))?;
+    let input_path = input.ok_or_else(|| {
+        anyhow::anyhow!("usage: tt plan --input <plan_input.json>  (or --example)")
+    })?;
 
     let raw = std::fs::read_to_string(input_path)
         .map_err(|e| anyhow::anyhow!("read {input_path}: {e}"))?;
     let plan_input: tt_plan_core::PlanInput =
         serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parse {input_path}: {e}"))?;
 
-    let result = tt_plan_core::replay(plan_input)
-        .map_err(|e| anyhow::anyhow!("replay failed: {e}"))?;
+    let result =
+        tt_plan_core::replay(plan_input).map_err(|e| anyhow::anyhow!("replay failed: {e}"))?;
 
     let payload = match output {
         Some(p) if p.ends_with(".json") => serde_json::to_string_pretty(&result)?,
@@ -647,7 +656,9 @@ fn format_plan_text(r: &tt_plan_core::PlanResult) -> String {
     ));
     out.push_str(&format!(
         "  cache_hit_rate   {:.1}%\n  p50_latency      {:.0}ms\n  p95_latency      {:.0}ms\n",
-        a.cache_hit_rate_projected * 100.0, a.p50_latency_ms_projected, a.p95_latency_ms_projected
+        a.cache_hit_rate_projected * 100.0,
+        a.p50_latency_ms_projected,
+        a.p95_latency_ms_projected
     ));
     out.push_str(&format!(
         "  requests: {} rerouted, {} unchanged, {} unprice-able\n\n",
@@ -671,7 +682,10 @@ fn format_plan_text(r: &tt_plan_core::PlanResult) -> String {
         for p in &a.l2_projections {
             out.push_str(&format!(
                 "  {:>9.2}  {:>7.1}%  {}/{}\n",
-                p.threshold, p.projected_l2_hit_rate * 100.0, p.projected_l2_hits, p.total
+                p.threshold,
+                p.projected_l2_hit_rate * 100.0,
+                p.projected_l2_hits,
+                p.total
             ));
         }
         if a.l2_poisoning_candidates > 0 {
@@ -688,8 +702,12 @@ fn format_plan_text(r: &tt_plan_core::PlanResult) -> String {
         for row in &r.per_route_breakdown {
             out.push_str(&format!(
                 "  {} ({}): matched={} baseline=${:.4} projected=${:.4} saved=${:.4}\n",
-                row.route_name, row.route_id, row.matched,
-                row.baseline_cost_usd, row.projected_cost_usd, row.savings_usd
+                row.route_name,
+                row.route_id,
+                row.matched,
+                row.baseline_cost_usd,
+                row.projected_cost_usd,
+                row.savings_usd
             ));
         }
         out.push('\n');
@@ -827,10 +845,7 @@ fn run_audit_verify(
 
     match tt_telemetry::audit::verify_chain(&parsed.entries, &verifying_key) {
         Ok(()) => {
-            println!(
-                "chain OK — all {} entries verified",
-                parsed.entries.len()
-            );
+            println!("chain OK — all {} entries verified", parsed.entries.len());
         }
         Err(e) => {
             anyhow::bail!("chain verification FAILED: {e}");
@@ -860,9 +875,8 @@ fn parse_chain_jsonl(content: &str) -> anyhow::Result<ParsedChain> {
         // line. The preamble carries `"meta": true` so it never collides
         // with a real `AuditEntry`.
         if entries.is_empty() && preamble_verifying_key.is_none() {
-            let v: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-                anyhow::anyhow!("failed to parse line {} as JSON: {e}", i + 1)
-            })?;
+            let v: serde_json::Value = serde_json::from_str(trimmed)
+                .map_err(|e| anyhow::anyhow!("failed to parse line {} as JSON: {e}", i + 1))?;
             if v.get("meta").and_then(|m| m.as_bool()) == Some(true) {
                 preamble_verifying_key = v
                     .get("verifying_key")
@@ -871,10 +885,8 @@ fn parse_chain_jsonl(content: &str) -> anyhow::Result<ParsedChain> {
                 continue;
             }
             // Fall through — not a preamble, parse as entry.
-            let entry: tt_telemetry::audit::AuditEntry =
-                serde_json::from_value(v).map_err(|e| {
-                    anyhow::anyhow!("failed to parse line {} as entry: {e}", i + 1)
-                })?;
+            let entry: tt_telemetry::audit::AuditEntry = serde_json::from_value(v)
+                .map_err(|e| anyhow::anyhow!("failed to parse line {} as entry: {e}", i + 1))?;
             entries.push(entry);
             continue;
         }
@@ -947,10 +959,7 @@ mod audit_verify_tests {
             serde_json::to_string(&entry).unwrap()
         );
         let parsed = parse_chain_jsonl(&content).unwrap();
-        assert_eq!(
-            parsed.preamble_verifying_key.as_deref(),
-            Some("deadbeef")
-        );
+        assert_eq!(parsed.preamble_verifying_key.as_deref(), Some("deadbeef"));
         assert_eq!(parsed.entries.len(), 1);
     }
 }

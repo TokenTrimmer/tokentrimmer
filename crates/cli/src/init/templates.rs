@@ -81,7 +81,11 @@ pub fn render_all(vars: &HashMap<String, String>) -> Result<Vec<RenderedFile>, T
         } else {
             0o644
         };
-        out.push(RenderedFile { dest: dest_path, content, mode });
+        out.push(RenderedFile {
+            dest: dest_path,
+            content,
+            mode,
+        });
     }
     Ok(out)
 }
@@ -100,7 +104,10 @@ mod tests {
         vars.insert("initialized_at".into(), "2026-05-28".into());
 
         let files = render_all(&vars).unwrap();
-        let agents = files.iter().find(|f| f.dest.ends_with("AGENTS.md")).expect("AGENTS.md missing");
+        let agents = files
+            .iter()
+            .find(|f| f.dest.ends_with("AGENTS.md"))
+            .expect("AGENTS.md missing");
         assert!(agents.content.contains("# AGENTS.md — my-app"));
         assert!(agents.content.contains("Primary language: Rust"));
     }
@@ -114,7 +121,10 @@ mod tests {
         vars.insert("tt_cli_version".into(), "0".into());
         vars.insert("initialized_at".into(), "x".into());
         let files = render_all(&vars).unwrap();
-        let hook = files.iter().find(|f| f.dest.ends_with("pre-edit-guard.sh")).unwrap();
+        let hook = files
+            .iter()
+            .find(|f| f.dest.ends_with("pre-edit-guard.sh"))
+            .unwrap();
         assert_eq!(hook.mode, 0o755);
     }
 }

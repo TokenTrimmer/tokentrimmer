@@ -49,7 +49,8 @@ mod tests {
     fn skipped_writes_stub_with_skipped_flag() {
         let d = tempfile::tempdir().unwrap();
         write_skipped_baseline(d.path()).unwrap();
-        let body = std::fs::read_to_string(d.path().join(".claude").join("inspect-baseline.json")).unwrap();
+        let body = std::fs::read_to_string(d.path().join(".claude").join("inspect-baseline.json"))
+            .unwrap();
         assert!(body.contains("\"skipped\": true"));
         assert!(body.contains("\"findings\": []"));
     }

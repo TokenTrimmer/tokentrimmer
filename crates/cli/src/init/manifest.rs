@@ -29,12 +29,16 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn new(version: impl Into<String>) -> Self {
-        Self { version: version.into(), installed: BTreeMap::new() }
+        Self {
+            version: version.into(),
+            installed: BTreeMap::new(),
+        }
     }
 
     pub fn record(&mut self, rel_path: &Path, original_content: &str) {
         let hex = sha256_hex(original_content.as_bytes());
-        self.installed.insert(rel_path.to_string_lossy().replace('\\', "/"), hex);
+        self.installed
+            .insert(rel_path.to_string_lossy().replace('\\', "/"), hex);
     }
 
     pub fn load(path: &Path) -> Result<Option<Manifest>, ManifestError> {
@@ -103,8 +107,14 @@ mod tests {
     #[test]
     fn classify_fresh_when_not_recorded() {
         let m = Manifest::new("0.1.0");
-        assert_eq!(classify_upgrade(&m, &PathBuf::from("X.md"), None), UpgradeAction::Fresh);
-        assert_eq!(classify_upgrade(&m, &PathBuf::from("X.md"), Some("anything")), UpgradeAction::Fresh);
+        assert_eq!(
+            classify_upgrade(&m, &PathBuf::from("X.md"), None),
+            UpgradeAction::Fresh
+        );
+        assert_eq!(
+            classify_upgrade(&m, &PathBuf::from("X.md"), Some("anything")),
+            UpgradeAction::Fresh
+        );
     }
 
     #[test]

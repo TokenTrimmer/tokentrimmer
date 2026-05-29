@@ -82,14 +82,24 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
         detect(&opts.root)
     };
 
-    let project_name = opts.root
+    let project_name = opts
+        .root
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("project")
         .to_string();
     let mut vars: HashMap<String, String> = HashMap::new();
     vars.insert("project_name".into(), project_name);
-    vars.insert("language".into(), format!("{:?}", detection.languages.first().unwrap_or(&detect::Language::Unknown)));
+    vars.insert(
+        "language".into(),
+        format!(
+            "{:?}",
+            detection
+                .languages
+                .first()
+                .unwrap_or(&detect::Language::Unknown)
+        ),
+    );
     vars.insert("frameworks_csv".into(), detection.frameworks.join(", "));
     vars.insert("tt_cli_version".into(), opts.tt_cli_version.clone());
     vars.insert("initialized_at".into(), chrono::Utc::now().to_rfc3339());
@@ -97,7 +107,8 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
     let files = render_all(&vars)?;
 
     let manifest_path = opts.root.join(".tt-init.lock");
-    let existing_manifest = Manifest::load(&manifest_path)?.unwrap_or_else(|| Manifest::new(&opts.tt_cli_version));
+    let existing_manifest =
+        Manifest::load(&manifest_path)?.unwrap_or_else(|| Manifest::new(&opts.tt_cli_version));
 
     let mut new_manifest = existing_manifest.clone();
     let mut written = 0u32;
@@ -136,7 +147,8 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
             UpgradeAction::SafeOverwrite => {
                 let new_content = if f.dest.file_name().is_some_and(|n| n == ".gitignore.append") {
                     let target_gitignore = opts.root.join(".gitignore");
-                    let existing_gi = std::fs::read_to_string(&target_gitignore).unwrap_or_default();
+                    let existing_gi =
+                        std::fs::read_to_string(&target_gitignore).unwrap_or_default();
                     let merged = append_gitignore(&existing_gi, &f.content);
                     if !opts.dry_run {
                         std::fs::write(&target_gitignore, &merged)?;
@@ -159,7 +171,10 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
                 };
                 new_manifest.record(&f.dest, &new_content);
                 written += 1;
-                println!("+ Updated {} (safe — unchanged from prior install)", f.dest.display());
+                println!(
+                    "+ Updated {} (safe — unchanged from prior install)",
+                    f.dest.display()
+                );
             }
             UpgradeAction::UserModified => {
                 if opts.force {
@@ -171,7 +186,10 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
                     println!("! Overwrote user-modified {} (--force)", f.dest.display());
                 } else {
                     skipped += 1;
-                    println!("- Skipped {} (user-modified; --force to overwrite)", f.dest.display());
+                    println!(
+                        "- Skipped {} (user-modified; --force to overwrite)",
+                        f.dest.display()
+                    );
                 }
             }
         }
@@ -193,13 +211,20 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
     };
 
     println!();
-    println!("Detected: {:?} + frameworks {:?}", detection.languages, detection.frameworks);
+    println!(
+        "Detected: {:?} + frameworks {:?}",
+        detection.languages, detection.frameworks
+    );
     println!("Files written: {written}, skipped: {skipped}");
     if let Some(n) = baseline_findings {
         println!("Inspect baseline: {n} findings -> .claude/inspect-baseline.json");
     }
 
-    Ok(RunReport { files_written: written, files_skipped: skipped, baseline_findings })
+    Ok(RunReport {
+        files_written: written,
+        files_skipped: skipped,
+        baseline_findings,
+    })
 }
 
 fn should_skip_by_options(f: &RenderedFile, opts: &RunOptions) -> bool {

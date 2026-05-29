@@ -55,7 +55,10 @@ pub fn detect(root: &Path) -> Detection {
         all.extend(langs);
         langs = all;
     }
-    Detection { languages: langs, frameworks: fws }
+    Detection {
+        languages: langs,
+        frameworks: fws,
+    }
 }
 
 fn detect_js_or_ts(root: &Path) -> Language {
@@ -64,7 +67,11 @@ fn detect_js_or_ts(root: &Path) -> Language {
     }
     // Cheap heuristic: any .ts file → TS.
     if let Ok(entries) = std::fs::read_dir(root.join("src").as_path()) {
-        if entries.flatten().any(|e| e.path().extension().is_some_and(|x| x == "ts" || x == "tsx")) {
+        if entries.flatten().any(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x == "ts" || x == "tsx")
+        }) {
             return Language::TypeScript;
         }
     }
@@ -72,7 +79,14 @@ fn detect_js_or_ts(root: &Path) -> Language {
 }
 
 fn scan_python_frameworks(root: &Path, out: &mut Vec<String>) {
-    let known = ["langchain", "openai", "anthropic", "instructor", "litellm", "fastapi"];
+    let known = [
+        "langchain",
+        "openai",
+        "anthropic",
+        "instructor",
+        "litellm",
+        "fastapi",
+    ];
     for f in ["pyproject.toml", "requirements.txt", "setup.py"] {
         if let Ok(s) = std::fs::read_to_string(root.join(f)) {
             for k in &known {
@@ -85,7 +99,14 @@ fn scan_python_frameworks(root: &Path, out: &mut Vec<String>) {
 }
 
 fn scan_js_frameworks(root: &Path, out: &mut Vec<String>) {
-    let known = ["ai", "@anthropic-ai/sdk", "openai", "langchain", "@langchain/core", "instructor-js"];
+    let known = [
+        "ai",
+        "@anthropic-ai/sdk",
+        "openai",
+        "langchain",
+        "@langchain/core",
+        "instructor-js",
+    ];
     if let Ok(s) = std::fs::read_to_string(root.join("package.json")) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
             for key in ["dependencies", "devDependencies"] {
@@ -118,12 +139,18 @@ mod tests {
     #[test]
     fn detects_python_with_langchain() {
         let d = make_repo();
-        write(&d.path().join("pyproject.toml"), r#"[tool.poetry.dependencies]
+        write(
+            &d.path().join("pyproject.toml"),
+            r#"[tool.poetry.dependencies]
 langchain = "^0.3"
 openai = "^1.0"
-"#);
+"#,
+        );
         let det = detect(d.path());
-        assert!(det.languages.iter().any(|l| matches!(l, Language::Python | Language::Mixed)));
+        assert!(det
+            .languages
+            .iter()
+            .any(|l| matches!(l, Language::Python | Language::Mixed)));
         assert!(det.frameworks.contains(&"langchain".to_string()));
         assert!(det.frameworks.contains(&"openai".to_string()));
     }
@@ -131,9 +158,12 @@ openai = "^1.0"
     #[test]
     fn detects_typescript_with_ai_sdk() {
         let d = make_repo();
-        write(&d.path().join("package.json"), r#"{
+        write(
+            &d.path().join("package.json"),
+            r#"{
   "dependencies": { "ai": "^4.0", "@anthropic-ai/sdk": "^0.40" }
-}"#);
+}"#,
+        );
         write(&d.path().join("tsconfig.json"), "{}");
         let det = detect(d.path());
         assert!(det.languages.contains(&Language::TypeScript));

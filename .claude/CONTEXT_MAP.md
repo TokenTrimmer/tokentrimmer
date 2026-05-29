@@ -58,6 +58,15 @@ This file is the human-curated counterpart to `.claude/INDEX.md` (auto-generated
 
 Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 
+### tt init installer
+
+| If you're doing | Read |
+|---|---|
+| Adding a new template | `crates/cli/templates/init/` (template files) + `crates/cli/src/init/templates.rs` (renderer) |
+| Adding a language detection signal | `crates/cli/src/init/detect.rs` |
+| Adjusting merge strategy for an existing file | `crates/cli/src/init/merge.rs` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackD-tt-init-installer-design.md` |
+
 ---
 
 ## Cross-cutting concerns
