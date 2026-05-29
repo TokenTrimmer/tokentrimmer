@@ -20,7 +20,7 @@ enum Command {
     Gateway,
     /// Scan a codebase for token-waste patterns.
     Inspect {
-        /// Path to scan.
+        /// Path to scan (rule mode) or to scope the diff to (`--cost-diff` mode).
         path: String,
         /// Fail the process if any finding meets or exceeds this severity.
         #[arg(long, default_value = "high")]
@@ -29,6 +29,17 @@ enum Command {
         /// A path ending in ".json" writes JSON; any other path writes markdown.
         #[arg(long)]
         output: Option<String>,
+        /// Cost-diff mode: instead of running rules, estimate the projected
+        /// per-call cost change of LLM model ids added/removed in `git diff
+        /// <base> -- <path>`. Reuses the pricing catalog; no cloud dependency.
+        #[arg(long)]
+        cost_diff: bool,
+        /// Base git ref to diff against in `--cost-diff` mode.
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// In `--cost-diff` mode, exit non-zero when a net cost increase is projected.
+        #[arg(long)]
+        fail_on_cost_increase: bool,
     },
     /// Replay historical telemetry against a proposed config and project
     /// cost/savings/cache-hit-rate impact with bootstrap confidence intervals.
@@ -202,8 +213,15 @@ async fn main() -> anyhow::Result<()> {
             path,
             fail_on,
             output,
+            cost_diff,
+            base,
+            fail_on_cost_increase,
         } => {
-            run_inspect(&path, &fail_on, output.as_deref())?;
+            if cost_diff {
+                run_cost_diff(&path, &base, output.as_deref(), fail_on_cost_increase)?;
+            } else {
+                run_inspect(&path, &fail_on, output.as_deref())?;
+            }
         }
         Command::Plan {
             input,
@@ -828,6 +846,61 @@ fn run_inspect(path: &str, fail_on: &str, output: Option<&str>) -> anyhow::Resul
              (use --fail-on critical to disable gating)",
             above.len(),
             fail_on_sev,
+        );
+    }
+
+    Ok(())
+}
+
+/// Run `tt inspect --cost-diff`: estimate the projected per-call cost change of
+/// LLM model identifiers added/removed between `base` and the working tree,
+/// scoped to `path`. Output is markdown (default / `*.json` → JSON) suitable
+/// for a GitHub check-run summary. With `fail_on_cost_increase`, exits non-zero
+/// on a projected net increase so CI can gate.
+fn run_cost_diff(
+    path: &str,
+    base: &str,
+    output: Option<&str>,
+    fail_on_cost_increase: bool,
+) -> anyhow::Result<()> {
+    use std::process::Command as ProcCommand;
+
+    // `git diff <base> -- <path>` — the working tree vs the base ref. We feed
+    // the unified-diff text to the pure analyzer, keeping git out of the core.
+    let out = ProcCommand::new("git")
+        .args(["diff", base, "--", path])
+        .output()
+        .context("failed to run `git diff` — is git installed and is this a repo?")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`git diff {base} -- {path}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let diff_text = String::from_utf8_lossy(&out.stdout);
+
+    let report = tt_cli::cost_diff::analyze(&diff_text);
+
+    let formatted = match output_format_for(output) {
+        OutputFormat::Json => serde_json::to_string_pretty(&report)
+            .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}")),
+        OutputFormat::Markdown => tt_cli::cost_diff::format_markdown(&report),
+    };
+
+    match output {
+        Some(p) if !p.is_empty() && p != "-" => {
+            std::fs::write(p, &formatted)
+                .map_err(|e| anyhow::anyhow!("failed to write output to {p}: {e}"))?;
+            eprintln!("wrote cost-diff report to {p}");
+        }
+        _ => print!("{formatted}"),
+    }
+
+    if fail_on_cost_increase && report.is_increase() {
+        anyhow::bail!(
+            "projected per-call cost increase of +${:.6} \
+             (use without --fail-on-cost-increase to report only)",
+            report.net_projected_usd
         );
     }
 

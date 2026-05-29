@@ -21,7 +21,7 @@ The second-most-important gap is **presentation**: the marketing site is a liter
 
 ## Implementation status — updated 2026-05-29
 
-Since this review was written, **24 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
+Since this review was written, **25 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, and the per-model rate catalog is externalized to versioned data.
 
 **✅ Shipped this session**
 - _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
@@ -31,9 +31,10 @@ Since this review was written, **24 of its items have shipped** — all inline, 
 - _Inspect / quality:_ `inspect-5-missing-rules` (15/15 P0 rules now ship), `preview-pricing-all-providers`, `retrieval-orgid-isolation`
 - _Docs / hygiene:_ `getting-started-guide` (`GETTING_STARTED.md`), `docs-readme-quickstart-fix`, `kdf-doc-align`, `workspace-lints-align`, `perms-least-privilege-cleanup`, `.gitignore` hardening
 - _Architecture:_ `pricing-externalize` — per-model rates moved to a versioned, embedded `data/pricing.toml` (real `effective_at` + price history; live + historical-replay lookups); all 7 paid providers delegate to the shared catalog
+- _CI / shift-left:_ `cost-diff-ci-lint` — `tt inspect --cost-diff [--base <ref>] [--fail-on-cost-increase]` prices LLM model ids added/removed in a `git diff`, reusing the pricing catalog (no cloud); markdown/JSON for a check-run
 - _Ops:_ `cloud-repo-remote` — cloud monorepo baselined + pushed to private `TokenTrimmer/cloud`
 
-**◻ Remaining — public, doable:** `cost-diff-ci-lint`, `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
+**◻ Remaining — public, doable:** `compat-crate-split`, `token-estimator-shared`, `hnsw-org-recall`, `inspect-new-rules`, `inspect-ast-migration`, `inspect-corpora-seed`
 
 **◻ Remaining — cloud repo (design + reporting):** `design-system-foundation`, `marketing-site-build`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`, `savings-badge`, `alert-dispatcher-slack`, `finops-export`, `forgone-savings-view`, `plan-reconciliation-trustscore`, `cloud-backlog-sync`
 
@@ -274,7 +275,7 @@ Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2
 - [x] [P1] [budget-caps-quota] ✅ **shipped `afc7f68`** — `BudgetEnforcer` trait + `InMemoryBudgetEnforcer` in tt-core; per-org monthly cap + per-minute rate; auth middleware → 429 + `X-TT-Budget-Remaining-Usd` + `Retry-After`; record in chat handler + SSE guard. Postgres-backed limits remain a cloud follow-up.
 - [x] [P2] [provider-failover] ✅ **shipped** — ordered fallback chain + per-provider circuit breaker. `RouteAction.fallbacks: Vec<String>` (serde-default, cloud-populated) drives `dispatch_with_failover` in `tt-core::failover`: tries `[primary, …fallbacks]`, skips providers whose `CircuitBreaker` is open (5 consecutive failures → 30s cooldown), fails over on fallback-eligible errors (5xx/timeout/model-not-found), short-circuits on non-eligible (bad request). Non-stream dispatch only; the serving provider is rebound so cost/headers/telemetry attribute correctly. 5 unit + 2 integration tests. Turns "cost layer" into "cost + reliability layer."
 - [ ] [P2] [alert-dispatcher-slack] rust-crate-builder: Outbound webhook + Slack sink firing on budget thresholds (50/80/100%), `anomaly.detected`, reconciliation drift >2%. Reuses existing signals. (est: ~$0.80)
-- [ ] [P2] [cost-diff-ci-lint] rust-crate-builder: `tt inspect --cost-diff` (or extend the GitHub Action) estimating projected per-call cost change of a PR's LLM-call edits, posted as a check-run. Reuses `crates/preview`; no cloud dep. A sticky surface no competitor occupies. (est: ~$1.00)
+- [x] [P2] [cost-diff-ci-lint] ✅ **shipped** — `tt inspect --cost-diff [--base <ref>] [--fail-on-cost-increase]`: a pure `tt_cli::cost_diff::analyze` over `git diff <base> -- <path>` extracts `model`-keyed string assignments on added/removed lines, prices each via `tt_preview::pricing` (shared catalog, no cloud), and reports per-model rate deltas + a net projected per-call change under a standard 1K-in/500-out profile. Markdown (check-run summary) or JSON; optional non-zero exit on a projected increase. 7 unit tests + e2e verified. A sticky surface no competitor occupies.
 - [ ] [P3] [finops-export] rust-crate-builder: FOCUS-aligned export format on the existing export endpoint for Cloudability/Vantage ingestion. (est: ~$0.50)
 
 ### Value visualization

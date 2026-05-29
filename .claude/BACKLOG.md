@@ -283,7 +283,7 @@ Items surfaced by the 9-lens project review (`PROJECT_REVIEW.md`). The three top
 
 - [x] [P1] [budget-caps-quota] rust-crate-builder: Add a spend/quota enforcement primitive (org-agnostic trait + in-memory impl in public): per-org monthly spend cap + per-minute window, enforced in auth middleware returning 429 + `X-TT-Budget-Remaining`. Foundational for tier caps and a headline "hard spend cap" feature. (est: $1.50)
 - [x] [P2] [provider-failover] rust-crate-builder: Extend the route target schema with an ordered fallback chain + per-provider circuit breaker in `crates/routing` (primary -> fallback on 429/5xx). Turns "cost layer" into "cost + reliability layer". (est: $1.20)
-- [ ] [P2] [cost-diff-ci-lint] rust-crate-builder: Add `tt inspect --cost-diff` (or extend the GitHub Action) estimating the projected per-call cost change of a PR's added/modified LLM calls, posted as a check-run; reuses `crates/preview`, no cloud dependency. (est: $1.00)
+- [x] [P2] [cost-diff-ci-lint] rust-crate-builder: Add `tt inspect --cost-diff` (or extend the GitHub Action) estimating the projected per-call cost change of a PR's added/modified LLM calls, posted as a check-run; reuses `crates/preview`, no cloud dependency. (est: $1.00)
 
 ### Design + brand uplift (cloud repo — skipped by public autopilot)
 
