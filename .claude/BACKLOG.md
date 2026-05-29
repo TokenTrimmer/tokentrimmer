@@ -204,7 +204,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 
 - [x] [P1] [fix-inspect-self-delta] rust-crate-builder: `scripts/tt-inspect-self.sh` currently fails on absolute count of HIGH/CRITICAL findings, not delta-vs-main. Rewrite to (1) run `tt inspect . --output /tmp/curr.json`, (2) checkout main into a worktree and run inspect there for /tmp/base.json, (3) diff and fail only on findings present in curr but not base. Discovered 2026-05-28 during trackD autopilot iteration — 10 pre-existing HIGH findings in sdk-python/sdk-typescript cause every gate to fail. (est: $0.40)
 - [x] [P1] [fix-sdk-output-max-tokens] inspect-rule-author: Fix the 10 HIGH `output-no-max-tokens` findings in our own SDKs (sdk-python/tokentrimmer/{__init__,client}.py and sdk-typescript/src/index.ts). Add `max_tokens` defaults appropriate to the thin-wrapper use case (probably 4096 for chat, smaller for embedding). We dogfood our own product; these are real cost regressions. (est: $0.30)
-- [ ] [P2] [fix-inspect-self-medium] inspect-rule-author: Also fix the 1 MEDIUM `model-flagship-for-extraction` finding in `sdk-typescript/src/index.ts:20`. (est: $0.10)
+- [x] [P2] [fix-inspect-self-medium] inspect-rule-author: Also fix the 1 MEDIUM `model-flagship-for-extraction` finding in `sdk-typescript/src/index.ts:20`. (est: $0.10)
 
 
 
