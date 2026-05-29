@@ -232,6 +232,83 @@ Six tracks scoped to evolve TokenTrimmer from "runtime API gateway" → "dev-too
 - [x] [P1] [trackD-tt-init-installer] rust-crate-builder: `tt init` subcommand drops `AGENTS.md`, hooks (pre-edit-guard, cost-cap-check, audit-line), `.claude/`, an Inspect baseline run, and cost-cap config into any user repo. Templates in `crates/cli/templates/init/`. Bundles existing assets as a product. Spec: `docs/superpowers/specs/2026-05-28-trackD-tt-init-installer-design.md`. Plan: `docs/superpowers/plans/2026-05-28-trackD-tt-init-installer.md`. (est: ~$2.50) _Shipped 2026-05-28 — Day-0 MVP._
 - [x] [P3] [trackE-rag-context-compression] rust-crate-builder: RAG / context-compression pillar. New crate `crates/retrieval/` — corpus ingestion via OpenAI embeddings, HNSW lookup over user codebase + docs, prompt-prefix swap that replaces verbose context with retrieved snippets. Dashboard `/context` page. Distinct from L2 semantic cache (which caches responses; this retrieves context). Spec: `docs/superpowers/specs/2026-05-28-trackE-rag-context-compression-design.md`. Plan: `docs/superpowers/plans/2026-05-28-trackE-rag-context-compression.md`. (est: ~$4.00) _Shipped 2026-05-28 — Day-0 MVP (chunking + embedding + in-memory store + tag parser + substitution + CLI; Postgres store + cloud endpoints + middleware activation deferred to follow-up)._
 
+## Project review follow-ups (2026-05-29)
+
+Items surfaced by the 9-lens project review (`PROJECT_REVIEW.md`). The three top savings-measurement fixes (routing-baseline, anthropic-stream-cached-tokens, proxy-savings-banner) already shipped in `9e6188c`. Public items below are unblocked and autopilot-pickable; design/cloud items are tagged `[CLOUD-REPO]` so the public loop skips them.
+
+### Savings correctness + gateway (public, actionable)
+
+- [ ] [P0] [registry-model-passthrough] rust-crate-builder: When `registry.by_model` misses, fall back to `tt_shared::providers::infer_provider(model) -> by_id` so valid unlisted models (newer GPT/Claude/Gemini, o3-mini, OpenRouter/Together/local passthrough) dispatch instead of 404ing. Keep the static table for pricing only. Tests: unknown-but-inferrable model dispatches; truly-unknown still 404s. (est: $0.60)
+- [ ] [P0] [wire-l2-cache-production] rust-crate-builder: Wire `with_l2` into the `tt gateway` CLI boot behind `TT_L2_SEMANTIC_CACHE=1` (construct embedder + `PostgresL2Cache` from the db pool); add a real per-row `baseline_cost_usd` so L2-hit savings are honest rather than the $1/$2 synthetic. If embedder/db absent, log and skip. Tests: L2 attached when flag+deps present; honest baseline on hit. (est: $1.00)
+- [ ] [P1] [fix-anthropic-cache-usage-mapping] provider-adapter-author: Normalize Anthropic usage to the OpenAI subset convention so `compute_cost` is correct: set `prompt_tokens = input_tokens + cache_read_input_tokens` (total input incl. cache reads), keep `cached_tokens = cache_read_input_tokens`. Apply to both `translate_usage` and the streaming terminal usage. Add a unit test with cache-read usage asserting cost == provider-billed and baseline == full-rate-over-all-input. (est: $0.40)
+- [ ] [P1] [fee-multiplier-apply] rust-crate-builder: Apply `CompatConfig::fee_multiplier` (OpenRouter 5% BYOK) to cost/baseline in `compute_cost` — add `fn fee_multiplier(&self)->f64` (default 1.0) to the Provider trait and multiply, or remove the dead field. Test: OpenRouter cost reflects 1.05x. (est: $0.40)
+- [ ] [P1] [retry-fallback-layer] rust-crate-builder: Wrap provider dispatch in a retry/backoff+fallback policy that consumes `ProviderError::is_retriable` (honor `RateLimited.retry_after_ms`) and `is_fallback_eligible`; streaming retry only before first chunk. Tests: 429 then 200 succeeds; non-retriable surfaces immediately. (est: $0.80)
+- [ ] [P1] [streaming-client-timeout] rust-crate-builder: Stop the fixed 120s reqwest total timeout from cutting long streams — use a separate streaming client (connect + read-idle timeout) or honor `RequestContext.deadline`; drop the deadline field if unused. Test: long stream past 120s isn't truncated by client timeout. (est: $0.50)
+- [ ] [P1] [retrieval-orgid-isolation] rust-crate-builder: Replace the hardcoded `org_id = Uuid::nil()` in `crates/core/src/middleware/retrieval.rs` with the real org from the `ApiKeyContext` extension; reject/empty when absent. Add a cross-org isolation test for the retrieval path. (est: $0.40)
+- [ ] [P2] [anthropic-total-tokens-fix] provider-adapter-author: Count `total_tokens = input + cache_read + cache_creation + output` in Anthropic non-stream + stream usage so totals reflect the full prompt when caching is active. (est: $0.30)
+- [ ] [P2] [preview-pricing-all-providers] rust-crate-builder: Extend `crates/preview/src/pricing.rs::lookup` to probe all 8 provider pricing tables (Groq/Mistral/Together/OpenRouter/Local), so cost-preview works for routed-to models like llama-3.1-8b-instant. (est: $0.30)
+- [ ] [P3] [openai-reasoning-stream-unblock] provider-adapter-author: Remove the stale `is_reasoning_model` streaming short-circuit in `crates/providers/openai/src/stream.rs:75-80` (or gate behind a verified per-model flag). (est: $0.20)
+- [ ] [P3] [kdf-doc-align] rust-crate-builder: Align the credential KDF wording — call it a SHA-256 KDF everywhere (credentials.rs/postgres.rs/SECURITY.md), or switch to real HKDF-SHA256. (est: $0.20)
+
+### Plan engine (public, actionable)
+
+- [ ] [P1] [plan-cache-savings-wire] plan-replay-validator: Thread projected L1/L2 cache hits into the cost loop in `crates/plan-core/src/replay.rs` — set a hit request's projected cost to 0 (or the provider cached-prefix discount) before aggregation/bootstrap. Add a test asserting a cache-only diff produces savings > 0. (est: $1.00)
+- [ ] [P1] [plan-latency-projection] plan-replay-validator: Stop echoing historical latency for rerouted requests — build a per-(provider,model) latency distribution from the window and resample for the proposed model, or mark latency "not projected (insufficient model history)". (est: $1.00)
+
+### Docs (public, actionable)
+
+- [ ] [P1] [docs-readme-quickstart-fix] rust-crate-builder: Fix `README.md` quickstart — real Docker image (`ghcr.io/tokentrimmer/tt-cli`, env-only config, no YAML mount), single Rust version (1.88) across README/CONTRIBUTING, populate-or-remove the `examples/` claim, and link `GETTING_STARTED.md`. (est: $0.30)
+
+### Inspect depth (public, actionable)
+
+- [ ] [P1] [inspect-5-missing-rules] inspect-rule-author: Implement the 5 documented-but-missing P0 rules (`model-deprecated`, `prompt-bloated-system`, `prompt-verbose-few-shot`, `prompt-no-output-constraint`, `config-agents-md-too-long`) with fixtures; reconcile the catalog's "15" claim. (est: $1.00)
+- [ ] [P1] [inspect-corpora-seed] rust-crate-builder: Vendor 5-10 pinned, permissively-licensed OSS LLM samples (LangChain/Vercel-AI/openai-cookbook) into `corpora/`, run `scripts/measure-fp-rate.sh`, record per-rule precision/recall. Unblocks the w24 FP gate. (est: $0.50)
+- [ ] [P2] [inspect-ast-migration] inspect-rule-author: Migrate the structural rules (cache_control/max_tokens/model-arg/loop-termination) from regex to the existing tree-sitter harness in `crates/inspect-core/src/parse.rs`; add a rule-level AST cache. (est: $1.20)
+- [ ] [P2] [inspect-new-rules] inspect-rule-author: Add `cache-anthropic-tools-not-cached`, `output-n-greater-than-one`, `model-reasoning-effort-default-high`, `prompt-dynamic-prefix-breaks-cache` with fixtures. (est: $0.80)
+
+### Architecture scalability (public, actionable)
+
+- [ ] [P1] [pricing-externalize] rust-crate-builder: Move pricing/model catalogs out of Rust source into versioned data (`include_dir` + refresh path, or a Postgres pricing table) with real `effective_at`; decouples the 50-provider catalog from releases and fixes historical replay. (est: $1.50)
+- [ ] [P2] [token-estimator-shared] rust-crate-builder: Extract a `tt-tokenize` crate (tiktoken) shared by tt-preview, tt-core dispatch, and tt-routing so routing rewrites use the same accurate estimate `/v1/preview` reports; move tiktoken-rs into `[workspace.dependencies]`. (est: $0.60)
+- [ ] [P2] [compat-crate-split] rust-crate-builder: Split `OpenAICompatibleProvider` into a `tt-provider-compat` crate so Mistral/Groq/Together/OpenRouter stop depending on the full OpenAI adapter; make registry registration config-aware; sort `/v1/models` output. (est: $0.80)
+- [ ] [P2] [hnsw-org-recall] rust-crate-builder: Fix L2 recall under multi-tenant load — tune `hnsw.ef_search` for the org-filtered query or partition `cache_entries` by org_id; add a recall regression test loading N orgs. (est: $0.80)
+- [ ] [P3] [workspace-lints-align] rust-crate-builder: Add `[workspace.lints]` to the public workspace mirroring cloud (forbid unsafe, deny the shared clippy set); add a cargo-deny ban keeping axum/hyper out of shared crates; align tokio/uuid pins. (est: $0.30)
+
+### Value visualization (public, actionable)
+
+- [ ] [P1] [stream-cost-headers] rust-crate-builder: Emit a terminal `event: tokentrimmer.usage` SSE event carrying cost/baseline/saved before `[DONE]` so streaming clients/SDKs see per-request savings (the dominant client mode currently shows none). (est: $0.60)
+- [ ] [P2] [live-cli-savings-ticker] rust-crate-builder: Add a rewriting stderr status line to `tt proxy` (gated by `--no-tui`) updating on each request: `tt · N req · $X saved · Y% cached`. (est: $0.50)
+
+### Cost-layer capabilities (public, actionable)
+
+- [ ] [P1] [budget-caps-quota] rust-crate-builder: Add a spend/quota enforcement primitive (org-agnostic trait + in-memory impl in public): per-org monthly spend cap + per-minute window, enforced in auth middleware returning 429 + `X-TT-Budget-Remaining`. Foundational for tier caps and a headline "hard spend cap" feature. (est: $1.50)
+- [ ] [P2] [provider-failover] rust-crate-builder: Extend the route target schema with an ordered fallback chain + per-provider circuit breaker in `crates/routing` (primary -> fallback on 429/5xx). Turns "cost layer" into "cost + reliability layer". (est: $1.20)
+- [ ] [P2] [cost-diff-ci-lint] rust-crate-builder: Add `tt inspect --cost-diff` (or extend the GitHub Action) estimating the projected per-call cost change of a PR's added/modified LLM calls, posted as a check-run; reuses `crates/preview`, no cloud dependency. (est: $1.00)
+
+### Design + brand uplift (cloud repo — skipped by public autopilot)
+
+- [ ] [P0] [design-system-foundation] astro-page-builder: Real token layer in `cloud/packages/ui/src/styles.css` (color/type-scale/8px-space/radius/shadow/z) + shared `<Layout>`/`<DashboardShell>` owning head/fonts/favicon/nav; migrate all 16 dashboard pages off duplicated inline CSS. [CLOUD-REPO] (est: $2.50)
+- [ ] [P0] [marketing-site-build] astro-page-builder: Build `cloud/apps/web` — hero + live savings proof, See/Plan/Optimize features, dashboard preview, drop-in snippet, pricing, social proof, footer; consume the new tokens. Replaces the current placeholder front door. [CLOUD-REPO] (est: $2.50)
+- [ ] [P1] [brand-kit] astro-page-builder: Wordmark + mark (SVG), favicon/apple-touch set, typeface pairing (UI grotesk + numeric mono, self-hosted woff2); wire via the shared Layout. [CLOUD-REPO] (est: $1.00)
+- [ ] [P1] [dark-mode] astro-page-builder: Light+dark token sets on `[data-theme]` + persisted toggle; theme uPlot charts from tokens. [CLOUD-REPO] (est: $0.80)
+- [ ] [P2] [chart-theming] astro-page-builder: Brand-themed uPlot (area fill, semantic-green savings), compact currency axis, styled tooltips, skeleton loaders, shared Chart wrapper component. [CLOUD-REPO] (est: $0.80)
+- [ ] [P2] [app-shell-nav] astro-page-builder: Branded sidebar/topbar nav with icons + active-route highlighting, org/user menu, focus rings; styled signin/verify auth screens. [CLOUD-REPO] (est: $0.80)
+- [ ] [P3] [docs-site-theme] astro-page-builder: Theme the Starlight docs site to the brand and land the build-time docs content sync. [CLOUD-REPO] (est: $0.50)
+
+### Cloud-side follow-ups (skipped by public autopilot)
+
+- [ ] [P1] [plan-reconciliation-trustscore] rust-crate-builder: Build the projected-vs-actual reconciliation loop feeding the user-facing trust score (calibration math in plan-core; post-window data fetch in cloud). [CLOUD-REPO] (est: $1.50)
+- [ ] [P2] [alert-dispatcher-slack] rust-crate-builder: Outbound webhook + Slack sink firing on budget thresholds (50/80/100%), `anomaly.detected` >3σ, reconciliation drift >2%; reuses existing cloud signals. [CLOUD-REPO] (est: $0.80)
+- [ ] [P2] [savings-badge] rust-crate-builder: `GET /v1/badges/savings?org_id&expires&sig` SVG via the existing HMAC signed-URL plumbing; "$X saved this month" README/Slack badge + copy snippet on /reports. [CLOUD-REPO] (est: $0.40)
+- [ ] [P3] [finops-export] rust-crate-builder: Add a FOCUS-aligned export format to the existing export endpoint for Cloudability/Vantage ingestion. [CLOUD-REPO] (est: $0.50)
+- [ ] [P3] [forgone-savings-view] rust-crate-builder: Aggregate preview `suggested_savings_usd` into a "potential additional savings" dashboard card (after the proxy banner fix). [CLOUD-REPO] (est: $0.60)
+
+### Ops / human-gated (not autopilot-pickable)
+
+- [ ] [P0] [cloud-repo-remote] Create the private `TokenTrimmer/cloud` GitHub repo + push the existing cloud checkout; unblocks ~10 P0 launch gates. [BLOCKED — needs human: repo create + push]
+- [ ] [P1] [cloud-backlog-sync] Flip the ~9 already-shipped cloud BACKLOG items to `[x]` (reconciliation, hosted-inspect, /inspect, /reports, /settings, anomaly, export, trust-score, stripe-webhooks). [CLOUD-REPO]
+- [ ] [P1] [env-secret-split-rotate] Split dev/prod secret sets (prod only in `fly secrets`); rotate the live keys read this session (TT_MASTER_KEY → requires re-encrypting provider_credentials, TT_ADMIN_TOKEN, FLY_DEPLOY_KEY, Stripe). [BLOCKED — needs human: key rotation]
+
 ## Completed
 
 - [x] [w0-pre-flight] Harness scaffolding (hooks, agents, Cargo workspace, CI, scripts, governance docs). 2026-05-25.
