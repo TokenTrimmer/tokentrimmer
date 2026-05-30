@@ -116,7 +116,7 @@ impl Provider for MockProvider {
 
 fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
     StreamLogContext {
-        writer,
+        writer: Some(writer),
         org_id: Uuid::nil(),
         api_key_id: Uuid::nil(),
         trace_id: Uuid::nil(),
@@ -143,6 +143,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         request_started: std::time::Instant::now(),
         budget: None,
         fee_multiplier: 1.0,
+        cache_insert: None,
     }
 }
 

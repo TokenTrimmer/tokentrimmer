@@ -39,7 +39,7 @@ use tt_shared::{
 use crate::{
     middleware::trace::TraceId,
     retry::{with_retry, RetryPolicy},
-    routes::sse::{self, StreamLogContext},
+    routes::sse::{self, CacheInsertContext, StreamLogContext},
     single_flight::wait_for_leader,
     state::L2Config,
     ApiError, ApiResult, AppState,
@@ -426,31 +426,79 @@ pub async fn handler(
             .await?
         };
 
-        let log_ctx = state.request_log_writer.as_ref().map(|w| StreamLogContext {
-            writer: w.clone(),
-            org_id: ctx.org_id,
-            api_key_id: ctx.api_key_id,
-            trace_id,
-            provider_id: provider.id().to_string(),
-            model: served_model.clone(),
-            input_tokens: estimated_input_tokens,
-            cached_tokens: 0,
-            pricing: provider.pricing(&served_model),
-            // Baseline against the originally-requested model when routed, so
-            // the streamed request_logs row carries the real routing saving.
-            baseline_pricing: if matched_route_id.is_some() {
-                requested_pricing.clone()
-            } else {
-                provider.pricing(&served_model)
-            },
-            route_id: matched_route_id,
-            tag: ctx.tag.clone(),
-            request_started,
-            budget: state.budget.clone(),
-            // Thread provider surcharge through so the streaming path applies
-            // it to both cost and baseline, matching the non-streaming path (§2.13).
-            fee_multiplier: provider.fee_multiplier(),
-        });
+        // Build the cache-insert context for the streaming miss path
+        // (§rv-l2-streaming-cache-write). On clean completion the DropGuard
+        // reconstructs a ChatCompletionResponse from the accumulated data and
+        // inserts it into L1/L2 — best-effort, after the final chunk.
+        //
+        // Gated on: do_insert=true AND at least one cache backend is wired.
+        // The guard closure uses the cost_usd/baseline_cost_usd it already
+        // computes for the request_logs row, so the L1Entry envelope carries
+        // accurate savings figures without repeating the pricing calculation.
+        let stream_cache_insert = if cache_behavior.do_insert
+            && (state.l1.is_some() || state.l2.is_some())
+        {
+            let l2_query_text = state
+                .l2
+                .as_ref()
+                .and_then(|_| tt_cache::l2_context_text(&req));
+            let ttl = effective_ttl_secs(
+                cache_behavior.ttl_secs,
+                caller_tier,
+                state
+                    .l1
+                    .as_ref()
+                    .map(|l| l.ttl_secs)
+                    .unwrap_or(L2_DEFAULT_TTL.as_secs()),
+            );
+            Some(CacheInsertContext {
+                l1: state.l1.clone(),
+                l2: state.l2.clone(),
+                l1_key: l1_key.clone().unwrap_or_default(),
+                l2_query_text,
+                ttl_secs: ttl,
+                model: served_model.clone(),
+                provider_id: provider.id().to_string(),
+                org_id: ctx.org_id,
+            })
+        } else {
+            None
+        };
+
+        // Build a StreamLogContext whenever either telemetry or cache insertion
+        // is needed. writer=None skips the request_logs row without preventing
+        // cache writes (tests, dev mode without a DB).
+        let needs_tracking = state.request_log_writer.is_some() || stream_cache_insert.is_some();
+        let log_ctx = if needs_tracking {
+            Some(StreamLogContext {
+                writer: state.request_log_writer.as_ref().map(|w| w.clone()),
+                org_id: ctx.org_id,
+                api_key_id: ctx.api_key_id,
+                trace_id,
+                provider_id: provider.id().to_string(),
+                model: served_model.clone(),
+                input_tokens: estimated_input_tokens,
+                cached_tokens: 0,
+                pricing: provider.pricing(&served_model),
+                // Baseline against the originally-requested model when routed, so
+                // the streamed request_logs row carries the real routing saving.
+                baseline_pricing: if matched_route_id.is_some() {
+                    requested_pricing.clone()
+                } else {
+                    provider.pricing(&served_model)
+                },
+                route_id: matched_route_id,
+                tag: ctx.tag.clone(),
+                request_started,
+                budget: state.budget.clone(),
+                // Thread provider surcharge through so the streaming path applies
+                // it to both cost and baseline, matching the non-streaming path (§2.13).
+                fee_multiplier: provider.fee_multiplier(),
+                cache_insert: stream_cache_insert,
+            })
+        } else {
+            None
+        };
 
         Ok(sse::stream_response(stream, &provider, trace_id, log_ctx))
     } else {

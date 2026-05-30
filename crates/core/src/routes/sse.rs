@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::response::{
     sse::{Event, KeepAlive},
@@ -26,14 +26,16 @@ use chrono::Utc;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use uuid::Uuid;
 
+use tt_cache::{CacheEntry, L1Entry};
 use tt_shared::{
     messages::{ChunkChoice, ChunkDelta, Message, MessageContent},
-    ChatCompletionChunk, ChatCompletionResponse, ModelPricing, Provider, ProviderError,
+    ChatCompletionChunk, ChatCompletionResponse, ModelPricing, Provider, ProviderError, Usage,
 };
 use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
 use tt_tokenize;
 
 use crate::budget::BudgetEnforcer;
+use crate::state::{L1Config, L2Config};
 
 // ─── PartialUsage ─────────────────────────────────────────────────────────────
 
@@ -58,7 +60,7 @@ pub struct PartialUsage {
 /// - Sets `finished` when any choice carries a `finish_reason`.
 pub(crate) struct UsageTrackingStream {
     inner: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
-    /// Accumulated output text for fallback token estimation.
+    /// Accumulated output text for fallback token estimation and cache reconstruction.
     output_text: String,
     input_tokens: i32,
     cached_tokens: i32,
@@ -68,6 +70,9 @@ pub(crate) struct UsageTrackingStream {
     authoritative: Option<(i32, i32, i32)>,
     /// True once any `finish_reason` chunk has been observed.
     pub(crate) finished: bool,
+    /// The `finish_reason` string from the terminal chunk (e.g. `"stop"`).
+    /// Used to reconstruct a `ChatCompletionResponse` for cache insertion.
+    pub(crate) finish_reason: Option<String>,
 }
 
 impl UsageTrackingStream {
@@ -85,7 +90,28 @@ impl UsageTrackingStream {
             provider_id: provider_id.into(),
             authoritative: None,
             finished: false,
+            finish_reason: None,
         }
+    }
+
+    /// Returns the accumulated data needed to reconstruct a `ChatCompletionResponse`
+    /// for cache insertion. Returns `None` when no authoritative usage block arrived
+    /// (i.e. stream was truncated / no terminal usage chunk), ensuring only cleanly
+    /// completed streams with known token counts are cached.
+    pub(crate) fn cache_completion_data(
+        &self,
+    ) -> Option<(String, String, Usage)> {
+        let (prompt_tokens, completion_tokens, cached_tokens) = self.authoritative?;
+        let finish_reason = self.finish_reason.clone().unwrap_or_else(|| "stop".into());
+        let text = self.output_text.clone();
+        let usage = Usage {
+            prompt_tokens: prompt_tokens as u64,
+            completion_tokens: completion_tokens as u64,
+            total_tokens: (prompt_tokens + completion_tokens) as u64,
+            cached_tokens: cached_tokens as u64,
+            cache_creation_input_tokens: None,
+        };
+        Some((text, finish_reason, usage))
     }
 
     pub(crate) fn snapshot(&self) -> PartialUsage {
@@ -115,9 +141,14 @@ impl Stream for UsageTrackingStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = Pin::new(&mut self.inner).poll_next(cx);
         if let Poll::Ready(Some(Ok(ref chunk))) = poll {
-            // Track finish_reason.
-            if chunk.choices.iter().any(|c| c.finish_reason.is_some()) {
-                self.finished = true;
+            // Track finish_reason (first observed value wins).
+            for choice in &chunk.choices {
+                if let Some(ref fr) = choice.finish_reason {
+                    self.finished = true;
+                    if self.finish_reason.is_none() {
+                        self.finish_reason = Some(fr.clone());
+                    }
+                }
             }
             // Accumulate output text from content deltas for fallback
             // token estimation (§2.12).
@@ -163,12 +194,46 @@ impl Drop for DropGuard {
     }
 }
 
+// ─── CacheInsertContext ────────────────────────────────────────────────────────
+
+/// Context for writing a cleanly-completed streaming response into L1/L2 cache.
+///
+/// Built by `chat.rs` and passed through `StreamLogContext` so the `DropGuard`
+/// can insert the response after the final chunk is sent — best-effort, never
+/// blocking the client.
+///
+/// Insertion is guarded by three conditions checked in the guard closure:
+///   1. `!truncated` — clean completion only (no partial responses cached).
+///   2. `authoritative` usage present — terminal chunk arrived with token counts.
+///   3. No tool calls in the reconstructed response (non-deterministic output).
+pub struct CacheInsertContext {
+    /// L1 exact-match cache backend + TTL config.
+    pub l1: Option<L1Config>,
+    /// L2 semantic cache backend (optional).
+    pub l2: Option<L2Config>,
+    /// Namespaced L1 key for this request: `"{org_id}:{cache_key(req)}"`.
+    pub l1_key: String,
+    /// L2 query text for embedding (the context text extracted from the request).
+    pub l2_query_text: Option<String>,
+    /// TTL seconds for both L1 and L2 inserts.
+    pub ttl_secs: u64,
+    /// The served model name (e.g. `"gpt-4o"`).
+    pub model: String,
+    /// The provider id (e.g. `"openai"`).
+    pub provider_id: String,
+    /// Org id — embedded in the L2 entry.
+    pub org_id: Uuid,
+}
+
 // ─── LogContext ───────────────────────────────────────────────────────────────
 
 /// Caller-supplied metadata needed to construct the `request_logs` row when
 /// the SSE stream terminates.
 pub struct StreamLogContext {
-    pub writer: Arc<dyn RequestLogWriter>,
+    /// Optional log writer. `None` skips the telemetry row (e.g. tests or dev
+    /// environments without a DB), but cache insertion still fires if
+    /// `cache_insert` is `Some`.
+    pub writer: Option<Arc<dyn RequestLogWriter>>,
     pub org_id: Uuid,
     pub api_key_id: Uuid,
     pub trace_id: Uuid,
@@ -191,6 +256,10 @@ pub struct StreamLogContext {
     /// Applied to both cost and baseline on the streaming path, matching the
     /// non-streaming path (§2.13).
     pub fee_multiplier: f64,
+    /// Optional cache insertion context. When `Some`, a cleanly-completed
+    /// stream writes its reconstructed response into L1 (and L2 if configured)
+    /// after the final chunk is sent.
+    pub cache_insert: Option<CacheInsertContext>,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -381,6 +450,7 @@ pub fn stream_response(
             let request_started = ctx.request_started;
             let log_trace_id = ctx.trace_id;
             let budget = ctx.budget.clone();
+            let cache_insert = ctx.cache_insert;
 
             let guard = DropGuard::new(move || {
                 let inner = shared_for_guard
@@ -388,6 +458,12 @@ pub fn stream_response(
                     .expect("tracking stream mutex poisoned");
                 let usage = inner.snapshot();
                 let truncated = !inner.finished;
+                // Extract cache data before dropping the lock.
+                let cache_data = if !truncated {
+                    inner.cache_completion_data()
+                } else {
+                    None
+                };
                 drop(inner);
 
                 // Apply provider surcharge to both cost and baseline (§2.13).
@@ -410,7 +486,7 @@ pub fn stream_response(
                     api_key_id,
                     ts: Utc::now(),
                     provider: provider_id_log,
-                    model,
+                    model: model.clone(),
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
                     cached_tokens: usage.cached_tokens,
@@ -428,12 +504,108 @@ pub fn stream_response(
                     truncated,
                 };
 
-                let writer_clone = writer.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = writer_clone.write(row).await {
-                        tracing::warn!(error = %e, "sse request_logs write failed");
+                if let Some(w) = writer {
+                    let writer_clone = w.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = writer_clone.write(row).await {
+                            tracing::warn!(error = %e, "sse request_logs write failed");
+                        }
+                    });
+                }
+
+                // Best-effort cache insert on clean completion (§rv-l2-streaming-cache-write).
+                //
+                // Conditions: stream completed cleanly (!truncated), authoritative usage
+                // arrived (cache_data is Some), and a CacheInsertContext was supplied by
+                // the caller. Tool-call responses are excluded (checked below).
+                if let (false, Some((output_text, finish_reason, auth_usage)), Some(ins)) =
+                    (truncated, cache_data, cache_insert)
+                {
+                    // Reconstruct the ChatCompletionResponse from accumulated data.
+                    use tt_shared::messages::{Choice, Message, MessageContent};
+                    let response = ChatCompletionResponse {
+                        id: format!("chatcmpl-stream-{}", Uuid::now_v7()),
+                        object: "chat.completion".into(),
+                        created: Utc::now().timestamp(),
+                        model: ins.model.clone(),
+                        choices: vec![Choice {
+                            index: 0,
+                            message: Message::Assistant {
+                                content: Some(MessageContent::Text(output_text)),
+                                tool_calls: vec![],
+                                name: None,
+                            },
+                            finish_reason: Some(finish_reason),
+                        }],
+                        usage: auth_usage,
+                    };
+
+                    // Do not cache tool-call responses (non-deterministic).
+                    let has_tool_calls = response.choices.iter().any(|c| {
+                        if let Message::Assistant { tool_calls, .. } = &c.message {
+                            !tool_calls.is_empty()
+                        } else {
+                            false
+                        }
+                    });
+                    if has_tool_calls {
+                        tracing::debug!("streaming cache insert skipped: response contains tool calls");
+                        return;
                     }
-                });
+
+                    // Spawn best-effort inserts — never block or fail the client response.
+                    // Use cost_usd / baseline_cost_usd already computed above for the
+                    // request_logs row — those are the authoritative streaming costs.
+                    let entry = L1Entry::new(
+                        response.clone(),
+                        baseline_cost_usd,
+                        cost_usd,
+                        ins.provider_id.clone(),
+                    );
+                    if let Some(l1) = ins.l1 {
+                        let key = ins.l1_key.clone();
+                        let ttl = ins.ttl_secs;
+                        tokio::spawn(async move {
+                            match entry.to_bytes() {
+                                Ok(bytes) => {
+                                    if let Err(e) = l1.cache.set(&key, &bytes, ttl).await {
+                                        tracing::warn!(
+                                            error = %e,
+                                            key = %key,
+                                            "streaming l1 cache insert failed"
+                                        );
+                                    } else {
+                                        tracing::debug!(key = %key, "streaming l1 cache insert ok");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "streaming l1 entry serialization failed"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    if let (Some(l2), Some(query_text)) = (ins.l2, ins.l2_query_text) {
+                        let ttl_secs = ins.ttl_secs;
+                        let org_id_l2 = ins.org_id;
+                        let provider_id_l2 = ins.provider_id.clone();
+                        let model_l2 = ins.model.clone();
+                        tokio::spawn(async move {
+                            stream_insert_into_l2(
+                                l2,
+                                org_id_l2,
+                                &query_text,
+                                response,
+                                provider_id_l2,
+                                model_l2,
+                                ttl_secs,
+                            )
+                            .await;
+                        });
+                    }
+                }
             });
 
             let guarded_stream = GuardedStream {
@@ -505,6 +677,55 @@ fn compute_streaming_baseline(usage: &PartialUsage, pricing: Option<&ModelPricin
     };
     (usage.input_tokens as f64) * pricing.input_per_million / 1_000_000.0
         + (usage.output_tokens as f64) * pricing.output_per_million / 1_000_000.0
+}
+
+// ─── stream_insert_into_l2 ────────────────────────────────────────────────────
+
+/// Best-effort L2 insert for the streaming cache-write path.
+/// Mirrors `insert_into_l2` in `chat.rs` but lives here so the DropGuard
+/// closure can call it without crossing module boundaries.
+async fn stream_insert_into_l2(
+    l2: L2Config,
+    org_id: Uuid,
+    query_text: &str,
+    response: ChatCompletionResponse,
+    _provider_id: String,
+    model_used: String,
+    ttl_secs: u64,
+) {
+    let embedding_model = l2.embedder.model().to_string();
+    let embed = match l2.embedder.embed(query_text).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "streaming l2 embed during insert failed");
+            return;
+        }
+    };
+    let response_bytes = match serde_json::to_vec(&response) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "streaming l2 response serialization failed");
+            return;
+        }
+    };
+    let ttl = Duration::from_secs(ttl_secs);
+    let now = Utc::now();
+    let entry = CacheEntry {
+        id: Uuid::now_v7(),
+        org_id,
+        embedding: embed,
+        response: response_bytes,
+        model: model_used,
+        embedding_model,
+        input_tokens: response.usage.prompt_tokens,
+        output_tokens: response.usage.completion_tokens,
+        hit_count: 0,
+        created_at: now,
+        expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
+    };
+    if let Err(e) = l2.cache.insert(entry).await {
+        tracing::warn!(error = %e, "streaming l2 cache insert failed");
+    }
 }
 
 // ─── fake_stream_from_response ────────────────────────────────────────────────

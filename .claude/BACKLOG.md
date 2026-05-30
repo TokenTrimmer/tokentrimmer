@@ -55,7 +55,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 ### P3 — whenever
 
 - [x] [P3] [rv-anthropic-cache-write-rate] rust-crate-builder: Add a `cache_write_per_million` rate to ModelPricing/pricing.toml and price `cache_creation_input_tokens` at the ~1.25× write premium (anthropic/stream.rs:551-558; chat.rs:748-758). (§2.18) (est: $0.40)
-- [ ] [P3] [rv-pricing-catalog-staleness] rust-crate-builder: Pricing-catalog refresh script/job + a test that warns when newest `effective_at` ages out + a telemetry counter for requests priced at $0 from a missing catalog entry (pricing.toml; pricing.rs:2; chat.rs:744-746). (§2.19) (est: $0.40)
+- [x] [P3] [rv-pricing-catalog-staleness] rust-crate-builder: Pricing-catalog refresh script/job + a test that warns when newest `effective_at` ages out + a telemetry counter for requests priced at $0 from a missing catalog entry (pricing.toml; pricing.rs:2; chat.rs:744-746). (§2.19) (est: $0.40)
 - [ ] [P3] [rv-l2-streaming-cache-write] rust-crate-builder: Accumulate the streamed response (SSE aggregator already tracks usage) and write it to L1/L2 on clean completion when cache-eligible, so streaming traffic builds + benefits from the cache (chat.rs:168-294; sse.rs:55-108). (§2.10) (est: $0.60)
 - [ ] [P3] [rv-cache-key-canonicalization] rust-crate-builder: Model-alias canonicalization (dated ids/provider aliases → one key) + optional message whitespace normalization + short-TTL negative caching of deterministic 4xx (key.rs:46-86). (§2.20) (est: $0.60)
 - [ ] [P3] [rv-l2-nan-finite-filter] rust-crate-builder: Filter non-finite similarities before `max_by` and validate embeddings are all-finite at insert (l2.rs:208-218). (§4.15) (est: $0.10)
