@@ -22,6 +22,17 @@ pub struct CallSite {
     pub line: u32,
 }
 
+/// An unbounded loop construct with its line range.
+#[derive(Debug, Clone)]
+pub struct InfiniteLoop {
+    /// 1-based line of the loop statement.
+    pub line: u32,
+    /// Starting line (1-based) of the loop body.
+    pub body_start_line: u32,
+    /// Ending line (1-based, inclusive) of the loop body.
+    pub body_end_line: u32,
+}
+
 impl CallSite {
     /// `true` if the call's argument span contains `needle` (an AST-scoped
     /// substring check — only matches text inside this call).
@@ -45,11 +56,11 @@ pub fn is_llm_create_callee(callee: &str) -> bool {
         || callee.ends_with("generateContent")
 }
 
-/// Lines (1-based, ascending) of every *unbounded* loop construct in `tree`:
+/// Every *unbounded* loop construct in `tree` with its body span:
 /// a `while` whose condition is the literal `true`/`True`, a C-style
 /// `for (;;)`, or a Python `for … in itertools.count(…)`. Detection is on real
 /// loop nodes, so a `while True` written in a comment or string is ignored.
-pub fn infinite_loop_lines(tree: &Tree, source: &str) -> Vec<u32> {
+pub fn infinite_loops_with_bodies(tree: &Tree, source: &str) -> Vec<InfiniteLoop> {
     let src = source.as_bytes();
     let mut out = Vec::new();
     let mut stack = vec![tree.root_node()];
@@ -66,7 +77,13 @@ pub fn infinite_loop_lines(tree: &Tree, source: &str) -> Vec<u32> {
                         .trim()
                         .to_ascii_lowercase();
                     if norm == "true" {
-                        out.push(node.start_position().row as u32 + 1);
+                        let loop_line = node.start_position().row as u32 + 1;
+                        let body_end_line = node.end_position().row as u32 + 1;
+                        out.push(InfiniteLoop {
+                            line: loop_line,
+                            body_start_line: loop_line + 1,
+                            body_end_line,
+                        });
                     }
                 }
             }
@@ -76,7 +93,13 @@ pub fn infinite_loop_lines(tree: &Tree, source: &str) -> Vec<u32> {
                 let compact: String = header.chars().filter(|c| !c.is_whitespace()).collect();
                 // Python `itertools.count()` iterable, or C-style empty `for(;;)`.
                 if text.contains("itertools.count(") || compact.contains("(;;)") {
-                    out.push(node.start_position().row as u32 + 1);
+                    let loop_line = node.start_position().row as u32 + 1;
+                    let body_end_line = node.end_position().row as u32 + 1;
+                    out.push(InfiniteLoop {
+                        line: loop_line,
+                        body_start_line: loop_line + 1,
+                        body_end_line,
+                    });
                 }
             }
             _ => {}
@@ -86,9 +109,20 @@ pub fn infinite_loop_lines(tree: &Tree, source: &str) -> Vec<u32> {
             stack.push(child);
         }
     }
-    out.sort_unstable();
-    out.dedup();
+    out.sort_unstable_by_key(|l| l.line);
+    out.dedup_by_key(|l| l.line);
     out
+}
+
+/// Lines (1-based, ascending) of every *unbounded* loop construct in `tree`:
+/// a `while` whose condition is the literal `true`/`True`, a C-style
+/// `for (;;)`, or a Python `for … in itertools.count(…)`. Detection is on real
+/// loop nodes, so a `while True` written in a comment or string is ignored.
+pub fn infinite_loop_lines(tree: &Tree, source: &str) -> Vec<u32> {
+    infinite_loops_with_bodies(tree, source)
+        .iter()
+        .map(|l| l.line)
+        .collect()
 }
 
 /// Walk `tree` and return every call site (Python `call`, JS/TS
