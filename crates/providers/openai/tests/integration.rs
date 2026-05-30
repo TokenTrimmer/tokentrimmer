@@ -85,7 +85,8 @@ fn success_body(cached_tokens: u64) -> String {
 }
 
 fn provider() -> OpenAiProvider {
-    OpenAiProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    OpenAiProvider::new_allow_local(ClientConfig::default())
 }
 
 // ---------------------------------------------------------------------------

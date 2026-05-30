@@ -91,6 +91,8 @@ impl LocalProvider {
             // table is empty; the fallback returns zero for any model.
             pricing_table: HashMap::new(),
             fee_multiplier: 1.0,
+            // Local providers target localhost — allow http and private IPs.
+            allow_local: true,
         };
         Self {
             backend,

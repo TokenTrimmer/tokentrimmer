@@ -10,6 +10,7 @@ pub mod messages;
 pub mod pricing;
 pub mod provider;
 pub mod providers;
+pub mod url_guard;
 pub mod usage;
 
 pub use capability_check::{message_text_for_estimation, RequiredCapabilities};
@@ -22,4 +23,5 @@ pub use messages::{
 };
 pub use pricing::{ModelInfo, ModelPricing};
 pub use provider::Provider;
+pub use url_guard::{filter_extra_headers, validate_provider_url, UrlGuardError};
 pub use usage::Usage;

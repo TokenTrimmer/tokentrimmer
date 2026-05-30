@@ -108,6 +108,9 @@ fn make_compat_provider(id: &'static str, model_id: &str) -> OpenAICompatiblePro
         }],
         pricing_table,
         fee_multiplier: 1.0,
+        // Tests use a local httpmock server on 127.0.0.1 — allow_local bypasses
+        // the SSRF guard so the mock URL passes validation.
+        allow_local: true,
     };
 
     OpenAICompatibleProvider::new(ClientConfig::default(), cfg)
@@ -314,6 +317,7 @@ fn compat_fee_multiplier_stored() {
         models: vec![],
         pricing_table: HashMap::new(),
         fee_multiplier: 1.05,
+        allow_local: false,
     };
     let provider = OpenAICompatibleProvider::new(ClientConfig::default(), cfg);
     // fee_multiplier is 1.05 — verify it is stored (billing layer reads it).
@@ -375,4 +379,60 @@ async fn compat_embeddings_success() {
     assert_eq!(resp.data[0].index, 0);
     assert_eq!(resp.data[0].embedding.len(), 8);
     assert_eq!(resp.usage.prompt_tokens, 4);
+}
+
+// ---------------------------------------------------------------------------
+// extra_headers denylist: Authorization/Host are dropped; custom headers kept
+// ---------------------------------------------------------------------------
+
+/// Verify that `authorization` and `host` extra_headers are stripped and that a
+/// legitimate custom header is forwarded to the upstream server.
+#[tokio::test]
+async fn extra_headers_denylist_drops_auth_and_host() {
+    let server = MockServer::start();
+    let _mock = server.mock(|when, then| {
+        when.method(POST).path("/chat/completions")
+            // The custom header MUST arrive at the server.
+            .header("x-custom-org", "org-123")
+            // Authorization should NOT be overridden by extra_headers.
+            // httpmock allows us to assert what was NOT sent by checking
+            // that the canonical Authorization header (set by the adapter)
+            // equals the adapter-set value (Bearer test-key), not "Bearer evil".
+            .header("authorization", "Bearer test-key");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .body(success_body("mistral-large-latest"));
+    });
+
+    let provider = make_compat_provider("mistral", "mistral-large-latest");
+
+    // Build a context with denied headers plus a legitimate custom header.
+    let ctx = RequestContext {
+        trace_id: uuid::Uuid::new_v4(),
+        org_id: uuid::Uuid::new_v4(),
+        api_key_id: uuid::Uuid::new_v4(),
+        credentials: ProviderCredentials {
+            api_key: SecretString::new("test-key"),
+            base_url: Some(server.base_url()),
+            extra_headers: vec![
+                // Should be dropped — would override the adapter-set auth.
+                ("Authorization".to_string(), "Bearer evil".to_string()),
+                // Should be dropped — routing header.
+                ("Host".to_string(), "internal.corp".to_string()),
+                // Should be forwarded.
+                ("X-Custom-Org".to_string(), "org-123".to_string()),
+            ],
+        },
+        tag: None,
+        deadline: None,
+    };
+
+    // The mock asserts that Authorization = "Bearer test-key" (not "Bearer evil")
+    // and that X-Custom-Org = "org-123" is present.
+    let resp = provider
+        .chat_completion(minimal_request("mistral-large-latest"), &ctx)
+        .await
+        .expect("request should succeed with filtered headers");
+
+    assert_eq!(resp.usage.prompt_tokens, 10);
 }

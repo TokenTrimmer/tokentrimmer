@@ -68,6 +68,7 @@ impl OpenRouterProvider {
             models: models(),
             pricing_table: pricing_table(),
             fee_multiplier: BYOK_FEE_MULTIPLIER,
+            allow_local: false,
         };
         Self {
             inner: OpenAICompatibleProvider::new(client_cfg, cfg),
@@ -80,6 +81,27 @@ impl OpenRouterProvider {
     /// fields. See [`CompatConfig::fee_multiplier`] for semantics.
     pub fn fee_multiplier(&self) -> f64 {
         self.inner.fee_multiplier()
+    }
+
+    /// Create an adapter that skips SSRF URL validation for tests targeting a
+    /// local mock server.
+    ///
+    /// # Warning
+    ///
+    /// Do not use in production code. This bypasses the SSRF guard.
+    #[doc(hidden)]
+    pub fn new_allow_local(client_cfg: ClientConfig) -> Self {
+        let cfg = CompatConfig {
+            id: "openrouter",
+            default_base_url: DEFAULT_BASE_URL.to_string(),
+            models: models(),
+            pricing_table: pricing_table(),
+            fee_multiplier: BYOK_FEE_MULTIPLIER,
+            allow_local: true,
+        };
+        Self {
+            inner: OpenAICompatibleProvider::new(client_cfg, cfg),
+        }
     }
 }
 

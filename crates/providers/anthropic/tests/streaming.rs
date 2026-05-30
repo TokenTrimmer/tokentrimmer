@@ -61,7 +61,8 @@ fn stream_request() -> ChatCompletionRequest {
 }
 
 fn provider() -> AnthropicProvider {
-    AnthropicProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    AnthropicProvider::new_allow_local(ClientConfig::default())
 }
 
 /// Build a standard Anthropic SSE text stream.

@@ -79,7 +79,8 @@ fn success_body() -> String {
 }
 
 fn provider() -> OpenRouterProvider {
-    OpenRouterProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    OpenRouterProvider::new_allow_local(ClientConfig::default())
 }
 
 // ---------------------------------------------------------------------------

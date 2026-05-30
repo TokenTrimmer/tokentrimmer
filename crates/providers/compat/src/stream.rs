@@ -27,7 +27,10 @@ use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use std::pin::Pin;
-use tt_shared::{ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext};
+use tt_shared::{
+    filter_extra_headers, ChatCompletionChunk, ChatCompletionRequest, ProviderError,
+    RequestContext,
+};
 
 use crate::errors::{map_reqwest_error, map_response_error};
 use crate::translate;
@@ -73,7 +76,8 @@ pub async fn stream_chat_completion(
 ) -> Result<ChunkStream, ProviderError> {
     let url = format!("{base_url}/chat/completions");
     let api_key = ctx.credentials.api_key.expose().to_string();
-    let extra_headers: Vec<(String, String)> = ctx.credentials.extra_headers.clone();
+    let extra_headers: Vec<(String, String)> =
+        filter_extra_headers(&ctx.credentials.extra_headers);
 
     // Translate to the OpenAI wire shape, then override the stream flag.
     let mut translated = translate::translate_request(req)?;

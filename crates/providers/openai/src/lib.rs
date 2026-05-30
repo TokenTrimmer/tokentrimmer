@@ -29,8 +29,9 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use tracing::instrument;
 use tt_shared::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
-    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+    filter_extra_headers, validate_provider_url, ChatCompletionChunk, ChatCompletionRequest,
+    ChatCompletionResponse, EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing,
+    Provider, ProviderError, RequestContext,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -40,6 +41,10 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// Create once with [`OpenAiProvider::new`] and share across requests.
 pub struct OpenAiProvider {
     client: Client,
+    /// When `true`, skip SSRF URL validation for private/loopback addresses.
+    /// Always `false` in production; set to `true` only in tests that target
+    /// a local mock server.
+    allow_local: bool,
 }
 
 impl OpenAiProvider {
@@ -52,7 +57,26 @@ impl OpenAiProvider {
     pub fn new(cfg: ClientConfig) -> Self {
         let client =
             client::build_client(&cfg).expect("failed to build reqwest::Client for OpenAI adapter");
-        Self { client }
+        Self {
+            client,
+            allow_local: false,
+        }
+    }
+
+    /// Create an adapter that skips SSRF URL validation for tests targeting a
+    /// local mock server.
+    ///
+    /// # Warning
+    ///
+    /// Do not use in production code. This bypasses the SSRF guard.
+    #[doc(hidden)]
+    pub fn new_allow_local(cfg: ClientConfig) -> Self {
+        let client =
+            client::build_client(&cfg).expect("failed to build reqwest::Client for OpenAI adapter");
+        Self {
+            client,
+            allow_local: true,
+        }
     }
 
     /// Resolve the base URL from credentials or fall back to the default.
@@ -89,6 +113,13 @@ impl Provider for OpenAiProvider {
         ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         let base_url = self.base_url(ctx);
+        // Validate customer-supplied base_url overrides; skip when using the
+        // compiled-in default (always safe) or when allow_local is set (tests).
+        if ctx.credentials.base_url.is_some() {
+            validate_provider_url(base_url, self.allow_local)
+                .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+        }
+
         let url = format!("{base_url}/chat/completions");
 
         let body = translate::translate_request(req)?;
@@ -103,8 +134,8 @@ impl Provider for OpenAiProvider {
             .header("Content-Type", "application/json")
             .json(&body);
 
-        // Apply any provider-specific extra headers from credentials.
-        for (name, value) in &ctx.credentials.extra_headers {
+        // Apply any provider-specific extra headers from credentials (denylist-filtered).
+        for (name, value) in &filter_extra_headers(&ctx.credentials.extra_headers) {
             request_builder = request_builder.header(name, value);
         }
 
@@ -148,7 +179,13 @@ impl Provider for OpenAiProvider {
         req: ChatCompletionRequest,
         ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
-        let base_url = self.base_url(ctx).to_string();
+        let base_url = self.base_url(ctx);
+        if ctx.credentials.base_url.is_some() {
+            validate_provider_url(base_url, self.allow_local)
+                .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+        }
+
+        let base_url = base_url.to_string();
         let client = self.client.clone();
         stream::stream_chat_completion(client, &base_url, req, ctx).await
     }
@@ -167,6 +204,11 @@ impl Provider for OpenAiProvider {
         ctx: &RequestContext,
     ) -> Result<EmbeddingsResponse, ProviderError> {
         let base_url = self.base_url(ctx);
+        if ctx.credentials.base_url.is_some() {
+            validate_provider_url(base_url, self.allow_local)
+                .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+        }
+
         let url = format!("{base_url}/embeddings");
 
         let body = translate::translate_embeddings_request(req)?;
@@ -181,7 +223,7 @@ impl Provider for OpenAiProvider {
             .header("Content-Type", "application/json")
             .json(&body);
 
-        for (name, value) in &ctx.credentials.extra_headers {
+        for (name, value) in &filter_extra_headers(&ctx.credentials.extra_headers) {
             request_builder = request_builder.header(name, value);
         }
 

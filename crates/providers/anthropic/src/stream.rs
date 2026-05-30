@@ -38,6 +38,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::pin::Pin;
 use tt_shared::{
+    filter_extra_headers,
     messages::{ChunkChoice, ChunkDelta, ToolCall, ToolCallFunction},
     ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext, Usage,
 };
@@ -179,7 +180,8 @@ pub async fn stream_chat_completion(
 ) -> Result<ChunkStream, ProviderError> {
     let url = format!("{base_url}/v1/messages");
     let api_key = ctx.credentials.api_key.expose().to_string();
-    let extra_headers: Vec<(String, String)> = ctx.credentials.extra_headers.clone();
+    let extra_headers: Vec<(String, String)> =
+        filter_extra_headers(&ctx.credentials.extra_headers);
 
     // Translate to the Anthropic wire shape with stream = true.
     let mut translated = translate::translate_request(req)?;

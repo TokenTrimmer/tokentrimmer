@@ -29,6 +29,7 @@
 //!     models: vec![],
 //!     pricing_table: HashMap::new(),
 //!     fee_multiplier: 1.0,
+//!     allow_local: false,
 //! };
 //! let provider = OpenAICompatibleProvider::new(ClientConfig::default(), cfg);
 //! ```
@@ -40,8 +41,9 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use tracing::instrument;
 use tt_shared::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
-    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+    filter_extra_headers, validate_provider_url, ChatCompletionChunk, ChatCompletionRequest,
+    ChatCompletionResponse, EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing,
+    Provider, ProviderError, RequestContext,
 };
 
 use crate::client::{build_client, ClientConfig};
@@ -80,6 +82,13 @@ pub struct CompatConfig {
     /// faithfully reports raw token counts; the dashboard billing pass applies
     /// the multiplier when computing the final USD charge. Default: `1.0`.
     pub fee_multiplier: f64,
+
+    /// When `true`, skip SSRF URL validation for private/loopback addresses.
+    ///
+    /// Set to `true` only for local providers (Ollama, vLLM, LM Studio) that
+    /// legitimately target `http://localhost` or `http://127.0.0.1`. All hosted
+    /// providers must use `false`.
+    pub allow_local: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +166,11 @@ impl Provider for OpenAICompatibleProvider {
         req: ChatCompletionRequest,
         ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
-        let url = format!("{}/chat/completions", self.base_url(ctx));
+        let base_url = self.base_url(ctx);
+        validate_provider_url(base_url, self.cfg.allow_local)
+            .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+
+        let url = format!("{base_url}/chat/completions");
         let body = translate::translate_request(req)?;
 
         let mut rb = self
@@ -170,7 +183,7 @@ impl Provider for OpenAICompatibleProvider {
             .header("Content-Type", "application/json")
             .json(&body);
 
-        for (name, value) in &ctx.credentials.extra_headers {
+        for (name, value) in &filter_extra_headers(&ctx.credentials.extra_headers) {
             rb = rb.header(name, value);
         }
 
@@ -207,7 +220,11 @@ impl Provider for OpenAICompatibleProvider {
         req: ChatCompletionRequest,
         ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
-        let base_url = self.base_url(ctx).to_string();
+        let base_url = self.base_url(ctx);
+        validate_provider_url(base_url, self.cfg.allow_local)
+            .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+
+        let base_url = base_url.to_string();
         let client = self.client.clone();
         stream::stream_chat_completion(client, &base_url, req, ctx).await
     }
@@ -225,7 +242,11 @@ impl Provider for OpenAICompatibleProvider {
         req: EmbeddingsRequest,
         ctx: &RequestContext,
     ) -> Result<EmbeddingsResponse, ProviderError> {
-        let url = format!("{}/embeddings", self.base_url(ctx));
+        let base_url = self.base_url(ctx);
+        validate_provider_url(base_url, self.cfg.allow_local)
+            .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+
+        let url = format!("{base_url}/embeddings");
         let body = translate::translate_embeddings_request(req)?;
 
         let mut rb = self
@@ -238,7 +259,7 @@ impl Provider for OpenAICompatibleProvider {
             .header("Content-Type", "application/json")
             .json(&body);
 
-        for (name, value) in &ctx.credentials.extra_headers {
+        for (name, value) in &filter_extra_headers(&ctx.credentials.extra_headers) {
             rb = rb.header(name, value);
         }
 

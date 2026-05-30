@@ -61,7 +61,8 @@ fn stream_request(model: &str) -> ChatCompletionRequest {
 }
 
 fn provider() -> OpenAiProvider {
-    OpenAiProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    OpenAiProvider::new_allow_local(ClientConfig::default())
 }
 
 /// Build a minimal `ChatCompletionChunk` JSON line (as a `data:` SSE event).
