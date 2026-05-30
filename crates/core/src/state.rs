@@ -13,6 +13,7 @@ use tt_telemetry::request_logs::RequestLogWriter;
 
 use crate::budget::BudgetEnforcer;
 use crate::failover::CircuitBreaker;
+use crate::middleware::key_cache::{KeyVerifyCache, VerifyCache};
 use crate::registry::{register_default_providers, ProviderRegistry};
 
 /// Default L2 cosine-similarity threshold per ADR-008 / spec §4.4.
@@ -67,6 +68,15 @@ pub struct AppState {
     /// rewrites `req.model` and stamps `request_logs.route_id`. `None`
     /// disables routing entirely (tests, dev mode, free-tier orgs).
     pub routing_store: Option<Arc<CachingRoutingStore>>,
+    /// In-process TTL cache for argon2 verify results.
+    ///
+    /// Always present (never `None`). The auth middleware consults this before
+    /// calling `tt_auth::verify` so argon2 runs at most once per bearer token
+    /// per TTL window rather than on every request.
+    ///
+    /// See [`crate::middleware::key_cache`] for TTL constants and the
+    /// revocation-staleness tradeoff documentation.
+    pub verify_cache: VerifyCache,
     /// When `true`, the auth middleware injects a dogfood [`ApiKeyContext`]
     /// for unauthenticated requests so the dogfood routing route fires.
     /// Enabled by setting `TT_DOGFOOD_GROQ_ROUTING=1` at startup.
@@ -96,6 +106,7 @@ impl AppState {
             credential_store: None,
             request_log_writer: None,
             routing_store: None,
+            verify_cache: Arc::new(KeyVerifyCache::new()),
             dogfood_enabled: false,
             budget: None,
             breaker: Arc::new(CircuitBreaker::default()),

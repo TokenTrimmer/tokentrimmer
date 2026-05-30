@@ -9,5 +9,6 @@
 //!   downstream handlers.
 
 pub mod auth;
+pub mod key_cache;
 pub mod retrieval;
 pub mod trace;

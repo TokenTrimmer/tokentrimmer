@@ -41,6 +41,7 @@ use tt_auth::ApiKeyContext;
 use uuid::Uuid;
 
 use crate::budget::BudgetDecision;
+use crate::middleware::key_cache::CacheLookup;
 use crate::{ApiError, AppState, DOGFOOD_ORG_ID};
 
 /// Axum `from_fn_with_state`-compatible middleware function.
@@ -65,24 +66,53 @@ pub async fn middleware(
             let Some(key_store) = state.key_store.as_ref() else {
                 return Ok(next.run(req).await);
             };
-            match tt_auth::verify(key_store.as_ref(), &token).await {
-                Ok(ctx) => {
-                    // Fire-and-forget last_used_at update. We never block the
-                    // request on this — the dashboard's "Last used" column
-                    // is informational, and Postgres write latency on a
-                    // cold-start path would burn the gateway's p50 budget.
-                    let key_store = key_store.clone();
-                    let key_id = ctx.key_id;
-                    tokio::spawn(async move {
-                        if let Err(e) = key_store.touch_last_used(key_id, chrono::Utc::now()).await
-                        {
-                            tracing::warn!(error = %e, "touch_last_used failed");
-                        }
-                    });
-                    org_id = Some(ctx.org_id);
-                    req.extensions_mut().insert(ctx);
+            // Consult the in-process verify cache first.  The cache is keyed
+            // by the blake3 hash of the bearer token so the plaintext is
+            // never stored.  On a cache hit we skip the argon2 call entirely.
+            let token_hash = crate::middleware::key_cache::hash_token(&token);
+            let cache = &state.verify_cache;
+
+            let ctx_opt = match cache.get(&token_hash) {
+                CacheLookup::Hit(cached_ctx) => {
+                    tracing::trace!("auth: cache hit, skipping argon2");
+                    Some(cached_ctx)
                 }
-                Err(_) => return Err(ApiError::Unauthorized),
+                CacheLookup::Failure => {
+                    // Recently-failed token — deny without argon2.
+                    tracing::trace!("auth: negative cache hit, denying");
+                    return Err(ApiError::Unauthorized);
+                }
+                CacheLookup::Miss => {
+                    // Cold path: run the real argon2 verify.
+                    match tt_auth::verify(key_store.as_ref(), &token).await {
+                        Ok(ctx) => {
+                            cache.insert_hit(token_hash, ctx.clone());
+                            Some(ctx)
+                        }
+                        Err(_) => {
+                            cache.insert_failure(token_hash);
+                            return Err(ApiError::Unauthorized);
+                        }
+                    }
+                }
+            };
+
+            if let Some(ctx) = ctx_opt {
+                // Fire-and-forget last_used_at update. We never block the
+                // request on this — the dashboard's "Last used" column
+                // is informational, and Postgres write latency on a
+                // cold-start path would burn the gateway's p50 budget.
+                let key_store = key_store.clone();
+                let key_id = ctx.key_id;
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        key_store.touch_last_used(key_id, chrono::Utc::now()).await
+                    {
+                        tracing::warn!(error = %e, "touch_last_used failed");
+                    }
+                });
+                org_id = Some(ctx.org_id);
+                req.extensions_mut().insert(ctx);
             }
         }
         // Any other token format passes through unchallenged — forward-compat.
@@ -182,4 +212,345 @@ fn extract_bearer(req: &Request) -> Option<String> {
         return None;
     }
     Some(value[scheme_len..].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration tests for the auth middleware + verify cache.
+    //!
+    //! These tests prove that:
+    //!
+    //! (a) Two requests with the same valid token within TTL invoke argon2
+    //!     verify only ONCE (tracked via `find_by_prefix` call count on the
+    //!     underlying store, since `tt_auth::verify` calls it exactly once).
+    //!
+    //! (b) After TTL expiry (simulated by using a fresh empty cache) the
+    //!     middleware re-verifies (argon2 runs again).
+    //!
+    //! (c) An invalid token gets a 401; a subsequent request with a VALID
+    //!     token for the same store still works (negative cache doesn't
+    //!     poison positive paths for different tokens).
+    //!
+    //! (d) Within the positive TTL, a revoked key is still accepted
+    //!     (documented staleness). After eviction / TTL expiry the key is
+    //!     re-verified and the revocation is surfaced as 401.
+
+    use std::collections::HashMap;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    };
+
+    use argon2::{
+        password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+        Argon2,
+    };
+    use async_trait::async_trait;
+    use axum::{
+        body::Body,
+        http::{Request as HttpRequest, StatusCode},
+        middleware,
+        routing::get,
+        Router,
+    };
+    use chrono::{DateTime, Utc};
+    use tower::ServiceExt;
+    use tt_auth::{ApiKey, Environment, KeyError, KeyStore};
+    use uuid::Uuid;
+
+    use crate::middleware::key_cache::{hash_token, KeyVerifyCache};
+    use crate::state::AppState;
+
+    // ------------------------------------------------------------------
+    // CountingKeyStore — a KeyStore backed by an interior-mutable HashMap
+    // plus a find_by_prefix counter.  `tt_auth::verify` calls find_by_prefix
+    // exactly once per cold-path verify, so the counter == argon2 runs.
+    // ------------------------------------------------------------------
+
+    struct CountingKeyStore {
+        by_prefix: Mutex<HashMap<String, ApiKey>>,
+        pub find_count: AtomicU32,
+    }
+
+    impl CountingKeyStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                by_prefix: Mutex::new(HashMap::new()),
+                find_count: AtomicU32::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl KeyStore for CountingKeyStore {
+        async fn insert(&self, key: ApiKey) -> Result<(), KeyError> {
+            self.by_prefix
+                .lock()
+                .map_err(|e| KeyError::Store(e.to_string()))?
+                .insert(key.prefix.clone(), key);
+            Ok(())
+        }
+
+        async fn find_by_prefix(&self, prefix: &str) -> Result<Option<ApiKey>, KeyError> {
+            self.find_count.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .by_prefix
+                .lock()
+                .map_err(|e| KeyError::Store(e.to_string()))?
+                .get(prefix)
+                .cloned())
+        }
+
+        async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
+            let mut g = self
+                .by_prefix
+                .lock()
+                .map_err(|e| KeyError::Store(e.to_string()))?;
+            for v in g.values_mut() {
+                if v.id == id {
+                    v.revoked_at = Some(at);
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    /// Issue a real argon2-hashed key and insert it into the store.
+    async fn seed_key(store: &Arc<CountingKeyStore>, org_id: Uuid, plaintext: &str) -> ApiKey {
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = Argon2::default()
+            .hash_password(plaintext.as_bytes(), &salt)
+            .expect("argon2 hash")
+            .to_string();
+        let prefix = plaintext[..12].to_string();
+        let key = ApiKey {
+            id: Uuid::now_v7(),
+            org_id,
+            prefix,
+            hash,
+            label: "test".to_string(),
+            environment: Environment::Live,
+            created_at: Utc::now(),
+            revoked_at: None,
+        };
+        store.insert(key.clone()).await.expect("insert");
+        key
+    }
+
+    /// Build a minimal `AppState` with a counting store and a FRESH verify cache.
+    fn state_with_store(store: Arc<CountingKeyStore>) -> AppState {
+        let mut app = AppState::new(crate::registry::ProviderRegistry::new());
+        app.verify_cache = Arc::new(KeyVerifyCache::new());
+        app.key_store = Some(store);
+        app
+    }
+
+    /// Build a trivial router that runs the auth middleware and returns 200 on pass.
+    fn build_router(state: AppState) -> Router {
+        Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::middleware,
+            ))
+            .with_state(state)
+    }
+
+    fn live_bearer(token: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .uri("/")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    // ------------------------------------------------------------------
+    // (a) Two requests with the same valid token invoke argon2 only ONCE
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn same_valid_token_argon2_once_within_ttl() {
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_aabbccdd1234"; // 20 chars, prefix = "tt_live_aabb"
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        let state = state_with_store(store.clone());
+        let router = build_router(state);
+
+        // First request — cold cache, should hit argon2.
+        let resp1 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("resp1");
+        assert_eq!(resp1.status(), StatusCode::OK, "first request should succeed");
+
+        // Second request — cache warm, should skip argon2.
+        let resp2 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("resp2");
+        assert_eq!(resp2.status(), StatusCode::OK, "second request should succeed");
+
+        // find_by_prefix (= argon2 runs) called exactly once.
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            1,
+            "argon2 / find_by_prefix should only run once within TTL"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (b) After TTL expiry the middleware re-verifies.
+    //
+    // We simulate expiry by using two separate AppState instances that each
+    // start with a fresh empty cache — equivalent to the state after expiry.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn re_verifies_after_ttl_expiry() {
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_ttlexpiry1234";
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        // Router 1 — first verify (cache miss → argon2).
+        let state1 = state_with_store(store.clone());
+        let router1 = build_router(state1);
+        let r1 = router1
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r1");
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+
+        // Router 2 — brand-new empty cache (simulates TTL expiry).
+        let state2 = state_with_store(store.clone());
+        let router2 = build_router(state2);
+        let r2 = router2
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r2");
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            2,
+            "after TTL expiry (simulated by fresh empty cache) argon2 should run again"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (c) Invalid token → 401; valid token for same store still works
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn invalid_token_denied_valid_token_still_works() {
+        let org = Uuid::new_v4();
+        let plaintext_valid = "tt_live_valid1234567";
+        let plaintext_bad = "tt_live_baddd1234567"; // different prefix, not in store
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext_valid).await;
+
+        let state = state_with_store(store.clone());
+        let router = build_router(state);
+
+        // Bad token → 401.
+        let r_bad = router
+            .clone()
+            .oneshot(live_bearer(plaintext_bad))
+            .await
+            .expect("bad resp");
+        assert_eq!(r_bad.status(), StatusCode::UNAUTHORIZED);
+
+        // Good token (different prefix) → 200.
+        let r_good = router
+            .clone()
+            .oneshot(live_bearer(plaintext_valid))
+            .await
+            .expect("good resp");
+        assert_eq!(r_good.status(), StatusCode::OK);
+    }
+
+    // ------------------------------------------------------------------
+    // (d) Revoked key: within positive TTL still accepted (documented staleness);
+    //     after cache eviction it is re-verified and rejected.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn revoked_key_accepted_within_positive_ttl_then_rejected_after_eviction() {
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_revokeable1234";
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        let cache = Arc::new(KeyVerifyCache::new());
+
+        let mut app = AppState::new(crate::registry::ProviderRegistry::new());
+        app.verify_cache = cache.clone();
+        app.key_store = Some(store.clone());
+        let router = build_router(app);
+
+        // First request — key is live, cache miss → argon2 runs → 200.
+        let r1 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r1");
+        assert_eq!(r1.status(), StatusCode::OK, "pre-revoke should succeed");
+
+        // Now revoke the key in the store.
+        store.revoke(
+            // find the key_id from the prefix
+            {
+                let g = store.by_prefix.lock().unwrap();
+                g.get(&plaintext[..12]).unwrap().id
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("revoke");
+
+        // Second request — cache still holds the positive entry → 200 (staleness window).
+        let r2 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r2");
+        assert_eq!(
+            r2.status(),
+            StatusCode::OK,
+            "revoked key still accepted within positive TTL (documented staleness)"
+        );
+        // argon2 was NOT called again (still 1 find_by_prefix).
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+
+        // Evict the cache entry (simulates TTL expiry or explicit invalidation).
+        let token_hash = hash_token(plaintext);
+        cache.evict(&token_hash);
+
+        // Third request — cache miss → argon2 runs → key is revoked → 401.
+        let r3 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r3");
+        assert_eq!(
+            r3.status(),
+            StatusCode::UNAUTHORIZED,
+            "after eviction, revoked key should be rejected"
+        );
+        // find_by_prefix was called a second time.
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 2);
+    }
 }

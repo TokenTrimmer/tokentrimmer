@@ -25,6 +25,8 @@ tt-provider-together.workspace = true
 tt-provider-openrouter.workspace = true
 
 sqlx.workspace = true
+blake3.workspace = true
+dashmap.workspace = true
 
 axum.workspace = true
 tower.workspace = true
@@ -42,6 +44,7 @@ chrono.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+argon2.workspace = true
 criterion.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
