@@ -7,21 +7,47 @@ use crate::error::RetrievalError;
 use crate::types::RetrievableTag;
 
 pub fn parse(text: &str) -> Result<Vec<RetrievableTag>, RetrievalError> {
-    // Non-greedy match of the open tag + payload + close tag.
-    let re =
-        Regex::new(r#"(?ms)<retrievable\s+corpus="([^"]+)"(?:\s+k="(\d+)")?>(.*?)</retrievable>"#)
-            .map_err(|e| RetrievalError::Tag(e.to_string()))?;
+    // Match opening tag attributes and payload. We capture the full attribute
+    // string so we can extract `k` and `min_similarity` regardless of order.
+    //
+    // Pattern: <retrievable ATTRS>PAYLOAD</retrievable>
+    // ATTRS is a non-greedy blob of attribute text (captured as group 1).
+    // PAYLOAD is captured as group 2.
+    let re = Regex::new(r#"(?ms)<retrievable\s+([^>]+?)>(.*?)</retrievable>"#)
+        .map_err(|e| RetrievalError::Tag(e.to_string()))?;
+    let k_re =
+        Regex::new(r#"k="(\d+)""#).map_err(|e| RetrievalError::Tag(e.to_string()))?;
+    let corpus_re =
+        Regex::new(r#"corpus="([^"]+)""#).map_err(|e| RetrievalError::Tag(e.to_string()))?;
+    let sim_re =
+        Regex::new(r#"min_similarity="([^"]+)""#).map_err(|e| RetrievalError::Tag(e.to_string()))?;
+
     let mut out = Vec::new();
     for m in re.captures_iter(text) {
         let full = m.get(0).unwrap();
-        let corpus = m.get(1).unwrap().as_str().to_string();
-        let k = m
-            .get(2)
-            .and_then(|x| x.as_str().parse::<u32>().ok())
+        let attrs = m.get(1).unwrap().as_str();
+
+        let corpus = corpus_re
+            .captures(attrs)
+            .and_then(|c| c.get(1))
+            .map(|s| s.as_str().to_string())
+            .ok_or_else(|| RetrievalError::Tag("missing corpus attribute".into()))?;
+
+        let k = k_re
+            .captures(attrs)
+            .and_then(|c| c.get(1))
+            .and_then(|s| s.as_str().parse::<u32>().ok())
             .unwrap_or(5);
+
+        let min_similarity = sim_re
+            .captures(attrs)
+            .and_then(|c| c.get(1))
+            .and_then(|s| s.as_str().parse::<f32>().ok());
+
         out.push(RetrievableTag {
             corpus,
             k,
+            min_similarity,
             span: (full.start(), full.end()),
         });
     }
@@ -38,12 +64,26 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].corpus, "docs");
         assert_eq!(t[0].k, 3);
+        assert_eq!(t[0].min_similarity, None);
     }
 
     #[test]
     fn default_k_when_missing() {
         let t = parse(r#"<retrievable corpus="x">y</retrievable>"#).unwrap();
         assert_eq!(t[0].k, 5);
+        assert_eq!(t[0].min_similarity, None);
+    }
+
+    #[test]
+    fn per_tag_min_similarity_parsed() {
+        let t = parse(
+            r#"<retrievable corpus="x" k="3" min_similarity="0.75">payload</retrievable>"#,
+        )
+        .unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].corpus, "x");
+        assert_eq!(t[0].k, 3);
+        assert_eq!(t[0].min_similarity, Some(0.75));
     }
 
     #[test]

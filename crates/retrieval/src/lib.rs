@@ -15,5 +15,5 @@ pub mod types;
 
 pub use error::RetrievalError;
 pub use store::RetrievalStore;
-pub use substitute::{substitute_in_messages, SubstitutionReport};
+pub use substitute::{substitute_in_messages, SubstitutionReport, DEFAULT_MIN_SIMILARITY};
 pub use types::{Chunk, Corpus, Document, RetrievableTag, RetrievalResult};

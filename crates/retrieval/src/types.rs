@@ -42,10 +42,13 @@ pub struct RetrievalResult {
     pub similarity: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetrievableTag {
     pub corpus: String,
     pub k: u32,
+    /// Per-tag similarity floor override. `None` means use the default from the
+    /// substitution caller (see `substitute::DEFAULT_MIN_SIMILARITY`).
+    pub min_similarity: Option<f32>,
     /// Span in the original message text (start_byte_idx, end_byte_idx_exclusive).
     pub span: (usize, usize),
 }

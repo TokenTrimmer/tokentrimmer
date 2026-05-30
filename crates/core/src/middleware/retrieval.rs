@@ -246,6 +246,11 @@ pub async fn maybe_substitute(
             if let Ok(v) = HeaderValue::from_str(&report.tokens_saved_estimate.to_string()) {
                 resp.headers_mut().insert("x-tt-retrieval-tokens-saved", v);
             }
+            if report.low_confidence_skips > 0 {
+                if let Ok(v) = HeaderValue::from_str(&report.low_confidence_skips.to_string()) {
+                    resp.headers_mut().insert("x-tt-retrieval-low-confidence", v);
+                }
+            }
 
             // Track E §10: fire-and-forget an encrypted-prompt audit row of the
             // ORIGINAL request body. Best-effort — spawned so it never blocks
