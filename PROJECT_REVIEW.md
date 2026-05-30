@@ -1,357 +1,197 @@
-# TokenTrimmer — Project Review & Path to Ideal State
+# TokenTrimmer — Senior Review
 
-_Reviewed 2026-05-29 · scope: both repos (`public/` OSS core + `cloud/` hosted) · method: 9-lens parallel audit (architecture, savings-proof, providers/gateway, inspect/plan, design, value-visualization, onboarding, backlog, security). Every headline claim below was independently re-verified against source (see Appendix)._
+_Date: 2026-05-30 · Reviewer: comprehensive multi-agent audit (12 area finders + adversarial verification) with maintainer spot-checks._
 
----
+**Scope:** both repos — `public/` (Gateway, Inspect, Plan, CLI, MCP, retrieval, SDKs) and the sibling `cloud/` (hosted API, worker, dashboard, marketing, docs).
 
-## 1. Verdict (TL;DR)
+**Method:** 12 parallel finder agents across the 7 review areas, with adversarial verification of every high/critical bug/security/legal finding, plus direct reading of the load-bearing files. Severities below are **post-verification** — where the verification pass downgraded a finder's claim, the original is noted in parentheses. File:line citations are repo-qualified (`public/…`, `cloud/…`).
 
-TokenTrimmer is **further along and better engineered than its launch surface suggests.** The Rust core is genuinely good: clean acyclic crate layering, a sound Provider abstraction, a tamper-evident audit log (BLAKE3 chain + Ed25519), strong per-tenant credential crypto (XChaCha20-Poly1305 + per-row derived keys), a statistically honest Plan replay engine with real bootstrap CIs, and a thoughtful streaming/partial-cost model. 110+ backlog items have shipped.
-
-But there is **one systemic gap that strikes directly at the mission**, and it is the most important takeaway of this review:
-
-> **TokenTrimmer delivers more savings than it can currently prove or show.**
-> Exact-cache savings are real and measured. Provider prompt-cache savings are real and measured for OpenAI. **Model-routing savings are real on the customer's provider bill but report as ~$0** because the baseline is priced against the cheaper routed-to model. The **L2 semantic cache is fully built and tested but never wired into any production gateway** (zero savings in prod). Anthropic prompt-cache savings are **mis-measured (non-stream) and zeroed (stream).**
-
-> **Update (2026-05-29): this gap is now closed.** Routing savings are priced against the *original* requested model, the L2 semantic cache is wired into the gateway (behind `TT_L2_SEMANTIC_CACHE=1`), Anthropic prompt-cache is measured correctly on both the non-stream and streaming paths, and streamed responses emit a terminal `tokentrimmer.usage` event. The savings TokenTrimmer delivers are now also **provable and visible per-request** (verified intact in current source — see §2's update banner, the Appendix re-verification, and §6). The single residual is the L2-**hit** baseline (a synthetic estimate pending a cloud `cache_entries.baseline_cost_usd` column). _Update (later 2026-05-29): the **dashboard design system** gap — once the largest distance between ambition and surface — is now closed too (tokens + shared shell + brand kit + dark mode + themed charts; all 16 pages migrated). See the Implementation-status build-out note._
-
-The second-most-important gap is **presentation**. _Update (2026-05-29): the marketing site has since been built — a shared `Layout` plus landing / pricing / changelog / blog pages in `cloud/apps/web` — so the front door is no longer a placeholder._ The remaining gap is the **dashboard**, which — while functionally rich — still has **no design system** (empty token package, 16 pages of duplicated inline CSS, no brand, no dark mode), plus a little marketing polish (a live savings-proof widget and a dashboard preview). That is now the largest distance between the product's premium ambition and what a prospect actually sees.
-
-**Neither gap is hard to close.** The savings-measurement fixes are mostly small and surgical (the highest-leverage one is a few lines in `chat.rs`). The design uplift is well-scoped (tokens → shared Layout → marketing build). Closing both is the difference between "a good gateway" and "a product that visibly, provably saves money the moment you use it."
+**Overall posture.** A genuinely well-engineered early product. The crypto primitives (Argon2 keys, XChaCha20-Poly1305 credential encryption, Ed25519 audit chain), the statistical core (seeded ChaCha8 replay, bootstrap CIs), the pricing-catalog/versioning design, the design *tokens*, and the *restraint* in marketing copy are all above the bar for a pre-alpha. The problems concentrate in three places: **the four products aren't wired into one loop**, **the semantic cache and streaming telemetry can silently produce wrong numbers/answers**, and **the runtime doesn't yet enforce the tiers/limits the business model sells.**
 
 ---
 
-## Implementation status — updated 2026-05-29
+## 1. Product completeness & coherence
 
-Since this review was written, **34 of its items have shipped** — all inline, each test-driven, with `cargo clippy --workspace -- -D warnings` green at every step. Crucially, the savings-**measurement** gaps that were the headline concern (§2) are now closed, the L2 cache + retry/failover resilience are live, the per-model rate catalog is externalized to versioned data, and the **Plan reconciliation / trust-score loop — the design's credibility loop (§5.4) — has now shipped cloud-side.**
+**State:** All four products exist as real, separately-tested code and are individually surprisingly complete. The seams between them are broken at *every* join — the headline "inspect → simulate → apply → report" loop does not close.
 
-> **Update — later 2026-05-29 (cloud-side session).** Two more review items shipped: **`marketing-site-build`** (`cloud/apps/web` now has a shared `Layout` + landing/pricing/changelog/blog; `astro check` 0/0/0, `astro build` emits 5 static pages) and **`cloud-backlog-sync`** (the cloud backlog is now 51 done / 15 open — the stale "open-but-shipped" items were flipped). Alongside those, several **cloud-only backlog** items (not original review findings, so not §6/§7 checkboxes) also landed: `post-team-rbac`, `post-enterprise-docker-compose` (self-host Compose bundle), `w21-typst-pdf` (monthly executive PDF), `w23` tier→budget caps, and **`w25-pro-tier-live` in TEST mode** (Stripe test prices minted + wired; live-mode flip deferred to the operator). The remaining review gap is the **dashboard** design system + a couple of marketing polish items.
+| # | Finding | Sev | Effort | Evidence |
+|---|---------|-----|--------|----------|
+| 1.1 | **Plan "apply" never writes Gateway routing config — the core loop is a no-op.** `apply_plan` only flips `status='applied'` + writes an audit row; `proposed_routes` are discarded and never inserted into the `routes` table the Gateway reads. | **Critical** | M | `public/crates/plan-core/src/apply.rs:162-197`; `cloud/crates/api/src/plan.rs:212-253`; routes consumed at `public/crates/cli/src/main.rs:704-708` |
+| 1.2 | **Dashboard "Apply plan" button POSTs to a route that doesn't exist** → guaranteed 404 on the product's headline CTA. The tt-api endpoint exists but the dashboard never proxies to it, and the in-page help text blames an already-resolved blocker. | **Critical** (finder high) | S | `cloud/apps/dashboard/src/pages/plan/[id].astro:137`; no `api/plans/` dir exists |
+| 1.3 | **Paid Tier 2/3 Inspect ruleset is an empty `Vec`** — a paying hosted scan returns byte-identical findings to the free `tt inspect .`. No premium Inspect value ships today. | High | L | `cloud/crates/inspect-rules-tier23/src/lib.rs:24-26` |
+| 1.4 | **Inspect never feeds Plan.** Findings carry no cost/route data; nothing converts them (or `preview`'s `RouteSuggestion`, which already computes target_model + savings) into `proposed_routes`. Users hand-author `plan-input.json`. | High | M | `public/crates/preview/src/route_suggestions.rs:41-53`; CLI reads pre-written JSON only `main.rs:924-947` |
+| 1.5 | **Reporting reflects only Gateway.** Digest + PDF query only `request_logs` — no Inspect findings, no Plan trust-scores, no anomalies, despite the worker doc claiming the digest carries "open Inspect findings." | High | M | `cloud/crates/api/src/digest.rs`; `cloud/crates/worker/src/pdf.rs:121-171`; `worker/src/lib.rs:5-7` |
+| 1.6 | `tt-worker` is a hollow library shell (1-line stubs, no `main.rs`); real scheduling lives in `tt-api` in-process loops. `lib.rs` misrepresents the architecture. | Medium | S | `cloud/crates/worker/src/*`; real loops `cloud/crates/api/src/main.rs:270-341` |
+| 1.7 | MCP `find_route_for` returns hardcoded `claude-haiku-4-5` in every branch while its tool description claims "historical… HIGH quality confidence" data. | Medium | M | `public/crates/mcp/src/tools/find_route_for.rs:23,35-48` |
+| 1.8 | `tt plan --apply` is a stub that prints a notice and silently runs projection-only. | Medium | S | `public/crates/cli/src/main.rs:67-70,934-939` |
+| 1.9 | `plan_runs.config_diff` stores the `PlanResult` (output), not `proposed_routes` (input) — so even once 1.1 is built, apply has nothing to replay from. | Medium | S | `cloud/crates/api/src/plan.rs:86-87,122` |
+| 1.10 | `tt_routing::RouteAction` (`fallbacks`) and `tt_plan_core::RouteAction` (`force_cache_layer`) have diverged despite both docs claiming "lockstep" — projections won't match live behavior. | Low | M | `public/crates/routing/src/lib.rs:68-81`; `public/crates/plan-core/src/types.rs:130-141` |
 
-> **Update — later still 2026-05-29 (billing + reconciliation).** Two further waves landed after the note above. **(1) `plan-reconciliation-trustscore` shipped cloud-side** — the projected-vs-actual reconciliation loop that is the design's entire credibility loop (§5.4): a daily worker in the `api` crate (`crates/api/src/reconciliation.rs`) matures applied plans over a 7-day window, computes `actual_savings_usd/pct` + `trust_score = 1 − clamp(|projected−actual|/…)` (5 unit tests, admin `run-now` route), feeding real user-facing trust surfaces — the `/reports` table + sparkline, the per-plan page, and a homepage "30-day trust score" tile. This **flips the last open §6 correctness item.** **(2) A pricing / billing overhaul** (net-new, _not_ a review finding; mostly **TEST mode**): the cloud adopted a usage-metered model — flat base $99/$399/$1,499 (Pro/Team/Scale) + per-tier **metered overage** ($2.50/$1.50/$1.00 per 10K requests above each band), **unlimited seats** (the 25-seat Team cap dropped), **annual** plans (2 months free: $990/$3,990/$14,990), and the **Enterprise tier + dedicated-support/SLA dropped** as undeliverable solo. Public-repo Stripe scripts mint monthly + annual flat + metered-overage prices (`scripts/setup-stripe-test-prices.sh`, `scripts/setup-stripe-overage.sh`); a test-clock harness validates overage end-to-end (`scripts/validate-stripe-overage.sh` — PASS: 100K × $0.00025 = $25.00 invoice line); the Free-tier monthly request cap was raised 5K → 10K (`crates/core/src/budget.rs`). The cloud backlog is now **53 done / 16 open** (was 51 / 15). _These SaaS billing rates are orthogonal to the §2.1 per-model token rates, which are unchanged._
-
-> **Update — 2026-05-29 (design-system + cost-layer build-out).** A focused session drove the remaining review backlog to ~complete. **Design (cloud `apps/dashboard` + `packages/ui`):** the empty `packages/ui` stub is now a real design system — a token layer (color / type-scale / 8px-space / radius / shadow / z, light+dark) + shared `DashboardLayout`/`AuthLayout`, with **all 16 dashboard pages migrated off `#06c` inline CSS**; plus **dark mode** (persisted toggle + no-flash init + `prefers-color-scheme`), a **brand kit** (self-hosted Hanken Grotesk + JetBrains Mono, geometric SVG mark/wordmark + favicon/apple-touch/manifest), **token-themed uPlot charts** (shared `Chart.tsx`, compact-currency axes, skeleton loaders, dark-mode redraw), and a brand-themed **Starlight docs** site. `astro check` 0/0/0; all apps build. **Cost-layer (cloud crates):** `savings-badge` (`/v1/badges/savings` + admin signer), `alert-dispatcher-slack` (`tt-worker::alert` outbound webhook/Slack sink), `finops-export` (FOCUS-aligned CSV). **Inspect (public):** the real-OSS FP corpus is now populated (a `vendor-corpora.sh` `cp`-path bug was fixed) and run — it surfaced two over-threshold rules; one a genuine FP (`model-flagship-for-extraction`, now fixed), one reclassified advisory (`output-no-max-tokens`); recorded in `corpora/FP_REPORT.md`. **Security:** a dev/prod secret-split + rotation runbook (`docs/SECRETS.md`); live-key rotation stays operator-gated. Cloud `cargo test`/`clippy` green (tt-api 100, tt-worker 15). **`forgone-savings-view` is complete too** (2026-05-30): the moment-of-use CLI surface plus a dashboard **"Potential additional savings" panel** on /costs (`getForgoneSavings` — a cloud-side opportunity analysis over non-cached, non-routed flagship calls re-priced against a conservative cheaper-sibling map; **no migration** — the per-request field originally scoped proved unnecessary). Every review-scope item is now shipped **except the operator-gated `env-secret-split-rotate` live-key rotation**.
-
-**✅ Shipped this session**
-- _Savings correctness:_ `fix-routing-baseline-savings` (routing `saved_usd` now correct), `fix-anthropic-cache-usage-mapping` + `fix-anthropic-stream-cached-tokens` + `anthropic-total-tokens-fix`, `fee-multiplier-apply` (OpenRouter 5% BYOK), `plan-cache-savings-wire`, `plan-latency-projection`
-- _Gateway:_ `registry-model-passthrough` (unlisted models dispatch, no 404), `streaming-client-timeout` (read-idle), `openai-reasoning-stream-unblock`, `retry-fallback-layer` (bounded retry/backoff on transient 429/5xx), `wire-l2-cache-production` (L2 semantic cache live behind `TT_L2_SEMANTIC_CACHE=1`), `provider-failover` (per-provider circuit breaker + ordered fallback chain on a route's `fallbacks`; non-stream dispatch fails over on 5xx/timeout)
-- _Moment-of-use:_ `fix-proxy-savings-banner`, `stream-cost-headers` (terminal `tokentrimmer.usage` event), `live-cli-savings-ticker`
-- _Headline feature:_ **`budget-caps-quota`** — per-org monthly spend cap + per-minute rate, enforced in auth middleware → 429 + `X-TT-Budget-Remaining-Usd`
-- _Inspect / quality:_ `inspect-5-missing-rules` (15/15 P0 rules now ship), `preview-pricing-all-providers`, `retrieval-orgid-isolation`
-- _Docs / hygiene:_ `getting-started-guide` (`GETTING_STARTED.md`), `docs-readme-quickstart-fix`, `kdf-doc-align`, `workspace-lints-align`, `perms-least-privilege-cleanup`, `.gitignore` hardening
-- _Architecture:_ `pricing-externalize` — per-model rates moved to a versioned, embedded `data/pricing.toml` (real `effective_at` + price history; live + historical-replay lookups); all 7 paid providers delegate to the shared catalog
-- _CI / shift-left:_ `cost-diff-ci-lint` — `tt inspect --cost-diff [--base <ref>] [--fail-on-cost-increase]` prices LLM model ids added/removed in a `git diff`, reusing the pricing catalog (no cloud); markdown/JSON for a check-run
-- _Layering:_ `compat-crate-split` — extracted `tt-provider-compat` (OpenAI-wire machinery); the 4 BYOK adapters no longer depend on the full OpenAI crate; config-aware registration (`TT_PROVIDERS` allowlist) + sorted `/v1/models`
-- _Accuracy:_ `token-estimator-shared` — new `tt-tokenize` crate (cached tiktoken + heuristic); preview and the live routing estimate share it, so route thresholds match what `/v1/preview` reports
-- _Recall:_ `hnsw-org-recall` — L2 lookups raise `hnsw.ef_search` (per-tx `SET LOCAL`, default 100) so org-filtered semantic search keeps high recall under multi-tenant load; 50-org recall + cross-tenant isolation regression tests
-- _Inspect:_ `inspect-new-rules` — 4 new cost/cache rules (19/19 P0): anthropic-tools-not-cached, output-n>1, reasoning-effort-default-high, dynamic-prefix-breaks-cache; each with ≥5/≥10 fixtures
-- _Inspect (AST):_ `inspect-ast-migration` — rule-level AST cache (`parse_cached`) + a shared `call_sites` helper; migrated the max_tokens/cache_control/model-arg rules off regex onto real call nodes (ignores comments/strings)
-- _Inspect (FP gate):_ `inspect-corpora-seed` — `corpora/samples` clean-code corpus + `measure-fp-rate.sh --corpus`; recorded 0 code-rule FPs in `corpora/FP_REPORT.md`
-- _Ops:_ `cloud-repo-remote` — cloud monorepo baselined + pushed to private `TokenTrimmer/cloud`
-
-**◻ Remaining — public, doable:** _none in this review's scope — all shipped._ Open backlog work is now CLOUD-repo or BLOCKED on external accounts/migrations. All review-scope follow-ups are shipped too; the only network-gated step left is *running* `scripts/vendor-corpora.sh` to populate `corpora/vendor/` with real OSS (the tooling + manifest are in place).
-
-**◻ Remaining — drained (one operator-gated item).** The design-system cluster (`design-system-foundation`, `brand-kit`, `dark-mode`, `chart-theming`, `app-shell-nav`, `docs-site-theme`), the cost-layer items (`savings-badge`, `alert-dispatcher-slack`, `finops-export`), and **`forgone-savings-view`** all **shipped 2026-05-29/30**. The only review-scope item left is **`env-secret-split-rotate`** — the dev/prod split + rotation runbook is written, but the live-key rotation + `fly secrets` migration is **operator-gated** (requires the human + the `TT_MASTER_KEY` re-encryption step). _Also shipped: `plan-reconciliation-trustscore`, `marketing-site-build`, `cloud-backlog-sync`._
-
-**◻ Remaining — human-gated:** `env-secret-split-rotate` (rotate the live keys read this session; prod secrets → `fly secrets`)
-
-The §6 / §7 checklists below are annotated `✅` where shipped.
+**Connecting insight:** 1.1/1.2/1.8/1.9/1.10 are the *same hole* viewed five ways — the apply path is unimplemented top to bottom, yet the audit log emits a `plan.applied` event asserting a change that never happened. Closing this loop (translate `proposed_routes` → org-scoped `routes` rows in the same txn as the status flip; persist input at create-time; add the dashboard route; make `--apply` real) is the single highest-leverage product change.
 
 ---
 
-## 2. Does it actually save tokens? — The savings reality
+## 2. Cost-reduction effectiveness (core value prop)
 
-> **Update (2026-05-29):** the measurement gaps below are now largely **fixed** — routing `saved_usd` is priced against the original model, Anthropic prompt-cache usage is mapped correctly (non-stream + stream), and streaming responses emit a terminal `tokentrimmer.usage` event. So the **provable** savings now approach the **delivered** savings. **L2 semantic cache is now wired** (behind `TT_L2_SEMANTIC_CACHE=1`); its hit-savings still use a synthetic baseline pending a `cache_entries.baseline_cost_usd` column (cloud migration). The original analysis below is preserved for context.
+**State:** Architecturally sound on the happy path (per-org-namespaced L1, tuned HNSW L2, versioned pricing catalog, circuit-breaker + bounded retry). But the **semantic cache can silently return wrong answers** and **streaming cost telemetry is systematically inaccurate**.
 
-**This is the question that matters most, so it goes first.** Here is the honest mechanism-by-mechanism scorecard, traced through real code:
+### Caching — quality-correctness cluster
+| # | Finding | Sev | Effort | Evidence |
+|---|---------|-----|--------|----------|
+| 2.1 | **L2 lookup ignores the requested model.** SQL filters only org_id + expiry + cosine; a `gpt-4o` request can be served a `gpt-4o-mini` (or any near-embedding) response, attributed to the wrong model. Invisible to the caller. | **Critical** | **S** | `public/crates/cache/src/l2.rs:356-367`; `chat.rs:335-336` |
+| 2.2 | **Caches & replays non-deterministic responses** (temperature>0, n>1, tool calls) for 24h with no opt-out. `n`/`seed` excluded from the key, so an `n=3` request can get a 1-choice cached body. | **Critical** | M | `public/crates/cache/src/key.rs:5-7,73-85`; `chat.rs:295-330` |
+| 2.3 | **L2 semantic key embeds only the *last user message*** — ignores system prompt, history, tools. Different conversations sharing a final turn collide above threshold and return each other's answers. | **Critical** | M | `chat.rs:333-336,438-456,567-580` |
+| 2.4 | **RAG substitution applies no similarity floor** in production — the `top_k(min_similarity)` helper exists but is unused, so off-topic chunks get spliced into prompts. | High | S | `public/crates/retrieval/src/substitute.rs:54-66`; unused `search.rs:9-22` |
+| 2.5 | **L2 mixes embedding spaces** — no `embedding_model`/version column; the documented embedder swap would corrupt similarity. | High | M | `migrations/0002_cache_entries.up.sql:17-27`; `l2.rs:356-367` |
+| 2.6 | **No cache-stampede / single-flight** — a cold/expiring popular key lets N concurrent identical requests all miss and hit the provider. | High | M | `chat.rs:303-382` |
+| 2.7 | **`tt_extras` advertises per-request "cache config" but no bypass/refresh/no-cache is wired** — no escape hatch, which makes 2.2 unavoidable for mixed traffic. | High | S | `public/crates/shared/src/messages.rs:42-45` |
+| 2.8 | Flat 24h TTL for L1+L2; documented per-tier (24h/7d/30d) and per-route TTLs never implemented → paid tiers lose hit-rate. | Medium | M | `state.rs:22-24`; `chat.rs:47-50,720` |
+| 2.9 | L2-hit "savings" computed from a hardcoded **$1/$2-per-M placeholder**, not real model price → fabricated numbers feed dashboard/badge/PDF. | Medium | S | `chat.rs:676-683,596,905` |
+| 2.10 | Streaming requests never populate the cache (read-on-stream, write-on-non-stream-only) → stream-default workloads get near-zero cache benefit. | Low | M | `chat.rs:168-294` vs `415-457` |
 
-| Mechanism | Saves real $? | Measured & shown? | Status |
-|---|:---:|:---:|---|
-| **L1 exact cache** (Redis) | ✅ yes | ✅ yes | **Real & honest.** Hit → cost $0, `saved_usd` = real baseline carried in the L1 envelope. (`chat.rs:436-460`, `l1_entry.rs`, tests pass.) |
-| **Provider prompt-cache (OpenAI)** | ✅ yes | ✅ yes | **Real & honest.** Cached input billed at the discounted rate, baseline at full rate. (`chat.rs:640-667`.) Savings are produced by the provider; TT measures them. |
-| **Model routing** (downgrade to cheaper model) | ✅ **yes — on the bill** | ❌ **no — reports ~$0** | **The core bug.** Routing rewrites `req.model` then prices *both* cost and baseline against the cheap routed-to model → `saved_usd ≈ 0`. Customer saves money; TT can't see it. (`chat.rs:143,314-316`.) |
-| **L2 semantic cache** (pgvector) | ⚠️ would, but | ❌ **$0 in prod** | **Built, tested, never wired.** `with_l2` is called nowhere outside the builder definition + doc examples. Dead at runtime in both the CLI gateway and cloud API. (`state.rs:111` only.) |
-| **Anthropic prompt-cache injection** | ✅ yes | ❌ **mis-measured** | Injection is correct, but usage-mapping mismatch under-reports savings (non-stream) and **streaming hardcodes `cached_tokens: 0`** → every streamed Claude call shows zero cache benefit. (`translate.rs:489-498`, `stream.rs:549`.) |
-| **RAG context compression** | ⚠️ maybe | ❌ heuristic-only | `tokens_saved` is `char_delta/4`, can go **negative**, never folded into cost, `org_id` hardcoded to `nil`. Not production-isolated. (`substitute.rs:63-74`, `retrieval.rs:160`.) |
-| **Inspect static fixes** | ✅ (advisory) | ✅ (qualitative) | **Honest.** Flags waste pre-runtime with dollar-quantified hints; doesn't claim measured savings. Correct positioning. |
-| **Plan projected savings** (offline) | ✅ correct math | ⚠️ corrupted input | The one place routing savings are computed correctly — but it reads `request_logs.baseline_cost_usd`, which the gateway writes wrong for routed traffic. Fix the gateway and Plan becomes trustworthy. |
+### Routing, fallback, telemetry, compression
+| # | Finding | Sev | Effort | Evidence |
+|---|---------|-----|--------|----------|
+| 2.11 | **Routing rewrites & failover have no capability/context-window quality floor** — a vision/tool/long-context request can be silently downgraded to an incompatible/smaller model. `ModelInfo.capabilities`/`max_input_tokens` exist but are never consulted. | High | M | `public/crates/routing/src/lib.rs:135-161`; `chat.rs:983-987`; `failover.rs:107-128` |
+| 2.12 | **Streaming output tokens fall back to raw byte count (~4× overcount)** when no usage block arrives (incl. client abort). (Finder high → verified **medium**: abort-only, bounded, self-correcting.) | Medium | S | `public/crates/core/src/routes/sse.rs:84-98,112-116,356-372` |
+| 2.13 | **OpenRouter 5% BYOK fee applied only on the non-streaming path** → every OpenRouter *stream* under-reports cost ~5%. | High | S | `sse.rs:455-476` vs `chat.rs:396-401`; `openrouter/src/lib.rs:49` |
+| 2.14 | `request_logs.truncated` is computed/set but **has no DB column** — silently dropped; the rows most likely to be byte-inflated can't be excluded. | Medium | S | `request_logs.rs:52-53,134-167`; `migrations/0001` |
+| 2.15 | Streaming input-token estimate uses `s.len()` (bytes) not `tt_tokenize` → overcounts CJK/emoji 2-4× and skews routes. | Medium | S | `chat.rs:201-240` vs `983-984` |
+| 2.16 | **No Batch API support** — the 50%-off OpenAI/Anthropic batch discount is absent; the routing `tag` predicate is the natural hook. | Medium | L | `routing/src/lib.rs:62-64` |
+| 2.17 | RAG savings ignore embedding-call cost and can report a "saving" when substitution *grows* the prompt. | Medium | M | `substitute.rs:63,71-75`; `embed.rs:27` |
+| 2.18 | Anthropic cache-creation tokens billed at base input rate, not the ~1.25× write premium → understates cost. | Low | M | `anthropic/src/stream.rs:551-558`; `chat.rs:748-758` |
+| 2.19 | Pricing catalog is a manual 2026-05-01 snapshot; "refreshed daily" docstrings have no automation; unknown model → priced at **$0**. | Low | M | `public/crates/shared/data/pricing.toml:25-27`; `chat.rs:744-746` |
 
-### 2.1 A realistic savings model
-
-Grounded in the **actual pricing tables in the code** (not marketing). Representative customer: a SaaS feature on OpenAI `gpt-4o`, ~10M input + 2M output tokens/day.
-
-- **Baseline:** 10M × $2.50/M + 2M × $10/M = **$45/day ($1,350/mo).**
-- **Layer 1 — L1 exact cache** _(real + measured)_: ~20% exact repeats → **−$9/day** → $36.
-- **Layer 2 — provider prompt cache** _(real + measured, OpenAI)_: ~40% of input cached at 50% off → **−$4/day** → $32.
-- **Layer 3 — model routing** _(real on the bill, **not measured today**)_: route ~30% of low-stakes calls `gpt-4o → gpt-4o-mini` (≈94% cheaper on that slice) → **−$12.69/day** → ~$20.
-
-| Band | Total reduction | What it represents |
-|---|:---:|---|
-| **Conservative** | **~12%** | Low cache-hit, low repeat rate. Measured today. |
-| **Expected** | **~28%** | The provable-today number (L1 + prompt cache). **What TT can prove right now.** |
-| **Optimistic** | **~55%** | Includes routing — **delivered to the customer's bill today, but invisible** in TT's headers/dashboard until the routing-baseline bug is fixed. |
-
-> **The single most valuable fix in this entire review** is `fix-routing-baseline-savings` (a few lines in `chat.rs`): capture the original requested model before routing rewrites it, and price `baseline_cost_usd` against *that*. This moves the provable number from ~28% toward ~55% — making the headline claim true *and demonstrable*. It also repairs Plan's input and every downstream dashboard/digest figure.
-
-### 2.2 The honest one-liner for marketing
-
-Until the fixes land, the defensible public claim is: **"15–30% measured savings from caching alone, typically 40–55% with routing"** — and you should be able to show the measured portion live. After the fixes, the full number becomes provable per-request.
+**Connecting insight:** 2.12/2.13/2.14/2.15 + 2.9 are one theme — **realized-savings numbers are unreliable for streaming, OpenRouter, and truncated traffic**, and feed the badge/digest/PDF, which creates the legal exposure in §6.
 
 ---
 
-## 3. Scorecard by dimension
+## 3. UX/UI & design system
 
-> _Grades **refreshed 2026-05-29** to reflect shipped remediations (each bump traces to commits logged in §6/§7); the as-audited grades remain in git history. Design holds at D+ — the dashboard design system is the one major dimension that has not moved._
+**State:** A genuinely good **token** foundation (`packages/ui/src/styles.css`). But "@tokentrimmer/ui" is a *stylesheet, not a component library* — every page hand-rolls buttons/inputs/modals/badges, and ~65 hardcoded hex values break dark mode.
 
-| Dimension | Grade | One-line |
-|---|:---:|---|
-| Architecture & scalability | **A** | Clean layering; the three cited debts — pricing-as-code, registry choke point, unwired retry/fallback — all shipped. |
-| Savings correctness | **B+** | Caching honest; routing / L2 / Anthropic-cache measurement now fixed & test-covered. Residual: L2-hit synthetic baseline (cloud migration) + RAG char-heuristic. |
-| Providers & gateway | **B+** | All 8 adapters real; registry now passes through unlisted models; cost-accounting bugs (fee_multiplier, Anthropic cache/total) fixed. |
-| Inspect | **B** | 19/19 P0 rules; structural rules migrated to AST; FP gate on a seeded clean-code corpus (real-OSS vendoring still network-gated). |
-| Plan | **A−** | Excellent engine; cache-savings, latency projection, and the reconciliation / trust-score loop now all shipped. |
-| Value visualization | **A−** | Dashboard strong; moment-of-use surfaced (terminal usage event, real proxy banner, live ticker); savings badge + a "potential additional savings" forgone panel both shipped. |
-| Design & brand | **B+** | Marketing site built; dashboard now has a full design system (tokens + shared shell), a brand kit (self-hosted fonts + SVG mark/favicon), dark mode, and token-themed charts. Remaining polish: marketing site adopting the shared tokens + a raster apple-touch PNG. |
-| Onboarding & docs | **B** | CLI self-documents; unified `GETTING_STARTED.md` shipped; README quickstart corrected (real image, env config, Rust 1.88). |
-| Security & crypto | **A−** | Strong core; retrieval tenant-isolation + harness least-privilege fixed; prod-secret split/rotation still human-gated. |
-| Backlog hygiene | **B+** | Public drained; cloud repo pushed + backlog synced (53 done / 16 open); launch gates now visible. |
+| # | Finding | Sev | Effort | Evidence |
+|---|---------|-----|--------|----------|
+| 3.1 | **`@tokentrimmer/ui` ships zero components** despite `package.json` advertising "buttons, forms, charts, table primitives." Root cause of all duplication/drift. | High | L | `cloud/packages/ui/src/` = `styles.css` + `index.ts` (fmt helpers only); `package.json:5` |
+| 3.2 | **Dark mode silently breaks on 11/16 pages** via hardcoded hex — most damaging: the **API-key reveal renders white-on-white** (`#fffbe6`/`#fff`). | High | M | `keys/index.astro:162-171`; `routes/index.astro:372-375`; `audit/index.astro:293,313` |
+| 3.3 | **Three divergent token systems for one brand** (dashboard `--tt-*`, marketing private `--bg/--accent`, docs hand-"mirrored"). Visible drift (Hanken Grotesk vs system font; `#8a6d00` vs `#9a7b00`). | High | M | `apps/web/src/layouts/Layout.astro:94-108`; `apps/docs/src/styles/brand.css:5` |
+| 3.4 | Modals hand-rolled per page, no `role=dialog`/`aria-modal`/focus-trap/Escape; destructive actions use native `confirm()`/`alert()`. | Medium | M | `routes/index.astro:377-398,327`; `keys/index.astro` |
+| 3.5 | Severity/event/status badges duplicated with conflicting hex while the token-based `.tt-chip` goes unused. | Medium | S | `inspect/index.astro:212-214`; `audit/index.astro:301-307`; `styles.css:770-792` |
+| 3.6 | Spacing/radius/type scales bypassed by hand-typed `0.3rem`/`0.375rem`/`0.85em` literals. | Medium | M | `routes/index.astro:352`; `inspect/index.astro:191`; `audit/index.astro:289,297` |
+| 3.7 | Minimal elevation/motion; no empty/loading/error language beyond charts; inline-SVG icons as raw strings; unverified WCAG contrast (`--tt-text-faint` ~2.5:1). | Low | M | `styles.css:104,546-551`; `DashboardLayout.astro:45-58` |
 
----
-
-## 4. The critical path — what to work on next (ranked)
-
-If you do nothing else, do these, in this order. The first cluster makes the product **provably** save money; the second makes it **look** like the premium product it is; the third unblocks the launch chain.
-
-> **Status (2026-05-29):** clusters 1, 2 and 4 below are **done** — the savings-measurement fixes (incl. `wire-l2-cache-production`), moment-of-use surfacing, and the cloud-repo unblock all shipped (see the Implementation-status section above). Cluster 3 (look premium) is now **also done** — `marketing-site-build` plus the full dashboard `design-system-foundation` + `brand-kit` + `dark-mode` + `chart-theming` + `app-shell-nav` + `docs-site-theme` all shipped (later 2026-05-29). `env-secret-split-rotate` is still human-gated (split/rotation runbook written; live-key rotation is the operator's).
-
-1. **Prove the savings you already deliver** (small, surgical, highest ROI):
-   - `fix-routing-baseline-savings` — price baseline against the *original* model. **(P0, S)**
-   - `fix-anthropic-stream-cached-tokens` — stop zeroing cache reads on streamed Claude calls. **(P0, S)**
-   - `fix-anthropic-cache-usage-mapping` — correct the OpenAI-vs-Anthropic usage convention. **(P1, S)**
-   - `wire-l2-cache-production` — actually attach L2 in the gateway (behind a flag) or stop listing it as live. **(P0, M)**
-2. **Show the savings at the moment of use:**
-   - `fix-proxy-savings-banner` — the Ctrl-C banner always prints `$0.0000`; wire the values already in scope. **(P1, S)**
-   - `stream-cost-headers` — emit cost/saved on streaming responses (terminal SSE event). **(P1, M)**
-3. **Look premium:**
-   - `design-system-foundation` — tokens + shared Layout for the **dashboard** (kills 16× duplicated CSS). **(P0, L)** — _still open._
-   - `marketing-site-build` — replace the placeholder front door. **(P0, L)** — _**done 2026-05-29** (`cloud/apps/web`: Layout + landing/pricing/changelog/blog). Remaining polish: live savings-proof widget + dashboard preview._
-4. **Unblock the launch chain (near-free):**
-   - `cloud-repo-remote` — create the private GitHub repo + push; unblocks ~10 P0 launch gates in minutes. **(P0, S)**
-   - `cloud-backlog-sync` — ~9 "open" cloud items are already shipped; flip them. **(P1, S)**
-5. **Correct the on-ramp:**
-   - `getting-started-guide` — **done in this session** (`GETTING_STARTED.md`); link from README. **(P1, done)**
-   - `docs-readme-quickstart-fix` — wrong Docker image + nonexistent YAML config + 3 conflicting Rust versions. **(P1, S)**
-6. **Tighten the harness** (your explicit request): least-privilege permission cleanup — **applied in this session** (see §9). **(P1, done)**
-
-Everything else is in the new-development backlog (§7).
+**Path to premium:** extract `tokens.css` consumed by all three apps; promote charts + build ~10 primitives (Button/Field/Select/Modal/Badge/Banner/StatCard/DataTable/Toast/EmptyState) into `packages/ui`; replace every hardcoded hex with tokens (CI stylelint); add motion tokens + press/hover states; bring brand fonts to web/docs.
 
 ---
 
-## 5. Detailed findings by area
+## 4. Bugs & correctness
 
-Severity: **P0** blocks the core promise/launch · **P1** important soon · **P2** worthwhile · **P3** nice-to-have. `→` = recommendation.
-
-> **Status note (2026-05-29):** §5 records the findings **as originally audited** and is preserved as the pre-remediation snapshot. For current per-item status and commit hashes, see the Implementation-status log above and the §6/§7 checklists — the large majority of the P0/P1 findings below have since shipped fixes. Inline **✅** / **⏳** markers flag the items that changed most notably (especially §5.4).
-
-### 5.1 Savings correctness & measurement
-- **[P0] Routing savings unmeasurable** — `chat.rs:314-316` prices baseline against the routed-to (cheap) model; `_requested_model` is reserved-but-unused (`chat.rs:643,662`). `saved_usd ≈ 0` for every routed request, and the wrong baseline is persisted to `request_logs`, corrupting Plan. → Capture original model pre-routing; price baseline against it; assert `saved_usd > 0` in `route_rewrite.rs`.
-- **[P0] L2 semantic cache never wired** — `with_l2` only appears at `state.rs:111` (definition) + doc examples. → Wire in CLI gateway behind `TT_L2_SEMANTIC_CACHE=1` (needs an embedder + real per-row baseline column), or stop advertising it as live.
-- **[P0] Anthropic streaming zeroes cache** — `stream.rs:549 cached_tokens: 0`; `handle_message_start` discards `cache_read_input_tokens`. → Thread cache fields through `StreamState`; add a streaming snapshot test.
-- **[P1] Anthropic non-stream cache mis-mapped** — `translate.rs:489-498` sets `prompt_tokens = input_tokens` (excludes cache reads) while `compute_cost` assumes the OpenAI subset convention → under-reported savings + understated cost. → Set `prompt_tokens = input_tokens + cache_read_input_tokens`.
-- **[P2] Streaming responses carry no cost/saved headers** — `sse.rs:364-373` (see §5.5).
-- **[P2] RAG tokens-saved is an unvalidated char-heuristic, can go negative, not tenant-isolated** — `substitute.rs:63-74`, `retrieval.rs:160`. → Clamp ≥0, real tokenizer, wire `org_id`. **⏳ Partial** — `org_id` is now threaded from `ApiKeyContext` (`retrieval-orgid-isolation`, `8e43137`, + cross-org test); the char-heuristic / negative-clamp / real-tokenizer parts remain open.
-- **[P3] Cost-preview knows pricing for only 3 of 8 providers** — `preview/src/pricing.rs:18-41` errors on Groq/Mistral/Together/OpenRouter/Local — including the dogfood routing target. → Probe all provider pricing tables.
-
-### 5.2 Architecture & scalability
-- **Strengths:** acyclic layering (`shared` = pure contracts); two-level error model; DB-optional by construction; solid CI (clippy `-D warnings`, deny, audit, gitleaks, weekly provider-contract matrix); reproducible distroless build.
-- **[P1] Retry/fallback advertised but never wired** — `ProviderError::is_retriable/is_fallback_eligible` have zero callers; `chat.rs:309` is a single attempt. A transient 429/5xx fails the user. → Add a retry/backoff+fallback policy layer (the error type already encodes the decision).
-- **[P1] `fee_multiplier` is a tested no-op** — set to 1.05 for OpenRouter, consumed nowhere in core → OpenRouter cost understated 5%. → Add `fee_multiplier()` to the Provider trait (default 1.0) and apply in `compute_cost`, or remove the field.
-- **[P1] Pricing/model catalogs hardcoded in Rust with `effective_at: Utc::now()`** — won't scale to 50+ providers; breaks historical replay; price change = recompile+redeploy. → Externalize to versioned data + a refresh path; make `effective_at` the real date.
-- **[P2] Accurate tiktoken estimator bypassed on hot paths** — routing decisions + stream cost use `len()/4` while `tt-preview` ships a real estimator. → Extract a shared `tt-tokenize` crate.
-- **[P2] Registry is a compile-time choke point** — every new provider edits core; compat crates pull the *full* OpenAI adapter. → Split a `tt-provider-compat` base crate; make registration config-aware; sort `/v1/models`.
-- **[P3] Public/cloud pin different axum/tokio/hyper majors** — latent hazard if a shared type touches axum. → Keep axum/hyper out of shared crates; add `[workspace.lints]`; align pins.
-
-### 5.3 Providers & gateway
-- **Strengths:** all 8 adapters are real; robust SSE parsers (fragmentation, `[DONE]`, ping-skip, mid-stream error); specific per-provider error mapping; `SecretString` redaction.
-- **[P0] Registry 404s any unlisted model** — `by_model` is a static HashMap; a valid newer model (future GPT/Claude/Gemini, o3-mini, OpenRouter/Together passthrough, local models) 404s even though upstream would serve it. → Fall back to `infer_provider(model) → by_id` and pass through; keep the static table for pricing only.
-- **[P1] Fixed 120s client timeout caps streaming mid-stream** — `client.rs:13-27`; `RequestContext.deadline` is documented-but-unused. → Separate streaming client config; honor `deadline` or drop it.
-- **[P2] Anthropic `total_tokens` undercounts when caching active** — `translate.rs:489-498`. → `input + cache_read + cache_creation`.
-- **[P3] OpenAI adapter blocks streaming for o3/o4-mini on a stale assumption** — `stream.rs:75-80`. → Remove the guard.
-- **[P3] Anthropic ToolResult flattened to a string** — drops structured/multimodal tool results (`translate.rs:273-285`).
-
-### 5.4 Inspect & Plan
-- **Plan strengths:** real determinism (ChaCha8-seeded, byte-identical snapshot), honest bootstrap CIs (Monte-Carlo coverage test asserts 93–97%), conservative cost invariant, gated Tier-3 LLM-judge, audit-coupled apply.
-- **[P1] Plan savings excludes ALL cache benefit** — cache hits compute a *rate* but never zero request cost (`replay.rs:189-224`), despite the design doc's `if hit: cost = 0`. → Thread the hit set into the cost vector. **✅ Resolved** (`plan-cache-savings-wire`, `fbeafd0`).
-- **[P1] Plan latency is a pure echo of historical latency** — a Sonnet→Haiku swap reports the *old* latency (`replay.rs:191`). → Build per-(provider,model) latency distributions or mark "not projected." **✅ Resolved** (`plan-latency-projection`, `7c3c2ec`).
-- **[P1] Reconciliation + user-facing trust score are design-only** — zero source hits for `reconcil/trust_score/calibrat`. This is the design's entire credibility loop. → Build the minimal reconcile job (compare projected vs actual post-apply). **✅ Resolved 2026-05-29** (`plan-reconciliation-trustscore`, cloud) — daily reconciliation worker in the `api` crate computes `actual_savings_usd/pct` + `trust_score` per matured applied plan; surfaced on `/reports` (table + sparkline), the per-plan page, and a homepage 30-day trust tile.
-- **[P1] Inspect ships 10 of 15 documented P0 rules** — missing `model-deprecated`, `prompt-bloated-system`, `config-agents-md-too-long`, etc. → Implement the 5 (all Tier-1 feasible) or reconcile the catalog. **✅ Resolved — 19/19 P0 rules now ship** (`inspect-5-missing-rules` → 15/15, then `inspect-new-rules` → 19/19).
-- **[P1] FP gate runs on self-authored fixtures; OSS corpus BLOCKED** — stop citing "0% FP" until an independent corpus exists. **⏳ Partial** (`inspect-corpora-seed`) — a clean-code corpus + a `--corpus` FP gate ship (0 code-rule FPs recorded), but those samples are in-repo representatives; **real OSS vendoring is a reproducible one-command path (`scripts/vendor-corpora.sh`) that is still network-gated** (`corpora/vendor/` unpopulated).
-- **[P2] Every rule is regex; the tree-sitter AST harness is built but unused** — brittle FNs + silent FP-suppression. → Migrate the structural rules to AST queries. **✅ Resolved** (`inspect-ast-migration`) — rule-level AST cache + the structural clusters (max_tokens / cache_control / model-arg / loop-termination) migrated onto real call/loop nodes.
-- **[P2] New high-ROI rule ideas** — `cache-anthropic-tools-not-cached`, `output-n-greater-than-one`, `model-reasoning-effort-default-high`, `prompt-dynamic-prefix-breaks-cache`. **✅ Shipped** (`inspect-new-rules`) — all four landed with ≥5/≥10 fixtures each.
-
-### 5.5 Value visualization ("showcase usefulness while it's being useful")
-- **Strengths:** realized-savings math is honest end-to-end; both SDKs expose `.tt.saved_usd`; dashboard reconciles projected-vs-actual with a trust-score sparkline; weekly digest leads with "$X saved this week."
-- **[P1] Streaming = zero moment-of-use savings visibility** — `sse.rs:364-373` emits only trace-id + provider; Claude Code/Cursor/chat UIs stream, so the most common path shows nothing and `.tt.savedUsd` is always null. → Emit a terminal `event: tokentrimmer.usage` before `[DONE]`.
-- **[P1] `tt proxy` Ctrl-C banner always shows `$0.0000`** — handlers hardcode `suggested_savings_usd: None` (`anthropic.rs:63`, `openai.rs:58`) and never read `x-tokentrimmer-saved-usd`; `tui.rs` fakes "cache savings." → Wire the values already in scope (~15 lines).
-- **[P2] No live CLI savings ticker** — savings only at shutdown. → A rewriting stderr line: `tt · 142 req · $1.83 saved · 38% cached`.
-- **[P2] No shareable "saved $X" badge** — the badge plumbing exists but renders only Inspect counts. → Clone the HMAC signed-URL badge, swap the data source. High virality, near-zero infra.
-- **[P3] Forgone-savings ("you left $X on the table") never aggregated** — preview suggestions are computed then dropped. **✅ Resolved** — the CLI proxy aggregates `suggested_savings_usd` into the session rollup + Ctrl-C banner (`proxy/session.rs:68`, `tui.rs:48`), and the dashboard now has a **"Potential additional savings"** panel on /costs (`getForgoneSavings`: a cloud-side opportunity analysis over non-cached, non-routed flagship calls re-priced against cheaper siblings — no migration).
-
-### 5.6 Design & brand (premium / luxury / modern bar)
-- **Strengths:** sound IA (Overview/Costs/Cache/Plan/Reports/Routes/Inspect/Audit/Settings); thoughtful empty/onboarding states; chart loading/error states; consistent numeric formatting; Astro+Solid+uPlot is the right premium-capable stack.
-- **[P0] Marketing site is a bare placeholder** — ✅ **RESOLVED 2026-05-29.** `cloud/apps/web` now has a shared `Layout` (nav, footer, brand mark, responsive CSS) and real pages: landing (hero + drop-in snippet + feature grid + CTA), pricing (Free/Pro/Team/Scale + FAQ), changelog, and a blog (index + launch post). `astro check` 0/0/0; `astro build` emits 5 static pages. _Remaining polish (not blocking): a live savings-proof widget, a dashboard-preview image, and migrating the site onto the shared design tokens once `design-system-foundation` lands (today it uses self-contained CSS)._
-- **[P0] No design system** — `packages/ui/src/styles.css` is one comment, `index.ts` is `export {}`, 16 pages duplicate inline CSS, `#06c` hardcoded 24×, no shared Layout. → Author real tokens (color/type/space/radius/shadow/z) + a shared `<Layout>`; migrate all pages.
-- **[P1] No brand identity** — no logo, favicon, or custom type; `system-ui` everywhere. → A wordmark+mark, favicon set, a typeface pairing (grotesk/geometric + mono for numerics), self-hosted woff2.
-- **[P1] No dark mode** — table stakes for a developer/cost tool; zero `prefers-color-scheme`/`data-theme`. → Light+dark token sets + a persisted toggle.
-- **[P2] Charts generic & off-brand** — monochrome, `$0.0010` raw axis labels, plain loading text. → Theme uPlot from tokens; smart currency formatting; skeletons; a shared Chart wrapper.
-- **[P2] Nav/chrome reads as a prototype** — plain blue text links, no active state, no app shell. → Branded sidebar/topbar with icons, org/user menu, focus rings; styled auth screens.
-- **[P3] Docs site is unstyled Starlight default** — theme it once the brand kit exists.
-
-### 5.7 Onboarding & docs
-- **Strengths:** the `tt` CLI is fully self-documenting; both SDKs are real with working READMEs; the one-line `base_url` swap genuinely works; `.env.example` is clean; `make dev` is real.
-- **[P1] No single getting-started guide** — scattered across README + AGENTS.md + four ~700-byte stubs. → **Done: `GETTING_STARTED.md` drafted this session** (every command/path verified against source). Link from README.
-- **[P1] README self-host quickstart is wrong** — references `ghcr.io/tokentrimmer/gateway` (the Dockerfile builds `tt-cli`) and a `/etc/tokentrimmer.yaml` mount (config is env-only, no YAML loader). → Fix to real image + env config.
-- **[P2] Rust version stated 3 ways** — README 1.85, CONTRIBUTING 1.83+, toolchain/Docker 1.88. → Make it 1.88 everywhere.
-- **[P2] `examples/` is empty** but README documents it. → Populate or remove the claim; clarify how to obtain `tt`.
-- **[P3] 8080 (self-host gateway) vs 31415 (tt proxy) undocumented as distinct** — the new guide separates them.
-
-### 5.8 Security & least-privilege
-- **Strengths (genuinely strong):** XChaCha20-Poly1305 provider creds with per-(org,provider) derived keys + AAD row-swap defense; argon2 keys with NotFound-collapse (no existence leak); BLAKE3+Ed25519 audit chain with SERIALIZABLE/FOR-UPDATE append; `SecretString` redaction; Sentry `before_send` scrubber; **no secrets in git history**; cargo-deny/audit enforced in CI.
-- **[P1] `.env.development` and `.env.production` are byte-identical and hold LIVE prod secrets** — real OpenAI key, Stripe, 64-char `TT_MASTER_KEY`/`TT_ADMIN_TOKEN`/audit key, 691-char Fly deploy token. Correctly gitignored & never committed, but production secrets sitting on the workstation under a "development" name. → Split dev/prod secret sets; keep prod only in `fly secrets`; **rotate** the high-value keys (note: `TT_MASTER_KEY` rotation requires re-encrypting `provider_credentials`).
-- **[P1] Retrieval middleware hardcodes `org_id = Uuid::nil()`** — collapses all tenants on that path (`retrieval.rs:159-163`). The real `org_id` is already available via `ApiKeyContext`. → Thread it through; add a cross-org isolation test.
-- **[P1] Harness allowlist has accreted broad, work-destroying entries** — `git checkout *`, `git restore *`, `awk *`, `cargo clippy *`, plus ~15 single-use prose entries. → **Cleaned up this session** (§9).
-- **[P2] Harness allows a GPG-signing bypass** — `git -c commit.gpgsign=false commit` contradicts SECURITY.md's "all commits signed." → **Removed this session** (§9).
-- **[P3] KDF documented as "HKDF" but is a SHA-256 one-shot** — sound construction, but align the docs (or switch to real HKDF) for audit accuracy.
-- **[P3] `tt_test_*` sandbox keys bypass all auth** — limited blast radius (free synthetic responses). → Document as unauthenticated; consider rate-limiting.
-
-### 5.9 Backlog triage & unblocks
-- **[P0] Cloud repo has no git remote** — `git -C .../cloud remote -v` is empty. Every `[BLOCKED — needs cloud repo + GitHub remote]` P0 (≈10 launch gates) is gated on this one minutes-long action. → Create the private repo + push.
-- **[P1] Cloud backlog is stale** — ~9 "open" items already shipped on disk (reconciliation, hosted inspect, /inspect, /reports, /settings, anomaly, export, trust-score, stripe-webhooks). → Flip to `[x]` so the real launch gates stand out.
-- **Genuinely actionable now in public:** `inspect-corpora-seed`, `trackE-quality-audit-log` (public write path), `trackE-postgres-store` (after one cloud migration).
-- **Missed opportunities (net-new):** spend budget caps / quota enforcement (the gateway has *none* today), Slack/webhook cost-alert bot, provider failover, cost-diff CI linting, savings badge, FinOps export — see §7.
+| # | Finding | Sev | Effort | Evidence |
+|---|---------|-----|--------|----------|
+| 4.1 | **All SSE parsers split only on `\n\n` and demand literal `data: `** — a CRLF/no-space compat upstream (vLLM/Ollama, reachable via customer `base_url`) buffers the whole response in memory and flushes at EOF. | Medium | M | `compat/src/stream.rs:241,269-271`; `anthropic/stream.rs:312-314,582-584`; `gemini/stream.rs:223,376-378` |
+| 4.2 | **Retry nested inside failover, no jitter** — primary + 2 fallbacks all 5xx → up to **9 upstream POSTs** for one request, synchronized backoff. | Medium | M | `failover.rs:107-129`; `retry.rs:31-49` |
+| 4.3 | **`is_fallback_eligible` matches `ProviderUpstream` for all statuses** — a deterministic 400/403/422 is retried against every fallback. | Medium | S | `public/crates/shared/src/error.rs:52-59`; `failover.rs:122-127` |
+| 4.4 | **Schedulers (digest/pdf/overage/reconciliation) are in-process loops with no leader election** — multi-instance/deploy overlap double-sends emails. (Finder high → verified **medium**.) | Medium | M | `cloud/crates/api/src/main.rs:281-347` |
+| 4.5 | **Overage idempotency key can double-bill** when Stripe succeeds but the watermark UPDATE fails and usage then grows. (Finder high → verified **medium**.) | Medium | M | `cloud/crates/api/src/overage.rs:157-181`; `stripe_client.rs:124-150` |
+| 4.6 | **Inspect walker prunes all hidden dirs**, so the Critical secret-scan rule can never read `.cursor/rules/*.md`. | High | S | `public/crates/inspect-core/src/walk.rs:63`; `config_agents_md_contains_secrets.rs:34` |
+| 4.7 | **`agent-no-termination-condition` whole-file substring matching** — broad `budget`/`timeout` terms suppress genuine runaway loops. (Finder high → verified **medium**.) | Medium | M | `agent_no_termination_condition.rs:60-61,91,110` |
+| 4.8 | **Dashboard false "audit chain broken" alarm** on every paged view / any org >200 entries. (Finder high → verified **medium**.) | Medium | S | `cloud/apps/dashboard/src/lib/audit.ts:102-109`; `audit/index.astro:34,76-81` |
+| 4.9 | Spend-anomaly detector matches local-TZ top-of-hour against UTC buckets → never fires unless process+DB both UTC. | Medium | S | `cloud/apps/dashboard/src/lib/anomaly.ts:58-67` |
+| 4.10 | Anomaly leave-one-out raises the real min bucket size to 4 (doc says 3) → no anomaly until ~28 days of per-hour data. | Medium | S | `cloud/crates/worker/src/anomaly.rs:46-49,77-83` |
+| 4.11 | L2 poisoning-candidate count is **summed across every threshold** → inflates the user-facing metric up to N×. | Medium | S | `public/crates/plan-core/src/l2_projection.rs:104-108` |
+| 4.12 | Replay equal-priority routes resolve by input array order (no tiebreak) → identical configs yield different projected savings. | Medium | S | `public/crates/plan-core/src/replay.rs:35-36`; `routing.rs:12-16` |
+| 4.13 | Plan reconciliation attributes **all** of an org's window traffic to one applied plan → trust-score becomes noise. | Medium | M | `cloud/crates/api/src/reconciliation.rs:105-134,169-173` |
+| 4.14 | API-key lookup prefix = 16 bits; UNIQUE column, no retry → issuance fails (~50% at 256 keys) with an opaque error. | Medium | S | `public/crates/auth/src/keys.rs:31,291`; `migrations/0001_cloud_schema.up.sql:89` |
+| 4.15 | DB-reading dashboard routes have no try/catch (Neon cold-start → unhandled 500 to polling islands, no backoff); no explicit body-size limit (axum 2MB default vs "oversized prompt" target); `/v1/embeddings` is a hard 404 stub; cosine NaN ordering can mask a valid L2 hit. | Low | S–M | `audit/since.ts:26`; `server.rs:36-73`; `embeddings.rs:11-16`; `l2.rs:208-218` |
 
 ---
 
-## 6. Actionable remediation checklist (fix existing)
+## 5. Security
 
-> Fixes to things that already exist — correctness, measurement, docs, security. Roughly ordered by leverage.
+**State:** Strong primitives (Argon2 keys with no oracle, AEAD credentials with per-row derived keys + AAD, Ed25519 audit chain, correct constant-time Stripe HMAC verifier, parameterized SQL, **`request_logs` stores no prompt/response content**). The systemic risk is the **dashboard↔tt-api trust model** and an **SSRF primitive**.
 
-**Savings correctness (make the mission provable)**
-- [x] `fix-routing-baseline-savings` **[P0/S]** ✅ — baseline priced against the original requested model (non-stream + streaming); asserts `saved_usd>0` on downgrade.
-- [x] `fix-anthropic-stream-cached-tokens` **[P0/S]** ✅ — `cache_read/creation` threaded through `StreamState`; streamed Claude calls report real `cached_tokens`.
-- [x] `wire-l2-cache-production` **[P0/M]** ✅ — L2 wired into gateway boot behind `TT_L2_SEMANTIC_CACHE=1` (PostgresL2Cache + OpenAI embedder) (`29a5b0a`). Honest per-row baseline still needs a `cache_entries.baseline_cost_usd` column (cloud).
-- [x] `fix-anthropic-cache-usage-mapping` **[P1/S]** ✅ — `prompt_tokens = input + cache_read (+ creation)`; cost/savings now correct (`669506c`, `5a53298`).
-- [x] `fee-multiplier-apply` **[P1/S]** ✅ — `Provider::fee_multiplier()` applied to cost+baseline; OpenRouter 5% BYOK (`cb0909b`).
-- [x] `anthropic-total-tokens-fix` **[P2/S]** ✅ — cache-creation folded into `prompt_tokens`/`total_tokens` (`5a53298`).
-- [x] `preview-pricing-all-providers` **[P3/S]** ✅ — `lookup()` probes all compat providers (`7d6e226`).
+| # | Finding | Sev | Effort | Evidence |
+|---|---------|-----|--------|----------|
+| 5.1 | **tt-api `/v1/admin/*` trusts caller-supplied `org_id` with no membership check** — tenant isolation rests entirely on the dashboard. Several handlers are `WHERE id = $1` only. Token leak / 2nd caller → cross-tenant read/write. | **High** | M | `cloud/crates/api/src/admin.rs:135-187,205-215,278-301`; `routes_admin.rs:183-200,242-263,280-303`; `inspect_hosted.rs:480-501` |
+| 5.2 | **Customer-controlled `base_url` + `extra_headers` = authenticated SSRF + header injection.** Any `credentials.write` user can target `169.254.169.254`/internal hosts; `extra_headers` appended *after* `Authorization`. No private-IP/scheme/host validation. | **High** | M | `auth/src/credentials.rs:24-26`; `admin.rs:320-323,368-372`; `compat/src/compat.rs:160-175` |
+| 5.3 | **Single shared `TT_ADMIN_TOKEN`** is the only thing between the internet and full multi-tenant admin; long-lived, in dashboard env, no rotation/scoping/rate-limit. Compounds 5.1. | Medium | M–L | `admin.rs:41-99`; `api-client.ts:5-7,29,41`; `docs/SECRETS.md:39` |
+| 5.4 | **Gateway runs Argon2 verify on every request** with no cache — `lib.rs:4` claims a 60s Redis cache that doesn't exist. Blows sub-30ms target; CPU-exhaustion lever. | Medium | M | `public/crates/core/src/middleware/auth.rs:68`; `auth/src/lib.rs:4`; `keys.rs:273` |
+| 5.5 | **No CSRF/Origin check** on cookie-auth mutating routes; **sessions never rotate**, fixed 30-day TTL; **no HSTS/CSP/Referrer-Policy** (magic-link token in URL → Referer/log leak). | Medium | S–M | `astro.config.mjs:15-20`; `session.ts:18,26,84-95,135-143`; `auth/callback.ts:19-28` |
+| 5.6 | **Magic-link signin has no rate limit** (Turnstile optional/off by default) → mail-bomb + unbounded `verification_tokens` growth. | Medium | M | `api/auth/signin.ts:44-89`; `turnstile.ts:45-48` |
+| 5.7 | Retrieval middleware buffers the whole body (1 MiB) on every chat POST when enabled + clones plaintext prompt to a detached task; **falls back to shared `Uuid::nil()` namespace** if `ApiKeyContext` absent (cross-tenant retrieval if layered ahead of auth). | Medium | S–M | `middleware/retrieval.rs:145,253-265,208-218` |
+| 5.8 | Stripe webhook has **no event-id idempotency**. (Finder high → verified **low**: dispatched writes are idempotent absolute-state; overage dedups separately.) | Low | M | `cloud/crates/api/src/routes.rs:69-128,259-277` |
+| 5.9 | **Dependency CVEs** (`rsa` Marvin, 4× `rustls-webpki` 0.102.8). (Finder high → verified **low**: `rsa` not compiled; `rustls-webpki` 0.102.8 sentry-only, real TLS uses patched 0.103.13; public CI runs cargo-deny.) **Real residual: `cloud/` has no CI/deny.toml — zero advisory gating.** | Low | M | `cargo-audit` both lockfiles; `public/.github/workflows/ci.yml:76-96`; cloud has none |
+| 5.10 | Env-credential fallback can forward one shared key for all orgs if mis-deployed; webhook returns raw SQL error strings; L2 stores responses unencrypted; GitHub OAuth no PKCE/`__Host-`; `revoke_key`/`issue` mutation+audit not atomic. | Low–Info | S–M | `credentials.rs:205-265`; `routes.rs:110,240,311`; `0002_cache_entries.up.sql:4-6`; `auth/github.ts:15-23` |
 
-**Moment-of-use visibility**
-- [x] `fix-proxy-savings-banner` **[P1/S]** ✅ — banner shows real realized savings (was `$0.0000`).
-- [x] `stream-cost-headers` **[P1/M]** ✅ — terminal `tokentrimmer.usage` SSE event before `[DONE]` (`deec5bf`).
-
-**Gateway correctness / resilience**
-- [x] `registry-model-passthrough` **[P0/M]** ✅ — `registry.resolve()` falls back to `infer_provider → by_id` (`9317b76`).
-- [x] `retry-fallback-layer` **[P1/M]** ✅ — bounded retry/backoff on transient errors (honors `retry_after_ms`), wired into non-stream + initial-stream dispatch (`691a055`). Alternate-provider fallback chain shipped in `provider-failover` (below).
-- [x] `streaming-client-timeout` **[P1/S]** ✅ — read-idle timeout so long streams aren't cut at 120s (`05e048e`).
-- [x] `openai-reasoning-stream-unblock` **[P3/S]** ✅ — o3/o4-mini stream; `Streaming` capability added (`a60f1ff`).
-
-**Plan correctness**
-- [x] `plan-cache-savings-wire` **[P1/M]** ✅ — projected cache hits zero per-request cost (`fbeafd0`).
-- [x] `plan-latency-projection` **[P1/M]** ✅ — latency projected from the target model's window history (`7c3c2ec`).
-- [x] `plan-reconciliation-trustscore` **[P1/L]** ✅ — projected-vs-actual reconcile loop feeding the trust score. **Shipped cloud-side 2026-05-29:** a daily reconciliation worker (`crates/api/src/reconciliation.rs`) matures applied plans over a 7-day window, computes `actual_savings_usd/pct` + `trust_score = 1 − clamp(|projected−actual|/…)` (5 unit tests), with an admin `run-now` route; user-facing trust surfaces on `/reports` (table + sparkline), the per-plan page, and a homepage 30-day trust tile.
-
-**Security & hygiene**
-- [ ] `env-secret-split-rotate` **[P1/M]** — **needs you:** split dev/prod secret sets; prod only in `fly secrets`; rotate `TT_MASTER_KEY`/`TT_ADMIN_TOKEN`/Fly/Stripe (read into this env).
-- [x] `retrieval-orgid-isolation` **[P1/S]** ✅ — real `org_id` from `ApiKeyContext`; cross-org isolation test (`8e43137`).
-- [x] `kdf-doc-align` **[P3/S]** ✅ — corrected to "SHA-256 KDF" (`38a7faf`).
-
-**Docs & onboarding**
-- [x] `getting-started-guide` **[P1]** ✅ — `GETTING_STARTED.md`.
-- [x] `docs-readme-quickstart-fix` **[P1/S]** ✅ — real image + env config, Rust 1.88, `examples/` fixed (`58a0d01`).
-- [x] `link-getting-started-from-readme` **[P1/XS]** ✅ — prominent link added in `58a0d01`.
-
-**Backlog hygiene / unblocks**
-- [x] `cloud-repo-remote` **[P0/S]** ✅ — cloud baseline committed + pushed to private `TokenTrimmer/cloud`; unblocks the launch gates.
-- [x] `cloud-backlog-sync` **[P1/S]** ✅ — cloud backlog reconciled against disk (now 51 done / 15 open); the stale "open-but-shipped" items were flipped so the real launch gates stand out. **(cloud repo.)**
-- [x] `perms-least-privilege-cleanup` **[P1]** ✅ — `settings.local.json` tightened (§9).
+**Connecting insight:** 5.1 + 5.2 + 5.3 compound — arbitrary `org_id` + arbitrary `base_url` behind one shared token = SSRF-as-any-tenant if the token leaks. Cheapest durable fix: (a) `WHERE id AND org_id` on every admin handler, (b) validate `base_url` (private-IP/metadata denylist) + header denylist, (c) network-isolate `/v1/admin/*` and move toward short-lived org-scoped assertions.
 
 ---
 
-## 7. New-development backlog (net-new)
+## 6. Legal & messaging safety
 
-> Net-new features and larger initiatives, in `BACKLOG.md` format so they can be synced (`./scripts/backlog.sh sync`). These are **additions**, not fixes (those are §6).
+**State:** Unusually restrained — **no "save X%" promises, no "guaranteed savings,"** SLA language already scrubbed. Exposure concentrates in *unqualified savings dollar figures* and a few absolutes/contradictions.
 
-### Design & brand (premium uplift) — _cloud repo_
-- [x] [P0] [design-system-foundation] ✅ **shipped 2026-05-29** — full token layer (color/type-scale/8px-space/radius/shadow/z, light+dark) in `packages/ui/src/styles.css` + shared `DashboardLayout`/`AuthLayout` owning `<head>`/fonts/favicon/nav; **all 16 dashboard pages migrated off inline `#06c` CSS**. `astro check` 0/0/0, build clean. (`tt-tokenize`-style helpers + theme init in `packages/ui/src/index.ts`, replacing the `export {}` stub.)
-- [x] [P0] [marketing-site-build] ✅ **shipped 2026-05-29** — `cloud/apps/web` built out: shared `Layout` (nav/footer/brand mark, dependency-free responsive CSS) + landing (hero, drop-in code snippet, feature grid, CTA band), `pricing` (Free/Pro/Team/Scale from `tier.rs` + the Stripe catalog, with FAQ), `changelog`, and `blog` (index + launch post). Plus `docs/launch/launch-posts.md` (Show HN / Reddit / IH / PH drafts). `astro check` 0/0/0 (8 files); `astro build` emits 5 static pages. _Remaining (deferred, non-blocking): a live savings-proof widget, a dashboard-preview image/social-proof, and consuming the shared design tokens once `design-system-foundation` lands (the site currently ships self-contained CSS)._ (est: ~$2.50)
-- [x] [P1] [brand-kit] ✅ **shipped** — geometric SVG mark + wordmark + favicon/apple-touch + `site.webmanifest`; self-hosted variable typeface pairing (Hanken Grotesk UI + JetBrains Mono numerics, via `@fontsource-variable`) wired through the Layout + `--tt-font-*` tokens.
-- [x] [P1] [dark-mode] ✅ **shipped** — light+dark token sets on `[data-theme]` + `prefers-color-scheme` fallback + persisted toggle with a no-flash inline init; uPlot re-themes from tokens on theme change.
-- [x] [P2] [chart-theming] ✅ **shipped** — shared `Chart.tsx` Solid wrapper (removes ~60 lines ×3 of boilerplate); all three charts read token colors (gold cost / green savings / red danger), compact `fmtUsdCompact` axes (no more raw `$0.0004`), `.tt-skeleton` loaders, dark-mode redraw via a `data-theme` MutationObserver.
-- [x] [P2] [app-shell-nav] ✅ **shipped** — branded sidebar (inline icons + gold active rail) + sticky topbar with theme toggle + org/user menu, focus rings; signin/verify restyled via `AuthLayout`.
-- [x] [P3] [docs-site-theme] ✅ **shipped** — Starlight themed to the gold brand (`brand.css` maps `--sl-*` accents light/dark + the brand fonts) + favicon; builds.
+| # | Finding | Sev | Effort | Evidence |
+|---|---------|-----|--------|----------|
+| 6.1 | **Every "Saved $X" surface (dashboard, digest, monthly PDF, public badge, SDK) shows a hard figure from a *synthetic* baseline with cache hits booked as 100% savings — no methodology disclosure.** PDF footer "figures reconciled against metered request logs" over-implies provider-invoice reconciliation. Badge is built for public embedding. (Finder high → verified **medium**: disclosure gap, additive-copy fix.) | Medium | S | `worker/src/pdf.rs:170-177`; `savings_badge.rs:168`; `api/src/digest.rs:139`; baseline `chat.rs:597,760-765` |
+| 6.2 | **Free-tier quota contradicts itself: "5,000" (home + blog) vs "10,000" (pricing).** Verified truth is **10,000** (`tier.rs:67-74`). (Direction is customer-favorable → finder high → verified **medium**.) | Medium | S | `index.astro:57`; `blog/introducing-tokentrimmer.astro:74`; `pricing.astro:18`; `tier.rs:67-74` |
+| 6.3 | Headline implies savings as an **outcome**: "same requests, smaller invoice," "watch the savings line move," "Stop overpaying." Implied-warranty-of-result trap. | Medium | S | `index.astro:50-51,86-89`; `blog…:75` |
+| 6.4 | Absolutes: **"Cache hits never touch a provider" / "served for free"** — an L2 hit is a *similarity* match and still consumes embedding spend. | Medium | S | `index.astro:22`; `blog…:46-47`; `pricing.astro:103` |
+| 6.5 | **"You're never cut off"** — unconditional commitment with no fair-use/abuse carve-out, next to "unlimited volume" on Scale. | Medium | S | `pricing.astro:95,79-80,177-178` |
+| 6.6 | Scale markets **"signed SLO PDFs" / "Externally-verifiable logs"** while the FAQ disclaims any SLA and the product is "pre-alpha" — internally contradictory. | Medium | M | `pricing.astro:81-82` vs `:111`; `README.md:6` |
+| 6.7 | "Cost analytics you can trust" frames an *estimate* as truth; PDF "reconciled" footer overstates verification; pre-alpha status not surfaced on paid/marketing surfaces. | Low | S | `index.astro:29-30`; `pdf.rs:176-178`; `README.md:6` |
 
-### Cost-layer capabilities (the mission) — _public + cloud_
-- [x] [P1] [budget-caps-quota] ✅ **shipped `afc7f68`** — `BudgetEnforcer` trait + `InMemoryBudgetEnforcer` in tt-core; per-org monthly cap + per-minute rate; auth middleware → 429 + `X-TT-Budget-Remaining-Usd` + `Retry-After`; record in chat handler + SSE guard. Postgres-backed limits remain a cloud follow-up.
-- [x] [P2] [provider-failover] ✅ **shipped** — ordered fallback chain + per-provider circuit breaker. `RouteAction.fallbacks: Vec<String>` (serde-default, cloud-populated) drives `dispatch_with_failover` in `tt-core::failover`: tries `[primary, …fallbacks]`, skips providers whose `CircuitBreaker` is open (5 consecutive failures → 30s cooldown), fails over on fallback-eligible errors (5xx/timeout/model-not-found), short-circuits on non-eligible (bad request). Covers **both** non-stream (`dispatch_with_failover`) and streaming (`dispatch_stream_with_failover` — failover on initial stream establishment; mid-stream errors are terminal) dispatch; the serving provider/model is rebound so cost/headers/telemetry attribute correctly. 7 unit + 2 integration tests. Turns "cost layer" into "cost + reliability layer."
-- [x] [P2] [alert-dispatcher-slack] ✅ **shipped** — `tt-worker::alert`: env-configured outbound webhook + Slack sink (`TT_ALERT_WEBHOOK_URL` / `TT_SLACK_WEBHOOK_URL`), `budget.threshold` / `anomaly.detected` / `reconciliation.drift` events with pure decision logic (band-crossing de-dup, >2% drift gate) + Slack-block/webhook payload formatting; wired into the worker anomaly path (reuses the existing `Anomaly` signal). 6 unit tests.
-- [x] [P2] [cost-diff-ci-lint] ✅ **shipped** — `tt inspect --cost-diff [--base <ref>] [--fail-on-cost-increase]`: a pure `tt_cli::cost_diff::analyze` over `git diff <base> -- <path>` extracts `model`-keyed string assignments on added/removed lines, prices each via `tt_preview::pricing` (shared catalog, no cloud), and reports per-model rate deltas + a net projected per-call change under a standard 1K-in/500-out profile. Markdown (check-run summary) or JSON; optional non-zero exit on a projected increase. 7 unit tests + e2e verified. A sticky surface no competitor occupies.
-- [x] [P3] [finops-export] ✅ **shipped** — FOCUS-aligned CSV (`GET /v1/admin/export/requests?format=focus`) with canonical FOCUS columns (BilledCost/EffectiveCost = billed, ListCost = baseline, PricingQuantity = tokens, per-month BillingPeriod) for Cloudability/Vantage; dashboard route passthrough + a FOCUS download link on /costs. 3 unit tests.
-
-### Value visualization
-- [x] [P2] [savings-badge] ✅ **shipped** — `GET /v1/badges/savings?org_id&expires&sig` SVG + `POST /v1/admin/savings/badge/sign`, cloning the inspect-badge HMAC plumbing with a domain-separated `savings|org|expires` MAC (so an inspect URL can't be replayed as savings); current-month realized savings from `request_logs`; live preview + copy-paste embed snippet on /reports. 5 unit tests.
-- [x] [P2] [live-cli-savings-ticker] ✅ **shipped `7bcaea2`** — rewriting stderr status line in `tt proxy`: `tt · N req · $X saved · Y% cached`.
-- [x] [P3] [forgone-savings-view] ✅ **shipped** — both surfaces live. Moment-of-use: the CLI proxy aggregates `suggested_savings_usd` into the session rollup + Ctrl-C banner (`proxy/session.rs:68`, `tui.rs:48`). Dashboard: a **"Potential additional savings" panel** on /costs (`lib/telemetry.ts::getForgoneSavings`) — a cloud-side opportunity analysis over non-cached, non-routed flagship requests, re-priced against a conservative cheaper-sibling map (gpt-4o→mini, opus/sonnet→haiku, gemini-pro→flash); shows the window total + top-5 opportunities + a `/routes` CTA. Derived from existing `request_logs` — **no migration or gateway hot-path change** (the originally-scoped per-request field proved unnecessary).
-
-### Inspect & Plan depth — _public_
-- [x] [P1] [inspect-5-missing-rules] ✅ **shipped `e168859`** — all 5 (`model-deprecated`, `prompt-bloated-system`, `prompt-verbose-few-shot`, `prompt-no-output-constraint`, `config-agents-md-too-long`) + fixtures; 15/15 P0 rules now ship.
-- [x] [P1] [inspect-corpora-seed] ✅ **shipped** — seeded `corpora/samples/` with 8 realistic, idiomatic LLM-SDK usage files (OpenAI/Anthropic/Vercel-AI/LangChain shapes) + an `AGENTS.md`, all best-practice so any finding is a presumed FP. Added a `--corpus <dir>` mode to `measure-fp-rate.sh` (counts findings per rule on real-code, fails > 5%; excludes repo-structure `config-*` rules) and recorded both the fixture precision/recall and the corpus FP rate in `corpora/FP_REPORT.md`. Result: **0 code-rule false positives** on the corpus; all 19 rules within the 5% gate. _Honesty note (in `corpora/README.md`):_ the `corpora/samples` files are authored in-repo representatives, not vendored upstream files. Real OSS vendoring is now a reproducible one-command path — `scripts/vendor-corpora.sh <name> <url> <pinned-sha> <glob>` fetches a slice + its LICENSE into `corpora/vendor/<name>/` and records provenance; `corpora/SOURCES.md` curates the source list. Running it (the actual fetch) needs network, so the vendored tier is populated by a human/CI; the FP gate (`measure-fp-rate.sh --corpus`) applies to both tiers.
-- [x] [P2] [inspect-ast-migration] ✅ **shipped** — added the rule-level AST cache (`tt_inspect_core::parse::parse_cached`: memoized `Arc<Tree>` keyed on `(language, source)`, bounded, so a file is parsed once and shared across every AST rule in a scan) + a reusable `tt_inspect_core::ast::{call_sites, is_llm_create_callee}` helper that scopes detection to real `call`/`call_expression` nodes (a create-call or `max_tokens` mentioned in a comment/string no longer triggers). Migrated all 4 named structural clusters off regex onto it: **max_tokens** (`output-no-max-tokens`), **cache_control** (`cache-anthropic-tools-not-cached`, `cache-anthropic-prompt-cache-missing`), **model-arg** (`model-deprecated`), and **loop-termination** (`agent-no-termination-condition` — now detects unbounded loops via real `while`/`for` AST nodes through `ast::infinite_loop_lines`, so a `while True` in a comment/string no longer triggers; the counter/budget safeguards stay lexical). All fixtures green.
-- [x] [P2] [inspect-new-rules] ✅ **shipped** — 4 new cost/cache rules (now **19/19** P0 rules): `cache-anthropic-tools-not-cached` (tools array with no `cache_control`), `output-n-greater-than-one` (`n`/`candidate_count` > 1 multiplies output cost), `model-reasoning-effort-default-high` (reasoning model with high/defaulted-high effort), `prompt-dynamic-prefix-breaks-cache` (timestamp/uuid/now() at the *start* of a system prompt invalidates prefix caching). Each ships with ≥5 should-detect + ≥10 should-not-detect fixtures; the fixture harness (counts, per-fixture detect/no-detect, id stability) is green.
-
-### Architecture scalability — _public_
-- [x] [P1] [pricing-externalize] ✅ **shipped** — model *rates* moved out of Rust source into a versioned, embedded data file (`crates/shared/data/pricing.toml`, `include_str!`-loaded once into `tt_shared::pricing::PricingCatalog` via `OnceLock`). A rate refresh is now a data edit, not a release. Real `effective_at` per row + per-model price *history*: `catalog().latest(provider, model)` for live pricing, `catalog().at(provider, model, ts)` for historical replay. All 7 paid providers delegate to it (openai/anthropic/gemini via `pricing_for`; groq/mistral/openrouter/together via `pricing_table` → `latest_for_provider`); local stays zero. 32 models; each provider's existing `pricing_values_match_spec`/`pricing_table_correct_rates` test verifies the TOML transcription is exact. _Scope note:_ model **descriptors** (capabilities/limits) stay typed in Rust; a live refresh / Postgres path is a follow-up. The Plan replay engine now sources its rates from the same catalog via `tt_plan_core::{catalog_pricing_table, catalog_pricing_table_at}` (built on `PricingCatalog::pairs` + `latest`/`at`), so `tt plan` replays price against the same data the gateway bills with — no hand-maintained pricing JSON.
-- [x] [P2] [token-estimator-shared] ✅ **shipped** — new `tt-tokenize` crate holds one estimator (cached tiktoken `cl100k` for openai/anthropic, `chars/4` heuristic otherwise, with a `Confidence`). `/v1/preview` (`tt-preview`) and the live routing estimate (`tt-core` `apply_routing`) both delegate to it, so a route's token-threshold decision matches what preview reports instead of using a separate `len/4` heuristic. `tiktoken-rs` moved into `[workspace.dependencies]`. tt-routing stays tokenization-free by design (receives the estimate). 5 tokenize unit tests; preview + routing suites green.
-- [x] [P2] [compat-crate-split] ✅ **shipped** — new `tt-provider-compat` crate holds the OpenAI-wire machinery (`client`/`compat`/`errors`/`stream`/`translate` + `OpenAICompatibleProvider`/`CompatConfig`/`ClientConfig`); `tt-provider-openai` now depends on it (native = compat + OpenAI pricing) and re-exports the types for back-compat; Groq/Mistral/Together/OpenRouter depend only on `tt-provider-compat`, not the full OpenAI adapter. Registration is config-aware via `ProvidersConfig` + `register_providers` (honors a `TT_PROVIDERS` allowlist; unset = all-on). `/v1/models` is sorted by (provider, id) for a stable catalog. Tests + snapshots moved with the code; all provider suites green.
-- [x] [P2] [hnsw-org-recall] ✅ **shipped** — L2 recall under multi-tenant load: the org-filtered HNSW query let other tenants' vectors crowd pgvector's default 40-candidate list and starve the querying org's nearest neighbour (false misses). `PostgresL2Cache` now runs each lookup in a transaction that first `SET LOCAL hnsw.ef_search` to a raised, configurable value (`DEFAULT_EF_SEARCH = 100`, `with_ef_search`), widening the candidate list so the org filter doesn't drop recall. Regression tests: a 50-org in-memory recall test (each org recalls its own planted near-duplicate, never another's) + a cross-tenant isolation test. The Postgres HNSW path upholds the same recall contract via the raised `ef_search`.
-- [x] [P3] [workspace-lints-align] ✅ **shipped `6d99465`** — `[workspace.lints]` (forbid unsafe, deny `uninlined_format_args`) propagated to all 23 crates, mirroring cloud. (axum/hyper-out-of-shared remains a convention — not cleanly a cargo-deny ban.)
+**Recommended fix:** ship a public "How we calculate savings" page and link one consistent methodology line from every savings surface. Keep the numbers, qualify the claim; lean into the trust-score + reconciliation as the credibility story.
 
 ---
 
-## 8. Getting-started guide
+## 7. Self-serve business model
 
-**Created this session:** [`GETTING_STARTED.md`](GETTING_STARTED.md) — a complete, copy-paste-ready guide covering what TokenTrimmer is, the four products, prerequisites per path, the 5-minute hosted quickstart, the self-host (Docker, env-only) path, and a verified example for **every** surface (`gateway`, `inspect`, `plan`, `init`, `mcp`, `proxy`, `retrieval`, both SDKs, `audit verify`). Every command, path, port, env var, and header was checked against source before drafting. It also supersedes the inaccurate README quickstart — fold those corrections back into README (`docs-readme-quickstart-fix`).
+**State:** Well-designed and correctly **rejects an enterprise/contact-sales tier** — Checkout (monthly/annual, flat + metered overage), Portal (upgrade/downgrade/cancel/card), webhook-mirrored state, daily idempotent overage sweep, auto-downgrade via `effective_tier`, SCIM deferred. But two pillars aren't wired, and SAML is sold-not-built.
 
----
-
-## 9. Least-privilege permissions (your request)
-
-Applied this session to `.claude/settings.local.json`:
-- **Removed** the broad, work-destroying allows: `git checkout *`, `git restore *`, `awk *`, `cargo clippy *`, and the GPG-signing-bypass commit allow (which contradicted SECURITY.md's "all commits signed").
-- **Removed** ~15 single-use, prose-laden one-off entries that can never match again (specific `session-end.sh`/`context-for.sh` strings, etc.).
-- **Kept** a minimal, narrowly-scoped working set (scoped `tt`/script invocations, read-only status checks).
-
-**Principle going forward** (also saved to memory): scope every allowlist entry as narrowly as the task permits (verb + subcommand, never bare `Bash(tool *)`); prefer the project-tracked `settings.json` for durable narrow allows; approve broad/destructive verbs per-invocation rather than persisting them; keep mutating-git verbs (`checkout`/`restore`/`reset`/`clean`) deny-by-default. The committed `settings.json` deny-list (push, `rm -rf`, curl/wget, publish, sudo) remains authoritative.
-
----
-
-## 10. The ideal state (north star)
-
-A prospect lands on a **premium, branded marketing site** with a live savings proof point. They change one line (`base_url`) and immediately see, **in the moment** — in their terminal, in the proxy banner, on the streamed response — a running, *accurate* "$X saved" that includes routing. They run `tt inspect` in CI and get dollar-quantified waste findings with an AST-precise FP rate validated on real OSS code. They run `tt plan` and trust the projection because a **reconciliation loop** has scored its past projections (the trust score is real, not a stub). The dashboard, in a cohesive design system with dark mode, shows realized savings, forgone savings, a shareable badge, and budget caps that actually enforce. Every claim the product makes about saving money is **measured, provable, and visible while it's being useful** — which is exactly the gap this review maps the path to closing.
+| # | Finding | Sev | Effort | Evidence |
+|---|---------|-----|--------|----------|
+| 7.1 | **Tier limits never enforced at request time.** `budget.rs` is USD-only and reads no subscription tier; only `max_keys`/`max_credentials` are checked. Free's 10K/mo hard-stop, 60 rpm, and L2 gating are decorative; a canceled/downgraded org keeps serving. | **Critical** | L | `public/crates/core/src/budget.rs:30-54`; `tier.rs:58,67-74` |
+| 7.2 | **No failed-payment/dunning handling; unbounded `past_due` grace.** `invoice.payment_failed` is NoOp; `effective_tier` treats `past_due` as fully paying forever; overage sweep keeps billing it → bad debt + manual ops. | High | M | `billing.rs:355-358`; `tier.rs:84-90`; `overage.rs:123-131` |
+| 7.3 | **SSO advertised on Team but unimplemented and ungated.** Auth is magic-link + GitHub OAuth only; RBAC isn't tier-gated; SAML routed to manual "email us." Your bar (SAML self-serve on top tiers) is met only in copy. | High | L | `pricing.astro:62,178`; `cloud/SECURITY.md:79` |
+| 7.4 | Checkout "Initialize" **hardcodes `tier='pro'`** regardless of purchased tier → wrong limits in the gap once 7.1 is wired. | Medium | S | `routes.rs:197-207`; tier known at `admin.rs:465` |
+| 7.5 | An **`'enterprise'` tier is half-wired** (`tier.rs:58`, `overage.rs:38,128`) with no Stripe price/checkout — dead code that could grant Scale-level entitlement against an unpaid base. | Medium | S | `tier.rs:58`; `overage.rs:38,128`; `main.rs:184-189` |
+| 7.6 | **No self-serve budget-cap UI** despite the FAQ promising "Set a budget cap and we'll stop." `BudgetEnforcer` supports `monthly_cap_usd` but nothing writes it → bill-shock risk + a "contact us" motion. | Medium | M | `pricing.astro:95`; `budget.rs:32-33,150`; `settings/index.astro:19-36` |
+| 7.7 | Overage sweep + reconciliation are 24h in-process loops (no leader election; non-transactional read→report→watermark) → multi-instance double-count race. Webhook not idempotent / no ordering guard. | Medium | M | `overage.rs:117-200`; `reconciliation.rs:200`; `routes.rs:259-277` |
+| 7.8 | Provider-invoice reconciliation is operator-manual by design; annual checkout 400s opaquely if annual price envs are unset (Annual UI shown unconditionally). | Low | M | `invoice_recon.rs:1-9,23`; `main.rs:207-228,336`; `admin.rs:460-467` |
 
 ---
 
-## Appendix — verification log
+## Top 10 highest-leverage changes
 
-Independently re-verified against source before publishing (not taken on the reviewers' word):
-- Routing baseline: `chat.rs:143` (`apply_routing(&mut req)`), `:314` (`pricing(&response.model)`), `:316` (`compute_cost(..., &req.model)`), `:643/:662` (`_requested_model` reserved-unused). **Confirmed.**
-- L2 wiring: `with_l2`/`PostgresL2Cache::new`/`InMemoryL2Cache::new` → only `state.rs:111` + `l2.rs` doc examples across both repos. **Confirmed dead in prod.**
-- Anthropic stream: `stream.rs:549 cached_tokens: 0`, `:550 cache_creation_input_tokens: None`. **Confirmed.**
-- Proxy banner: `routes/anthropic.rs:63` + `routes/openai.rs:58` `suggested_savings_usd: None`; `session.rs:65` sums it; `tui.rs:13` reads it. **Confirmed always $0.**
-- `fee_multiplier`: zero consumers in `crates/core` or `crates/cli`; defined only in shared/providers/tests. **Confirmed no-op.**
-- Marketing placeholder: `cloud/apps/web/src/pages/index.astro` was `<h1>` + `<p>` ("placeholder to keep the build green"). **Confirmed at review time; since superseded** — `apps/web` was built out 2026-05-29 (Layout + landing/pricing/changelog/blog).
-- Cloud git remote: `git -C cloud remote -v` empty. **Confirmed at review time; since superseded** — the cloud repo now has `origin → github.com/TokenTrimmer/cloud`.
+1. **Close the Plan→Gateway apply loop** (§1.1/1.2/1.8/1.9). *This is the product.* — M
+2. **Make the L2 semantic cache safe** (§2.1/2.2/2.3/2.7): model filter (one line), gate non-deterministic caching, embed full context, wire `tt_extras` bypass. — S–M
+3. **Enforce tier limits at request time** (§7.1). — L
+4. **Fix streaming cost telemetry** (§2.12/2.13/2.14/2.15, §2.9): tokenize not byte-count, apply OpenRouter fee on stream, persist `truncated`. — M
+5. **Add routing/failover capability + context-window quality floor** (§2.11). — M
+6. **Server-side org-scoping on tt-api admin endpoints** (§5.1): `WHERE id AND org_id`. — M
+7. **SSRF guard on `base_url` + header denylist** (§5.2). — M
+8. **Dunning + bounded `past_due` grace** (§7.2). — M
+9. **Build `@tokentrimmer/ui` component layer + kill dark-mode hex** (§3.1/3.2/3.3). — L
+10. **Verified-key cache in front of Argon2** (§5.4) + **savings-methodology disclosure** (§6.1). — M / S
 
-**Follow-up re-verification (2026-05-29, later session — 14-agent parallel audit across both repos):**
-- §2 savings fixes re-confirmed **intact** in current source: routing baseline captured pre-rewrite (`chat.rs:151`, used at `:283-287`/`:391-402`); L2 wired at `cli/src/main.rs:675` (`with_l2`); Anthropic streaming `cached_tokens` real (`stream.rs:551-557`, regression test asserts `cached==80`); non-stream cache-read mapping (`translate.rs:497-503`); `fee_multiplier` applied to cost+baseline (`chat.rs:770-771`). §2.1 per-model rates unchanged in `crates/shared/data/pricing.toml` (gpt-4o $2.50/$10); the cloud SaaS-tier overhaul is orthogonal (no per-model `pricing.toml` in cloud). **No regression.**
-- The 11 "remaining" items each re-checked against source: **`plan-reconciliation-trustscore` → shipped** (cloud `crates/api/src/reconciliation.rs` + dashboard trust surfaces); **`forgone-savings-view` → partial** (CLI aggregation only); the other **9 confirmed open** — the design-system cluster (`packages/ui` is an empty stub; no `[data-theme]`/`prefers-color-scheme` anywhere; 14 dashboard pages hardcode `#06c`), `savings-badge` (no `/v1/badges/savings`, but cloud `/v1/badges/inspect` HMAC plumbing exists to clone), `alert-dispatcher-slack` (detector only, no outbound sink), `finops-export` (generic csv/jsonl only, no FOCUS schema). _These were the states **at audit time (2026-05-29)**; all 11 have since shipped (see the Implementation-status build-out notes) except the operator-gated `env-secret-split-rotate`._
-- Unreflected new work folded into the Implementation-status log: public Stripe-overage + annual-billing scripts + free-tier cap 5K→10K; cloud pricing overhaul (usage-metered, unlimited seats, Enterprise dropped) + metered-overage + annual billing (all TEST mode). Cloud backlog now **53 done / 16 open**.
-- _Side-issue noted (out of doc scope):_ `crates/core/src/budget.rs:42` doc-comment still reads "5 000 requests/month" while the code returns `Some(10_000)` — a stale source comment to fix in a follow-up commit.
+## Quick wins (≤ ~1 day each)
+
+- **§2.1** — `AND model = $N` on the L2 lookup. *Stops wrong-model answers.*
+- **§6.2 / copy** — fix Free-tier "5,000"→"10,000" (home+blog); standardize gateway base URL (`api.tokentrimmer.com`, never `fly.dev`).
+- **§6.1** — one-line savings-methodology disclaimer on PDF footer, digest footer, badge alt-text, dashboard Saved card.
+- **§5.2-partial** — send the Gemini key in `x-goog-api-key` header, not the URL (`gemini/stream.rs:71`).
+- **§4.3** — guard `is_fallback_eligible` on `status >= 500`.
+- **§3.2 / UX** — remove API-key reveal's 6s auto-reload, add Copy button, detokenize the white-on-white panel.
+- **UX** — add `$` to digest subject + a `List-Unsubscribe` header.
+- **§1.2/§1.8** — relabel Apply button "Mark as applied (record only)" / hide it; make `tt plan --apply` exit non-zero until wired.
+- **§4.14** — widen key display prefix to ~12 hex chars (or retry on unique-violation).
+- **§7.5** — delete the dead `'enterprise'` tier branch.
+- **§4.11** — report L2 poisoning per-threshold, not summed.
+- **§4.12** — deterministic tiebreak on equal-priority route sorting.
+- **§5.9-residual** — add `deny.toml` + cargo-deny CI to the **cloud** repo; set `advisories = "deny"`.
+- **§4.15** — explicit `DefaultBodyLimit`; return 501 (not 404) from `/v1/embeddings` stub.
+
+## What's genuinely strong
+
+Crypto (Argon2 keys with no oracle, AEAD credentials with per-row derived keys + AAD, Ed25519 audit chain), the Stripe HMAC verifier, seeded-deterministic replay + bootstrap CIs, the versioned pricing catalog with historical replay, the design-*token* layer and token-aware charts, `request_logs` storing **no** prompt/response content, and the restrained marketing copy are all above the pre-alpha bar. The work here is mostly *connecting* and *enforcing* what already exists, not rebuilding.
