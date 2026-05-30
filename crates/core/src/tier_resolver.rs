@@ -94,6 +94,38 @@ pub trait TierResolver: Send + Sync {
 
 // ─── CallerTier helpers ─────────────────────────────────────────────────────
 
+/// Fold a self-serve budget-cap override (from `org_budget_caps`, written by
+/// the dashboard "Budget cap" setting — rv-budget-cap-ui §7.6) into `limits`.
+///
+/// Semantics:
+/// * `monthly_cap_usd` — **sets** a spend cap where the tier has none. A paid
+///   tier has `monthly_cap_usd: None` (overage-billed); a user-set value adds
+///   the hard spend stop the pricing FAQ promises.
+/// * `monthly_request_cap` — **only tightens**, never loosens. The Free tier's
+///   10 000/mo hard-stop must survive a user setting a *larger* request cap, so
+///   we take the `min` of the existing and user values.
+///
+/// `None` on a field leaves that dimension untouched. Pure + unit-tested; the
+/// DB read that produces the arguments is best-effort (see
+/// [`PostgresTierResolver::fetch_cap_override`]).
+pub fn apply_cap_override(
+    limits: &mut BudgetLimits,
+    monthly_cap_usd: Option<f64>,
+    monthly_request_cap: Option<u32>,
+) {
+    if let Some(cap) = monthly_cap_usd {
+        if cap.is_finite() && cap >= 0.0 {
+            limits.monthly_cap_usd = Some(cap);
+        }
+    }
+    if let Some(user_cap) = monthly_request_cap {
+        limits.monthly_request_cap = Some(match limits.monthly_request_cap {
+            Some(existing) => existing.min(user_cap),
+            None => user_cap,
+        });
+    }
+}
+
 /// Parse the `tier` DB string + `status` DB string into a [`CallerTier`] after
 /// applying the cancel-downgrade collapse. Unknown values → Free.
 fn caller_tier_from_strs(tier: &str, status: &str) -> (CallerTier, BudgetLimits) {
@@ -130,6 +162,35 @@ impl PostgresTierResolver {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self { pool }
     }
+
+    /// Best-effort read of the per-org budget-cap override from
+    /// `org_budget_caps` (rv-budget-cap-ui). Returns `(monthly_cap_usd,
+    /// monthly_request_cap)`.
+    ///
+    /// **Fail-soft, NOT fail-open-to-Free:** any error (table not yet migrated,
+    /// DB blip) returns `(None, None)` — i.e. *no override* — and logs `debug`.
+    /// A missing/erroring cap table must never collapse a paid org's resolved
+    /// tier; it only ever means "the user hasn't set a cap." The query is kept
+    /// separate from the `subscriptions` read for exactly this reason.
+    async fn fetch_cap_override(&self, org_id: Uuid) -> (Option<f64>, Option<u32>) {
+        // (monthly_cap_usd, monthly_request_cap) — both nullable columns.
+        type CapRow = (Option<f64>, Option<i32>);
+        let row: Result<Option<CapRow>, sqlx::Error> = sqlx::query_as(
+            r#"SELECT monthly_cap_usd, monthly_request_cap
+               FROM org_budget_caps WHERE org_id = $1"#,
+        )
+        .bind(org_id)
+        .fetch_optional(&self.pool)
+        .await;
+        match row {
+            Ok(Some((usd, req))) => (usd, req.map(|r| r.max(0) as u32)),
+            Ok(None) => (None, None),
+            Err(e) => {
+                tracing::debug!(error = %e, %org_id, "budget-cap read failed — no override applied");
+                (None, None)
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for PostgresTierResolver {
@@ -151,12 +212,20 @@ impl TierResolver for PostgresTierResolver {
         .await
         .map_err(|source| TierResolverError::Db { org_id, source })?;
 
-        let Some((tier, status)) = row else {
-            // No subscription row → Free default (safe for unregistered orgs).
-            return Ok(ResolvedTier::free_default());
+        // No subscription row → Free default (safe for unregistered orgs);
+        // otherwise map (tier, status) → limits.
+        let (caller_tier, mut limits) = match row {
+            Some((tier, status)) => caller_tier_from_strs(&tier, &status),
+            None => {
+                let d = ResolvedTier::free_default();
+                (d.caller_tier, d.limits)
+            }
         };
 
-        let (caller_tier, limits) = caller_tier_from_strs(&tier, &status);
+        // Fold in the self-serve budget cap (best-effort; never downgrades).
+        let (cap_usd, cap_req) = self.fetch_cap_override(org_id).await;
+        apply_cap_override(&mut limits, cap_usd, cap_req);
+
         Ok(ResolvedTier {
             caller_tier,
             limits,
@@ -340,6 +409,62 @@ mod tests {
         let (ct, l) = caller_tier_from_strs("pro", "canceled");
         assert_eq!(ct, CallerTier::Free);
         assert!(!l.l2_cache);
+    }
+
+    // ── apply_cap_override ──────────────────────────────────────────────────
+
+    #[test]
+    fn cap_override_sets_spend_cap_on_paid_tier() {
+        // Pro has no USD cap; a user-set cap adds the hard stop.
+        let (_ct, mut l) = caller_tier_from_strs("pro", "active");
+        assert_eq!(l.monthly_cap_usd, None);
+        apply_cap_override(&mut l, Some(250.0), None);
+        assert_eq!(l.monthly_cap_usd, Some(250.0));
+        // Pro's rpm + L2 are untouched.
+        assert_eq!(l.max_requests_per_min, Some(600));
+        assert!(l.l2_cache);
+    }
+
+    #[test]
+    fn cap_override_request_cap_only_tightens() {
+        // Free has a 10 000/mo hard stop; a *larger* user value must NOT loosen it.
+        let mut free = BudgetLimits::free_tier();
+        apply_cap_override(&mut free, None, Some(50_000));
+        assert_eq!(free.monthly_request_cap, Some(10_000), "must not loosen Free cap");
+        // A smaller value tightens.
+        let mut free2 = BudgetLimits::free_tier();
+        apply_cap_override(&mut free2, None, Some(2_000));
+        assert_eq!(free2.monthly_request_cap, Some(2_000));
+    }
+
+    #[test]
+    fn cap_override_request_cap_sets_where_none() {
+        // Pro has no request cap; a user value sets one.
+        let (_ct, mut l) = caller_tier_from_strs("pro", "active");
+        assert_eq!(l.monthly_request_cap, None);
+        apply_cap_override(&mut l, None, Some(100_000));
+        assert_eq!(l.monthly_request_cap, Some(100_000));
+    }
+
+    #[test]
+    fn cap_override_none_is_noop() {
+        let (_ct, before) = caller_tier_from_strs("team", "active");
+        let mut after = before;
+        apply_cap_override(&mut after, None, None);
+        assert_eq!(after.monthly_cap_usd, before.monthly_cap_usd);
+        assert_eq!(after.monthly_request_cap, before.monthly_request_cap);
+        assert_eq!(after.max_requests_per_min, before.max_requests_per_min);
+    }
+
+    #[test]
+    fn cap_override_rejects_nonfinite_or_negative_usd() {
+        let mut l = BudgetLimits::free_tier();
+        apply_cap_override(&mut l, Some(f64::NAN), None);
+        assert_eq!(l.monthly_cap_usd, None, "NaN must be ignored");
+        apply_cap_override(&mut l, Some(-5.0), None);
+        assert_eq!(l.monthly_cap_usd, None, "negative must be ignored");
+        apply_cap_override(&mut l, Some(0.0), None);
+        assert_eq!(l.monthly_cap_usd, Some(0.0), "zero is a valid (hard-stop) cap");
     }
 
     // ── CachedTierResolver caching ──────────────────────────────────────────
