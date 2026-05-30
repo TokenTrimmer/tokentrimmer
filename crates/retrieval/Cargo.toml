@@ -8,6 +8,7 @@ description = "RAG / context compression: chunking, embedding, HNSW retrieval, <
 
 [dependencies]
 tt-shared.workspace = true
+tt-tokenize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

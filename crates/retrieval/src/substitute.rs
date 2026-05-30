@@ -5,8 +5,17 @@
 //! When no chunk clears the similarity floor for a given span the original
 //! payload is left intact and the span is counted in
 //! `SubstitutionReport::low_confidence_skips`.
+//!
+//! When the retrieved replacement is LARGER than the original payload for a
+//! given span the substitution is skipped (original payload kept) so we never
+//! splice in content that increases the token count.
+//!
+//! `tokens_saved_estimate` is NET: gross token delta (original − replacement,
+//! using the tiktoken tokenizer) minus the query-embedding token cost per
+//! message. The embedding model is `text-embedding-3-small` (OpenAI, cl100k).
 
 use serde_json::Value;
+use tt_tokenize::estimate_tokens;
 use uuid::Uuid;
 
 use crate::embed::EmbeddingClient;
@@ -20,14 +29,30 @@ use crate::tags;
 /// `<retrievable>` payload is kept unchanged.
 pub const DEFAULT_MIN_SIMILARITY: f32 = 0.6;
 
+/// Provider id used when counting tokens. The embedding model is OpenAI
+/// (`text-embedding-3-small`), which uses cl100k — the same tokenizer used for
+/// chat models. Passing "openai" picks the high-confidence tiktoken path.
+const EMBEDDING_PROVIDER: &str = "openai";
+
 pub struct SubstitutionReport {
     /// Number of `<retrievable>` spans that were replaced with retrieved chunks.
     pub substitutions: u32,
     /// Spans where every candidate chunk fell below the similarity floor and
     /// the original payload was therefore left intact.
     pub low_confidence_skips: u32,
-    /// Rough token-savings estimate (char-delta ÷ 4) across **substituted**
-    /// spans only. Skipped spans contribute nothing.
+    /// Spans where the retrieved replacement was *larger* than the original
+    /// payload (substituting would increase the token count), so the original
+    /// was kept intact.
+    pub size_increase_skips: u32,
+    /// Gross tokens saved by substitutions (original token count − replacement
+    /// token count, summed over substituted spans only, before embedding cost).
+    pub gross_tokens_saved: i64,
+    /// Tokens consumed by embedding calls (one query embedding per message that
+    /// has at least one retrievable tag). Charged against gross savings.
+    pub embedding_tokens_cost: i64,
+    /// NET token-savings estimate: `gross_tokens_saved − embedding_tokens_cost`.
+    /// May be zero or negative if the embedding overhead dominates. A negative
+    /// value means RAG cost MORE tokens than it saved for this request.
     pub tokens_saved_estimate: i64,
 }
 
@@ -39,7 +64,9 @@ pub async fn substitute_in_messages(
 ) -> Result<SubstitutionReport, RetrievalError> {
     let mut substitutions = 0u32;
     let mut low_confidence_skips = 0u32;
-    let mut saved = 0i64;
+    let mut size_increase_skips = 0u32;
+    let mut gross_saved: i64 = 0;
+    let mut embedding_cost: i64 = 0;
 
     for msg in messages.iter_mut() {
         let Some(content) = msg.get_mut("content") else {
@@ -65,8 +92,14 @@ pub async fn substitute_in_messages(
 
         let query_emb = embedder.embed(&without_tags).await?;
 
+        // One embedding request was made for this message — deduct its token
+        // cost from the gross savings.
+        let query_tokens = estimate_tokens(EMBEDDING_PROVIDER, &without_tags) as i64;
+        embedding_cost += query_tokens;
+
         // Reassemble — replace each tag with retrieved chunks (joined by ---),
-        // or leave the original payload when no chunk clears the floor.
+        // or leave the original payload when no chunk clears the floor, or when
+        // the replacement would be larger than the original.
         let mut new_text = String::new();
         let mut cursor = 0;
         for t in &tags {
@@ -86,20 +119,38 @@ pub async fn substitute_in_messages(
                     .map(|r| r.text.clone())
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n");
-                saved += original_payload.len() as i64 - replacement.len() as i64;
-                new_text.push_str(&replacement);
-                substitutions += 1;
+
+                let orig_tokens =
+                    estimate_tokens(EMBEDDING_PROVIDER, original_payload) as i64;
+                let repl_tokens =
+                    estimate_tokens(EMBEDDING_PROVIDER, &replacement) as i64;
+                let delta = orig_tokens - repl_tokens;
+
+                if delta <= 0 {
+                    // Replacement is the same size or larger — skip to avoid
+                    // inflating the prompt.
+                    new_text.push_str(original_payload);
+                    size_increase_skips += 1;
+                } else {
+                    gross_saved += delta;
+                    new_text.push_str(&replacement);
+                    substitutions += 1;
+                }
             }
             cursor = t.span.1;
         }
         new_text.push_str(&text[cursor..]);
         *content = Value::String(new_text);
     }
-    // Char-delta / 4 as the token-savings heuristic.
+
+    let net = gross_saved - embedding_cost;
     Ok(SubstitutionReport {
         substitutions,
         low_confidence_skips,
-        tokens_saved_estimate: saved / 4,
+        size_increase_skips,
+        gross_tokens_saved: gross_saved,
+        embedding_tokens_cost: embedding_cost,
+        tokens_saved_estimate: net,
     })
 }
 
@@ -163,7 +214,13 @@ mod tests {
 
         assert_eq!(report.substitutions, 0);
         assert_eq!(report.low_confidence_skips, 1);
-        assert_eq!(report.tokens_saved_estimate, 0);
+        // No gross savings — all spans skipped. Embedding cost was still incurred,
+        // so net savings (tokens_saved_estimate) is <= 0.
+        assert_eq!(report.gross_tokens_saved, 0);
+        assert!(
+            report.tokens_saved_estimate <= 0,
+            "net savings must be <= 0 when nothing was substituted (embedding cost > 0)"
+        );
         // Payload must be intact (the entire original string is preserved).
         let content = messages[0]["content"].as_str().unwrap();
         assert_eq!(content, original, "content must be unchanged when no chunk clears the floor");
@@ -262,9 +319,119 @@ mod tests {
 
         assert_eq!(report.substitutions, 1);
         assert_eq!(report.low_confidence_skips, 1);
-        // tokens_saved must be non-zero (original payload was longer than "Short")
-        // but must not account for the skipped span.
-        assert!(report.tokens_saved_estimate > 0, "expected positive token savings from substituted span");
+        // gross must be positive (original payload was longer than "Short")
+        assert!(report.gross_tokens_saved > 0, "expected positive gross token savings from substituted span");
+        // skipped span contributes nothing to gross
+    }
+
+    // TDD (a): net savings subtracts embedding cost — a tiny payload nets ~0 or negative.
+    #[tokio::test]
+    async fn net_savings_subtracts_embedding_cost() {
+        let server = MockServer::start_async().await;
+        let embedder = mock_embedder(&server, vec![1.0, 0.0]).await;
+        let store = MemoryStore::new();
+        let org = Uuid::new_v4();
+
+        // The original payload is tiny (a few tokens) and the replacement is
+        // also short — gross savings will be small. The query text is
+        // substantive enough that embedding_tokens_cost > gross_saved,
+        // so net (tokens_saved_estimate) must be <= 0.
+        store
+            .insert(chunk(org, "docs", vec![1.0, 0.0], "ok"))
+            .await
+            .unwrap();
+
+        // Payload: "x" (1 token) → replacement: "ok" (1 token) → gross delta = 0.
+        // Query is a long sentence → embedding cost > 0.
+        // Net must be <= 0.
+        let long_query = "This is a fairly long surrounding context sentence to ensure the embedding query has a non-trivial token cost that will exceed any tiny gross savings.";
+        let content = format!(
+            r#"{} <retrievable corpus="docs" k="1">x</retrievable>"#,
+            long_query
+        );
+        let mut messages = vec![json!({ "role": "user", "content": content })];
+        let report = substitute_in_messages(&mut messages, org, &store, &embedder)
+            .await
+            .unwrap();
+
+        assert!(
+            report.embedding_tokens_cost > 0,
+            "embedding cost must be tracked (got {})",
+            report.embedding_tokens_cost
+        );
+        // gross_saved may be 0 since "x" and "ok" are both ~1 token;
+        // net must be <= 0 when embedding cost dominates
+        assert!(
+            report.tokens_saved_estimate <= 0,
+            "net savings must be <= 0 when embedding cost dominates (got {})",
+            report.tokens_saved_estimate
+        );
+    }
+
+    // TDD (b): a replacement larger than the payload is SKIPPED, payload unchanged.
+    #[tokio::test]
+    async fn larger_replacement_is_skipped() {
+        let server = MockServer::start_async().await;
+        let embedder = mock_embedder(&server, vec![1.0, 0.0]).await;
+        let store = MemoryStore::new();
+        let org = Uuid::new_v4();
+
+        // The replacement chunk is much larger than the tiny original payload.
+        let big_chunk = "This is a very long retrieved chunk that contains many many tokens and is definitely much larger than the tiny original placeholder text.";
+        store
+            .insert(chunk(org, "docs", vec![1.0, 0.0], big_chunk))
+            .await
+            .unwrap();
+
+        let original = r#"Q: <retrievable corpus="docs" k="1">tiny</retrievable>"#;
+        let mut messages = vec![json!({ "role": "user", "content": original })];
+        let report = substitute_in_messages(&mut messages, org, &store, &embedder)
+            .await
+            .unwrap();
+
+        // Substitution must be skipped because replacement > original.
+        assert_eq!(
+            report.substitutions, 0,
+            "larger replacement must not be counted as a substitution"
+        );
+        assert_eq!(
+            report.size_increase_skips, 1,
+            "larger replacement must be counted in size_increase_skips"
+        );
+        assert_eq!(
+            report.gross_tokens_saved, 0,
+            "no gross savings when replacement is larger"
+        );
+        // Content must be unchanged (original payload preserved).
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("tiny"),
+            "original payload must be preserved when replacement is larger"
+        );
+        assert!(
+            !content.contains(big_chunk),
+            "large replacement must not be spliced in"
+        );
+    }
+
+    // TDD (c): the estimate uses the tokenizer (different from chars/4 heuristic for
+    // multi-byte strings with known tokenizer behaviour).
+    #[test]
+    fn estimate_uses_tokenizer_not_char_div_4() {
+        // "café" has 4 Unicode chars → chars/4 heuristic = ceil(4/4) = 1.
+        // tiktoken cl100k tokenizes "café" as 2 tokens ("caf" + "é" or similar),
+        // so estimate_tokens("openai", "café") returns 2 ≠ 1.
+        let text = "café";
+        let tokenizer_estimate = tt_tokenize::estimate_tokens(EMBEDDING_PROVIDER, text);
+        let char_div_4 = tt_tokenize::char_count_estimate(text);
+        // tiktoken must give a different count than the chars/4 heuristic for "café".
+        assert_ne!(
+            tokenizer_estimate, char_div_4,
+            "tiktoken estimate ({}) must differ from chars/4 heuristic ({}) for \"café\"",
+            tokenizer_estimate, char_div_4
+        );
+        // Also confirm the tokenizer gives a positive, plausible estimate.
+        assert!(tokenizer_estimate > 0, "tokenizer must return > 0 for non-empty text");
     }
 
     // Regression: original substitution_replaces_payload_with_top_k_chunks still passes.
