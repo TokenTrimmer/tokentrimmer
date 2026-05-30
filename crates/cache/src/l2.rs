@@ -147,6 +147,13 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na * nb)
 }
 
+/// True iff every component of the embedding is finite (no NaN/Inf). A
+/// non-finite component would make cosine similarity NaN and corrupt ranking,
+/// so such vectors are rejected at insert time (§4.15).
+fn embedding_is_finite(v: &[f32]) -> bool {
+    v.iter().all(|x| x.is_finite())
+}
+
 // ---------------------------------------------------------------------------
 // l2_context_text — canonicalized embedding input  (fix §2.3)
 // ---------------------------------------------------------------------------
@@ -281,6 +288,9 @@ impl Default for InMemoryL2Cache {
 impl L2Cache for InMemoryL2Cache {
     /// Insert `entry` into the in-memory store.
     async fn insert(&self, entry: CacheEntry) -> Result<(), CacheError> {
+        if !embedding_is_finite(&entry.embedding) {
+            return Err(CacheError::InvalidEmbedding);
+        }
         let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         guard.push(entry);
         Ok(())
@@ -312,7 +322,7 @@ impl L2Cache for InMemoryL2Cache {
                 let sim = cosine(&e.embedding, query_embedding);
                 (e, sim)
             })
-            .filter(|(_, sim)| *sim >= threshold)
+            .filter(|(_, sim)| sim.is_finite() && *sim >= threshold)
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(best.map(|(e, sim)| (e.clone(), sim)))
@@ -397,6 +407,9 @@ impl L2Cache for PostgresL2Cache {
     /// Uses `ON CONFLICT DO NOTHING` so duplicate `id` values are silently
     /// ignored (callers always generate a fresh UUID per insert).
     async fn insert(&self, entry: CacheEntry) -> Result<(), CacheError> {
+        if !embedding_is_finite(&entry.embedding) {
+            return Err(CacheError::InvalidEmbedding);
+        }
         // Convert Vec<f32> to pgvector::Vector for the Postgres `vector` column.
         let vec = pgvector::Vector::from(entry.embedding);
 
@@ -661,5 +674,30 @@ mod tests {
                 .is_none(),
             "an org must not see another org's cached entry"
         );
+    }
+
+    /// §4.15: an embedding with a non-finite (NaN/Inf) component is rejected at
+    /// insert so it can never poison similarity ranking; finite vectors insert.
+    #[tokio::test]
+    async fn insert_rejects_non_finite_embedding() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let org = Uuid::new_v4();
+
+        let nan = cache
+            .insert(entry_at(Uuid::new_v4(), org, vec![1.0, f32::NAN, 0.0], now))
+            .await;
+        assert!(matches!(nan, Err(CacheError::InvalidEmbedding)));
+
+        let inf = cache
+            .insert(entry_at(Uuid::new_v4(), org, vec![f32::INFINITY, 0.0], now))
+            .await;
+        assert!(matches!(inf, Err(CacheError::InvalidEmbedding)));
+
+        // A finite vector still inserts fine.
+        cache
+            .insert(entry_at(Uuid::new_v4(), org, vec![1.0, 0.0], now))
+            .await
+            .expect("finite embedding inserts");
     }
 }

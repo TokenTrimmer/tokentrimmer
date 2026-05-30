@@ -47,6 +47,10 @@ pub enum CacheError {
     /// An error originating from the sqlx database client (L2 Postgres cache).
     #[error("sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
+    /// The embedding vector contained a non-finite (NaN/Inf) component. Rejected
+    /// at insert so a corrupt vector can't poison similarity ranking.
+    #[error("invalid embedding: non-finite component")]
+    InvalidEmbedding,
 }
 
 /// L1 exact-match cache contract. Keys are SHA-256 hashes of normalized requests.
