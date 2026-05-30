@@ -24,7 +24,7 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use tt_cache::{key::cache_key, CacheEntry, L1Entry};
+use tt_cache::{key::cache_key, l2_context_text, CacheEntry, L1Entry};
 use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
 use uuid::Uuid;
 
@@ -330,10 +330,18 @@ pub async fn handler(
 
         // 3b. Try L2 semantic cache lookup before dispatching to the provider.
         if let Some(l2) = state.l2.as_ref() {
-            if let Some(query_text) = last_user_message_text(&req) {
-                if let Ok(query_vec) = l2.embedder.embed(query_text).await {
-                    if let Ok(Some((entry, similarity))) =
-                        l2.cache.lookup(ctx.org_id, &query_vec, l2.threshold).await
+            if let Some(query_text) = l2_context_text(&req) {
+                if let Ok(query_vec) = l2.embedder.embed(&query_text).await {
+                    if let Ok(Some((entry, similarity))) = l2
+                        .cache
+                        .lookup(
+                            ctx.org_id,
+                            &query_vec,
+                            l2.threshold,
+                            &req.model,
+                            l2.embedder.model(),
+                        )
+                        .await
                     {
                         // Cache hit — best-effort bump and return.
                         let _ = l2.cache.bump_hit_count(entry.id).await;
@@ -435,18 +443,17 @@ pub async fn handler(
 
         // 3f. Best-effort L2 insert. Errors are logged but never block the request.
         if let Some(l2) = state.l2.as_ref() {
-            if let Some(query_text) = last_user_message_text(&req) {
+            if let Some(query_text) = l2_context_text(&req) {
                 let l2_provider_id = provider_id.clone();
                 let l2_model_used = response.model.clone();
                 let response_clone = response.clone();
                 let l2_clone = l2.clone();
                 let org_id = ctx.org_id;
-                let query_text_owned = query_text.to_string();
                 tokio::spawn(async move {
                     insert_into_l2(
                         l2_clone,
                         org_id,
-                        &query_text_owned,
+                        &query_text,
                         response_clone,
                         l2_provider_id,
                         l2_model_used,
@@ -692,6 +699,7 @@ async fn insert_into_l2(
     _provider_id: String,
     model_used: String,
 ) {
+    let embedding_model = l2.embedder.model().to_string();
     let embed = match l2.embedder.embed(query_text).await {
         Ok(v) => v,
         Err(e) => {
@@ -713,6 +721,7 @@ async fn insert_into_l2(
         embedding: embed,
         response: response_bytes,
         model: model_used,
+        embedding_model,
         input_tokens: response.usage.prompt_tokens,
         output_tokens: response.usage.completion_tokens,
         hit_count: 0,

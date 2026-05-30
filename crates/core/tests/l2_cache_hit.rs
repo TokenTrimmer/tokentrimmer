@@ -242,6 +242,7 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         embedding: entry_vec.clone(),
         response: serde_json::to_vec(&primed).unwrap(),
         model: "counting-1".into(),
+        embedding_model: "fixed-embed".into(),
         input_tokens: 100,
         output_tokens: 50,
         hit_count: 0,

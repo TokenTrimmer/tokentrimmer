@@ -218,6 +218,7 @@ async fn different_orgs_do_not_share_retrieval_data() {
     let retrieval_state = RetrievalState {
         store: store as Arc<dyn RetrievalStore + Send + Sync>,
         embedder,
+        audit: None,
     };
     let application = app(retrieval_state);
 

@@ -205,6 +205,7 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
     let retrieval = RetrievalState {
         store: store as Arc<dyn RetrievalStore + Send + Sync>,
         embedder,
+        audit: None,
     };
     let app = app_with_echo(Some(retrieval));
 
@@ -285,6 +286,7 @@ async fn retrieval_enabled_no_tag_sets_ready_header() {
     let retrieval = RetrievalState {
         store: store as Arc<dyn RetrievalStore + Send + Sync>,
         embedder,
+        audit: None,
     };
     let app = app_with_echo(Some(retrieval));
 

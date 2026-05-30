@@ -30,7 +30,7 @@ pub mod redis_impl;
 // Re-export key L2 types at the crate root for convenience.
 pub use embed::{EmbedError, EmbeddingProvider, MockEmbedder, OpenAIEmbedder};
 pub use l1_entry::L1Entry;
-pub use l2::{CacheEntry, InMemoryL2Cache, L2Cache, PostgresL2Cache};
+pub use l2::{l2_context_text, CacheEntry, InMemoryL2Cache, L2Cache, PostgresL2Cache};
 
 use async_trait::async_trait;
 use thiserror::Error;

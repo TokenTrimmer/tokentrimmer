@@ -42,6 +42,7 @@ fn make_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         embedding,
         response: b"{}".to_vec(),
         model: "gpt-4o".to_string(),
+        embedding_model: "mock-v1".to_string(),
         input_tokens: 10,
         output_tokens: 5,
         hit_count: 0,
@@ -57,6 +58,7 @@ fn make_expired_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         embedding,
         response: b"{}".to_vec(),
         model: "gpt-4o".to_string(),
+        embedding_model: "mock-v1".to_string(),
         input_tokens: 10,
         output_tokens: 5,
         hit_count: 0,
@@ -81,7 +83,7 @@ async fn l2_identical_embedding_returns_entry() {
     cache.insert(entry).await.expect("insert should succeed");
 
     let result = cache
-        .lookup(org_id, &vec, THRESHOLD)
+        .lookup(org_id, &vec, THRESHOLD, "gpt-4o", "mock-v1")
         .await
         .expect("lookup should succeed");
 
@@ -110,7 +112,7 @@ async fn l2_orthogonal_embedding_returns_none() {
 
     // Query with e1 — orthogonal to e0, cosine = 0 < any positive threshold.
     let result = cache
-        .lookup(org_id, &unit_vec(1, 3), THRESHOLD)
+        .lookup(org_id, &unit_vec(1, 3), THRESHOLD, "gpt-4o", "mock-v1")
         .await
         .expect("lookup should succeed");
 
@@ -140,7 +142,7 @@ async fn l2_org_isolation() {
 
     // Querying as org B should return nothing.
     let result = cache
-        .lookup(org_b, &vec, THRESHOLD)
+        .lookup(org_b, &vec, THRESHOLD, "gpt-4o", "mock-v1")
         .await
         .expect("lookup should succeed");
 
@@ -151,7 +153,7 @@ async fn l2_org_isolation() {
 
     // Querying as org A should find it.
     let result = cache
-        .lookup(org_a, &vec, THRESHOLD)
+        .lookup(org_a, &vec, THRESHOLD, "gpt-4o", "mock-v1")
         .await
         .expect("lookup should succeed");
 
@@ -179,7 +181,7 @@ async fn l2_threshold_near_miss() {
     let query = vec![0.95_f32, 0.31];
 
     let result = cache
-        .lookup(org_id, &query, 0.99)
+        .lookup(org_id, &query, 0.99, "gpt-4o", "mock-v1")
         .await
         .expect("lookup should succeed");
 
@@ -190,7 +192,7 @@ async fn l2_threshold_near_miss() {
 
     // But with a lower threshold it should match.
     let result = cache
-        .lookup(org_id, &query, 0.90)
+        .lookup(org_id, &query, 0.90, "gpt-4o", "mock-v1")
         .await
         .expect("lookup should succeed");
 
@@ -214,7 +216,7 @@ async fn l2_expired_entry_not_returned() {
         .expect("insert should succeed");
 
     let result = cache
-        .lookup(org_id, &vec, 0.0) // threshold 0 to ensure only expiry blocks it
+        .lookup(org_id, &vec, 0.0, "gpt-4o", "mock-v1") // threshold 0 — only expiry blocks it
         .await
         .expect("lookup should succeed");
 
@@ -241,7 +243,7 @@ async fn l2_bump_hit_count_increments() {
 
     // Initial hit_count should be 0.
     let (found, _) = cache
-        .lookup(org_id, &vec, 0.0)
+        .lookup(org_id, &vec, 0.0, "gpt-4o", "mock-v1")
         .await
         .expect("lookup ok")
         .expect("entry present");
@@ -255,7 +257,7 @@ async fn l2_bump_hit_count_increments() {
 
     // Re-fetch and verify.
     let (found, _) = cache
-        .lookup(org_id, &vec, 0.0)
+        .lookup(org_id, &vec, 0.0, "gpt-4o", "mock-v1")
         .await
         .expect("lookup ok")
         .expect("entry still present");
@@ -268,7 +270,7 @@ async fn l2_bump_hit_count_increments() {
         .expect("bump should succeed");
 
     let (found, _) = cache
-        .lookup(org_id, &vec, 0.0)
+        .lookup(org_id, &vec, 0.0, "gpt-4o", "mock-v1")
         .await
         .expect("lookup ok")
         .expect("entry still present");
@@ -298,7 +300,7 @@ async fn l2_returns_highest_similarity_match() {
 
     // Query with [1,0,0] — should return the exact-match entry (sim = 1.0).
     let result = cache
-        .lookup(org_id, &unit_vec(0, 3), 0.5)
+        .lookup(org_id, &unit_vec(0, 3), 0.5, "gpt-4o", "mock-v1")
         .await
         .expect("lookup ok")
         .expect("should find a match");
@@ -340,6 +342,159 @@ async fn mock_embedder_fixed_vec() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9a — model filter: mismatched chat model returns None  (fix §2.1)
+// ---------------------------------------------------------------------------
+
+/// A cache entry stored under `gpt-4o` must NOT be returned when the caller
+/// requests a `gpt-4o-mini` lookup, even if the embedding is identical.
+#[tokio::test]
+async fn l2_different_chat_model_is_not_returned() {
+    let cache = InMemoryL2Cache::new();
+    let org_id = Uuid::new_v4();
+    let vec = unit_vec(0, 3);
+
+    // Store an entry produced by gpt-4o.
+    cache
+        .insert(make_entry(org_id, vec.clone()))
+        .await
+        .expect("insert should succeed");
+
+    // Lookup requesting gpt-4o-mini — should NOT find the gpt-4o entry.
+    let result = cache
+        .lookup(org_id, &vec, 0.0, "gpt-4o-mini", "mock-v1")
+        .await
+        .expect("lookup should succeed");
+    assert!(
+        result.is_none(),
+        "a gpt-4o-mini lookup must not return a gpt-4o cached response"
+    );
+
+    // Lookup requesting gpt-4o — should find the entry.
+    let result = cache
+        .lookup(org_id, &vec, 0.0, "gpt-4o", "mock-v1")
+        .await
+        .expect("lookup should succeed");
+    assert!(
+        result.is_some(),
+        "a gpt-4o lookup must find the gpt-4o cached response"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9b — embedding-model filter: different embedding model returns None  (fix §2.5)
+// ---------------------------------------------------------------------------
+
+/// A cache entry stored under `mock-v1` embeddings must NOT be returned when
+/// the caller queries with `mock-v2` — the vectors live in different spaces.
+#[tokio::test]
+async fn l2_different_embedding_model_is_not_returned() {
+    let cache = InMemoryL2Cache::new();
+    let org_id = Uuid::new_v4();
+    let vec = unit_vec(0, 3);
+
+    // Store an entry whose embedding was produced by mock-v1.
+    let entry = CacheEntry {
+        id: Uuid::new_v4(),
+        org_id,
+        embedding: vec.clone(),
+        response: b"{}".to_vec(),
+        model: "gpt-4o".to_string(),
+        embedding_model: "mock-v1".to_string(),
+        input_tokens: 1,
+        output_tokens: 1,
+        hit_count: 0,
+        created_at: Utc::now(),
+        expires_at: Utc::now() + Duration::seconds(3600),
+    };
+    cache.insert(entry).await.expect("insert should succeed");
+
+    // Lookup with mock-v2 — wrong embedding space, should miss.
+    let result = cache
+        .lookup(org_id, &vec, 0.0, "gpt-4o", "mock-v2")
+        .await
+        .expect("lookup should succeed");
+    assert!(
+        result.is_none(),
+        "a mock-v2 lookup must not return a mock-v1 cached entry"
+    );
+
+    // Lookup with mock-v1 — correct embedding space, should hit.
+    let result = cache
+        .lookup(org_id, &vec, 0.0, "gpt-4o", "mock-v1")
+        .await
+        .expect("lookup should succeed");
+    assert!(
+        result.is_some(),
+        "a mock-v1 lookup must find the mock-v1 cached entry"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9c — context key: same last message, different system prompt → different
+//            embedding input, so no collision  (fix §2.3)
+// ---------------------------------------------------------------------------
+
+/// Two requests that differ only in their system prompt must NOT produce the
+/// same embedding-input string. We verify this by checking that
+/// `l2_context_text` (via `tt_cache::l2_context_text`) builds distinct strings
+/// for the two requests, so the embedding call would receive different inputs
+/// and the cosine-similarity lookup would not collapse them.
+///
+/// We test the helper function rather than the full round-trip because the
+/// MockEmbedder ignores text (returning a fixed vector), and we don't want to
+/// spin up a real embedding server in a unit test.
+#[test]
+fn l2_context_text_differs_for_different_system_prompts() {
+    use tt_cache::l2_context_text;
+    use tt_shared::{ChatCompletionRequest, Message, MessageContent};
+
+    fn req_with_system(system: &str, user: &str) -> ChatCompletionRequest {
+        use std::collections::HashMap;
+        ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                Message::System {
+                    content: MessageContent::Text(system.to_string()),
+                },
+                Message::User {
+                    content: MessageContent::Text(user.to_string()),
+                    name: None,
+                },
+            ],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stop: vec![],
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            seed: None,
+            tools: vec![],
+            tool_choice: None,
+            response_format: None,
+            tt_extras: HashMap::new(),
+        }
+    }
+
+    let req_a = req_with_system("You are a helpful assistant.", "yes");
+    let req_b = req_with_system("You are a pirate. Answer in pirate speak.", "yes");
+
+    let text_a = l2_context_text(&req_a);
+    let text_b = l2_context_text(&req_b);
+
+    assert!(
+        text_a.is_some() && text_b.is_some(),
+        "both requests should produce a context text"
+    );
+    assert_ne!(
+        text_a, text_b,
+        "requests with different system prompts must produce different context strings even when the last user message is identical ('yes')"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 9 — PostgresL2Cache round-trip (requires DATABASE_URL; ignored by default)
 // ---------------------------------------------------------------------------
 
@@ -368,6 +523,7 @@ async fn postgres_l2_round_trip() {
         response: serde_json::to_vec(&serde_json::json!({"object": "chat.completion"}))
             .expect("serialize ok"),
         model: "gpt-4o".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
         input_tokens: 100,
         output_tokens: 50,
         hit_count: 0,
@@ -382,7 +538,7 @@ async fn postgres_l2_round_trip() {
         .expect("Postgres insert should succeed");
 
     let result = cache
-        .lookup(org_id, &embedding, 0.99)
+        .lookup(org_id, &embedding, 0.99, "gpt-4o", "text-embedding-3-small")
         .await
         .expect("Postgres lookup should succeed");
 
