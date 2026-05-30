@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 use crate::budget::BudgetDecision;
 use crate::middleware::key_cache::CacheLookup;
+use crate::tier_resolver::resolve_or_free;
 use crate::{ApiError, AppState, DOGFOOD_ORG_ID};
 
 /// Axum `from_fn_with_state`-compatible middleware function.
@@ -97,7 +98,7 @@ pub async fn middleware(
                 }
             };
 
-            if let Some(ctx) = ctx_opt {
+            if let Some(mut ctx) = ctx_opt {
                 // Fire-and-forget last_used_at update. We never block the
                 // request on this — the dashboard's "Last used" column
                 // is informational, and Postgres write latency on a
@@ -111,6 +112,14 @@ pub async fn middleware(
                         tracing::warn!(error = %e, "touch_last_used failed");
                     }
                 });
+
+                // Resolve subscription tier and stamp ApiKeyContext.tier.
+                // Fail-open: a DB error returns Free defaults and logs a warn.
+                if let Some(resolver) = state.tier_resolver.as_ref() {
+                    let resolved = resolve_or_free(resolver.as_ref(), ctx.org_id).await;
+                    ctx.tier = Some(resolved.caller_tier);
+                }
+
                 org_id = Some(ctx.org_id);
                 req.extensions_mut().insert(ctx);
             }
@@ -130,9 +139,30 @@ pub async fn middleware(
 
     // Pre-flight budget gate for identified orgs. Anonymous/dev requests
     // (no org_id) and the sandbox path are not metered.
+    //
+    // When `tier_resolver` is wired, we use per-org resolved limits via
+    // `dynamic_budget`; otherwise we fall back to the global `budget`
+    // enforcer (if any). This preserves today's dev/no-pool behaviour.
     let mut spend_remaining: Option<f64> = None;
-    if let (Some(org), Some(budget)) = (org_id, state.budget.as_ref()) {
-        match budget.check(org, chrono::Utc::now()) {
+    if let Some(org) = org_id {
+        let decision = if let Some(resolver) = state.tier_resolver.as_ref() {
+            // Tier-aware path: resolve limits for this org and check against
+            // the per-org dynamic enforcer (fail-open on resolver error).
+            let resolved = resolve_or_free(resolver.as_ref(), org).await;
+            state
+                .dynamic_budget
+                .check_with_limits(org, &resolved.limits, chrono::Utc::now())
+        } else if let Some(budget) = state.budget.as_ref() {
+            // Legacy path: global limits enforcer.
+            budget.check(org, chrono::Utc::now())
+        } else {
+            // No enforcer wired → allow (dev mode).
+            BudgetDecision::Allow {
+                spend_remaining_usd: None,
+            }
+        };
+
+        match decision {
             BudgetDecision::Allow {
                 spend_remaining_usd,
             } => spend_remaining = spend_remaining_usd,

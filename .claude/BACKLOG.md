@@ -64,7 +64,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 - [x] [P3] [rv-revoke-key-atomic] rust-crate-builder: Wrap key mutation + audit append in one DB transaction (or emit a metric/alert on the audit-after-mutation failure path) so the chain is a complete record (auth/keys.rs:369-389). (§5.10) (est: $0.40)
 - [x] [P3] [rv-inspect-parallel-scan] rust-crate-builder: Parallelize the per-file inspect scan with rayon for large repos + store source length alongside the 64-bit AST-cache hash to remove the collision class (engine.rs:60-84; parse.rs:73-101). (§4.15) (est: $0.40)
 - [x] [P3] [rv-preview-provider-disambig] rust-crate-builder: Let preview pricing lookup honor the intended provider for cross-listed models instead of first-hit probe order (preview/pricing.rs:33-59). (§4-preview) (est: $0.20)
-- [ ] [P3] [rv-env-credential-failclosed] rust-crate-builder: Don't chain the Env credential store as a multi-tenant fallback; boot-assert/metric when `EnvProviderCredentialStore` is active alongside >1 org (credentials.rs:205-265; chat.rs:822-834). (§5.10) (est: $0.30)
+- [x] [P3] [rv-env-credential-failclosed] rust-crate-builder: Don't chain the Env credential store as a multi-tenant fallback; boot-assert/metric when `EnvProviderCredentialStore` is active alongside >1 org (credentials.rs:205-265; chat.rs:822-834). (§5.10) (est: $0.30)
 
 ---
 

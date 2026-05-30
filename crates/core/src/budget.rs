@@ -36,21 +36,65 @@ pub struct BudgetLimits {
     /// Max requests per calendar month. `None` = unlimited monthly volume.
     /// Resets with the spend accumulator at the month boundary.
     pub monthly_request_cap: Option<u32>,
+    /// Whether the L2 semantic cache is available for this tier.
+    /// Free is L1-only (`false`); Pro/Team/Scale enable L2 (`true`).
+    pub l2_cache: bool,
 }
 
 impl BudgetLimits {
     /// The Free-tier shape: 60 requests/minute, 10 000 requests/month, no USD
-    /// cap (Free is metered by volume, not spend). Mirrors
-    /// `tt_api::tier::limits_for("free")` so the gateway enforces the same caps
-    /// the cloud advertises. (Per-org tier→limits resolution — applying this to
-    /// the right orgs — is the remaining cloud wire-up; the primitive is here.)
+    /// cap (Free is metered by volume, not spend), no L2 cache. Mirrors
+    /// `tt_api::tier::limits_for("free")` — see [`tier_budget_limits`] for the
+    /// full mapping.
     #[must_use]
     pub fn free_tier() -> Self {
         Self {
             monthly_cap_usd: None,
             max_requests_per_min: Some(60),
             monthly_request_cap: Some(10_000),
+            l2_cache: false,
         }
+    }
+}
+
+/// Map a subscription `(tier, status)` pair → the [`BudgetLimits`] the gateway
+/// enforces at request time. Applies the same cancel-downgrade rule as
+/// `tt_api::tier::effective_tier` (CLOUD canonical source): non-paying statuses
+/// collapse to Free.
+///
+/// **Sync note:** the band numbers below mirror `cloud/crates/api/src/tier.rs`
+/// (`limits_for`). When the cloud canonical values change, update both files and
+/// keep this comment pointing at the cloud source.
+///
+/// | Tier  | rpm cap | monthly cap | L2 cache |
+/// |-------|---------|-------------|----------|
+/// | free  | 60      | 10 000      | no       |
+/// | pro   | 600     | unlimited   | yes      |
+/// | team  | unlimited | unlimited | yes      |
+/// | scale | unlimited | unlimited | yes      |
+#[must_use]
+pub fn tier_budget_limits(tier: &str, status: &str) -> BudgetLimits {
+    // Apply the cancel-downgrade collapse (mirrors cloud effective_tier).
+    let effective = match status {
+        "active" | "trialing" | "past_due" => tier,
+        // canceled, unpaid, incomplete, incomplete_expired → Free.
+        _ => "free",
+    };
+    match effective {
+        "pro" => BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: Some(600),
+            monthly_request_cap: None, // paid tiers bill overage, no hard-stop
+            l2_cache: true,
+        },
+        "team" | "scale" | "enterprise" => BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: None, // unlimited rpm for team/scale
+            monthly_request_cap: None,
+            l2_cache: true,
+        },
+        // "free", "", unknown → Free caps.
+        _ => BudgetLimits::free_tier(),
     }
 }
 
@@ -195,6 +239,90 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
     }
 }
 
+/// Budget enforcer where each org's [`BudgetLimits`] are resolved at check
+/// time from an external source (the tier resolver). Used by the auth
+/// middleware when `AppState.tier_resolver` is set.
+///
+/// Unlike [`InMemoryBudgetEnforcer`] (which uses one global limit for all
+/// orgs), `DynamicBudgetEnforcer` accepts the limits as a parameter to
+/// [`DynamicBudgetEnforcer::check_with_limits`] — the caller resolves them
+/// (async) from the tier resolver, then passes the result in.
+pub struct DynamicBudgetEnforcer {
+    state: Mutex<HashMap<Uuid, OrgState>>,
+}
+
+impl DynamicBudgetEnforcer {
+    /// Create a new empty enforcer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Pre-flight check: may `org_id` make a request at `now` given `limits`?
+    /// Mutates internal state (rate window, request count).
+    pub fn check_with_limits(
+        &self,
+        org_id: Uuid,
+        limits: &BudgetLimits,
+        now: DateTime<Utc>,
+    ) -> BudgetDecision {
+        let mut guard = self.state.lock().expect("dynamic budget state poisoned");
+        let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
+        st.roll_month(now);
+
+        if let Some(cap) = limits.monthly_cap_usd {
+            if st.spend_usd >= cap {
+                return BudgetDecision::DenySpend;
+            }
+        }
+
+        if let Some(mcap) = limits.monthly_request_cap {
+            if st.month_request_count >= mcap {
+                return BudgetDecision::DenyMonthlyRequests;
+            }
+        }
+
+        if let Some(rpm) = limits.max_requests_per_min {
+            let elapsed = now.signed_duration_since(st.window_start).num_seconds();
+            if elapsed >= RATE_WINDOW_SECS {
+                st.window_start = now;
+                st.window_count = 1;
+            } else if st.window_count >= rpm {
+                let retry = (RATE_WINDOW_SECS - elapsed).max(0) as u64;
+                return BudgetDecision::DenyRate {
+                    retry_after_secs: retry,
+                };
+            } else {
+                st.window_count += 1;
+            }
+        }
+
+        st.month_request_count = st.month_request_count.saturating_add(1);
+
+        BudgetDecision::Allow {
+            spend_remaining_usd: limits
+                .monthly_cap_usd
+                .map(|cap| (cap - st.spend_usd).max(0.0)),
+        }
+    }
+
+    /// Record realized spend after the response completes.
+    pub fn record(&self, org_id: Uuid, cost_usd: f64, now: DateTime<Utc>) {
+        let mut guard = self.state.lock().expect("dynamic budget state poisoned");
+        let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
+        st.roll_month(now);
+        st.spend_usd += cost_usd.max(0.0);
+    }
+}
+
+impl Default for DynamicBudgetEnforcer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +356,7 @@ mod tests {
             monthly_cap_usd: Some(10.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         e.record(org(), 4.0, now);
@@ -245,6 +374,7 @@ mod tests {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -258,6 +388,7 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: Some(2),
             monthly_request_cap: None,
+            l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -276,6 +407,7 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: Some(1),
             monthly_request_cap: None,
+            l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -294,6 +426,7 @@ mod tests {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            l2_cache: false,
         });
         let may = t(2026, 5, 31, 23, 0, 0);
         e.record(org(), 2.0, may);
@@ -309,6 +442,7 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: None,
             monthly_request_cap: Some(3),
+            l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         for _ in 0..3 {
@@ -323,6 +457,7 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: None,
             monthly_request_cap: Some(1),
+            l2_cache: false,
         });
         let may = t(2026, 5, 31, 23, 0, 0);
         assert!(e.check(org(), may).is_allowed());
@@ -346,6 +481,7 @@ mod tests {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         let a = Uuid::from_u128(1);
@@ -353,5 +489,144 @@ mod tests {
         e.record(a, 2.0, now); // org a over cap
         assert_eq!(e.check(a, now), BudgetDecision::DenySpend);
         assert!(e.check(b, now).is_allowed(), "org b must be unaffected");
+    }
+
+    // -----------------------------------------------------------------------
+    // tier_budget_limits: mapping + effective-tier collapse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn free_tier_limits_for_free_active() {
+        let l = tier_budget_limits("free", "active");
+        assert_eq!(l.max_requests_per_min, Some(60));
+        assert_eq!(l.monthly_request_cap, Some(10_000));
+        assert_eq!(l.monthly_cap_usd, None);
+        assert!(!l.l2_cache, "Free is L1-only");
+    }
+
+    #[test]
+    fn pro_tier_limits() {
+        let l = tier_budget_limits("pro", "active");
+        assert_eq!(l.max_requests_per_min, Some(600));
+        assert_eq!(l.monthly_request_cap, None, "paid tiers bill overage, no hard-stop");
+        assert!(l.l2_cache, "Pro has L2 cache");
+    }
+
+    #[test]
+    fn team_and_scale_have_unlimited_rpm() {
+        for tier in &["team", "scale"] {
+            let l = tier_budget_limits(tier, "active");
+            assert_eq!(l.max_requests_per_min, None, "{tier} should have unlimited rpm");
+            assert_eq!(l.monthly_request_cap, None);
+            assert!(l.l2_cache);
+        }
+    }
+
+    #[test]
+    fn unknown_tier_falls_back_to_free() {
+        let l = tier_budget_limits("mystery", "active");
+        assert_eq!(l.max_requests_per_min, Some(60));
+        assert_eq!(l.monthly_request_cap, Some(10_000));
+        assert!(!l.l2_cache);
+    }
+
+    #[test]
+    fn canceled_subscription_collapses_to_free() {
+        // A canceled Pro org is enforced at Free caps.
+        let l = tier_budget_limits("pro", "canceled");
+        assert_eq!(l.max_requests_per_min, Some(60));
+        assert_eq!(l.monthly_request_cap, Some(10_000));
+        assert!(!l.l2_cache);
+    }
+
+    #[test]
+    fn unpaid_and_incomplete_collapse_to_free() {
+        for status in &["unpaid", "incomplete", "incomplete_expired"] {
+            let l = tier_budget_limits("team", status);
+            assert_eq!(
+                l.max_requests_per_min,
+                Some(60),
+                "status={status} should collapse to Free"
+            );
+            assert!(!l.l2_cache, "status={status} should lose L2");
+        }
+    }
+
+    #[test]
+    fn past_due_and_trialing_keep_paid_tier() {
+        for status in &["past_due", "trialing"] {
+            let l = tier_budget_limits("pro", status);
+            assert_eq!(
+                l.max_requests_per_min,
+                Some(600),
+                "status={status} should keep Pro rpm"
+            );
+            assert!(l.l2_cache, "status={status} should keep L2");
+        }
+    }
+
+    #[test]
+    fn free_org_over_monthly_cap_gets_denied() {
+        // Simulate a Free org that has reached its 10 000 request cap.
+        // Advance the clock by >60 s between batches so the rpm window
+        // resets, avoiding a DenyRate before the monthly cap is hit.
+        let limits = tier_budget_limits("free", "active");
+        // Temporarily disable rpm by using InMemoryBudgetEnforcer with only
+        // the monthly cap set, to test the monthly cap in isolation.
+        let cap_only = BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: None,
+            monthly_request_cap: Some(10_000),
+            l2_cache: false,
+        };
+        let e = InMemoryBudgetEnforcer::new(cap_only);
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = Uuid::from_u128(99);
+        for _ in 0..10_000 {
+            assert!(e.check(org, now).is_allowed());
+        }
+        assert_eq!(
+            e.check(org, now),
+            BudgetDecision::DenyMonthlyRequests,
+            "Free org at 10k cap must be denied"
+        );
+
+        // Also verify the free_tier() limits (with rpm) hit the monthly cap
+        // when the clock advances to avoid rpm conflicts.
+        let e2 = InMemoryBudgetEnforcer::new(limits);
+        let org2 = Uuid::from_u128(199);
+        let mut total = 0u32;
+        'outer: for minute in 0i64..200 {
+            let ts = t(2026, 5, 1, 0, 0, 0) + chrono::Duration::seconds(minute * 61);
+            for _ in 0..59u32 {
+                if total >= 10_000 {
+                    break 'outer;
+                }
+                assert!(e2.check(org2, ts).is_allowed(), "request {total} at minute {minute}");
+                total += 1;
+            }
+        }
+        assert_eq!(total, 10_000, "should have issued exactly 10_000 requests");
+        let last_ts = t(2026, 5, 1, 0, 0, 0) + chrono::Duration::seconds(201 * 61);
+        assert_eq!(
+            e2.check(org2, last_ts),
+            BudgetDecision::DenyMonthlyRequests,
+            "Free org at 10k cap must be denied (with rpm enabled)"
+        );
+    }
+
+    #[test]
+    fn free_org_over_rpm_gets_denied() {
+        let limits = tier_budget_limits("free", "active");
+        let e = InMemoryBudgetEnforcer::new(limits);
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = Uuid::from_u128(100);
+        for _ in 0..60 {
+            assert!(e.check(org, now).is_allowed());
+        }
+        assert!(
+            matches!(e.check(org, now), BudgetDecision::DenyRate { .. }),
+            "Free org at 60 rpm must be rate-denied"
+        );
     }
 }

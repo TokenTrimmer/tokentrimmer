@@ -11,11 +11,12 @@ use tt_cache::{EmbeddingProvider, L1Cache, L2Cache};
 use tt_routing::CachingRoutingStore;
 use tt_telemetry::request_logs::RequestLogWriter;
 
-use crate::budget::BudgetEnforcer;
+use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
 use crate::failover::CircuitBreaker;
 use crate::middleware::key_cache::{KeyVerifyCache, VerifyCache};
 use crate::single_flight::SingleFlight;
 use crate::registry::{register_default_providers, ProviderRegistry};
+use crate::tier_resolver::TierResolver;
 
 /// Default L2 cosine-similarity threshold per ADR-008 / spec §4.4.
 /// Below this, a cached entry is considered too far from the query to reuse.
@@ -86,6 +87,21 @@ pub struct AppState {
     /// checks it pre-flight (429 on deny) and the chat handler records realized
     /// spend. `None` disables budget enforcement (tests, dev, unmetered orgs).
     pub budget: Option<Arc<dyn BudgetEnforcer>>,
+    /// Optional per-org subscription tier resolver. When `Some`, the auth
+    /// middleware resolves the org's effective tier, stamps
+    /// `ApiKeyContext.tier`, and uses the resolved [`BudgetLimits`] for the
+    /// pre-flight budget check (overriding the global `budget` enforcer for
+    /// that org). `None` keeps today's behaviour: no tier resolution, the
+    /// global enforcer (if any) applies unchanged.
+    ///
+    /// Tier resolution errors **fail open** — a DB blip falls back to Free
+    /// limits and logs a warn rather than 429-ing the request.
+    pub tier_resolver: Option<Arc<dyn TierResolver>>,
+    /// Per-org dynamic budget state used when `tier_resolver` is `Some`.
+    /// Holds the monthly/rate counters per org; the limits are supplied at
+    /// check time from the resolved tier. Always present; only active when
+    /// `tier_resolver` is set.
+    pub dynamic_budget: Arc<DynamicBudgetEnforcer>,
     /// Per-provider circuit breaker shared across requests. Used by the chat
     /// handler when a matched route declares `fallbacks`: a provider that
     /// trips the breaker is skipped during failover until its cooldown
@@ -119,6 +135,8 @@ impl AppState {
             verify_cache: Arc::new(KeyVerifyCache::new()),
             dogfood_enabled: false,
             budget: None,
+            tier_resolver: None,
+            dynamic_budget: Arc::new(DynamicBudgetEnforcer::new()),
             breaker: Arc::new(CircuitBreaker::default()),
             single_flight: Arc::new(SingleFlight::new()),
         }
@@ -193,6 +211,17 @@ impl AppState {
     /// Builder-style attach: enable per-org spend cap + rate enforcement.
     pub fn with_budget(mut self, enforcer: Arc<dyn BudgetEnforcer>) -> Self {
         self.budget = Some(enforcer);
+        self
+    }
+
+    /// Builder-style attach: enable per-org subscription tier resolution.
+    ///
+    /// When set, the auth middleware resolves each request's org tier from
+    /// the subscription DB and uses the resolved limits for enforcement.
+    /// Resolution errors fail open (Free limits + warn log) rather than
+    /// 429-ing the request.
+    pub fn with_tier_resolver(mut self, resolver: Arc<dyn TierResolver>) -> Self {
+        self.tier_resolver = Some(resolver);
         self
     }
 }
