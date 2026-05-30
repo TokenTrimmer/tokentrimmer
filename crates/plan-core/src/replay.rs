@@ -31,9 +31,19 @@ use crate::{
 pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     validate(&input)?;
 
-    // Sort routes by priority descending — first match wins.
+    // Sort routes by priority descending — first match wins. Tie-break on
+    // the route's `id` (ascending) so equal-priority routes have a stable,
+    // config-intrinsic order independent of the caller's input array order.
+    // Without this, two logically-identical configs that differ only in the
+    // ordering of two equal-priority matching routes could resolve to
+    // different winners and thus different projected savings — violating the
+    // replay's "same config → bit-identical result" determinism contract.
     let mut routes = input.proposed_routes.clone();
-    routes.sort_by_key(|r| std::cmp::Reverse(r.priority));
+    routes.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     // Walk requests in deterministic order (by id).
     let mut requests = input.requests.clone();

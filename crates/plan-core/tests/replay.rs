@@ -450,6 +450,96 @@ fn snapshot_canned_replay() {
 }
 
 #[test]
+fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
+    // Two routes share priority 100 and BOTH match the same request (the
+    // request's model is in each route's `model_in`), but they reroute to
+    // DIFFERENT target models with different pricing — so which one wins is
+    // observable in the projected savings. Build two configs that are
+    // identical except for the order of these two routes in the input array.
+    // With a deterministic id-tiebreak the winner (and thus the result) must
+    // be identical across both orderings.
+    let req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+
+    // route_a (lower id) -> haiku; route_b (higher id) -> a pricier target.
+    // The id-tiebreak picks the lower id, so route_a must always win.
+    let route_a = ProposedRoute {
+        id: det_uuid(100),
+        name: "route-a".into(),
+        priority: 100,
+        enabled: true,
+        when: RouteConditions {
+            model_in: vec!["claude-3-5-sonnet".into()],
+            ..Default::default()
+        },
+        then: RouteAction {
+            target_model: "claude-3-5-haiku".into(),
+            force_cache_layer: None,
+        },
+    };
+    let route_b = ProposedRoute {
+        id: det_uuid(200),
+        name: "route-b".into(),
+        priority: 100,
+        enabled: true,
+        when: RouteConditions {
+            model_in: vec!["claude-3-5-sonnet".into()],
+            ..Default::default()
+        },
+        then: RouteAction {
+            target_model: "claude-3-haiku-pricier".into(),
+            force_cache_layer: None,
+        },
+    };
+
+    let mut pricing = HashMap::new();
+    let (k1, v1) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    let (k2, v2) = pricing_with("anthropic", "claude-3-haiku-pricier", 1.0, 5.0);
+    pricing.insert(k1, v1);
+    pricing.insert(k2, v2);
+
+    // Order 1: [route_a, route_b]
+    let input_ab = input_with_routes(
+        vec![req.clone()],
+        vec![route_a.clone(), route_b.clone()],
+        pricing.clone(),
+        100,
+    );
+    // Order 2: [route_b, route_a] — only the array order differs.
+    let input_ba = input_with_routes(vec![req], vec![route_b, route_a], pricing, 100);
+
+    let res_ab = replay(input_ab).expect("replay ab must succeed");
+    let res_ba = replay(input_ba).expect("replay ba must succeed");
+
+    // The determinism the review wants (§4.12): same config modulo array
+    // order -> bit-identical PROJECTION. We compare the projection outputs
+    // (aggregates + CIs + per-route breakdown) rather than the whole
+    // PlanResult because `proposed_routes` is deliberately echoed in the
+    // caller's authored (unsorted) order for apply-path round-trip fidelity —
+    // that field is the input document, not the projection. Before the
+    // tiebreak, the winner (and so these projection numbers) flipped with the
+    // array order; that is the bug being fixed.
+    let proj_ab =
+        serde_json::to_string(&(&res_ab.aggregates, &res_ab.confidence_intervals, &res_ab.per_route_breakdown))
+            .expect("serialize ab projection");
+    let proj_ba =
+        serde_json::to_string(&(&res_ba.aggregates, &res_ba.confidence_intervals, &res_ba.per_route_breakdown))
+            .expect("serialize ba projection");
+    assert_eq!(
+        proj_ab, proj_ba,
+        "equal-priority route configs that differ only in array order must \
+         produce a bit-identical projection"
+    );
+
+    // And specifically: the lower-id route (route_a -> haiku) wins in both,
+    // independent of which order it was authored in.
+    for res in [&res_ab, &res_ba] {
+        assert_eq!(res.aggregates.requests_rerouted, 1);
+        assert_eq!(res.per_route_breakdown.len(), 1);
+        assert_eq!(res.per_route_breakdown[0].route_id, det_uuid(100));
+    }
+}
+
+#[test]
 fn caveat_small_sample_present_under_1000() {
     let input = deterministic_input(50, 100);
     let result = replay(input).unwrap();
