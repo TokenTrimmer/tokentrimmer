@@ -46,21 +46,24 @@ product_id_by_name() {
     | jq -r --arg n "$1" '.data[] | select(.name==$n) | .id' | head -n1
 }
 
-# Reuse an existing metered overage price on the product (by tier metadata),
-# else create one tied to the meter at the per-request rate. Echoes the id.
+# Reuse an existing metered overage price on the product (by tier + interval),
+# else create one tied to the meter at the per-request rate. The rate is the
+# same for monthly and annual — only the billing cycle differs (annual plans
+# need a yearly overage item so all subscription items share an interval).
+# Echoes the id.
 overage_price() {
-  local product_name="$1" tier="$2" decimal="$3" pid existing
+  local product_name="$1" tier="$2" decimal="$3" interval="$4" pid existing
   pid=$(product_id_by_name "$product_name")
   if [ -z "$pid" ]; then echo "PRODUCT NOT FOUND: $product_name" >&2; return 1; fi
   existing=$(curl -sS "${API}/prices?product=${pid}&active=true&limit=100" -u "${STRIPE_SECRET_KEY}:" \
-    | jq -r --arg t "$tier" \
-        '.data[] | select(.recurring.usage_type=="metered" and .metadata.tier==$t and .metadata.kind=="overage") | .id' \
+    | jq -r --arg t "$tier" --arg i "$interval" \
+        '.data[] | select(.recurring.usage_type=="metered" and .recurring.interval==$i and .metadata.tier==$t and .metadata.kind=="overage") | .id' \
     | head -n1)
   if [ -n "$existing" ]; then echo "$existing"; return; fi
   curl -sS "${API}/prices" -u "${STRIPE_SECRET_KEY}:" \
     -d "product=${pid}" \
     -d "currency=usd" \
-    -d "recurring[interval]=month" \
+    -d "recurring[interval]=${interval}" \
     -d "recurring[usage_type]=metered" \
     -d "recurring[meter]=${meter_id}" \
     -d "billing_scheme=per_unit" \
@@ -70,16 +73,22 @@ overage_price() {
     | jq -r '.id'
 }
 
-PRO=$(overage_price "TokenTrimmer Pro" pro 0.025)     # $2.50 / 10K
-TEAM=$(overage_price "TokenTrimmer Team" team 0.015)  # $1.50 / 10K
-SCALE=$(overage_price "TokenTrimmer Scale" scale 0.010) # $1.00 / 10K
+PRO_M=$(overage_price "TokenTrimmer Pro" pro 0.025 month)    # $2.50 / 10K
+PRO_A=$(overage_price "TokenTrimmer Pro" pro 0.025 year)
+TEAM_M=$(overage_price "TokenTrimmer Team" team 0.015 month) # $1.50 / 10K
+TEAM_A=$(overage_price "TokenTrimmer Team" team 0.015 year)
+SCALE_M=$(overage_price "TokenTrimmer Scale" scale 0.010 month) # $1.00 / 10K
+SCALE_A=$(overage_price "TokenTrimmer Scale" scale 0.010 year)
 
 cat <<EOF
 
 # Stripe overage meter + metered prices (TEST). meter event_name=${EVENT_NAME}
 # meter id (informational): ${meter_id}
 # Paste into .env.development:
-STRIPE_OVERAGE_PRICE_PRO=${PRO}
-STRIPE_OVERAGE_PRICE_TEAM=${TEAM}
-STRIPE_OVERAGE_PRICE_SCALE=${SCALE}
+STRIPE_OVERAGE_PRICE_PRO=${PRO_M}
+STRIPE_OVERAGE_PRICE_TEAM=${TEAM_M}
+STRIPE_OVERAGE_PRICE_SCALE=${SCALE_M}
+STRIPE_OVERAGE_PRICE_PRO_ANNUAL=${PRO_A}
+STRIPE_OVERAGE_PRICE_TEAM_ANNUAL=${TEAM_A}
+STRIPE_OVERAGE_PRICE_SCALE_ANNUAL=${SCALE_A}
 EOF

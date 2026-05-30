@@ -37,15 +37,15 @@ find_or_create_product() {
     | jq -r '.id'
 }
 
-# Reuse an active monthly price at the target amount that already carries the
+# Reuse an active price at the target amount + interval that already carries the
 # right tier metadata, else create one. The webhook reads price.metadata.tier
 # to map a subscription back to a tier (defaulting to "pro"), so Team/Scale
 # MUST be stamped or they would silently resolve to Pro. Echoes the price id.
 find_or_create_price() {
-  local product_id="$1" cents="$2" tier="$3" existing
+  local product_id="$1" cents="$2" tier="$3" interval="$4" existing
   existing=$(curl -sS "${API}/prices?product=${product_id}&active=true&limit=100" -u "${STRIPE_SECRET_KEY}:" \
-    | jq -r --argjson c "$cents" --arg t "$tier" \
-        '.data[] | select(.unit_amount == $c and .currency == "usd" and .recurring.interval == "month" and .metadata.tier == $t) | .id' \
+    | jq -r --argjson c "$cents" --arg t "$tier" --arg i "$interval" \
+        '.data[] | select(.unit_amount == $c and .currency == "usd" and .recurring.interval == $i and .metadata.tier == $t) | .id' \
     | head -n1)
   if [ -n "$existing" ]; then
     echo "$existing"
@@ -55,28 +55,35 @@ find_or_create_price() {
     -d "product=${product_id}" \
     -d "unit_amount=${cents}" \
     -d "currency=usd" \
-    -d "recurring[interval]=month" \
+    -d "recurring[interval]=${interval}" \
     -d "metadata[tier]=${tier}" \
     | jq -r '.id'
 }
 
-create_tier() {
-  local name="$1" cents="$2" tier="$3" desc="$4" product
+# Mint a tier's monthly + annual flat prices (annual = monthly × 10 → 2 months
+# free). Echoes "<monthly_id> <annual_id>".
+mint_tier() {
+  local name="$1" monthly="$2" tier="$3" desc="$4" product m a
   product=$(find_or_create_product "$name" "$desc")
-  find_or_create_price "$product" "$cents" "$tier"
+  m=$(find_or_create_price "$product" "$monthly" "$tier" month)
+  a=$(find_or_create_price "$product" "$(( monthly * 10 ))" "$tier" year)
+  printf '%s %s\n' "$m" "$a"
 }
 
-PRO=$(create_tier "TokenTrimmer Pro" 9900 pro \
+read -r PRO_M PRO_A < <(mint_tier "TokenTrimmer Pro" 9900 pro \
   "Up to 500K req/mo, 90d retention, CSV/JSON export, L1 + L2 cache")
-TEAM=$(create_tier "TokenTrimmer Team" 39900 team \
+read -r TEAM_M TEAM_A < <(mint_tier "TokenTrimmer Team" 39900 team \
   "Pro features + RBAC, SSO (Google + GitHub), PR bot on up to 10 repos, unlimited seats")
-SCALE=$(create_tier "TokenTrimmer Scale" 149900 scale \
+read -r SCALE_M SCALE_A < <(mint_tier "TokenTrimmer Scale" 149900 scale \
   "Team features + S3 Object Lock audit, signed monthly SLO PDFs, email support")
 
 cat <<EOF
 
 # Paste into .env.development (and Fly secrets for prod with live-mode IDs later):
-STRIPE_PRICE_PRO=${PRO}
-STRIPE_PRICE_TEAM=${TEAM}
-STRIPE_PRICE_SCALE=${SCALE}
+STRIPE_PRICE_PRO=${PRO_M}
+STRIPE_PRICE_TEAM=${TEAM_M}
+STRIPE_PRICE_SCALE=${SCALE_M}
+STRIPE_PRICE_PRO_ANNUAL=${PRO_A}
+STRIPE_PRICE_TEAM_ANNUAL=${TEAM_A}
+STRIPE_PRICE_SCALE_ANNUAL=${SCALE_A}
 EOF
