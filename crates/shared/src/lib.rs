@@ -23,5 +23,5 @@ pub use messages::{
 };
 pub use pricing::{ModelInfo, ModelPricing};
 pub use provider::Provider;
-pub use url_guard::{filter_extra_headers, validate_provider_url, UrlGuardError};
+pub use url_guard::{filter_extra_headers, find_denied_header, validate_provider_url, UrlGuardError};
 pub use usage::Usage;

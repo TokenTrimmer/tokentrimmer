@@ -294,6 +294,24 @@ const DENIED_HEADERS: &[&str] = &[
     "proxy-connection",
 ];
 
+/// Check whether any header in `extra_headers` is on the denylist.
+///
+/// Returns the **name** (as supplied by the caller) of the first disallowed
+/// header found, or `None` if all headers are acceptable. Matching is
+/// case-insensitive.
+///
+/// Use this at write time (e.g. credential creation) to reject bad input with
+/// a clear error message rather than silently dropping the header at use time.
+pub fn find_denied_header(headers: &[(String, String)]) -> Option<&str> {
+    for (name, _) in headers {
+        let lower = name.to_ascii_lowercase();
+        if DENIED_HEADERS.contains(&lower.as_str()) {
+            return Some(name.as_str());
+        }
+    }
+    None
+}
+
 /// Filter `extra_headers`, dropping any header whose name is in the denylist.
 ///
 /// Matching is case-insensitive. Returns a new `Vec` containing only the
