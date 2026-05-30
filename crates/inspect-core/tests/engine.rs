@@ -221,3 +221,72 @@ fn engine_scans_cursor_rules_but_not_git() {
     );
     assert_eq!(findings[0].rule_id, "config-agents-md-contains-secrets");
 }
+
+// ---------------------------------------------------------------------------
+// Determinism: parallel scan must return identical sorted findings each run
+// ---------------------------------------------------------------------------
+
+/// A rule that emits one finding per file with a predictable rule_id prefix.
+struct AllFilesRule {
+    id: &'static str,
+}
+
+impl Rule for AllFilesRule {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        Severity::Low
+    }
+    fn supported_languages(&self) -> &'static [Language] {
+        &[Language::Python]
+    }
+    fn check(&self, _src: &str, _lang: Language, path: &str) -> Vec<Finding> {
+        vec![Finding {
+            rule_id: self.id.into(),
+            severity: Severity::Low,
+            file: path.into(),
+            line: 1,
+            message: "found".into(),
+            confidence: 1.0,
+            fix_hint: None,
+        }]
+    }
+}
+
+/// Scanning the same multi-file directory twice must produce identical, sorted
+/// findings regardless of rayon thread scheduling. This test asserts on the
+/// sorted order property directly.
+#[test]
+fn engine_scan_output_is_deterministic_and_sorted() {
+    let tmp = TempDir::new().unwrap();
+
+    // Write several files whose natural filesystem order is unpredictable.
+    for name in ["z_file.py", "a_file.py", "m_file.py", "b_file.py"] {
+        fs::write(tmp.path().join(name), format!("# {name}\nx = 1\n")).unwrap();
+    }
+
+    let engine = Engine::new().with_rule(Box::new(AllFilesRule { id: "determinism-rule" }));
+
+    let run1 = engine.scan(tmp.path());
+    let run2 = engine.scan(tmp.path());
+
+    // Both runs must produce the same number of findings.
+    assert_eq!(run1.len(), 4, "expected one finding per Python file");
+    assert_eq!(run1.len(), run2.len(), "run counts must match");
+
+    // Both runs must be identical (sorted order is stable).
+    for (a, b) in run1.iter().zip(run2.iter()) {
+        assert_eq!(a.file, b.file, "finding files must match across runs");
+        assert_eq!(a.rule_id, b.rule_id, "finding rule_ids must match across runs");
+    }
+
+    // Findings must be sorted by file path (the primary sort key).
+    let files: Vec<&str> = run1.iter().map(|f| f.file.as_str()).collect();
+    let mut sorted = files.clone();
+    sorted.sort();
+    assert_eq!(
+        files, sorted,
+        "engine output must be sorted by file path; got: {files:?}"
+    );
+}

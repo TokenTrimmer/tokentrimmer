@@ -74,6 +74,9 @@ redis = { version = "0.27", features = ["tokio-rustls-comp", "connection-manager
 pgvector = { version = "0.4", features = ["sqlx"] }
 dashmap = "6"
 
+# Parallelism
+rayon = "1.10"
+
 # Streaming + utilities
 futures = "0.3"
 async-stream = "0.3"

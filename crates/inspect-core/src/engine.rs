@@ -1,7 +1,22 @@
 //! Rule engine: walks a directory, feeds each file to every applicable rule,
 //! and aggregates the resulting [`Finding`]s.
+//!
+//! # Parallelism and determinism
+//!
+//! [`Engine::scan`] processes files **in parallel** using rayon's work-stealing
+//! thread pool — each file's rules run concurrently across worker threads. The
+//! parse cache (`parse_cached`) is guarded by a `Mutex` and is therefore safe
+//! to call from multiple threads simultaneously.
+//!
+//! Because rayon's scheduling is non-deterministic, findings from different
+//! files may arrive in any order. After collecting all findings they are sorted
+//! by `(file, line, rule_id)` before returning, so the output is byte-for-byte
+//! identical regardless of how threads interleave — a property the
+//! `tt-inspect-self.sh` diff relies on.
 
 use std::path::Path;
+
+use rayon::prelude::*;
 
 use crate::{walk, Finding, Rule};
 
@@ -53,32 +68,55 @@ impl Engine {
     /// Scan all eligible source files under `path`, running every registered
     /// rule against each file whose language is supported by that rule.
     ///
+    /// Files are processed **in parallel** across rayon worker threads; the
+    /// results are sorted by `(file, line, rule_id)` before returning so the
+    /// output is deterministic regardless of thread scheduling.
+    ///
     /// Errors at the individual-file level (read errors, binary content) are
     /// silently skipped so that a single problem file never aborts the scan.
     /// Parse errors inside rules are similarly the rule's responsibility to
     /// handle gracefully.
     pub fn scan(&self, path: &Path) -> Vec<Finding> {
-        let mut all: Vec<Finding> = Vec::new();
+        // Collect the file list eagerly so we can parallel-iterate over it.
+        // walk() is a lazy iterator backed by walkdir, which is not Send, so
+        // we materialise the list on the calling thread first.
+        let files: Vec<_> = walk::walk(path).collect();
 
-        for (file_path, lang) in walk::walk(path) {
-            // Skip files we cannot read as UTF-8 — they're likely binary or
-            // have an encoding issue. Not a fatal error.
-            let source = match std::fs::read_to_string(&file_path) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+        let mut all: Vec<Finding> = files
+            .into_par_iter()
+            .flat_map(|(file_path, lang)| {
+                // Skip files we cannot read as UTF-8 — they're likely binary or
+                // have an encoding issue. Not a fatal error.
+                let source = match std::fs::read_to_string(&file_path) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
 
-            let path_str = file_path.to_string_lossy();
+                let path_str = file_path.to_string_lossy().into_owned();
+                let mut file_findings: Vec<Finding> = Vec::new();
 
-            for rule in &self.rules {
-                // Only run rules that advertise support for this file's language.
-                if !rule.supported_languages().contains(&lang) {
-                    continue;
+                for rule in &self.rules {
+                    // Only run rules that advertise support for this file's language.
+                    if !rule.supported_languages().contains(&lang) {
+                        continue;
+                    }
+                    let mut findings = rule.check(&source, lang, &path_str);
+                    file_findings.append(&mut findings);
                 }
-                let mut findings = rule.check(&source, lang, &path_str);
-                all.append(&mut findings);
-            }
-        }
+
+                file_findings
+            })
+            .collect();
+
+        // Sort for deterministic output: file path first, then line number,
+        // then rule_id as a tiebreaker. This ensures identical output
+        // regardless of rayon thread scheduling — required by tt-inspect-self.sh.
+        all.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.rule_id.cmp(&b.rule_id))
+        });
 
         all
     }
