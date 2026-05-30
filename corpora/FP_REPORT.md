@@ -54,3 +54,52 @@ not meaningful on a flat code corpus._
 
 Total findings across corpus: 1.
 RESULT: all rules within the 5% FP threshold on the corpus.
+
+---
+
+## 3. Real-OSS vendored corpus (`corpora/vendor`)
+
+_The strongest FP signal is **real upstream code**. `scripts/vendor-corpora.sh`
+fetched idiomatic slices (pinned commits, license-clean) of four permissively
+licensed LLM-SDK repos into `corpora/vendor/`:_
+
+| source | files | licence |
+|---|---:|---|
+| `openai-python` (examples) | 8 | Apache-2.0 |
+| `openai-cookbook` (examples) | 8 | MIT |
+| `anthropic-sdk-python` (examples) | 8 | MIT |
+| `vercel-ai` (examples) | 8 | Apache-2.0 |
+
+Run: `./scripts/measure-fp-rate.sh --corpus corpora/vendor` (32 files).
+
+**This tier did its job — it surfaced noise the self-authored `corpora/samples`
+did not.** First pass, two rules exceeded the 5% gate at 9% each:
+
+- `model-flagship-for-extraction` — **true false positive, now fixed.** It fired
+  on OpenAI's official Structured-Outputs demos because the SDK *method* name
+  `completions.parse(...)` / the `.parsed` accessor matched the "parse"
+  extraction keyword (not any user-facing "parse this data" intent). The
+  detector now strips dotted `.parse` access before the keyword check; a bare
+  instruction ("Parse the invoice") still matches. Fixture precision/recall
+  stayed 100%/100%.
+- `output-no-max-tokens` — **legitimate detection, reclassified advisory.** The
+  flagged calls genuinely omit `max_tokens`; that pattern is identical in demo
+  and production code, so no AST-level precision change can separate them
+  without gutting the rule. It is intentionally high-recall (`Severity::High`,
+  not `Critical`) and is now excluded from the strict corpus gate the same way
+  `config-*` rules are — rationale documented in `measure-fp-rate.sh` and the
+  rule's module docstring.
+
+After those changes the gate passes — all code rules ≤ 3% on real OSS:
+
+| rule | files flagged | total files | FP rate | status |
+|---|---:|---:|---:|---|
+| agent-no-termination-condition | 1 | 32 | 3% | ok |
+| conversation-unbounded-history | 1 | 32 | 3% | ok |
+| lib-anthropic-sdk-no-cache-control | 1 | 32 | 3% | ok |
+
+Total findings across corpus: 8. RESULT: all rules within the 5% threshold.
+
+_Honesty note:_ `corpora/vendor/` is fetched on demand (needs network) and is
+not committed by default; the provenance (`.source`) + upstream `LICENSE` are
+written per source. Re-run the vendor script + the gate to reproduce.

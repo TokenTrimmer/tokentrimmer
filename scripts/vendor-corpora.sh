@@ -54,10 +54,12 @@ for lic in LICENSE LICENSE.md LICENSE.txt COPYING; do
 done
 
 # Copy up to MAX_FILES matching files, preserving basenames.
+# `find` emits repo-relative paths (e.g. ./examples/foo.py); the copy must
+# resolve them against the clone dir, not the caller's CWD.
 count=0
 while IFS= read -r -d '' f; do
   [[ "$count" -ge "$MAX_FILES" ]] && break
-  cp "$f" "$DEST/$(basename "$f")"
+  cp "$TMP/repo/$f" "$DEST/$(basename "$f")"
   count=$((count + 1))
 done < <(cd "$TMP/repo" && find . -path "./$GLOB" -type f -print0 2>/dev/null)
 

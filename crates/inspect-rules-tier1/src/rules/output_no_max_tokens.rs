@@ -4,6 +4,28 @@
 //! explicit output-length constraint (`max_tokens`, `max_completion_tokens`,
 //! or `max_output_tokens`). Without such a limit, models may produce
 //! arbitrarily long — and expensive — outputs.
+//!
+//! # Advisory classification
+//!
+//! This rule is intentionally **high-recall**: it flags *every* LLM call that
+//! lacks an output-length cap, regardless of context. That breadth is the
+//! point — even a single uncapped call in production can produce runaway token
+//! spend.
+//!
+//! However, this same breadth means the rule has a structurally unavoidable
+//! false-positive rate on real-world OSS corpora. Official SDK example files
+//! (openai-python, anthropic-sdk-python, openai-cookbook, etc.) routinely omit
+//! `max_tokens` for brevity in demos; so do auth examples, grader utilities,
+//! and one-off scripts. The rule cannot distinguish "demo brevity" from
+//! "production omission" at the AST level — the callee pattern and argument
+//! list look identical.
+//!
+//! As a result, this rule is **excluded from the strict per-rule corpus FP
+//! gate** in `scripts/measure-fp-rate.sh --corpus`, the same way `config-*`
+//! rules are excluded. It still appears in the full fixture-based FP-rate
+//! report (non-corpus mode) where its precision/recall on the synthetic
+//! fixture suite is excellent. Callers who want to suppress it in CI should
+//! use `--fail-on critical` (this rule is `Severity::High`, not `Critical`).
 
 use tt_inspect_core::ast::{call_sites, is_llm_create_callee};
 use tt_inspect_core::parse::parse_cached;

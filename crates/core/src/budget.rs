@@ -39,7 +39,7 @@ pub struct BudgetLimits {
 }
 
 impl BudgetLimits {
-    /// The Free-tier shape: 60 requests/minute, 5 000 requests/month, no USD
+    /// The Free-tier shape: 60 requests/minute, 10 000 requests/month, no USD
     /// cap (Free is metered by volume, not spend). Mirrors
     /// `tt_api::tier::limits_for("free")` so the gateway enforces the same caps
     /// the cloud advertises. (Per-org tier→limits resolution — applying this to
