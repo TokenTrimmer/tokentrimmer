@@ -256,3 +256,21 @@ When you make a non-trivial call:
 5. **Pointers** should be enough that someone re-reading 6 months from now can find the implementation.
 
 When a decision is reversed, mark the old one `Superseded by ADR-NNN` and write the new one — never delete history.
+
+---
+
+## ADR-017 — No encryption-at-rest for L2 cached responses; per-org opt-out instead (2026-05-30)
+
+**Status**: Adopted
+
+**Context**: PROJECT_REVIEW.md §5.10 flagged that the L2 semantic cache stores responses unencrypted. The L2 table `cache_entries` (migration `0002_cache_entries`) persists per row: `embedding vector(1536)`, `response JSONB`, `model`, token counts, TTLs. By design (migration 0002 header) it NEVER stores the original prompt text — only its embedding. L1 (Redis, `redis_impl.rs` `set_ex`) is short-TTL/ephemeral; the durable at-rest surface is the L2 Postgres table. We already run a per-org AEAD scheme (XChaCha20-Poly1305, per-row key = `SHA-256(TT_MASTER_KEY ‖ domain ‖ org_id)`, AAD bound to org_id, nonce-prefixed) for genuinely-secret recoverable data in `crates/auth/src/credentials.rs` and `crates/retrieval/src/audit.rs`.
+
+**Decision**: Do NOT encrypt the L2 `response` column at rest in v1. Instead (1) document the residual threat (this ADR) and (2) ship a per-org opt-out: orgs with sensitive payloads can disable semantic caching entirely so nothing of theirs is persisted. The opt-out is tracked as `rv-l2-org-cache-optout`.
+
+**Consequences**:
+- The high-value exfil concern is the **embeddings** (a leaked embedding can be partially inverted to recover prompt semantics). Encrypting only `response` leaves `embedding` plaintext, and `embedding` cannot be encrypted without destroying the HNSW cosine index (0002) that is the entire reason L2 exists — so response-only encryption buys little against the stated threat.
+- Response-only encryption stays cheap to add later (reuse `retrieval/audit.rs` verbatim, `response JSONB` → `BYTEA`, domain separator `tt-cache:l2_response:v1`) but would add a decrypt on every cache hit (hot path, `chat.rs` `build_hit_l2_response`) and join the `TT_MASTER_KEY` rotation set (see `docs/SECRETS.md`).
+- Residual threat accepted: a DB-at-rest snapshot/backup leak or staff read of `cache_entries` yields per-org embeddings + cached responses (NOT raw prompts); org_id scoping keeps it per-tenant attributable. Out of scope: cross-tenant read at query time (lookup is `WHERE org_id = $1`), live SQLi (parameterized). Mitigated by: no prompt text stored, Fly Postgres disk encryption, and the per-org opt-out.
+- Revisit triggers: a contract requires column-level encryption beyond disk encryption, or responses become recoverable secrets (e.g. caching tool outputs with PII).
+
+**Pointers**: `crates/core/migrations/0002_cache_entries.up.sql`; `crates/cache/src/l2.rs`; `crates/retrieval/src/audit.rs` (reusable AEAD); follow-up `rv-l2-org-cache-optout` (per-org `semantic_cache_disabled` → force `cache_behavior.do_lookup=do_insert=false`, resolve alongside tier in `tier_resolver.rs`, gate before the L1/L2 branches in `chat.rs`).
