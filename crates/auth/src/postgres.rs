@@ -447,7 +447,7 @@ fn env_to_str(env: Environment) -> &'static str {
 #[async_trait]
 impl KeyStore for PostgresKeyStore {
     async fn insert(&self, key: ApiKey) -> Result<(), KeyError> {
-        sqlx::query(
+        let res = sqlx::query(
             r#"INSERT INTO api_keys
                  (id, org_id, label, prefix, secret_hash, environment, created_at, last_used_at, revoked_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
@@ -462,9 +462,21 @@ impl KeyStore for PostgresKeyStore {
         .bind(Option::<DateTime<Utc>>::None) // last_used_at — not tracked at insert time
         .bind(key.revoked_at)
         .execute(&self.pool)
-        .await
-        .map_err(|e| KeyError::Store(e.to_string()))?;
-        Ok(())
+        .await;
+
+        match res {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(db_err))
+                if db_err.code().as_deref() == Some("23505")
+                    && db_err
+                        .constraint()
+                        .map(|c| c.contains("prefix"))
+                        .unwrap_or(false) =>
+            {
+                Err(KeyError::PrefixCollision)
+            }
+            Err(e) => Err(KeyError::Store(e.to_string())),
+        }
     }
 
     async fn find_by_prefix(&self, prefix: &str) -> Result<Option<ApiKey>, KeyError> {
