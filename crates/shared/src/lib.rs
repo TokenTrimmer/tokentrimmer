@@ -14,7 +14,7 @@ pub mod url_guard;
 pub mod usage;
 
 pub use capability_check::{message_text_for_estimation, RequiredCapabilities};
-pub use context::RequestContext;
+pub use context::{CallerTier, RequestContext};
 pub use error::ProviderError;
 pub use messages::{
     parse_cache_control, CacheControlConfig, CacheMode, ChatCompletionChunk,

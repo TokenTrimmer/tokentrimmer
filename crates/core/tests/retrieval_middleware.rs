@@ -223,6 +223,7 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
     let ctx = tt_auth::ApiKeyContext {
         key_id: Uuid::new_v4(),
         org_id,
+        tier: None,
     };
 
     let resp = app

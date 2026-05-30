@@ -123,6 +123,7 @@ pub async fn middleware(
         req.extensions_mut().insert(ApiKeyContext {
             key_id: Uuid::nil(),
             org_id: DOGFOOD_ORG_ID,
+            tier: None,
         });
         org_id = Some(DOGFOOD_ORG_ID);
     }

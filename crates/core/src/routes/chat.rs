@@ -50,6 +50,31 @@ use crate::{
 /// auth layer surfaces the caller's tier.
 const L2_DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Select the effective cache TTL (seconds) for an insert operation.
+///
+/// Priority (highest → lowest):
+/// 1. Per-request TTL override from `tt_extras.cache.ttl_secs` (Fix B §2.7).
+/// 2. Tier-based TTL from the caller's subscription tier (spec §8.4).
+/// 3. The conservative 24h gateway default when no tier is known.
+///
+/// The `tier` argument comes from `ApiKeyContext::tier`, which is injected by
+/// the cloud tier-resolution layer (`rv-tier-limits-enforcement`). Until that
+/// layer is wired, `tier` is always `None` and the 24h default applies —
+/// preserving current behavior for all requests.
+fn effective_ttl_secs(
+    request_override: Option<u64>,
+    tier: Option<tt_shared::CallerTier>,
+    default: u64,
+) -> u64 {
+    if let Some(secs) = request_override {
+        return secs;
+    }
+    if let Some(t) = tier {
+        return t.ttl_secs();
+    }
+    default
+}
+
 // ---------------------------------------------------------------------------
 // Cache-eligibility gate (Fix A §2.2) + tt_extras cache-control (Fix B §2.7)
 // ---------------------------------------------------------------------------
@@ -220,9 +245,9 @@ pub async fn handler(
     // legacy behavior of forwarding the raw Bearer to the upstream provider.
     // That fallback is what keeps `tt_test_*` E2E tests and unauthenticated
     // dev calls working through this handler.
-    let (org_id, api_key_id) = match auth_ctx.as_deref() {
-        Some(c) => (c.org_id, c.key_id),
-        None => (Uuid::nil(), Uuid::nil()),
+    let (org_id, api_key_id, caller_tier) = match auth_ctx.as_deref() {
+        Some(c) => (c.org_id, c.key_id, c.tier),
+        None => (Uuid::nil(), Uuid::nil(), None),
     };
     let credentials = resolve_credentials(&state, org_id, provider.id(), &raw_bearer).await;
 
@@ -675,11 +700,13 @@ pub async fn handler(
                 match entry.to_bytes() {
                     Ok(bytes) => {
                         let l1_clone = l1.clone();
-                        // Use caller-requested TTL override when present, else
-                        // fall back to the L1 config default.
-                        let ttl = cache_behavior
-                            .ttl_secs
-                            .unwrap_or(l1_clone.ttl_secs);
+                        // TTL priority: tt_extras override > tier-based TTL >
+                        // L1 config default (spec §8.4 / rv-per-tier-ttl).
+                        let ttl = effective_ttl_secs(
+                            cache_behavior.ttl_secs,
+                            caller_tier,
+                            l1_clone.ttl_secs,
+                        );
                         if let Some(guard) = single_flight_guard.take() {
                             // Leader path: await the insert so followers can
                             // read it from L1 immediately after we signal them.
@@ -727,8 +754,13 @@ pub async fn handler(
                     let response_clone = response.clone();
                     let l2_clone = l2.clone();
                     let org_id = ctx.org_id;
-                    // Pass the caller's TTL override (None = use L2 default).
-                    let ttl_override = cache_behavior.ttl_secs;
+                    // TTL priority: tt_extras override > tier-based TTL >
+                    // L2_DEFAULT_TTL (spec §8.4 / rv-per-tier-ttl).
+                    let l2_ttl_secs = effective_ttl_secs(
+                        cache_behavior.ttl_secs,
+                        caller_tier,
+                        L2_DEFAULT_TTL.as_secs(),
+                    );
                     tokio::spawn(async move {
                         insert_into_l2(
                             l2_clone,
@@ -737,7 +769,7 @@ pub async fn handler(
                             response_clone,
                             l2_provider_id,
                             l2_model_used,
-                            ttl_override,
+                            l2_ttl_secs,
                         )
                         .await;
                     });
@@ -974,8 +1006,9 @@ fn synthetic_baseline_from_entry(entry: &CacheEntry) -> f64 {
 /// Background L2 insert. Swallows errors with a tracing log — never blocks
 /// the user request.
 ///
-/// `ttl_override` is an optional per-request TTL from `tt_extras.cache.ttl_secs`
-/// (Fix B §2.7). When `None`, the gateway-level [`L2_DEFAULT_TTL`] is used.
+/// `ttl_secs` is the pre-resolved TTL (already factoring in the tt_extras
+/// override and the caller's tier per spec §8.4 / rv-per-tier-ttl).
+/// The caller must call `effective_ttl_secs` before spawning this task.
 async fn insert_into_l2(
     l2: L2Config,
     org_id: Uuid,
@@ -983,7 +1016,7 @@ async fn insert_into_l2(
     response: ChatCompletionResponse,
     _provider_id: String,
     model_used: String,
-    ttl_override: Option<u64>,
+    ttl_secs: u64,
 ) {
     let embedding_model = l2.embedder.model().to_string();
     let embed = match l2.embedder.embed(query_text).await {
@@ -1000,9 +1033,7 @@ async fn insert_into_l2(
             return;
         }
     };
-    let ttl = ttl_override
-        .map(Duration::from_secs)
-        .unwrap_or(L2_DEFAULT_TTL);
+    let ttl = Duration::from_secs(ttl_secs);
     let now = Utc::now();
     let entry = CacheEntry {
         id: Uuid::now_v7(),
@@ -1548,6 +1579,113 @@ mod fee_tests {
         assert!(
             (base_fee - base * 1.05).abs() < 1e-12,
             "base_fee = {base_fee}"
+        );
+    }
+}
+
+/// Tests for the per-tier TTL selection (rv-per-tier-ttl, spec §8.4).
+///
+/// Covers:
+/// (a) `CallerTier::ttl_secs()` returns the correct values per tier.
+/// (b) `effective_ttl_secs` returns the tier TTL when no override is present.
+/// (c) Absent tier (None) falls back to the supplied default (24h behavior).
+/// (d) `tt_extras` override wins over both tier and default.
+#[cfg(test)]
+mod tier_ttl_tests {
+    use super::*;
+    use tt_shared::CallerTier;
+
+    const SECS_24H: u64 = 24 * 60 * 60;
+    const SECS_7D: u64 = 7 * 24 * 60 * 60;
+    const SECS_30D: u64 = 30 * 24 * 60 * 60;
+
+    // (a) CallerTier::ttl_secs() returns the correct per-tier values.
+
+    #[test]
+    fn free_tier_ttl_is_24h() {
+        assert_eq!(CallerTier::Free.ttl_secs(), SECS_24H);
+    }
+
+    #[test]
+    fn pro_tier_ttl_is_7d() {
+        assert_eq!(CallerTier::Pro.ttl_secs(), SECS_7D);
+    }
+
+    #[test]
+    fn team_tier_ttl_is_7d() {
+        // Team and Pro share the same 7d band per spec §8.4.
+        assert_eq!(CallerTier::Team.ttl_secs(), SECS_7D);
+    }
+
+    #[test]
+    fn scale_tier_ttl_is_30d() {
+        assert_eq!(CallerTier::Scale.ttl_secs(), SECS_30D);
+    }
+
+    // (b) effective_ttl_secs returns the tier TTL when no override is present.
+
+    #[test]
+    fn no_override_free_tier_returns_24h() {
+        assert_eq!(
+            effective_ttl_secs(None, Some(CallerTier::Free), SECS_24H),
+            SECS_24H
+        );
+    }
+
+    #[test]
+    fn no_override_pro_tier_returns_7d() {
+        assert_eq!(
+            effective_ttl_secs(None, Some(CallerTier::Pro), SECS_24H),
+            SECS_7D
+        );
+    }
+
+    #[test]
+    fn no_override_team_tier_returns_7d() {
+        assert_eq!(
+            effective_ttl_secs(None, Some(CallerTier::Team), SECS_24H),
+            SECS_7D
+        );
+    }
+
+    #[test]
+    fn no_override_scale_tier_returns_30d() {
+        assert_eq!(
+            effective_ttl_secs(None, Some(CallerTier::Scale), SECS_24H),
+            SECS_30D
+        );
+    }
+
+    // (c) Absent tier (None) falls back to the default — existing 24h behavior.
+
+    #[test]
+    fn absent_tier_uses_default() {
+        assert_eq!(effective_ttl_secs(None, None, SECS_24H), SECS_24H);
+    }
+
+    #[test]
+    fn absent_tier_uses_custom_default() {
+        // When the caller passes a non-standard default, that default is honored.
+        assert_eq!(effective_ttl_secs(None, None, 3600), 3600);
+    }
+
+    // (d) tt_extras override wins over both tier TTL and default.
+
+    #[test]
+    fn request_override_beats_tier_ttl() {
+        let override_secs = 7200_u64;
+        assert_eq!(
+            effective_ttl_secs(Some(override_secs), Some(CallerTier::Scale), SECS_24H),
+            override_secs
+        );
+    }
+
+    #[test]
+    fn request_override_beats_default() {
+        let override_secs = 3600_u64;
+        assert_eq!(
+            effective_ttl_secs(Some(override_secs), None, SECS_24H),
+            override_secs
         );
     }
 }

@@ -10,6 +10,7 @@
 //! mitigate CPU-exhaustion spam. See `crates/core/src/middleware/key_cache.rs`
 //! for the revocation-staleness tradeoff documentation.
 
+use tt_shared::CallerTier;
 use uuid::Uuid;
 
 pub mod credentials;
@@ -31,10 +32,19 @@ pub use keys::{
 /// Context returned after a successful API key verification.
 ///
 /// Carries the minimum identity information needed by downstream middleware.
+///
+/// `tier` is set by the cloud tier-resolution layer (`rv-tier-limits-enforcement`).
+/// Until that layer is wired, `tier` is always `None` and the gateway defaults
+/// to the conservative 24h cache TTL (spec §8.4). The field is `Option` so
+/// the production default is preserved without any code change when the cloud
+/// later injects the real tier.
 #[derive(Debug, Clone)]
 pub struct ApiKeyContext {
     /// Unique key identifier matching [`ApiKey::id`].
     pub key_id: Uuid,
     /// Organization this key was issued to.
     pub org_id: Uuid,
+    /// Subscription tier, injected by the cloud tier-resolution layer once
+    /// `rv-tier-limits-enforcement` is wired. `None` → 24h TTL default.
+    pub tier: Option<CallerTier>,
 }

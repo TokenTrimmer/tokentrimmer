@@ -419,6 +419,10 @@ pub async fn verify<S: KeyStore + ?Sized>(
     Ok(ApiKeyContext {
         key_id: key.id,
         org_id: key.org_id,
+        // `tier` is injected by the cloud tier-resolution layer
+        // (rv-tier-limits-enforcement). Until that layer is wired, `None`
+        // causes the gateway to fall back to the 24h conservative default.
+        tier: None,
     })
 }
 

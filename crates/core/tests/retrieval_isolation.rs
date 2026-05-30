@@ -238,6 +238,7 @@ async fn different_orgs_do_not_share_retrieval_data() {
             ApiKeyContext {
                 key_id: Uuid::new_v4(),
                 org_id: org_a,
+                tier: None,
             },
         ))
         .await
@@ -279,6 +280,7 @@ async fn different_orgs_do_not_share_retrieval_data() {
             ApiKeyContext {
                 key_id: Uuid::new_v4(),
                 org_id: org_b,
+                tier: None,
             },
         ))
         .await

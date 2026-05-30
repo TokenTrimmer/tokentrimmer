@@ -464,6 +464,7 @@ mod tests {
         let ctx = ApiKeyContext {
             key_id: Uuid::new_v4(),
             org_id,
+            tier: None,
         };
 
         let req = HttpRequest::builder()
