@@ -3,5 +3,6 @@
 
 pub mod cost_diff;
 pub mod init;
+pub mod plan_suggest;
 pub mod proxy;
 pub mod retrieval;

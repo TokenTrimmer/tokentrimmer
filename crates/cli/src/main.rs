@@ -40,6 +40,15 @@ enum Command {
         /// In `--cost-diff` mode, exit non-zero when a net cost increase is projected.
         #[arg(long)]
         fail_on_cost_increase: bool,
+        /// Suggest-plan mode: scan `path` for model strings, generate cheaper-model
+        /// route suggestions via the preview engine, and emit a skeleton
+        /// `PlanInput` JSON with `proposed_routes` pre-filled.
+        ///
+        /// The output can be fed straight into `tt plan --input <file>` after
+        /// filling in `org_id`, `requests`, and the replay window.
+        /// Pairs with `--output` to write to a file instead of stdout.
+        #[arg(long, conflicts_with_all = ["cost_diff"])]
+        suggest_plan: bool,
     },
     /// Replay historical telemetry against a proposed config and project
     /// cost/savings/cache-hit-rate impact with bootstrap confidence intervals.
@@ -216,9 +225,12 @@ async fn main() -> anyhow::Result<()> {
             cost_diff,
             base,
             fail_on_cost_increase,
+            suggest_plan,
         } => {
             if cost_diff {
                 run_cost_diff(&path, &base, output.as_deref(), fail_on_cost_increase)?;
+            } else if suggest_plan {
+                run_suggest_plan(&path, output.as_deref())?;
             } else {
                 run_inspect(&path, &fail_on, output.as_deref())?;
             }
@@ -847,6 +859,29 @@ fn run_inspect(path: &str, fail_on: &str, output: Option<&str>) -> anyhow::Resul
             above.len(),
             fail_on_sev,
         );
+    }
+
+    Ok(())
+}
+
+/// Run `tt inspect --suggest-plan`: scan `path` for LLM model strings, generate
+/// preview route suggestions for each unique model found, and emit a skeleton
+/// [`tt_plan_core::PlanInput`] JSON with `proposed_routes` pre-filled.
+///
+/// Users write the output to a file (via `--output`), fill in `org_id` /
+/// `requests` / `pricing`, then run `tt plan --input <file>` to replay.
+fn run_suggest_plan(path: &str, output: Option<&str>) -> anyhow::Result<()> {
+    let json = tt_cli::plan_suggest::build_plan_input_json(path)?;
+
+    match output {
+        Some(p) if !p.is_empty() && p != "-" => {
+            std::fs::write(p, &json)
+                .map_err(|e| anyhow::anyhow!("failed to write plan input to {p}: {e}"))?;
+            eprintln!("wrote plan-input skeleton to {p}  (edit org_id + requests, then: tt plan --input {p})");
+        }
+        _ => {
+            print!("{json}");
+        }
     }
 
     Ok(())
