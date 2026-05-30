@@ -5,6 +5,7 @@
 //! Week-1+ iterations and intentionally NOT wired here yet — keep the skeleton
 //! testable end-to-end first.
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::{
     routing::{get, post},
@@ -69,6 +70,10 @@ pub fn build_router_with_retrieval(
             .allow_methods(Any)
             .allow_headers(Any),
     )
+    // Explicit request-body cap. Axum's default is only 2MB — too small for
+    // large-context chat requests (256k-token windows can exceed it). Sized
+    // for the largest supported context; returns 413 on exceed. (§4.15)
+    .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
     .with_state(state)
 }
 
@@ -435,6 +440,27 @@ mod tests {
             .unwrap();
         let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(envelope["error"]["code"], "model_not_found");
+    }
+
+    #[tokio::test]
+    async fn embeddings_returns_501_not_implemented() {
+        let body = serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": "hello",
+        });
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 501 Not Implemented — not a misleading 404 (§4.15).
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     // ── Dispatch tests (new — w6-gateway-dispatch) ─────────────────────────────
