@@ -232,11 +232,28 @@ impl ProviderCredentialStore for EnvProviderCredentialStore {
 pub struct ChainedProviderCredentialStore<A, B> {
     pub primary: A,
     pub fallback: B,
+    /// Set once the fallback has served a credential, so the multi-tenant
+    /// misconfiguration warning fires at most once per process, not per request.
+    env_fallback_warned: std::sync::atomic::AtomicBool,
 }
 
 impl<A, B> ChainedProviderCredentialStore<A, B> {
+    /// Try `primary` first; fall back to `secondary` on `None`.
+    ///
+    /// SECURITY: the fallback is intended for single-tenant / self-host
+    /// dogfooding (e.g. [`EnvProviderCredentialStore`], which ignores `org_id`
+    /// and returns one shared process-env key for ALL orgs). In a HOSTED /
+    /// multi-tenant deployment do NOT chain a shared env store — use the
+    /// Postgres store alone and fail closed (the gateway then falls back to the
+    /// customer's own raw Bearer) so one org can't be billed against / exposed
+    /// to another org's shared key. When the fallback serves a credential this
+    /// store logs a one-time warning to surface such a misconfiguration. (§5.10)
     pub fn new(primary: A, fallback: B) -> Self {
-        Self { primary, fallback }
+        Self {
+            primary,
+            fallback,
+            env_fallback_warned: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -251,10 +268,31 @@ where
         org_id: Uuid,
         provider_id: &str,
     ) -> Result<Option<ProviderCredentials>, CredentialError> {
-        match self.primary.get(org_id, provider_id).await? {
-            Some(c) => Ok(Some(c)),
-            None => self.fallback.get(org_id, provider_id).await,
+        if let Some(c) = self.primary.get(org_id, provider_id).await? {
+            return Ok(Some(c));
         }
+        let fallback = self.fallback.get(org_id, provider_id).await?;
+        if fallback.is_some()
+            && self
+                .env_fallback_warned
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            tracing::warn!(
+                %org_id,
+                provider_id,
+                "provider credential served from the SHARED fallback store (e.g. process env) — \
+                 OK for single-tenant/self-host, but a misconfiguration in a multi-tenant \
+                 deployment (an org billed against / exposed to a shared key). Use Postgres-only \
+                 + fail-closed in hosted mode. (warns once per process)"
+            );
+        }
+        Ok(fallback)
     }
 
     async fn count_for_org(&self, org_id: Uuid) -> Result<u32, CredentialError> {
