@@ -4807,6 +4807,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tt-shared",
+ "unicode-normalization",
  "uuid",
 ]
 

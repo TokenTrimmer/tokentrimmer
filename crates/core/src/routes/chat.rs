@@ -50,6 +50,114 @@ use crate::{
 /// auth layer surfaces the caller's tier.
 const L2_DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// TTL for negative-cache entries (deterministic 4xx errors).
+///
+/// Short by design: a client error cached for too long would prevent legitimate
+/// retries after the caller fixes their request.  60 s is enough to protect
+/// against hot-loop bad-request storms while expiring fast enough not to
+/// confuse operators.
+const NEGATIVE_CACHE_TTL_SECS: u64 = 60;
+
+/// Key prefix that separates negative-cache entries from positive-cache entries
+/// in the shared L1 store.
+const NEGATIVE_CACHE_PREFIX: &str = "neg:";
+
+// ---------------------------------------------------------------------------
+// Negative-cache helpers (rv-cache-key-canonicalization §2.20)
+// ---------------------------------------------------------------------------
+
+/// A minimal, serializable record stored as a negative-cache entry.
+///
+/// Contains just enough to reconstruct the original error response when the
+/// negative cache is hit.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct NegativeCacheEntry {
+    /// HTTP status code of the original error response.
+    status: u16,
+    /// Human-readable error message, preserved verbatim.
+    message: String,
+}
+
+/// Returns `true` when `err` is a **deterministic** client error that is safe
+/// to negative-cache.
+///
+/// The only errors that qualify are those that will produce the same failure
+/// for every identical re-submission of the same request:
+/// - `ProviderError::InvalidRequest` (upstream 400 / 422)
+/// - `ProviderError::ProviderUpstream` with a 4xx status OTHER THAN 429
+///   (which is rate-limited and transient)
+/// - `ApiError::InvalidRequest` (our own 400 validation — e.g. malformed JSON)
+///
+/// Errors that MUST NOT be negative-cached:
+/// - 429 / `RateLimited` — transient; retry must always reach the provider.
+/// - 408 / `Timeout` — transient.
+/// - 5xx / `ProviderUpstream { status >= 500 }` — server-side transient.
+/// - `Network` — transient.
+/// - `Internal` / `Deserialize` — our own bugs; must not suppress retries.
+fn is_deterministic_client_error(err: &ApiError) -> bool {
+    use tt_shared::ProviderError;
+    match err {
+        // Our own 400 validation before even hitting the provider.
+        ApiError::InvalidRequest(_) => true,
+        // Provider returned a deterministic 4xx (but NOT 429).
+        ApiError::Provider(pe) => match pe {
+            ProviderError::InvalidRequest(_) => true,
+            ProviderError::ProviderUpstream { status, .. } => {
+                // 4xx client errors are deterministic; 429 is rate-limited
+                // (transient) so it is explicitly excluded.
+                *status >= 400 && *status < 500 && *status != 429
+            }
+            // Transient or server-side errors — never cache.
+            ProviderError::RateLimited { .. }
+            | ProviderError::Timeout { .. }
+            | ProviderError::Network(_)
+            | ProviderError::ModelNotFound { .. }
+            | ProviderError::Unauthorized(_)
+            | ProviderError::Deserialize(_)
+            | ProviderError::Internal(_)
+            | ProviderError::Unsupported(_) => false,
+        },
+        // All other ApiError variants are either auth/rate/server errors — never cache.
+        ApiError::Unauthorized
+        | ApiError::PaymentRequired
+        | ApiError::Forbidden(_)
+        | ApiError::ModelNotFound { .. }
+        | ApiError::RateLimited { .. }
+        | ApiError::Internal(_) => false,
+    }
+}
+
+/// Derive the HTTP status code that would be returned for `err`.
+fn error_status_code(err: &ApiError) -> u16 {
+    use axum::http::StatusCode;
+    use tt_shared::ProviderError;
+    let status: StatusCode = match err {
+        ApiError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+        ApiError::PaymentRequired => StatusCode::PAYMENT_REQUIRED,
+        ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+        ApiError::ModelNotFound { .. } => StatusCode::NOT_FOUND,
+        ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+        ApiError::Provider(pe) => match pe {
+            ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            ProviderError::ProviderUpstream { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
+            }
+            _ => StatusCode::BAD_GATEWAY,
+        },
+        ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    status.as_u16()
+}
+
+/// Compute the L1 key for a negative-cache entry.
+///
+/// Uses the same namespaced positive key with a `"neg:"` prefix so the two
+/// namespaces can never collide.
+fn negative_l1_key(positive_key: &str) -> String {
+    format!("{NEGATIVE_CACHE_PREFIX}{positive_key}")
+}
+
 /// Select the effective cache TTL (seconds) for an insert operation.
 ///
 /// Priority (highest → lowest):
@@ -509,6 +617,64 @@ pub async fn handler(
             .l1
             .as_ref()
             .map(|_| namespaced_l1_key(ctx.org_id, &req));
+
+        // 3a-neg. Negative-cache lookup — check before positive L1/L2.
+        //
+        // If a previous identical request received a deterministic 4xx from the
+        // provider, the error is stored in L1 under "neg:{l1_key}" with a short
+        // TTL (NEGATIVE_CACHE_TTL_SECS).  Serve the cached error immediately to
+        // avoid re-hitting the provider with a request that will fail again.
+        //
+        // Gated on the same cache_behavior.do_lookup flag so bypass/read-only
+        // semantics are respected.  Only wired for the non-streaming path
+        // (streaming errors are not deterministic in the same way).
+        if cache_behavior.do_lookup {
+            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
+                let neg_key = negative_l1_key(key);
+                match l1.cache.get(&neg_key).await {
+                    Ok(Some(bytes)) => {
+                        match serde_json::from_slice::<NegativeCacheEntry>(&bytes) {
+                            Ok(neg) => {
+                                tracing::debug!(
+                                    key = %neg_key,
+                                    status = neg.status,
+                                    "negative cache hit — short-circuiting provider call"
+                                );
+                                // Reconstruct and return the cached error response.
+                                let err_body = serde_json::json!({
+                                    "error": {
+                                        "message": neg.message,
+                                        "type": "invalid_request_error",
+                                        "code": "cached_client_error",
+                                        "param": null
+                                    }
+                                });
+                                let status = axum::http::StatusCode::from_u16(neg.status)
+                                    .unwrap_or(axum::http::StatusCode::BAD_REQUEST);
+                                let mut resp = (status, Json(err_body)).into_response();
+                                if let Ok(v) = "neg-hit".parse() {
+                                    resp.headers_mut().insert("x-tokentrimmer-cache", v);
+                                }
+                                return Ok(resp);
+                            }
+                            Err(e) => {
+                                // Deserialization failure is non-fatal; fall through.
+                                tracing::warn!(
+                                    error = %e,
+                                    key = %neg_key,
+                                    "negative cache entry deserialization failed — ignoring"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(error = %e, "negative cache lookup error — ignoring");
+                    }
+                }
+            }
+        }
+
         if cache_behavior.do_lookup {
             if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
                 match l1.cache.get(key).await {
@@ -664,12 +830,13 @@ pub async fn handler(
         //     circuit breaker is open; otherwise dispatch the single provider
         //     with retry. `provider` is rebound to whichever provider actually
         //     served the request so cost/headers/telemetry below reflect it.
-        let (provider, response) = if route_fallbacks.is_empty() {
-            let resp = with_retry(&RetryPolicy::default(), || {
+        let dispatch_result: ApiResult<_> = if route_fallbacks.is_empty() {
+            with_retry(&RetryPolicy::default(), || {
                 provider.chat_completion(req.clone(), &ctx)
             })
-            .await?;
-            (provider, resp)
+            .await
+            .map(|resp| (provider, resp))
+            .map_err(ApiError::from)
         } else {
             let candidates: Vec<String> = std::iter::once(req.model.clone())
                 .chain(route_fallbacks.iter().cloned())
@@ -693,8 +860,66 @@ pub async fn handler(
                     estimated_tokens: cap_est_tokens,
                 }),
             )
-            .await?
+            .await
+            .map_err(ApiError::from)
         };
+
+        // 3c-neg. Negative-cache write on deterministic client errors.
+        //
+        // When the provider returned a deterministic 4xx (e.g. InvalidRequest /
+        // ProviderUpstream 400..=499 excluding 429), store a short-lived entry
+        // in L1 under "neg:{l1_key}" so identical repeat requests are served
+        // from the negative cache instead of re-hitting the provider.
+        //
+        // Gated on cache_behavior.do_insert — the same flag used for positive
+        // cache inserts — so Bypass/ReadOnly mode suppresses negative caching
+        // as well as positive caching.
+        //
+        // NEVER caches: 429/RateLimited, timeout, 5xx, network, internal errors.
+        if let Err(ref err) = dispatch_result {
+            if cache_behavior.do_insert && is_deterministic_client_error(err) {
+                if let (Some(l1), Some(pos_key)) = (state.l1.as_ref(), l1_key.as_ref()) {
+                    let neg_key = negative_l1_key(pos_key);
+                    let entry = NegativeCacheEntry {
+                        status: error_status_code(err),
+                        message: err.to_string(),
+                    };
+                    match serde_json::to_vec(&entry) {
+                        Ok(bytes) => {
+                            let l1_clone = l1.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = l1_clone
+                                    .cache
+                                    .set(&neg_key, &bytes, NEGATIVE_CACHE_TTL_SECS)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        error = %e,
+                                        key = %neg_key,
+                                        "negative cache insert failed"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        key = %neg_key,
+                                        "negative cache entry stored"
+                                    );
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "negative cache entry serialization failed"
+                            );
+                        }
+                    }
+                }
+            }
+            // Also drop any single-flight guard so followers don't wait forever.
+            drop(single_flight_guard.take());
+        }
+
+        let (provider, response) = dispatch_result?;
 
         // 3d. Compute cost via provider pricing table BEFORE caching — the L1
         //     envelope carries baseline_cost_usd so hit responses can report

@@ -174,7 +174,103 @@ async fn test_key_stop_order_independent() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8 — Redis round-trip (requires REDIS_URL env var; skipped otherwise)
+// Test 8 — Content normalization: trailing whitespace produces the same key
+// ---------------------------------------------------------------------------
+
+/// Two requests that differ only in trailing whitespace on a message must
+/// produce the SAME cache key (normalization collapses them).
+#[tokio::test]
+async fn test_key_trailing_whitespace_same_key() {
+    let req_clean = base_request(); // "hello world"
+    let mut req_trailing = base_request();
+    req_trailing.messages = vec![Message::User {
+        content: MessageContent::Text("hello world   \n\t".into()),
+        name: None,
+    }];
+
+    assert_eq!(
+        cache_key(&req_clean),
+        cache_key(&req_trailing),
+        "trailing whitespace must not produce a different cache key"
+    );
+}
+
+/// A request with semantically-different content (not just whitespace) must
+/// still produce a DIFFERENT key — normalization must not over-collapse.
+#[tokio::test]
+async fn test_key_different_semantic_content_differs() {
+    let req_a = base_request(); // "hello world"
+    let mut req_b = base_request();
+    req_b.messages = vec![Message::User {
+        content: MessageContent::Text("goodbye world".into()),
+        name: None,
+    }];
+
+    assert_ne!(
+        cache_key(&req_a),
+        cache_key(&req_b),
+        "semantically different messages must produce different keys even after normalization"
+    );
+}
+
+/// Two requests that differ only in NFC vs NFD Unicode form must produce the
+/// SAME cache key.  'é' as U+00E9 (NFC, single code point) vs U+0065 U+0301
+/// (NFD, base + combining accent) encode the same character.
+#[tokio::test]
+async fn test_key_nfc_nfd_same_key() {
+    // U+00E9 — precomposed é (NFC form)
+    let nfc_text = "\u{00E9}";
+    // U+0065 U+0301 — e + combining acute accent (NFD form)
+    let nfd_text = "\u{0065}\u{0301}";
+    assert_ne!(nfc_text, nfd_text, "sanity: raw strings must differ");
+
+    let mut req_nfc = base_request();
+    req_nfc.messages = vec![Message::User {
+        content: MessageContent::Text(nfc_text.into()),
+        name: None,
+    }];
+    let mut req_nfd = base_request();
+    req_nfd.messages = vec![Message::User {
+        content: MessageContent::Text(nfd_text.into()),
+        name: None,
+    }];
+
+    assert_eq!(
+        cache_key(&req_nfc),
+        cache_key(&req_nfd),
+        "NFC and NFD forms of the same character must produce the same cache key"
+    );
+}
+
+/// Normalization applies only to the KEY derivation — the original request
+/// object is not mutated.  Verify the request's message text is unchanged.
+#[tokio::test]
+async fn test_key_normalization_does_not_mutate_request() {
+    let original_text = "hello world   \n";
+    let mut req = base_request();
+    req.messages = vec![Message::User {
+        content: MessageContent::Text(original_text.into()),
+        name: None,
+    }];
+
+    let _key = cache_key(&req);
+
+    // The request must be unchanged after key derivation.
+    match &req.messages[0] {
+        Message::User { content, .. } => match content {
+            MessageContent::Text(s) => assert_eq!(
+                s.as_str(),
+                original_text,
+                "cache_key must not mutate the request"
+            ),
+            _ => panic!("expected Text content"),
+        },
+        _ => panic!("expected User message"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 — Redis round-trip (requires REDIS_URL env var; skipped otherwise)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
