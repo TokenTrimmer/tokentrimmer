@@ -47,15 +47,23 @@ Because every row in `provider_credentials` is sealed with a key **derived from*
 `TT_MASTER_KEY` (+ per-(org,provider) salt + AAD), rotating the master key means
 re-sealing every credential:
 
-1. Stand up the new key as `TT_MASTER_KEY_NEXT` alongside the current one.
-2. For each credential: decrypt with the **old** derived key, re-encrypt with the
-   **new** derived key, write back in a transaction.
-3. Promote `TT_MASTER_KEY_NEXT` → `TT_MASTER_KEY`; remove the old key.
-4. Verify a sample credential decrypts; record the rotation as an audit event.
+The re-encryption primitive now exists:
+**`tt_auth::postgres::PostgresProviderCredentialStore::reencrypt_all(&new_master_key)`**
+(crates/auth/src/postgres.rs) decrypts every row under the current key and
+re-seals it under the new one in a single all-or-nothing transaction. Procedure:
 
-(If a re-encryption migration binary does not yet exist, this is the one piece
-of tooling to write before rotating — do **not** swap `TT_MASTER_KEY` in place,
-or every stored credential becomes undecryptable.)
+1. Build the store with the **current** key: `PostgresProviderCredentialStore::from_env(pool)`.
+2. Call `store.reencrypt_all(&new_key_bytes)` — returns the row count re-sealed
+   (transaction rolls back if any row fails, so the table is never half-rotated).
+3. Promote the new key → `TT_MASTER_KEY` (e.g. `fly secrets set`); restart so the
+   gateway/api read it. Remove the old key.
+4. Verify a sample credential decrypts under the new key; record the rotation as
+   an audit event.
+
+Do **not** swap `TT_MASTER_KEY` in place without running `reencrypt_all` first, or
+every stored credential becomes undecryptable. _(An operator-facing `tt`
+subcommand wrapping `reencrypt_all` is a thin follow-up; the primitive + its
+DB-free round-trip test ship today.)_
 
 ## Operator checklist (the human-gated part)
 

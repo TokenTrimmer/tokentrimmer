@@ -184,13 +184,7 @@ impl PostgresProviderCredentialStore {
     /// dep tree thinner — no `hkdf` crate — without giving up the property
     /// that a leak of one row's ciphertext does not help decrypt another.
     fn derive_key(&self, org_id: Uuid, provider: &str) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(self.master_key);
-        h.update(b"|tt-auth:cred-key:v1|");
-        h.update(org_id.as_bytes());
-        h.update(b"|");
-        h.update(provider.as_bytes());
-        h.finalize().into()
+        derive_key_with(&self.master_key, org_id, provider)
     }
 
     /// Build the AAD bytes for an encrypt/decrypt operation.
@@ -227,6 +221,111 @@ impl PostgresProviderCredentialStore {
             .map_err(|_| CredentialStoreError::Decrypt)?;
         String::from_utf8(plain).map_err(|_| CredentialStoreError::Decrypt)
     }
+
+    /// Re-encrypt every stored credential from this store's (current/OLD) master
+    /// key to `new_master_key`, in a single all-or-nothing transaction. Run this
+    /// BEFORE promoting a new `TT_MASTER_KEY`: build the store with the current
+    /// key, call `reencrypt_all(&new_key)`, then swap the env var and restart.
+    /// Each row is decrypted under its old per-row derived key and re-sealed
+    /// under the new one (fresh nonce, same `(org_id, provider)` AAD). Returns
+    /// the number of rows re-encrypted. This is the tooling the secret-rotation
+    /// runbook (`docs/SECRETS.md`) requires before a master-key swap.
+    pub async fn reencrypt_all(
+        &self,
+        new_master_key: &[u8; 32],
+    ) -> Result<usize, CredentialStoreError> {
+        let rows: Vec<(Uuid, Uuid, String, Vec<u8>)> =
+            sqlx::query_as(r#"SELECT id, org_id, provider, secret_enc FROM provider_credentials"#)
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut tx = self.pool.begin().await?;
+        let mut count = 0usize;
+        for (id, org_id, provider, blob) in rows {
+            // Decrypt under the OLD master, re-seal under the NEW one. A bad row
+            // (truncated / wrong key) aborts the whole transaction — rotation is
+            // all-or-nothing so we never leave a half-rotated table.
+            let plain = decrypt_blob(&self.master_key, org_id, &provider, &blob)?;
+            let new_blob = encrypt_blob(new_master_key, org_id, &provider, &plain)?;
+            sqlx::query(
+                r#"UPDATE provider_credentials SET secret_enc = $1, rotated_at = now() WHERE id = $2"#,
+            )
+            .bind(&new_blob)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            count += 1;
+        }
+        tx.commit().await?;
+        Ok(count)
+    }
+}
+
+/// Derive the per-row encryption key from a given master key. Parameterized so
+/// rotation can derive under both the old and new master; the instance
+/// `derive_key` delegates here so the SHA-256 KDF has a single definition.
+fn derive_key_with(master: &[u8; 32], org_id: Uuid, provider: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(master);
+    h.update(b"|tt-auth:cred-key:v1|");
+    h.update(org_id.as_bytes());
+    h.update(b"|");
+    h.update(provider.as_bytes());
+    h.finalize().into()
+}
+
+/// Seal `plain` under the per-row key derived from `master` (fresh random nonce,
+/// AAD bound to `(org_id, provider)`). Returns `nonce || ciphertext`.
+fn encrypt_blob(
+    master: &[u8; 32],
+    org_id: Uuid,
+    provider: &str,
+    plain: &str,
+) -> Result<Vec<u8>, CredentialStoreError> {
+    let derived = derive_key_with(master, org_id, provider);
+    let cipher = XChaCha20Poly1305::new((&derived).into());
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let aad = PostgresProviderCredentialStore::aad(org_id, provider);
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            chacha20poly1305::aead::Payload {
+                msg: plain.as_bytes(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CredentialStoreError::Encrypt)?;
+    let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// Open a `nonce || ciphertext` blob under the per-row key derived from `master`.
+fn decrypt_blob(
+    master: &[u8; 32],
+    org_id: Uuid,
+    provider: &str,
+    blob: &[u8],
+) -> Result<String, CredentialStoreError> {
+    if blob.len() < NONCE_LEN {
+        return Err(CredentialStoreError::CiphertextTooShort { len: blob.len() });
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
+    let nonce = XNonce::from_slice(nonce_bytes);
+    let derived = derive_key_with(master, org_id, provider);
+    let cipher = XChaCha20Poly1305::new((&derived).into());
+    let aad = PostgresProviderCredentialStore::aad(org_id, provider);
+    let plain = cipher
+        .decrypt(
+            nonce,
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CredentialStoreError::Decrypt)?;
+    String::from_utf8(plain).map_err(|_| CredentialStoreError::Decrypt)
 }
 
 #[async_trait]
@@ -650,5 +749,33 @@ mod tests {
             err,
             CredentialStoreError::CiphertextTooShort { len: 5 }
         ));
+    }
+
+    /// Core rotation crypto (no DB): a blob sealed under the OLD master, then
+    /// decrypted + re-sealed under the NEW master, opens under NEW and not OLD.
+    /// This is the per-row step `reencrypt_all` performs across the table.
+    #[tokio::test]
+    async fn reencrypt_moves_ciphertext_to_new_master() {
+        let old = [9u8; 32];
+        let new = [4u8; 32];
+        let org = Uuid::from_u128(7);
+        let provider = "openai";
+        let plain = "sk-live-rotate-me";
+
+        let blob_old = encrypt_blob(&old, org, provider, plain).unwrap();
+        // The rotation step: decrypt under old, re-seal under new.
+        let recovered = decrypt_blob(&old, org, provider, &blob_old).unwrap();
+        let blob_new = encrypt_blob(&new, org, provider, &recovered).unwrap();
+
+        // Re-sealed blob opens under the NEW master…
+        assert_eq!(decrypt_blob(&new, org, provider, &blob_new).unwrap(), plain);
+        // …and NOT under the OLD master (rotation actually changed the key).
+        assert!(decrypt_blob(&old, org, provider, &blob_new).is_err());
+        // Free helpers agree with the instance method (same KDF + AAD + format).
+        let store = PostgresProviderCredentialStore {
+            pool: panic_pool(),
+            master_key: new,
+        };
+        assert_eq!(store.decrypt(org, provider, &blob_new).unwrap(), plain);
     }
 }

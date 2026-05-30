@@ -19,13 +19,22 @@ regex = "1.11"
 uuid.workspace = true
 async-trait = "0.1"
 
+# Crypto for the encrypted-prompt retrieval audit log (postgres feature only).
+chacha20poly1305 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
 [features]
 default = []
-postgres = ["dep:sqlx"]
+postgres = ["dep:sqlx", "dep:pgvector", "dep:chacha20poly1305", "dep:sha2", "dep:hex"]
 
 [dependencies.sqlx]
 workspace = true
-features = ["postgres", "runtime-tokio-rustls"]
+features = ["postgres", "runtime-tokio-rustls", "uuid", "json"]
+optional = true
+
+[dependencies.pgvector]
+workspace = true
 optional = true
 
 [dev-dependencies]

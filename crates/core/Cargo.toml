@@ -10,7 +10,7 @@ description = "Axum HTTP server, routing engine, middleware, and provider regist
 tt-shared.workspace = true
 tt-tokenize.workspace = true
 tt-cache.workspace = true
-tt-retrieval.workspace = true
+tt-retrieval = { workspace = true, features = ["postgres"] }
 tt-preview.workspace = true
 tt-routing.workspace = true
 tt-auth.workspace = true

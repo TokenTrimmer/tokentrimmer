@@ -2,6 +2,8 @@
 //!
 //! See `docs/superpowers/specs/2026-05-28-trackE-rag-context-compression-design.md`.
 
+#[cfg(feature = "postgres")]
+pub mod audit;
 pub mod chunking;
 pub mod embed;
 pub mod error;

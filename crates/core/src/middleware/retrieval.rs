@@ -6,8 +6,9 @@
 //! response header on the response.
 //!
 //! # Activation
-//! Set `TT_RETRIEVAL_STORE=memory` and `TT_OPENAI_EMBED_KEY=<key>` at
-//! Gateway boot. When either is absent, retrieval is disabled and
+//! Set `TT_RETRIEVAL_STORE=memory|postgres` and `TT_OPENAI_EMBED_KEY=<key>` at
+//! Gateway boot (the `postgres` store also needs `DATABASE_URL`). When the
+//! required vars are absent, retrieval is disabled and
 //! `x-tt-retrieval-enabled: disabled` is returned on every response.
 
 use std::sync::Arc;
@@ -21,7 +22,9 @@ use tracing::{debug, warn};
 
 use tt_auth::ApiKeyContext;
 use tt_retrieval::embed::EmbeddingClient;
+use tt_retrieval::audit::RetrievalAuditLog;
 use tt_retrieval::store::memory::MemoryStore;
+use tt_retrieval::store::postgres::PostgresStore;
 use tt_retrieval::store::RetrievalStore;
 use tt_retrieval::substitute_in_messages;
 
@@ -33,6 +36,9 @@ const MAX_BYTES: usize = 1 << 20;
 pub struct RetrievalState {
     pub store: Arc<dyn RetrievalStore + Send + Sync>,
     pub embedder: Arc<EmbeddingClient>,
+    /// Encrypted-prompt audit log (Track E §10). `Some` only with the Postgres
+    /// store + `TT_MASTER_KEY`; writes are best-effort and never fail a request.
+    pub audit: Option<Arc<RetrievalAuditLog>>,
 }
 
 /// Build `RetrievalState` from environment variables.
@@ -56,8 +62,36 @@ pub fn build_retrieval_state() -> Option<RetrievalState> {
         }
     };
 
+    // Optional encrypted-prompt audit log (Track E §10) — built alongside the
+    // Postgres store when TT_MASTER_KEY is present.
+    let mut audit: Option<Arc<RetrievalAuditLog>> = None;
     let store: Arc<dyn RetrievalStore + Send + Sync> = match store_kind.as_str() {
         "memory" => Arc::new(MemoryStore::new()),
+        "postgres" => {
+            let url = match std::env::var("DATABASE_URL") {
+                Ok(u) => u,
+                Err(_) => {
+                    warn!(
+                        "TT_RETRIEVAL_STORE=postgres but DATABASE_URL is missing — retrieval middleware disabled"
+                    );
+                    return None;
+                }
+            };
+            // Lazy pool: connects on first use, so this stays sync and never
+            // blocks boot on a cold Neon start (mirrors the L2 cache wiring).
+            match sqlx::PgPool::connect_lazy(&url) {
+                Ok(pool) => {
+                    // The audit log shares the pool; enabled only when
+                    // TT_MASTER_KEY is set (otherwise it's silently off).
+                    audit = RetrievalAuditLog::from_env(pool.clone()).map(Arc::new);
+                    Arc::new(PostgresStore::new(pool))
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to build Postgres retrieval store — retrieval middleware disabled");
+                    return None;
+                }
+            }
+        }
         other => {
             warn!(
                 store_kind = %other,
@@ -68,7 +102,11 @@ pub fn build_retrieval_state() -> Option<RetrievalState> {
     };
 
     let embedder = Arc::new(EmbeddingClient::openai(embed_key));
-    Some(RetrievalState { store, embedder })
+    Some(RetrievalState {
+        store,
+        embedder,
+        audit,
+    })
 }
 
 /// Middleware entry point when retrieval is **disabled** (no env vars or
@@ -207,6 +245,23 @@ pub async fn maybe_substitute(
             }
             if let Ok(v) = HeaderValue::from_str(&report.tokens_saved_estimate.to_string()) {
                 resp.headers_mut().insert("x-tt-retrieval-tokens-saved", v);
+            }
+
+            // Track E §10: fire-and-forget an encrypted-prompt audit row of the
+            // ORIGINAL request body. Best-effort — spawned so it never blocks
+            // the response, and a failure only logs (never fails the request).
+            if let Some(audit) = state.audit.clone() {
+                let prompt = body_str.to_string();
+                let substitutions = report.substitutions;
+                let tokens_saved = report.tokens_saved_estimate;
+                tokio::spawn(async move {
+                    if let Err(e) = audit
+                        .record(org_id, substitutions, tokens_saved, &prompt)
+                        .await
+                    {
+                        warn!(error = %e, "retrieval audit record failed");
+                    }
+                });
             }
             resp
         }
