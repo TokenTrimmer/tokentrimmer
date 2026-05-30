@@ -550,13 +550,14 @@ impl KeyStore for PostgresKeyStore {
             .collect()
     }
 
-    async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
+    async fn revoke(&self, id: Uuid, org_id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
         let rows = sqlx::query(
-            r#"UPDATE api_keys SET revoked_at = $1
-               WHERE id = $2 AND revoked_at IS NULL"#,
+            r#"UPDATE api_keys SET revoked_at = $3
+               WHERE id = $1 AND org_id = $2 AND revoked_at IS NULL"#,
         )
-        .bind(at)
         .bind(id)
+        .bind(org_id)
+        .bind(at)
         .execute(&self.pool)
         .await
         .map_err(|e| KeyError::Store(e.to_string()))?;

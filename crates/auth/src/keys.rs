@@ -188,8 +188,13 @@ pub trait KeyStore: Send + Sync {
 
     /// Mark the key with the given `id` as revoked at `at`.
     ///
-    /// Returns `true` if found and updated, `false` if not found.
-    async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError>;
+    /// The `org_id` parameter is required for tenant isolation — only a key
+    /// that belongs to `org_id` will be revoked. Returns `true` if the key was
+    /// found, matched the org, and was active (i.e., it was just revoked).
+    /// Returns `false` if not found, already revoked, or the org_id does not
+    /// match — callers cannot distinguish the no-match cases, which is
+    /// intentional (no oracle for key enumeration across orgs).
+    async fn revoke(&self, id: Uuid, org_id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError>;
 
     /// Stamp `last_used_at = at` on the row with the given `id`. Default
     /// impl is a no-op so stores that don't track usage (e.g., simple
@@ -256,13 +261,19 @@ impl KeyStore for InMemoryKeyStore {
         Ok(out)
     }
 
-    async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
+    async fn revoke(&self, id: Uuid, org_id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
         let mut g = self
             .by_prefix
             .lock()
             .map_err(|e| KeyError::Store(e.to_string()))?;
         for v in g.values_mut() {
             if v.id == id {
+                // Org-scoping: a key that belongs to a different org must not
+                // be revoked by this caller. Return false (same as "not found")
+                // so the caller cannot enumerate cross-tenant keys.
+                if v.org_id != org_id {
+                    return Ok(false);
+                }
                 if v.revoked_at.is_some() {
                     // Idempotent: revoking an already-revoked key is a
                     // no-op. Matches the Postgres impl's `WHERE revoked_at
@@ -461,7 +472,7 @@ pub async fn revoke_key<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
     actor: Actor,
 ) -> Result<(), KeyError> {
     let now = Utc::now();
-    let updated = store.revoke(key_id, now).await?;
+    let updated = store.revoke(key_id, org_id, now).await?;
     if !updated {
         return Err(KeyError::NotFound);
     }
@@ -526,8 +537,8 @@ mod prefix_collision_tests {
             self.inner.find_by_prefix(prefix).await
         }
 
-        async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
-            self.inner.revoke(id, at).await
+        async fn revoke(&self, id: Uuid, org_id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
+            self.inner.revoke(id, org_id, at).await
         }
     }
 
@@ -692,5 +703,77 @@ mod list_active_tests {
     async fn list_active_empty_for_unknown_org() {
         let store = InMemoryKeyStore::new();
         assert!(store.list_active(Uuid::now_v7()).await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod revoke_org_scoping_tests {
+    use super::*;
+
+    fn make_key(org_id: Uuid, prefix: &str) -> ApiKey {
+        ApiKey {
+            id: Uuid::now_v7(),
+            org_id,
+            prefix: prefix.to_string(),
+            hash: "hash".to_string(),
+            label: "label".to_string(),
+            environment: Environment::Live,
+            created_at: Utc::now(),
+            revoked_at: None,
+        }
+    }
+
+    /// Revoking with the correct org_id succeeds and marks the key revoked.
+    #[tokio::test]
+    async fn revoke_with_correct_org_id_succeeds() {
+        let store = InMemoryKeyStore::new();
+        let org = Uuid::now_v7();
+        let key = make_key(org, "tt_live_aaaa");
+        let key_id = key.id;
+        store.insert(key).await.unwrap();
+
+        let updated = store.revoke(key_id, org, Utc::now()).await.unwrap();
+        assert!(updated, "should return true when key is active and org matches");
+
+        // Key must now be revoked.
+        let found = store.find_by_prefix("tt_live_aaaa").await.unwrap().unwrap();
+        assert!(found.revoked_at.is_some(), "key must be marked revoked");
+    }
+
+    /// Revoking with a WRONG org_id must return false and leave the key active
+    /// — no cross-tenant revocation.
+    #[tokio::test]
+    async fn revoke_with_wrong_org_id_returns_false_and_leaves_key_active() {
+        let store = InMemoryKeyStore::new();
+        let org_a = Uuid::now_v7();
+        let org_b = Uuid::now_v7();
+        let key = make_key(org_a, "tt_live_bbbb");
+        let key_id = key.id;
+        store.insert(key).await.unwrap();
+
+        // org_b tries to revoke org_a's key.
+        let updated = store.revoke(key_id, org_b, Utc::now()).await.unwrap();
+        assert!(!updated, "cross-tenant revoke must return false");
+
+        // Key must still be active.
+        let found = store.find_by_prefix("tt_live_bbbb").await.unwrap().unwrap();
+        assert!(
+            found.revoked_at.is_none(),
+            "key must remain active after cross-tenant revoke attempt"
+        );
+    }
+
+    /// Revoking an already-revoked key is idempotent (returns false, not an error).
+    #[tokio::test]
+    async fn revoke_already_revoked_is_idempotent() {
+        let store = InMemoryKeyStore::new();
+        let org = Uuid::now_v7();
+        let key = make_key(org, "tt_live_cccc");
+        let key_id = key.id;
+        store.insert(key).await.unwrap();
+
+        store.revoke(key_id, org, Utc::now()).await.unwrap();
+        let second = store.revoke(key_id, org, Utc::now()).await.unwrap();
+        assert!(!second, "second revoke must return false (already revoked)");
     }
 }

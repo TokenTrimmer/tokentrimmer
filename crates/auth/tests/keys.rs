@@ -207,7 +207,7 @@ async fn test_revoke_then_verify_returns_revoked() {
         .expect("issue should succeed");
 
     let found = store
-        .revoke(issued.record.id, Utc::now())
+        .revoke(issued.record.id, org_id, Utc::now())
         .await
         .expect("revoke should succeed");
     assert!(found, "revoke should return true for existing key");

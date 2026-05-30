@@ -332,13 +332,13 @@ mod tests {
                 .cloned())
         }
 
-        async fn revoke(&self, id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
+        async fn revoke(&self, id: Uuid, org_id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
             let mut g = self
                 .by_prefix
                 .lock()
                 .map_err(|e| KeyError::Store(e.to_string()))?;
             for v in g.values_mut() {
-                if v.id == id {
+                if v.id == id && v.org_id == org_id {
                     v.revoked_at = Some(at);
                     return Ok(true);
                 }
@@ -540,17 +540,16 @@ mod tests {
             .expect("r1");
         assert_eq!(r1.status(), StatusCode::OK, "pre-revoke should succeed");
 
-        // Now revoke the key in the store.
-        store.revoke(
-            // find the key_id from the prefix
-            {
-                let g = store.by_prefix.lock().unwrap();
-                g.get(&plaintext[..12]).unwrap().id
-            },
-            Utc::now(),
-        )
-        .await
-        .expect("revoke");
+        // Now revoke the key in the store (org_id required for org-scoped revoke).
+        let (key_id, key_org_id) = {
+            let g = store.by_prefix.lock().unwrap();
+            let k = g.get(&plaintext[..12]).unwrap();
+            (k.id, k.org_id)
+        };
+        store
+            .revoke(key_id, key_org_id, Utc::now())
+            .await
+            .expect("revoke");
 
         // Second request — cache still holds the positive entry → 200 (staleness window).
         let r2 = router
