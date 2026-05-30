@@ -74,7 +74,8 @@ enum Command {
         example: bool,
 
         /// Apply the plan via the hosted backend (requires a tt_live_* key).
-        /// Not yet wired — currently prints a notice and exits 0.
+        /// Not yet wired: the projection is shown, then the command exits
+        /// NON-ZERO so CI/automation can't assume the config was applied.
         #[arg(long, conflicts_with = "example")]
         apply: bool,
     },
@@ -966,12 +967,6 @@ fn run_plan(
         print_plan_example();
         return Ok(());
     }
-    if apply {
-        eprintln!(
-            "tt plan --apply: hosted backend not wired (cloud repo + auth required). \
-             For now, review the projection here and apply via the dashboard once it ships."
-        );
-    }
     let input_path = input.ok_or_else(|| {
         anyhow::anyhow!("usage: tt plan --input <plan_input.json>  (or --example)")
     })?;
@@ -997,6 +992,17 @@ fn run_plan(
         _ => {
             print!("{payload}");
         }
+    }
+
+    // `--apply` is not wired to a hosted backend yet. The projection above is
+    // real, but NO config was applied. Exit non-zero so CI/automation using
+    // `--apply` can't silently treat the run as "applied" (rv-plan-apply-cli-honest, §1.8).
+    if apply {
+        anyhow::bail!(
+            "tt plan --apply is not wired yet (needs the hosted backend + a tt_live_* key); \
+             the projection above did NOT change any routing config. Apply via the dashboard \
+             once it ships. Exiting non-zero so automation does not assume the plan was applied."
+        );
     }
 
     Ok(())
@@ -1089,8 +1095,8 @@ fn format_plan_text(r: &tt_plan_core::PlanResult) -> String {
 /// Print a minimal example PlanInput to stdout. Users redirect to a file
 /// and edit. Avoids the chicken-and-egg of "I want to try `tt plan` but
 /// don't know the JSON shape".
-fn print_plan_example() {
-    let example = serde_json::json!({
+fn plan_example_json() -> serde_json::Value {
+    serde_json::json!({
         "plan_id": "00000000-0000-0000-0000-000000000001",
         "org_id":  "00000000-0000-0000-0000-000000000002",
         "window_start": "2026-05-01T00:00:00Z",
@@ -1140,8 +1146,14 @@ fn print_plan_example() {
         },
         "seed": 42,
         "bootstrap_iterations": 1000
-    });
-    println!("{}", serde_json::to_string_pretty(&example).unwrap());
+    })
+}
+
+fn print_plan_example() {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&plan_example_json()).unwrap()
+    );
 }
 
 /// Implement `tt audit verify`.
@@ -1412,5 +1424,50 @@ mod sentry_scrub_tests {
         );
         assert_eq!(out.tags.get("bearer-prefix").unwrap(), SCRUB_PLACEHOLDER);
         assert_eq!(out.tags.get("provider").unwrap(), "openai");
+    }
+}
+
+#[cfg(test)]
+mod plan_apply_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn example_input_file() -> tempfile::NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".json")
+            .tempfile()
+            .expect("tempfile");
+        f.write_all(serde_json::to_string(&plan_example_json()).unwrap().as_bytes())
+            .unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// `--apply` must exit non-zero until the hosted backend is wired, so CI /
+    /// automation can't assume a no-op run actually applied the config.
+    #[test]
+    fn apply_exits_nonzero_until_wired() {
+        let input = example_input_file();
+        let out = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        let res = run_plan(
+            input.path().to_str(),
+            out.path().to_str(),
+            false,
+            true, // --apply
+        );
+        let err = res.expect_err("--apply must error until the hosted backend is wired");
+        assert!(
+            err.to_string().contains("apply"),
+            "error should mention apply: {err}"
+        );
+    }
+
+    /// The same projection WITHOUT `--apply` succeeds (exit 0).
+    #[test]
+    fn plan_without_apply_succeeds() {
+        let input = example_input_file();
+        let out = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        run_plan(input.path().to_str(), out.path().to_str(), false, false)
+            .expect("projection without --apply should succeed");
     }
 }
