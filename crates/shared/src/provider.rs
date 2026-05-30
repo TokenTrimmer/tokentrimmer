@@ -19,7 +19,10 @@ pub trait Provider: Send + Sync {
     /// All models supported by this adapter, with capabilities.
     fn models(&self) -> Vec<ModelInfo>;
 
-    /// Pricing for a model. Cached; refreshed daily.
+    /// Pricing for a model. Drawn from the manually-curated `data/pricing.toml`
+    /// snapshot embedded at build time; rates are updated by hand, not
+    /// automatically. Returns `None` only when the model is absent from the
+    /// catalog — local providers should return `Some` with zero rates instead.
     fn pricing(&self, model: &str) -> Option<ModelPricing>;
 
     /// Multiplier applied to computed cost/baseline to account for a provider

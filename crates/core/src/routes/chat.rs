@@ -652,6 +652,22 @@ pub async fn handler(
         //     envelope carries baseline_cost_usd so hit responses can report
         //     accurate savings without re-running pricing later.
         let pricing = provider.pricing(&response.model);
+
+        // Warn when a model is absent from the pricing catalog so the request
+        // is priced at $0. This is distinct from a local provider (ollama,
+        // vllm, lmstudio) where pricing() intentionally returns Some(zero) —
+        // those providers never return None. A None here means the model is
+        // simply missing from data/pricing.toml and the cost will be recorded
+        // as zero, silently under-counting spend. Update pricing.toml to fix.
+        if pricing.is_none() {
+            tracing::warn!(
+                provider = provider.id(),
+                model = %response.model,
+                "model absent from pricing catalog — request cost recorded as $0; \
+                 update data/pricing.toml to restore accurate cost tracking"
+            );
+        }
+
         // Baseline is priced against the originally-requested model when a route
         // rewrote it; otherwise against the served model (same pricing → no
         // routing saving, only cache/discount savings).

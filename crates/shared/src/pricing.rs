@@ -1,6 +1,9 @@
-//! Pricing tables per model. Values come from provider pricing pages and are
-//! refreshed daily. `effective_at` lets us replay historical telemetry against
-//! the correct rate. See `docs/02-provider-adapter-guide.md`.
+//! Pricing tables per model. Values are a **manually-curated snapshot** taken
+//! from provider pricing pages; they are NOT refreshed automatically.
+//! `effective_at` records when each rate took effect and lets us replay
+//! historical telemetry against the correct rate. To refresh rates, edit
+//! `data/pricing.toml` and append new entries — see `scripts/refresh-pricing.sh`
+//! for the manual workflow. See also `docs/02-provider-adapter-guide.md`.
 //!
 //! Rates live in a versioned data file (`data/pricing.toml`), embedded at build
 //! time and parsed once into a [`PricingCatalog`]. Provider adapters delegate
@@ -162,6 +165,20 @@ impl PricingCatalog {
     pub fn is_empty(&self) -> bool {
         self.by_model.is_empty()
     }
+
+    /// The newest `effective_at` across every entry in the catalog — i.e. the
+    /// date of the most recent manual rate snapshot. Returns `None` only when
+    /// the catalog is empty (a build-time error in practice, because the
+    /// embedded file is non-empty and the parse is guarded by a unit test).
+    ///
+    /// Use this as a freshness signal: if the returned date is far in the past
+    /// it means pricing.toml has not been updated in a while.
+    pub fn catalog_max_effective_at(&self) -> Option<DateTime<Utc>> {
+        self.by_model
+            .values()
+            .filter_map(|history| history.last().map(|p| p.effective_at))
+            .max()
+    }
 }
 
 /// The process-wide pricing catalog, parsed once from the embedded
@@ -189,6 +206,60 @@ mod catalog_tests {
             32,
             "unexpected catalog size — update if intentional"
         );
+    }
+
+    /// The embedded catalog must carry at least one `effective_at` date and it
+    /// must be parseable (which `catalog_max_effective_at` returning `Some`
+    /// proves). This test is NOT time-sensitive: we assert presence only, never
+    /// a hardcoded "must be within N days of today", so it will never fail
+    /// merely because time has passed.
+    #[test]
+    fn catalog_max_effective_at_is_present() {
+        let c = catalog();
+        let max_date = c
+            .catalog_max_effective_at()
+            .expect("non-empty catalog must have a max effective_at");
+        // Sanity: the catalog was first created in 2026; the date must be at
+        // least 2026-01-01 to confirm we aren't reading a zero/epoch value.
+        let floor = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        assert!(
+            max_date >= floor,
+            "catalog_max_effective_at = {max_date} is older than expected floor {floor}"
+        );
+    }
+
+    /// Staleness helper works on a synthetic catalog with known dates.
+    #[test]
+    fn catalog_max_effective_at_picks_newest() {
+        let toml = r#"
+            [[entry]]
+            provider = "p"
+            model = "m1"
+            input_per_million = 1.0
+            output_per_million = 2.0
+            effective_at = "2026-03-01T00:00:00Z"
+
+            [[entry]]
+            provider = "p"
+            model = "m2"
+            input_per_million = 3.0
+            output_per_million = 4.0
+            effective_at = "2026-05-01T00:00:00Z"
+        "#;
+        let c = PricingCatalog::parse(toml).expect("valid");
+        let max = c.catalog_max_effective_at().expect("present");
+        assert_eq!(
+            max,
+            Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            "should return the newest effective_at across all models"
+        );
+    }
+
+    /// Empty catalog returns None (not a panic).
+    #[test]
+    fn catalog_max_effective_at_empty_catalog() {
+        let c = PricingCatalog::parse("").expect("empty TOML is valid");
+        assert!(c.catalog_max_effective_at().is_none());
     }
 
     #[test]
