@@ -137,9 +137,9 @@ where
             match next_item {
                 Some(Ok(chunk)) => {
                     buffer.extend_from_slice(&chunk);
-                    // Process all complete SSE events delimited by \n\n.
-                    while let Some(event_end) = find_double_newline(&buffer) {
-                        let event_bytes = buffer.drain(..event_end + 2).collect::<Vec<_>>();
+                    // Process all complete SSE events (delimited by \n\n or \r\n\r\n).
+                    while let Some((event_end, sep_len)) = find_event_boundary(&buffer) {
+                        let event_bytes = buffer.drain(..event_end + sep_len).collect::<Vec<_>>();
                         let outcomes = process_sse_event(
                             &event_bytes,
                             &stream_id,
@@ -220,7 +220,7 @@ fn process_sse_event(
         if line.is_empty() {
             continue;
         }
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)) {
             data_line = Some(data.trim());
         }
     }
@@ -372,9 +372,22 @@ fn process_sse_event(
 // Buffer utilities
 // ---------------------------------------------------------------------------
 
-/// Find the byte offset of the first `\n\n` in `buf`.
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+/// Find the first SSE event boundary in `buf`.
+///
+/// Returns `(offset, sep_len)` where `offset` is the index of the first byte
+/// of the boundary sequence and `sep_len` is the number of bytes in the
+/// separator (`2` for `\n\n`, `4` for `\r\n\r\n`).  Callers should drain
+/// `..offset + sep_len` to consume the full event including its terminator.
+///
+/// Both `\n\n` and `\r\n\r\n` are valid SSE event terminators per RFC 8898.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((pos, 4));
+    }
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((pos, 2));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -386,15 +399,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_double_newline_basic() {
+    fn find_event_boundary_lf() {
         let buf = b"data: {}\n\ndata: {}\n\n";
-        assert_eq!(find_double_newline(buf), Some(8));
+        assert_eq!(find_event_boundary(buf), Some((8, 2)));
     }
 
     #[test]
-    fn find_double_newline_none() {
+    fn find_event_boundary_crlf() {
+        let buf = b"data: {}\r\n\r\ndata: {}\r\n\r\n";
+        assert_eq!(find_event_boundary(buf), Some((8, 4)));
+    }
+
+    #[test]
+    fn find_event_boundary_none() {
         let buf = b"data: {}\n";
-        assert_eq!(find_double_newline(buf), None);
+        assert_eq!(find_event_boundary(buf), None);
     }
 
     #[test]
@@ -436,5 +455,29 @@ mod tests {
             assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
             assert!(chunk.usage.is_some());
         }
+    }
+
+    // --- CRLF + no-space data: regression tests (rv-sse-crlf-parsing) ---
+
+    #[test]
+    fn process_sse_event_crlf_text_chunk() {
+        // CRLF line endings within the event bytes (after boundary stripping).
+        let event = b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]},\"index\":0}]}\r\n\r\n";
+        let mut first = true;
+        let outcomes = process_sse_event(event, "test-id", 0, "gemini-3.1-pro", &mut first);
+        // Should yield the same role chunk + content chunk as the LF form.
+        assert_eq!(outcomes.len(), 2,
+            "CRLF-delimited Gemini event should yield role + content chunks");
+        assert!(!first);
+    }
+
+    #[test]
+    fn process_sse_event_no_space_data_prefix() {
+        // data:{...} (no space) must not be dropped — parse identically to data: {...}.
+        let event = b"data:{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]},\"index\":0}]}\n\n";
+        let mut first = true;
+        let outcomes = process_sse_event(event, "test-id", 0, "gemini-3.1-pro", &mut first);
+        assert_eq!(outcomes.len(), 2,
+            "no-space data: prefix should parse the same as data: with space");
     }
 }

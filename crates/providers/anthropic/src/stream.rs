@@ -252,9 +252,9 @@ where
             match next_item {
                 Some(Ok(chunk)) => {
                     buffer.extend_from_slice(&chunk);
-                    // Process all complete SSE events delimited by \n\n.
-                    while let Some(event_end) = find_double_newline(&buffer) {
-                        let event_bytes = buffer.drain(..event_end + 2).collect::<Vec<_>>();
+                    // Process all complete SSE events (delimited by \n\n or \r\n\r\n).
+                    while let Some((event_end, sep_len)) = find_event_boundary(&buffer) {
+                        let event_bytes = buffer.drain(..event_end + sep_len).collect::<Vec<_>>();
                         match process_sse_event(&event_bytes, &mut state) {
                             SseOutcome::Chunk(c) => yield Ok(c),
                             SseOutcome::Err(e) => yield Err(e),
@@ -311,9 +311,9 @@ fn process_sse_event(event_bytes: &[u8], state: &mut Option<StreamState>) -> Sse
         if line.is_empty() {
             continue;
         }
-        if let Some(ev) = line.strip_prefix("event: ") {
+        if let Some(ev) = line.strip_prefix("event:").map(|s| s.strip_prefix(' ').unwrap_or(s)) {
             event_type = Some(ev.trim());
-        } else if let Some(data) = line.strip_prefix("data: ") {
+        } else if let Some(data) = line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)) {
             data_line = Some(data.trim());
         }
     }
@@ -580,9 +580,22 @@ fn handle_message_delta(data: &str, state: &mut Option<StreamState>) -> SseOutco
 // Buffer utilities
 // ---------------------------------------------------------------------------
 
-/// Find the byte offset of the first `\n\n` in `buf`.
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+/// Find the first SSE event boundary in `buf`.
+///
+/// Returns `(offset, sep_len)` where `offset` is the index of the first byte
+/// of the boundary sequence and `sep_len` is the number of bytes in the
+/// separator (`2` for `\n\n`, `4` for `\r\n\r\n`).  Callers should drain
+/// `..offset + sep_len` to consume the full event including its terminator.
+///
+/// Both `\n\n` and `\r\n\r\n` are valid SSE event terminators per RFC 8898.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((pos, 4));
+    }
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((pos, 2));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -594,15 +607,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_double_newline_basic() {
+    fn find_event_boundary_lf() {
         let buf = b"event: ping\ndata: {}\n\nevent: message_stop\ndata: {}\n\n";
-        assert_eq!(find_double_newline(buf), Some(20));
+        assert_eq!(find_event_boundary(buf), Some((20, 2)));
     }
 
     #[test]
-    fn find_double_newline_none() {
+    fn find_event_boundary_crlf() {
+        let buf = b"event: ping\r\ndata: {}\r\n\r\nevent: message_stop\r\ndata: {}\r\n\r\n";
+        assert_eq!(find_event_boundary(buf), Some((21, 4)));
+    }
+
+    #[test]
+    fn find_event_boundary_none() {
         let buf = b"event: ping\ndata: {}\n";
-        assert_eq!(find_double_newline(buf), None);
+        assert_eq!(find_event_boundary(buf), None);
     }
 
     #[test]
@@ -649,6 +668,38 @@ mod tests {
         let mut state = None;
         let outcome = process_sse_event(event, &mut state);
         assert!(matches!(outcome, SseOutcome::Done));
+    }
+
+    // --- CRLF + no-space data: regression tests (rv-sse-crlf-parsing) ---
+
+    #[test]
+    fn ping_event_skipped_crlf() {
+        // Same ping event, but with CRLF line endings and \r\n\r\n terminator.
+        let event = b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n";
+        let mut state = None;
+        let outcome = process_sse_event(event, &mut state);
+        assert!(matches!(outcome, SseOutcome::Skip),
+            "CRLF-delimited ping event should still be skipped");
+    }
+
+    #[test]
+    fn message_stop_crlf() {
+        // message_stop with CRLF terminators must still return Done.
+        let event = b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n";
+        let mut state = None;
+        let outcome = process_sse_event(event, &mut state);
+        assert!(matches!(outcome, SseOutcome::Done),
+            "CRLF message_stop must return Done");
+    }
+
+    #[test]
+    fn no_space_data_prefix_anthropic() {
+        // data:{...} without a space after the colon must not be silently dropped.
+        let event = b"event: message_stop\ndata:{\"type\":\"message_stop\"}\n\n";
+        let mut state = None;
+        let outcome = process_sse_event(event, &mut state);
+        assert!(matches!(outcome, SseOutcome::Done),
+            "data:{{...}} (no space) must parse the same as `data: {{...}}`");
     }
 
     #[test]

@@ -150,9 +150,9 @@ where
             match next_item {
                 Some(Ok(chunk)) => {
                     buffer.extend_from_slice(&chunk);
-                    // Process all complete SSE events delimited by \n\n.
-                    while let Some(event_end) = find_double_newline(&buffer) {
-                        let event_bytes = buffer.drain(..event_end + 2).collect::<Vec<_>>();
+                    // Process all complete SSE events (delimited by \n\n or \r\n\r\n).
+                    while let Some((event_end, sep_len)) = find_event_boundary(&buffer) {
+                        let event_bytes = buffer.drain(..event_end + sep_len).collect::<Vec<_>>();
                         // Each event may have multiple lines; process each.
                         let mut done = false;
                         for event in parse_sse_event(&event_bytes) {
@@ -242,7 +242,7 @@ fn parse_sse_event(event_bytes: &[u8]) -> Vec<SseEvent> {
             continue;
         }
 
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)) {
             if data == "[DONE]" {
                 results.push(SseEvent::Done);
                 // Stop processing further lines in this event.
@@ -266,12 +266,24 @@ fn parse_sse_event(event_bytes: &[u8]) -> Vec<SseEvent> {
     results
 }
 
-/// Find the byte offset of the first `\n\n` sequence in `buf`.
+/// Find the first SSE event boundary in `buf`.
 ///
-/// Returns the index of the *first* `\n` in the pair so that
-/// `buf.drain(..idx + 2)` removes the entire event including the separator.
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+/// Returns `(offset, sep_len)` where `offset` is the index of the first byte
+/// of the boundary sequence and `sep_len` is the number of bytes in the
+/// separator (`2` for `\n\n`, `4` for `\r\n\r\n`).  Callers should drain
+/// `..offset + sep_len` to consume the full event including its terminator.
+///
+/// Both `\n\n` and `\r\n\r\n` are valid SSE event terminators per RFC 8898.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    // Scan for \r\n\r\n first so a CRLF stream never accidentally matches the
+    // \r byte of a CRLF pair as a lone \n\n pair.
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((pos, 4));
+    }
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((pos, 2));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -296,15 +308,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_double_newline_basic() {
+    fn find_event_boundary_lf() {
         let buf = b"data: hello\n\ndata: world\n\n";
-        assert_eq!(find_double_newline(buf), Some(11));
+        assert_eq!(find_event_boundary(buf), Some((11, 2)));
     }
 
     #[test]
-    fn find_double_newline_none() {
+    fn find_event_boundary_crlf() {
+        let buf = b"data: hello\r\n\r\ndata: world\r\n\r\n";
+        assert_eq!(find_event_boundary(buf), Some((11, 4)));
+    }
+
+    #[test]
+    fn find_event_boundary_none() {
         let buf = b"data: hello\n";
-        assert_eq!(find_double_newline(buf), None);
+        assert_eq!(find_event_boundary(buf), None);
     }
 
     #[test]
@@ -335,5 +353,40 @@ mod tests {
         let results = parse_sse_event(b"data: {not valid json}\n\n");
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], SseEvent::Err(_)));
+    }
+
+    // --- CRLF + no-space data: regression tests (rv-sse-crlf-parsing) ---
+
+    #[test]
+    fn parse_sse_event_crlf_data_line() {
+        // CRLF line endings: the event bytes passed to parse_sse_event still have \r\n
+        // (after draining with sep_len=4 the trailing \r\n\r\n is consumed, so the
+        // body itself uses \r\n line endings).
+        let chunk_json = r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#;
+        let event = format!("data: {chunk_json}\r\n\r\n");
+        let results = parse_sse_event(event.as_bytes());
+        assert_eq!(results.len(), 1, "CRLF event should parse to one chunk");
+        assert!(matches!(&results[0], SseEvent::Chunk(c) if c.id == "c2"),
+            "CRLF-delimited event should parse identical to LF form");
+    }
+
+    #[test]
+    fn parse_sse_event_no_space_data_prefix() {
+        // `data:{...}` (no space after colon) is valid SSE and must not be dropped.
+        let chunk_json = r#"{"id":"c3","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#;
+        let event = format!("data:{chunk_json}\n\n");
+        let results = parse_sse_event(event.as_bytes());
+        assert_eq!(results.len(), 1, "no-space data: event should parse to one chunk");
+        assert!(matches!(&results[0], SseEvent::Chunk(c) if c.id == "c3"),
+            "data:{{...}} (no space) should parse the same as `data: {{...}}`");
+    }
+
+    #[test]
+    fn find_event_boundary_prefers_crlf_over_lf_in_same_buf() {
+        // A buffer with \r\n\r\n earlier than \n\n should return the CRLF boundary.
+        let buf = b"data: a\r\n\r\ndata: b\n\n";
+        let (pos, sep) = find_event_boundary(buf).expect("boundary found");
+        assert_eq!(sep, 4, "should detect CRLF boundary");
+        assert_eq!(pos, 7);
     }
 }
