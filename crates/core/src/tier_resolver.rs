@@ -136,8 +136,10 @@ fn caller_tier_from_strs(tier: &str, status: &str) -> (CallerTier, BudgetLimits)
     let caller_tier = match (limits.l2_cache, limits.max_requests_per_min) {
         (false, _) => CallerTier::Free,
         (true, Some(600)) => CallerTier::Pro,
+        // enterprise is not a paid tier (rv-enterprise-dead-tier) so it never
+        // reaches this arm — tier_budget_limits collapses it to Free (l2=false).
         (true, None) => match tier {
-            "scale" | "enterprise" => CallerTier::Scale,
+            "scale" => CallerTier::Scale,
             _ => CallerTier::Team,
         },
         _ => CallerTier::Free,

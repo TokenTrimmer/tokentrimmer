@@ -87,13 +87,18 @@ pub fn tier_budget_limits(tier: &str, status: &str) -> BudgetLimits {
             monthly_request_cap: None, // paid tiers bill overage, no hard-stop
             l2_cache: true,
         },
-        "team" | "scale" | "enterprise" => BudgetLimits {
+        "team" | "scale" => BudgetLimits {
             monthly_cap_usd: None,
             max_requests_per_min: None, // unlimited rpm for team/scale
             monthly_request_cap: None,
             l2_cache: true,
         },
-        // "free", "", unknown → Free caps.
+        // "free", "", "enterprise", unknown → Free caps.
+        //
+        // `enterprise` is intentionally NOT a paid tier (rv-enterprise-dead-tier,
+        // §7.5): no Stripe product exists for it, so a stray
+        // `subscriptions.tier='enterprise'` must collapse to Free here, matching
+        // `tt_api::tier::limits_for` + `overage::rate_per_request_cents`.
         _ => BudgetLimits::free_tier(),
     }
 }
@@ -520,6 +525,16 @@ mod tests {
             assert_eq!(l.monthly_request_cap, None);
             assert!(l.l2_cache);
         }
+    }
+
+    #[test]
+    fn enterprise_is_not_a_paid_tier_collapses_to_free() {
+        // rv-enterprise-dead-tier (§7.5): mirrors tt_api::tier::limits_for —
+        // a stray tier='enterprise' must grant only Free, never Scale.
+        let l = tier_budget_limits("enterprise", "active");
+        assert_eq!(l.max_requests_per_min, Some(60));
+        assert_eq!(l.monthly_request_cap, Some(10_000));
+        assert!(!l.l2_cache, "enterprise must not get L2 (it's Free)");
     }
 
     #[test]
