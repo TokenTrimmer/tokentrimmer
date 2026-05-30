@@ -34,7 +34,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 - [x] [P1] [rv-inspect-walker-hidden-dirs] inspect-rule-author: Allowlist `.cursor`/`.github`/`.claude` before the leading-dot prune so `config-agents-md-contains-secrets` can actually scan `.cursor/rules/*.md`; add a `.cursor/rules/` fixture (walk.rs:63; config_agents_md_contains_secrets.rs:34). (§4.6) (est: $0.30)
 - [x] [P1] [rv-key-prefix-entropy] rust-crate-builder: Widen the key display prefix to ~12 hex chars (≥48 bits) or retry issuance on unique-violation, and surface a retryable error instead of opaque `Store(...)` (keys.rs:31,268-269,291). (§4.14) (est: $0.30)
 - [x] [P1] [rv-truncated-column] rust-crate-builder: Add a `truncated BOOLEAN NOT NULL DEFAULT false` migration + INSERT bind, and exclude/down-weight truncated rows in realized-savings sums; add a bind-count test (request_logs.rs:52-53,134-167; migrations/0001). (§2.14) (est: $0.30)
-- [ ] [P1] [rv-inspect-feeds-plan] rust-crate-builder: Converter from `preview::RouteSuggestion` / inspect findings → `Vec<ProposedRoute>` + a `tt inspect --suggest-plan` (and pre-filled PlanInput) so Inspect actually feeds Plan (preview/route_suggestions.rs:41-53; cli/main.rs:924-947). (§1.4) (est: $0.80)
+- [x] [P1] [rv-inspect-feeds-plan] rust-crate-builder: Converter from `preview::RouteSuggestion` / inspect findings → `Vec<ProposedRoute>` + a `tt inspect --suggest-plan` (and pre-filled PlanInput) so Inspect actually feeds Plan (preview/route_suggestions.rs:41-53; cli/main.rs:924-947). (§1.4) (est: $0.80)
 
 ### P2 — soon
 
@@ -75,9 +75,9 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 - [ ] [P0] [w23-free-tier-live] rust-crate-builder: Enable Free tier in prod. [BLOCKED — external accounts] Remaining code bit (per-org tier→BudgetLimits) is now tracked as cloud `rv-tier-limits-enforcement`. (est: $0.80)
 - [ ] [P0] [w23-alpha-reconciliation-gate] rust-crate-builder: 14 consecutive days of drift ≤2%. [BLOCKED — needs live alpha traffic] (est: $0.30)
 - [ ] [P0] [w24-alpha-inspect-fp-gate] rust-crate-builder: Inspect FP <5% on real alpha org repos. [BLOCKED — needs alpha traffic] (est: $0.30)
-- [ ] [P1] [post-team-pr-bot] rust-crate-builder: PR-bot GitHub App (free to register), Inspect findings as check-runs, ≤10 repos. Post-beta. (est: $0.80)
-- [ ] [P1] [post-team-sso] rust-crate-builder: Google OAuth SSO (free; GitHub half shipped). Post-beta. See review §7.3 for the SAML/self-serve angle. (est: $0.60)
-- [ ] [P1] [post-scale-s3-object-lock] rust-crate-builder: WORM audit storage via Cloudflare R2 Bucket Locks (B2 only if certified COMPLIANCE-mode demanded). Post-beta. (est: $1.00)
+- [ ] [P1] [post-team-pr-bot] rust-crate-builder: PR-bot GitHub App (free to register), Inspect findings as check-runs, ≤10 repos. [DEFERRED — post-beta, needs GitHub App registration] (est: $0.80)
+- [ ] [P1] [post-team-sso] rust-crate-builder: Google OAuth SSO (free; GitHub half shipped). See review §7.3 for the SAML/self-serve angle. [DEFERRED — post-beta, needs Google OAuth client] (est: $0.60)
+- [ ] [P1] [post-scale-s3-object-lock] rust-crate-builder: WORM audit storage via Cloudflare R2 Bucket Locks (B2 only if certified COMPLIANCE-mode demanded). [DEFERRED — post-beta, needs R2 config] (est: $1.00)
 - [ ] [P1] [post-scale-slo-proof] rust-crate-builder: SLO dashboard + signed monthly PDF. [BLOCKED — post-beta] (est: $0.60)
 - [ ] [P2] [post-enterprise-workos-saml] rust-crate-builder: Defer the build; surface "SSO/SAML on request" and integrate WorkOS ($0 dev; $125/connection when a paying enterprise asks). See review §7.3. (est: $1.50)
 - [ ] [P2] [post-enterprise-customer-s3-sync] rust-crate-builder: Customer S3-compatible bucket sync + SIEM CEF/LEEF export (any S3 endpoint; not AWS-specific). Post-beta. (est: $1.00)
