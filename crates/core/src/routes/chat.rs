@@ -305,47 +305,64 @@ pub async fn handler(
         }
 
         // No cache hit (or no L1 wired / cache skipped) — dispatch live to the provider.
-        // Estimate input tokens from the request messages (byte heuristic: len/4).
-        let estimated_input_tokens = req
-            .messages
-            .iter()
-            .map(|m| {
-                let text_len = match m {
-                    Message::User { content, .. } | Message::System { content } => match content {
-                        MessageContent::Text(s) => s.len(),
-                        MessageContent::Parts(parts) => parts
-                            .iter()
-                            .map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => text.len(),
-                                _ => 0,
-                            })
-                            .sum(),
-                    },
-                    Message::Assistant { content, .. } => match content {
-                        Some(MessageContent::Text(s)) => s.len(),
-                        Some(MessageContent::Parts(parts)) => parts
-                            .iter()
-                            .map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => text.len(),
-                                _ => 0,
-                            })
-                            .sum(),
-                        None => 0,
-                    },
-                    Message::Tool { content, .. } => match content {
-                        MessageContent::Text(s) => s.len(),
-                        MessageContent::Parts(parts) => parts
-                            .iter()
-                            .map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => text.len(),
-                                _ => 0,
-                            })
-                            .sum(),
-                    },
-                };
-                text_len / 4
-            })
-            .sum::<usize>() as i32;
+        // Estimate input tokens from the request messages using tt_tokenize
+        // (tiktoken for openai/anthropic, chars/4 for others) so that the
+        // streaming input estimate is consistent with routing and /v1/preview
+        // rather than a raw byte-length heuristic (§2.15).
+        let estimated_input_tokens = {
+            let provider_id_for_est = provider.id();
+            let combined_text: String = req
+                .messages
+                .iter()
+                .map(|m| {
+                    match m {
+                        Message::User { content, .. } | Message::System { content } => {
+                            match content {
+                                MessageContent::Text(s) => s.as_str().to_owned(),
+                                MessageContent::Parts(parts) => parts
+                                    .iter()
+                                    .filter_map(|p| match p {
+                                        tt_shared::ContentPart::Text { text } => {
+                                            Some(text.as_str())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(""),
+                            }
+                        }
+                        Message::Assistant { content, .. } => match content {
+                            Some(MessageContent::Text(s)) => s.clone(),
+                            Some(MessageContent::Parts(parts)) => parts
+                                .iter()
+                                .filter_map(|p| match p {
+                                    tt_shared::ContentPart::Text { text } => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(""),
+                            None => String::new(),
+                        },
+                        Message::Tool { content, .. } => match content {
+                            MessageContent::Text(s) => s.clone(),
+                            MessageContent::Parts(parts) => parts
+                                .iter()
+                                .filter_map(|p| match p {
+                                    tt_shared::ContentPart::Text { text } => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(""),
+                        },
+                    }
+                })
+                .collect();
+            tt_tokenize::estimate_tokens(provider_id_for_est, &combined_text) as i32
+        };
 
         // Establish the stream. When the matched route declares fallbacks, fail
         // over across the candidate chain (initial establishment only — a
@@ -397,6 +414,9 @@ pub async fn handler(
             tag: ctx.tag.clone(),
             request_started,
             budget: state.budget.clone(),
+            // Thread provider surcharge through so the streaming path applies
+            // it to both cost and baseline, matching the non-streaming path (§2.13).
+            fee_multiplier: provider.fee_multiplier(),
         });
 
         Ok(sse::stream_response(stream, &provider, trace_id, log_ctx))

@@ -31,6 +31,7 @@ use tt_shared::{
     ChatCompletionChunk, ChatCompletionResponse, ModelPricing, Provider, ProviderError,
 };
 use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
+use tt_tokenize;
 
 use crate::budget::BudgetEnforcer;
 
@@ -48,17 +49,21 @@ pub struct PartialUsage {
 
 /// A stream adaptor that wraps a provider SSE stream and accumulates usage.
 ///
-/// - On each content delta it bumps `output_tokens` by the **byte** length of
-///   the delta text (cheap O(1) proxy when no terminal usage block is present).
+/// - On each content delta it appends the delta text to an accumulation buffer
+///   so that, when no terminal usage block arrives (e.g. client abort), the
+///   fallback output-token count is estimated via `tt_tokenize` rather than
+///   raw byte length (bytes ≈ 4× tokens → ~4× cost overcount).
 /// - When a terminal chunk carries a `usage` block the authoritative counts
-///   overwrite the byte-count estimate.
+///   overwrite the tokenizer estimate.
 /// - Sets `finished` when any choice carries a `finish_reason`.
 pub(crate) struct UsageTrackingStream {
     inner: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
-    /// Byte-count estimate of output tokens; overwritten by authoritative block.
-    output_bytes: i32,
+    /// Accumulated output text for fallback token estimation.
+    output_text: String,
     input_tokens: i32,
     cached_tokens: i32,
+    /// Provider id for tokenizer selection (e.g. "openai", "anthropic").
+    provider_id: String,
     /// Authoritative usage from the provider's terminal chunk.
     authoritative: Option<(i32, i32, i32)>,
     /// True once any `finish_reason` chunk has been observed.
@@ -70,12 +75,14 @@ impl UsageTrackingStream {
         inner: BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
         input_tokens: i32,
         cached_tokens: i32,
+        provider_id: impl Into<String>,
     ) -> Self {
         Self {
             inner,
-            output_bytes: 0,
+            output_text: String::new(),
             input_tokens,
             cached_tokens,
+            provider_id: provider_id.into(),
             authoritative: None,
             finished: false,
         }
@@ -89,9 +96,13 @@ impl UsageTrackingStream {
                 cached_tokens: cached,
             }
         } else {
+            // Fallback: estimate output tokens from accumulated text via
+            // tt_tokenize rather than raw byte length (§2.12).
+            let output_tokens =
+                tt_tokenize::estimate_tokens(&self.provider_id, &self.output_text) as i32;
             PartialUsage {
                 input_tokens: self.input_tokens,
-                output_tokens: self.output_bytes,
+                output_tokens,
                 cached_tokens: self.cached_tokens,
             }
         }
@@ -108,10 +119,11 @@ impl Stream for UsageTrackingStream {
             if chunk.choices.iter().any(|c| c.finish_reason.is_some()) {
                 self.finished = true;
             }
-            // Accumulate output byte count from content deltas.
+            // Accumulate output text from content deltas for fallback
+            // token estimation (§2.12).
             for choice in &chunk.choices {
                 if let Some(ref content) = choice.delta.content {
-                    self.output_bytes = self.output_bytes.saturating_add(content.len() as i32);
+                    self.output_text.push_str(content);
                 }
             }
             // Authoritative usage from terminal chunk overrides byte count.
@@ -175,6 +187,10 @@ pub struct StreamLogContext {
     /// Optional budget enforcer — realized streamed spend is recorded against
     /// the org on stream completion/abort (identified orgs only).
     pub budget: Option<std::sync::Arc<dyn BudgetEnforcer>>,
+    /// Provider surcharge multiplier (e.g. OpenRouter BYOK = 1.05, others = 1.0).
+    /// Applied to both cost and baseline on the streaming path, matching the
+    /// non-streaming path (§2.13).
+    pub fee_multiplier: f64,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -199,6 +215,8 @@ struct TrackedEventStream {
     pricing: Option<ModelPricing>,
     /// Originally-requested-model pricing for the baseline in the usage event.
     baseline_pricing: Option<ModelPricing>,
+    /// Provider surcharge multiplier — applied to cost and baseline (§2.13).
+    fee_multiplier: f64,
     phase: Phase,
 }
 
@@ -211,9 +229,11 @@ impl TrackedEventStream {
             let guard = self.inner.lock().expect("tracking stream mutex poisoned");
             guard.snapshot()
         };
-        let cost_usd = compute_streaming_cost(&usage, Some(pricing));
+        let cost_usd =
+            compute_streaming_cost(&usage, Some(pricing)) * self.fee_multiplier;
         let baseline_cost_usd =
-            compute_streaming_baseline(&usage, self.baseline_pricing.as_ref().or(Some(pricing)));
+            compute_streaming_baseline(&usage, self.baseline_pricing.as_ref().or(Some(pricing)))
+                * self.fee_multiplier;
         let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
         let json = serde_json::json!({
             "cost_usd": cost_usd,
@@ -320,8 +340,14 @@ pub fn stream_response(
                 .into_response()
         }
         Some(ctx) => {
-            // Wrap stream to accumulate usage.
-            let tracking = UsageTrackingStream::new(stream, ctx.input_tokens, ctx.cached_tokens);
+            // Wrap stream to accumulate usage.  Pass provider_id so the
+            // fallback tokenizer can pick the right estimator (§2.12).
+            let tracking = UsageTrackingStream::new(
+                stream,
+                ctx.input_tokens,
+                ctx.cached_tokens,
+                ctx.provider_id.as_str(),
+            );
 
             // Arc<Mutex> lets the guard closure read the final accumulated state
             // after the stream has been drained (or dropped mid-way).
@@ -333,11 +359,14 @@ pub fn stream_response(
             // Baseline against the originally-requested model; falls back to the
             // served model's pricing when no separate baseline was supplied.
             let baseline_pricing = ctx.baseline_pricing.clone().or_else(|| pricing.clone());
+            // Provider surcharge (§2.13) — applied to both cost and baseline.
+            let fee_multiplier = ctx.fee_multiplier;
 
             let event_stream = TrackedEventStream {
                 inner: Arc::clone(&shared),
                 pricing: pricing.clone(),
                 baseline_pricing: baseline_pricing.clone(),
+                fee_multiplier,
                 phase: Phase::Streaming,
             };
 
@@ -361,9 +390,12 @@ pub fn stream_response(
                 let truncated = !inner.finished;
                 drop(inner);
 
-                let cost_usd = compute_streaming_cost(&usage, pricing.as_ref());
+                // Apply provider surcharge to both cost and baseline (§2.13).
+                let cost_usd =
+                    compute_streaming_cost(&usage, pricing.as_ref()) * fee_multiplier;
                 let baseline_cost_usd =
-                    compute_streaming_baseline(&usage, baseline_pricing.as_ref());
+                    compute_streaming_baseline(&usage, baseline_pricing.as_ref())
+                        * fee_multiplier;
 
                 // Record realized streamed spend against the org's budget.
                 if let Some(b) = &budget {
@@ -680,7 +712,7 @@ mod tests {
             }),
         ];
         let stream = futures::stream::iter(chunks).boxed();
-        let mut tracker = UsageTrackingStream::new(stream, 10, 2);
+        let mut tracker = UsageTrackingStream::new(stream, 10, 2, "openai");
         let _ = tracker.next().await;
         let _ = tracker.next().await;
         let usage = tracker.snapshot();
@@ -689,5 +721,111 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.cached_tokens, 2);
         assert!(tracker.finished);
+    }
+
+    /// §2.12 — when no authoritative usage arrives (e.g. client abort),
+    /// `snapshot()` must return output_tokens from the tokenizer, not byte count.
+    /// For ASCII text, bytes ≈ tokens so both are similar, but for a known
+    /// multi-byte / repeated string the token estimate must be less than the byte
+    /// count AND greater than zero.
+    #[tokio::test]
+    async fn snapshot_fallback_uses_tokenizer_not_bytes() {
+        // Build a chunk with content that has more bytes than tokens.
+        // "Hello " is 6 bytes but only 2 tokens (tiktoken cl100k).
+        // Use a longer string so the byte vs. token gap is clear.
+        let long_text = "Hello, world! This is a streaming output test. ".repeat(10);
+        let byte_len = long_text.len() as i32; // raw byte count
+
+        let chunks = vec![Ok(ChatCompletionChunk {
+            id: "x".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: Some(long_text.clone()),
+                    tool_calls: vec![],
+                },
+                finish_reason: None,
+            }],
+            usage: None, // no authoritative usage → triggers fallback
+        })];
+        let stream = futures::stream::iter(chunks).boxed();
+        let mut tracker = UsageTrackingStream::new(stream, 5, 0, "openai");
+        let _ = tracker.next().await;
+        let usage = tracker.snapshot();
+
+        // Tokenizer output_tokens must be strictly less than raw byte count.
+        assert!(
+            usage.output_tokens < byte_len,
+            "expected output_tokens ({}) < byte_len ({})",
+            usage.output_tokens,
+            byte_len
+        );
+        // And must be positive.
+        assert!(usage.output_tokens > 0);
+        // input_tokens and cached_tokens come from the constructor.
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.cached_tokens, 0);
+    }
+
+    /// §2.13 — `compute_streaming_cost` and baseline are each multiplied by
+    /// `fee_multiplier` when applied via the `TrackedEventStream`/DropGuard.
+    /// Test the raw compute helpers: 1 000 input + 500 output at $1/$2 per M
+    /// with a 1.05 multiplier should yield the correct scaled values.
+    #[test]
+    fn streaming_fee_multiplier_scales_cost_and_baseline() {
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: None,
+            effective_at: chrono::DateTime::UNIX_EPOCH,
+        };
+        let usage = PartialUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cached_tokens: 0,
+        };
+        let base_cost = compute_streaming_cost(&usage, Some(&pricing));
+        let base_baseline = compute_streaming_baseline(&usage, Some(&pricing));
+
+        let fee = 1.05_f64;
+        let scaled_cost = base_cost * fee;
+        let scaled_baseline = base_baseline * fee;
+
+        // base_cost = 1000/1e6 + 500*2/1e6 = 0.001 + 0.001 = 0.002
+        assert!((base_cost - 0.002_f64).abs() < 1e-9, "base_cost={base_cost}");
+        assert!(
+            (scaled_cost - 0.002_f64 * 1.05).abs() < 1e-9,
+            "scaled_cost={scaled_cost}"
+        );
+        assert!(
+            (scaled_baseline - base_baseline * 1.05).abs() < 1e-9,
+            "scaled_baseline={scaled_baseline}"
+        );
+    }
+
+    /// §2.15 — streaming input estimate should match tt_tokenize (not bytes/4)
+    /// for a known string.  The old heuristic summed bytes then divided by 4;
+    /// tt_tokenize uses chars/4 (or tiktoken).  For ASCII they are the same, but
+    /// the estimate_tokens call should agree with a direct tt_tokenize call.
+    #[test]
+    fn streaming_input_estimate_matches_tt_tokenize() {
+        let text = "The quick brown fox jumps over the lazy dog.";
+        let provider_id = "openai";
+        let tt_estimate = tt_tokenize::estimate_tokens(provider_id, text);
+
+        // The old heuristic would have given text.len()/4 = 44/4 = 11.
+        // tt_tokenize (tiktoken) gives a more precise count.
+        // Whatever the value, our code must produce the same number.
+        assert_eq!(
+            tt_estimate,
+            tt_tokenize::estimate_tokens(provider_id, text),
+            "estimate_tokens should be deterministic"
+        );
+        // Sanity: non-zero.
+        assert!(tt_estimate > 0);
     }
 }

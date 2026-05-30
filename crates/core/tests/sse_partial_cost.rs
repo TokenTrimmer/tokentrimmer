@@ -139,6 +139,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         tag: None,
         request_started: std::time::Instant::now(),
         budget: None,
+        fee_multiplier: 1.0,
     }
 }
 
@@ -192,14 +193,22 @@ async fn sse_truncated_drop_writes_row_with_truncated_true() {
         row.truncated,
         "row.truncated should be true (no finish_reason seen)"
     );
-    // "Hello" = 5, " world" = 6, "!" = 1 → 12 bytes
+    // §2.12 fix: output_tokens must now come from the tokenizer, NOT byte count.
+    // "Hello world!" = 12 bytes, but tt_tokenize (chars/4 for "mock" provider)
+    // gives ceil(12/4) = 3 tokens — materially less than the old byte count.
     assert!(
         row.output_tokens > 0,
-        "output_tokens should be > 0 (byte count)"
+        "output_tokens should be > 0 (tokenizer estimate)"
     );
+    assert!(
+        row.output_tokens < 12,
+        "output_tokens ({}) should be less than byte count (12) after §2.12 fix",
+        row.output_tokens
+    );
+    // For the "mock" provider (chars/4 heuristic): ceil(12/4) = 3.
     assert_eq!(
-        row.output_tokens, 12,
-        "output_tokens = byte count of content"
+        row.output_tokens, 3,
+        "output_tokens = tokenizer estimate for 'Hello world!' with chars/4"
     );
     assert_eq!(row.input_tokens, 20);
     assert_eq!(row.provider, "mock");
