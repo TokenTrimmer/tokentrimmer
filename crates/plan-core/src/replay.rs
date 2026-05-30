@@ -72,6 +72,14 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     let confidence_intervals = compute_cis(&projection, input.seed, input.bootstrap_iterations);
     let per_route_breakdown = build_per_route(projection.per_route);
 
+    // Carry the proposed routes through to the result so the apply path can
+    // persist them. We move the *original* (unsorted) input vec rather than
+    // the priority-sorted `routes` clone above — apply re-sorts at write time
+    // and we want to preserve the caller's authored ordering for round-trip
+    // fidelity. This is a partial move out of `input`; the remaining fields
+    // read below (`plan_id`, `org_id`, the window bounds) are all `Copy`.
+    let proposed_routes = input.proposed_routes;
+
     let mut caveats = build_caveats(
         requests.len(),
         aggregates.requests_unprice_able,
@@ -93,6 +101,7 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         // `replay_with_quality`; bare `replay()` returns `None` here so the
         // existing JSON snapshot stays byte-identical.
         quality: None,
+        proposed_routes,
     })
 }
 

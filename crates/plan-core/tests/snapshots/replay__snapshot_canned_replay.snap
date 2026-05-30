@@ -57,5 +57,23 @@ expression: result
   "caveats": [
     "Small sample size (50 requests) — confidence intervals are wide.",
     "50 rerouted request(s) had no latency history for the target model — their latency is shown unchanged, not projected."
+  ],
+  "proposed_routes": [
+    {
+      "id": "00000000-0000-0000-0000-00000000beef",
+      "name": "cheap-for-short",
+      "priority": 100,
+      "enabled": true,
+      "when": {
+        "model_in": [],
+        "input_tokens_lt": 300,
+        "input_tokens_gt": null,
+        "tag_equals": null
+      },
+      "then": {
+        "target_model": "claude-3-5-haiku",
+        "force_cache_layer": null
+      }
+    }
   ]
 }

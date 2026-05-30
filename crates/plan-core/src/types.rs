@@ -258,6 +258,18 @@ pub struct PlanResult {
     /// `None` so existing snapshots / persisted rows stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<crate::quality::QualityResult>,
+    /// The proposed routes that produced this projection, echoed from
+    /// [`PlanInput::proposed_routes`]. Carried on the result so the apply
+    /// path ([`crate::apply::apply_plan`]) can persist them to the Gateway
+    /// routing config in the same transaction as the status flip — without
+    /// this the result has no record of *what* to apply.
+    ///
+    /// `#[serde(default)]` so plan_runs rows persisted before this field
+    /// existed (which stored only the projection output) still deserialize;
+    /// they decode to an empty Vec, and applying such a row writes no routes
+    /// (matching today's no-op behavior rather than crashing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_routes: Vec<ProposedRoute>,
 }
 
 /// Point-estimate aggregates the replay produces.
