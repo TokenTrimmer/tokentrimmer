@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 use tt_inspect_core::{Engine, Finding, Language, Rule, Severity};
+use tt_inspect_rules_tier1::ConfigAgentsMdContainsSecretsRule;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -163,4 +164,60 @@ fn engine_continues_through_unreadable_files() {
     let findings = engine.scan(tmp.path());
     // Only b.py (non-empty) produces a finding.
     assert_eq!(findings.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Hidden-directory allowlist: end-to-end regression test
+// ---------------------------------------------------------------------------
+
+/// Verifies that `config-agents-md-contains-secrets` fires on a secret planted
+/// inside `.cursor/rules/secret.md`, and that a file inside `.git/` is NOT
+/// scanned (prune preserved).
+///
+/// Before the walker allowlist fix, `.cursor/` was pruned unconditionally,
+/// making this an uncatchable false negative.
+#[test]
+fn engine_scans_cursor_rules_but_not_git() {
+    let tmp = TempDir::new().unwrap();
+
+    // Construct a clearly-fake Anthropic key at runtime so the pre-edit-guard
+    // does not reject the test source file itself.  The key is long enough to
+    // satisfy the regex used by ConfigAgentsMdContainsSecretsRule.
+    let fake_key = ["sk-ant-api03-", &"A".repeat(88)].concat();
+
+    // Plant the fake key inside .cursor/rules/ — this is the path the rule
+    // targets via lower.contains(".cursor/rules").
+    fs::create_dir_all(tmp.path().join(".cursor/rules")).unwrap();
+    fs::write(
+        tmp.path().join(".cursor/rules/secret.md"),
+        format!("# agent rules\n{fake_key}\n"),
+    )
+    .unwrap();
+
+    // A file inside .git/ must never be yielded by the walker even though it
+    // also contains the pattern.
+    fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    fs::write(
+        tmp.path().join(".git/COMMIT_EDITMSG"),
+        format!("{fake_key}\n"),
+    )
+    .unwrap();
+
+    let engine =
+        Engine::new().with_rule(Box::new(ConfigAgentsMdContainsSecretsRule::new()));
+    let findings = engine.scan(tmp.path());
+
+    // Exactly one finding: the secret in .cursor/rules/secret.md.
+    // The .git/COMMIT_EDITMSG file must not produce a finding.
+    assert_eq!(
+        findings.len(),
+        1,
+        "expected exactly one finding from .cursor/rules/secret.md; got: {findings:#?}"
+    );
+    assert!(
+        findings[0].file.contains(".cursor"),
+        "finding must reference the .cursor file, got: {}",
+        findings[0].file
+    );
+    assert_eq!(findings[0].rule_id, "config-agents-md-contains-secrets");
 }

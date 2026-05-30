@@ -19,6 +19,7 @@ walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tt-inspect-rules-tier1 = { path = "../inspect-rules-tier1" }
 
 [lints]
 workspace = true

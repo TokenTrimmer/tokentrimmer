@@ -4923,6 +4923,7 @@ dependencies = [
  "tree-sitter-javascript",
  "tree-sitter-python",
  "tree-sitter-typescript",
+ "tt-inspect-rules-tier1",
  "walkdir",
 ]
 
