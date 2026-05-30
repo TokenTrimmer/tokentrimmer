@@ -50,7 +50,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 - [x] [P2] [rv-mcp-find-route-honest] rust-crate-builder: Back `find_route_for` with real per-task-class telemetry, or downgrade its tool description from "historical / HIGH quality confidence" to "heuristic default by keyword" (mcp/tools/find_route_for.rs:23,35-48). (§1.7) (est: $0.40)
 - [x] [P2] [rv-plan-apply-cli-honest] rust-crate-builder: Make `tt plan --apply` exit non-zero with a clear message until the apply path is wired, instead of silently running projection-only (cli/main.rs:67-70,934-939). (§1.8 quick win) (est: $0.10)
 - [x] [P2] [rv-rag-savings-embedding-cost] rust-crate-builder: Account embedding-call cost in RAG net-savings, clamp/skip negative substitution deltas, batch per-message embeddings, and use the tokenizer not byte/4 (substitute.rs:63,71-75; embed.rs:27). (§2.17) (est: $0.40)
-- [ ] [P2] [rv-inspect-agent-loop-scope] inspect-rule-author: Scope `agent-no-termination-condition`'s termination search to the AST loop body, tighten the broad `budget`/`timeout` tokens, and add a multi-function (one bounded + one unbounded) fixture (agent_no_termination_condition.rs:60-61,91,110). (§4.7) (est: $0.40)
+- [x] [P2] [rv-inspect-agent-loop-scope] inspect-rule-author: Scope `agent-no-termination-condition`'s termination search to the AST loop body, tighten the broad `budget`/`timeout` tokens, and add a multi-function (one bounded + one unbounded) fixture (agent_no_termination_condition.rs:60-61,91,110). (§4.7) (est: $0.40)
 
 ### P3 — whenever
 
@@ -71,7 +71,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 ## Carried over — still open from prior backlog (full notes in `.claude/BACKLOG_ARCHIVE.md`)
 
 - [ ] [P0] [w11-e2e-smoke-test] rust-crate-builder: signup→magic-link→Stripe $1→issue key→curl Gateway→dashboard within 30s. 🟡 authored + CI-wired. [BLOCKED — CI/staging only, not runnable in-sandbox] (est: $0.80)
-- [ ] [P2] [w20-dashboard-perf-gate] rust-crate-builder: Playwright p75<1.5s on dashboard pages. 🟡 authored + CI-wired, CI/staging step. (est: $0.30)
+- [ ] [P2] [w20-dashboard-perf-gate] rust-crate-builder: Playwright p75<1.5s on dashboard pages. 🟡 authored + CI-wired. [BLOCKED — CI/staging only, not runnable in-sandbox] (est: $0.30)
 - [ ] [P0] [w23-free-tier-live] rust-crate-builder: Enable Free tier in prod. [BLOCKED — external accounts] Remaining code bit (per-org tier→BudgetLimits) is now tracked as cloud `rv-tier-limits-enforcement`. (est: $0.80)
 - [ ] [P0] [w23-alpha-reconciliation-gate] rust-crate-builder: 14 consecutive days of drift ≤2%. [BLOCKED — needs live alpha traffic] (est: $0.30)
 - [ ] [P0] [w24-alpha-inspect-fp-gate] rust-crate-builder: Inspect FP <5% on real alpha org repos. [BLOCKED — needs alpha traffic] (est: $0.30)
