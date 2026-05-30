@@ -27,6 +27,7 @@ tt-provider-openrouter.workspace = true
 sqlx.workspace = true
 blake3.workspace = true
 dashmap.workspace = true
+rand_core.workspace = true
 
 axum.workspace = true
 tower.workspace = true

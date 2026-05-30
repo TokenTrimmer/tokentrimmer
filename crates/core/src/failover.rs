@@ -7,6 +7,23 @@
 //! timeout). A non-fallback-eligible error (e.g. a bad request) short-circuits
 //! — there's no point retrying a different model for a malformed request.
 //!
+//! ## Fan-out bound
+//!
+//! When a **chain** of more than one candidate is provided the per-candidate
+//! retry budget is capped to [`CHAINED_MAX_ATTEMPTS`] (2). A single-candidate
+//! route keeps the full policy budget. This bounds the worst-case upstream call
+//! count to `candidates.len() * CHAINED_MAX_ATTEMPTS`. With the default policy
+//! (max_attempts=3) and a 3-candidate chain that is at most **6** calls instead
+//! of the un-bounded **9**.
+//!
+//! ## Circuit-breaker on retry exhaustion
+//!
+//! Whenever `with_retry` returns a *retriable* error (i.e. the candidate
+//! exhausted its attempt budget on 5xx / timeout / network errors) that error
+//! is fed to [`CircuitBreaker::record_failure`] regardless of whether it is
+//! fallback-eligible. This lets a hot-looping provider trip the breaker faster
+//! than a single registered failure per failover would allow.
+//!
 //! The clock is injected via `now` so the breaker is deterministic in tests.
 
 use std::collections::HashMap;
@@ -23,6 +40,15 @@ use tt_shared::{
 
 use crate::registry::ProviderRegistry;
 use crate::retry::{with_retry, RetryPolicy};
+
+/// Per-candidate attempt cap when dispatching a **chain** (more than one
+/// candidate). Keeps the worst-case upstream call count to
+/// `candidates.len() × CHAINED_MAX_ATTEMPTS`.
+///
+/// A single-candidate route is NOT subject to this cap — it keeps the full
+/// policy budget so operators who hard-wire a single model don't silently lose
+/// retries.
+const CHAINED_MAX_ATTEMPTS: u32 = 2;
 
 /// Optional capability guard passed to the failover dispatch functions.
 ///
@@ -124,6 +150,17 @@ pub async fn dispatch_with_failover(
     now: DateTime<Utc>,
     cap_check: Option<CapCheck<'_>>,
 ) -> Result<(Arc<dyn Provider>, ChatCompletionResponse), ProviderError> {
+    // When multiple candidates form a chain, cap per-candidate retries so the
+    // total upstream call count stays bounded (see module-level docs).
+    let chained = candidates.len() > 1;
+    let effective_retry;
+    let retry = if chained {
+        effective_retry = retry.capped(CHAINED_MAX_ATTEMPTS);
+        &effective_retry
+    } else {
+        retry
+    };
+
     let mut last_err: Option<ProviderError> = None;
     for model in candidates {
         // Capability guard: skip candidates we know can't serve the request.
@@ -156,10 +193,23 @@ pub async fn dispatch_with_failover(
                 return Ok((provider, resp));
             }
             Err(e) if e.is_fallback_eligible() => {
+                // Fallback-eligible: record a breaker failure and try the next
+                // candidate. If retry exhausted all attempts on a retriable
+                // error, the brunt of those failures has already been observed
+                // — record it once more here so the breaker sees the full
+                // exhaustion signal.
                 breaker.record_failure(provider.id(), now);
                 last_err = Some(e);
             }
-            // Not fallback-eligible (bad request, unsupported, …) — surface now.
+            Err(e) if e.is_retriable() => {
+                // Retriable but NOT fallback-eligible (e.g. Network errors):
+                // still feed the failure into the breaker so a hot-looping
+                // provider trips it faster, then surface the error.
+                breaker.record_failure(provider.id(), now);
+                return Err(e);
+            }
+            // Not fallback-eligible, not retriable (bad request, unsupported,
+            // …) — surface immediately without touching the breaker.
             Err(e) => return Err(e),
         }
     }
@@ -196,6 +246,16 @@ pub async fn dispatch_stream_with_failover(
     ),
     ProviderError,
 > {
+    // Mirror the fan-out bound from dispatch_with_failover.
+    let chained = candidates.len() > 1;
+    let effective_retry;
+    let retry = if chained {
+        effective_retry = retry.capped(CHAINED_MAX_ATTEMPTS);
+        &effective_retry
+    } else {
+        retry
+    };
+
     let mut last_err: Option<ProviderError> = None;
     for model in candidates {
         // Capability guard.
@@ -233,6 +293,10 @@ pub async fn dispatch_stream_with_failover(
             Err(e) if e.is_fallback_eligible() => {
                 breaker.record_failure(provider.id(), now);
                 last_err = Some(e);
+            }
+            Err(e) if e.is_retriable() => {
+                breaker.record_failure(provider.id(), now);
+                return Err(e);
             }
             Err(e) => return Err(e),
         }
@@ -396,9 +460,11 @@ mod tests {
     }
 
     fn fast() -> RetryPolicy {
+        use crate::retry::JitterFn;
         RetryPolicy {
             max_attempts: 2,
             base_delay: Duration::ZERO,
+            jitter: JitterFn::none(),
         }
     }
 
@@ -885,5 +951,298 @@ mod tests {
         .expect("capable model should serve");
         assert_eq!(provider.id(), "prov");
         assert_eq!(resp.model, "capable-model");
+    }
+
+    // ---- Fan-out bound tests ----
+
+    /// A counting mock that always returns 503 and records every call.
+    struct CountingProvider {
+        id: &'static str,
+        model: &'static str,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait]
+    impl Provider for CountingProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                id: self.model.to_string(),
+                provider: self.id.to_string(),
+                capabilities: vec![Capability::Text],
+                max_input_tokens: 128_000,
+                max_output_tokens: 4096,
+            }]
+        }
+        fn pricing(&self, _: &str) -> Option<ModelPricing> {
+            None
+        }
+        async fn chat_completion(
+            &self,
+            _req: ChatCompletionRequest,
+            _: &RequestContext,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ProviderError::ProviderUpstream {
+                status: 503,
+                message: "always down".into(),
+            })
+        }
+        async fn chat_completion_stream(
+            &self,
+            _: ChatCompletionRequest,
+            _: &RequestContext,
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ProviderError::ProviderUpstream {
+                status: 503,
+                message: "always down".into(),
+            })
+        }
+        async fn embeddings(
+            &self,
+            _: EmbeddingsRequest,
+            _: &RequestContext,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+    }
+
+    /// (b) A 3-candidate all-failing chain makes at most
+    /// `3 * CHAINED_MAX_ATTEMPTS` = 6 upstream calls — well below the
+    /// old un-bounded 9 (3 candidates × 3 attempts each).
+    #[tokio::test]
+    async fn three_candidate_chain_bounded_call_count() {
+        use crate::retry::JitterFn;
+
+        let calls_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_b = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_c = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(CountingProvider {
+            id: "pa",
+            model: "model-a",
+            calls: calls_a.clone(),
+        }));
+        reg.register(Arc::new(CountingProvider {
+            id: "pb",
+            model: "model-b",
+            calls: calls_b.clone(),
+        }));
+        reg.register(Arc::new(CountingProvider {
+            id: "pc",
+            model: "model-c",
+            calls: calls_c.clone(),
+        }));
+
+        // Use max_attempts=3 (the default budget) so we can prove the chain cap
+        // kicks in and limits each candidate to CHAINED_MAX_ATTEMPTS=2.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::ZERO,
+            jitter: JitterFn::none(),
+        };
+        let breaker = CircuitBreaker::default();
+        let candidates = vec![
+            "model-a".to_string(),
+            "model-b".to_string(),
+            "model-c".to_string(),
+        ];
+        let result = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &policy,
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            now(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "all candidates fail → must return error");
+
+        let total = calls_a.load(std::sync::atomic::Ordering::SeqCst)
+            + calls_b.load(std::sync::atomic::Ordering::SeqCst)
+            + calls_c.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Each candidate is capped to CHAINED_MAX_ATTEMPTS=2; total ≤ 3*2=6.
+        // The old un-bounded code would produce 3*3=9 calls.
+        assert!(
+            total <= (3 * CHAINED_MAX_ATTEMPTS),
+            "expected ≤ {} upstream calls, got {total}",
+            3 * CHAINED_MAX_ATTEMPTS,
+        );
+        assert!(
+            total < 9,
+            "total {total} must be less than old un-bounded worst-case 9"
+        );
+    }
+
+    /// (d) Single-candidate route keeps the full policy budget (fan-out cap
+    /// does NOT apply) so retry-then-success still works.
+    #[tokio::test]
+    async fn single_candidate_keeps_full_budget() {
+        use crate::retry::JitterFn;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Fails twice then succeeds on the 3rd attempt.
+        struct FlakyProvider {
+            calls: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Provider for FlakyProvider {
+            fn id(&self) -> &'static str {
+                "flaky"
+            }
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![ModelInfo {
+                    id: "flaky-model".to_string(),
+                    provider: "flaky".to_string(),
+                    capabilities: vec![Capability::Text],
+                    max_input_tokens: 128_000,
+                    max_output_tokens: 4096,
+                }]
+            }
+            fn pricing(&self, _: &str) -> Option<ModelPricing> {
+                None
+            }
+            async fn chat_completion(
+                &self,
+                req: ChatCompletionRequest,
+                _: &RequestContext,
+            ) -> Result<ChatCompletionResponse, ProviderError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    return Err(ProviderError::ProviderUpstream {
+                        status: 503,
+                        message: "transient".into(),
+                    });
+                }
+                Ok(ChatCompletionResponse {
+                    id: "x".into(),
+                    object: "chat.completion".into(),
+                    created: 0,
+                    model: req.model,
+                    choices: vec![Choice {
+                        index: 0,
+                        message: Message::Assistant {
+                            content: Some(MessageContent::Text("ok".into())),
+                            tool_calls: vec![],
+                            name: None,
+                        },
+                        finish_reason: Some("stop".into()),
+                    }],
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                        cached_tokens: 0,
+                        cache_creation_input_tokens: None,
+                    },
+                })
+            }
+            async fn chat_completion_stream(
+                &self,
+                _: ChatCompletionRequest,
+                _: &RequestContext,
+            ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+            {
+                Err(ProviderError::Unsupported("n/a".into()))
+            }
+            async fn embeddings(
+                &self,
+                _: EmbeddingsRequest,
+                _: &RequestContext,
+            ) -> Result<EmbeddingsResponse, ProviderError> {
+                Err(ProviderError::Unsupported("n/a".into()))
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(FlakyProvider {
+            calls: calls.clone(),
+        }));
+
+        // max_attempts=3 on a single-candidate route — must NOT be capped to 2.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::ZERO,
+            jitter: JitterFn::none(),
+        };
+        let breaker = CircuitBreaker::default();
+        let candidates = vec!["flaky-model".to_string()];
+        let (prov, _) = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &policy,
+            &candidates,
+            &req("flaky-model"),
+            &ctx(),
+            now(),
+            None,
+        )
+        .await
+        .expect("should succeed on 3rd attempt");
+        assert_eq!(prov.id(), "flaky", "single candidate must use full budget");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "must have made exactly 3 calls"
+        );
+    }
+
+    // ---- Breaker-on-exhaustion tests ----
+
+    /// (c) When a candidate exhausts its retries (all attempts fail with
+    /// retriable errors), the circuit breaker records a failure for that
+    /// provider. This lets a hot-looping provider trip the breaker faster.
+    #[tokio::test]
+    async fn retry_exhaustion_records_breaker_failure() {
+        use crate::retry::JitterFn;
+
+        // Breaker opens after a single failure so we can observe it easily.
+        let breaker = CircuitBreaker::new(1, Duration::from_secs(30));
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(CountingProvider {
+            id: "failing-prov",
+            model: "failing-model",
+            calls: calls.clone(),
+        }));
+
+        let policy = RetryPolicy {
+            max_attempts: 2, // exhausts after 2 attempts
+            base_delay: Duration::ZERO,
+            jitter: JitterFn::none(),
+        };
+        let candidates = vec!["failing-model".to_string()];
+        let result = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &policy,
+            &candidates,
+            &req("failing-model"),
+            &ctx(),
+            now(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "all retries exhausted");
+
+        // The exhaustion should have been recorded as a breaker failure, which
+        // means the circuit is now open (threshold=1).
+        assert!(
+            breaker.is_open("failing-prov", now()),
+            "breaker must be open after retry exhaustion"
+        );
     }
 }
