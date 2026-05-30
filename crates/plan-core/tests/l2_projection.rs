@@ -275,14 +275,21 @@ fn divergent_finish_reason_flags_poisoning_candidate() {
     ];
     let result = project_l2_hits(&reqs, &cfg());
 
-    // 4 thresholds × 1 hit each × poisoning on every hit = 4 candidates.
+    // 4 thresholds × 1 hit each = 4 projected hits across the sweep.
     let total_hits: u32 = result
         .per_threshold
         .iter()
         .map(|p| p.projected_l2_hits)
         .sum();
     assert_eq!(total_hits, 4);
-    assert_eq!(result.poisoning_candidates, 4);
+    // Each threshold reports its OWN poisoning count (the single divergent
+    // request poisons at every threshold it hits → 1 per threshold).
+    for p in &result.per_threshold {
+        assert_eq!(p.poisoning_candidates, 1);
+    }
+    // Aggregate dedups the single distinct candidate request → 1, NOT the
+    // old cross-sweep sum of 4.
+    assert_eq!(result.poisoning_candidates, 1);
 }
 
 #[test]
@@ -309,7 +316,12 @@ fn divergent_output_tokens_flags_poisoning_candidate() {
         .map(|p| p.projected_l2_hits)
         .sum();
     assert_eq!(total_hits, 4);
-    assert_eq!(result.poisoning_candidates, 4);
+    // Per-threshold each row owns its count; aggregate dedups to the single
+    // distinct candidate request (was 4 under the old summed behaviour).
+    for p in &result.per_threshold {
+        assert_eq!(p.poisoning_candidates, 1);
+    }
+    assert_eq!(result.poisoning_candidates, 1);
 }
 
 // --------------------------------------------------------------------- (9)

@@ -1040,19 +1040,20 @@ fn format_plan_text(r: &tt_plan_core::PlanResult) -> String {
 
     if !a.l2_projections.is_empty() {
         out.push_str("## L2 semantic cache sweep\n\n");
-        out.push_str("  threshold  hit_rate  hits/total\n");
+        out.push_str("  threshold  hit_rate  hits/total  poisoning\n");
         for p in &a.l2_projections {
             out.push_str(&format!(
-                "  {:>9.2}  {:>7.1}%  {}/{}\n",
+                "  {:>9.2}  {:>7.1}%  {}/{}  {}\n",
                 p.threshold,
                 p.projected_l2_hit_rate * 100.0,
                 p.projected_l2_hits,
-                p.total
+                p.total,
+                p.poisoning_candidates
             ));
         }
         if a.l2_poisoning_candidates > 0 {
             out.push_str(&format!(
-                "  ⚠ {} cache-poisoning candidate(s) detected (similar requests with divergent outcomes)\n",
+                "  ⚠ {} distinct cache-poisoning candidate(s) across the sweep (similar requests with divergent outcomes)\n",
                 a.l2_poisoning_candidates
             ));
         }

@@ -373,16 +373,28 @@ pub struct L2Projection {
     pub projected_l2_hits: u32,
     /// `projected_l2_hits / total` (0–1, 0 when `total == 0`).
     pub projected_l2_hit_rate: f64,
+    /// Count of L2 hits the cache-poisoning heuristic flagged as suspicious
+    /// **at this threshold** — high similarity but historical outcomes
+    /// diverged. Reported per-threshold so the risk is shown against the
+    /// threshold that produced it (a higher threshold typically yields
+    /// fewer, tighter matches and so fewer candidates). See
+    /// [`crate::l2_projection`] for the heuristic.
+    #[serde(default)]
+    pub poisoning_candidates: u32,
 }
 
 /// The complete output of one L2 sweep pass — the per-threshold rows plus
-/// the poisoning-candidate count aggregated across all thresholds.
+/// the deduplicated poisoning-candidate count across the whole sweep.
 #[derive(Debug, Clone, Default)]
 pub struct L2SweepResult {
-    /// One [`L2Projection`] per requested threshold, in input order.
+    /// One [`L2Projection`] per requested threshold, in input order. Each
+    /// row carries its own [`L2Projection::poisoning_candidates`].
     pub per_threshold: Vec<L2Projection>,
-    /// Aggregate count of L2 hits the poisoning heuristic flagged across
-    /// the entire sweep — see [`crate::l2_projection`] for the rules.
+    /// Count of **distinct** requests the poisoning heuristic flagged at
+    /// **any** threshold in the sweep. A request that poisons at several
+    /// thresholds is counted once — this is deliberately NOT the sum of the
+    /// per-threshold counts (which would inflate the metric up to N× for an
+    /// N-threshold sweep). See [`crate::l2_projection`] for the rules.
     pub poisoning_candidates: u32,
 }
 
