@@ -1,5 +1,6 @@
 ---
 source: crates/plan-core/tests/replay.rs
+assertion_line: 453
 expression: result
 ---
 {
@@ -71,8 +72,7 @@ expression: result
         "tag_equals": null
       },
       "then": {
-        "target_model": "claude-3-5-haiku",
-        "force_cache_layer": null
+        "target_model": "claude-3-5-haiku"
       }
     }
   ]

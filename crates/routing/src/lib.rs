@@ -76,8 +76,15 @@ pub struct RouteAction {
     /// Empty = no failover. The gateway resolves each via the registry, so a
     /// fallback may cross providers. Populated by the cloud routes schema;
     /// `#[serde(default)]` keeps older rows / payloads compatible.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,
+    /// Override the projected cache layer carried from a Plan apply. The
+    /// gateway does not yet honor this at runtime (follow-up: wire
+    /// force_cache_layer into the dispatch path); the field is present so a
+    /// `tt_plan_core::RouteAction` round-trips losslessly to a
+    /// `tt_routing::RouteAction` without dropping the value on apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_cache_layer: Option<String>,
 }
 
 /// Rule engine. Hold routes sorted by descending priority; iterate to find
@@ -181,6 +188,7 @@ mod tests {
             then: RouteAction {
                 target_model: target.into(),
                 fallbacks: Vec::new(),
+                force_cache_layer: None,
             },
         }
     }
@@ -326,5 +334,70 @@ mod tests {
         assert!(eng
             .evaluate(&make_req("claude-sonnet-4-6"), &make_ctx(None), 100)
             .is_some());
+    }
+
+    // --- rv-routeaction-shared-type: field-parity serde tests ---
+
+    /// (c) Serializing a `RouteAction` with empty fallbacks and no
+    /// force_cache_layer must produce the same JSON as before — just
+    /// `{"target_model":"x"}` — confirming skip_serializing_if is wired.
+    #[test]
+    fn route_action_minimal_serializes_without_new_fields() {
+        let a = RouteAction {
+            target_model: "x".into(),
+            fallbacks: Vec::new(),
+            force_cache_layer: None,
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, r#"{"target_model":"x"}"#,
+            "empty fallbacks and None force_cache_layer must be omitted from JSON");
+    }
+
+    /// (b) Old JSON that has only `target_model` still deserializes — serde
+    /// default fills in empty fallbacks and None force_cache_layer.
+    #[test]
+    fn route_action_backward_compat_deserialize() {
+        let json = r#"{"target_model":"gpt-4o-mini"}"#;
+        let a: RouteAction = serde_json::from_str(json).unwrap();
+        assert_eq!(a.target_model, "gpt-4o-mini");
+        assert!(a.fallbacks.is_empty(), "fallbacks must default to empty");
+        assert!(a.force_cache_layer.is_none(), "force_cache_layer must default to None");
+    }
+
+    /// (a) Full round-trip: a `RouteAction` with both new fields serializes to
+    /// JSON that carries both fields, and deserializes back with all values
+    /// preserved — no field dropped.
+    #[test]
+    fn route_action_full_round_trip() {
+        let original = RouteAction {
+            target_model: "claude-haiku-4-5".into(),
+            fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
+            force_cache_layer: Some("l1".into()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        // Both new fields must appear in the serialized JSON.
+        assert!(json.contains("\"fallbacks\""), "fallbacks must be present: {json}");
+        assert!(json.contains("\"force_cache_layer\""), "force_cache_layer must be present: {json}");
+        let roundtripped: RouteAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.target_model, original.target_model);
+        assert_eq!(roundtripped.fallbacks, original.fallbacks);
+        assert_eq!(roundtripped.force_cache_layer, original.force_cache_layer);
+    }
+
+    /// Cross-crate lossless round-trip: JSON produced by `tt_routing::RouteAction`
+    /// (with both fields) deserializes into a structurally identical representation.
+    /// Because both types are now field-identical (target_model, fallbacks,
+    /// force_cache_layer), the JSON is the shared wire format — a plan apply
+    /// can serialize a `tt_plan_core::RouteAction` and the gateway reads it as
+    /// a `tt_routing::RouteAction` without dropping any field.
+    #[test]
+    fn route_action_cross_type_wire_compat() {
+        // Simulate the JSON a tt_plan_core::RouteAction with all fields would
+        // produce (field names and serde attributes are now identical).
+        let plan_side_json = r#"{"target_model":"claude-3-5-haiku","fallbacks":["gpt-4o-mini"],"force_cache_layer":"l1"}"#;
+        let gateway_action: RouteAction = serde_json::from_str(plan_side_json).unwrap();
+        assert_eq!(gateway_action.target_model, "claude-3-5-haiku");
+        assert_eq!(gateway_action.fallbacks, vec!["gpt-4o-mini"]);
+        assert_eq!(gateway_action.force_cache_layer.as_deref(), Some("l1"));
     }
 }

@@ -391,6 +391,7 @@ async fn replay_with_quality_attaches_quality_field() {
         then: RouteAction {
             target_model: "claude-3-5-haiku".into(),
             force_cache_layer: None,
+            fallbacks: Vec::new(),
         },
     };
     let mut pricing = HashMap::new();
