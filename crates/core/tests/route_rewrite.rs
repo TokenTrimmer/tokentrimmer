@@ -187,6 +187,7 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
             then: RouteAction {
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
+                force_cache_layer: None,
             },
         }],
     );
@@ -260,6 +261,7 @@ async fn routed_request_reports_savings_against_original_model() {
             then: RouteAction {
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
+                force_cache_layer: None,
             },
         }],
     );
@@ -365,6 +367,7 @@ async fn route_for_other_org_does_not_match() {
             then: RouteAction {
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
+                force_cache_layer: None,
             },
         }],
     );
@@ -415,6 +418,7 @@ async fn route_skipped_when_no_resolvable_org() {
             then: RouteAction {
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
+                force_cache_layer: None,
             },
         }],
     );
