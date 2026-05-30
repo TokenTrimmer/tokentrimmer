@@ -217,12 +217,21 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
         }]
     });
 
+    // Attach an ApiKeyContext so the middleware takes the authenticated path
+    // (not the fail-closed unauthenticated path).  We use the same nil org_id
+    // that was seeded into the MemoryStore above.
+    let ctx = tt_auth::ApiKeyContext {
+        key_id: Uuid::new_v4(),
+        org_id,
+    };
+
     let resp = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
+                .extension(ctx)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )

@@ -199,23 +199,42 @@ pub async fn maybe_substitute(
     // per-tenant isolation in the retrieval store: org A's stored documents
     // are never surfaced to org B and vice versa.
     //
-    // When no ApiKeyContext is present (unauthenticated or dev-mode requests
-    // without a key store wired), fall back to Uuid::nil() — the shared
-    // unauthenticated namespace — and emit a debug trace. This preserves
-    // the legacy behaviour for local development and integration tests that
-    // don't wire the auth middleware. Authenticated production traffic never
-    // reaches this branch.
-    let org_id = parts
-        .extensions
-        .get::<ApiKeyContext>()
-        .map(|ctx| ctx.org_id)
-        .unwrap_or_else(|| {
-            tracing::debug!(
-                "retrieval: no ApiKeyContext present — \
-                 using nil org (unauthenticated / dev path)"
-            );
-            uuid::Uuid::nil()
-        });
+    // Fail-closed: when no ApiKeyContext is present (auth middleware absent or
+    // not yet run), skip substitution entirely and forward the request body
+    // unchanged. This prevents cross-tenant data leaks if retrieval is ever
+    // accidentally layered ahead of auth or used in a passthrough deployment.
+    //
+    // Set TT_RETRIEVAL_ALLOW_ANON=1 to opt in to the old nil-namespace
+    // fallback for local development / integration tests that don't wire the
+    // auth middleware. Never set this in production.
+    let org_id = match parts.extensions.get::<ApiKeyContext>() {
+        Some(ctx) => ctx.org_id,
+        None => {
+            let allow_anon = std::env::var("TT_RETRIEVAL_ALLOW_ANON")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+            if allow_anon {
+                tracing::debug!(
+                    "retrieval: no ApiKeyContext present — \
+                     TT_RETRIEVAL_ALLOW_ANON=1, using nil org (dev path)"
+                );
+                uuid::Uuid::nil()
+            } else {
+                warn!(
+                    "retrieval: no ApiKeyContext present and TT_RETRIEVAL_ALLOW_ANON not set \
+                     — skipping substitution (fail-closed)"
+                );
+                let req = Request::from_parts(parts, Body::from(bytes));
+                let mut resp = next.run(req).await;
+                resp.headers_mut().insert(
+                    "x-tt-retrieval-skipped",
+                    HeaderValue::from_static("no-auth"),
+                );
+                return resp;
+            }
+        }
+    };
 
     // Run substitution.
     match substitute_in_messages(messages, org_id, state.store.as_ref(), &state.embedder).await {
@@ -285,5 +304,196 @@ pub async fn maybe_substitute(
             }
             resp
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use axum::http::{Request as HttpRequest, StatusCode};
+    use axum::middleware;
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use tt_auth::ApiKeyContext;
+    use tt_retrieval::embed::EmbeddingClient;
+    use tt_retrieval::store::memory::MemoryStore;
+
+    use super::{maybe_substitute, RetrievalState};
+
+    /// Process-wide lock that serializes tests which read/write
+    /// `TT_RETRIEVAL_ALLOW_ANON` so they cannot race each other in the
+    /// multi-threaded test runner.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A minimal chat-completions body that contains a `<retrievable` tag so
+    /// the middleware won't short-circuit on the quick-scan check.
+    fn retrievable_body() -> &'static str {
+        r#"{"messages":[{"role":"user","content":"<retrievable corpus=\"test\">hello</retrievable>"}]}"#
+    }
+
+    fn build_state() -> RetrievalState {
+        RetrievalState {
+            store: Arc::new(MemoryStore::new()),
+            embedder: Arc::new(EmbeddingClient::openai("test-key")),
+            audit: None,
+        }
+    }
+
+    /// Build a router that runs `maybe_substitute` then a trivial handler.
+    fn build_router(state: RetrievalState) -> Router {
+        Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|body: axum::body::Bytes| async move {
+                    // Echo the body back so tests can inspect what was forwarded.
+                    axum::response::Response::builder()
+                        .status(200)
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            )
+            .layer(middleware::from_fn_with_state(state.clone(), maybe_substitute))
+            .with_state(state)
+    }
+
+    fn chat_request(body: &'static str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request")
+    }
+
+    // (a) No ApiKeyContext + dev flag OFF → body forwarded unchanged,
+    //     x-tt-retrieval-skipped: no-auth header set, no search runs.
+    #[tokio::test]
+    async fn fail_closed_no_auth_no_flag() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // Ensure the env var is NOT set for this test.
+        std::env::remove_var("TT_RETRIEVAL_ALLOW_ANON");
+
+        let router = build_router(build_state());
+        let resp = router
+            .oneshot(chat_request(retrievable_body()))
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Must emit the skipped header.
+        assert_eq!(
+            resp.headers().get("x-tt-retrieval-skipped").map(|v| v.as_bytes()),
+            Some(b"no-auth".as_slice()),
+            "expected x-tt-retrieval-skipped: no-auth when no ApiKeyContext and flag off"
+        );
+
+        // Must NOT emit the active/ready retrieval header (no substitution ran).
+        assert!(
+            resp.headers().get("x-tt-retrieval-enabled").is_none(),
+            "x-tt-retrieval-enabled should be absent when substitution is skipped"
+        );
+
+        // The body forwarded to the handler must be the original bytes unchanged.
+        let forwarded = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        assert_eq!(
+            forwarded.as_ref(),
+            retrievable_body().as_bytes(),
+            "body must be forwarded unchanged when substitution is skipped"
+        );
+    }
+
+    // (b) No ApiKeyContext + TT_RETRIEVAL_ALLOW_ANON=1 → nil org used,
+    //     substitution ATTEMPTED (embedding will fail with test key, but the
+    //     middleware does NOT return the skipped header — it reaches the
+    //     substitution path).
+    #[tokio::test]
+    async fn allow_anon_flag_attempts_substitution() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("TT_RETRIEVAL_ALLOW_ANON", "1");
+
+        let router = build_router(build_state());
+        let resp = router
+            .oneshot(chat_request(retrievable_body()))
+            .await
+            .expect("response");
+
+        // Clean up before any assertions so the lock is still held.
+        std::env::remove_var("TT_RETRIEVAL_ALLOW_ANON");
+
+        // The skipped header must NOT be present (we took the anon path).
+        assert!(
+            resp.headers().get("x-tt-retrieval-skipped").is_none(),
+            "x-tt-retrieval-skipped must be absent when TT_RETRIEVAL_ALLOW_ANON=1"
+        );
+
+        // Embedding will fail (fake key), so we expect an error header — but
+        // crucially we did NOT short-circuit before substitution.
+        let has_error = resp.headers().get("x-tt-retrieval-error").is_some();
+        let has_active = resp
+            .headers()
+            .get("x-tt-retrieval-enabled")
+            .map(|v| v == "active")
+            .unwrap_or(false);
+        assert!(
+            has_error || has_active,
+            "substitution path must have been attempted (error or active header expected)"
+        );
+    }
+
+    // (c) Valid ApiKeyContext present → org_id used, substitution attempted
+    //     against real org (embedding fails with test key, but skipped header
+    //     is absent — the authed path was taken).
+    #[tokio::test]
+    async fn authenticated_path_uses_real_org() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("TT_RETRIEVAL_ALLOW_ANON");
+
+        let org_id = Uuid::new_v4();
+        let ctx = ApiKeyContext {
+            key_id: Uuid::new_v4(),
+            org_id,
+        };
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .extension(ctx)
+            .body(Body::from(retrievable_body()))
+            .expect("request");
+
+        let router = build_router(build_state());
+        let resp = router.oneshot(req).await.expect("response");
+
+        // Skipped header must NOT be present.
+        assert!(
+            resp.headers().get("x-tt-retrieval-skipped").is_none(),
+            "x-tt-retrieval-skipped must be absent when ApiKeyContext is present"
+        );
+
+        // Substitution was attempted (embedding fails w/ test key → error
+        // header; OR it somehow succeeds → active header).
+        let has_error = resp.headers().get("x-tt-retrieval-error").is_some();
+        let has_active = resp
+            .headers()
+            .get("x-tt-retrieval-enabled")
+            .map(|v| v == "active")
+            .unwrap_or(false);
+        assert!(
+            has_error || has_active,
+            "authenticated path must attempt substitution"
+        );
     }
 }
