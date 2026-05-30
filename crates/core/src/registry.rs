@@ -11,12 +11,13 @@ use tt_provider_mistral::MistralProvider;
 use tt_provider_openai::{ClientConfig as OpenAiClientConfig, OpenAiProvider};
 use tt_provider_openrouter::OpenRouterProvider;
 use tt_provider_together::TogetherProvider;
-use tt_shared::Provider;
+use tt_shared::{ModelInfo, Provider};
 
 #[derive(Default)]
 pub struct ProviderRegistry {
     by_id: HashMap<&'static str, Arc<dyn Provider>>,
     by_model: HashMap<String, Arc<dyn Provider>>,
+    model_info: HashMap<String, ModelInfo>,
 }
 
 impl ProviderRegistry {
@@ -27,10 +28,21 @@ impl ProviderRegistry {
     pub fn register(&mut self, provider: Arc<dyn Provider>) {
         let id = provider.id();
         for model in provider.models() {
+            self.model_info
+                .insert(model.id.clone(), model.clone());
             self.by_model
                 .insert(model.id.clone(), Arc::clone(&provider));
         }
         self.by_id.insert(id, provider);
+    }
+
+    /// Look up the static [`ModelInfo`] for `model_id`.
+    ///
+    /// Returns `None` when the model is unknown to the catalog (dispatch may
+    /// still succeed via [`Self::resolve`]'s fallback path, but capability
+    /// checking treats unknown models as *permissive* — not blocked).
+    pub fn model_info(&self, model_id: &str) -> Option<&ModelInfo> {
+        self.model_info.get(model_id)
     }
 
     pub fn by_id(&self, id: &str) -> Option<Arc<dyn Provider>> {

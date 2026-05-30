@@ -381,6 +381,9 @@ pub async fn handler(
             let candidates: Vec<String> = std::iter::once(req.model.clone())
                 .chain(route_fallbacks.iter().cloned())
                 .collect();
+            // Build the capability check for the streaming failover path.
+            let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
+            let cap_est_tokens = estimated_input_tokens.max(0) as u64;
             crate::failover::dispatch_stream_with_failover(
                 &state.registry,
                 &state.breaker,
@@ -389,6 +392,10 @@ pub async fn handler(
                 &req,
                 &ctx,
                 Utc::now(),
+                Some(crate::failover::CapCheck {
+                    required: &cap_required,
+                    estimated_tokens: cap_est_tokens,
+                }),
             )
             .await?
         };
@@ -510,6 +517,12 @@ pub async fn handler(
             let candidates: Vec<String> = std::iter::once(req.model.clone())
                 .chain(route_fallbacks.iter().cloned())
                 .collect();
+            // Build the capability check for the failover path.
+            let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
+            let cap_est_tokens = {
+                let combined = tt_shared::message_text_for_estimation(&req);
+                tt_tokenize::estimate_tokens(provider.id(), &combined) as u64
+            };
             crate::failover::dispatch_with_failover(
                 &state.registry,
                 &state.breaker,
@@ -518,6 +531,10 @@ pub async fn handler(
                 &req,
                 &ctx,
                 Utc::now(),
+                Some(crate::failover::CapCheck {
+                    required: &cap_required,
+                    estimated_tokens: cap_est_tokens,
+                }),
             )
             .await?
         };
@@ -1151,6 +1168,32 @@ async fn apply_routing(
     let m = engine.evaluate(req, ctx, input_tokens)?;
     let route_id = m.id;
     let fallbacks = m.then.fallbacks.clone();
+
+    // Capability guard: before committing the rewrite, check that the
+    // target model supports everything the request requires. When ModelInfo
+    // is unknown (not in the catalog) we are permissive — only skip when
+    // we positively know a capability is missing.
+    let required_caps = tt_shared::RequiredCapabilities::from_request(req);
+    let estimated_tokens = {
+        let combined = tt_shared::message_text_for_estimation(req);
+        tt_tokenize::estimate_tokens(provider_id, &combined) as u64
+    };
+    if let Some(info) = state.registry.model_info(&m.then.target_model) {
+        if !required_caps.satisfied_by(info, estimated_tokens) {
+            let reasons = required_caps.skip_reasons(info, estimated_tokens);
+            tracing::info!(
+                org_id = %ctx.org_id,
+                route_id = %route_id,
+                model = %m.then.target_model,
+                reasons = ?reasons,
+                "route_skipped_capability: rewrite target lacks required capabilities, passing through unchanged"
+            );
+            // Do not rewrite req.model — return None so the request
+            // continues with the original model.
+            return None;
+        }
+    }
+
     let original = std::mem::replace(&mut req.model, m.then.target_model.clone());
     tracing::debug!(
         org_id = %ctx.org_id,
