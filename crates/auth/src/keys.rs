@@ -345,9 +345,23 @@ pub async fn issue<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
                     "label": label,
                     "environment": environment,
                 });
-                audit_writer
+                if let Err(e) = audit_writer
                     .write(org_id, actor, "apikey.issued".to_string(), payload)
-                    .await?;
+                    .await
+                {
+                    // The key IS persisted but the tamper-evident chain entry
+                    // failed. KeyStore + AuditWriter are separate traits (not a
+                    // shared txn yet — see follow-up), so surface this loudly so
+                    // it can be re-emitted out-of-band rather than silently
+                    // diverging. (§5.10)
+                    tracing::error!(
+                        key_id = %id,
+                        event = "apikey.issued",
+                        error = %e,
+                        "AUDIT GAP: api key issued but audit-chain write failed — re-emit out-of-band"
+                    );
+                    return Err(KeyError::from(e));
+                }
 
                 return Ok(IssuedKey {
                     record: key,
@@ -455,9 +469,20 @@ pub async fn revoke_key<S: KeyStore + ?Sized, A: AuditWriter + ?Sized>(
         "key_id": key_id,
         "revoked_at": now.to_rfc3339(),
     });
-    audit_writer
+    if let Err(e) = audit_writer
         .write(org_id, actor, "apikey.revoked".to_string(), payload)
-        .await?;
+        .await
+    {
+        // Key IS revoked but the chain entry failed; loud signal for
+        // out-of-band re-emission (no shared txn across stores yet). (§5.10)
+        tracing::error!(
+            key_id = %key_id,
+            event = "apikey.revoked",
+            error = %e,
+            "AUDIT GAP: api key revoked but audit-chain write failed — re-emit out-of-band"
+        );
+        return Err(KeyError::from(e));
+    }
     Ok(())
 }
 
