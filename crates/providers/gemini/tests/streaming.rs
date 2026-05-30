@@ -398,9 +398,9 @@ async fn stream_server_closes_without_finish_reason() {
     let mut chunks = Vec::new();
     // This must complete without panic.
     while let Some(result) = stream.next().await {
-        match result {
-            Ok(c) => chunks.push(c),
-            Err(_) => {} // tolerate errors
+        // Tolerate errors; we only assert the stream completes without panic.
+        if let Ok(c) = result {
+            chunks.push(c);
         }
     }
 

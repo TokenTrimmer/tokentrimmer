@@ -17,7 +17,8 @@
 //! # API differences from OpenAI
 //!
 //! - Model is in the URL path, not the request body.
-//! - Auth is a query-string `?key=...` parameter, not a `Bearer` header.
+//! - Auth is the `x-goog-api-key` request header (NOT a URL `?key=` query
+//!   param — keys in URLs leak via logs/proxies; see review §5.2).
 //! - System messages map to `systemInstruction`.
 //! - Tools use `functionDeclarations` inside a single `tools` object.
 //! - Streaming uses SSE format with `?alt=sse`.
@@ -86,7 +87,7 @@ impl Provider for GeminiProvider {
     }
 
     /// Non-streaming chat completion via
-    /// `POST /v1beta/models/{model}:generateContent?key={api_key}`.
+    /// `POST /v1beta/models/{model}:generateContent` (key in `x-goog-api-key` header).
     ///
     /// Translates the canonical request to Gemini's wire format, sends it,
     /// and maps errors to [`ProviderError`].
@@ -100,7 +101,7 @@ impl Provider for GeminiProvider {
         let api_key = ctx.credentials.api_key.expose().to_string();
         let model = req.model.clone();
 
-        let url = format!("{base_url}/v1beta/models/{model}:generateContent?key={api_key}");
+        let url = format!("{base_url}/v1beta/models/{model}:generateContent");
 
         let body = translate::translate_request(req)?;
 
@@ -108,6 +109,7 @@ impl Provider for GeminiProvider {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &api_key)
             .json(&body)
             .send()
             .await
@@ -135,7 +137,7 @@ impl Provider for GeminiProvider {
     }
 
     /// Streaming chat completion via
-    /// `POST /v1beta/models/{model}:streamGenerateContent?key={api_key}&alt=sse`.
+    /// `POST /v1beta/models/{model}:streamGenerateContent?alt=sse` (key in `x-goog-api-key` header).
     ///
     /// Returns [`ProviderError`] before yielding any chunk if the server
     /// responds with HTTP ≥ 400. Otherwise returns a `BoxStream` that parses

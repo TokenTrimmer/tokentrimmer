@@ -99,7 +99,7 @@ async fn success_200_with_cached_content_token_count() {
     let _mock = server.mock(|when, then| {
         when.method(POST)
             .path("/v1beta/models/gemini-3.1-pro:generateContent")
-            .query_param("key", "test-key");
+            .header("x-goog-api-key", "test-key");
         then.status(200)
             .header("Content-Type", "application/json")
             .body(success_body());
@@ -406,17 +406,17 @@ async fn embeddings_returns_unsupported() {
 }
 
 // ---------------------------------------------------------------------------
-// Auth: API key passed as query parameter
+// Auth: API key passed in the x-goog-api-key header, never the URL (§5.2)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn request_uses_api_key_as_query_param() {
+async fn request_uses_api_key_header() {
     let server = MockServer::start();
 
     let _mock = server.mock(|when, then| {
         when.method(POST)
             .path("/v1beta/models/gemini-3.1-pro:generateContent")
-            .query_param("key", "my-specific-test-key");
+            .header("x-goog-api-key", "my-specific-test-key");
         then.status(200)
             .header("Content-Type", "application/json")
             .body(success_body());
@@ -438,7 +438,7 @@ async fn request_uses_api_key_as_query_param() {
     let resp = provider()
         .chat_completion(minimal_request(), &ctx)
         .await
-        .expect("should succeed with query-param API key");
+        .expect("should succeed with x-goog-api-key header");
 
     assert!(resp.id.starts_with("chatcmpl-gem-"));
 }

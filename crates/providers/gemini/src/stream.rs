@@ -68,8 +68,7 @@ pub async fn stream_chat_completion(
     // Translate to the Gemini wire shape.
     let body = translate::translate_request(req)?;
 
-    let url =
-        format!("{base_url}/v1beta/models/{model}:streamGenerateContent?key={api_key}&alt=sse");
+    let url = format!("{base_url}/v1beta/models/{model}:streamGenerateContent?alt=sse");
 
     let body_bytes = serde_json::to_vec(&body)
         .map_err(|e| ProviderError::Internal(format!("failed to serialize stream body: {e}")))?;
@@ -77,6 +76,7 @@ pub async fn stream_chat_completion(
     let response = client
         .post(&url)
         .header("Content-Type", "application/json")
+        .header("x-goog-api-key", &api_key)
         .body(body_bytes)
         .send()
         .await
