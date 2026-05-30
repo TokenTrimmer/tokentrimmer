@@ -8,13 +8,23 @@ use crate::classifier::TaskClass;
 use crate::pricing::cost_usd;
 use crate::types::{QualityRiskBand, RouteSuggestion};
 
-/// Candidate cheaper models per task class. Ordered by preference.
-fn candidates_for(class: TaskClass) -> &'static [&'static str] {
+/// Candidate cheaper models per task class, each paired with its provider so
+/// pricing is attributed from the RIGHT catalog (avoids the probe-order
+/// mis-attribution for any cross-listed model). Ordered by preference.
+fn candidates_for(class: TaskClass) -> &'static [(&'static str, &'static str)] {
     match class {
-        TaskClass::Classification => &["claude-haiku-4-5", "gpt-4o-mini", "gemini-3.1-flash-lite"],
-        TaskClass::Extraction => &["claude-haiku-4-5", "gpt-4o-mini", "gemini-3.5-flash"],
-        TaskClass::Chat => &["claude-haiku-4-5", "gpt-4o-mini"],
-        TaskClass::Code => &["claude-haiku-4-5", "gpt-4o-mini"],
+        TaskClass::Classification => &[
+            ("claude-haiku-4-5", "anthropic"),
+            ("gpt-4o-mini", "openai"),
+            ("gemini-3.1-flash-lite", "gemini"),
+        ],
+        TaskClass::Extraction => &[
+            ("claude-haiku-4-5", "anthropic"),
+            ("gpt-4o-mini", "openai"),
+            ("gemini-3.5-flash", "gemini"),
+        ],
+        TaskClass::Chat => &[("claude-haiku-4-5", "anthropic"), ("gpt-4o-mini", "openai")],
+        TaskClass::Code => &[("claude-haiku-4-5", "anthropic"), ("gpt-4o-mini", "openai")],
         TaskClass::Agent => &[],
     }
 }
@@ -27,11 +37,11 @@ pub fn suggest(
     task_class: TaskClass,
 ) -> Vec<RouteSuggestion> {
     let mut out = Vec::new();
-    for &candidate in candidates_for(task_class) {
+    for &(candidate, provider) in candidates_for(task_class) {
         if candidate == current_model {
             continue;
         }
-        let Ok(hit) = crate::pricing::lookup(candidate) else {
+        let Ok(hit) = crate::pricing::lookup_with_provider(candidate, provider) else {
             continue;
         };
         let cost = cost_usd(input_tokens, output_tokens, &hit);
