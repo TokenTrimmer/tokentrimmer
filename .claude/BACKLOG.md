@@ -21,7 +21,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 
 - [x] [P0] [rv-l2-cache-correctness] rust-crate-builder: Make the L2 semantic cache safe — add `AND model = $N` to the lookup (l2.rs:356-367) + in-memory scan (l2.rs:208-216); embed full context (system + history) not just the last user message (chat.rs:333-336,567-580); add an `embedding_model`/version column to cache_entries + lookup filter so embedder swaps partition cleanly. (§2.1/2.3/2.5) (est: $1.50)
 - [x] [P0] [rv-cache-nondeterministic-guard] rust-crate-builder: Gate caching of non-deterministic requests (skip when temperature>0 / top_p<1 / n>1 / seed set / response has tool_calls) and wire a `tt_extras` cache-control (bypass/refresh/read-only/ttl) before the L1/L2 branches (chat.rs:295-330; key.rs; messages.rs:42-45). (§2.2/2.7) (est: $1.00)
-- [ ] [P0] [rv-plan-apply-writes-routes] plan-replay-validator: Extend `apply_plan` + the `PlanStore` trait to persist `proposed_routes` and emit them for the routing table; persist `proposed_routes` at plan-create time (apply.rs:162-197; types.rs:217). Pairs with cloud `rv-plan-apply-route` (dashboard+handler writeback). (§1.1/1.9) (est: $1.20)
+- [x] [P0] [rv-plan-apply-writes-routes] plan-replay-validator: Extend `apply_plan` + the `PlanStore` trait to persist `proposed_routes` and emit them for the routing table; persist `proposed_routes` at plan-create time (apply.rs:162-197; types.rs:217). Pairs with cloud `rv-plan-apply-route` (dashboard+handler writeback). (§1.1/1.9) (est: $1.20)
 
 ### P1 — high
 
@@ -70,7 +70,7 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 
 ## Carried over — still open from prior backlog (full notes in `.claude/BACKLOG_ARCHIVE.md`)
 
-- [ ] [P0] [w11-e2e-smoke-test] rust-crate-builder: signup→magic-link→Stripe $1→issue key→curl Gateway→dashboard within 30s. 🟡 authored + CI-wired, not executed green in-sandbox (CI/staging step). (est: $0.80)
+- [ ] [P0] [w11-e2e-smoke-test] rust-crate-builder: signup→magic-link→Stripe $1→issue key→curl Gateway→dashboard within 30s. 🟡 authored + CI-wired. [BLOCKED — CI/staging only, not runnable in-sandbox] (est: $0.80)
 - [ ] [P2] [w20-dashboard-perf-gate] rust-crate-builder: Playwright p75<1.5s on dashboard pages. 🟡 authored + CI-wired, CI/staging step. (est: $0.30)
 - [ ] [P0] [w23-free-tier-live] rust-crate-builder: Enable Free tier in prod. [BLOCKED — external accounts] Remaining code bit (per-org tier→BudgetLimits) is now tracked as cloud `rv-tier-limits-enforcement`. (est: $0.80)
 - [ ] [P0] [w23-alpha-reconciliation-gate] rust-crate-builder: 14 consecutive days of drift ≤2%. [BLOCKED — needs live alpha traffic] (est: $0.30)
