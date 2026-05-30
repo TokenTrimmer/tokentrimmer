@@ -40,6 +40,7 @@ use crate::{
     middleware::trace::TraceId,
     retry::{with_retry, RetryPolicy},
     routes::sse::{self, StreamLogContext},
+    single_flight::wait_for_leader,
     state::L2Config,
     ApiError, ApiResult, AppState,
 };
@@ -501,6 +502,89 @@ pub async fn handler(
             }
         }
 
+        // 3b.5. Single-flight coalescing for cache-eligible non-streaming requests.
+        //
+        // When multiple concurrent requests share the same L1 key and all miss
+        // L1+L2, only the FIRST (leader) dispatches to the provider.  The rest
+        // (followers) wait up to FOLLOWER_TIMEOUT and then re-read L1; if the
+        // leader has populated it they serve from cache.  If the leader fails or
+        // the timeout fires, followers fall through to their own provider dispatch
+        // (correctness over coalescing).
+        //
+        // Scope: cache-eligible, do_lookup=true, non-streaming, L1 configured.
+        // Streaming single-flight is a follow-up (broadcasting an SSE stream to
+        // multiple waiters is non-trivial).
+        let mut single_flight_guard = None::<crate::single_flight::LeaderGuard>;
+        if cache_behavior.do_lookup {
+            if let Some(sf_key) = l1_key.as_deref() {
+                match state.single_flight.try_become_leader(sf_key) {
+                    Ok(guard) => {
+                        // We are the leader — proceed to provider dispatch below
+                        // and call guard.complete() after populating L1.
+                        tracing::debug!(key = %sf_key, "single-flight: became leader");
+                        single_flight_guard = Some(guard);
+                    }
+                    Err(rx) => {
+                        // We are a follower — wait for the leader to finish.
+                        tracing::debug!(key = %sf_key, "single-flight: following leader");
+                        let populated = wait_for_leader(rx).await;
+                        if populated {
+                            // Re-read L1; if it's there, serve it directly.
+                            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_deref()) {
+                                match l1.cache.get(key).await {
+                                    Ok(Some(bytes)) => match L1Entry::from_bytes(&bytes) {
+                                        Ok(entry) => {
+                                            tracing::debug!(
+                                                key = %key,
+                                                "single-flight: follower served from populated L1"
+                                            );
+                                            spawn_request_log(
+                                                state.request_log_writer.as_ref(),
+                                                request_log_for_l1_hit(
+                                                    &entry,
+                                                    &ctx,
+                                                    trace_id,
+                                                    request_started,
+                                                    matched_route_id,
+                                                ),
+                                            );
+                                            return Ok(build_hit_l1_response(entry, trace_id));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                key = %key,
+                                                "single-flight: follower L1 re-read deserialized failed, falling through"
+                                            );
+                                        }
+                                    },
+                                    Ok(None) => {
+                                        tracing::debug!(
+                                            key = %key,
+                                            "single-flight: follower L1 re-read empty, falling through"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "single-flight: follower L1 re-read error, falling through"
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                key = %sf_key,
+                                "single-flight: leader failed or timed out, follower dispatching independently"
+                            );
+                        }
+                        // Fall through to provider dispatch (leader failed /
+                        // L1 re-read miss / timeout).
+                    }
+                }
+            }
+        }
+
         // 3c. No cache hit — dispatch to provider. When the matched route
         //     declared fallbacks, fail over across the candidate chain
         //     (primary first, then each fallback) skipping providers whose
@@ -573,6 +657,12 @@ pub async fn handler(
         // 3e. Best-effort L1 insert. Gated on do_insert (Fix A + Fix B) and
         //     the response not containing tool_calls (non-deterministic output).
         //     Errors are logged but never block the request.
+        //
+        //     Single-flight note: when this request is the single-flight leader
+        //     we must ensure the L1 entry is visible before signalling followers.
+        //     To do that we await the insert inline (rather than spawning it) and
+        //     then call guard.complete().  When no guard is held the normal
+        //     fire-and-forget spawn is used so the non-coalesced path is unchanged.
         let response_has_tools = response_has_tool_calls(&response);
         if cache_behavior.do_insert && !response_has_tools {
             if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key) {
@@ -590,15 +680,42 @@ pub async fn handler(
                         let ttl = cache_behavior
                             .ttl_secs
                             .unwrap_or(l1_clone.ttl_secs);
-                        tokio::spawn(async move {
+                        if let Some(guard) = single_flight_guard.take() {
+                            // Leader path: await the insert so followers can
+                            // read it from L1 immediately after we signal them.
                             if let Err(e) = l1_clone.cache.set(&key, &bytes, ttl).await {
-                                tracing::warn!(error = %e, "l1 cache insert failed");
+                                tracing::warn!(error = %e, "l1 cache insert failed (leader)");
+                                // Drop guard without calling complete() — followers
+                                // will fall through to their own dispatch.
+                                drop(guard);
+                            } else {
+                                // Insert succeeded; signal followers.
+                                guard.complete();
                             }
-                        });
+                        } else {
+                            // Non-leader path: fire-and-forget as before.
+                            tokio::spawn(async move {
+                                if let Err(e) = l1_clone.cache.set(&key, &bytes, ttl).await {
+                                    tracing::warn!(error = %e, "l1 cache insert failed");
+                                }
+                            });
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "l1 envelope serialization failed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "l1 envelope serialization failed");
+                        // Guard drops here (single_flight_guard still Some if
+                        // we didn't take it above); followers fall through.
+                        drop(single_flight_guard.take());
+                    }
                 }
+            } else {
+                // No L1 configured — drop any guard so followers fall through.
+                drop(single_flight_guard.take());
             }
+        } else {
+            // Insert skipped (tool calls or do_insert=false) — drop guard so
+            // followers are not left waiting indefinitely.
+            drop(single_flight_guard.take());
         }
 
         // 3f. Best-effort L2 insert. Same gate as L1.

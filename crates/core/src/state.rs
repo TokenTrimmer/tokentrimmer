@@ -14,6 +14,7 @@ use tt_telemetry::request_logs::RequestLogWriter;
 use crate::budget::BudgetEnforcer;
 use crate::failover::CircuitBreaker;
 use crate::middleware::key_cache::{KeyVerifyCache, VerifyCache};
+use crate::single_flight::SingleFlight;
 use crate::registry::{register_default_providers, ProviderRegistry};
 
 /// Default L2 cosine-similarity threshold per ADR-008 / spec §4.4.
@@ -91,6 +92,15 @@ pub struct AppState {
     /// elapses. Always present (default thresholds); failover is a no-op when
     /// no route declares fallbacks.
     pub breaker: Arc<CircuitBreaker>,
+    /// In-process single-flight coalescing for the non-streaming cache-miss
+    /// path. When N concurrent requests share the same L1 cache key and all
+    /// miss, only the first (leader) dispatches to the provider; the others
+    /// (followers) wait up to [`crate::single_flight::FOLLOWER_TIMEOUT`] and
+    /// then re-read L1 or fall through to their own dispatch.
+    ///
+    /// Always present. Disabled by setting `l1` to `None` in `AppState`
+    /// (single-flight is gated on cache_behavior.do_lookup, which requires L1).
+    pub single_flight: Arc<SingleFlight>,
 }
 
 impl AppState {
@@ -110,6 +120,7 @@ impl AppState {
             dogfood_enabled: false,
             budget: None,
             breaker: Arc::new(CircuitBreaker::default()),
+            single_flight: Arc::new(SingleFlight::new()),
         }
     }
 

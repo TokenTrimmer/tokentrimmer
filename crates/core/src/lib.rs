@@ -11,6 +11,7 @@ pub mod registry;
 pub mod retry;
 pub mod routes;
 pub mod server;
+pub mod single_flight;
 pub mod state;
 
 pub use budget::{BudgetDecision, BudgetEnforcer, BudgetLimits, InMemoryBudgetEnforcer};
