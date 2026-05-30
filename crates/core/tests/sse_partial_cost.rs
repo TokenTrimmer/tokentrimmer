@@ -87,6 +87,7 @@ impl Provider for MockProvider {
             input_per_million: 3.0,
             output_per_million: 6.0,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             effective_at: chrono::Utc::now(),
         })
     }
@@ -127,12 +128,14 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
             input_per_million: 3.0,
             output_per_million: 6.0,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             effective_at: chrono::Utc::now(),
         }),
         baseline_pricing: Some(ModelPricing {
             input_per_million: 3.0,
             output_per_million: 6.0,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             effective_at: chrono::Utc::now(),
         }),
         route_id: None,
@@ -272,12 +275,14 @@ async fn sse_routed_stream_logs_baseline_against_original_model() {
         input_per_million: 0.15,
         output_per_million: 0.6,
         cached_input_per_million: None,
+        cache_write_per_million: None,
         effective_at: chrono::Utc::now(),
     };
     let expensive = ModelPricing {
         input_per_million: 5.0,
         output_per_million: 15.0,
         cached_input_per_million: None,
+        cache_write_per_million: None,
         effective_at: chrono::Utc::now(),
     };
     let mut ctx = make_log_ctx(Arc::clone(&writer));

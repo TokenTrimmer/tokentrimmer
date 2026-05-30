@@ -61,6 +61,7 @@ impl Provider for RecordingProvider {
             input_per_million: 0.1,
             output_per_million: 0.1,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             effective_at: Utc::now(),
         })
     }

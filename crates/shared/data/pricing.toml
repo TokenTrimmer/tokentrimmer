@@ -92,12 +92,16 @@ effective_at = "2026-05-01T00:00:00Z"
 
 # ── Anthropic ───────────────────────────────────────────────────────────────
 # cached_input_per_million is the cache-READ rate (~10% of standard input).
+# cache_write_per_million is the cache-WRITE (creation) rate (~1.25× standard
+# input). Anthropic charges a write premium for tokens written to the prompt
+# cache; this is distinct from the lower read rate on cache hits.
 [[entry]]
 provider = "anthropic"
 model = "claude-haiku-4-5"
 input_per_million = 1.00
 output_per_million = 5.00
 cached_input_per_million = 0.10
+cache_write_per_million = 1.25
 effective_at = "2026-05-01T00:00:00Z"
 
 [[entry]]
@@ -106,6 +110,7 @@ model = "claude-sonnet-4-6"
 input_per_million = 3.00
 output_per_million = 15.00
 cached_input_per_million = 0.30
+cache_write_per_million = 3.75
 effective_at = "2026-05-01T00:00:00Z"
 
 [[entry]]
@@ -114,6 +119,7 @@ model = "claude-opus-4-7"
 input_per_million = 5.00
 output_per_million = 25.00
 cached_input_per_million = 0.50
+cache_write_per_million = 6.25
 effective_at = "2026-05-01T00:00:00Z"
 
 # ── Google Gemini ─────────────────────────────────────────────────────────────

@@ -1074,16 +1074,37 @@ fn compute_cost(
         return (0.0, 0.0);
     };
 
-    let cached = usage.cached_tokens.min(usage.prompt_tokens);
-    let non_cached_input = usage.prompt_tokens.saturating_sub(cached);
+    // Token breakdown (no double-counting):
+    //   cache_read   = cached_tokens (already a subset of prompt_tokens)
+    //   cache_write  = cache_creation_input_tokens (also in prompt_tokens)
+    //   fresh_input  = prompt_tokens - cache_read - cache_write
+    //
+    // Rates:
+    //   cache_read  → cached_input_per_million  (or base if absent)
+    //   cache_write → cache_write_per_million   (or base if absent; non-Anthropic unchanged)
+    //   fresh_input → input_per_million
+    let cache_read = usage.cached_tokens.min(usage.prompt_tokens);
+    let cache_write = usage
+        .cache_creation_input_tokens
+        .unwrap_or(0)
+        .min(usage.prompt_tokens.saturating_sub(cache_read));
+    let fresh_input = usage
+        .prompt_tokens
+        .saturating_sub(cache_read)
+        .saturating_sub(cache_write);
 
     // Use cached rate when available; fall back to regular input rate.
     let cached_rate = pricing
         .cached_input_per_million
         .unwrap_or(pricing.input_per_million);
+    // Use write-premium rate when available; fall back to base input rate.
+    let write_rate = pricing
+        .cache_write_per_million
+        .unwrap_or(pricing.input_per_million);
 
-    let cost_usd = (non_cached_input as f64) * pricing.input_per_million / 1_000_000.0
-        + (cached as f64) * cached_rate / 1_000_000.0
+    let cost_usd = (fresh_input as f64) * pricing.input_per_million / 1_000_000.0
+        + (cache_read as f64) * cached_rate / 1_000_000.0
+        + (cache_write as f64) * write_rate / 1_000_000.0
         + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
 
     // Baseline: full input × input rate + output × output rate (no cache
@@ -1556,6 +1577,7 @@ mod fee_tests {
             input_per_million: 1.0,
             output_per_million: 2.0,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             effective_at: Utc::now(),
         }
     }
@@ -1579,6 +1601,140 @@ mod fee_tests {
         assert!(
             (base_fee - base * 1.05).abs() < 1e-12,
             "base_fee = {base_fee}"
+        );
+    }
+}
+
+/// Tests for the Anthropic cache-write-rate fix (rv-anthropic-cache-write-rate).
+///
+/// Token-budget breakdown enforced by compute_cost:
+///   cache_read    → cached_input_per_million  (or base if absent)
+///   cache_write   → cache_write_per_million   (or base if absent; non-Anthropic unchanged)
+///   fresh_input   → input_per_million
+///   (cache_read + cache_write + fresh_input == prompt_tokens — no double counting)
+///   output        → output_per_million
+///
+/// Covers:
+/// (a) Model WITH cache_write rate prices cache_creation at the write premium.
+/// (b) Model WITHOUT cache_write rate is unchanged — cache_creation gets base input rate.
+/// (c) cache_read tokens are priced at the cached (discounted) rate.
+/// (d) No double counting: sum of priced buckets == all prompt_tokens.
+#[cfg(test)]
+mod cache_write_rate_tests {
+    use super::*;
+
+    /// Anthropic-like pricing: $3/$15 input/output, $0.30 cache-read, $3.75 cache-write.
+    fn anthropic_pricing() -> ModelPricing {
+        ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+            cached_input_per_million: Some(0.30),
+            cache_write_per_million: Some(3.75),
+            effective_at: Utc::now(),
+        }
+    }
+
+    /// Non-Anthropic pricing: base input rate only, no cache-write premium.
+    fn no_write_rate_pricing() -> ModelPricing {
+        ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+            cached_input_per_million: Some(0.30),
+            cache_write_per_million: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    // (a) cache_creation tokens priced at write-premium rate (strictly > base input rate).
+    #[test]
+    fn cache_creation_with_write_rate_costs_more_than_base_input() {
+        // 0 fresh input, 0 cache_read, 1M cache_write, 0 output.
+        // At write rate ($3.75/M): $3.75.
+        // At base input rate ($3.00/M): $3.00.
+        let p = anthropic_pricing();
+        let usage_write = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 0,
+            cache_creation_input_tokens: Some(1_000_000),
+        };
+        let usage_base = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None, // same tokens, no write bucket
+        };
+        let (cost_write, _) = compute_cost(&usage_write, Some(&p), Some(&p), 1.0);
+        let (cost_base, _) = compute_cost(&usage_base, Some(&p), Some(&p), 1.0);
+        assert!(
+            cost_write > cost_base,
+            "write-premium cost ({cost_write}) must exceed base-input cost ({cost_base})"
+        );
+        assert!(
+            (cost_write - 3.75).abs() < 1e-9,
+            "1M cache_write @ $3.75/M = $3.75, got {cost_write}"
+        );
+    }
+
+    // (b) Without a write rate, cache_creation tokens fall back to base input rate (unchanged behavior).
+    #[test]
+    fn cache_creation_without_write_rate_uses_base_input_rate() {
+        let p = no_write_rate_pricing();
+        // 1M cache_write, 0 cache_read, 0 fresh — should price at $3.00/M.
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 0,
+            cache_creation_input_tokens: Some(1_000_000),
+        };
+        let (cost, _) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        assert!(
+            (cost - 3.0).abs() < 1e-9,
+            "1M cache_write with no write-rate @ $3.00/M = $3.00, got {cost}"
+        );
+    }
+
+    // (c) cache_read tokens use the discounted cached rate, not base input rate.
+    #[test]
+    fn cache_read_uses_cached_rate() {
+        let p = anthropic_pricing();
+        // 1M cache_read, 0 cache_write, 0 fresh — should price at $0.30/M.
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 1_000_000,
+            cache_creation_input_tokens: None,
+        };
+        let (cost, _) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        assert!(
+            (cost - 0.30).abs() < 1e-9,
+            "1M cache_read @ $0.30/M = $0.30, got {cost}"
+        );
+    }
+
+    // (d) No double counting: fresh + cache_read + cache_write cover all prompt_tokens exactly.
+    #[test]
+    fn no_double_counting_three_buckets_sum_to_prompt_tokens() {
+        // 400K fresh, 300K cache_read, 300K cache_write = 1M prompt_tokens.
+        // Expected cost: 400K @ $3.00/M + 300K @ $0.30/M + 300K @ $3.75/M
+        //   = $1.20 + $0.09 + $1.125 = $2.415
+        let p = anthropic_pricing();
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 300_000,
+            cache_creation_input_tokens: Some(300_000),
+        };
+        let (cost, _) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        let expected = (400_000.0 * 3.0 + 300_000.0 * 0.30 + 300_000.0 * 3.75) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "expected {expected}, got {cost}"
         );
     }
 }

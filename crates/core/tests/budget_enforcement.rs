@@ -47,6 +47,7 @@ impl Provider for PricedProvider {
             input_per_million: 1.0,
             output_per_million: 2.0,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             effective_at: chrono::Utc::now(),
         })
     }

@@ -135,6 +135,7 @@ impl Provider for LocalProvider {
             input_per_million: 0.0,
             output_per_million: 0.0,
             cached_input_per_million: Some(0.0),
+            cache_write_per_million: None,
             effective_at: Utc::now(),
         })
     }

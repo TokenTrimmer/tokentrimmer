@@ -46,6 +46,7 @@ impl Provider for TestProvider {
             input_per_million: 3.0,
             output_per_million: 6.0,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             effective_at: Utc::now(),
         })
     }

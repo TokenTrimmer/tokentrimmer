@@ -23,6 +23,10 @@ pub struct ModelPricing {
     pub output_per_million: f64,
     /// USD per 1M cached input tokens (Anthropic 10%, OpenAI 10%, Gemini 10%).
     pub cached_input_per_million: Option<f64>,
+    /// USD per 1M cache-creation (cache-write) input tokens. Anthropic charges
+    /// ~1.25× the base input rate for tokens written to the prompt cache.
+    /// `None` for providers with no documented write premium (cost path unchanged).
+    pub cache_write_per_million: Option<f64>,
     /// When this pricing took effect (for historical replay).
     pub effective_at: DateTime<Utc>,
 }
@@ -62,6 +66,8 @@ struct RawEntry {
     output_per_million: f64,
     #[serde(default)]
     cached_input_per_million: Option<f64>,
+    #[serde(default)]
+    cache_write_per_million: Option<f64>,
     effective_at: DateTime<Utc>,
 }
 
@@ -92,6 +98,7 @@ impl PricingCatalog {
                     input_per_million: e.input_per_million,
                     output_per_million: e.output_per_million,
                     cached_input_per_million: e.cached_input_per_million,
+                    cache_write_per_million: e.cache_write_per_million,
                     effective_at: e.effective_at,
                 });
         }
@@ -195,6 +202,49 @@ mod catalog_tests {
         // A model whose cached rate is omitted in TOML → None, not 0.0.
         let g = c.latest("groq", "llama-3.1-8b-instant").expect("present");
         assert_eq!(g.cached_input_per_million, None);
+    }
+
+    /// Anthropic models must carry a cache_write_per_million at ~1.25× base input.
+    /// Non-Anthropic models must have None (no write premium documented).
+    #[test]
+    fn anthropic_models_have_cache_write_rate() {
+        let c = catalog();
+
+        let haiku = c.latest("anthropic", "claude-haiku-4-5").expect("present");
+        assert_eq!(
+            haiku.cache_write_per_million,
+            Some(1.25),
+            "haiku write rate = 1.25× base input (1.00)"
+        );
+
+        let sonnet = c.latest("anthropic", "claude-sonnet-4-6").expect("present");
+        assert_eq!(
+            sonnet.cache_write_per_million,
+            Some(3.75),
+            "sonnet write rate = 1.25× base input (3.00)"
+        );
+
+        let opus = c.latest("anthropic", "claude-opus-4-7").expect("present");
+        assert_eq!(
+            opus.cache_write_per_million,
+            Some(6.25),
+            "opus write rate = 1.25× base input (5.00)"
+        );
+
+        // Non-Anthropic models have no documented write premium.
+        let gpt4o = c.latest("openai", "gpt-4o").expect("gpt-4o present");
+        assert_eq!(
+            gpt4o.cache_write_per_million,
+            None,
+            "OpenAI has no cache-write premium"
+        );
+
+        let groq_llama = c.latest("groq", "llama-3.1-8b-instant").expect("present");
+        assert_eq!(
+            groq_llama.cache_write_per_million,
+            None,
+            "Groq has no cache-write premium"
+        );
     }
 
     #[test]

@@ -51,6 +51,7 @@ impl Provider for CountingProvider {
             input_per_million: 3.0,
             output_per_million: 6.0,
             cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
             effective_at: Utc::now(),
         })
     }

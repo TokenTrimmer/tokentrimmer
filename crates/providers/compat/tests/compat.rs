@@ -92,6 +92,7 @@ fn make_compat_provider(id: &'static str, model_id: &str) -> OpenAICompatiblePro
             input_per_million: 1.00,
             output_per_million: 3.00,
             cached_input_per_million: None,
+            cache_write_per_million: None,
             effective_at: now,
         },
     );
