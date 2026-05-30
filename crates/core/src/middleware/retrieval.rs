@@ -111,6 +111,12 @@ pub fn build_retrieval_state() -> Option<RetrievalState> {
 
 /// Middleware entry point when retrieval is **disabled** (no env vars or
 /// invalid config). Adds `x-tt-retrieval-enabled: disabled` to every response.
+///
+/// This path NEVER buffers the request body — it forwards `req` straight to
+/// `next` with no `to_bytes` call, so the gateway pays zero body-buffering cost
+/// when `TT_RETRIEVAL_STORE` is unset (rv-retrieval-body-buffer, §5.7). Only the
+/// enabled path ([`maybe_substitute`]) buffers, and only for POSTs to the chat
+/// endpoints.
 pub async fn maybe_substitute_disabled(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     resp.headers_mut().insert(
@@ -275,16 +281,22 @@ pub async fn maybe_substitute(
             // ORIGINAL request body. Best-effort — spawned so it never blocks
             // the response, and a failure only logs (never fails the request).
             if let Some(audit) = state.audit.clone() {
-                let prompt = body_str.to_string();
+                // Hold the plaintext prompt clone in a Zeroizing wrapper so the
+                // heap buffer is wiped when the spawned task ends — rather than
+                // freed (and potentially reused) with the secret still resident
+                // (rv-retrieval-body-buffer, §5.7). `record` encrypts via
+                // audit.rs; this clone is the only extra plaintext copy.
+                let prompt = zeroize::Zeroizing::new(body_str.to_string());
                 let substitutions = report.substitutions;
                 let tokens_saved = report.tokens_saved_estimate;
                 tokio::spawn(async move {
                     if let Err(e) = audit
-                        .record(org_id, substitutions, tokens_saved, &prompt)
+                        .record(org_id, substitutions, tokens_saved, prompt.as_str())
                         .await
                     {
                         warn!(error = %e, "retrieval audit record failed");
                     }
+                    // `prompt` (Zeroizing<String>) drops here, wiping the clone.
                 });
             }
             resp
@@ -495,6 +507,52 @@ mod tests {
         assert!(
             has_error || has_active,
             "authenticated path must attempt substitution"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_path_forwards_body_unbuffered() {
+        // The disabled middleware must stream the body straight through with no
+        // buffering (rv-retrieval-body-buffer). A body larger than the enabled
+        // path's MAX_BYTES cap proves it: if the disabled path buffered+capped,
+        // this would be truncated/rejected; it must pass through untouched and
+        // still carry the `disabled` header.
+        let big = vec![b'x'; (1 << 20) + 4096]; // > 1 MiB
+        let sent_len = big.len();
+
+        let router = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|body: axum::body::Bytes| async move {
+                    // Echo the received body so the test can compare lengths.
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            )
+            .layer(middleware::from_fn(super::maybe_substitute_disabled));
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::from(big))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-tt-retrieval-enabled").map(|v| v.as_bytes()),
+            Some(&b"disabled"[..]),
+            "disabled middleware must mark the response"
+        );
+        let echoed = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        assert_eq!(
+            echoed.len(),
+            sent_len,
+            "disabled path must forward the full body untouched (no buffering/cap)"
         );
     }
 }

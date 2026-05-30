@@ -4930,6 +4930,7 @@ dependencies = [
  "tt-telemetry",
  "tt-tokenize",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -43,6 +43,8 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
+# Zeroizing wrapper for the plaintext retrieval-prompt clone (middleware/retrieval.rs).
+zeroize.workspace = true
 
 [dev-dependencies]
 argon2.workspace = true
