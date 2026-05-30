@@ -14,8 +14,9 @@ pub mod usage;
 pub use context::RequestContext;
 pub use error::ProviderError;
 pub use messages::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart,
-    EmbeddingsRequest, EmbeddingsResponse, Message, MessageContent, Tool, ToolCall, ToolChoice,
+    parse_cache_control, CacheControlConfig, CacheMode, ChatCompletionChunk,
+    ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart, EmbeddingsRequest,
+    EmbeddingsResponse, Message, MessageContent, Tool, ToolCall, ToolChoice,
 };
 pub use pricing::{ModelInfo, ModelPricing};
 pub use provider::Provider;

@@ -32,8 +32,8 @@ use tt_auth::ApiKeyContext;
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
     messages::Choice,
-    ChatCompletionRequest, ChatCompletionResponse, Message, MessageContent, ModelPricing,
-    RequestContext, Usage,
+    parse_cache_control, CacheControlConfig, CacheMode, ChatCompletionRequest,
+    ChatCompletionResponse, Message, MessageContent, ModelPricing, RequestContext, Usage,
 };
 
 use crate::{
@@ -48,6 +48,105 @@ use crate::{
 /// (24h / 7d / 30d); the gateway-level default is conservative until the
 /// auth layer surfaces the caller's tier.
 const L2_DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+// ---------------------------------------------------------------------------
+// Cache-eligibility gate (Fix A §2.2) + tt_extras cache-control (Fix B §2.7)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when the request parameters are deterministic enough that
+/// caching the response is safe and correct.
+///
+/// A request is NOT eligible when:
+/// - `temperature` is set and > 0.0  (non-deterministic sampling)
+/// - `top_p` is set and < 1.0        (nucleus sampling narrows distribution)
+/// - `n` is set and > 1              (caller wants multiple distinct completions)
+/// - `seed` is set                   (caller controls RNG — implies they want
+///   repeatable variance, not a cached result)
+///
+/// Note: `seed` being set makes the request *deterministic per-model*, but
+/// caching it could return a different model's output on a later lookup, which
+/// violates the caller's intent. Skip caching to be safe.
+fn is_cache_eligible(req: &ChatCompletionRequest) -> bool {
+    if req.temperature.is_some_and(|t| t > 0.0) {
+        return false;
+    }
+    if req.top_p.is_some_and(|p| p < 1.0) {
+        return false;
+    }
+    if req.n.is_some_and(|n| n > 1) {
+        return false;
+    }
+    if req.seed.is_some() {
+        return false;
+    }
+    true
+}
+
+/// Returns `true` when any choice in the response contains tool calls.
+/// Responses with tool calls are non-deterministic in call order/arguments and
+/// must not be replayed from cache.
+fn response_has_tool_calls(resp: &ChatCompletionResponse) -> bool {
+    resp.choices.iter().any(|c| {
+        if let Message::Assistant { tool_calls, .. } = &c.message {
+            !tool_calls.is_empty()
+        } else {
+            false
+        }
+    })
+}
+
+/// Consolidated cache behaviour for a single request, derived from both
+/// eligibility (Fix A) and the caller's `tt_extras.cache` override (Fix B).
+#[derive(Debug)]
+struct CacheBehavior {
+    /// Whether to attempt a cache lookup (L1 + L2).
+    do_lookup: bool,
+    /// Whether to insert a fresh response into cache. Also gated on
+    /// `response_has_tool_calls` at insert time (checked separately).
+    do_insert: bool,
+    /// Per-request TTL override from `tt_extras`. `None` = use gateway default.
+    ttl_secs: Option<u64>,
+}
+
+impl CacheBehavior {
+    fn resolve(req: &ChatCompletionRequest) -> Self {
+        // Fix A: structural eligibility — non-deterministic params skip both.
+        if !is_cache_eligible(req) {
+            return Self {
+                do_lookup: false,
+                do_insert: false,
+                ttl_secs: None,
+            };
+        }
+
+        // Fix B: parse caller's tt_extras.cache override.
+        let ctrl: CacheControlConfig = parse_cache_control(&req.tt_extras)
+            .unwrap_or_default();
+
+        match ctrl.mode {
+            CacheMode::Normal => Self {
+                do_lookup: true,
+                do_insert: true,
+                ttl_secs: ctrl.ttl_secs,
+            },
+            CacheMode::Bypass => Self {
+                do_lookup: false,
+                do_insert: false,
+                ttl_secs: None,
+            },
+            CacheMode::Refresh => Self {
+                do_lookup: false,
+                do_insert: true,
+                ttl_secs: ctrl.ttl_secs,
+            },
+            CacheMode::ReadOnly => Self {
+                do_lookup: true,
+                do_insert: false,
+                ttl_secs: None,
+            },
+        }
+    }
+}
 
 /// Handler for `POST /v1/chat/completions`.
 ///
@@ -164,6 +263,11 @@ pub async fn handler(
             })?;
     }
 
+    // 2d. Determine cache behaviour for this request (Fix A §2.2 + Fix B §2.7).
+    //     Resolved once here so all four call-sites (streaming L1 read,
+    //     non-streaming L1 read, L2 read, L1/L2 insert) share a single decision.
+    let cache_behavior = CacheBehavior::resolve(&req);
+
     // 3. Branch: streaming vs non-streaming.
     if req.stream {
         // 3α. L1 fake-stream — when a streaming request has a cached
@@ -172,31 +276,35 @@ pub async fn handler(
         //     non-stream branch's `namespaced_l1_key` so streaming and
         //     non-streaming variants of the same prompt share cache
         //     entries.
+        // L1 fake-stream lookup — gated on cache eligibility (Fix A) and
+        // tt_extras.cache mode (Fix B).
         let l1_key = state
             .l1
             .as_ref()
             .map(|_| namespaced_l1_key(ctx.org_id, &req));
-        if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
-            if let Ok(Some(bytes)) = l1.cache.get(key).await {
-                if let Ok(entry) = L1Entry::from_bytes(&bytes) {
-                    spawn_request_log(
-                        state.request_log_writer.as_ref(),
-                        request_log_for_l1_hit(
-                            &entry,
-                            &ctx,
-                            trace_id,
-                            request_started,
-                            matched_route_id,
-                        ),
-                    );
-                    let fake = sse::fake_stream_from_response(entry.response);
-                    // L1 hit already logged above; no need for a second row.
-                    return Ok(sse::stream_response(fake, &provider, trace_id, None));
+        if cache_behavior.do_lookup {
+            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
+                if let Ok(Some(bytes)) = l1.cache.get(key).await {
+                    if let Ok(entry) = L1Entry::from_bytes(&bytes) {
+                        spawn_request_log(
+                            state.request_log_writer.as_ref(),
+                            request_log_for_l1_hit(
+                                &entry,
+                                &ctx,
+                                trace_id,
+                                request_started,
+                                matched_route_id,
+                            ),
+                        );
+                        let fake = sse::fake_stream_from_response(entry.response);
+                        // L1 hit already logged above; no need for a second row.
+                        return Ok(sse::stream_response(fake, &provider, trace_id, None));
+                    }
                 }
             }
         }
 
-        // No cache hit (or no L1 wired) — dispatch live to the provider.
+        // No cache hit (or no L1 wired / cache skipped) — dispatch live to the provider.
         // Estimate input tokens from the request messages (byte heuristic: len/4).
         let estimated_input_tokens = req
             .messages
@@ -293,69 +401,74 @@ pub async fn handler(
 
         Ok(sse::stream_response(stream, &provider, trace_id, log_ctx))
     } else {
-        // 3a. L1 exact-match cache. Cheapest lookup — try first. Best-effort:
-        //     any Redis error falls through to L2/provider — we never fail a
-        //     user request because the cache is unhealthy.
+        // 3a. L1 exact-match cache. Cheapest lookup — try first. Gated on
+        //     cache eligibility (Fix A §2.2) and tt_extras.cache mode (Fix B §2.7).
+        //     Best-effort: any Redis error falls through to L2/provider.
         let l1_key = state
             .l1
             .as_ref()
             .map(|_| namespaced_l1_key(ctx.org_id, &req));
-        if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
-            match l1.cache.get(key).await {
-                Ok(Some(bytes)) => match L1Entry::from_bytes(&bytes) {
-                    Ok(entry) => {
-                        // Log the L1 hit before returning. The hit baseline is
-                        // either the envelope's own value or the synthetic
-                        // fallback for pre-envelope cache rows.
-                        spawn_request_log(
-                            state.request_log_writer.as_ref(),
-                            request_log_for_l1_hit(
-                                &entry,
-                                &ctx,
-                                trace_id,
-                                request_started,
-                                matched_route_id,
-                            ),
-                        );
-                        return Ok(build_hit_l1_response(entry, trace_id));
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, key = %key, "l1 cache entry failed to deserialize");
-                    }
-                },
-                Ok(None) => {}
-                Err(e) => tracing::warn!(error = %e, "l1 lookup failed"),
+        if cache_behavior.do_lookup {
+            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
+                match l1.cache.get(key).await {
+                    Ok(Some(bytes)) => match L1Entry::from_bytes(&bytes) {
+                        Ok(entry) => {
+                            // Log the L1 hit before returning. The hit baseline is
+                            // either the envelope's own value or the synthetic
+                            // fallback for pre-envelope cache rows.
+                            spawn_request_log(
+                                state.request_log_writer.as_ref(),
+                                request_log_for_l1_hit(
+                                    &entry,
+                                    &ctx,
+                                    trace_id,
+                                    request_started,
+                                    matched_route_id,
+                                ),
+                            );
+                            return Ok(build_hit_l1_response(entry, trace_id));
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, key = %key, "l1 cache entry failed to deserialize");
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %e, "l1 lookup failed"),
+                }
             }
         }
 
         // 3b. Try L2 semantic cache lookup before dispatching to the provider.
-        if let Some(l2) = state.l2.as_ref() {
-            if let Some(query_text) = l2_context_text(&req) {
-                if let Ok(query_vec) = l2.embedder.embed(&query_text).await {
-                    if let Ok(Some((entry, similarity))) = l2
-                        .cache
-                        .lookup(
-                            ctx.org_id,
-                            &query_vec,
-                            l2.threshold,
-                            &req.model,
-                            l2.embedder.model(),
-                        )
-                        .await
-                    {
-                        // Cache hit — best-effort bump and return.
-                        let _ = l2.cache.bump_hit_count(entry.id).await;
-                        spawn_request_log(
-                            state.request_log_writer.as_ref(),
-                            request_log_for_l2_hit(
-                                &entry,
-                                &ctx,
-                                trace_id,
-                                request_started,
-                                matched_route_id,
-                            ),
-                        );
-                        return build_hit_l2_response(entry, similarity, trace_id);
+        //     Gated on cache eligibility + tt_extras.cache mode.
+        if cache_behavior.do_lookup {
+            if let Some(l2) = state.l2.as_ref() {
+                if let Some(query_text) = l2_context_text(&req) {
+                    if let Ok(query_vec) = l2.embedder.embed(&query_text).await {
+                        if let Ok(Some((entry, similarity))) = l2
+                            .cache
+                            .lookup(
+                                ctx.org_id,
+                                &query_vec,
+                                l2.threshold,
+                                &req.model,
+                                l2.embedder.model(),
+                            )
+                            .await
+                        {
+                            // Cache hit — best-effort bump and return.
+                            let _ = l2.cache.bump_hit_count(entry.id).await;
+                            spawn_request_log(
+                                state.request_log_writer.as_ref(),
+                                request_log_for_l2_hit(
+                                    &entry,
+                                    &ctx,
+                                    trace_id,
+                                    request_started,
+                                    matched_route_id,
+                                ),
+                            );
+                            return build_hit_l2_response(entry, similarity, trace_id);
+                        }
                     }
                 }
             }
@@ -420,46 +533,61 @@ pub async fn handler(
         let provider_id = provider.id().to_string();
         let model_used = response.model.clone();
 
-        // 3e. Best-effort L1 insert. Errors are logged but never block the request.
-        if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key) {
-            let entry = L1Entry::new(
-                response.clone(),
-                baseline_cost_usd,
-                cost_usd,
-                provider_id.clone(),
-            );
-            match entry.to_bytes() {
-                Ok(bytes) => {
-                    let l1_clone = l1.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = l1_clone.cache.set(&key, &bytes, l1_clone.ttl_secs).await {
-                            tracing::warn!(error = %e, "l1 cache insert failed");
-                        }
-                    });
+        // 3e. Best-effort L1 insert. Gated on do_insert (Fix A + Fix B) and
+        //     the response not containing tool_calls (non-deterministic output).
+        //     Errors are logged but never block the request.
+        let response_has_tools = response_has_tool_calls(&response);
+        if cache_behavior.do_insert && !response_has_tools {
+            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key) {
+                let entry = L1Entry::new(
+                    response.clone(),
+                    baseline_cost_usd,
+                    cost_usd,
+                    provider_id.clone(),
+                );
+                match entry.to_bytes() {
+                    Ok(bytes) => {
+                        let l1_clone = l1.clone();
+                        // Use caller-requested TTL override when present, else
+                        // fall back to the L1 config default.
+                        let ttl = cache_behavior
+                            .ttl_secs
+                            .unwrap_or(l1_clone.ttl_secs);
+                        tokio::spawn(async move {
+                            if let Err(e) = l1_clone.cache.set(&key, &bytes, ttl).await {
+                                tracing::warn!(error = %e, "l1 cache insert failed");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::warn!(error = %e, "l1 envelope serialization failed"),
                 }
-                Err(e) => tracing::warn!(error = %e, "l1 envelope serialization failed"),
             }
         }
 
-        // 3f. Best-effort L2 insert. Errors are logged but never block the request.
-        if let Some(l2) = state.l2.as_ref() {
-            if let Some(query_text) = l2_context_text(&req) {
-                let l2_provider_id = provider_id.clone();
-                let l2_model_used = response.model.clone();
-                let response_clone = response.clone();
-                let l2_clone = l2.clone();
-                let org_id = ctx.org_id;
-                tokio::spawn(async move {
-                    insert_into_l2(
-                        l2_clone,
-                        org_id,
-                        &query_text,
-                        response_clone,
-                        l2_provider_id,
-                        l2_model_used,
-                    )
-                    .await;
-                });
+        // 3f. Best-effort L2 insert. Same gate as L1.
+        if cache_behavior.do_insert && !response_has_tools {
+            if let Some(l2) = state.l2.as_ref() {
+                if let Some(query_text) = l2_context_text(&req) {
+                    let l2_provider_id = provider_id.clone();
+                    let l2_model_used = response.model.clone();
+                    let response_clone = response.clone();
+                    let l2_clone = l2.clone();
+                    let org_id = ctx.org_id;
+                    // Pass the caller's TTL override (None = use L2 default).
+                    let ttl_override = cache_behavior.ttl_secs;
+                    tokio::spawn(async move {
+                        insert_into_l2(
+                            l2_clone,
+                            org_id,
+                            &query_text,
+                            response_clone,
+                            l2_provider_id,
+                            l2_model_used,
+                            ttl_override,
+                        )
+                        .await;
+                    });
+                }
             }
         }
 
@@ -691,6 +819,9 @@ fn synthetic_baseline_from_entry(entry: &CacheEntry) -> f64 {
 
 /// Background L2 insert. Swallows errors with a tracing log — never blocks
 /// the user request.
+///
+/// `ttl_override` is an optional per-request TTL from `tt_extras.cache.ttl_secs`
+/// (Fix B §2.7). When `None`, the gateway-level [`L2_DEFAULT_TTL`] is used.
 async fn insert_into_l2(
     l2: L2Config,
     org_id: Uuid,
@@ -698,6 +829,7 @@ async fn insert_into_l2(
     response: ChatCompletionResponse,
     _provider_id: String,
     model_used: String,
+    ttl_override: Option<u64>,
 ) {
     let embedding_model = l2.embedder.model().to_string();
     let embed = match l2.embedder.embed(query_text).await {
@@ -714,6 +846,9 @@ async fn insert_into_l2(
             return;
         }
     };
+    let ttl = ttl_override
+        .map(Duration::from_secs)
+        .unwrap_or(L2_DEFAULT_TTL);
     let now = Utc::now();
     let entry = CacheEntry {
         id: Uuid::now_v7(),
@@ -726,7 +861,7 @@ async fn insert_into_l2(
         output_tokens: response.usage.completion_tokens,
         hit_count: 0,
         created_at: now,
-        expires_at: now + chrono::Duration::from_std(L2_DEFAULT_TTL).unwrap_or_default(),
+        expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
     };
     if let Err(e) = l2.cache.insert(entry).await {
         tracing::warn!(error = %e, "l2 cache insert failed");
@@ -1009,6 +1144,196 @@ async fn apply_routing(
         route_id,
         fallbacks,
     })
+}
+
+#[cfg(test)]
+mod cache_eligibility_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn base_req() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: false,
+            tools: vec![],
+            tool_choice: None,
+            response_format: None,
+            stop: vec![],
+            presence_penalty: None,
+            frequency_penalty: None,
+            n: None,
+            seed: None,
+            user: None,
+            tt_extras: HashMap::new(),
+        }
+    }
+
+    fn assistant_resp(tool_calls: Vec<tt_shared::ToolCall>) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "id".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: None,
+                    tool_calls,
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+            },
+        }
+    }
+
+    // --- Fix A: is_cache_eligible ---
+
+    #[test]
+    fn deterministic_request_is_eligible() {
+        assert!(is_cache_eligible(&base_req()));
+    }
+
+    #[test]
+    fn temperature_above_zero_is_not_eligible() {
+        let mut req = base_req();
+        req.temperature = Some(0.7);
+        assert!(!is_cache_eligible(&req));
+    }
+
+    #[test]
+    fn temperature_zero_is_eligible() {
+        let mut req = base_req();
+        req.temperature = Some(0.0);
+        assert!(is_cache_eligible(&req));
+    }
+
+    #[test]
+    fn top_p_below_one_is_not_eligible() {
+        let mut req = base_req();
+        req.top_p = Some(0.9);
+        assert!(!is_cache_eligible(&req));
+    }
+
+    #[test]
+    fn top_p_one_is_eligible() {
+        let mut req = base_req();
+        req.top_p = Some(1.0);
+        assert!(is_cache_eligible(&req));
+    }
+
+    #[test]
+    fn n_greater_than_one_is_not_eligible() {
+        let mut req = base_req();
+        req.n = Some(2);
+        assert!(!is_cache_eligible(&req));
+    }
+
+    #[test]
+    fn n_equal_one_is_eligible() {
+        let mut req = base_req();
+        req.n = Some(1);
+        assert!(is_cache_eligible(&req));
+    }
+
+    #[test]
+    fn seed_set_is_not_eligible() {
+        let mut req = base_req();
+        req.seed = Some(42);
+        assert!(!is_cache_eligible(&req));
+    }
+
+    #[test]
+    fn response_with_tool_calls_not_inserted() {
+        let tool_call = tt_shared::ToolCall {
+            id: "call_1".into(),
+            r#type: "function".into(),
+            function: tt_shared::messages::ToolCallFunction {
+                name: "get_weather".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let resp = assistant_resp(vec![tool_call]);
+        assert!(response_has_tool_calls(&resp));
+    }
+
+    #[test]
+    fn response_without_tool_calls_is_fine() {
+        let resp = assistant_resp(vec![]);
+        assert!(!response_has_tool_calls(&resp));
+    }
+
+    // --- Fix B: CacheBehavior::resolve ---
+
+    #[test]
+    fn normal_extras_gives_lookup_and_insert() {
+        let req = base_req();
+        let b = CacheBehavior::resolve(&req);
+        assert!(b.do_lookup);
+        assert!(b.do_insert);
+        assert!(b.ttl_secs.is_none());
+    }
+
+    #[test]
+    fn bypass_skips_both() {
+        let mut req = base_req();
+        req.tt_extras.insert(
+            "cache".into(),
+            serde_json::json!({"mode": "bypass"}),
+        );
+        let b = CacheBehavior::resolve(&req);
+        assert!(!b.do_lookup);
+        assert!(!b.do_insert);
+    }
+
+    #[test]
+    fn refresh_skips_lookup_but_inserts() {
+        let mut req = base_req();
+        req.tt_extras.insert(
+            "cache".into(),
+            serde_json::json!({"mode": "refresh", "ttl_secs": 7200}),
+        );
+        let b = CacheBehavior::resolve(&req);
+        assert!(!b.do_lookup);
+        assert!(b.do_insert);
+        assert_eq!(b.ttl_secs, Some(7200));
+    }
+
+    #[test]
+    fn read_only_looks_up_never_inserts() {
+        let mut req = base_req();
+        req.tt_extras.insert(
+            "cache".into(),
+            serde_json::json!({"mode": "read-only"}),
+        );
+        let b = CacheBehavior::resolve(&req);
+        assert!(b.do_lookup);
+        assert!(!b.do_insert);
+    }
+
+    #[test]
+    fn nondeterministic_request_overrides_refresh() {
+        // Even if caller says "refresh", temperature>0 means we skip both.
+        let mut req = base_req();
+        req.temperature = Some(1.0);
+        req.tt_extras.insert(
+            "cache".into(),
+            serde_json::json!({"mode": "refresh"}),
+        );
+        let b = CacheBehavior::resolve(&req);
+        assert!(!b.do_lookup);
+        assert!(!b.do_insert);
+    }
 }
 
 #[cfg(test)]
