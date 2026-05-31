@@ -55,6 +55,19 @@ impl BudgetLimits {
             l2_cache: false,
         }
     }
+
+    /// Limits for an INTERNAL org (platform-admin SP-0): everything unbounded,
+    /// L2 on. Used by the tier resolver when `orgs.is_internal` is true so the
+    /// owner/staff can test without limits.
+    #[must_use]
+    pub fn internal_unlimited() -> Self {
+        Self {
+            monthly_cap_usd: None,
+            max_requests_per_min: None,
+            monthly_request_cap: None,
+            l2_cache: true,
+        }
+    }
 }
 
 /// Map a subscription `(tier, status)` pair → the [`BudgetLimits`] the gateway
@@ -478,6 +491,16 @@ mod tests {
         assert_eq!(l.max_requests_per_min, Some(60));
         assert_eq!(l.monthly_request_cap, Some(10_000));
         assert_eq!(l.monthly_cap_usd, None);
+    }
+
+    #[test]
+    fn internal_unlimited_has_no_caps_and_l2_enabled() {
+        // SP-0 platform-admin bypass: all caps None, L2 on. No DB required.
+        let l = BudgetLimits::internal_unlimited();
+        assert_eq!(l.monthly_cap_usd, None, "internal must have no USD cap");
+        assert_eq!(l.max_requests_per_min, None, "internal must have no rpm cap");
+        assert_eq!(l.monthly_request_cap, None, "internal must have no monthly request cap");
+        assert!(l.l2_cache, "internal must have L2 cache enabled");
     }
 
     #[test]

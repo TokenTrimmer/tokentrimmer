@@ -165,6 +165,17 @@ impl PostgresTierResolver {
         Self { pool }
     }
 
+    /// Best-effort read of `orgs.is_internal`. Fail-soft → `false` (never
+    /// grants unlimited on error). Kept separate from the subscriptions read.
+    async fn fetch_is_internal(&self, org_id: Uuid) -> bool {
+        let row: Result<Option<(bool,)>, sqlx::Error> =
+            sqlx::query_as(r#"SELECT is_internal FROM orgs WHERE id = $1"#)
+                .bind(org_id)
+                .fetch_optional(&self.pool)
+                .await;
+        matches!(row, Ok(Some((true,))))
+    }
+
     /// Best-effort read of the per-org budget-cap override from
     /// `org_budget_caps` (rv-budget-cap-ui). Returns `(monthly_cap_usd,
     /// monthly_request_cap)`.
@@ -206,6 +217,16 @@ impl std::fmt::Debug for PostgresTierResolver {
 #[async_trait]
 impl TierResolver for PostgresTierResolver {
     async fn resolve(&self, org_id: Uuid) -> Result<ResolvedTier, TierResolverError> {
+        // Internal orgs (platform-admin SP-0) get unlimited limits regardless
+        // of their subscription record. Fail-soft: any DB error → false →
+        // normal resolution continues.
+        if self.fetch_is_internal(org_id).await {
+            return Ok(ResolvedTier {
+                caller_tier: CallerTier::Scale, // top tier label; semantics carried by unlimited limits
+                limits: BudgetLimits::internal_unlimited(),
+            });
+        }
+
         let row: Option<(String, String)> = sqlx::query_as(
             r#"SELECT tier, status FROM subscriptions WHERE org_id = $1"#,
         )
@@ -468,6 +489,15 @@ mod tests {
         apply_cap_override(&mut l, Some(0.0), None);
         assert_eq!(l.monthly_cap_usd, Some(0.0), "zero is a valid (hard-stop) cap");
     }
+
+    // ── is_internal DB path ─────────────────────────────────────────────────
+    //
+    // `fetch_is_internal` and the `resolve()` short-circuit are exercised by
+    // the SP-0 manual verification (see docs/superpowers/plans). No DB test is
+    // added here because the existing `PostgresTierResolver` tests require a
+    // live DATABASE_URL and are not run locally without one; adding a flaky DB
+    // test would break the offline test suite. The pure unit coverage is
+    // provided by `budget::tests::internal_unlimited_has_no_caps_and_l2_enabled`.
 
     // ── CachedTierResolver caching ──────────────────────────────────────────
 
