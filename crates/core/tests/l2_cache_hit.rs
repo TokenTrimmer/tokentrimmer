@@ -284,6 +284,41 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         "provider must NOT be called on a cache hit"
     );
 
+    // ── Savings headers: an L2 hit must report full savings (saved == baseline).
+    //
+    // `build_hit_l2_response` calls `synthetic_baseline_from_entry` which
+    // prices at $1/M input + $2/M output (the conservative default until the
+    // L2 schema carries its own baseline_cost_usd column).
+    //
+    // The primed entry above has input_tokens=100, output_tokens=50 so:
+    //   baseline = (100 × $1 + 50 × $2) / 1_000_000 = 0.0002
+    //   saved    = baseline  (cost is zero — no provider call on a hit)
+    let baseline_l2: f64 = response
+        .headers()["x-tokentrimmer-baseline-cost-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expected_baseline = (100.0_f64 * 1.0 + 50.0_f64 * 2.0) / 1_000_000.0;
+    assert!(
+        baseline_l2 > 0.0,
+        "L2 hit must report a positive baseline; got {baseline_l2}"
+    );
+    assert!(
+        (baseline_l2 - expected_baseline).abs() < 1e-9,
+        "L2 hit baseline should be synthetic $1/M·$2/M estimate ({expected_baseline}); got {baseline_l2}"
+    );
+    let saved_l2: f64 = response
+        .headers()["x-tokentrimmer-saved-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (saved_l2 - baseline_l2).abs() < 1e-9,
+        "L2 hit saved should equal baseline ({baseline_l2}) — 100% savings; got {saved_l2}"
+    );
+
     // Body must be the cached body, not the live provider one.
     let bytes = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
