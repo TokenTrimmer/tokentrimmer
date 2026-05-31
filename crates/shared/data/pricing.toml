@@ -109,6 +109,17 @@ output_per_million = 240.00
 cached_input_per_million = 15.00
 effective_at = "2026-05-01T00:00:00Z"
 
+# Updated 2026-05-31 — o3's list price was cut sharply since the May snapshot.
+# Current OpenRouter list price: $2/$8, cache-read $0.50. Appended per the
+# versioning rule (the $60/$240 row above is retained for historical replay).
+[[entry]]
+provider = "openai"
+model = "o3"
+input_per_million = 2.00
+output_per_million = 8.00
+cached_input_per_million = 0.50
+effective_at = "2026-05-31T00:00:00Z"
+
 [[entry]]
 provider = "openai"
 model = "o4-mini"
@@ -301,7 +312,7 @@ effective_at = "2026-05-01T00:00:00Z"
 # applied separately via the provider's fee_multiplier, not baked in here).
 [[entry]]
 provider = "openrouter"
-model = "anthropic/claude-sonnet-4-6"
+model = "anthropic/claude-sonnet-4.6"
 input_per_million = 3.00
 output_per_million = 15.00
 effective_at = "2026-05-01T00:00:00Z"
@@ -315,7 +326,7 @@ effective_at = "2026-05-01T00:00:00Z"
 
 [[entry]]
 provider = "openrouter"
-model = "google/gemini-3.1-pro"
+model = "google/gemini-3.1-pro-preview"
 input_per_million = 2.00
 output_per_million = 12.00
 effective_at = "2026-05-01T00:00:00Z"
@@ -326,6 +337,15 @@ model = "meta-llama/llama-3.3-70b-instruct"
 input_per_million = 0.59
 output_per_million = 0.79
 effective_at = "2026-05-01T00:00:00Z"
+
+# Updated 2026-05-31 — OpenRouter list price for this model dropped to
+# $0.10/$0.32 (openrouter:* rows mirror OpenRouter list price by definition).
+[[entry]]
+provider = "openrouter"
+model = "meta-llama/llama-3.3-70b-instruct"
+input_per_million = 0.10
+output_per_million = 0.32
+effective_at = "2026-05-31T00:00:00Z"
 
 [[entry]]
 provider = "openrouter"
