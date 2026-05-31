@@ -27,6 +27,31 @@ auth() { curl -sS "$@" -u "${STRIPE_SECRET_KEY}:"; }
 cleanup() { [ -n "${CLOCK:-}" ] && auth -X DELETE "$API/test_helpers/test_clocks/$CLOCK" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# rv-annual-checkout-guard (§7.8): if any annual price ids are configured, assert
+# each resolves to a live Stripe price with a YEARLY recurring interval. A
+# monthly price id wired into an *_ANNUAL slot silently breaks annual checkout
+# (the items would mix intervals). Unset annual vars are skipped (annual is
+# optional; the gateway falls back to monthly).
+check_yearly() {
+  local var="$1" id="${2:-}"
+  [ -z "$id" ] && return 0
+  local interval
+  interval=$(auth "$API/prices/$id" | jq -r '.recurring.interval // empty')
+  if [ -z "$interval" ]; then
+    echo "   ❌ $var=$id did not resolve to a Stripe price" >&2; exit 1
+  elif [ "$interval" != "year" ]; then
+    echo "   ❌ $var=$id has recurring.interval='$interval' (expected 'year')" >&2; exit 1
+  fi
+  echo "   ✅ $var is a yearly price"
+}
+echo "0) validate any configured annual price ids resolve to yearly Stripe prices"
+check_yearly STRIPE_PRICE_PRO_ANNUAL           "${STRIPE_PRICE_PRO_ANNUAL:-}"
+check_yearly STRIPE_PRICE_TEAM_ANNUAL          "${STRIPE_PRICE_TEAM_ANNUAL:-}"
+check_yearly STRIPE_PRICE_SCALE_ANNUAL         "${STRIPE_PRICE_SCALE_ANNUAL:-}"
+check_yearly STRIPE_OVERAGE_PRICE_PRO_ANNUAL   "${STRIPE_OVERAGE_PRICE_PRO_ANNUAL:-}"
+check_yearly STRIPE_OVERAGE_PRICE_TEAM_ANNUAL  "${STRIPE_OVERAGE_PRICE_TEAM_ANNUAL:-}"
+check_yearly STRIPE_OVERAGE_PRICE_SCALE_ANNUAL "${STRIPE_OVERAGE_PRICE_SCALE_ANNUAL:-}"
+
 NOW=$(date +%s)
 echo "1) create test clock @ $NOW"
 CLOCK=$(auth "$API/test_helpers/test_clocks" -d "frozen_time=$NOW" -d "name=overage-validation" | jq -r '.id')
