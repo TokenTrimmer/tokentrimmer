@@ -261,6 +261,16 @@ input_per_million = 0.70
 output_per_million = 2.10
 effective_at = "2026-05-01T00:00:00Z"
 
+# Updated 2026-05-31 — mistral-medium-latest now resolves to Mistral Medium 3
+# at $0.40/$2.00 (mistral.ai/news/mistral-medium-3, confirmed via OpenRouter
+# mistralai/mistral-medium-3.1). Was $0.70/$2.10.
+[[entry]]
+provider = "mistral"
+model = "mistral-medium-latest"
+input_per_million = 0.40
+output_per_million = 2.00
+effective_at = "2026-05-31T00:00:00Z"
+
 [[entry]]
 provider = "mistral"
 model = "mistral-small-latest"
@@ -289,6 +299,16 @@ model = "meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo"
 input_per_million = 0.88
 output_per_million = 0.88
 effective_at = "2026-05-01T00:00:00Z"
+
+# Updated 2026-05-31 — Together's hosted rate for this model is now $1.04/$1.04
+# (confirmed via OpenRouter's per-endpoint pricing: Together endpoint on
+# meta-llama/llama-3.3-70b-instruct). Was $0.88/$0.88.
+[[entry]]
+provider = "together"
+model = "meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo"
+input_per_million = 1.04
+output_per_million = 1.04
+effective_at = "2026-05-31T00:00:00Z"
 
 [[entry]]
 provider = "together"

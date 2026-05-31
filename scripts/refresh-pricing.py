@@ -64,6 +64,24 @@ SLUG = {
     # "-latest" alias to one would rot, so they're left to manual verification.
 }
 
+# Host-specific resale rates (Groq/Together) aren't in /models. OpenRouter's
+# per-model `endpoints` API lists each host with its own price, so we verify
+# those rows against the matching host endpoint.
+# (catalog provider, model) -> (openrouter base slug, provider_name as OpenRouter shows it)
+HOST_ENDPOINT = {
+    ("groq", "llama-3.3-70b-versatile"): ("meta-llama/llama-3.3-70b-instruct", "Groq"),
+    ("groq", "llama-3.1-8b-instant"): ("meta-llama/llama-3.1-8b-instruct", "Groq"),
+    ("together", "meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo"): (
+        "meta-llama/llama-3.3-70b-instruct",
+        "Together",
+    ),
+    # Retired Groq models + Together 405B/Qwen/DeepSeek have no matching host
+    # endpoint on OpenRouter → reported "missing_in_source" (a signal to verify
+    # on the host console / confirm the model is still offered).
+    ("groq", "deepseek-r1-distill-llama-70b"): ("deepseek/deepseek-r1-distill-llama-70b", "Groq"),
+    ("groq", "mixtral-8x7b-32768"): ("mistralai/mixtral-8x7b-instruct", "Groq"),
+}
+
 
 def latest_entries(catalog_path: Path) -> list[dict]:
     """The most-recent entry per (provider, model)."""
@@ -85,6 +103,31 @@ def fetch_openrouter() -> dict[str, dict]:
     for m in payload.get("data", []):
         out[m["id"]] = m.get("pricing", {})
     return out
+
+
+_ENDPOINT_CACHE: dict[str, list] = {}
+
+
+def fetch_endpoints(base_slug: str) -> list:
+    """OpenRouter per-model endpoints (each host + its pricing). Cached; empty on error."""
+    if base_slug not in _ENDPOINT_CACHE:
+        url = f"https://openrouter.ai/api/v1/models/{base_slug}/endpoints"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "tt-pricing-refresh"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                _ENDPOINT_CACHE[base_slug] = json.load(resp).get("data", {}).get("endpoints", [])
+        except Exception:  # noqa: BLE001
+            _ENDPOINT_CACHE[base_slug] = []
+    return _ENDPOINT_CACHE[base_slug]
+
+
+def host_price(base_slug: str, provider_name: str) -> tuple[float | None, float | None] | None:
+    """The (input, output) $/1M for `provider_name`'s endpoint of `base_slug`, or None."""
+    for e in fetch_endpoints(base_slug):
+        if e.get("provider_name") == provider_name:
+            p = e.get("pricing", {})
+            return per_m(p.get("prompt")), per_m(p.get("completion"))
+    return None
 
 
 def per_m(token_price: str | float | None) -> float | None:
@@ -117,22 +160,34 @@ def main() -> int:
 
     for r in rows:
         key = (r["provider"], r["model"])
-        slug = slug_for.get(key)
-        if slug is None:
-            report["manual"].append({**_id(r), "reason": "no automated source (host-specific / embeddings)"})
-            continue
-        pricing = live.get(slug)
-        if pricing is None:
-            report["missing_in_source"].append({**_id(r), "slug": slug})
-            continue
-        live_in, live_out = per_m(pricing.get("prompt")), per_m(pricing.get("completion"))
         cat_in, cat_out = r["input_per_million"], r["output_per_million"]
+        slug = slug_for.get(key)
+        host = HOST_ENDPOINT.get(key)
+
+        if slug is not None:  # first-party list price via /models
+            pricing = live.get(slug)
+            if pricing is None:
+                report["missing_in_source"].append({**_id(r), "slug": slug})
+                continue
+            live_in, live_out = per_m(pricing.get("prompt")), per_m(pricing.get("completion"))
+            src = slug
+        elif host is not None:  # host-specific rate via the endpoints API
+            hp = host_price(*host)
+            src = f"{host[1]}@{host[0]}"
+            if hp is None:
+                report["missing_in_source"].append({**_id(r), "slug": src})
+                continue
+            live_in, live_out = hp
+        else:
+            report["manual"].append({**_id(r), "reason": "no automated source"})
+            continue
+
         din = None if live_in is None else abs(live_in - cat_in)
         dout = None if live_out is None else abs(live_out - cat_out)
         drifted = (din is not None and din > TOLERANCE_USD_PER_M) or (
             dout is not None and dout > TOLERANCE_USD_PER_M
         )
-        rec = {**_id(r), "slug": slug, "catalog": [cat_in, cat_out], "live": [live_in, live_out]}
+        rec = {**_id(r), "slug": src, "catalog": [cat_in, cat_out], "live": [live_in, live_out]}
         (report["drift"] if drifted else report["matched"]).append(rec)
 
     if as_json:

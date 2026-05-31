@@ -282,11 +282,10 @@ mod tests {
             "gemini-3.1-flash-lite",
             "gemini-3.5-flash",
             "gemini-3.1-pro",
-            // Groq
+            // Groq (deepseek-r1-distill-llama-70b + mixtral-8x7b-32768 removed —
+            // retired by Groq 2025-09 / 2025-03; don't suggest routes to them)
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
-            "deepseek-r1-distill-llama-70b",
-            "mixtral-8x7b-32768",
             // Mistral
             "mistral-large-latest",
             "mistral-medium-latest",
