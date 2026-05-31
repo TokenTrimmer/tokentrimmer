@@ -666,6 +666,24 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         tracing::warn!("no DB pool; tt_live_* keys pass through without verification (dev mode)");
     }
 
+    // Tier resolver: Postgres when available. Resolves each org's subscription
+    // (tier, status) + self-serve budget cap (`org_budget_caps`) into the
+    // per-request `BudgetLimits` the auth middleware enforces via
+    // `dynamic_budget`. Without it the middleware enforces NO per-org tier
+    // limits or budget caps (rv-tier-limits-enforcement / rv-budget-cap-ui).
+    // Wrapped in a 30s-TTL cache so a webhook tier change propagates within a
+    // minute without a DB hit per request. Fail-open: a resolver error falls
+    // back to Free defaults, never blocking legitimate traffic.
+    if let Some(pool) = db_pool.as_ref() {
+        let resolver = tt_core::tier_resolver::PostgresTierResolver::new(pool.clone());
+        state = state.with_tier_resolver(Arc::new(
+            tt_core::tier_resolver::CachedTierResolver::new(resolver),
+        ));
+        tracing::info!("tier resolver: Postgres-backed (per-org tier limits + budget caps enforced)");
+    } else {
+        tracing::warn!("no DB pool; per-org tier limits + budget caps NOT enforced");
+    }
+
     // Request-log writer: Postgres when available. The dashboard's
     // `/api/telemetry` endpoint reads from this table for spend / savings
     // / cache hit rate cards.
@@ -743,6 +761,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                 then: tt_routing::RouteAction {
                     target_model: "llama-3.1-8b-instant".into(),
                     fallbacks: Vec::new(),
+                    force_cache_layer: None,
                 },
             }],
         );

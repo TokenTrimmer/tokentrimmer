@@ -53,6 +53,7 @@ pub fn suggestions_to_proposed_routes(
             },
             then: RouteAction {
                 target_model: s.model.clone(),
+                fallbacks: Vec::new(),
                 force_cache_layer: None,
             },
         })
