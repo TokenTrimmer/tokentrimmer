@@ -242,10 +242,29 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
 
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Response must carry tokens-saved header.
-    assert!(
-        resp.headers().contains_key("x-tt-retrieval-tokens-saved"),
-        "x-tt-retrieval-tokens-saved header must be present on successful substitution"
+    // Response must carry tokens-saved header with the correct NET value.
+    //
+    // Token math for this fixture (cl100k_base tiktoken, EMBEDDING_PROVIDER="openai"):
+    //   original_span = `<retrievable corpus="my-docs" k="1">verbose payload …</retrievable>`
+    //                   → 26 tokens
+    //   replacement   = "Retrieved chunk content here."
+    //                   → 6 tokens
+    //   gross_saved   = 26 − 6 = 20
+    //   without_tags  = "Please review:  and summarize."  (embedding query)
+    //                   → 7 tokens  (embedding cost deducted from gross)
+    //   net_saved     = 20 − 7 = 13
+    let tokens_saved_str = resp
+        .headers()
+        .get("x-tt-retrieval-tokens-saved")
+        .expect("x-tt-retrieval-tokens-saved header must be present on successful substitution")
+        .to_str()
+        .unwrap();
+    let tokens_saved: i64 = tokens_saved_str
+        .parse()
+        .unwrap_or_else(|_| panic!("x-tt-retrieval-tokens-saved must be an integer; got {tokens_saved_str:?}"));
+    assert_eq!(
+        tokens_saved, 13,
+        "net tokens saved must equal gross (20) minus embedding query cost (7) = 13; got {tokens_saved}"
     );
     assert_eq!(
         resp.headers()
