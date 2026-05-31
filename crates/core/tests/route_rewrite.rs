@@ -20,6 +20,7 @@ use tt_auth::{
     keys::{issue, Environment},
     InMemoryKeyStore, KeyStore,
 };
+use tt_cache::memory::InMemoryL1Cache;
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_routing::{
     CachingRoutingStore, InMemoryRoutingStore, Route, RouteAction, RouteConditions, RoutingStore,
@@ -448,4 +449,150 @@ async fn route_skipped_when_no_resolvable_org() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(served.lock().unwrap().clone(), vec!["gpt-4o".to_string()]);
+}
+
+/// Routing-baseline is preserved into the L1 cache envelope so that a second
+/// request (cache hit) reports the *routing* baseline — not zero, and not the
+/// cheap routed model's price. This proves routing savings and L1 cache savings
+/// compose rather than collapse.
+///
+/// Savings math (RecordingProvider usage: prompt=5, completion=5):
+///   cost_r1      = (5 × $0.15/M  + 5 × $0.6/M)  ≈ 3.75e-6  (gpt-4o-mini)
+///   baseline_r1  = (5 × $5.0/M   + 5 × $15.0/M) = 1.0e-4   (gpt-4o)
+///   saved_r1     = baseline_r1 - cost_r1         (verified via r1 headers)
+///
+///   Request 2 is an L1 cache hit whose envelope carries the routing baseline
+///   from r1. The hit path sets saved == baseline (cost=0), so:
+///   baseline_r2  = baseline_r1   (routing baseline preserved in envelope)
+///   saved_r2     = baseline_r2   (100% saving on cache hit)
+///
+/// NOTE: cost_r1 and saved_r1 are asserted via the saved = baseline − cost
+/// relationship (mirroring routed_request_reports_savings_against_original_model)
+/// because the :.6 header format rounds 3.75e-6 → "0.000004" (6th decimal).
+/// The r2 assertions use r1's parsed header values directly, so no rounding gap.
+#[tokio::test]
+async fn routing_baseline_preserved_in_l1_cache_hit() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let served = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        served_models: Arc::clone(&served),
+        calls: Arc::clone(&calls),
+    }));
+
+    let raw_store = InMemoryKeyStore::new();
+    let org_id = Uuid::now_v7();
+    let plaintext = issue_key_for(&raw_store, org_id).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
+
+    let routes_backing = Arc::new(InMemoryRoutingStore::new());
+    routes_backing.set_routes(
+        org_id,
+        vec![Route {
+            id: Uuid::now_v7(),
+            name: "downgrade-4o-combined".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                ..Default::default()
+            },
+            then: RouteAction {
+                target_model: "gpt-4o-mini".into(),
+                fallbacks: Vec::new(),
+                force_cache_layer: None,
+            },
+        }],
+    );
+    let routing = Arc::new(CachingRoutingStore::new(
+        routes_backing as Arc<dyn RoutingStore>,
+    ));
+
+    let l1 = Arc::new(InMemoryL1Cache::new());
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_routing_store(routing)
+            .with_l1(l1, None),
+    );
+
+    let header_f64 = |headers: &axum::http::HeaderMap, name: &str| -> f64 {
+        headers[name].to_str().unwrap().parse::<f64>().unwrap()
+    };
+
+    // ── Request 1: routing miss (gpt-4o → gpt-4o-mini downgrade) ─────────────
+    let r1 = app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &plaintext))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "provider called for miss");
+    assert_eq!(served.lock().unwrap().as_slice(), ["gpt-4o-mini"]);
+
+    let cost_r1 = header_f64(r1.headers(), "x-tokentrimmer-cost-usd");
+    let baseline_r1 = header_f64(r1.headers(), "x-tokentrimmer-baseline-cost-usd");
+    let saved_r1 = header_f64(r1.headers(), "x-tokentrimmer-saved-usd");
+
+    // Routing baseline (gpt-4o, exact via headers): 5×$5/M + 5×$15/M = 0.0001.
+    // Since baseline_r1 is formatted as :.6 and 0.0001 is representable exactly
+    // at 6 decimal places, we can assert the exact value.
+    let expected_baseline_r1 = (5.0_f64 * 5.0 + 5.0_f64 * 15.0) / 1_000_000.0; // = 0.0001
+    assert!(
+        (baseline_r1 - expected_baseline_r1).abs() < 1e-9,
+        "r1 baseline should be {expected_baseline_r1} (gpt-4o pricing); got {baseline_r1}"
+    );
+    // Routing saving: baseline (expensive model) must exceed cost (cheap model).
+    assert!(
+        baseline_r1 > cost_r1,
+        "routing baseline ({baseline_r1}) must exceed routed cost ({cost_r1})"
+    );
+    assert!(
+        saved_r1 > 0.0,
+        "routing saving must be positive; got {saved_r1}"
+    );
+    // saved must equal baseline − cost even across rounding.
+    assert!(
+        (saved_r1 - (baseline_r1 - cost_r1)).abs() < 1e-9,
+        "r1 saved ({saved_r1}) must equal baseline − cost ({})",
+        baseline_r1 - cost_r1
+    );
+
+    // Allow the spawned L1 insert to land.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // ── Request 2: L1 cache hit — routing baseline must survive in envelope ───
+    let r2 = app
+        .oneshot(chat_request("gpt-4o", &plaintext))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    assert_eq!(
+        r2.headers()
+            .get("x-tokentrimmer-cache")
+            .and_then(|v| v.to_str().ok()),
+        Some("hit-l1"),
+        "second identical request must be an L1 cache hit"
+    );
+    // Provider must NOT have been called again.
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "provider must not be called on L1 hit"
+    );
+
+    let baseline_r2 = header_f64(r2.headers(), "x-tokentrimmer-baseline-cost-usd");
+    let saved_r2 = header_f64(r2.headers(), "x-tokentrimmer-saved-usd");
+
+    // The routing baseline is preserved in the L1 envelope (chat.rs ~925):
+    // L1Entry::new captures baseline_cost_usd at insert time.
+    // On the hit path: saved == baseline (cost = 0).
+    assert!(
+        (baseline_r2 - baseline_r1).abs() < 1e-9,
+        "L1 hit must carry routing baseline from r1 ({baseline_r1}); got {baseline_r2}"
+    );
+    assert!(
+        (saved_r2 - baseline_r2).abs() < 1e-9,
+        "L1 hit saved should equal baseline ({baseline_r2}); got {saved_r2}"
+    );
 }
