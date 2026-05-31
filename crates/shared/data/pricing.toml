@@ -228,6 +228,10 @@ input_per_million = 0.05
 output_per_million = 0.08
 effective_at = "2026-05-01T00:00:00Z"
 
+# DEPRECATED by Groq (verified 2026-05-31): deepseek-r1-distill-llama-70b was
+# retired 2025-09-02, mixtral-8x7b-32768 on 2025-03-05. Rows retained for
+# historical replay, but the gateway's Groq registry should NOT offer these for
+# routing. (Groq console: console.groq.com/docs/deprecations)
 [[entry]]
 provider = "groq"
 model = "deepseek-r1-distill-llama-70b"
