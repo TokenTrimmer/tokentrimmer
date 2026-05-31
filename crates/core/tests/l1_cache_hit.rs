@@ -398,3 +398,165 @@ async fn streaming_request_fake_streams_from_l1_hit() {
         "terminator chunk should carry finish_reason=stop; got:\n{body}"
     );
 }
+
+// ── Task 2 helper: a provider that reports cached_tokens in its Usage. ───────
+//
+// The CountingProvider above always returns cached_tokens=0. This one returns
+// cached_tokens=50 out of 100 prompt tokens so the cached-token discount
+// (chat.rs compute_cost, ~line 1345) kicks in for a live (non-cache-hit)
+// request. The provider prices $3/M input, $6/M output, $0.3/M cached — the
+// same as CountingProvider so math is comparable.
+
+struct CachedDiscountProvider;
+
+#[async_trait]
+impl Provider for CachedDiscountProvider {
+    fn id(&self) -> &'static str {
+        "cached-discount"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: "cached-discount-1".into(),
+            provider: "cached-discount".into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 4096,
+            max_output_tokens: 4096,
+        }]
+    }
+    fn pricing(&self, _: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 6.0,
+            cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
+            effective_at: Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-cached-discount".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("with cached discount".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                // 50 of 100 prompt tokens were read from the provider's KV
+                // cache — only the remaining 50 are charged at the fresh rate.
+                cached_tokens: 50,
+                cache_creation_input_tokens: None,
+            },
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+/// A single (non-L1-hit) request where the *provider* itself reports
+/// `cached_tokens > 0` (i.e. its own KV-cache read discount, distinct from the
+/// TokenTrimmer L1/L2 cache). The gateway must surface this as a positive
+/// `saved_usd = baseline - cost`.
+///
+/// Pricing (compute_cost, chat.rs ~line 1356):
+///   cache_read   = 50 (cached_tokens), cache_write = 0, fresh_input = 50
+///   cost_usd     = 50 × $3/M + 50 × $0.3/M + 50 × $6/M
+///                = 0.000150 + 0.000015 + 0.000300 = 0.000465
+///   baseline_usd = 100 × $3/M + 50 × $6/M = 0.000300 + 0.000300 = 0.000600
+///   saved_usd    = 0.000600 − 0.000465 = 0.000135
+#[tokio::test]
+async fn cached_token_discount_shows_up_as_positive_saved() {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CachedDiscountProvider));
+    // No L1 cache — we want a live provider dispatch, not a cache hit.
+    let app = build_router(AppState::new(registry));
+
+    let body = json!({
+        "model": "cached-discount-1",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "stream": false,
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Must NOT be a cache hit — verify the provider actually ran.
+    assert_ne!(
+        resp.headers()
+            .get("x-tokentrimmer-cache")
+            .and_then(|v| v.to_str().ok()),
+        Some("hit-l1"),
+        "should be a live request, not an L1 hit"
+    );
+
+    let header_f64 = |name: &str| -> f64 {
+        resp.headers()[name]
+            .to_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+    };
+    let cost = header_f64("x-tokentrimmer-cost-usd");
+    let baseline = header_f64("x-tokentrimmer-baseline-cost-usd");
+    let saved = header_f64("x-tokentrimmer-saved-usd");
+
+    // Pricing derivation (see docstring above):
+    //   fresh_input=50, cache_read=50, output=50
+    //   $3/M × 50  + $0.3/M × 50  + $6/M × 50
+    let expected_cost = (50.0 * 3.0 + 50.0 * 0.3 + 50.0 * 6.0) / 1_000_000.0;
+    // Baseline: all 100 prompt tokens at the plain input rate, no cache
+    // discount.
+    let expected_baseline = (100.0 * 3.0 + 50.0 * 6.0) / 1_000_000.0;
+    let expected_saved = expected_baseline - expected_cost;
+
+    assert!(
+        (cost - expected_cost).abs() < 1e-9,
+        "cost should be {expected_cost} (cached-token discount applied); got {cost}"
+    );
+    assert!(
+        (baseline - expected_baseline).abs() < 1e-9,
+        "baseline should be {expected_baseline} (no cache discount); got {baseline}"
+    );
+    assert!(
+        baseline > cost,
+        "baseline ({baseline}) should exceed discounted cost ({cost})"
+    );
+    assert!(
+        (saved - expected_saved).abs() < 1e-9,
+        "saved should equal baseline − cost = {expected_saved}; got {saved}"
+    );
+}
