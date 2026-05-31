@@ -1,0 +1,31 @@
+name: Pricing drift
+
+# Monthly drift check: reconcile the embedded price catalog
+# (crates/shared/data/pricing.toml) against live provider list prices via
+# scripts/refresh-pricing.py. The job FAILS when drift is detected (exit 1) so
+# the scheduled-run failure notifies maintainers to review + append a dated
+# entry. It never edits the catalog — pricing is billing-critical and stays
+# human-gated. Also runnable on demand.
+
+on:
+  schedule:
+    - cron: '0 9 1 * *' # 09:00 UTC on the 1st of each month
+  workflow_dispatch:
+  # Also sanity-check the script + catalog parse on PRs that touch either.
+  pull_request:
+    paths:
+      - 'scripts/refresh-pricing.py'
+      - 'crates/shared/data/pricing.toml'
+
+jobs:
+  drift:
+    name: catalog vs live provider pricing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12' # tomllib needs >=3.11
+      - name: Detect pricing drift
+        run: python3 scripts/refresh-pricing.py
