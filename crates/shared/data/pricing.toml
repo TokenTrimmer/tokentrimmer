@@ -25,6 +25,19 @@
 # Snapshot: May 2026 baseline. effective_at = 2026-05-01T00:00:00Z for every
 # row in this initial import (the date this catalog was first externalized);
 # subsequent refreshes append rows with their real effective dates.
+#
+# Flagship verification — 2026-05-31:
+#   OpenAI gpt-5.5 ($5/$30/$0.50) + gpt-5.4 ($2.50/$15/$0.25) confirmed vs
+#   developers.openai.com/api/docs/pricing; added current gpt-5.5-pro,
+#   gpt-5.4-mini, gpt-5.4-pro. gpt-4o/o3/o4-mini/text-embedding-3-* are off
+#   OpenAI's current pricing page (legacy rows retained for replay).
+#   Anthropic claude-haiku-4-5 ($1/$5), claude-sonnet-4-6 ($3/$15) confirmed
+#   vs platform.claude.com/docs/.../pricing; added current claude-opus-4-8.
+#   Gemini gemini-3.5-flash ($1.50/$9/$0.15), gemini-3.1-pro ($2/$12/$0.20),
+#   gemini-3.1-flash-lite ($0.25/$1.50/$0.025) confirmed vs
+#   ai.google.dev/gemini-api/docs/pricing — all exact matches.
+#   NOT yet re-verified this pass: Groq, Mistral, Together, OpenRouter rows
+#   (carried from the May snapshot — verify in the next refresh).
 
 # ── OpenAI ──────────────────────────────────────────────────────────────────
 [[entry]]
@@ -43,6 +56,35 @@ output_per_million = 15.00
 cached_input_per_million = 0.25
 effective_at = "2026-05-01T00:00:00Z"
 
+# Added 2026-05-31 — verified vs developers.openai.com/api/docs/pricing.
+# gpt-5.x variants now on OpenAI's current pricing page (pro variants do not
+# list a cached-input rate).
+[[entry]]
+provider = "openai"
+model = "gpt-5.5-pro"
+input_per_million = 30.00
+output_per_million = 180.00
+effective_at = "2026-05-31T00:00:00Z"
+
+[[entry]]
+provider = "openai"
+model = "gpt-5.4-mini"
+input_per_million = 0.75
+output_per_million = 4.50
+cached_input_per_million = 0.075
+effective_at = "2026-05-31T00:00:00Z"
+
+[[entry]]
+provider = "openai"
+model = "gpt-5.4-pro"
+input_per_million = 30.00
+output_per_million = 180.00
+effective_at = "2026-05-31T00:00:00Z"
+
+# Legacy: gpt-4o / gpt-4o-mini / o3 / o4-mini / text-embedding-3-* are no longer
+# on OpenAI's current pricing page (2026-05-31). Rows retained for historical
+# replay (PricingCatalog::at) — do NOT delete; their effective_at predates any
+# delisting so past requests still price correctly.
 [[entry]]
 provider = "openai"
 model = "gpt-4o"
@@ -121,6 +163,18 @@ output_per_million = 25.00
 cached_input_per_million = 0.50
 cache_write_per_million = 6.25
 effective_at = "2026-05-01T00:00:00Z"
+
+# Added 2026-05-31 — Claude Opus 4.8 is now Anthropic's current Opus flagship
+# (anthropic.com/claude/opus), $5/$25. Cache read/write follow Anthropic's
+# documented 0.1× / 1.25× input formula (cached 0.50, write 6.25).
+[[entry]]
+provider = "anthropic"
+model = "claude-opus-4-8"
+input_per_million = 5.00
+output_per_million = 25.00
+cached_input_per_million = 0.50
+cache_write_per_million = 6.25
+effective_at = "2026-05-31T00:00:00Z"
 
 # ── Google Gemini ─────────────────────────────────────────────────────────────
 # Headline rate is the ≤200K-token bracket; >200K bracket pricing is a v2 item.

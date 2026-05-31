@@ -200,10 +200,12 @@ mod catalog_tests {
     fn embedded_catalog_parses_and_is_populated() {
         let c = catalog();
         assert!(!c.is_empty(), "embedded catalog should not be empty");
-        // 32 models across 7 paid providers at import time.
+        // 36 models across 7 paid providers (32 at import + 4 current flagships
+        // added in the 2026-05-31 verification: gpt-5.5-pro, gpt-5.4-mini,
+        // gpt-5.4-pro, claude-opus-4-8).
         assert_eq!(
             c.len(),
-            32,
+            36,
             "unexpected catalog size — update if intentional"
         );
     }
