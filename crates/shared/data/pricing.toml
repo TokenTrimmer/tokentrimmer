@@ -278,6 +278,15 @@ input_per_million = 0.20
 output_per_million = 0.60
 effective_at = "2026-05-01T00:00:00Z"
 
+# Updated 2026-05-31 — mistral-small-latest now resolves to Mistral Small 4 at
+# $0.10/$0.30 (mistral.ai/pricing). Was $0.20/$0.60.
+[[entry]]
+provider = "mistral"
+model = "mistral-small-latest"
+input_per_million = 0.10
+output_per_million = 0.30
+effective_at = "2026-05-31T00:00:00Z"
+
 [[entry]]
 provider = "mistral"
 model = "codestral-latest"
@@ -285,6 +294,10 @@ input_per_million = 0.30
 output_per_million = 0.90
 effective_at = "2026-05-01T00:00:00Z"
 
+# UNVERIFIED 2026-05-31 — pixtral-large is no longer on Mistral's current
+# pricing page (mistral.ai/pricing) and isn't on OpenRouter; likely superseded
+# by Mistral Small 4 (multimodal). Rate below is the May snapshot, unconfirmed —
+# verify in the Mistral console or drop if the model is retired.
 [[entry]]
 provider = "mistral"
 model = "pixtral-large-latest"
@@ -310,6 +323,11 @@ input_per_million = 1.04
 output_per_million = 1.04
 effective_at = "2026-05-31T00:00:00Z"
 
+# UNVERIFIED 2026-05-31 — the next three (405B-Turbo, Qwen2.5-72B-Turbo,
+# DeepSeek-V3) are NOT on Together's current serverless models catalog
+# (docs.together.ai/docs/serverless-models) and have no Together endpoint on
+# OpenRouter; likely retired/repriced. Rates below are the May snapshot,
+# unconfirmed — verify in the Together console or drop if retired.
 [[entry]]
 provider = "together"
 model = "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo"
