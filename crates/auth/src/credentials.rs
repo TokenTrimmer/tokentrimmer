@@ -71,6 +71,19 @@ pub trait ProviderCredentialStore: Send + Sync {
         Err(CredentialError::Store("store is read-only".into()))
     }
 
+    /// Delete the credential for `(org_id, provider_id)`. Returns `true` if a
+    /// row existed and was removed, `false` if there was nothing to delete (so
+    /// the caller can skip writing an audit row). Default impl rejects with
+    /// [`CredentialError::Store`] — read-only stores inherit it; writable stores
+    /// (in-memory, Postgres) override. (rv-credentials-delete)
+    async fn delete(
+        &self,
+        _org_id: Uuid,
+        _provider_id: &str,
+    ) -> Result<bool, CredentialError> {
+        Err(CredentialError::Store("store is read-only".into()))
+    }
+
     /// Number of distinct providers `org_id` has stored credentials for.
     /// Default `0` — read-only / env stores don't track per-org counts;
     /// InMemory and Postgres override. Used to enforce per-tier credential
@@ -141,6 +154,14 @@ impl ProviderCredentialStore for InMemoryProviderCredentialStore {
             .map_err(|e| CredentialError::Store(e.to_string()))?;
         g.insert((org_id, provider_id.to_string()), credentials);
         Ok(())
+    }
+
+    async fn delete(&self, org_id: Uuid, provider_id: &str) -> Result<bool, CredentialError> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|e| CredentialError::Store(e.to_string()))?;
+        Ok(g.remove(&(org_id, provider_id.to_string())).is_some())
     }
 
     async fn count_for_org(&self, org_id: Uuid) -> Result<u32, CredentialError> {
@@ -300,6 +321,12 @@ where
         // the fallback (env) holds no per-org rows.
         self.primary.count_for_org(org_id).await
     }
+
+    async fn delete(&self, org_id: Uuid, provider_id: &str) -> Result<bool, CredentialError> {
+        // Deletes target the writable primary store; the env fallback is
+        // read-only and holds no per-org rows to remove.
+        self.primary.delete(org_id, provider_id).await
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +348,29 @@ mod tests {
         store.insert(org, "openai", creds("sk-abc"));
         let got = store.get(org, "openai").await.unwrap().unwrap();
         assert_eq!(got.api_key.expose(), "sk-abc");
+    }
+
+    #[tokio::test]
+    async fn in_memory_delete_removes_and_reports_existence() {
+        let store = InMemoryProviderCredentialStore::new();
+        let org = Uuid::now_v7();
+        store.insert(org, "openai", creds("sk-abc"));
+        // Deleting a present credential reports true + removes it.
+        assert!(store.delete(org, "openai").await.unwrap());
+        assert!(store.get(org, "openai").await.unwrap().is_none());
+        // Deleting again (or an unknown provider) reports false — caller skips audit.
+        assert!(!store.delete(org, "openai").await.unwrap());
+        // Another org's credential is untouched by a same-provider delete.
+        let other = Uuid::now_v7();
+        store.insert(other, "openai", creds("sk-other"));
+        assert!(!store.delete(org, "openai").await.unwrap());
+        assert!(store.get(other, "openai").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn env_store_delete_is_read_only() {
+        let store = EnvProviderCredentialStore::new();
+        assert!(store.delete(Uuid::now_v7(), "openai").await.is_err());
     }
 
     #[tokio::test]

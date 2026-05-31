@@ -392,6 +392,20 @@ impl ProviderCredentialStore for PostgresProviderCredentialStore {
                 .map_err(CredentialStoreError::Sql)?;
         Ok(n as u32)
     }
+
+    async fn delete(&self, org_id: Uuid, provider_id: &str) -> Result<bool, CredentialError> {
+        // Scoped by (org_id, provider) — the upsert key — so one org can never
+        // delete another's credential (rv-credentials-delete).
+        let res = sqlx::query(
+            r#"DELETE FROM provider_credentials WHERE org_id = $1 AND provider = $2"#,
+        )
+        .bind(org_id)
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await
+        .map_err(CredentialStoreError::Sql)?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 // ─── Postgres-backed API key store ─────────────────────────────────────────
