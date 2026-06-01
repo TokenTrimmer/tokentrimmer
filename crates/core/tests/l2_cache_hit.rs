@@ -7,6 +7,8 @@
 //! 3. Cache state header is `none` when L2 is not wired on the app state.
 //! 4. Streaming requests skip L2 entirely (the fake-stream-from-cache
 //!    feature is `w7-fake-stream-cache`, still blocked).
+//! 5. Free-tier (or unauthenticated) callers do NOT get L2 hits or writes
+//!    even when `state.l2` is configured — L2 is a paid-tier entitlement.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -19,13 +21,15 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
 use tower::util::ServiceExt;
 
+use tt_auth::ApiKeyContext;
 use tt_cache::{CacheEntry, EmbeddingProvider, InMemoryL2Cache};
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
     messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
     pricing::Capability,
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
-    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
+    CallerTier, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError,
+    RequestContext, Usage,
 };
 use uuid::Uuid;
 
@@ -150,6 +154,30 @@ fn chat_request(model: &str, stream: bool) -> Request<Body> {
         .unwrap()
 }
 
+/// Build a chat request pre-stamped with an `ApiKeyContext` carrying the given
+/// tier. Because the auth middleware only inserts `ApiKeyContext` when a valid
+/// `tt_live_*` token is present (and no key store is wired in these tests), a
+/// pre-inserted extension survives the middleware pass-through intact.
+fn chat_request_with_tier(model: &str, stream: bool, tier: Option<CallerTier>) -> Request<Body> {
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "hello there" }],
+        "stream": stream,
+    });
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    req.extensions_mut().insert(ApiKeyContext {
+        key_id: Uuid::nil(),
+        org_id: Uuid::nil(),
+        tier,
+    });
+    req
+}
+
 #[tokio::test]
 async fn no_l2_configured_yields_cache_none_header() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -259,8 +287,9 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
     let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.99));
     let app = build_router(state);
 
+    // L2 lookup is paid-tier only; inject a Pro-tier context so the hit fires.
     let response = app
-        .oneshot(chat_request("counting-1", false))
+        .oneshot(chat_request_with_tier("counting-1", false, Some(CallerTier::Pro)))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -353,4 +382,97 @@ async fn streaming_request_bypasses_l2_cache() {
     );
     // Provider was called for the streaming path.
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+/// Regression test: a Free-tier (or unauthenticated) caller must NOT get an
+/// L2 hit even when the L2 store is configured and contains a matching entry.
+/// L2 is a paid-tier entitlement (`BudgetLimits.l2_cache`).
+///
+/// Setup mirrors `l2_hit_serves_cached_response_without_provider_call` but
+/// with tier=None (unauthenticated dev request). The provider must be called
+/// (L2 read is skipped) and the response body must come from the provider, NOT
+/// from the cached entry.
+#[tokio::test]
+async fn free_tier_caller_skips_l2_lookup_and_write() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let cache = Arc::new(InMemoryL2Cache::new());
+
+    // Prime the L2 cache with an entry that would hit at similarity 1.0.
+    let primed = ChatCompletionResponse {
+        id: "chatcmpl-should-not-serve".into(),
+        object: "chat.completion".into(),
+        created: 0,
+        model: "counting-1".into(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message::Assistant {
+                content: Some(MessageContent::Text("should not appear".into())),
+                tool_calls: vec![],
+                name: None,
+            },
+            finish_reason: Some("stop".into()),
+        }],
+        usage: Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        },
+    };
+    let entry_vec = vec![1.0; 1536];
+    let entry = CacheEntry {
+        id: Uuid::now_v7(),
+        org_id: Uuid::nil(), // matches the nil org_id of an unauthenticated request
+        embedding: entry_vec.clone(),
+        response: serde_json::to_vec(&primed).unwrap(),
+        model: "counting-1".into(),
+        embedding_model: "fixed-embed".into(),
+        input_tokens: 100,
+        output_tokens: 50,
+        hit_count: 0,
+        created_at: Utc::now(),
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+    };
+    {
+        use tt_cache::L2Cache;
+        cache.insert(entry).await.unwrap();
+    }
+
+    let embedder = Arc::new(FixedEmbedder { vec: entry_vec });
+    // Low threshold (0.5) so anything would hit — but the entitlement gate
+    // must block the lookup before it even reaches the store.
+    let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.5));
+    let app = build_router(state);
+
+    // No tier injected → l2_allowed = false → L2 read must be skipped.
+    let response = app
+        .oneshot(chat_request("counting-1", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Provider must have been called (L2 did not short-circuit it).
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "provider must be called when L2 is blocked by Free/None tier"
+    );
+
+    // Response must be the live provider body, NOT the cached entry.
+    let bytes = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_ne!(
+        body["id"], "chatcmpl-should-not-serve",
+        "Free-tier caller must NOT receive the L2-cached response"
+    );
+    // The provider stub returns id "chatcmpl-live".
+    assert_eq!(
+        body["id"], "chatcmpl-live",
+        "Free-tier caller must get the live provider response"
+    );
 }

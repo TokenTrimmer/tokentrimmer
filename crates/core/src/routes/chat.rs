@@ -357,6 +357,17 @@ pub async fn handler(
         Some(c) => (c.org_id, c.key_id, c.tier),
         None => (Uuid::nil(), Uuid::nil(), None),
     };
+    // L2 semantic cache is a paid-tier entitlement (BudgetLimits.l2_cache:
+    // false for Free, true for Pro/Team/Scale; internal orgs resolve to Scale).
+    // Unauthenticated/dev (tier None) is treated as Free → no L2.
+    let l2_allowed = matches!(
+        caller_tier,
+        Some(
+            tt_shared::CallerTier::Pro
+                | tt_shared::CallerTier::Team
+                | tt_shared::CallerTier::Scale
+        )
+    );
     let credentials = resolve_credentials(&state, org_id, provider.id(), &raw_bearer).await;
 
     let ctx = RequestContext {
@@ -707,7 +718,7 @@ pub async fn handler(
 
         // 3b. Try L2 semantic cache lookup before dispatching to the provider.
         //     Gated on cache eligibility + tt_extras.cache mode.
-        if cache_behavior.do_lookup {
+        if cache_behavior.do_lookup && l2_allowed {
             if let Some(l2) = state.l2.as_ref() {
                 if let Some(query_text) = l2_context_text(&req) {
                     if let Ok(query_vec) = l2.embedder.embed(&query_text).await {
@@ -1031,7 +1042,7 @@ pub async fn handler(
         }
 
         // 3f. Best-effort L2 insert. Same gate as L1.
-        if cache_behavior.do_insert && !response_has_tools {
+        if cache_behavior.do_insert && !response_has_tools && l2_allowed {
             if let Some(l2) = state.l2.as_ref() {
                 if let Some(query_text) = l2_context_text(&req) {
                     let l2_provider_id = provider_id.clone();
