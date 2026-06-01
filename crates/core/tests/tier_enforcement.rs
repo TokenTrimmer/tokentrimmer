@@ -371,3 +371,81 @@ async fn tier_cache_serves_second_request_without_re_querying() {
         "inner resolver must not be called again on cache hit (was {count_after_r1} → {count_after_r2})"
     );
 }
+
+/// (e, SEAM) `spend_sink()` and the auth budget pre-flight use the SAME
+/// enforcer state.
+///
+/// This test proves the seam: the [`SpendSink`] that the chat handler records
+/// spend into is the one the auth middleware reads for the pre-flight check.
+/// If a future refactor makes them diverge (e.g. `spend_sink()` returns a
+/// different `DynamicBudgetEnforcer` than `state.dynamic_budget`), this test
+/// fails.
+///
+/// Steps:
+///   1. Build an AppState with a FixedTierResolver returning `monthly_cap_usd:
+///      Some(1.0)` (only the USD cap is in play; rpm/request caps are None).
+///   2. Record >$1 of spend via `state.spend_sink().record(org, 2.0, now)`.
+///   3. Drive an HTTP request for that org through the router.
+///   4. Assert 429 `budget_exceeded`.
+#[tokio::test]
+async fn spend_sink_and_auth_share_same_enforcer_seam() {
+    use tt_core::budget::{BudgetLimits, SpendSink};
+    use tt_core::tier_resolver::ResolvedTier;
+    use tt_shared::CallerTier;
+
+    let store = InMemoryKeyStore::new();
+    let org = Uuid::now_v7();
+    let key = issue_key_for(&store, org).await;
+
+    // Resolver returns a $1/month USD cap with no rpm or monthly-request limit
+    // so only the spend cap can fire.
+    struct CapResolver;
+    #[async_trait]
+    impl TierResolver for CapResolver {
+        async fn resolve(&self, _org_id: Uuid) -> Result<ResolvedTier, TierResolverError> {
+            Ok(ResolvedTier {
+                caller_tier: CallerTier::Pro,
+                limits: BudgetLimits {
+                    monthly_cap_usd: Some(1.0),
+                    max_requests_per_min: None,
+                    monthly_request_cap: None,
+                    l2_cache: true,
+                },
+            })
+        }
+    }
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(EchoProvider));
+    let state = AppState::new(registry)
+        .with_tier_resolver(Arc::new(CapResolver) as Arc<dyn TierResolver>)
+        .with_key_store(Arc::new(store));
+
+    // Record $2 of spend via spend_sink() — the spend that the auth middleware
+    // will check against when it reads dynamic_budget for this org.
+    let now = chrono::Utc::now();
+    assert!(
+        matches!(state.spend_sink(), SpendSink::Dynamic(_)),
+        "expected SpendSink::Dynamic when tier_resolver is wired"
+    );
+    state.spend_sink().record(org, 2.0, now);
+
+    // Build the router AFTER recording spend so the router's clone of state
+    // shares the same Arc<DynamicBudgetEnforcer>.
+    let app = build_router(state);
+
+    let resp = app.oneshot(chat_request(&key)).await.expect("response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "org over spend cap must get 429"
+    );
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 8192)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+    assert_eq!(
+        body["error"]["type"], "budget_exceeded",
+        "should be budget_exceeded (spend cap), got: {body}"
+    );
+}

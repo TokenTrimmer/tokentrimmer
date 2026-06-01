@@ -9,6 +9,9 @@
 //!    feature is `w7-fake-stream-cache`, still blocked).
 //! 5. Free-tier (or unauthenticated) callers do NOT get L2 hits or writes
 //!    even when `state.l2` is configured — L2 is a paid-tier entitlement.
+//! 6. Free-tier STREAMING completions do NOT write into L2 even when L2 is
+//!    wired — `stream_cache_insert.l2` must be None for Free/None callers
+//!    (rv-streaming-l2-tier-gate).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,7 +25,7 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 use tt_auth::ApiKeyContext;
-use tt_cache::{CacheEntry, EmbeddingProvider, InMemoryL2Cache};
+use tt_cache::{CacheEntry, EmbeddingProvider, InMemoryL2Cache, L2Cache};
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
     messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
@@ -474,5 +477,68 @@ async fn free_tier_caller_skips_l2_lookup_and_write() {
     assert_eq!(
         body["id"], "chatcmpl-live",
         "Free-tier caller must get the live provider response"
+    );
+}
+
+/// Regression: a Free-tier (or unauthenticated) STREAMING completion must NOT
+/// write into L2 after stream completion.
+///
+/// Before the fix, `stream_cache_insert.l2` was populated unconditionally for
+/// any streaming miss when `state.l2.is_some()`, so the fire-and-forget
+/// `tokio::spawn` in `sse.rs` wrote to L2 regardless of tier.  After the fix,
+/// `l2_for_insert` is `None` when `!l2_allowed`, so no L2 spawn occurs.
+///
+/// The assertion: after the SSE response body is fully drained and a brief
+/// yield window has passed, the L2 store for the request's org must remain
+/// empty (lookup returns None).
+#[tokio::test]
+async fn free_tier_streaming_does_not_write_l2() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let cache = Arc::new(InMemoryL2Cache::new());
+    let embedder = Arc::new(FixedEmbedder {
+        vec: vec![1.0; 1536],
+    });
+    // Wire L2 with a very low threshold so any entry would hit.
+    let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.0));
+    let app = build_router(state);
+
+    // No tier injected (tier=None → l2_allowed=false).
+    let response = app
+        .oneshot(chat_request("counting-1", true))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Fully drain the SSE body so the stream completes and any background
+    // spawn triggered by the guard drop has a chance to run.
+    let _body_bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+
+    // Yield to the executor a few times to let any spawned futures settle.
+    // The fire-and-forget insert path in sse.rs uses `tokio::spawn`, so
+    // it runs on the same single-threaded test runtime; a single yield is
+    // sufficient, but we give it a few to be safe.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Assert the L2 store has no entry for the nil org (the unauthenticated
+    // org_id used by requests with no ApiKeyContext).
+    let hit = cache
+        .lookup(
+            Uuid::nil(),
+            &vec![1.0f32; 1536],
+            0.0,
+            "counting-1",
+            "fixed-embed",
+        )
+        .await
+        .unwrap();
+    assert!(
+        hit.is_none(),
+        "Free-tier streaming completion must NOT write to L2; found an entry: {hit:?}"
     );
 }

@@ -554,11 +554,17 @@ pub async fn handler(
         // The guard closure uses the cost_usd/baseline_cost_usd it already
         // computes for the request_logs row, so the L1Entry envelope carries
         // accurate savings figures without repeating the pricing calculation.
+        //
+        // L2 tier gate: the L2 portion is gated on `l2_allowed` (Pro/Team/Scale
+        // only). Free/None callers write to L1 only. `sse.rs` already no-ops the
+        // L2 insert when `ins.l2` is None, so setting it to None here is the
+        // correct minimal fix (rv-streaming-l2-tier-gate).
         let stream_cache_insert = if cache_behavior.do_insert
             && (state.l1.is_some() || state.l2.is_some())
         {
-            let l2_query_text = state
-                .l2
+            // Only populate the L2 handle and query text for paid-tier callers.
+            let l2_for_insert = if l2_allowed { state.l2.clone() } else { None };
+            let l2_query_text = l2_for_insert
                 .as_ref()
                 .and_then(|_| tt_cache::l2_context_text(&req));
             let ttl = effective_ttl_secs(
@@ -572,7 +578,7 @@ pub async fn handler(
             );
             Some(CacheInsertContext {
                 l1: state.l1.clone(),
-                l2: state.l2.clone(),
+                l2: l2_for_insert,
                 l1_key: l1_key.clone().unwrap_or_default(),
                 l2_query_text,
                 ttl_secs: ttl,

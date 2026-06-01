@@ -43,15 +43,19 @@
 //!
 //! ## Size bound
 //!
-//! The cache is hard-capped at [`MAX_ENTRIES`] entries to prevent unbounded memory
+//! The cache is soft-capped at [`MAX_ENTRIES`] entries to prevent unbounded memory
 //! growth from token-flood attacks (distinct invalid tokens would otherwise create
 //! permanent negative entries). At ~64 B per entry, 100 000 entries ≈ 6 MB ceiling.
 //! Because argon2 is ~100 ms/call, filling 50 000 entries requires ~85 CPU-minutes,
-//! which is far slower than the cache can be filled via HTTP — the hard cap is a
-//! safety net, not the primary throttle.
+//! which is far slower than the cache can be filled via HTTP — the cap is a safety
+//! net, not the primary throttle.  Under concurrent inserts the cap is best-effort:
+//! `len()` is a non-atomic per-shard sum, so it may transiently overshoot by the
+//! number of concurrent inserters (bounded by in-flight auth requests).
 //!
-//! On every insert, if the map has reached [`SWEEP_THRESHOLD`] entries, all expired
-//! entries are purged first (opportunistic sweep). If the map is still at or above
+//! When the map reaches [`SWEEP_THRESHOLD`] entries, a full O(n) `retain` sweep is
+//! run on every subsequent insert until enough entries expire.  This is bounded in
+//! practice because every insert is gated behind the ~100 ms argon2 verify in
+//! `auth.rs`, which dominates the scan cost.  If the map is still at or above
 //! [`MAX_ENTRIES`] after the sweep, the new entry is silently dropped — the cache is
 //! best-effort; a cold miss falls back to a full argon2 verify, which is the
 //! pre-cache behaviour.
@@ -71,13 +75,20 @@ pub const POSITIVE_TTL_SECS: u64 = 60;
 /// failure entry expires.
 pub const NEGATIVE_TTL_SECS: u64 = 10;
 
-/// Hard upper bound on cache entries. Inserts beyond this limit are silently
+/// Soft upper bound on cache entries. Inserts beyond this limit are silently
 /// dropped (best-effort cache). At ~64 B/entry this is roughly a 6 MB ceiling.
+///
+/// **Concurrency note:** `len()` is a non-atomic per-shard sum computed by
+/// summing across DashMap shards under per-shard read locks.  Under concurrent
+/// inserts the cap is best-effort and may transiently overshoot by the number
+/// of concurrent inserters (bounded by in-flight auth requests).
 pub const MAX_ENTRIES: usize = 100_000;
 
-/// When the map reaches this size, a full sweep of expired entries is run before
-/// each insert. The sweep pays its cost once per SWEEP_THRESHOLD insertions in the
-/// worst case, amortising the O(n) scan.
+/// When the map reaches this size, a full O(n) `retain` sweep is run on every
+/// subsequent insert until enough entries expire.  While `len() >= SWEEP_THRESHOLD`,
+/// each insert runs the sweep — the O(n) scan is bounded in practice because every
+/// insert is gated behind a ~100 ms argon2 verify in `auth.rs`, which dominates
+/// the scan cost and limits concurrent inserters.
 pub const SWEEP_THRESHOLD: usize = 50_000;
 
 /// A single entry in the verify cache.
@@ -266,10 +277,11 @@ impl<C: Clock> KeyVerifyCache<C> {
         self.map.insert(hash, CacheEntry::Failure { inserted_at: now });
     }
 
-    /// Sweep expired entries and check the hard cap.
+    /// Sweep expired entries and check the soft cap.
     ///
     /// Returns `true` if the caller should proceed with the insert, `false` if
-    /// the cache is full and the entry should be dropped (best-effort cache).
+    /// the cache is at or above [`MAX_ENTRIES`] after the sweep and the entry
+    /// should be dropped (best-effort cache).
     fn maybe_sweep_and_cap(&self, now: Instant) -> bool {
         if self.map.len() >= SWEEP_THRESHOLD {
             let pos_ttl = self.positive_ttl;
