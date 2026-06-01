@@ -34,7 +34,7 @@ use tt_shared::{
 use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
 use tt_tokenize;
 
-use crate::budget::BudgetEnforcer;
+use crate::budget::SpendSink;
 use crate::state::{L1Config, L2Config};
 
 // ─── PartialUsage ─────────────────────────────────────────────────────────────
@@ -249,9 +249,10 @@ pub struct StreamLogContext {
     pub route_id: Option<Uuid>,
     pub tag: Option<String>,
     pub request_started: Instant,
-    /// Optional budget enforcer — realized streamed spend is recorded against
-    /// the org on stream completion/abort (identified orgs only).
-    pub budget: Option<std::sync::Arc<dyn BudgetEnforcer>>,
+    /// Spend sink — realized streamed spend is recorded through this into the
+    /// same enforcer the auth pre-flight check uses (dynamic on tier-aware path,
+    /// global enforcer otherwise, no-op when neither is wired).
+    pub spend_sink: SpendSink,
     /// Provider surcharge multiplier (e.g. OpenRouter BYOK = 1.05, others = 1.0).
     /// Applied to both cost and baseline on the streaming path, matching the
     /// non-streaming path (§2.13).
@@ -449,7 +450,7 @@ pub fn stream_response(
             let tag = ctx.tag.clone();
             let request_started = ctx.request_started;
             let log_trace_id = ctx.trace_id;
-            let budget = ctx.budget.clone();
+            let spend_sink = ctx.spend_sink.clone();
             let cache_insert = ctx.cache_insert;
 
             let guard = DropGuard::new(move || {
@@ -473,12 +474,8 @@ pub fn stream_response(
                     compute_streaming_baseline(&usage, baseline_pricing.as_ref())
                         * fee_multiplier;
 
-                // Record realized streamed spend against the org's budget.
-                if let Some(b) = &budget {
-                    if org_id != Uuid::nil() {
-                        b.record(org_id, cost_usd, Utc::now());
-                    }
-                }
+                // Record realized streamed spend into the same enforcer the check uses.
+                spend_sink.record(org_id, cost_usd, Utc::now());
 
                 let row = RequestLogRow {
                     id: Uuid::now_v7(),

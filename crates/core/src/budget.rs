@@ -257,6 +257,31 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
     }
 }
 
+/// Selects which budget enforcer realized spend is recorded into, mirroring the
+/// auth pre-flight check's selection (tier-aware → dynamic_budget; else the global
+/// enforcer; else nothing). This keeps the spend cap honest: the check reads the
+/// same `OrgState.spend_usd` the record writes.
+#[derive(Clone)]
+pub enum SpendSink {
+    Dynamic(std::sync::Arc<DynamicBudgetEnforcer>),
+    Global(std::sync::Arc<dyn BudgetEnforcer>),
+    None,
+}
+
+impl SpendSink {
+    /// Record realized `cost_usd` for `org_id` (no-op for the nil org or `None` sink).
+    pub fn record(&self, org_id: Uuid, cost_usd: f64, now: DateTime<Utc>) {
+        if org_id == Uuid::nil() {
+            return;
+        }
+        match self {
+            SpendSink::Dynamic(d) => d.record(org_id, cost_usd, now),
+            SpendSink::Global(g) => g.record(org_id, cost_usd, now),
+            SpendSink::None => {}
+        }
+    }
+}
+
 /// Budget enforcer where each org's [`BudgetLimits`] are resolved at check
 /// time from an external source (the tier resolver). Used by the auth
 /// middleware when `AppState.tier_resolver` is set.
@@ -650,6 +675,68 @@ mod tests {
             e2.check(org2, last_ts),
             BudgetDecision::DenyMonthlyRequests,
             "Free org at 10k cap must be denied (with rpm enabled)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SpendSink: record→check land on the same state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spend_sink_dynamic_records_make_cap_trip() {
+        // Build a DynamicBudgetEnforcer, wrap in SpendSink::Dynamic, record
+        // enough spend to exceed a $1 monthly cap, then assert check_with_limits
+        // returns DenySpend. Proves record→check share the same OrgState.
+        let enforcer = std::sync::Arc::new(DynamicBudgetEnforcer::new());
+        let sink = SpendSink::Dynamic(enforcer.clone());
+        let org = Uuid::from_u128(42);
+        let limits = BudgetLimits {
+            monthly_cap_usd: Some(1.0),
+            max_requests_per_min: None,
+            monthly_request_cap: None,
+            l2_cache: false,
+        };
+        let now = t(2026, 6, 1, 0, 0, 0);
+
+        // Before recording: allowed.
+        assert!(
+            enforcer.check_with_limits(org, &limits, now).is_allowed(),
+            "should be allowed before any spend"
+        );
+
+        // Record spend that exceeds the cap.
+        sink.record(org, 1.5, now);
+
+        // After recording: check on the same enforcer must deny.
+        assert_eq!(
+            enforcer.check_with_limits(org, &limits, now),
+            BudgetDecision::DenySpend,
+            "should deny after spend exceeds monthly cap"
+        );
+    }
+
+    #[test]
+    fn spend_sink_nil_org_is_noop() {
+        // SpendSink::Dynamic with a nil org_id must not record anything —
+        // a real org's check_with_limits must still Allow afterward.
+        let enforcer = std::sync::Arc::new(DynamicBudgetEnforcer::new());
+        let sink = SpendSink::Dynamic(enforcer.clone());
+        let limits = BudgetLimits {
+            monthly_cap_usd: Some(1.0),
+            max_requests_per_min: None,
+            monthly_request_cap: None,
+            l2_cache: false,
+        };
+        let now = t(2026, 6, 1, 0, 0, 0);
+        let real_org = Uuid::from_u128(99);
+
+        // Record against nil — should be a no-op.
+        sink.record(Uuid::nil(), 5.0, now);
+
+        // A real org with no spend should still be allowed (nil spend not recorded).
+        assert!(
+            enforcer.check_with_limits(real_org, &limits, now).is_allowed(),
+            "nil org record must not affect real org"
         );
     }
 

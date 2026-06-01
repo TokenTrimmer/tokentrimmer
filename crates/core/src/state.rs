@@ -224,4 +224,67 @@ impl AppState {
         self.tier_resolver = Some(resolver);
         self
     }
+
+    /// The enforcer realized spend must be recorded into — the SAME selection the
+    /// auth pre-flight budget check uses, so `monthly_cap_usd` actually trips.
+    pub fn spend_sink(&self) -> crate::budget::SpendSink {
+        if self.tier_resolver.is_some() {
+            crate::budget::SpendSink::Dynamic(self.dynamic_budget.clone())
+        } else if let Some(b) = self.budget.as_ref() {
+            crate::budget::SpendSink::Global(b.clone())
+        } else {
+            crate::budget::SpendSink::None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::{BudgetEnforcer, BudgetLimits, InMemoryBudgetEnforcer, SpendSink};
+    use crate::tier_resolver::{ResolvedTier, TierResolver, TierResolverError};
+    use async_trait::async_trait;
+    use uuid::Uuid;
+
+    struct StubTierResolver;
+
+    #[async_trait]
+    impl TierResolver for StubTierResolver {
+        async fn resolve(&self, _org_id: Uuid) -> Result<ResolvedTier, TierResolverError> {
+            Ok(ResolvedTier::free_default())
+        }
+    }
+
+    /// spend_sink() returns Dynamic when tier_resolver is set.
+    #[test]
+    fn spend_sink_is_dynamic_when_tier_resolver_set() {
+        let state = AppState::with_default_providers()
+            .with_tier_resolver(Arc::new(StubTierResolver) as Arc<dyn TierResolver>);
+        assert!(
+            matches!(state.spend_sink(), SpendSink::Dynamic(_)),
+            "spend_sink must be Dynamic when tier_resolver is set"
+        );
+    }
+
+    /// spend_sink() returns Global when only the legacy budget enforcer is set.
+    #[test]
+    fn spend_sink_is_global_when_only_budget_set() {
+        let enforcer: Arc<dyn BudgetEnforcer> =
+            Arc::new(InMemoryBudgetEnforcer::new(BudgetLimits::default()));
+        let state = AppState::with_default_providers().with_budget(enforcer);
+        assert!(
+            matches!(state.spend_sink(), SpendSink::Global(_)),
+            "spend_sink must be Global when only budget is set"
+        );
+    }
+
+    /// spend_sink() returns None when neither tier_resolver nor budget is set.
+    #[test]
+    fn spend_sink_is_none_when_nothing_wired() {
+        let state = AppState::with_default_providers();
+        assert!(
+            matches!(state.spend_sink(), SpendSink::None),
+            "spend_sink must be None when no enforcer is wired"
+        );
+    }
 }
