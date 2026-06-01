@@ -40,6 +40,21 @@
 //!
 //! The cache accepts a `now_fn: impl Fn() -> std::time::Instant` at construction
 //! time so tests can advance time deterministically without `thread::sleep`.
+//!
+//! ## Size bound
+//!
+//! The cache is hard-capped at [`MAX_ENTRIES`] entries to prevent unbounded memory
+//! growth from token-flood attacks (distinct invalid tokens would otherwise create
+//! permanent negative entries). At ~64 B per entry, 100 000 entries ≈ 6 MB ceiling.
+//! Because argon2 is ~100 ms/call, filling 50 000 entries requires ~85 CPU-minutes,
+//! which is far slower than the cache can be filled via HTTP — the hard cap is a
+//! safety net, not the primary throttle.
+//!
+//! On every insert, if the map has reached [`SWEEP_THRESHOLD`] entries, all expired
+//! entries are purged first (opportunistic sweep). If the map is still at or above
+//! [`MAX_ENTRIES`] after the sweep, the new entry is silently dropped — the cache is
+//! best-effort; a cold miss falls back to a full argon2 verify, which is the
+//! pre-cache behaviour.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,6 +70,15 @@ pub const POSITIVE_TTL_SECS: u64 = 60;
 /// Kept short so a newly-issued or rotated key is usable quickly after a stale
 /// failure entry expires.
 pub const NEGATIVE_TTL_SECS: u64 = 10;
+
+/// Hard upper bound on cache entries. Inserts beyond this limit are silently
+/// dropped (best-effort cache). At ~64 B/entry this is roughly a 6 MB ceiling.
+pub const MAX_ENTRIES: usize = 100_000;
+
+/// When the map reaches this size, a full sweep of expired entries is run before
+/// each insert. The sweep pays its cost once per SWEEP_THRESHOLD insertions in the
+/// worst case, amortising the O(n) scan.
+pub const SWEEP_THRESHOLD: usize = 50_000;
 
 /// A single entry in the verify cache.
 #[derive(Clone, Debug)]
@@ -74,6 +98,15 @@ impl CacheEntry {
             CacheEntry::Hit { inserted_at, .. } | CacheEntry::Failure { inserted_at } => {
                 *inserted_at
             }
+        }
+    }
+
+    /// Returns `true` if this entry has outlived its TTL as of `now`.
+    fn is_expired(&self, now: Instant, positive_ttl: Duration, negative_ttl: Duration) -> bool {
+        let age = now.duration_since(self.inserted_at());
+        match self {
+            CacheEntry::Hit { .. } => age > positive_ttl,
+            CacheEntry::Failure { .. } => age > negative_ttl,
         }
     }
 }
@@ -179,7 +212,9 @@ impl<C: Clock> KeyVerifyCache<C> {
 
     /// Look up the cache for a given token hash.
     ///
-    /// Expired entries are treated as misses (and lazily removed).
+    /// Fresh entries are returned immediately. Expired entries are removed from the
+    /// map (lazy eviction) and reported as a Miss. The DashMap read guard is dropped
+    /// before calling `remove` to avoid holding a shard lock across two operations.
     pub fn get(&self, hash: &TokenHash) -> CacheLookup {
         let now = self.clock.now();
         if let Some(entry) = self.map.get(hash) {
@@ -189,31 +224,59 @@ impl<C: Clock> KeyVerifyCache<C> {
                     if age <= self.positive_ttl {
                         return CacheLookup::Hit(ctx.clone());
                     }
-                    // Expired — fall through to Miss (lazy eviction below)
+                    // Expired — drop the read guard before removing (DashMap
+                    // deadlock safety: never hold a shard ref across remove).
                 }
                 CacheEntry::Failure { .. } => {
                     if age <= self.negative_ttl {
                         return CacheLookup::Failure;
                     }
+                    // Expired — drop the read guard before removing.
                 }
             }
+        } else {
+            return CacheLookup::Miss;
         }
+        // Entry was found but is expired: remove it, then report Miss.
+        self.map.remove(hash);
         CacheLookup::Miss
     }
 
     /// Insert a successful verification result.
+    ///
+    /// Runs an opportunistic sweep when the map is large, and skips the insert
+    /// entirely if the map is still at [`MAX_ENTRIES`] after the sweep.
     pub fn insert_hit(&self, hash: TokenHash, ctx: ApiKeyContext) {
-        let inserted_at = self.clock.now();
-        self.map.insert(
-            hash,
-            CacheEntry::Hit { ctx, inserted_at },
-        );
+        let now = self.clock.now();
+        if !self.maybe_sweep_and_cap(now) {
+            return;
+        }
+        self.map.insert(hash, CacheEntry::Hit { ctx, inserted_at: now });
     }
 
     /// Insert a failed verification (wrong secret, not found, revoked).
+    ///
+    /// Runs an opportunistic sweep when the map is large, and skips the insert
+    /// entirely if the map is still at [`MAX_ENTRIES`] after the sweep.
     pub fn insert_failure(&self, hash: TokenHash) {
-        let inserted_at = self.clock.now();
-        self.map.insert(hash, CacheEntry::Failure { inserted_at });
+        let now = self.clock.now();
+        if !self.maybe_sweep_and_cap(now) {
+            return;
+        }
+        self.map.insert(hash, CacheEntry::Failure { inserted_at: now });
+    }
+
+    /// Sweep expired entries and check the hard cap.
+    ///
+    /// Returns `true` if the caller should proceed with the insert, `false` if
+    /// the cache is full and the entry should be dropped (best-effort cache).
+    fn maybe_sweep_and_cap(&self, now: Instant) -> bool {
+        if self.map.len() >= SWEEP_THRESHOLD {
+            let pos_ttl = self.positive_ttl;
+            let neg_ttl = self.negative_ttl;
+            self.map.retain(|_, e| !e.is_expired(now, pos_ttl, neg_ttl));
+        }
+        self.map.len() < MAX_ENTRIES
     }
 
     /// Remove a specific entry — used after explicit revocation to shorten
@@ -369,5 +432,87 @@ mod tests {
         let h1 = hash_token("tt_live_aaa");
         let h2 = hash_token("tt_live_bbb");
         assert_ne!(h1, h2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy eviction + size bounding (DoS resistance)
+    // -----------------------------------------------------------------------
+
+    /// Expired entries must be removed from the map on the next `get()` call
+    /// (lazy eviction). After expiry + get, `len()` must be 0.
+    #[test]
+    fn expired_entry_removed_on_get() {
+        let (cache, clock) = cache_with_fake_clock();
+        let hash = hash_token("tt_live_lazy_evict");
+        cache.insert_failure(hash);
+        assert_eq!(cache.len(), 1, "entry should be present before expiry");
+
+        // Advance past negative TTL so the entry is expired.
+        clock.advance(Duration::from_secs(NEGATIVE_TTL_SECS + 1));
+
+        let result = cache.get(&hash);
+        assert!(
+            matches!(result, CacheLookup::Miss),
+            "expired entry must report Miss, got {result:?}"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "expired entry must be removed from the map on get()"
+        );
+    }
+
+    /// Inserting more than MAX_ENTRIES distinct failure hashes (with no clock
+    /// advancement so none expire) must not grow the map past MAX_ENTRIES.
+    #[test]
+    fn insert_is_bounded_under_token_flood() {
+        let (cache, _clock) = cache_with_fake_clock();
+
+        // Use a smaller ceiling for this test so it runs fast, by directly
+        // exercising the real MAX_ENTRIES constant with a fixed extra.
+        // We insert MAX_ENTRIES + 500 distinct tokens.
+        let flood = MAX_ENTRIES + 500;
+        for i in 0..flood {
+            // Each token string is unique → each blake3 hash is unique.
+            let hash = hash_token(&format!("tt_live_flood_{i:09}"));
+            cache.insert_failure(hash);
+        }
+
+        assert!(
+            cache.len() <= MAX_ENTRIES,
+            "cache grew to {} entries, expected <= {MAX_ENTRIES}",
+            cache.len()
+        );
+    }
+
+    /// After filling the map past SWEEP_THRESHOLD with entries that have all
+    /// expired, a single further insert should trigger a sweep that reclaims the
+    /// expired entries, leaving the map very small.
+    #[test]
+    fn sweep_reclaims_expired_on_insert() {
+        let (cache, clock) = cache_with_fake_clock();
+
+        // Fill just past the sweep threshold with failure entries.
+        let fill = SWEEP_THRESHOLD + 1;
+        for i in 0..fill {
+            let hash = hash_token(&format!("tt_live_sweep_{i:09}"));
+            cache.insert_failure(hash);
+        }
+        assert!(cache.len() >= SWEEP_THRESHOLD, "pre-condition: map must be at/above threshold");
+
+        // Advance clock so every entry is expired.
+        clock.advance(Duration::from_secs(NEGATIVE_TTL_SECS + 1));
+
+        // One more insert triggers the sweep.
+        let trigger_hash = hash_token("tt_live_sweep_trigger");
+        cache.insert_failure(trigger_hash);
+
+        // All the old entries were expired and should have been reclaimed.
+        // Only the newly inserted entry remains.
+        assert!(
+            cache.len() <= 1,
+            "sweep should have reclaimed all expired entries; len = {}",
+            cache.len()
+        );
     }
 }
