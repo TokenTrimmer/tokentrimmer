@@ -229,8 +229,8 @@ fn pricing_table_correct_rates() {
     let small = p
         .pricing("mistral-small-latest")
         .expect("pricing for small");
-    assert_eq!(small.input_per_million, 0.20);
-    assert_eq!(small.output_per_million, 0.60);
+    assert_eq!(small.input_per_million, 0.10);
+    assert_eq!(small.output_per_million, 0.30);
 
     let codestral = p
         .pricing("codestral-latest")

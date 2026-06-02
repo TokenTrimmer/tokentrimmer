@@ -589,9 +589,10 @@ fn pricing_values_match_spec() {
     assert_eq!(gpt55.cached_input_per_million, Some(0.50));
 
     let o3 = p.pricing("o3").expect("o3 pricing");
-    assert_eq!(o3.input_per_million, 60.00);
-    assert_eq!(o3.output_per_million, 240.00);
-    assert_eq!(o3.cached_input_per_million, Some(15.00));
+    // o3 list price was cut to $2/$8/$0.50 (2026-05-31 catalog entry).
+    assert_eq!(o3.input_per_million, 2.00);
+    assert_eq!(o3.output_per_million, 8.00);
+    assert_eq!(o3.cached_input_per_million, Some(0.50));
 
     let mini = p.pricing("gpt-4o-mini").expect("gpt-4o-mini pricing");
     assert_eq!(mini.input_per_million, 0.15);
