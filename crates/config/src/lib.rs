@@ -97,11 +97,19 @@ fn opt(var: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes the tests below that mutate the process-global `PORT` env
+    /// var. Rust runs a crate's tests in one process in parallel, so without
+    /// this they race — one clears `PORT` while the other sets it to a bad
+    /// value, making `defaults_when_only_required_missing` see the bad value.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// `from_env` is allowed to be called in tests that don't set anything;
     /// must return defaults rather than error.
     #[test]
     fn defaults_when_only_required_missing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // PORT may already be set by the test runner; clear it inside this
         // test only.
         let prev_port = std::env::var("PORT").ok();
@@ -117,6 +125,7 @@ mod tests {
 
     #[test]
     fn invalid_port_returns_parse_error() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PORT", "not-a-number");
         let err = Config::from_env().expect_err("invalid port must fail");
         match err {
