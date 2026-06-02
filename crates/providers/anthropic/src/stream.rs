@@ -38,6 +38,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::pin::Pin;
 use tt_shared::{
+    filter_extra_headers,
     messages::{ChunkChoice, ChunkDelta, ToolCall, ToolCallFunction},
     ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext, Usage,
 };
@@ -138,6 +139,10 @@ struct StreamState {
     created: i64,
     /// Input tokens from `message_start`.
     input_tokens: u64,
+    /// Prompt-cache read tokens from `message_start` (billed at the cached rate).
+    cache_read_input_tokens: u64,
+    /// Prompt-cache creation tokens from `message_start`.
+    cache_creation_input_tokens: Option<u64>,
     /// Output tokens accumulated from `message_delta`.
     output_tokens: u64,
     /// The tool call currently being assembled (index → partial).
@@ -173,9 +178,9 @@ pub async fn stream_chat_completion(
     req: ChatCompletionRequest,
     ctx: &RequestContext,
 ) -> Result<ChunkStream, ProviderError> {
-    let url = format!("{}/v1/messages", base_url);
+    let url = format!("{base_url}/v1/messages");
     let api_key = ctx.credentials.api_key.expose().to_string();
-    let extra_headers: Vec<(String, String)> = ctx.credentials.extra_headers.clone();
+    let extra_headers: Vec<(String, String)> = filter_extra_headers(&ctx.credentials.extra_headers);
 
     // Translate to the Anthropic wire shape with stream = true.
     let mut translated = translate::translate_request(req)?;
@@ -246,9 +251,9 @@ where
             match next_item {
                 Some(Ok(chunk)) => {
                     buffer.extend_from_slice(&chunk);
-                    // Process all complete SSE events delimited by \n\n.
-                    while let Some(event_end) = find_double_newline(&buffer) {
-                        let event_bytes = buffer.drain(..event_end + 2).collect::<Vec<_>>();
+                    // Process all complete SSE events (delimited by \n\n or \r\n\r\n).
+                    while let Some((event_end, sep_len)) = find_event_boundary(&buffer) {
+                        let event_bytes = buffer.drain(..event_end + sep_len).collect::<Vec<_>>();
                         match process_sse_event(&event_bytes, &mut state) {
                             SseOutcome::Chunk(c) => yield Ok(c),
                             SseOutcome::Err(e) => yield Err(e),
@@ -305,9 +310,15 @@ fn process_sse_event(event_bytes: &[u8], state: &mut Option<StreamState>) -> Sse
         if line.is_empty() {
             continue;
         }
-        if let Some(ev) = line.strip_prefix("event: ") {
+        if let Some(ev) = line
+            .strip_prefix("event:")
+            .map(|s| s.strip_prefix(' ').unwrap_or(s))
+        {
             event_type = Some(ev.trim());
-        } else if let Some(data) = line.strip_prefix("data: ") {
+        } else if let Some(data) = line
+            .strip_prefix("data:")
+            .map(|s| s.strip_prefix(' ').unwrap_or(s))
+        {
             data_line = Some(data.trim());
         }
     }
@@ -341,11 +352,9 @@ fn process_sse_event(event_bytes: &[u8], state: &mut Option<StreamState>) -> Sse
         "content_block_stop" => handle_content_block_stop(state),
         "message_delta" => handle_message_delta(data, state),
         "message_stop" => SseOutcome::Done,
-        "error" => {
-            SseOutcome::Err(ProviderError::Deserialize(format!(
-                "mid-stream error event: {data}"
-            )))
-        }
+        "error" => SseOutcome::Err(ProviderError::Deserialize(format!(
+            "mid-stream error event: {data}"
+        ))),
         _ => SseOutcome::Skip,
     }
 }
@@ -364,18 +373,18 @@ fn handle_message_start(data: &str, state: &mut Option<StreamState>) -> SseOutco
         }
     };
 
-    let input_tokens = ev
-        .message
-        .usage
-        .as_ref()
-        .map(|u| u.input_tokens)
-        .unwrap_or(0);
+    let usage = ev.message.usage.as_ref();
+    let input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0);
+    let cache_read_input_tokens = usage.and_then(|u| u.cache_read_input_tokens).unwrap_or(0);
+    let cache_creation_input_tokens = usage.and_then(|u| u.cache_creation_input_tokens);
 
     let new_state = StreamState {
         id: ev.message.id.clone(),
         model: ev.message.model.clone(),
         created: chrono::Utc::now().timestamp(),
         input_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
         output_tokens: 0,
         current_tool: None,
         stop_reason: None,
@@ -542,12 +551,18 @@ fn handle_message_delta(data: &str, state: &mut Option<StreamState>) -> SseOutco
         .map(translate::map_stop_reason)
         .map(str::to_string);
 
+    // Mirror the non-streaming `translate::translate_usage` mapping so streamed
+    // and non-streamed Claude calls report identical usage: prompt_tokens
+    // INCLUDES cache reads (OpenAI subset convention) and cached_tokens is the
+    // cache-read subset — instead of input_tokens-only with cache reads zeroed.
+    let prompt_tokens =
+        st.input_tokens + st.cache_read_input_tokens + st.cache_creation_input_tokens.unwrap_or(0);
     let usage = Usage {
-        prompt_tokens: st.input_tokens,
+        prompt_tokens,
         completion_tokens: st.output_tokens,
-        total_tokens: st.input_tokens + st.output_tokens,
-        cached_tokens: 0,
-        cache_creation_input_tokens: None,
+        total_tokens: prompt_tokens + st.output_tokens,
+        cached_tokens: st.cache_read_input_tokens,
+        cache_creation_input_tokens: st.cache_creation_input_tokens,
     };
 
     let chunk = ChatCompletionChunk {
@@ -570,9 +585,22 @@ fn handle_message_delta(data: &str, state: &mut Option<StreamState>) -> SseOutco
 // Buffer utilities
 // ---------------------------------------------------------------------------
 
-/// Find the byte offset of the first `\n\n` in `buf`.
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+/// Find the first SSE event boundary in `buf`.
+///
+/// Returns `(offset, sep_len)` where `offset` is the index of the first byte
+/// of the boundary sequence and `sep_len` is the number of bytes in the
+/// separator (`2` for `\n\n`, `4` for `\r\n\r\n`).  Callers should drain
+/// `..offset + sep_len` to consume the full event including its terminator.
+///
+/// Both `\n\n` and `\r\n\r\n` are valid SSE event terminators per RFC 8898.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((pos, 4));
+    }
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((pos, 2));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -584,15 +612,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_double_newline_basic() {
+    fn find_event_boundary_lf() {
         let buf = b"event: ping\ndata: {}\n\nevent: message_stop\ndata: {}\n\n";
-        assert_eq!(find_double_newline(buf), Some(20));
+        assert_eq!(find_event_boundary(buf), Some((20, 2)));
     }
 
     #[test]
-    fn find_double_newline_none() {
+    fn find_event_boundary_crlf() {
+        let buf = b"event: ping\r\ndata: {}\r\n\r\nevent: message_stop\r\ndata: {}\r\n\r\n";
+        assert_eq!(find_event_boundary(buf), Some((21, 4)));
+    }
+
+    #[test]
+    fn find_event_boundary_none() {
         let buf = b"event: ping\ndata: {}\n";
-        assert_eq!(find_double_newline(buf), None);
+        assert_eq!(find_event_boundary(buf), None);
     }
 
     #[test]
@@ -623,6 +657,8 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             created: 0,
             input_tokens: 10,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: None,
             output_tokens: 0,
             current_tool: None,
             stop_reason: None,
@@ -637,5 +673,70 @@ mod tests {
         let mut state = None;
         let outcome = process_sse_event(event, &mut state);
         assert!(matches!(outcome, SseOutcome::Done));
+    }
+
+    // --- CRLF + no-space data: regression tests (rv-sse-crlf-parsing) ---
+
+    #[test]
+    fn ping_event_skipped_crlf() {
+        // Same ping event, but with CRLF line endings and \r\n\r\n terminator.
+        let event = b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n";
+        let mut state = None;
+        let outcome = process_sse_event(event, &mut state);
+        assert!(
+            matches!(outcome, SseOutcome::Skip),
+            "CRLF-delimited ping event should still be skipped"
+        );
+    }
+
+    #[test]
+    fn message_stop_crlf() {
+        // message_stop with CRLF terminators must still return Done.
+        let event = b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n";
+        let mut state = None;
+        let outcome = process_sse_event(event, &mut state);
+        assert!(
+            matches!(outcome, SseOutcome::Done),
+            "CRLF message_stop must return Done"
+        );
+    }
+
+    #[test]
+    fn no_space_data_prefix_anthropic() {
+        // data:{...} without a space after the colon must not be silently dropped.
+        let event = b"event: message_stop\ndata:{\"type\":\"message_stop\"}\n\n";
+        let mut state = None;
+        let outcome = process_sse_event(event, &mut state);
+        assert!(
+            matches!(outcome, SseOutcome::Done),
+            "data:{{...}} (no space) must parse the same as `data: {{...}}`"
+        );
+    }
+
+    #[test]
+    fn message_delta_reports_cache_tokens_from_message_start() {
+        // Anthropic reports prompt-cache reads/creations in the `message_start`
+        // usage block. The terminal usage must surface them — previously
+        // `cached_tokens` was hardcoded to 0, zeroing cache savings on every
+        // streamed Claude call.
+        let start = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"role\":\"assistant\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":20}}}\n\n";
+        let mut state = None;
+        let _ = process_sse_event(start, &mut state);
+
+        let delta = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n";
+        let outcome = process_sse_event(delta, &mut state);
+        let chunk = if let SseOutcome::Chunk(c) = outcome {
+            c
+        } else {
+            panic!("expected terminal chunk from message_delta");
+        };
+        let usage = chunk.usage.expect("terminal chunk carries usage");
+        assert_eq!(
+            usage.cached_tokens, 80,
+            "cache reads must be reported, not zeroed"
+        );
+        assert_eq!(usage.cache_creation_input_tokens, Some(20));
+        // prompt_tokens is the FULL input: 10 fresh + 80 cache-read + 20 create = 110.
+        assert_eq!(usage.prompt_tokens, 110);
     }
 }

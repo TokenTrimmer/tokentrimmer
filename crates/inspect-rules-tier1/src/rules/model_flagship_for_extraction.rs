@@ -122,9 +122,27 @@ impl Rule for ModelFlagshipForExtractionRule {
 
             let lower_ctx = context.to_lowercase();
 
-            let has_extraction = EXTRACTION_KEYWORDS
-                .iter()
-                .any(|kw| lower_ctx.contains(kw));
+            // Strip attribute/method accesses that contain "parse" as an
+            // identifier component (e.g. `.parse(`, `.parsed`, `.parser`) from
+            // the context before checking the "parse" extraction keyword. Without
+            // this, SDK demo files using the OpenAI Structured Outputs `.parse()`
+            // API method — and attribute accesses like `message.parsed` — trigger
+            // on the programmatic identifier alone rather than on genuine
+            // "parse this data" intent expressed in the prompt or system message.
+            // All other extraction keywords are checked against the full context.
+            //
+            // Technique: replace every `.parse` occurrence (dotted access) with a
+            // neutral placeholder. A legitimate extraction intent like "Parse the
+            // invoice" or "parse this document" does NOT start with `.`, so it
+            // survives the replacement.
+            let ctx_for_parse_check = lower_ctx.replace(".parse", " _SDK_ ");
+            let has_extraction = EXTRACTION_KEYWORDS.iter().any(|kw| {
+                if *kw == "parse" {
+                    ctx_for_parse_check.contains(kw)
+                } else {
+                    lower_ctx.contains(kw)
+                }
+            });
             if !has_extraction {
                 continue;
             }

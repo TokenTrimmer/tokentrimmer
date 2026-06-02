@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use httpmock::prelude::*;
+use tt_provider_compat::ClientConfig;
 use tt_provider_groq::GroqProvider;
-use tt_provider_openai::ClientConfig;
 use tt_shared::{
     context::{ProviderCredentials, RequestContext, SecretString},
     messages::{Message, MessageContent},
@@ -79,7 +79,8 @@ fn success_body() -> String {
 }
 
 fn provider() -> GroqProvider {
-    GroqProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    GroqProvider::new_allow_local(ClientConfig::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +132,12 @@ async fn smoke_429_rate_limited() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 2_000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 2_000
+            }
+        ),
         "expected RateLimited{{2000}}, got {err:?}"
     );
 }
@@ -184,10 +190,22 @@ fn models_list_contains_expected_models() {
     assert_eq!(models.len(), 4, "expected 4 Groq models");
 
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert!(ids.contains(&"llama-3.3-70b-versatile"), "missing llama-3.3-70b-versatile");
-    assert!(ids.contains(&"llama-3.1-8b-instant"), "missing llama-3.1-8b-instant");
-    assert!(ids.contains(&"deepseek-r1-distill-llama-70b"), "missing deepseek-r1-distill-llama-70b");
-    assert!(ids.contains(&"mixtral-8x7b-32768"), "missing mixtral-8x7b-32768");
+    assert!(
+        ids.contains(&"llama-3.3-70b-versatile"),
+        "missing llama-3.3-70b-versatile"
+    );
+    assert!(
+        ids.contains(&"llama-3.1-8b-instant"),
+        "missing llama-3.1-8b-instant"
+    );
+    assert!(
+        ids.contains(&"deepseek-r1-distill-llama-70b"),
+        "missing deepseek-r1-distill-llama-70b"
+    );
+    assert!(
+        ids.contains(&"mixtral-8x7b-32768"),
+        "missing mixtral-8x7b-32768"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -198,19 +216,27 @@ fn models_list_contains_expected_models() {
 fn pricing_table_correct_rates() {
     let p = provider();
 
-    let llama70b = p.pricing("llama-3.3-70b-versatile").expect("pricing for llama-3.3-70b");
+    let llama70b = p
+        .pricing("llama-3.3-70b-versatile")
+        .expect("pricing for llama-3.3-70b");
     assert_eq!(llama70b.input_per_million, 0.59);
     assert_eq!(llama70b.output_per_million, 0.79);
 
-    let llama8b = p.pricing("llama-3.1-8b-instant").expect("pricing for llama-3.1-8b");
+    let llama8b = p
+        .pricing("llama-3.1-8b-instant")
+        .expect("pricing for llama-3.1-8b");
     assert_eq!(llama8b.input_per_million, 0.05);
     assert_eq!(llama8b.output_per_million, 0.08);
 
-    let deepseek = p.pricing("deepseek-r1-distill-llama-70b").expect("pricing for deepseek-r1");
+    let deepseek = p
+        .pricing("deepseek-r1-distill-llama-70b")
+        .expect("pricing for deepseek-r1");
     assert_eq!(deepseek.input_per_million, 0.75);
     assert_eq!(deepseek.output_per_million, 0.99);
 
-    let mixtral = p.pricing("mixtral-8x7b-32768").expect("pricing for mixtral");
+    let mixtral = p
+        .pricing("mixtral-8x7b-32768")
+        .expect("pricing for mixtral");
     assert_eq!(mixtral.input_per_million, 0.24);
     assert_eq!(mixtral.output_per_million, 0.24);
 
@@ -227,7 +253,9 @@ fn deepseek_r1_has_reasoning_capability() {
 
     let p = provider();
     let models = p.models();
-    let deepseek = models.iter().find(|m| m.id == "deepseek-r1-distill-llama-70b")
+    let deepseek = models
+        .iter()
+        .find(|m| m.id == "deepseek-r1-distill-llama-70b")
         .expect("deepseek-r1-distill-llama-70b should be in models");
 
     assert!(

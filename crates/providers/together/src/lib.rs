@@ -1,13 +1,13 @@
 //! Together AI provider adapter (OpenAI-compatible).
 //!
-//! Thin wrapper over [`tt_provider_openai::OpenAICompatibleProvider`] with
+//! Thin wrapper over [`tt_provider_compat::OpenAICompatibleProvider`] with
 //! Together AI's models, pricing, and default endpoint baked in.
 //!
 //! # Usage
 //!
 //! ```rust,no_run
 //! use tt_provider_together::TogetherProvider;
-//! use tt_provider_openai::ClientConfig;
+//! use tt_provider_compat::ClientConfig;
 //!
 //! let provider = TogetherProvider::new(ClientConfig::default());
 //! ```
@@ -15,9 +15,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use futures::stream::BoxStream;
-use tt_provider_openai::{CompatConfig, ClientConfig, OpenAICompatibleProvider};
+use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     pricing::{Capability, ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
@@ -46,6 +45,28 @@ impl TogetherProvider {
             models: models(),
             pricing_table: pricing_table(),
             fee_multiplier: 1.0,
+            allow_local: false,
+        };
+        Self {
+            inner: OpenAICompatibleProvider::new(client_cfg, cfg),
+        }
+    }
+
+    /// Create an adapter that skips SSRF URL validation for tests targeting a
+    /// local mock server.
+    ///
+    /// # Warning
+    ///
+    /// Do not use in production code. This bypasses the SSRF guard.
+    #[doc(hidden)]
+    pub fn new_allow_local(client_cfg: ClientConfig) -> Self {
+        let cfg = CompatConfig {
+            id: "together",
+            default_base_url: DEFAULT_BASE_URL.to_string(),
+            models: models(),
+            pricing_table: pricing_table(),
+            fee_multiplier: 1.0,
+            allow_local: true,
         };
         Self {
             inner: OpenAICompatibleProvider::new(client_cfg, cfg),
@@ -151,46 +172,11 @@ fn models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Build the Together model→rate map from the shared versioned pricing
+/// catalog. Fed into the OpenAI-compatible inner client at construction.
 fn pricing_table() -> HashMap<String, ModelPricing> {
-    let now = Utc::now();
-    let mut table = HashMap::new();
-
-    table.insert(
-        "meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo".to_string(),
-        ModelPricing {
-            input_per_million: 0.88,
-            output_per_million: 0.88,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo".to_string(),
-        ModelPricing {
-            input_per_million: 3.50,
-            output_per_million: 3.50,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "Qwen/Qwen2.5-72B-Instruct-Turbo".to_string(),
-        ModelPricing {
-            input_per_million: 1.20,
-            output_per_million: 1.20,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "deepseek-ai/DeepSeek-V3".to_string(),
-        ModelPricing {
-            input_per_million: 1.25,
-            output_per_million: 1.25,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-
-    table
+    tt_shared::pricing::catalog()
+        .latest_for_provider("together")
+        .into_iter()
+        .collect()
 }

@@ -80,7 +80,8 @@ fn success_body() -> String {
 }
 
 fn provider() -> AnthropicProvider {
-    AnthropicProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    AnthropicProvider::new_allow_local(ClientConfig::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -105,9 +106,10 @@ async fn success_200_with_cached_tokens() {
         .expect("should succeed");
 
     assert_eq!(resp.id, "msg_01abc");
-    assert_eq!(resp.usage.prompt_tokens, 10);
+    // prompt_tokens is the FULL input: 10 fresh + 80 cache-read + 20 cache-create = 110.
+    assert_eq!(resp.usage.prompt_tokens, 110);
     assert_eq!(resp.usage.completion_tokens, 5);
-    assert_eq!(resp.usage.total_tokens, 15);
+    assert_eq!(resp.usage.total_tokens, 115);
     assert_eq!(resp.usage.cached_tokens, 80);
     assert_eq!(resp.usage.cache_creation_input_tokens, Some(20));
     assert_eq!(resp.choices.len(), 1);
@@ -164,7 +166,12 @@ async fn error_429_with_retry_after() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 3000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 3000
+            }
+        ),
         "expected RateLimited{{3000}}, got {err:?}"
     );
 }
@@ -191,7 +198,12 @@ async fn error_429_without_retry_after_defaults_1000ms() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 1000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 1000
+            }
+        ),
         "expected RateLimited{{1000}}, got {err:?}"
     );
 }

@@ -61,7 +61,8 @@ fn stream_request(model: &str) -> ChatCompletionRequest {
 }
 
 fn provider() -> OpenAiProvider {
-    OpenAiProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    OpenAiProvider::new_allow_local(ClientConfig::default())
 }
 
 /// Build a minimal `ChatCompletionChunk` JSON line (as a `data:` SSE event).
@@ -138,7 +139,10 @@ async fn stream_happy_path() {
     assert_eq!(chunks.len(), 5, "expected 5 chunks, got {}", chunks.len());
 
     // First chunk has role delta.
-    assert_eq!(chunks[0].choices[0].delta.role.as_deref(), Some("assistant"));
+    assert_eq!(
+        chunks[0].choices[0].delta.role.as_deref(),
+        Some("assistant")
+    );
 
     // Second chunk has first content.
     assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("Hello"));
@@ -178,7 +182,11 @@ async fn stream_chunk_fragmentation() {
     // Two events that we will split manually in a unit style assertion,
     // but here we verify the HTTP round-trip correctly reconstitutes both events.
     let part1 = chunk_event("chatcmpl-2", "Frag", None);
-    let part2 = format!("{}{}", chunk_event("chatcmpl-2", "mented", Some("stop")), done_event());
+    let part2 = format!(
+        "{}{}",
+        chunk_event("chatcmpl-2", "mented", Some("stop")),
+        done_event()
+    );
 
     let sse_body = format!("{part1}{part2}");
 
@@ -206,10 +214,7 @@ async fn stream_chunk_fragmentation() {
         chunks[1].choices[0].delta.content.as_deref(),
         Some("mented")
     );
-    assert_eq!(
-        chunks[1].choices[0].finish_reason.as_deref(),
-        Some("stop")
-    );
+    assert_eq!(chunks[1].choices[0].finish_reason.as_deref(), Some("stop"));
 }
 
 // ---------------------------------------------------------------------------
@@ -366,8 +371,15 @@ async fn stream_midstream_malformed_json_continues() {
     // Should have received: "Before" chunk, one Deserialize error, "After" chunk.
     assert_eq!(chunks.len(), 2, "expected 2 valid chunks");
     assert_eq!(errors.len(), 1, "expected 1 deserialize error");
-    assert!(errors[0].contains("deserialize"), "error should mention deserialize: {}", errors[0]);
-    assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("Before"));
+    assert!(
+        errors[0].contains("deserialize"),
+        "error should mention deserialize: {}",
+        errors[0]
+    );
+    assert_eq!(
+        chunks[0].choices[0].delta.content.as_deref(),
+        Some("Before")
+    );
     assert_eq!(chunks[1].choices[0].delta.content.as_deref(), Some("After"));
 }
 
@@ -433,32 +445,38 @@ async fn stream_tool_call_delta() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: Reasoning model rejected without HTTP call
+// Test 8: Reasoning models (o3 / o4-mini) stream like any other model
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn stream_reasoning_model_rejected() {
+async fn stream_reasoning_models_supported() {
+    // o3 / o4-mini DO support streaming via the chat-completions API — the
+    // adapter must no longer short-circuit them with Unsupported.
     let server = MockServer::start();
-
-    // No HTTP mock registered — if the adapter makes a call, the test will
-    // panic (httpmock panics on unregistered requests when assertions run).
+    let body = format!(
+        "{}{}{}data: [DONE]\n\n",
+        role_chunk_event("chatcmpl-o3"),
+        chunk_event("chatcmpl-o3", "Hi", Some("stop")),
+        usage_chunk_event("chatcmpl-o3"),
+    );
+    let _mock = server.mock(|when, then| {
+        when.method(POST).path("/chat/completions");
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body(&body);
+    });
     let ctx = make_ctx(&server.base_url());
 
     for model in ["o3", "o4-mini"] {
-        let result = provider()
+        let stream = provider()
             .chat_completion_stream(stream_request(model), &ctx)
-            .await;
-
-        assert!(result.is_err(), "model {model} should be rejected");
-        match result.err().expect("error") {
-            ProviderError::Unsupported(msg) => {
-                assert!(
-                    msg.contains("reasoning"),
-                    "error should mention reasoning models, got: {msg}"
-                );
-            }
-            other => panic!("model {model}: expected Unsupported, got {other:?}"),
-        }
+            .await
+            .unwrap_or_else(|e| panic!("model {model} should stream, got {e:?}"));
+        let chunks: Vec<_> = stream.collect().await;
+        assert!(
+            chunks.iter().any(std::result::Result::is_ok),
+            "model {model} should yield at least one chunk"
+        );
     }
 }
 

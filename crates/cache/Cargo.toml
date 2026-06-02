@@ -21,3 +21,7 @@ sqlx.workspace = true
 pgvector.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+unicode-normalization = "0.1"
+
+[lints]
+workspace = true

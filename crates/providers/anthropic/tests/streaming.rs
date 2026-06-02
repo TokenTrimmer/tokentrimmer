@@ -61,7 +61,8 @@ fn stream_request() -> ChatCompletionRequest {
 }
 
 fn provider() -> AnthropicProvider {
-    AnthropicProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    AnthropicProvider::new_allow_local(ClientConfig::default())
 }
 
 /// Build a standard Anthropic SSE text stream.
@@ -84,8 +85,7 @@ fn text_stream(text_chunks: &[&str], stop_reason: &str, output_tokens: u64) -> S
     for text in text_chunks {
         sse.push_str("event: content_block_delta\n");
         sse.push_str(&format!(
-            r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{}"}}}}"#,
-            text
+            r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}"#
         ));
         sse.push_str("\n\n");
     }
@@ -139,7 +139,11 @@ async fn stream_happy_path() {
     }
 
     // Expected: message_start chunk + 3 text delta chunks + message_delta chunk = 5
-    assert!(chunks.len() >= 4, "expected at least 4 chunks, got {}", chunks.len());
+    assert!(
+        chunks.len() >= 4,
+        "expected at least 4 chunks, got {}",
+        chunks.len()
+    );
 
     // First chunk carries role=assistant.
     let first_delta = &chunks[0].choices[0].delta;
@@ -366,8 +370,13 @@ async fn stream_tool_use_input_json_accumulation() {
 
     // The last tool chunk's arguments should contain all the JSON.
     let last_tool_chunk = tool_chunks.last().unwrap();
-    let args = &last_tool_chunk.choices[0].delta.tool_calls[0].function.arguments;
-    assert!(args.contains("London"), "arguments should contain 'London', got: {args}");
+    let args = &last_tool_chunk.choices[0].delta.tool_calls[0]
+        .function
+        .arguments;
+    assert!(
+        args.contains("London"),
+        "arguments should contain 'London', got: {args}"
+    );
 
     // The message_delta chunk should have finish_reason = tool_calls.
     let finish_chunk = chunks

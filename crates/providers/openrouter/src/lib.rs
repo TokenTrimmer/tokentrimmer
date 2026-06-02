@@ -1,6 +1,6 @@
 //! OpenRouter provider adapter (OpenAI-compatible).
 //!
-//! Thin wrapper over [`tt_provider_openai::OpenAICompatibleProvider`] with
+//! Thin wrapper over [`tt_provider_compat::OpenAICompatibleProvider`] with
 //! OpenRouter's models, pricing, and default endpoint baked in.
 //!
 //! OpenRouter is a pass-through gateway aggregating 300+ models. This v1
@@ -24,7 +24,7 @@
 //!
 //! ```rust,no_run
 //! use tt_provider_openrouter::OpenRouterProvider;
-//! use tt_provider_openai::ClientConfig;
+//! use tt_provider_compat::ClientConfig;
 //!
 //! let provider = OpenRouterProvider::new(ClientConfig::default());
 //! ```
@@ -32,9 +32,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use futures::stream::BoxStream;
-use tt_provider_openai::{CompatConfig, ClientConfig, OpenAICompatibleProvider};
+use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     pricing::{Capability, ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
@@ -69,6 +68,7 @@ impl OpenRouterProvider {
             models: models(),
             pricing_table: pricing_table(),
             fee_multiplier: BYOK_FEE_MULTIPLIER,
+            allow_local: false,
         };
         Self {
             inner: OpenAICompatibleProvider::new(client_cfg, cfg),
@@ -81,6 +81,27 @@ impl OpenRouterProvider {
     /// fields. See [`CompatConfig::fee_multiplier`] for semantics.
     pub fn fee_multiplier(&self) -> f64 {
         self.inner.fee_multiplier()
+    }
+
+    /// Create an adapter that skips SSRF URL validation for tests targeting a
+    /// local mock server.
+    ///
+    /// # Warning
+    ///
+    /// Do not use in production code. This bypasses the SSRF guard.
+    #[doc(hidden)]
+    pub fn new_allow_local(client_cfg: ClientConfig) -> Self {
+        let cfg = CompatConfig {
+            id: "openrouter",
+            default_base_url: DEFAULT_BASE_URL.to_string(),
+            models: models(),
+            pricing_table: pricing_table(),
+            fee_multiplier: BYOK_FEE_MULTIPLIER,
+            allow_local: true,
+        };
+        Self {
+            inner: OpenAICompatibleProvider::new(client_cfg, cfg),
+        }
     }
 }
 
@@ -96,6 +117,10 @@ impl Provider for OpenRouterProvider {
 
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
         self.inner.pricing(model)
+    }
+
+    fn fee_multiplier(&self) -> f64 {
+        self.inner.fee_multiplier()
     }
 
     async fn chat_completion(
@@ -194,55 +219,13 @@ fn models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Build the OpenRouter model→rate map from the shared versioned pricing
+/// catalog. These are upstream list prices; OpenRouter's 5% BYOK fee is applied
+/// separately via `fee_multiplier`, not baked into the rate. Fed into the
+/// OpenAI-compatible inner client at construction.
 fn pricing_table() -> HashMap<String, ModelPricing> {
-    let now = Utc::now();
-    let mut table = HashMap::new();
-
-    table.insert(
-        "anthropic/claude-sonnet-4-6".to_string(),
-        ModelPricing {
-            input_per_million: 3.00,
-            output_per_million: 15.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "openai/gpt-5.5".to_string(),
-        ModelPricing {
-            input_per_million: 5.00,
-            output_per_million: 30.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "google/gemini-3.1-pro".to_string(),
-        ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 12.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "meta-llama/llama-3.3-70b-instruct".to_string(),
-        ModelPricing {
-            input_per_million: 0.59,
-            output_per_million: 0.79,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "mistralai/mistral-large".to_string(),
-        ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 6.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-
-    table
+    tt_shared::pricing::catalog()
+        .latest_for_provider("openrouter")
+        .into_iter()
+        .collect()
 }

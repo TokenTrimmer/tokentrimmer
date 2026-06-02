@@ -1,0 +1,7 @@
+# Added by tt init
+.claude/cost-ledger.jsonl
+.claude/AUDIT.log
+.claude/PAUSED
+.claude/STOP-CHAIN
+.claude/sessions/
+.tt-init.lock

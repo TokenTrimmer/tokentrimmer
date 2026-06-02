@@ -60,11 +60,7 @@ impl L1Cache for RedisL1Cache {
     /// Store `value` under `key` with a TTL of `ttl_secs` seconds.
     async fn set(&self, key: &str, value: &[u8], ttl_secs: u64) -> Result<(), CacheError> {
         let full = self.full_key(key);
-        let _: () = self
-            .conn
-            .clone()
-            .set_ex(&full, value, ttl_secs)
-            .await?;
+        let _: () = self.conn.clone().set_ex(&full, value, ttl_secs).await?;
         Ok(())
     }
 

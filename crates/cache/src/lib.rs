@@ -22,13 +22,15 @@
 
 pub mod embed;
 pub mod key;
+pub mod l1_entry;
 pub mod l2;
 pub mod memory;
 pub mod redis_impl;
 
 // Re-export key L2 types at the crate root for convenience.
 pub use embed::{EmbedError, EmbeddingProvider, MockEmbedder, OpenAIEmbedder};
-pub use l2::{CacheEntry, InMemoryL2Cache, L2Cache, PostgresL2Cache};
+pub use l1_entry::L1Entry;
+pub use l2::{l2_context_text, CacheEntry, InMemoryL2Cache, L2Cache, PostgresL2Cache};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -45,6 +47,10 @@ pub enum CacheError {
     /// An error originating from the sqlx database client (L2 Postgres cache).
     #[error("sqlx: {0}")]
     Sqlx(#[from] sqlx::Error),
+    /// The embedding vector contained a non-finite (NaN/Inf) component. Rejected
+    /// at insert so a corrupt vector can't poison similarity ranking.
+    #[error("invalid embedding: non-finite component")]
+    InvalidEmbedding,
 }
 
 /// L1 exact-match cache contract. Keys are SHA-256 hashes of normalized requests.

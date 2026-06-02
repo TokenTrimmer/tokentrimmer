@@ -3,19 +3,27 @@
 //! No business logic lives here — only the contracts that other crates implement.
 //! See `docs/02-provider-adapter-guide.md` for the Provider trait.
 
+pub mod capability_check;
 pub mod context;
 pub mod error;
 pub mod messages;
 pub mod pricing;
 pub mod provider;
+pub mod providers;
+pub mod url_guard;
 pub mod usage;
 
-pub use context::RequestContext;
+pub use capability_check::{message_text_for_estimation, RequiredCapabilities};
+pub use context::{CallerTier, RequestContext};
 pub use error::ProviderError;
 pub use messages::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart,
-    EmbeddingsRequest, EmbeddingsResponse, Message, MessageContent, Tool, ToolCall, ToolChoice,
+    parse_cache_control, CacheControlConfig, CacheMode, ChatCompletionChunk, ChatCompletionRequest,
+    ChatCompletionResponse, Choice, ContentPart, EmbeddingsRequest, EmbeddingsResponse, Message,
+    MessageContent, Tool, ToolCall, ToolChoice,
 };
 pub use pricing::{ModelInfo, ModelPricing};
 pub use provider::Provider;
+pub use url_guard::{
+    filter_extra_headers, find_denied_header, validate_provider_url, UrlGuardError,
+};
 pub use usage::Usage;

@@ -6,6 +6,45 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
+/// Subscription tier for the calling organisation, as surfaced by the cloud
+/// tier-resolution layer.
+///
+/// The tier drives cache TTL selection per spec §8.4 (24h / 7d / 30d bands).
+/// The `tier` field on [`crate::context::RequestContext`] and on
+/// `tt_auth::ApiKeyContext` is `Option<CallerTier>`: when `None`, the gateway
+/// falls back to the conservative 24h default. The cloud will inject the real
+/// tier once `rv-tier-limits-enforcement` is wired; until then all requests
+/// run as if Free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerTier {
+    /// Free tier — 24h cache TTL (spec §8.4).
+    Free,
+    /// Pro tier — 7d cache TTL (spec §8.4).
+    Pro,
+    /// Team tier — 7d cache TTL (spec §8.4, same band as Pro).
+    Team,
+    /// Scale tier — 30d cache TTL (spec §8.4).
+    Scale,
+}
+
+impl CallerTier {
+    /// Cache TTL in seconds for this tier, per spec §8.4.
+    ///
+    /// | Tier        | TTL    |
+    /// | ----------- | ------ |
+    /// | Free        | 24h    |
+    /// | Pro / Team  | 7d     |
+    /// | Scale       | 30d    |
+    #[must_use]
+    pub fn ttl_secs(self) -> u64 {
+        match self {
+            CallerTier::Free => 24 * 60 * 60,
+            CallerTier::Pro | CallerTier::Team => 7 * 24 * 60 * 60,
+            CallerTier::Scale => 30 * 24 * 60 * 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub trace_id: Uuid,

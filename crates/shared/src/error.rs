@@ -49,12 +49,64 @@ impl ProviderError {
     }
 
     /// True if the error means we should try a fallback provider.
+    ///
+    /// Only upstream *server* errors (5xx) are fallback-eligible. A
+    /// deterministic client error (400 invalid request, 403 forbidden, 422
+    /// unprocessable) will fail identically on every provider, so failing
+    /// over just burns extra upstream calls + spend. Matches the `>= 500`
+    /// guard in [`Self::is_retriable`]. (429 maps to [`Self::RateLimited`]
+    /// and timeouts to [`Self::Timeout`], which are handled separately.)
     pub fn is_fallback_eligible(&self) -> bool {
-        matches!(
-            self,
-            ProviderError::ModelNotFound { .. }
-                | ProviderError::ProviderUpstream { .. }
-                | ProviderError::Timeout { .. }
-        )
+        match self {
+            ProviderError::ModelNotFound { .. } => true,
+            ProviderError::Timeout { .. } => true,
+            ProviderError::ProviderUpstream { status, .. } => *status >= 500,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_5xx_is_fallback_eligible() {
+        assert!(ProviderError::ProviderUpstream {
+            status: 500,
+            message: "boom".into()
+        }
+        .is_fallback_eligible());
+        assert!(ProviderError::ProviderUpstream {
+            status: 503,
+            message: "unavailable".into()
+        }
+        .is_fallback_eligible());
+    }
+
+    #[test]
+    fn upstream_4xx_is_not_fallback_eligible() {
+        for status in [400u16, 403, 404, 422] {
+            assert!(
+                !ProviderError::ProviderUpstream {
+                    status,
+                    message: "client error".into()
+                }
+                .is_fallback_eligible(),
+                "status {status} must not fail over"
+            );
+        }
+    }
+
+    #[test]
+    fn model_not_found_and_timeout_still_fallback_eligible() {
+        assert!(ProviderError::ModelNotFound { model: "x".into() }.is_fallback_eligible());
+        assert!(ProviderError::Timeout { ms: 1000 }.is_fallback_eligible());
+    }
+
+    #[test]
+    fn invalid_request_and_unauthorized_not_fallback_eligible() {
+        assert!(!ProviderError::InvalidRequest("bad".into()).is_fallback_eligible());
+        assert!(!ProviderError::Unauthorized("nope".into()).is_fallback_eligible());
     }
 }

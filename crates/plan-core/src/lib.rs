@@ -21,6 +21,7 @@ pub mod cache_projection;
 pub mod cost;
 pub mod error;
 pub mod l2_projection;
+pub mod pricing;
 pub mod quality;
 pub mod replay;
 pub mod routing;
@@ -28,6 +29,7 @@ pub mod types;
 
 pub use apply::{apply_plan, ApplyError, InMemoryPlanStore, PlanStore};
 pub use error::PlanError;
+pub use pricing::{catalog_pricing_table, catalog_pricing_table_at};
 pub use quality::{
     score_quality, stratified_sample, JudgeProvider, JudgeVerdict, MockJudge, QualityConfig,
     QualityError, QualityResult, RiskBand, SampleScore,

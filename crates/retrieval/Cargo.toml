@@ -1,0 +1,47 @@
+[package]
+name = "tt-retrieval"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RAG / context compression: chunking, embedding, HNSW retrieval, <retrievable> tag substitution."
+
+[dependencies]
+tt-shared.workspace = true
+tt-tokenize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+reqwest.workspace = true
+tiktoken-rs = "0.5"
+regex = "1.11"
+uuid.workspace = true
+async-trait = "0.1"
+
+# Crypto for the encrypted-prompt retrieval audit log (postgres feature only).
+chacha20poly1305 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
+[features]
+default = []
+postgres = ["dep:sqlx", "dep:pgvector", "dep:chacha20poly1305", "dep:sha2", "dep:hex"]
+
+[dependencies.sqlx]
+workspace = true
+features = ["postgres", "runtime-tokio-rustls", "uuid", "json"]
+optional = true
+
+[dependencies.pgvector]
+workspace = true
+optional = true
+
+[dev-dependencies]
+httpmock = "0.7"
+insta = { version = "1.39", features = ["json"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

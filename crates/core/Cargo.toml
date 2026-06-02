@@ -8,7 +8,10 @@ description = "Axum HTTP server, routing engine, middleware, and provider regist
 
 [dependencies]
 tt-shared.workspace = true
+tt-tokenize.workspace = true
 tt-cache.workspace = true
+tt-retrieval = { workspace = true, features = ["postgres"] }
+tt-preview.workspace = true
 tt-routing.workspace = true
 tt-auth.workspace = true
 tt-telemetry.workspace = true
@@ -22,6 +25,9 @@ tt-provider-together.workspace = true
 tt-provider-openrouter.workspace = true
 
 sqlx.workspace = true
+blake3.workspace = true
+dashmap.workspace = true
+rand_core.workspace = true
 
 axum.workspace = true
 tower.workspace = true
@@ -37,13 +43,22 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
+# Zeroizing wrapper for the plaintext retrieval-prompt clone (middleware/retrieval.rs).
+zeroize.workspace = true
 
 [dev-dependencies]
+argon2.workspace = true
 criterion.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
 serde_json.workspace = true
+httpmock.workspace = true
+tt-retrieval.workspace = true
+reqwest.workspace = true
 
 [[bench]]
 name = "streaming"
 harness = false
+
+[lints]
+workspace = true

@@ -53,6 +53,7 @@ impl Provider for CountingMock {
             input_per_million: 0.0,
             output_per_million: 0.0,
             cached_input_per_million: Some(0.0),
+            cache_write_per_million: None,
             effective_at: chrono::Utc::now(),
         })
     }
@@ -62,7 +63,9 @@ impl Provider for CountingMock {
         _req: ChatCompletionRequest,
         _ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
-        Err(ProviderError::Unsupported("non-streaming not exercised here".into()))
+        Err(ProviderError::Unsupported(
+            "non-streaming not exercised here".into(),
+        ))
     }
 
     async fn chat_completion_stream(
@@ -83,7 +86,11 @@ impl Provider for CountingMock {
                     choices: vec![ChunkChoice {
                         index: 0,
                         delta: ChunkDelta {
-                            role: if i == 0 { Some("assistant".into()) } else { None },
+                            role: if i == 0 {
+                                Some("assistant".into())
+                            } else {
+                                None
+                            },
                             content: Some(format!("chunk-{i} ")),
                             tool_calls: vec![],
                         },
@@ -207,12 +214,10 @@ async fn one_hundred_concurrent_sse_streams_complete_cleanly() {
     // raise the budget — it's a sanity check, not a strict perf gate.
     assert!(
         elapsed < Duration::from_secs(5),
-        "100 concurrent streams took {:?} — investigate before raising the budget",
-        elapsed
+        "100 concurrent streams took {elapsed:?} — investigate before raising the budget",
     );
 
     eprintln!(
-        "100 concurrent SSE streams completed in {:?}, total body bytes {}",
-        elapsed, total_bytes
+        "100 concurrent SSE streams completed in {elapsed:?}, total body bytes {total_bytes}",
     );
 }

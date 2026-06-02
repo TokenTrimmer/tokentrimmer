@@ -18,7 +18,7 @@ use thiserror::Error;
 use tt_telemetry::audit::{Actor, AuditError, AuditWriter};
 use uuid::Uuid;
 
-use crate::types::PlanResult;
+use crate::types::{PlanResult, ProposedRoute};
 
 /// Errors returned by the plan-apply path.
 #[derive(Debug, Error)]
@@ -51,35 +51,72 @@ pub enum ApplyError {
 /// crate when the sqlx-pool wiring is done).
 #[async_trait]
 pub trait PlanStore: Send + Sync {
-    /// Atomically transition `plan_id` from status `'projected'` to
-    /// `'applied'` and stamp `applied_at`. Return the previous status when
-    /// the row exists, or `None` when no such row.
+    /// Atomically (1) transition `plan_id` from status `'projected'` to
+    /// `'applied'` and stamp `applied_at`, AND (2) persist `routes` to the
+    /// Gateway routing config the live gateway reads. Return the previous
+    /// status when the row exists, or `None` when no such row.
     ///
-    /// MUST be atomic: a partial update that leaves status mismatched with
-    /// applied_at violates the audit promise.
+    /// MUST be atomic across BOTH effects: the status flip and the route
+    /// write commit together or not at all. A partial update — status
+    /// flipped but routes not written, applied_at stamped but status
+    /// mismatched — violates the audit promise, because the `plan.applied`
+    /// chain entry asserts that the routes are now live. Implementations
+    /// MUST use a single transaction (Postgres: `BEGIN; UPDATE plan_runs;
+    /// INSERT INTO routes; COMMIT`).
+    ///
+    /// The store MUST only write `routes` when the transition actually
+    /// happens (previous status was `'projected'`). When the row is already
+    /// in a terminal state, return the previous status and write nothing —
+    /// the free function [`apply_plan`] turns that into
+    /// [`ApplyError::InvalidState`] and emits no audit row.
+    ///
+    /// `routes` is the caller's authored route set (see
+    /// [`PlanResult::proposed_routes`]); it may be empty, in which case the
+    /// status flips and no routes are written (the legacy no-op shape, for
+    /// plan rows persisted before routes were carried on the result).
     async fn mark_applied(
         &self,
         plan_id: Uuid,
         applied_at: DateTime<Utc>,
+        routes: &[ProposedRoute],
     ) -> Result<Option<String>, ApplyError>;
 }
 
-/// In-memory store for tests. Tracks status per `plan_id`.
+/// In-memory store for tests. Tracks status + applied routes per `plan_id`.
 #[derive(Default)]
 pub struct InMemoryPlanStore {
     rows: Arc<Mutex<HashMap<Uuid, InMemoryRow>>>,
+    /// When set, [`PlanStore::mark_applied`] returns
+    /// [`ApplyError::Store`] *before* mutating anything — used by tests to
+    /// prove that a route-write failure leaves the row untouched AND emits
+    /// no audit row. Mirrors a Postgres `INSERT INTO routes` failing inside
+    /// the transaction (which rolls the whole txn back).
+    fail_route_write: bool,
 }
 
 #[derive(Debug, Clone)]
 struct InMemoryRow {
     status: String,
     applied_at: Option<DateTime<Utc>>,
+    /// Routes written when the row transitioned to `applied`. Empty until
+    /// (and unless) a successful apply with a non-empty route set.
+    applied_routes: Vec<ProposedRoute>,
 }
 
 impl InMemoryPlanStore {
     /// Construct an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a store whose [`PlanStore::mark_applied`] always fails the
+    /// route write (and therefore the whole atomic operation). For tests
+    /// that assert no audit row is emitted when persistence fails.
+    pub fn with_failing_route_write() -> Self {
+        Self {
+            fail_route_write: true,
+            ..Self::default()
+        }
     }
 
     /// Seed a row in `status='projected'`. Returns the id for callers to
@@ -92,6 +129,7 @@ impl InMemoryPlanStore {
             InMemoryRow {
                 status: "projected".into(),
                 applied_at: None,
+                applied_routes: Vec::new(),
             },
         );
         id
@@ -108,6 +146,14 @@ impl InMemoryPlanStore {
         let g = self.rows.lock().expect("rows lock");
         g.get(&plan_id).and_then(|r| r.applied_at)
     }
+
+    /// Read-only lookup of the routes persisted by a successful apply. Used
+    /// by tests to assert the proposed routes actually landed in the store
+    /// (the heart of the rv-plan-apply-writes-routes fix).
+    pub fn applied_routes(&self, plan_id: Uuid) -> Option<Vec<ProposedRoute>> {
+        let g = self.rows.lock().expect("rows lock");
+        g.get(&plan_id).map(|r| r.applied_routes.clone())
+    }
 }
 
 #[async_trait]
@@ -116,7 +162,16 @@ impl PlanStore for InMemoryPlanStore {
         &self,
         plan_id: Uuid,
         applied_at: DateTime<Utc>,
+        routes: &[ProposedRoute],
     ) -> Result<Option<String>, ApplyError> {
+        // Simulate the route-write leg of the transaction failing. We fail
+        // BEFORE touching any row state so the post-condition matches a real
+        // txn rollback: nothing committed, so no audit row is emitted by the
+        // caller.
+        if self.fail_route_write {
+            return Err(ApplyError::Store("simulated route-write failure".into()));
+        }
+
         let mut g = self
             .rows
             .lock()
@@ -125,9 +180,14 @@ impl PlanStore for InMemoryPlanStore {
             return Ok(None);
         };
         let prev = row.status.clone();
+        // Both effects happen together, and only on the projected→applied
+        // transition. Holding the single `rows` mutex for the whole block is
+        // this store's stand-in for the Postgres transaction the contract
+        // requires.
         if prev == "projected" {
             row.status = "applied".into();
             row.applied_at = Some(applied_at);
+            row.applied_routes = routes.to_vec();
         }
         Ok(Some(prev))
     }
@@ -144,21 +204,31 @@ struct ApplyPayload {
     projected_savings_usd: f64,
 }
 
-/// Mark a Plan as applied and emit a `plan.applied` audit row.
+/// Mark a Plan as applied, persist its proposed routes, and emit a
+/// `plan.applied` audit row.
 ///
 /// Two-step:
-///   1. `store.mark_applied(plan_id, now)` — atomic state transition.
-///   2. `audit_writer.write(plan.applied, payload)` — tamper-evident record.
+///   1. `store.mark_applied(plan_id, now, routes)` — atomic state transition
+///      AND route persistence (both commit together; see [`PlanStore`]).
+///   2. `audit_writer.write(plan.applied, payload)` — tamper-evident record,
+///      emitted only AFTER step 1 succeeds, so the chain never asserts an
+///      apply that didn't actually write its routes.
+///
+/// The routes come from [`PlanResult::proposed_routes`], which `replay()`
+/// populates from the [`crate::types::PlanInput`]. Callers persisting the
+/// result must keep that field populated; a result deserialized from a
+/// legacy row (no routes) applies the status flip with an empty route set.
 ///
 /// # Errors
 ///
 /// - [`ApplyError::NotFound`] — no row matches `result.plan_id`.
 /// - [`ApplyError::InvalidState`] — row exists but is not in `projected`
-///   (already applied, reverted, or failed).
-/// - [`ApplyError::Store`] — store update could not complete.
+///   (already applied, reverted, or failed). No routes were written.
+/// - [`ApplyError::Store`] — the atomic status-flip + route-write could not
+///   complete; by contract nothing was committed, so no audit row is emitted.
 /// - [`ApplyError::Audit`] — store succeeded but audit emission failed.
-///   The plan IS applied when this is returned; out-of-band recovery is
-///   the caller's responsibility.
+///   The plan IS applied (and routes ARE written) when this is returned;
+///   out-of-band recovery is the caller's responsibility.
 pub async fn apply_plan<S: PlanStore, A: AuditWriter>(
     store: &S,
     audit_writer: &A,
@@ -166,7 +236,9 @@ pub async fn apply_plan<S: PlanStore, A: AuditWriter>(
     actor: Actor,
 ) -> Result<(), ApplyError> {
     let now = Utc::now();
-    let prev_status = store.mark_applied(result.plan_id, now).await?;
+    let prev_status = store
+        .mark_applied(result.plan_id, now, &result.proposed_routes)
+        .await?;
     match prev_status {
         None => return Err(ApplyError::NotFound),
         Some(s) if s != "projected" => {
@@ -199,11 +271,40 @@ pub async fn apply_plan<S: PlanStore, A: AuditWriter>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Aggregates, ConfidenceIntervals, PlanResult};
+    use crate::types::{Aggregates, ConfidenceIntervals, PlanResult, RouteAction, RouteConditions};
     use chrono::Utc;
     use tt_telemetry::audit::{verify_chain, InMemoryAuditWriter};
 
+    /// One non-trivial proposed route, so apply has something real to persist.
+    fn sample_routes() -> Vec<ProposedRoute> {
+        vec![ProposedRoute {
+            id: Uuid::now_v7(),
+            name: "haiku-for-cheap-classification".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                model_in: vec!["claude-sonnet-4-5".into()],
+                input_tokens_lt: Some(2_000),
+                input_tokens_gt: None,
+                tag_equals: None,
+            },
+            then: RouteAction {
+                target_model: "claude-haiku-4-5".into(),
+                force_cache_layer: None,
+                fallbacks: Vec::new(),
+            },
+        }]
+    }
+
     fn make_plan_result(plan_id: Uuid, org_id: Uuid) -> PlanResult {
+        make_plan_result_with_routes(plan_id, org_id, sample_routes())
+    }
+
+    fn make_plan_result_with_routes(
+        plan_id: Uuid,
+        org_id: Uuid,
+        proposed_routes: Vec<ProposedRoute>,
+    ) -> PlanResult {
         PlanResult {
             plan_id,
             org_id,
@@ -234,6 +335,7 @@ mod tests {
             per_route_breakdown: Vec::new(),
             caveats: Vec::new(),
             quality: None,
+            proposed_routes,
         }
     }
 
@@ -251,6 +353,12 @@ mod tests {
 
         assert_eq!(store.status(plan_id).as_deref(), Some("applied"));
         assert!(store.applied_at(plan_id).is_some());
+
+        // (a) The proposed routes were persisted alongside the status flip.
+        let written = store.applied_routes(plan_id).expect("row exists");
+        assert_eq!(written.len(), 1, "the one proposed route must be written");
+        assert_eq!(written[0].then.target_model, "claude-haiku-4-5");
+        assert_eq!(written[0].name, "haiku-for-cheap-classification");
 
         let entries = audit.list(org_id).await.expect("list ok");
         assert_eq!(entries.len(), 1);
@@ -301,6 +409,95 @@ mod tests {
         }
 
         // Only one audit row — second attempt didn't emit.
+        let entries = audit.list(org_id).await.expect("list ok");
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// (a) Applying a projected plan records BOTH `status='applied'` AND the
+    /// exact proposed routes — the core rv-plan-apply-writes-routes contract.
+    #[tokio::test]
+    async fn apply_persists_proposed_routes_atomically_with_status() {
+        let store = InMemoryPlanStore::new();
+        let audit = InMemoryAuditWriter::new();
+        let plan_id = store.seed_projected();
+        let org_id = Uuid::now_v7();
+
+        let routes = sample_routes();
+        let route_id = routes[0].id;
+        let result = make_plan_result_with_routes(plan_id, org_id, routes);
+
+        apply_plan(&store, &audit, &result, Actor::System)
+            .await
+            .expect("apply ok");
+
+        // Status flipped.
+        assert_eq!(store.status(plan_id).as_deref(), Some("applied"));
+        // Routes written, identity preserved.
+        let written = store.applied_routes(plan_id).expect("row exists");
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].id, route_id);
+        assert_eq!(written[0].priority, 100);
+        assert_eq!(written[0].when.model_in, vec!["claude-sonnet-4-5"]);
+        assert_eq!(written[0].then.target_model, "claude-haiku-4-5");
+
+        // And the audit row was emitted (after both effects).
+        let entries = audit.list(org_id).await.expect("list ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "plan.applied");
+    }
+
+    /// (c) When the store fails the route write, the operation is rejected
+    /// AND no audit row is emitted — the chain must never assert an apply
+    /// whose routes didn't land.
+    #[tokio::test]
+    async fn route_write_failure_emits_no_audit_row() {
+        // This store has a row in `projected` but fails the atomic write.
+        let store = InMemoryPlanStore::with_failing_route_write();
+        let audit = InMemoryAuditWriter::new();
+        // Seed a row so the failure is the route write, not a missing row.
+        let plan_id = store.seed_projected();
+        let org_id = Uuid::now_v7();
+        let result = make_plan_result(plan_id, org_id);
+
+        let err = apply_plan(&store, &audit, &result, Actor::System)
+            .await
+            .expect_err("route-write failure must surface");
+        assert!(matches!(err, ApplyError::Store(_)), "got {err:?}");
+
+        // Row untouched: still projected, no routes, no applied_at.
+        assert_eq!(store.status(plan_id).as_deref(), Some("projected"));
+        assert!(store.applied_at(plan_id).is_none());
+        assert_eq!(
+            store.applied_routes(plan_id).expect("row exists").len(),
+            0,
+            "no routes may be written when the txn fails"
+        );
+
+        // No audit row.
+        let entries = audit.list(org_id).await.expect("list ok");
+        assert!(
+            entries.is_empty(),
+            "audit row must NOT be emitted on a failed route write"
+        );
+    }
+
+    /// A legacy result (no carried routes) still applies — flips status and
+    /// writes zero routes, matching the pre-fix no-op shape rather than
+    /// erroring. Guards the `#[serde(default)]` round-trip path.
+    #[tokio::test]
+    async fn apply_with_empty_routes_flips_status_and_writes_none() {
+        let store = InMemoryPlanStore::new();
+        let audit = InMemoryAuditWriter::new();
+        let plan_id = store.seed_projected();
+        let org_id = Uuid::now_v7();
+        let result = make_plan_result_with_routes(plan_id, org_id, Vec::new());
+
+        apply_plan(&store, &audit, &result, Actor::System)
+            .await
+            .expect("apply ok even with no routes");
+
+        assert_eq!(store.status(plan_id).as_deref(), Some("applied"));
+        assert_eq!(store.applied_routes(plan_id).expect("row exists").len(), 0);
         let entries = audit.list(org_id).await.expect("list ok");
         assert_eq!(entries.len(), 1);
     }

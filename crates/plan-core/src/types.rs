@@ -127,6 +127,12 @@ pub struct RouteConditions {
 }
 
 /// What a matching [`ProposedRoute`] does.
+///
+/// Field order matches `tt_routing::RouteAction` exactly so the two types
+/// produce identical JSON for the same logical value — a requirement for the
+/// Plan apply round-trip (a `ProposedRoute` serialized by the Plan engine and
+/// then deserialized by the Gateway must carry all fields without loss or
+/// reordering).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteAction {
     /// Rewrite to this model on the same provider as the request. v1 is
@@ -134,9 +140,19 @@ pub struct RouteAction {
     /// because cost projection needs each provider's pricing table and we
     /// want one source of truth here.
     pub target_model: String,
+    /// Ordered fallback model ids, mirroring `tt_routing::RouteAction::fallbacks`.
+    /// The replay engine does not yet simulate fallback firing (follow-up:
+    /// extend the replay matcher to account for fallback paths); the field
+    /// is present so a `tt_routing::RouteAction` round-trips losslessly to a
+    /// `tt_plan_core::RouteAction` without dropping fallbacks on read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<String>,
     /// Override the projected cache layer (e.g. force `"l1"` projection
-    /// even when the request didn't hit cache in the baseline).
-    #[serde(default)]
+    /// even when the request didn't hit cache in the baseline). The replay
+    /// engine does not yet simulate the effect of this override (follow-up:
+    /// wire force_cache_layer into the cache-projection step); the field is
+    /// present so the Plan result carries it through to apply without loss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_cache_layer: Option<String>,
 }
 
@@ -258,6 +274,18 @@ pub struct PlanResult {
     /// `None` so existing snapshots / persisted rows stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<crate::quality::QualityResult>,
+    /// The proposed routes that produced this projection, echoed from
+    /// [`PlanInput::proposed_routes`]. Carried on the result so the apply
+    /// path ([`crate::apply::apply_plan`]) can persist them to the Gateway
+    /// routing config in the same transaction as the status flip — without
+    /// this the result has no record of *what* to apply.
+    ///
+    /// `#[serde(default)]` so plan_runs rows persisted before this field
+    /// existed (which stored only the projection output) still deserialize;
+    /// they decode to an empty Vec, and applying such a row writes no routes
+    /// (matching today's no-op behavior rather than crashing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_routes: Vec<ProposedRoute>,
 }
 
 /// Point-estimate aggregates the replay produces.
@@ -361,16 +389,28 @@ pub struct L2Projection {
     pub projected_l2_hits: u32,
     /// `projected_l2_hits / total` (0–1, 0 when `total == 0`).
     pub projected_l2_hit_rate: f64,
+    /// Count of L2 hits the cache-poisoning heuristic flagged as suspicious
+    /// **at this threshold** — high similarity but historical outcomes
+    /// diverged. Reported per-threshold so the risk is shown against the
+    /// threshold that produced it (a higher threshold typically yields
+    /// fewer, tighter matches and so fewer candidates). See
+    /// [`crate::l2_projection`] for the heuristic.
+    #[serde(default)]
+    pub poisoning_candidates: u32,
 }
 
 /// The complete output of one L2 sweep pass — the per-threshold rows plus
-/// the poisoning-candidate count aggregated across all thresholds.
+/// the deduplicated poisoning-candidate count across the whole sweep.
 #[derive(Debug, Clone, Default)]
 pub struct L2SweepResult {
-    /// One [`L2Projection`] per requested threshold, in input order.
+    /// One [`L2Projection`] per requested threshold, in input order. Each
+    /// row carries its own [`L2Projection::poisoning_candidates`].
     pub per_threshold: Vec<L2Projection>,
-    /// Aggregate count of L2 hits the poisoning heuristic flagged across
-    /// the entire sweep — see [`crate::l2_projection`] for the rules.
+    /// Count of **distinct** requests the poisoning heuristic flagged at
+    /// **any** threshold in the sweep. A request that poisons at several
+    /// thresholds is counted once — this is deliberately NOT the sum of the
+    /// per-threshold counts (which would inflate the metric up to N× for an
+    /// N-threshold sweep). See [`crate::l2_projection`] for the rules.
     pub poisoning_candidates: u32,
 }
 
@@ -379,4 +419,85 @@ pub struct L2SweepResult {
 #[must_use]
 pub fn pricing_key(provider: &str, model: &str) -> String {
     format!("{provider}:{model}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- rv-routeaction-shared-type: field-parity serde tests ---
+
+    /// (c) Serializing a `RouteAction` with empty fallbacks and no
+    /// force_cache_layer must produce the same JSON as before — just
+    /// `{"target_model":"x"}` — confirming skip_serializing_if is wired.
+    #[test]
+    fn route_action_minimal_serializes_without_new_fields() {
+        let a = RouteAction {
+            target_model: "x".into(),
+            force_cache_layer: None,
+            fallbacks: Vec::new(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(
+            json, r#"{"target_model":"x"}"#,
+            "None force_cache_layer and empty fallbacks must be omitted from JSON"
+        );
+    }
+
+    /// (b) Old JSON that has only `target_model` still deserializes — serde
+    /// default fills in None force_cache_layer and empty fallbacks.
+    #[test]
+    fn route_action_backward_compat_deserialize() {
+        let json = r#"{"target_model":"claude-3-5-haiku"}"#;
+        let a: RouteAction = serde_json::from_str(json).unwrap();
+        assert_eq!(a.target_model, "claude-3-5-haiku");
+        assert!(
+            a.force_cache_layer.is_none(),
+            "force_cache_layer must default to None"
+        );
+        assert!(a.fallbacks.is_empty(), "fallbacks must default to empty");
+    }
+
+    /// (a) Full round-trip: a `RouteAction` with both new fields serializes to
+    /// JSON carrying both fields, and deserializes back with all values
+    /// preserved — no field dropped.
+    #[test]
+    fn route_action_full_round_trip() {
+        let original = RouteAction {
+            target_model: "claude-3-5-haiku".into(),
+            force_cache_layer: Some("l1".into()),
+            fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(
+            json.contains("\"force_cache_layer\""),
+            "force_cache_layer must appear in JSON: {json}"
+        );
+        assert!(
+            json.contains("\"fallbacks\""),
+            "fallbacks must appear in JSON: {json}"
+        );
+        let roundtripped: RouteAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.target_model, original.target_model);
+        assert_eq!(roundtripped.force_cache_layer, original.force_cache_layer);
+        assert_eq!(roundtripped.fallbacks, original.fallbacks);
+    }
+
+    /// Cross-crate lossless round-trip: JSON produced by
+    /// `tt_routing::RouteAction` (target_model + fallbacks + force_cache_layer)
+    /// is accepted by `tt_plan_core::RouteAction` without dropping any field,
+    /// and vice-versa. The wire shapes are now structurally identical.
+    #[test]
+    fn route_action_cross_type_wire_compat() {
+        // Simulate the JSON a tt_routing::RouteAction with all fields would emit.
+        let gateway_json = r#"{"target_model":"gpt-4o-mini","fallbacks":["claude-haiku"],"force_cache_layer":"l2"}"#;
+        let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
+        assert_eq!(plan_action.target_model, "gpt-4o-mini");
+        assert_eq!(plan_action.fallbacks, vec!["claude-haiku"]);
+        assert_eq!(plan_action.force_cache_layer.as_deref(), Some("l2"));
+        // Re-serialize: must re-produce the same JSON (field order is
+        // declaration order, which is now identical between the two types).
+        let reemitted = serde_json::to_string(&plan_action).unwrap();
+        assert_eq!(reemitted, gateway_json);
+    }
 }

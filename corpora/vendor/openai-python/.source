@@ -1,0 +1,6 @@
+name = "openai-python"
+url = "https://github.com/openai/openai-python"
+ref = "HEAD"
+commit = "09ece2ee0aa73077d04ac3669d101120076b52fb"
+glob = "examples/*.py"
+files = 8

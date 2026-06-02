@@ -2,194 +2,87 @@
 
 Single source of truth for actionable work. Entries are checkboxes; flip to `[x]` when done. Sync to GitHub Issues with `autopilot` label via `./scripts/backlog.sh sync`.
 
-**Format**: `- [PRIORITY] [task-id] subagent: brief description (est: $X.XX)`
+**Format**: `- [ ] [PRIORITY] [task-id] subagent: brief description (§review-ref) (est: $X.XX)`
 
 - `PRIORITY` ∈ {P0 (blocker), P1 (next), P2 (soon), P3 (whenever)}
 - `task-id` is short kebab-case, used in branch names: `autopilot/<task-id>`
-- `subagent` is the matching specialist: `rust-crate-builder`, `provider-adapter-author`, `inspect-rule-author`, `astro-page-builder`, `plan-replay-validator`
-- `est` is a rough token-cost estimate
+- `subagent` ∈ `rust-crate-builder`, `provider-adapter-author`, `inspect-rule-author`, `astro-page-builder`, `plan-replay-validator`
+- `§ref` points to the section in `PROJECT_REVIEW.md` (2026-05-30 senior review) the item came from.
 
-## Week 1 — Gateway skeleton + OpenAI adapter
+> **History:** all completed pre-2026-05-30 items live in `.claude/BACKLOG_ARCHIVE.md` (frozen snapshot). Cloud-side items live in `../cloud/.claude/BACKLOG.md`.
+>
+> **Note on prior review:** the 2026-05-29 follow-ups shipped, but the 2026-05-30 audit found several were *incomplete*. Items below tagged "(extends …)" supersede a previously-closed item rather than duplicating it.
 
-- [x] [P0] [w1-axum-skeleton] rust-crate-builder: Wire Axum app in `crates/core/src/server.rs` with `/v1/chat/completions` POST, `/v1/embeddings` POST, `/v1/models` GET, `/health` GET. Pass through to provider registry. (est: $0.40)
-- [x] [P0] [w1-openai-trait-impl] provider-adapter-author: Implement `Provider` trait for `tt-provider-openai` — chat_completion (non-streaming first), pricing table for GPT-5.5/5.4/o3/o4-mini/4o/4o-mini. (est: $0.80)
-- [x] [P0] [w1-openai-streaming] provider-adapter-author: SSE streaming for OpenAI, with insta snapshot fixtures for typed events. (est: $0.60)
-- [x] [P0] [w1-openai-tests] provider-adapter-author: httpmock tests for 200/429/500/network-reset/malformed-JSON/partial-stream. Min 20 fixtures. (est: $0.50)
-- [x] [P1] [w1-redis-l1] rust-crate-builder: Wire `tt-cache` Redis impl. Key = SHA-256 of normalized request. Default TTL 24h. (est: $0.40)
-- [x] [P1] [w1-request-logs-schema] rust-crate-builder: SQLx migration for `request_logs` table per spec §8.2. Include `baseline_cost_usd`, `actual_cost_usd`, `cache_layer`, `trace_id`. (est: $0.50)
-- [x] [P1] [w1-otel-init] rust-crate-builder: OpenTelemetry init in `tt-telemetry`. Span the full request lifecycle. Trace ID into response header. (est: $0.30)
-- [x] [P1] [w1-audit-write-path] rust-crate-builder: Audit-row write path in `tt-telemetry::audit`, hash-chained + Ed25519. Called on `provider_credential.add`, `route.create`, etc. (est: $0.70)
-- [x] [P2] [w1-dockerfile] rust-crate-builder: Multi-stage Dockerfile for `tt-cli`, push to GHCR. (est: $0.20)
-- [x] [P2] [w1-fly-toml] rust-crate-builder: `fly.toml` for the Gateway. Single-region `iad` initially. (est: $0.20)
+---
 
-## Week 0 follow-ups (not blocking, but worth doing)
+## Review follow-ups (2026-05-30) — public repo (gateway, cache, routing, plan, inspect, retrieval, auth, preview, MCP, CLI, providers)
 
-- [x] [P2] [w0-cargo-resolves] verify cargo workspace resolves once Rust 1.85 is installed locally.
-- [ ] [P2] [w0-fp-rate-script] write `scripts/measure-fp-rate.sh` for Inspect rule FP measurement (used by inspect-rule-author). [BLOCKED — needs Week 14 Inspect rules + corpora]
-- [ ] [P2] [w0-corpora-seed] add `corpora/` directory with small open-source LangChain/Vercel-AI samples for Inspect FP measurement. [BLOCKED — defer to Week 14 prep]
-- [x] [P3] [w0-pr-template] add `.github/pull_request_template.md` enforcing handoff format. _(done in this session)_
-- [x] [P3] [w0-issue-templates] add `.github/ISSUE_TEMPLATE/` for autopilot/bug/feature. _(done in this session)_
+### P0 — critical / highest-leverage
 
-- [x] [P1] [w1-openai-register-in-core] rust-crate-builder: Register OpenAiProvider in crates/core/src/registry.rs; update build_router caller to seed AppState with it. Update tt-core models endpoint test to assert OpenAI models appear. (est: $0.30)
+- [x] [P0] [rv-l2-cache-correctness] rust-crate-builder: Make the L2 semantic cache safe — add `AND model = $N` to the lookup (l2.rs:356-367) + in-memory scan (l2.rs:208-216); embed full context (system + history) not just the last user message (chat.rs:333-336,567-580); add an `embedding_model`/version column to cache_entries + lookup filter so embedder swaps partition cleanly. (§2.1/2.3/2.5) (est: $1.50)
+- [x] [P0] [rv-cache-nondeterministic-guard] rust-crate-builder: Gate caching of non-deterministic requests (skip when temperature>0 / top_p<1 / n>1 / seed set / response has tool_calls) and wire a `tt_extras` cache-control (bypass/refresh/read-only/ttl) before the L1/L2 branches (chat.rs:295-330; key.rs; messages.rs:42-45). (§2.2/2.7) (est: $1.00)
+- [x] [P0] [rv-plan-apply-writes-routes] plan-replay-validator: Extend `apply_plan` + the `PlanStore` trait to persist `proposed_routes` and emit them for the routing table; persist `proposed_routes` at plan-create time (apply.rs:162-197; types.rs:217). Pairs with cloud `rv-plan-apply-route` (dashboard+handler writeback). (§1.1/1.9) (est: $1.20)
 
-## Week 2-4 — Anthropic adapter (the worked reference)
+### P1 — high
 
-- [x] [P0] [w2-anthropic-trait] provider-adapter-author: Implement `Provider` trait for `crates/providers/anthropic/` — chat_completion, streaming, embeddings stubs, pricing table for Haiku 4.5 / Sonnet 4.6 / Opus 4.7. (est: $1.00)
-- [x] [P0] [w2-anthropic-translate] provider-adapter-author: `translate.rs` — separate system messages into Anthropic `system` block array, map tool_calls → ToolUse blocks, map Tool role → user ToolResult, default max_tokens=4096. Min 20 fixtures. (est: $1.20)
-- [x] [P0] [w2-anthropic-cache-inject] provider-adapter-author: Auto-inject `cache_control: ephemeral` on last system block when token count ≥ 1024 in `translate.rs`; config flag to disable. (est: $0.60)
-- [x] [P0] [w2-anthropic-stream] provider-adapter-author: Typed SSE stream translation in `stream.rs` — `message_start`, `content_block_delta`, `message_delta`, tool-use JSON fragment accumulation, ping skip, mid-stream error propagation. (est: $1.00)
-- [x] [P0] [w2-anthropic-error-map] provider-adapter-author: `errors.rs` — map 401→Unauthorized, 429→RateLimited with retry_after_ms, 400→InvalidRequest, 404→ModelNotFound, 5xx→ProviderUpstream. (est: $0.40)
-- [x] [P1] [w2-anthropic-httpmock-tests] provider-adapter-author: httpmock integration tests for 200/429/500/network-reset/malformed-event/partial-stream; insta snapshots for translate_request and translate_response. Min 20 fixture cases. (est: $0.80)
-- [x] [P1] [w3-anthropic-register] rust-crate-builder: Register AnthropicProvider in `crates/core/src/registry.rs`; update models endpoint to include Anthropic models; verify contract test passes. (est: $0.30)
-- [x] [P1] [w4-load-test-gateway] rust-crate-builder: Load test script using `oha` against local Gateway: p50 miss <30ms, p50 hit <5ms on cache; verify audit rows written for `route.*` events. (est: $0.40)
+- [x] [P1] [rv-streaming-cost-accuracy] rust-crate-builder: Fix streaming telemetry — tokenize output via `tt_tokenize` instead of byte counts (sse.rs:84-98,112-116); apply the OpenRouter `fee_multiplier` on the streaming cost+baseline path (sse.rs:455-476); use `tt_tokenize` for the streaming input estimate (chat.rs:201-240). (extends `fee-multiplier-apply`, which fixed non-stream only) (§2.12/2.13/2.15) (est: $0.80)
+- [x] [P1] [rv-routing-capability-floor] rust-crate-builder: Intersect a request's required capabilities (vision/tools/json/reasoning) + estimated input tokens against candidate `ModelInfo` before any route rewrite or failover; skip unqualified candidates and log `route_skipped_capability` instead of silently degrading (routing/lib.rs:135-161; chat.rs:983-987; failover.rs:107-128). (§2.11) (est: $0.80)
+- [x] [P1] [rv-ssrf-url-guard] rust-crate-builder: Shared `tt_shared::url_guard` — https-only + reject RFC1918/loopback/link-local/metadata IPs; use it when building every provider client; add an `extra_headers` denylist (Authorization/Host) in the compat/openai/anthropic adapters (compat.rs:160-175; credentials.rs). Cloud `rv-ssrf-write-validate` adds write-time validation. (§5.2) (est: $0.80)
+- [x] [P1] [rv-gateway-keycache-argon2] rust-crate-builder: Add the documented short-TTL verified-key cache (blake3/sha256 of token → ApiKeyContext, ~60s) in front of per-request argon2 in the auth middleware; fix the stale `lib.rs:4` claim (middleware/auth.rs:68; auth/lib.rs:4; keys.rs:273). Restores the sub-30ms target; removes a CPU-DoS lever. (§5.4) (est: $0.60)
+- [x] [P1] [rv-rag-similarity-floor] rust-crate-builder: Route retrieval substitution through `top_k(min_similarity)` with a sane default floor + per-tag override; leave the payload unsubstituted when nothing clears it (substitute.rs:54-66; search.rs:9-22). (§2.4) (est: $0.40)
+- [x] [P1] [rv-retrieval-orgid-failclosed] rust-crate-builder: Fail closed (skip substitution + warn header) when `ApiKeyContext` is absent instead of falling back to the shared `Uuid::nil()` retrieval namespace (middleware/retrieval.rs:208-218). (extends `retrieval-orgid-isolation`) (§5.7) (est: $0.30)
+- [x] [P1] [rv-inspect-walker-hidden-dirs] inspect-rule-author: Allowlist `.cursor`/`.github`/`.claude` before the leading-dot prune so `config-agents-md-contains-secrets` can actually scan `.cursor/rules/*.md`; add a `.cursor/rules/` fixture (walk.rs:63; config_agents_md_contains_secrets.rs:34). (§4.6) (est: $0.30)
+- [x] [P1] [rv-key-prefix-entropy] rust-crate-builder: Widen the key display prefix to ~12 hex chars (≥48 bits) or retry issuance on unique-violation, and surface a retryable error instead of opaque `Store(...)` (keys.rs:31,268-269,291). (§4.14) (est: $0.30)
+- [x] [P1] [rv-truncated-column] rust-crate-builder: Add a `truncated BOOLEAN NOT NULL DEFAULT false` migration + INSERT bind, and exclude/down-weight truncated rows in realized-savings sums; add a bind-count test (request_logs.rs:52-53,134-167; migrations/0001). (§2.14) (est: $0.30)
+- [x] [P1] [rv-inspect-feeds-plan] rust-crate-builder: Converter from `preview::RouteSuggestion` / inspect findings → `Vec<ProposedRoute>` + a `tt inspect --suggest-plan` (and pre-filled PlanInput) so Inspect actually feeds Plan (preview/route_suggestions.rs:41-53; cli/main.rs:924-947). (§1.4) (est: $0.80)
 
-## Week 5 — Gateway provider breadth (compatible providers)
+### P2 — soon
 
-- [x] [P0] [w5-gemini-adapter] provider-adapter-author: Implement `Provider` trait for `crates/providers/gemini/` — translate to `:generateContent` REST endpoint, `systemInstruction` extraction, `functionDeclarations` tool format, JSON-array `:streamGenerateContent` streaming, pricing for Flash-Lite / Flash / Pro with context-length brackets. (est: $1.50)
-- [x] [P0] [w5-gemini-stream] provider-adapter-author: Gemini JSON-array stream translation in `crates/providers/gemini/src/stream.rs` — parse server-streamed JSON chunks, emit OpenAI-format ChatCompletionChunks, aggregate usage from final chunk. (est: $0.80)
-- [x] [P1] [w5-mistral-adapter] provider-adapter-author: Implement `Provider` trait for `crates/providers/mistral/` using `OpenAICompatibleProvider` base; pricing table; model list; base_url override. (est: $0.40)
-- [x] [P1] [w5-groq-adapter] provider-adapter-author: Implement `Provider` trait for `crates/providers/groq/` using `OpenAICompatibleProvider` base; pricing table; model list. (est: $0.40)
-- [x] [P1] [w5-together-adapter] provider-adapter-author: Implement `Provider` trait for `crates/providers/together/` using `OpenAICompatibleProvider` base; pricing table; model list. (est: $0.40)
-- [x] [P1] [w5-openrouter-adapter] provider-adapter-author: Implement `Provider` trait for `crates/providers/openrouter/` using `OpenAICompatibleProvider` base; 5% BYOK fee in pricing; model list via `/models` endpoint. (est: $0.50)
-- [x] [P2] [w5-provider-contract-ci] rust-crate-builder: Add `provider-contract-tests.yml` GitHub Actions workflow — weekly schedule, `--ignored` flag, $5/wk cap, opens issue with `provider-broken` label on failure. (est: $0.40)
+- [x] [P2] [rv-cache-stampede-singleflight] rust-crate-builder: Per-key single-flight (keyed async mutex / Notify map, or short Redis SETNX) so concurrent identical misses share one upstream call (chat.rs:303-382). (§2.6) (est: $0.80)
+- [x] [P2] [rv-per-tier-ttl] rust-crate-builder: Plumb the caller's tier into L1/L2 TTL selection (24h/7d/30d) + per-route TTL override (state.rs:22-24; chat.rs:47-50,720). (§2.8) (est: $0.60)
+- [x] [P2] [rv-sse-crlf-parsing] provider-adapter-author: SSE parsers accept `\r\n\r\n` event separators + optional space after `data:` across compat/anthropic/gemini `stream.rs`; add CRLF + no-space regression fixtures (stream.rs:241,269-271 et al). (§4.1) (est: $0.40)
+- [x] [P2] [rv-retry-jitter-fanout] rust-crate-builder: Add full jitter to retry backoff, bound the failover×retry fan-out (smaller per-candidate attempts when a chain exists), and feed retry-exhaustion into the circuit breaker (failover.rs:107-129; retry.rs:43-49). (§4.2) (est: $0.40)
+- [x] [P2] [rv-fallback-eligible-5xx] rust-crate-builder: Guard `is_fallback_eligible` on `status >= 500` (keep 408/429) so deterministic 4xx short-circuits failover instead of fanning out (shared/error.rs:52-59). (§4.3, quick win) (est: $0.10)
+- [x] [P2] [rv-gemini-key-header] provider-adapter-author: Send the Gemini key in the `x-goog-api-key` header instead of the URL query string (gemini/stream.rs:66,71-72). (§5.2 quick win) (est: $0.20)
+- [x] [P2] [rv-replay-priority-tiebreak] plan-replay-validator: Deterministic tiebreak (route_id/name) on the equal-priority route sort so identical configs project identically (replay.rs:35-36; routing.rs:12-16). (§4.12) (est: $0.20)
+- [x] [P2] [rv-l2-poisoning-per-threshold] plan-replay-validator: Report L2 poisoning candidates per-threshold (or dedup across passes) instead of summing across the whole sweep (l2_projection.rs:104-108). (§4.11) (est: $0.20)
+- [ ] [P2] [rv-batch-api] rust-crate-builder: Batch-API dispatch path (OpenAI `/v1/batches`, Anthropic Message Batches) keyed off a route action / `tag=background`, polled async, reporting the ~50% discount as realized savings (routing/lib.rs:62-64). (§2.16) (est: $1.50) [NEEDS-SPEC — turns the sync proxy into an async job model (submit→poll→retrieve→reconcile); a feature needing a spec→plan cycle, not a one-shot autopilot iteration. Deferred from the auto-loop.]
+- [x] [P2] [rv-mcp-find-route-honest] rust-crate-builder: Back `find_route_for` with real per-task-class telemetry, or downgrade its tool description from "historical / HIGH quality confidence" to "heuristic default by keyword" (mcp/tools/find_route_for.rs:23,35-48). (§1.7) (est: $0.40)
+- [x] [P2] [rv-plan-apply-cli-honest] rust-crate-builder: Make `tt plan --apply` exit non-zero with a clear message until the apply path is wired, instead of silently running projection-only (cli/main.rs:67-70,934-939). (§1.8 quick win) (est: $0.10)
+- [x] [P2] [rv-rag-savings-embedding-cost] rust-crate-builder: Account embedding-call cost in RAG net-savings, clamp/skip negative substitution deltas, batch per-message embeddings, and use the tokenizer not byte/4 (substitute.rs:63,71-75; embed.rs:27). (§2.17) (est: $0.40)
+- [x] [P2] [rv-inspect-agent-loop-scope] inspect-rule-author: Scope `agent-no-termination-condition`'s termination search to the AST loop body, tighten the broad `budget`/`timeout` tokens, and add a multi-function (one bounded + one unbounded) fixture (agent_no_termination_condition.rs:60-61,91,110). (§4.7) (est: $0.40)
 
-## Week 6 — Local providers + streaming hardening
+### P3 — whenever
 
-- [x] [P0] [w6-local-crate] provider-adapter-author: Implement `crates/providers/local/` crate with `OpenAICompatibleProvider` impl, `is_local: true` flag, cost_per_million=0, higher default timeouts; covers Ollama (port 11434), vLLM (port 8000), LM Studio (port 1234). (est: $0.60)
-- [x] [P0] [w6-gateway-dispatch] rust-crate-builder: Wire gateway request pipeline in tt-core: resolve provider via registry.by_model(req.model), dispatch chat_completion (non-streaming) + chat_completion_stream (SSE), populate X-TokenTrimmer-{Provider,Model-Used,Cost-Usd,Baseline-Cost-Usd,Saved-Usd} response headers, structured trace span. Skip auth/cache/routing — bare minimum dispatch. Tests: 200 success via mocked provider in registry, 404 on unknown model, streaming end-to-end. (est: $0.80)
-- [x] [P0] [w6-concurrent-sse-test] rust-crate-builder: 100 concurrent SSE streams integration test in `crates/core/tests/`; gate must pass before Week 7. (est: $0.60)
-- [ ] [P1] [w6-dogfood-groq-routing] rust-crate-builder: Wire classification routing rule in local Gateway config to send short prompts to Groq for internal dogfooding; verify `route.*` audit rows. (est: $0.30) [BLOCKED — needs routing engine impl + running gateway + Groq API key + audit-row wiring]
+- [x] [P3] [rv-anthropic-cache-write-rate] rust-crate-builder: Add a `cache_write_per_million` rate to ModelPricing/pricing.toml and price `cache_creation_input_tokens` at the ~1.25× write premium (anthropic/stream.rs:551-558; chat.rs:748-758). (§2.18) (est: $0.40)
+- [x] [P3] [rv-pricing-catalog-staleness] rust-crate-builder: Pricing-catalog refresh script/job + a test that warns when newest `effective_at` ages out + a telemetry counter for requests priced at $0 from a missing catalog entry (pricing.toml; pricing.rs:2; chat.rs:744-746). (§2.19) (est: $0.40)
+- [x] [P3] [rv-l2-streaming-cache-write] rust-crate-builder: Accumulate the streamed response (SSE aggregator already tracks usage) and write it to L1/L2 on clean completion when cache-eligible, so streaming traffic builds + benefits from the cache (chat.rs:168-294; sse.rs:55-108). (§2.10) (est: $0.60)
+- [x] [P3] [rv-cache-key-canonicalization] rust-crate-builder: Model-alias canonicalization (dated ids/provider aliases → one key) + optional message whitespace normalization + short-TTL negative caching of deterministic 4xx (key.rs:46-86). (§2.20) (est: $0.60)
+- [x] [P3] [rv-l2-nan-finite-filter] rust-crate-builder: Filter non-finite similarities before `max_by` and validate embeddings are all-finite at insert (l2.rs:208-218). (§4.15) (est: $0.10)
+- [x] [P3] [rv-body-limit-embeddings-stub] rust-crate-builder: Set an explicit `DefaultBodyLimit` sized for the largest context window; return 501 (not a misleading 404) from the `/v1/embeddings` stub with a clear message (server.rs:36-73; embeddings.rs:11-16). (§4.15) (est: $0.30)
+- [x] [P3] [rv-routeaction-shared-type] rust-crate-builder: Define the route condition/action shape once in tt-shared so `tt_routing::RouteAction` and `tt_plan_core::RouteAction` round-trip losslessly (routing/lib.rs:68-81; plan-core/types.rs:130-141). (§1.10) (est: $0.50)
+- [x] [P3] [rv-revoke-key-atomic] rust-crate-builder: Wrap key mutation + audit append in one DB transaction (or emit a metric/alert on the audit-after-mutation failure path) so the chain is a complete record (auth/keys.rs:369-389). (§5.10) (est: $0.40)
+- [x] [P3] [rv-inspect-parallel-scan] rust-crate-builder: Parallelize the per-file inspect scan with rayon for large repos + store source length alongside the 64-bit AST-cache hash to remove the collision class (engine.rs:60-84; parse.rs:73-101). (§4.15) (est: $0.40)
+- [x] [P3] [rv-preview-provider-disambig] rust-crate-builder: Let preview pricing lookup honor the intended provider for cross-listed models instead of first-hit probe order (preview/pricing.rs:33-59). (§4-preview) (est: $0.20)
+- [x] [P3] [rv-env-credential-failclosed] rust-crate-builder: Don't chain the Env credential store as a multi-tenant fallback; boot-assert/metric when `EnvProviderCredentialStore` is active alongside >1 org (credentials.rs:205-265; chat.rs:822-834). (§5.10) (est: $0.30)
+- [ ] [P3] [rv-l2-org-cache-optout] rust-crate-builder: Per-org `semantic_cache_disabled` flag that forces `cache_behavior.do_lookup=do_insert=false` for sensitive orgs (resolve alongside tier in tier_resolver.rs; gate before the L1/L2 branches in chat.rs). Implements the ADR-017 control. (§5.10 follow-up of rv-l2-response-encryption-decision) (est: $0.50)
 
-## Week 7-8 — Auth + billing + dashboard skeleton
+---
 
-- [ ] [P0] [w7-magic-link-auth] rust-crate-builder: Auth.js magic-link via Resend in `apps/dashboard/src/lib/auth.ts`; sessions stored in Postgres, signed with rotating HMAC secret; no passwords. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P0] [w7-stripe-checkout] rust-crate-builder: Stripe Checkout integration in `crates/api/src/billing/`; create customer + subscription on first payment; store in `subscriptions` table. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P0] [w7-stripe-portal] rust-crate-builder: Stripe Customer Portal link endpoint; cancel flow downgrades subscription in `subscriptions` table via webhook. (est: $0.50) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P0] [w7-stripe-webhooks] rust-crate-builder: Stripe webhook handler for `customer.subscription.*` and `invoice.payment_*` events — verify signature, update local state, write audit row for `subscription.changed`. (est: $0.70) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [x] [P0] [w7-api-key-issuance] rust-crate-builder: API key issuance in `crates/auth/src/keys.rs` — `tt_live_*` prefix format, argon2 hash stored, prefix only shown in UI; `apikey.issued` audit row. (est: $0.60)
-- [ ] [P0] [w7-provider-cred-storage] rust-crate-builder: Provider credential storage with XChaCha20-Poly1305 encryption in `crates/api/src/credentials/`; key from Fly secrets; `provider_credential.add` audit row. (est: $0.70) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P1] [w8-dashboard-shell] astro-page-builder: Dashboard shell — login page, "create your first key" onboarding step, empty request log table at `/`; Auth.js session required on all routes. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [x] [P1] [w8-audit-row-gate] rust-crate-builder: Synthetic audit-row integration test — assert that `user.login`, `apikey.issued`, `subscription.changed`, `provider_credential.add` events are all written with valid hash-chain links. (est: $0.50)
+## Carried over — still open from prior backlog (full notes in `.claude/BACKLOG_ARCHIVE.md`)
 
-## Week 11 — HARD CHECKPOINT prep
-
-- [ ] [P0] [w11-e2e-smoke-test] rust-crate-builder: Playwright e2e test covering signup → magic-link → Stripe $1 test → issue key → curl Gateway → dashboard entry appears within 30s. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [x] [P0] [w11-latency-smoke] rust-crate-builder: `oha` load smoke script against prod Fly `iad` — assert p50 miss <30ms, p50 hit <5ms; include in `make ci-local`. (est: $0.30)
-- [ ] [P0] [w11-webhook-replay-attack] rust-crate-builder: Stripe webhook replay-attack test — verify replayed webhook with old timestamp is rejected. (est: $0.30) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P0] [w11-cancel-downgrade] rust-crate-builder: Integration test verifying Customer Portal cancel sets subscription status to `canceled` and removes overage access in `crates/auth/src/keys.rs` quota check. (est: $0.40) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P1] [w11-sentry-integration] rust-crate-builder: Wire Sentry DSN into Gateway and API crates; emit an intentional test error from each service; verify Sentry captures it with trace_id. (est: $0.30) [BLOCKED — needs Sentry DSN + cloud crates to wire into; OSS users may opt out so wiring belongs in cloud-only crate]
-- [x] [P1] [w11-sandbox-test-key] rust-crate-builder: `tt_test_*` sandbox key returns deterministic synthetic response without calling real providers; all response headers populated. (est: $0.40)
-
-## Week 12-13 — Semantic cache (pgvector L2) + cost pages
-
-- [x] [P0] [w12-pgvector-migration] rust-crate-builder: SQLx migration adding `cache_entries` table with `vector(1536)` column and HNSW index per spec §8.2; enable `pgvector` extension in Neon. (est: $0.30)
-- [x] [P0] [w12-embedding-pipeline] rust-crate-builder: Embedding pipeline in `crates/cache/src/l2.rs` — embed last user message via OpenAI `text-embedding-3-small`, insert into `cache_entries`, cosine-similarity lookup with per-org threshold default 0.92. (est: $1.00)
-- [x] [P0] [w12-l2-cache-hit-path] rust-crate-builder: Wire L2 semantic cache into Gateway request flow in `crates/core/src/gateway.rs`; set `X-TokenTrimmer-Cache: hit-l2` header; per-org isolation via `org_id` predicate. (est: $0.60)
-- [ ] [P0] [w12-reconciliation-job] rust-crate-builder: Daily reconciliation worker using Apalis on Postgres (ADR-007) — compare claimed savings against provider invoice totals; write `weekly_reconciliation` table; banner if drift >2%. (est: $1.00) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P1] [w13-dashboard-overview] astro-page-builder: Dashboard `/` overview page — current month spend, savings month-to-date, cache hit rate, top 5 cost drivers; Solid.js islands for charts via uPlot. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P1] [w13-dashboard-costs] astro-page-builder: Dashboard `/costs` cost-explorer page — drill down by API key, model, route, custom tag, time period; `@tanstack/solid-query` for data fetching. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-
-## Week 14 — Inspect CLI + 10 P0 rules
-
-- [x] [P0] [w14-inspect-cli-binary] rust-crate-builder: `tt inspect` binary in `crates/cli/`; tree-sitter for Python + TypeScript; markdown + JSON output formats; `--fail-on` flag; `--output` flag. (est: $0.80)
-- [x] [P0] [w14-inspect-rule-harness] rust-crate-builder: Rule engine harness in `crates/inspect-core/`; loads YAML rule files; runs Tier 1 (AST/regex) and Tier 2 (small model) rules; FP rate measurement via `scripts/measure-fp-rate.sh`. (est: $1.00)
-- [x] [P0] [w14-inspect-cache-anthropic-prompt-cache-missing] inspect-rule-author: Rule `cache-anthropic-prompt-cache-missing` — detect Anthropic calls with system ≥1024 tokens lacking `cache_control`; ≥5 positive + ≥10 negative fixtures; FP rate <5% on corpora/. (est: $0.20)
-- [x] [P0] [w14-inspect-cache-openai-prompt-cache-eligible] inspect-rule-author: Rule `cache-openai-prompt-cache-eligible` — detect OpenAI calls with static prefix ≥1024 tokens that could benefit from prompt caching; fixtures + FP measurement. (est: $0.20)
-- [x] [P0] [w14-inspect-lib-anthropic-sdk-no-cache-control] inspect-rule-author: Rule `lib-anthropic-sdk-no-cache-control` — detect Anthropic SDK calls with long system prompts missing `cache_control`; Python + TS tree-sitter queries; fixtures. (est: $0.20)
-- [x] [P0] [w14-inspect-model-flagship-for-classification] inspect-rule-author: Rule `model-flagship-for-classification` — Tier 2 small-model classifier detects GPT-4*/Claude Sonnet/Gemini Pro calls where prompt asks for classification/label/boolean; fixtures. (est: $0.30)
-- [x] [P0] [w14-inspect-model-flagship-for-extraction] inspect-rule-author: Rule `model-flagship-for-extraction` — Tier 2 small-model classifier detects flagship-model calls extracting structured data from short inputs; fixtures. (est: $0.30)
-- [x] [P0] [w14-inspect-output-no-max-tokens] inspect-rule-author: Rule `output-no-max-tokens` — Tier 1 AST detect LLM calls without `max_tokens` parameter; Python + TS; ≥5 positive + ≥10 negative fixtures. (est: $0.20)
-- [x] [P0] [w14-inspect-conversation-unbounded-history] inspect-rule-author: Rule `conversation-unbounded-history` — Tier 2 detect conversation handlers appending messages indefinitely without pruning; fixtures. (est: $0.30)
-- [x] [P0] [w14-inspect-agent-no-termination-condition] inspect-rule-author: Rule `agent-no-termination-condition` — Tier 2 detect agent loops without max-iteration cap or explicit termination; fixtures. (est: $0.30)
-- [x] [P0] [w14-inspect-config-no-agents-md] inspect-rule-author: Rule `config-no-agents-md` — Tier 1 detect repo root missing `AGENTS.md`, `CLAUDE.md`, `.cursor/rules` or equivalent; fixtures. (est: $0.20)
-- [x] [P0] [w14-inspect-config-agents-md-contains-secrets] inspect-rule-author: Rule `config-agents-md-contains-secrets` — Tier 1 detect API keys, tokens, passwords in AGENTS.md using high-entropy + keyword patterns; fixtures. (est: $0.20)
-- [ ] [P0] [w14-corpora-seed] rust-crate-builder: Seed `corpora/` with small open-source LangChain and Vercel-AI samples; run `scripts/measure-fp-rate.sh` on all 10 rules; gate: FP rate <5% on each. (est: $0.30) [BLOCKED — needs independently-sourced OSS samples + scripts/measure-fp-rate.sh; biased if author of rules also seeds corpora]
-
-## Week 15 — Inspect hosted backend + GitHub Action
-
-- [ ] [P0] [w15-hosted-scan-endpoint] rust-crate-builder: `POST /v1/admin/inspect/runs` endpoint in `crates/api/`; trigger async scan job via Apalis; `GET /v1/admin/inspect/runs/:id` for status + findings; short-lived action token scoped to `/inspect/runs` only. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [x] [P0] [w15-inspect-findings-schema] rust-crate-builder: SQLx migrations for `inspect_runs` and `inspect_findings` tables per spec §8.2; index by `run_id`, `severity`, `rule_id`. (est: $0.30)
-- [x] [P0] [w15-github-action] rust-crate-builder: `tokentrimmer/inspect-action@v1` GitHub Action wrapper — `action.yml` with `token`, `fail-on` inputs; posts check-run summary on PR; authenticate short-lived token via hosted backend. (est: $0.60)
-- [ ] [P1] [w15-dashboard-inspect-page] astro-page-builder: Dashboard `/inspect` page — open findings, severity distribution, projected savings if addressed; Solid.js island for findings table. (est: $0.60) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [x] [P1] [w15-inspect-self-ci] rust-crate-builder: `inspect-self.yml` GitHub Actions workflow — runs `tt inspect` on own repo as blocking CI gate; fails on new HIGH/CRITICAL findings; dogfood gate from Week 14 forward. (est: $0.30)
-
-## Week 16-17 — Plan engine (cost projection)
-
-- [x] [P0] [w16-plan-core-replay] plan-replay-validator: Implement replay engine core in `crates/plan-core/src/replay.rs` — fetch `request_logs` for window, apply proposed config routes, project new model + cost per request; determinism gate (same seed → bit-identical output). (est: $2.00)
-- [x] [P0] [w16-plan-l1-cache-projection] plan-replay-validator: L1 cache projection in `crates/plan-core/src/cache.rs` — exact cache key SHA-256 match within proposed TTL window on in-memory request set. (est: $1.00)
-- [x] [P0] [w16-plan-l2-cache-projection] plan-replay-validator: L2 semantic cache projection — pgvector HNSW in-memory index over window embeddings; cosine-similarity threshold sweep (0.85/0.90/0.92/0.95); cache-poisoning detection heuristics. (est: $2.00)
-- [x] [P0] [w16-plan-bootstrap-ci] plan-replay-validator: Bootstrap CI in `crates/plan-core/src/ci.rs` — 10K iterations non-parametric resampling for cost, savings, cache hit rate, latency percentiles; wide-CI warning when relative width >30%. (est: $2.00)
-- [x] [P0] [w17-plan-cli] rust-crate-builder: `tt plan` CLI subcommand — `--diff`, `--window`, `--sample`, `--quality-budget` flags; render plan summary output matching spec §14 format; `--apply` flag triggers `POST /v1/admin/plans/:id/apply`. (est: $0.80)
-- [ ] [P0] [w17-plan-admin-endpoint] rust-crate-builder: `POST /v1/admin/plans` + `GET /v1/admin/plans/:id` + `POST /v1/admin/plans/:id/apply` in `crates/api/src/plan/`; 202 Accepted with plan_id; async job via Apalis; apply writes atomic Postgres transaction + hot-reload event. (est: $1.00) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [x] [P1] [w17-plan-reconciliation-schema] rust-crate-builder: `plan_runs` table migration per spec §8.2; `plan.applied` audit row; 7d and 30d reconciliation report generation comparing projected vs actual metrics. (est: $0.60)
-- [x] [P1] [w17-plan-self-ci] rust-crate-builder: `plan-self.yml` GitHub Actions workflow — replays synthetic 10K-request workload with insta snapshot; fails if replay output drifts; dogfood gate from Week 17. (est: $0.40)
-
-## Week 18-20 — Reporting (dashboard + weekly digest + trust score)
-
-- [ ] [P0] [w18-dashboard-cache-page] astro-page-builder: Dashboard `/cache` page — hit rates over time, top cached patterns (no raw prompts), L1 vs L2 breakdown; uPlot time-series chart island. (est: $0.60) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P0] [w18-dashboard-routes-page] astro-page-builder: Dashboard `/routes` page — list of active routes, hit rates, savings per route; enable/disable toggle; link to Plan history for each route. (est: $0.60) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P0] [w18-dashboard-plan-pages] astro-page-builder: Dashboard `/plan/index.astro` list + `/plan/[id].astro` detail — past simulations, applied vs unapplied status, projected vs actual comparison, per-route savings breakdown drill-down. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P0] [w18-dashboard-reports-page] astro-page-builder: Dashboard `/reports` page — reconciliation report table, week-over-week comparison, trust score display, download links for CSV/JSON export. (est: $0.60) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P0] [w19-weekly-digest-email] rust-crate-builder: Weekly digest email worker — Resend MJML template with last-week spend, savings, cache hit rate, anomalies, open Inspect findings count, unapplied Plans reminder; scheduled Monday 09:00 local time per org via Apalis. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P0] [w19-trust-score] rust-crate-builder: Trust score computation in `crates/api/src/trust.rs` — 0-100 rolling variance between projected and actual savings across last N applied Plans; update on each reconciliation run; write to `plan_runs.trust_score`; surface in dashboard. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P1] [w20-dashboard-settings-pages] astro-page-builder: Dashboard settings sub-pages — `/settings/api-keys.astro`, `/settings/providers.astro`, `/settings/billing.astro`, `/settings/team.astro`; Stripe Portal link; key revocation; provider credential add/delete. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P1] [w20-dashboard-perf-gate] rust-crate-builder: Playwright p75 load time measurement on dashboard pages; gate: p75 <1.5s; add to `make ci-local`. (est: $0.30) [BLOCKED — needs dashboard which is in cloud repo]
-- [ ] [P2] [w20-inspect-badge] rust-crate-builder: README badge endpoint — `GET /v1/badges/:org_id/inspect` returns SVG with current high/critical/medium counts; serve from `crates/api/`. (est: $0.30) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-
-## Week 21-22 — Polish (PDF, Tier 3 quality, anomaly)
-
-- [ ] [P1] [w21-typst-pdf] rust-crate-builder: Monthly executive PDF in `crates/worker/src/pdf.rs` using `typst-pdf` crate (ADR-005); one-page two-sided layout; headline savings, ROI line, spend trend, top 3 cost drivers, top 3 Inspect findings, Plan history; target <500KB, PDF/UA-1 accessible. (est: $1.00) [BLOCKED — crates/worker is in cloud repo]
-- [ ] [P1] [w21-pdf-scheduled-job] rust-crate-builder: Schedule PDF generation via Apalis on the 1st of each month per org; upload to Cloudflare R2; email link via Resend; store R2 key in `reports` table. (est: $0.50) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [x] [P1] [w21-plan-quality-scoring] plan-replay-validator: Tier 3 LLM-judge quality scoring in `crates/plan-core/src/quality.rs` — stratified sampling, re-run against proposed model (opts-in required), judge-prompt scoring, risk band aggregation (HIGH/MEDIUM/LOW) per spec §7.4. (est: $2.00)
-- [ ] [P1] [w22-anomaly-detection] rust-crate-builder: Anomaly detection worker in `crates/worker/src/anomaly.rs` — z-score on hourly spend with seasonal decomposition; trigger webhook `anomaly.detected` + dashboard notification when deviation >3σ; synthetic 5σ test must fire. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P2] [w22-data-export] rust-crate-builder: CSV/JSON export endpoints in `crates/api/src/export/` — `GET /v1/admin/export/requests` and `GET /v1/admin/export/plans`; scoped to retention window; email download link via Resend when file ready. (est: $0.50) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-
-## Week 23-24 — Private alpha
-
-- [ ] [P0] [w23-free-tier-live] rust-crate-builder: Enable Free tier in production — GitHub OAuth required gate (>7d account, >0 public commits), Cloudflare Turnstile captcha, 60 req/min hard cap, 5K req/mo hard cap (no overage), L1 cache only (no L2 writes), max 2 keys + 2 provider creds per Free org. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-- [ ] [P0] [w23-onboarding-script] astro-page-builder: Onboarding flow — guided steps for first key, first provider cred, first Gateway call; write `onboarding.step.completed` audit events at each step; visible in `/` dashboard overview. (est: $0.60) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P0] [w23-alpha-reconciliation-gate] rust-crate-builder: Run daily reconciliation for 14 consecutive days; gate: drift ≤2% every day; surface in STATUS.md; must pass before beta launch. (est: $0.30) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-- [ ] [P0] [w24-alpha-inspect-fp-gate] rust-crate-builder: Confirm Inspect FP rate <5% on alpha user traffic; `scripts/measure-fp-rate.sh` run against alpha org repos; document results in STATUS.md. (est: $0.30) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-- [ ] [P1] [w24-alpha-bug-triage] rust-crate-builder: Zero P0 bugs open >24h gate; create `scripts/check-p0-bugs.sh` that queries GitHub Issues for open P0 + age >24h; include in `make ci-local`. (est: $0.20) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-
-## Week 25-26 — Bug fix + beta launch
-
-- [ ] [P0] [w25-pro-tier-live] rust-crate-builder: Enable Pro tier ($99/mo) in Stripe; verify quota limits (500K req/mo, 90d retention, CSV/JSON export); gate: Stripe Checkout + Portal flow green in prod. (est: $0.40) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P0] [w25-game-day-runbook] rust-crate-builder: Rehearse game-day: kill Fly `iad` region, observe failover to restore; document in `runbooks/region-failover.md`; verify all PagerDuty alert runbooks exist (100% coverage). (est: $0.50) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-- [ ] [P0] [w25-penetration-test] rust-crate-builder: Pre-launch security checklist — auth path (magic-link replay, session fixation), key handling (timing attack on argon2 compare), audit integrity (hash chain tamper), cross-tenant isolation (org_id scoping); document findings in `SECURITY.md`. (est: $0.50) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P0] [w26-launch-hn-reddit] astro-page-builder: Pre-launch checklist — HN Show HN post drafted, Reddit r/programming post drafted, IH product page, Product Hunt scheduled; verify `tokentrimmer.com` marketing site has correct pricing table, changelog, first blog post live. (est: $0.30) [BLOCKED — needs cloud repo + GitHub remote + Resend/Stripe/Neon accounts]
-- [ ] [P1] [w26-status-page] rust-crate-builder: UptimeRobot status page at `status.tokentrimmer.com` monitoring `/health` on Gateway and API; RSS feed; in-app banner integration for incidents; Sentry WARN+ zero-unticketed gate. (est: $0.30) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-- [x] [P2] [w26-sdk-python-publish] rust-crate-builder: Publish `sdk-python/` as `tokentrimmer` to PyPI; thin wrapper over openai SDK with `tt_tag` convenience param and `.tt` metadata accessor on responses. (est: $0.40)
-- [x] [P2] [w26-sdk-typescript-publish] rust-crate-builder: Publish `sdk-typescript/` as `@tokentrimmer/client` to npm; thin wrapper over openai SDK with `ttTag` convenience param and `.tt` metadata accessor. (est: $0.40)
-
-## Post-beta backlog (Team/Scale/Enterprise rollout)
-
-- [ ] [P1] [post-team-rbac] rust-crate-builder: Team tier RBAC — `org_members.role` enum (owner/admin/member) enforced in API middleware; multiple API keys per role; up to 25 seats. (est: $0.80) [BLOCKED — post-beta cloud/enterprise track]
-- [ ] [P1] [post-team-pr-bot] rust-crate-builder: PR bot GitHub App integration for Team tier — up to 10 repos; posts Inspect findings as check-run on every PR; `fail-on: high` configurable. (est: $0.80) [BLOCKED — post-beta cloud/enterprise track]
-- [ ] [P1] [post-team-sso] rust-crate-builder: Google + GitHub OAuth SSO for Team tier — Auth.js additional providers; session merging with existing magic-link accounts. (est: $0.60) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P1] [post-scale-s3-object-lock] rust-crate-builder: AWS S3 Object Lock Compliance mode audit storage for Scale tier (ADR-009) — sync audit rows to customer-controlled S3 bucket with WORM; `tt audit verify` CLI reads from S3. (est: $1.00) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-- [ ] [P1] [post-scale-slo-proof] rust-crate-builder: SLO dashboard page — rolling 30d uptime, p95 latency, error rate; signed monthly summary PDF showing SLO adherence; required for Scale tier marketing. (est: $0.60) [BLOCKED — post-beta cloud/enterprise track]
-- [ ] [P2] [post-enterprise-workos-saml] rust-crate-builder: WorkOS SAML/OIDC integration for Enterprise tier — replace magic-link with WorkOS managed SSO ($125/connection/mo); configure per-org; audit row for `auth.saml.login`. (est: $1.50) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly)]
-- [ ] [P2] [post-enterprise-customer-s3-sync] rust-crate-builder: Customer S3 bucket sync for Enterprise — IAM role assumption; real-time audit row replication to customer's bucket; SIEM CEF/LEEF export format. (est: $1.00) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-- [ ] [P2] [post-enterprise-docker-compose] rust-crate-builder: Docker Compose self-host bundle for Enterprise — `docker-compose.yml` with Gateway + API + Worker + Postgres+pgvector + Redis + Nginx; `make setup` bootstraps keys and DB; docs at `docs.tokentrimmer.com/self-host`. (est: $0.80) [BLOCKED — needs cloud repo + GitHub remote + external accounts (Stripe/Resend/Neon/Fly/Cloudflare/GitHub OAuth/Stripe)]
-- [ ] [P3] [post-watch-pr-bot-v2] rust-crate-builder: Watch product PR bot for Pro tier — cost diff comment on every PR using Plan projection against merged diff; requires Gateway telemetry baseline ≥14d. (est: $1.50) [BLOCKED — post-beta cloud/enterprise track]
-- [ ] [P3] [post-clickhouse-migration] rust-crate-builder: ClickHouse migration for `request_logs` at Scale-tier write rate — `crates/telemetry/` dual-write Postgres + ClickHouse; Postgres read path fallback; `crates/plan-core/` read adapter. (est: $2.00) [BLOCKED — post-beta cloud/enterprise track]
-
-
-- [x] [P2] [w6-streaming-bench] rust-crate-builder: Criterion benchmark in crates/core/benches/streaming.rs — measure per-chunk SSE overhead through gateway dispatch (excluding provider latency). Target <1ms per chunk. Use mock provider for deterministic timing. (est: $0.40)
-
-- [ ] [P2] [w7-fake-stream-cache] rust-crate-builder: When L1 cache returns a hit for a stream:true request, fake-stream the cached response in chunks via routes/sse.rs to preserve UX. Tests: cached streaming request returns SSE not JSON; X-TokenTrimmer-Cache: hit-l1 header set. [BLOCKED — depends on w7-l1-cache-middleware] (est: $0.50)
-
-- [ ] [P2] [w7-partial-cost-disconnect] rust-crate-builder: Record partial token-cost in request_logs when client disconnects mid-stream. Wrap the SSE response in a guard that observes Tokio Drop and emits the audit row with accumulated usage. Tests: simulated abort via Drop yields request_logs row with truncated completion_tokens. [BLOCKED — depends on w7-telemetry-write-path] (est: $0.60)
-
-- [x] [P1] [fix-config-no-agents-md] inspect-rule-author: Fix config-no-agents-md false-positive: rule fires before walker reaches AGENTS.md because AtomicBool-based stateful design is filesystem-order-dependent. Refactor to a 2-pass approach (engine-level support for finalize() OR rule pre-scans for AGENTS-like files via its own walkdir on first invocation before firing). (est: $0.40)
-
-- [x] [P1] [w4-routing-engine-impl] rust-crate-builder: Implement tt-routing::RoutingEngine — evaluate rule list against RequestContext + ChatCompletionRequest, return matched route. Currently empty stub. Required before w6-dogfood-groq-routing. (est: $0.50)
-
-- [x] [P2] [w17-plan-apply-audit] rust-crate-builder: Add tt_plan_core::apply_plan() library function — updates plan_runs row to status=applied + applied_at, emits plan.applied audit row via AuditWriter (analogous to tt_auth::revoke_key). (est: $0.40)
-
-- [ ] [P2] [w17-plan-reconciliation-worker] rust-crate-builder: 7d/30d reconciliation report worker — Apalis job comparing projected vs actual metrics; writes back to plan_runs.actual_* columns + computes trust_score. [BLOCKED — needs cloud worker] (est: $0.80)
-
-## Completed
-
-- [x] [w0-pre-flight] Harness scaffolding (hooks, agents, Cargo workspace, CI, scripts, governance docs). 2026-05-25.
+- [ ] [P0] [w11-e2e-smoke-test] rust-crate-builder: signup→magic-link→Stripe $1→issue key→curl Gateway→dashboard within 30s. 🟡 authored + CI-wired. [BLOCKED — CI/staging only, not runnable in-sandbox] (est: $0.80)
+- [ ] [P2] [w20-dashboard-perf-gate] rust-crate-builder: Playwright p75<1.5s on dashboard pages. 🟡 authored + CI-wired. [BLOCKED — CI/staging only, not runnable in-sandbox] (est: $0.30)
+- [ ] [P0] [w23-free-tier-live] rust-crate-builder: Enable Free tier in prod. [BLOCKED — external accounts] Remaining code bit (per-org tier→BudgetLimits) is now tracked as cloud `rv-tier-limits-enforcement`. (est: $0.80)
+- [ ] [P0] [w23-alpha-reconciliation-gate] rust-crate-builder: 14 consecutive days of drift ≤2%. [BLOCKED — needs live alpha traffic] (est: $0.30)
+- [ ] [P0] [w24-alpha-inspect-fp-gate] rust-crate-builder: Inspect FP <5% on real alpha org repos. [BLOCKED — needs alpha traffic] (est: $0.30)
+- [ ] [P1] [post-team-pr-bot] rust-crate-builder: PR-bot GitHub App (free to register), Inspect findings as check-runs, ≤10 repos. [DEFERRED — post-beta, needs GitHub App registration] (est: $0.80)
+- [ ] [P1] [post-team-sso] rust-crate-builder: Google OAuth SSO (free; GitHub half shipped). See review §7.3 for the SAML/self-serve angle. [DEFERRED — post-beta, needs Google OAuth client] (est: $0.60)
+- [ ] [P1] [post-scale-s3-object-lock] rust-crate-builder: WORM audit storage via Cloudflare R2 Bucket Locks (B2 only if certified COMPLIANCE-mode demanded). [DEFERRED — post-beta, needs R2 config] (est: $1.00)
+- [ ] [P1] [post-scale-slo-proof] rust-crate-builder: SLO dashboard + signed monthly PDF. [BLOCKED — post-beta] (est: $0.60)
+- [ ] [P2] [post-enterprise-workos-saml] rust-crate-builder: Defer the build; surface "SSO/SAML on request" and integrate WorkOS ($0 dev; $125/connection when a paying enterprise asks). See review §7.3. [DEFERRED — post-beta, needs WorkOS account] (est: $1.50)
+- [ ] [P2] [post-enterprise-customer-s3-sync] rust-crate-builder: Customer S3-compatible bucket sync + SIEM CEF/LEEF export (any S3 endpoint; not AWS-specific). [DEFERRED — post-beta] (est: $1.00)
+- [ ] [P3] [post-watch-pr-bot-v2] rust-crate-builder: Cost-diff PR comments (same free GitHub App; needs ≥14d telemetry baseline). [DEFERRED — post-beta] (est: $1.50)
+- [ ] [P3] [post-clickhouse-migration] rust-crate-builder: ClickHouse dual-write for request_logs at Scale rate. [BLOCKED — post-beta] (est: $2.00)
+- [ ] [P1] [env-secret-split-rotate] ops: Rotate live keys read this session (TT_MASTER_KEY re-encrypt, TT_ADMIN_TOKEN, FLY_DEPLOY_KEY, Stripe) + split dev/prod secret sets. [BLOCKED — human: key rotation] Re-encryption primitive + runbook already shipped. (est: —)
+- [x] [P2] [rv-ssrf-gemini-guard] rust-crate-builder: Apply tt_shared::url_guard::validate_provider_url to the Gemini adapter base_url (non-stream + stream) — rv-ssrf-url-guard covered compat/openai/anthropic but missed gemini; add allow_local test seam like the other native adapters (§5.2) (est: $0.30)

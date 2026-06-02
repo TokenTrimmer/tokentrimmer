@@ -5,11 +5,12 @@
 //! Week-1+ iterations and intentionally NOT wired here yet — keep the skeleton
 //! testable end-to-end first.
 
+use axum::extract::DefaultBodyLimit;
+use axum::http::StatusCode;
 use axum::{
     routing::{get, post},
     Router,
 };
-use axum::http::StatusCode;
 use tower_http::{
     cors::{Any, CorsLayer},
     timeout::TimeoutLayer,
@@ -19,25 +20,61 @@ use tower_http::{
 use crate::{middleware, routes, AppState};
 
 /// Build the public router. Returns a fully composed `Router` ready to bind.
+///
+/// Retrieval middleware is activated when `TT_RETRIEVAL_STORE` and
+/// `TT_OPENAI_EMBED_KEY` are set in the process environment.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    build_router_with_retrieval(state, middleware::retrieval::build_retrieval_state())
+}
+
+/// Internal constructor that accepts an explicit (possibly `None`) retrieval
+/// state. Used in integration tests to inject a pre-built `RetrievalState`
+/// without relying on process-level env vars.
+pub fn build_router_with_retrieval(
+    state: AppState,
+    retrieval: Option<middleware::retrieval::RetrievalState>,
+) -> Router {
+    let base = Router::new()
         .route("/health", get(routes::health::handler))
         .route("/v1/models", get(routes::models::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))
-        .layer(axum::middleware::from_fn(middleware::trace::middleware))
-        .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(600),
-        ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .with_state(state)
+        .route(
+            "/v1/preview",
+            axum::routing::post(crate::routes::preview::post_preview),
+        );
+
+    let base = match retrieval {
+        Some(rs) => base.layer(axum::middleware::from_fn_with_state(
+            rs,
+            middleware::retrieval::maybe_substitute,
+        )),
+        None => base.layer(axum::middleware::from_fn(
+            middleware::retrieval::maybe_substitute_disabled,
+        )),
+    };
+
+    base.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        middleware::auth::middleware,
+    ))
+    .layer(axum::middleware::from_fn(middleware::trace::middleware))
+    .layer(TraceLayer::new_for_http())
+    .layer(TimeoutLayer::with_status_code(
+        StatusCode::GATEWAY_TIMEOUT,
+        std::time::Duration::from_secs(600),
+    ))
+    .layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+    // Explicit request-body cap. Axum's default is only 2MB — too small for
+    // large-context chat requests (256k-token windows can exceed it). Sized
+    // for the largest supported context; returns 413 on exceed. (§4.15)
+    .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+    .with_state(state)
 }
 
 #[cfg(test)]
@@ -51,14 +88,15 @@ mod tests {
 
     // ── Mock provider ──────────────────────────────────────────────────────────
 
-    use std::sync::Arc;
     use async_trait::async_trait;
     use futures::stream::StreamExt;
+    use std::sync::Arc;
     use tt_shared::{
-        pricing::Capability, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-        EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError,
-        RequestContext, Usage,
         messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
+        pricing::Capability,
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
+        EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+        Usage,
     };
 
     /// In-memory mock provider for dispatch tests.
@@ -102,6 +140,7 @@ mod tests {
                 input_per_million: 1.0,
                 output_per_million: 2.0,
                 cached_input_per_million: Some(0.1),
+                cache_write_per_million: None,
                 effective_at: chrono::Utc::now(),
             })
         }
@@ -145,8 +184,10 @@ mod tests {
             &self,
             _req: ChatCompletionRequest,
             _ctx: &RequestContext,
-        ) -> Result<futures::stream::BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
-        {
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+            ProviderError,
+        > {
             let chunks = vec![
                 ChatCompletionChunk {
                     id: "c1".into(),
@@ -197,19 +238,19 @@ mod tests {
 
     /// Empty-registry app for tests that don't care about providers.
     fn app() -> Router {
-        build_router(AppState::new(ProviderRegistry::new()))
+        build_router_with_retrieval(AppState::new(ProviderRegistry::new()), None)
     }
 
     /// Default-providers app for tests that exercise the model catalog.
     fn app_with_defaults() -> Router {
-        build_router(AppState::with_default_providers())
+        build_router_with_retrieval(AppState::with_default_providers(), None)
     }
 
     /// App pre-wired with `MockProvider`.
     fn app_with_mock() -> Router {
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(MockProvider));
-        build_router(AppState::new(registry))
+        build_router_with_retrieval(AppState::new(registry), None)
     }
 
     fn chat_request(model: &str, stream: bool) -> Request<Body> {
@@ -231,7 +272,12 @@ mod tests {
     #[tokio::test]
     async fn health_returns_ok() {
         let response = app()
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -250,7 +296,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["object"], "list");
         assert_eq!(body["data"].as_array().unwrap().len(), 0);
@@ -275,7 +323,14 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = body["data"].as_array().expect("data should be an array");
         let ids: Vec<&str> = data.iter().filter_map(|m| m["id"].as_str()).collect();
-        for expected in ["gpt-5.5", "gpt-5.4", "gpt-4o", "gpt-4o-mini", "o3", "o4-mini"] {
+        for expected in [
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "o3",
+            "o4-mini",
+        ] {
             assert!(
                 ids.contains(&expected),
                 "expected model {expected} in catalog, got {ids:?}"
@@ -304,7 +359,12 @@ mod tests {
     #[tokio::test]
     async fn trace_id_header_present_on_every_response() {
         let response = app()
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -322,11 +382,21 @@ mod tests {
         let app = app();
         let r1 = app
             .clone()
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let r2 = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let t1 = r1
@@ -365,9 +435,32 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(envelope["error"]["code"], "model_not_found");
+    }
+
+    #[tokio::test]
+    async fn embeddings_returns_501_not_implemented() {
+        let body = serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": "hello",
+        });
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 501 Not Implemented — not a misleading 404 (§4.15).
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     // ── Dispatch tests (new — w6-gateway-dispatch) ─────────────────────────────
@@ -400,7 +493,9 @@ mod tests {
 
         // Provider header is "mock".
         assert_eq!(
-            response.headers()["x-tokentrimmer-provider"].to_str().unwrap(),
+            response.headers()["x-tokentrimmer-provider"]
+                .to_str()
+                .unwrap(),
             "mock"
         );
 
@@ -437,7 +532,9 @@ mod tests {
         );
 
         // Response body should be valid JSON with `id` and `choices`.
-        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["id"], "chatcmpl-mock-1");
         assert!(!body["choices"].as_array().unwrap().is_empty());
@@ -453,7 +550,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(envelope["error"]["code"], "model_not_found");
     }
@@ -469,9 +568,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let content_type = response.headers()["content-type"]
-            .to_str()
-            .unwrap();
+        let content_type = response.headers()["content-type"].to_str().unwrap();
         assert!(
             content_type.contains("text/event-stream"),
             "expected text/event-stream, got {content_type}"
@@ -513,10 +610,16 @@ mod tests {
             .expect("x-tokentrimmer-trace-id missing on streaming response")
             .to_str()
             .unwrap();
-        assert_eq!(trace_id.len(), 36, "trace id should be a UUID, got {trace_id}");
+        assert_eq!(
+            trace_id.len(),
+            36,
+            "trace id should be a UUID, got {trace_id}"
+        );
 
         assert_eq!(
-            response.headers()["x-tokentrimmer-provider"].to_str().unwrap(),
+            response.headers()["x-tokentrimmer-provider"]
+                .to_str()
+                .unwrap(),
             "mock"
         );
     }
@@ -533,7 +636,9 @@ mod tests {
         // ProviderUpstream with status 500 → 502 Bad Gateway from map_provider_error.
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
-        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
             envelope["error"]["message"].as_str().is_some(),
@@ -557,7 +662,9 @@ mod tests {
         }
         #[async_trait]
         impl Provider for CountingProvider {
-            fn id(&self) -> &'static str { "counted-mock" }
+            fn id(&self) -> &'static str {
+                "counted-mock"
+            }
             fn models(&self) -> Vec<ModelInfo> {
                 vec![ModelInfo {
                     id: "counted-model".into(),
@@ -567,33 +674,56 @@ mod tests {
                     max_output_tokens: 4096,
                 }]
             }
-            fn pricing(&self, _: &str) -> Option<ModelPricing> { None }
-            async fn chat_completion(&self, _req: ChatCompletionRequest, _ctx: &RequestContext) -> Result<ChatCompletionResponse, ProviderError> {
+            fn pricing(&self, _: &str) -> Option<ModelPricing> {
+                None
+            }
+            async fn chat_completion(
+                &self,
+                _req: ChatCompletionRequest,
+                _ctx: &RequestContext,
+            ) -> Result<ChatCompletionResponse, ProviderError> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 Err(ProviderError::Unsupported("would-be-called".into()))
             }
-            async fn chat_completion_stream(&self, _req: ChatCompletionRequest, _ctx: &RequestContext) -> Result<futures::stream::BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+            async fn chat_completion_stream(
+                &self,
+                _req: ChatCompletionRequest,
+                _ctx: &RequestContext,
+            ) -> Result<
+                futures::stream::BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+                ProviderError,
+            > {
                 Err(ProviderError::Unsupported("n/a".into()))
             }
-            async fn embeddings(&self, _req: EmbeddingsRequest, _ctx: &RequestContext) -> Result<EmbeddingsResponse, ProviderError> {
+            async fn embeddings(
+                &self,
+                _req: EmbeddingsRequest,
+                _ctx: &RequestContext,
+            ) -> Result<EmbeddingsResponse, ProviderError> {
                 Err(ProviderError::Unsupported("n/a".into()))
             }
         }
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(CountingProvider { calls: Arc::clone(&calls) }));
+        registry.register(Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        }));
         let app = build_router(AppState::new(registry));
 
         let body = serde_json::json!({
             "model": "counted-model",
             "messages": [{"role":"user","content":"hi"}]
-        }).to_string();
+        })
+        .to_string();
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer tt_test_abcdef0123456789abcdef0123456789")
+                    .header(
+                        "authorization",
+                        "Bearer tt_test_abcdef0123456789abcdef0123456789",
+                    )
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -602,24 +732,44 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get("x-tokentrimmer-provider").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("x-tokentrimmer-provider")
+                .and_then(|v| v.to_str().ok()),
             Some("sandbox"),
             "sandbox key must report provider=sandbox, NOT the registered provider"
         );
         assert_eq!(
-            response.headers().get("x-tokentrimmer-cache").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("x-tokentrimmer-cache")
+                .and_then(|v| v.to_str().ok()),
             Some("sandbox")
         );
         assert_eq!(
-            response.headers().get("x-tokentrimmer-cost-usd").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("x-tokentrimmer-cost-usd")
+                .and_then(|v| v.to_str().ok()),
             Some("0.000000")
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 0,
-            "sandbox short-circuit must NOT dispatch to any provider");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "sandbox short-circuit must NOT dispatch to any provider"
+        );
 
-        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body["id"].as_str().unwrap().starts_with("chatcmpl-sandbox-"));
-        assert!(body["choices"][0]["message"]["content"].as_str().unwrap().starts_with("[sandbox]"));
+        assert!(body["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("chatcmpl-sandbox-"));
+        assert!(body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[sandbox]"));
     }
 }

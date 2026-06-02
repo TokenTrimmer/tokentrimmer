@@ -121,7 +121,15 @@ fn single_request_no_candidates_zero_hits_all_thresholds() {
 fn two_identical_requests_within_ttl_hit_at_every_threshold() {
     let emb = vec![1.0_f32, 0.0, 0.0];
     let reqs = vec![
-        make_req(1, 0, "anthropic", "claude", Some(emb.clone()), Some("stop"), 10),
+        make_req(
+            1,
+            0,
+            "anthropic",
+            "claude",
+            Some(emb.clone()),
+            Some("stop"),
+            10,
+        ),
         make_req(2, 30, "anthropic", "claude", Some(emb), Some("stop"), 10),
     ];
     let result = project_l2_hits(&reqs, &cfg());
@@ -184,7 +192,15 @@ fn pair_with_cosine_about_0_93_hits_low_thresholds_only() {
 fn requests_outside_ttl_window_do_not_hit() {
     let emb = vec![1.0_f32, 0.0];
     let reqs = vec![
-        make_req(1, 0, "anthropic", "claude", Some(emb.clone()), Some("stop"), 10),
+        make_req(
+            1,
+            0,
+            "anthropic",
+            "claude",
+            Some(emb.clone()),
+            Some("stop"),
+            10,
+        ),
         // 120s gap, TTL is 60s → second request must miss.
         make_req(2, 120, "anthropic", "claude", Some(emb), Some("stop"), 10),
     ];
@@ -205,9 +221,25 @@ fn requests_outside_ttl_window_do_not_hit() {
 fn different_provider_model_are_isolated() {
     let emb = vec![1.0_f32, 0.0];
     let reqs = vec![
-        make_req(1, 0, "anthropic", "claude", Some(emb.clone()), Some("stop"), 10),
+        make_req(
+            1,
+            0,
+            "anthropic",
+            "claude",
+            Some(emb.clone()),
+            Some("stop"),
+            10,
+        ),
         // Same embedding but different model → must NOT hit.
-        make_req(2, 5, "anthropic", "haiku", Some(emb.clone()), Some("stop"), 10),
+        make_req(
+            2,
+            5,
+            "anthropic",
+            "haiku",
+            Some(emb.clone()),
+            Some("stop"),
+            10,
+        ),
         // Same embedding but different provider → must NOT hit either.
         make_req(3, 10, "openai", "claude", Some(emb), Some("stop"), 10),
     ];
@@ -230,23 +262,34 @@ fn divergent_finish_reason_flags_poisoning_candidate() {
     // finish_reason → every hit counts as a poisoning candidate.
     let emb = vec![1.0_f32, 0.0, 0.0];
     let reqs = vec![
-        make_req(1, 0, "anthropic", "claude", Some(emb.clone()), Some("stop"), 10),
         make_req(
-            2,
-            30,
+            1,
+            0,
             "anthropic",
             "claude",
-            Some(emb),
-            Some("length"),
+            Some(emb.clone()),
+            Some("stop"),
             10,
         ),
+        make_req(2, 30, "anthropic", "claude", Some(emb), Some("length"), 10),
     ];
     let result = project_l2_hits(&reqs, &cfg());
 
-    // 4 thresholds × 1 hit each × poisoning on every hit = 4 candidates.
-    let total_hits: u32 = result.per_threshold.iter().map(|p| p.projected_l2_hits).sum();
+    // 4 thresholds × 1 hit each = 4 projected hits across the sweep.
+    let total_hits: u32 = result
+        .per_threshold
+        .iter()
+        .map(|p| p.projected_l2_hits)
+        .sum();
     assert_eq!(total_hits, 4);
-    assert_eq!(result.poisoning_candidates, 4);
+    // Each threshold reports its OWN poisoning count (the single divergent
+    // request poisons at every threshold it hits → 1 per threshold).
+    for p in &result.per_threshold {
+        assert_eq!(p.poisoning_candidates, 1);
+    }
+    // Aggregate dedups the single distinct candidate request → 1, NOT the
+    // old cross-sweep sum of 4.
+    assert_eq!(result.poisoning_candidates, 1);
 }
 
 #[test]
@@ -255,13 +298,30 @@ fn divergent_output_tokens_flags_poisoning_candidate() {
     // beyond max(20, 100/4) = 25 → poisoning candidate.
     let emb = vec![1.0_f32, 0.0, 0.0];
     let reqs = vec![
-        make_req(1, 0, "anthropic", "claude", Some(emb.clone()), Some("stop"), 100),
+        make_req(
+            1,
+            0,
+            "anthropic",
+            "claude",
+            Some(emb.clone()),
+            Some("stop"),
+            100,
+        ),
         make_req(2, 30, "anthropic", "claude", Some(emb), Some("stop"), 200),
     ];
     let result = project_l2_hits(&reqs, &cfg());
-    let total_hits: u32 = result.per_threshold.iter().map(|p| p.projected_l2_hits).sum();
+    let total_hits: u32 = result
+        .per_threshold
+        .iter()
+        .map(|p| p.projected_l2_hits)
+        .sum();
     assert_eq!(total_hits, 4);
-    assert_eq!(result.poisoning_candidates, 4);
+    // Per-threshold each row owns its count; aggregate dedups to the single
+    // distinct candidate request (was 4 under the old summed behaviour).
+    for p in &result.per_threshold {
+        assert_eq!(p.poisoning_candidates, 1);
+    }
+    assert_eq!(result.poisoning_candidates, 1);
 }
 
 // --------------------------------------------------------------------- (9)
@@ -322,11 +382,43 @@ fn determinism_serialized_byte_identical() {
     let emb2 = vec![0.0_f32, 1.0];
     let emb3 = vec![0.9_f32, 0.4358899]; // ~cos 0.9; sits at ~0.9
     let reqs = vec![
-        make_req(1, 0, "anthropic", "claude", Some(emb1.clone()), Some("stop"), 10),
-        make_req(2, 5, "anthropic", "claude", Some(emb1.clone()), Some("stop"), 10),
+        make_req(
+            1,
+            0,
+            "anthropic",
+            "claude",
+            Some(emb1.clone()),
+            Some("stop"),
+            10,
+        ),
+        make_req(
+            2,
+            5,
+            "anthropic",
+            "claude",
+            Some(emb1.clone()),
+            Some("stop"),
+            10,
+        ),
         make_req(3, 10, "anthropic", "haiku", Some(emb1), Some("stop"), 10),
-        make_req(4, 15, "anthropic", "claude", Some(emb2.clone()), Some("length"), 50),
-        make_req(5, 20, "anthropic", "claude", Some(emb2), Some("length"), 100),
+        make_req(
+            4,
+            15,
+            "anthropic",
+            "claude",
+            Some(emb2.clone()),
+            Some("length"),
+            50,
+        ),
+        make_req(
+            5,
+            20,
+            "anthropic",
+            "claude",
+            Some(emb2),
+            Some("length"),
+            100,
+        ),
         make_req(6, 25, "anthropic", "claude", Some(emb3), Some("stop"), 10),
         make_req(7, 30, "anthropic", "claude", None, None, 10),
     ];
@@ -338,7 +430,10 @@ fn determinism_serialized_byte_identical() {
     assert_eq!(a.poisoning_candidates, b.poisoning_candidates);
     let ja = serde_json::to_string(&a.per_threshold).unwrap();
     let jb = serde_json::to_string(&b.per_threshold).unwrap();
-    assert_eq!(ja, jb, "L2 projection must produce byte-identical output across runs");
+    assert_eq!(
+        ja, jb,
+        "L2 projection must produce byte-identical output across runs"
+    );
 }
 
 #[test]
@@ -346,8 +441,24 @@ fn determinism_input_permutation_safe() {
     // Same set, presented in two different input orders — sort-by-(ts, id)
     // makes the projection invariant.
     let emb = vec![1.0_f32, 0.0, 0.0];
-    let r1 = make_req(1, 0, "anthropic", "claude", Some(emb.clone()), Some("stop"), 10);
-    let r2 = make_req(2, 5, "anthropic", "claude", Some(emb.clone()), Some("stop"), 10);
+    let r1 = make_req(
+        1,
+        0,
+        "anthropic",
+        "claude",
+        Some(emb.clone()),
+        Some("stop"),
+        10,
+    );
+    let r2 = make_req(
+        2,
+        5,
+        "anthropic",
+        "claude",
+        Some(emb.clone()),
+        Some("stop"),
+        10,
+    );
     let r3 = make_req(3, 10, "anthropic", "claude", Some(emb), Some("stop"), 10);
 
     let forward = vec![r1.clone(), r2.clone(), r3.clone()];

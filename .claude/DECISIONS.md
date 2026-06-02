@@ -218,6 +218,33 @@ Format per entry: ID, date, status, context (what problem), decision (what we ch
 
 ---
 
+## ADR-016 — `min_machines_running = 1` for the Gateway, no scale-to-zero (2026-05-27)
+
+**Status**: Adopted
+
+**Context**: Fly supports `min_machines_running = 0` (scale-to-zero, machine boots on first request) and `min_machines_running >= 1` (always-on). Scale-to-zero saves ~$1.50/mo of idle compute on a `shared-cpu-2x` / 512MB instance; the cost is a ~20–30 s cold-start on the first request after idle. Cold boot of the `tt gateway` binary itself is <1 s, but the cold-start budget on Fly's side includes image pull and the machine spin-up, and a misconfigured `REDIS_URL` previously caused the whole boot to hang past the 5 s grace window (see `boot_timeout` in `cli/src/main.rs`).
+
+**Decision**: Keep `min_machines_running = 1` in `fly.toml`. Gateway is always-on.
+
+The Gateway's product promise is a `p50 miss < 30 ms / p50 hit < 5 ms` latency budget (spec §4). Letting a customer's first request after idle take 20–30 s makes the product feel broken at the exact moment they're evaluating it — the opposite of the "TokenTrimmer is faster than calling OpenAI directly" pitch.
+
+The $1.50/mo idle cost is trivial vs the brand cost of a cold start. We re-evaluate only if:
+- Idle cost rises (e.g., moving to a larger machine class), AND
+- Traffic is bursty enough that scale-to-zero would actually save meaningful money, AND
+- We have a warm-pool / preemptive boot story to keep customer cold starts <2 s.
+
+Until all three are true, stay at 1.
+
+**Consequences**:
+- ~$1.50/mo of always-on idle compute. Acceptable.
+- One machine = no automatic regional failover. ADR-010 already accepted single-region (`iad`) until $5K MRR; this is consistent.
+- Deploys briefly run two machines (blue/green via Fly's release strategy) — billing barely changes.
+- A hung boot (timeout in `tt-config` env load or external dependency connect) takes the whole gateway down. Mitigated by the 5 s `tokio::time::timeout` wrappers around DB + Redis connects so any one external dep can fail without crashlooping the process.
+
+**Pointers**: `fly.toml` (`http_service` block), `crates/cli/src/main.rs` (`run_gateway` boot timeouts), HANDOFF.md (gateway deploy session narrative).
+
+---
+
 ## How to add a decision
 
 When you make a non-trivial call:
@@ -229,3 +256,21 @@ When you make a non-trivial call:
 5. **Pointers** should be enough that someone re-reading 6 months from now can find the implementation.
 
 When a decision is reversed, mark the old one `Superseded by ADR-NNN` and write the new one — never delete history.
+
+---
+
+## ADR-017 — No encryption-at-rest for L2 cached responses; per-org opt-out instead (2026-05-30)
+
+**Status**: Adopted
+
+**Context**: PROJECT_REVIEW.md §5.10 flagged that the L2 semantic cache stores responses unencrypted. The L2 table `cache_entries` (migration `0002_cache_entries`) persists per row: `embedding vector(1536)`, `response JSONB`, `model`, token counts, TTLs. By design (migration 0002 header) it NEVER stores the original prompt text — only its embedding. L1 (Redis, `redis_impl.rs` `set_ex`) is short-TTL/ephemeral; the durable at-rest surface is the L2 Postgres table. We already run a per-org AEAD scheme (XChaCha20-Poly1305, per-row key = `SHA-256(TT_MASTER_KEY ‖ domain ‖ org_id)`, AAD bound to org_id, nonce-prefixed) for genuinely-secret recoverable data in `crates/auth/src/credentials.rs` and `crates/retrieval/src/audit.rs`.
+
+**Decision**: Do NOT encrypt the L2 `response` column at rest in v1. Instead (1) document the residual threat (this ADR) and (2) ship a per-org opt-out: orgs with sensitive payloads can disable semantic caching entirely so nothing of theirs is persisted. The opt-out is tracked as `rv-l2-org-cache-optout`.
+
+**Consequences**:
+- The high-value exfil concern is the **embeddings** (a leaked embedding can be partially inverted to recover prompt semantics). Encrypting only `response` leaves `embedding` plaintext, and `embedding` cannot be encrypted without destroying the HNSW cosine index (0002) that is the entire reason L2 exists — so response-only encryption buys little against the stated threat.
+- Response-only encryption stays cheap to add later (reuse `retrieval/audit.rs` verbatim, `response JSONB` → `BYTEA`, domain separator `tt-cache:l2_response:v1`) but would add a decrypt on every cache hit (hot path, `chat.rs` `build_hit_l2_response`) and join the `TT_MASTER_KEY` rotation set (see `docs/SECRETS.md`).
+- Residual threat accepted: a DB-at-rest snapshot/backup leak or staff read of `cache_entries` yields per-org embeddings + cached responses (NOT raw prompts); org_id scoping keeps it per-tenant attributable. Out of scope: cross-tenant read at query time (lookup is `WHERE org_id = $1`), live SQLi (parameterized). Mitigated by: no prompt text stored, Fly Postgres disk encryption, and the per-org opt-out.
+- Revisit triggers: a contract requires column-level encryption beyond disk encryption, or responses become recoverable secrets (e.g. caching tool outputs with PII).
+
+**Pointers**: `crates/core/migrations/0002_cache_entries.up.sql`; `crates/cache/src/l2.rs`; `crates/retrieval/src/audit.rs` (reusable AEAD); follow-up `rv-l2-org-cache-optout` (per-org `semantic_cache_disabled` → force `cache_behavior.do_lookup=do_insert=false`, resolve alongside tier in `tier_resolver.rs`, gate before the L1/L2 branches in `chat.rs`).

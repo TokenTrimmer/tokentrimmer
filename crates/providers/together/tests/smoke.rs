@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use httpmock::prelude::*;
-use tt_provider_openai::ClientConfig;
+use tt_provider_compat::ClientConfig;
 use tt_provider_together::TogetherProvider;
 use tt_shared::{
     context::{ProviderCredentials, RequestContext, SecretString},
@@ -79,7 +79,8 @@ fn success_body() -> String {
 }
 
 fn provider() -> TogetherProvider {
-    TogetherProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    TogetherProvider::new_allow_local(ClientConfig::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +132,12 @@ async fn smoke_429_rate_limited() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 7_000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 7_000
+            }
+        ),
         "expected RateLimited{{7000}}, got {err:?}"
     );
 }
@@ -199,8 +205,8 @@ fn pricing_table_correct_rates() {
     let llama70b = p
         .pricing("meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo")
         .expect("pricing for llama-3.3-70b");
-    assert_eq!(llama70b.input_per_million, 0.88);
-    assert_eq!(llama70b.output_per_million, 0.88);
+    assert_eq!(llama70b.input_per_million, 1.04);
+    assert_eq!(llama70b.output_per_million, 1.04);
 
     let llama405b = p
         .pricing("meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo")

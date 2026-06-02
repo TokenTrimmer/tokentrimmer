@@ -17,7 +17,8 @@
 //! # API differences from OpenAI
 //!
 //! - Model is in the URL path, not the request body.
-//! - Auth is a query-string `?key=...` parameter, not a `Bearer` header.
+//! - Auth is the `x-goog-api-key` request header (NOT a URL `?key=` query
+//!   param — keys in URLs leak via logs/proxies; see review §5.2).
 //! - System messages map to `systemInstruction`.
 //! - Tools use `functionDeclarations` inside a single `tools` object.
 //! - Streaming uses SSE format with `?alt=sse`.
@@ -33,8 +34,9 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use tracing::instrument;
 use tt_shared::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
-    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+    validate_provider_url, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError,
+    RequestContext,
 };
 
 pub use client::ClientConfig;
@@ -47,6 +49,10 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 /// Create once with [`GeminiProvider::new`] and share across requests.
 pub struct GeminiProvider {
     client: Client,
+    /// When `true`, skip SSRF URL validation for private/loopback addresses.
+    /// Always `false` in production; set to `true` only in tests that target
+    /// a local mock server.
+    allow_local: bool,
 }
 
 impl GeminiProvider {
@@ -57,9 +63,28 @@ impl GeminiProvider {
     /// Panics if the underlying [`reqwest::Client`] cannot be constructed (very
     /// rare — only happens with invalid TLS configuration).
     pub fn new(cfg: ClientConfig) -> Self {
-        let client = client::build_client(&cfg)
-            .expect("failed to build reqwest::Client for Gemini adapter");
-        Self { client }
+        let client =
+            client::build_client(&cfg).expect("failed to build reqwest::Client for Gemini adapter");
+        Self {
+            client,
+            allow_local: false,
+        }
+    }
+
+    /// Create an adapter that skips SSRF URL validation for tests targeting a
+    /// local mock server.
+    ///
+    /// # Warning
+    ///
+    /// Do not use in production code. This bypasses the SSRF guard.
+    #[doc(hidden)]
+    pub fn new_allow_local(cfg: ClientConfig) -> Self {
+        let client =
+            client::build_client(&cfg).expect("failed to build reqwest::Client for Gemini adapter");
+        Self {
+            client,
+            allow_local: true,
+        }
     }
 
     /// Resolve the base URL from credentials or fall back to the default.
@@ -86,7 +111,7 @@ impl Provider for GeminiProvider {
     }
 
     /// Non-streaming chat completion via
-    /// `POST /v1beta/models/{model}:generateContent?key={api_key}`.
+    /// `POST /v1beta/models/{model}:generateContent` (key in `x-goog-api-key` header).
     ///
     /// Translates the canonical request to Gemini's wire format, sends it,
     /// and maps errors to [`ProviderError`].
@@ -97,13 +122,17 @@ impl Provider for GeminiProvider {
         ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         let base_url = self.base_url(ctx);
+        // Validate customer-supplied base_url overrides; skip when using the
+        // compiled-in default (always safe) or when allow_local is set (tests).
+        if ctx.credentials.base_url.is_some() {
+            validate_provider_url(base_url, self.allow_local)
+                .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+        }
+
         let api_key = ctx.credentials.api_key.expose().to_string();
         let model = req.model.clone();
 
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            base_url, model, api_key
-        );
+        let url = format!("{base_url}/v1beta/models/{model}:generateContent");
 
         let body = translate::translate_request(req)?;
 
@@ -111,6 +140,7 @@ impl Provider for GeminiProvider {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &api_key)
             .json(&body)
             .send()
             .await
@@ -123,10 +153,7 @@ impl Provider for GeminiProvider {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(errors::map_reqwest_error)?;
+        let response_text = response.text().await.map_err(errors::map_reqwest_error)?;
 
         if status >= 400 {
             return Err(errors::map_response_error(
@@ -141,7 +168,7 @@ impl Provider for GeminiProvider {
     }
 
     /// Streaming chat completion via
-    /// `POST /v1beta/models/{model}:streamGenerateContent?key={api_key}&alt=sse`.
+    /// `POST /v1beta/models/{model}:streamGenerateContent?alt=sse` (key in `x-goog-api-key` header).
     ///
     /// Returns [`ProviderError`] before yielding any chunk if the server
     /// responds with HTTP ≥ 400. Otherwise returns a `BoxStream` that parses
@@ -152,7 +179,13 @@ impl Provider for GeminiProvider {
         req: ChatCompletionRequest,
         ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
-        let base_url = self.base_url(ctx).to_string();
+        let base_url = self.base_url(ctx);
+        if ctx.credentials.base_url.is_some() {
+            validate_provider_url(base_url, self.allow_local)
+                .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+        }
+
+        let base_url = base_url.to_string();
         let client = self.client.clone();
         stream::stream_chat_completion(client, &base_url, req, ctx).await
     }

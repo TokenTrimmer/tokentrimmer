@@ -165,10 +165,7 @@ fn translate_long_system_gets_cache_control() {
 
 #[test]
 fn translate_short_system_no_cache_control() {
-    let messages = vec![
-        system_text("Be helpful."),
-        user_text("Hi"),
-    ];
+    let messages = vec![system_text("Be helpful."), user_text("Hi")];
 
     let req = make_request("claude-sonnet-4-6", messages);
     let body = translate_request(req).expect("translate ok");
@@ -368,9 +365,11 @@ fn usage_round_trip_with_cache_fields() {
 
     let usage = translate_usage(u);
 
-    assert_eq!(usage.prompt_tokens, 200);
+    // prompt_tokens is the FULL input: fresh + cache reads + cache creation
+    // (200 + 150 + 50 = 400); cached_tokens is the cache-read subset.
+    assert_eq!(usage.prompt_tokens, 400);
     assert_eq!(usage.completion_tokens, 80);
-    assert_eq!(usage.total_tokens, 280);
+    assert_eq!(usage.total_tokens, 480);
     assert_eq!(usage.cached_tokens, 150);
     assert_eq!(usage.cache_creation_input_tokens, Some(50));
 }

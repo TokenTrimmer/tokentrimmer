@@ -30,5 +30,12 @@ fi
 echo "==> tt inspect ."
 ./scripts/tt-inspect-self.sh
 
+echo "==> check-p0-bugs"
+if command -v gh >/dev/null 2>&1; then
+  ./scripts/check-p0-bugs.sh
+else
+  echo "(skipping: gh CLI not installed)"
+fi
+
 echo
 echo "All local CI gates passed."

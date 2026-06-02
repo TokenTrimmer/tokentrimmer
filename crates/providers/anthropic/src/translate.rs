@@ -19,9 +19,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tt_shared::{
-    messages::{
-        ContentPart, Message, MessageContent, ToolCall, ToolCallFunction, ToolChoice,
-    },
+    messages::{ContentPart, Message, MessageContent, ToolCall, ToolCallFunction, ToolChoice},
     usage::Usage,
     ChatCompletionResponse, Choice, ProviderError,
 };
@@ -253,8 +251,8 @@ pub fn translate_request(
                     blocks.extend(translate_content_blocks(c)?);
                 }
                 for tc in tool_calls {
-                    let input: serde_json::Value =
-                        serde_json::from_str(&tc.function.arguments).map_err(|e| {
+                    let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                        .map_err(|e| {
                             ProviderError::Deserialize(format!(
                                 "tool_call arguments not valid JSON: {e}"
                             ))
@@ -487,12 +485,21 @@ pub fn map_stop_reason(stop_reason: &str) -> &'static str {
 
 /// Convert [`AnthropicUsage`] into canonical [`Usage`].
 pub fn translate_usage(u: AnthropicUsage) -> Usage {
-    let total = u.input_tokens + u.output_tokens;
+    // OpenAI subset convention (what `tt-core::compute_cost` assumes):
+    // `prompt_tokens` is the TOTAL input INCLUDING cache reads, and
+    // `cached_tokens` is the cache-read subset. Anthropic reports
+    // `input_tokens` EXCLUSIVE of cache reads, so add them back — otherwise
+    // compute_cost bills only the fresh tokens and drops the cache-read cost.
+    let cached = u.cache_read_input_tokens.unwrap_or(0);
+    let created = u.cache_creation_input_tokens.unwrap_or(0);
+    // Full prompt = fresh input + cache reads + cache creation, so total_tokens
+    // reflects the real prompt size and total == prompt + completion holds.
+    let prompt_tokens = u.input_tokens + cached + created;
     Usage {
-        prompt_tokens: u.input_tokens,
+        prompt_tokens,
         completion_tokens: u.output_tokens,
-        total_tokens: total,
-        cached_tokens: u.cache_read_input_tokens.unwrap_or(0),
+        total_tokens: prompt_tokens + u.output_tokens,
+        cached_tokens: cached,
         cache_creation_input_tokens: u.cache_creation_input_tokens,
     }
 }
@@ -613,14 +620,7 @@ mod tests {
             system[0].cache_control.is_some(),
             "long system should have cache_control"
         );
-        assert_eq!(
-            system[0]
-                .cache_control
-                .as_ref()
-                .unwrap()
-                .ctype,
-            "ephemeral"
-        );
+        assert_eq!(system[0].cache_control.as_ref().unwrap().ctype, "ephemeral");
     }
 
     #[test]
@@ -694,9 +694,11 @@ mod tests {
             cache_read_input_tokens: Some(80),
         };
         let usage = translate_usage(u);
-        assert_eq!(usage.prompt_tokens, 100);
+        // prompt_tokens is the FULL input: fresh + cache reads + cache creation
+        // (100 + 80 + 20 = 200); cached_tokens is the cache-read subset.
+        assert_eq!(usage.prompt_tokens, 200);
         assert_eq!(usage.completion_tokens, 50);
-        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.total_tokens, 250);
         assert_eq!(usage.cached_tokens, 80);
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
     }

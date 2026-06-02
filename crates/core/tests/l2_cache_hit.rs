@@ -7,6 +7,11 @@
 //! 3. Cache state header is `none` when L2 is not wired on the app state.
 //! 4. Streaming requests skip L2 entirely (the fake-stream-from-cache
 //!    feature is `w7-fake-stream-cache`, still blocked).
+//! 5. Free-tier (or unauthenticated) callers do NOT get L2 hits or writes
+//!    even when `state.l2` is configured — L2 is a paid-tier entitlement.
+//! 6. Free-tier STREAMING completions do NOT write into L2 even when L2 is
+//!    wired — `stream_cache_insert.l2` must be None for Free/None callers
+//!    (rv-streaming-l2-tier-gate).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -19,13 +24,15 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use tt_cache::{CacheEntry, EmbeddingProvider, InMemoryL2Cache};
+use tt_auth::ApiKeyContext;
+use tt_cache::{CacheEntry, EmbeddingProvider, InMemoryL2Cache, L2Cache};
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
     messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
     pricing::Capability,
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
-    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
+    CallerTier, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError,
+    RequestContext, Usage,
 };
 use uuid::Uuid;
 
@@ -54,6 +61,7 @@ impl Provider for CountingProvider {
             input_per_million: 3.0,
             output_per_million: 6.0,
             cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
             effective_at: Utc::now(),
         })
     }
@@ -149,6 +157,30 @@ fn chat_request(model: &str, stream: bool) -> Request<Body> {
         .unwrap()
 }
 
+/// Build a chat request pre-stamped with an `ApiKeyContext` carrying the given
+/// tier. Because the auth middleware only inserts `ApiKeyContext` when a valid
+/// `tt_live_*` token is present (and no key store is wired in these tests), a
+/// pre-inserted extension survives the middleware pass-through intact.
+fn chat_request_with_tier(model: &str, stream: bool, tier: Option<CallerTier>) -> Request<Body> {
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "hello there" }],
+        "stream": stream,
+    });
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    req.extensions_mut().insert(ApiKeyContext {
+        key_id: Uuid::nil(),
+        org_id: Uuid::nil(),
+        tier,
+    });
+    req
+}
+
 #[tokio::test]
 async fn no_l2_configured_yields_cache_none_header() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -242,6 +274,7 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         embedding: entry_vec.clone(),
         response: serde_json::to_vec(&primed).unwrap(),
         model: "counting-1".into(),
+        embedding_model: "fixed-embed".into(),
         input_tokens: 100,
         output_tokens: 50,
         hit_count: 0,
@@ -257,8 +290,13 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
     let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.99));
     let app = build_router(state);
 
+    // L2 lookup is paid-tier only; inject a Pro-tier context so the hit fires.
     let response = app
-        .oneshot(chat_request("counting-1", false))
+        .oneshot(chat_request_with_tier(
+            "counting-1",
+            false,
+            Some(CallerTier::Pro),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -282,6 +320,39 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         "provider must NOT be called on a cache hit"
     );
 
+    // ── Savings headers: an L2 hit must report full savings (saved == baseline).
+    //
+    // `build_hit_l2_response` calls `synthetic_baseline_from_entry` which
+    // prices at $1/M input + $2/M output (the conservative default until the
+    // L2 schema carries its own baseline_cost_usd column).
+    //
+    // The primed entry above has input_tokens=100, output_tokens=50 so:
+    //   baseline = (100 × $1 + 50 × $2) / 1_000_000 = 0.0002
+    //   saved    = baseline  (cost is zero — no provider call on a hit)
+    let baseline_l2: f64 = response.headers()["x-tokentrimmer-baseline-cost-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expected_baseline = (100.0_f64 * 1.0 + 50.0_f64 * 2.0) / 1_000_000.0;
+    assert!(
+        baseline_l2 > 0.0,
+        "L2 hit must report a positive baseline; got {baseline_l2}"
+    );
+    assert!(
+        (baseline_l2 - expected_baseline).abs() < 1e-9,
+        "L2 hit baseline should be synthetic $1/M·$2/M estimate ({expected_baseline}); got {baseline_l2}"
+    );
+    let saved_l2: f64 = response.headers()["x-tokentrimmer-saved-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (saved_l2 - baseline_l2).abs() < 1e-9,
+        "L2 hit saved should equal baseline ({baseline_l2}) — 100% savings; got {saved_l2}"
+    );
+
     // Body must be the cached body, not the live provider one.
     let bytes = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -302,10 +373,7 @@ async fn streaming_request_bypasses_l2_cache() {
     let state = AppState::new(registry).with_l2(cache.clone(), embedder, None);
     let app = build_router(state);
 
-    let response = app
-        .oneshot(chat_request("counting-1", true))
-        .await
-        .unwrap();
+    let response = app.oneshot(chat_request("counting-1", true)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     // SSE response — no cache header is set on the stream path (fake-stream
     // from cache is w7-fake-stream-cache).
@@ -319,4 +387,157 @@ async fn streaming_request_bypasses_l2_cache() {
     );
     // Provider was called for the streaming path.
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+/// Regression test: a Free-tier (or unauthenticated) caller must NOT get an
+/// L2 hit even when the L2 store is configured and contains a matching entry.
+/// L2 is a paid-tier entitlement (`BudgetLimits.l2_cache`).
+///
+/// Setup mirrors `l2_hit_serves_cached_response_without_provider_call` but
+/// with tier=None (unauthenticated dev request). The provider must be called
+/// (L2 read is skipped) and the response body must come from the provider, NOT
+/// from the cached entry.
+#[tokio::test]
+async fn free_tier_caller_skips_l2_lookup_and_write() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let cache = Arc::new(InMemoryL2Cache::new());
+
+    // Prime the L2 cache with an entry that would hit at similarity 1.0.
+    let primed = ChatCompletionResponse {
+        id: "chatcmpl-should-not-serve".into(),
+        object: "chat.completion".into(),
+        created: 0,
+        model: "counting-1".into(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message::Assistant {
+                content: Some(MessageContent::Text("should not appear".into())),
+                tool_calls: vec![],
+                name: None,
+            },
+            finish_reason: Some("stop".into()),
+        }],
+        usage: Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        },
+    };
+    let entry_vec = vec![1.0; 1536];
+    let entry = CacheEntry {
+        id: Uuid::now_v7(),
+        org_id: Uuid::nil(), // matches the nil org_id of an unauthenticated request
+        embedding: entry_vec.clone(),
+        response: serde_json::to_vec(&primed).unwrap(),
+        model: "counting-1".into(),
+        embedding_model: "fixed-embed".into(),
+        input_tokens: 100,
+        output_tokens: 50,
+        hit_count: 0,
+        created_at: Utc::now(),
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+    };
+    {
+        use tt_cache::L2Cache;
+        cache.insert(entry).await.unwrap();
+    }
+
+    let embedder = Arc::new(FixedEmbedder { vec: entry_vec });
+    // Low threshold (0.5) so anything would hit — but the entitlement gate
+    // must block the lookup before it even reaches the store.
+    let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.5));
+    let app = build_router(state);
+
+    // No tier injected → l2_allowed = false → L2 read must be skipped.
+    let response = app
+        .oneshot(chat_request("counting-1", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Provider must have been called (L2 did not short-circuit it).
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "provider must be called when L2 is blocked by Free/None tier"
+    );
+
+    // Response must be the live provider body, NOT the cached entry.
+    let bytes = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_ne!(
+        body["id"], "chatcmpl-should-not-serve",
+        "Free-tier caller must NOT receive the L2-cached response"
+    );
+    // The provider stub returns id "chatcmpl-live".
+    assert_eq!(
+        body["id"], "chatcmpl-live",
+        "Free-tier caller must get the live provider response"
+    );
+}
+
+/// Regression: a Free-tier (or unauthenticated) STREAMING completion must NOT
+/// write into L2 after stream completion.
+///
+/// Before the fix, `stream_cache_insert.l2` was populated unconditionally for
+/// any streaming miss when `state.l2.is_some()`, so the fire-and-forget
+/// `tokio::spawn` in `sse.rs` wrote to L2 regardless of tier.  After the fix,
+/// `l2_for_insert` is `None` when `!l2_allowed`, so no L2 spawn occurs.
+///
+/// The assertion: after the SSE response body is fully drained and a brief
+/// yield window has passed, the L2 store for the request's org must remain
+/// empty (lookup returns None).
+#[tokio::test]
+async fn free_tier_streaming_does_not_write_l2() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let cache = Arc::new(InMemoryL2Cache::new());
+    let embedder = Arc::new(FixedEmbedder {
+        vec: vec![1.0; 1536],
+    });
+    // Wire L2 with a very low threshold so any entry would hit.
+    let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.0));
+    let app = build_router(state);
+
+    // No tier injected (tier=None → l2_allowed=false).
+    let response = app.oneshot(chat_request("counting-1", true)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Fully drain the SSE body so the stream completes and any background
+    // spawn triggered by the guard drop has a chance to run.
+    let _body_bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+
+    // Yield to the executor a few times to let any spawned futures settle.
+    // The fire-and-forget insert path in sse.rs uses `tokio::spawn`, so
+    // it runs on the same single-threaded test runtime; a single yield is
+    // sufficient, but we give it a few to be safe.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Assert the L2 store has no entry for the nil org (the unauthenticated
+    // org_id used by requests with no ApiKeyContext).
+    let hit = cache
+        .lookup(
+            Uuid::nil(),
+            &vec![1.0f32; 1536],
+            0.0,
+            "counting-1",
+            "fixed-embed",
+        )
+        .await
+        .unwrap();
+    assert!(
+        hit.is_none(),
+        "Free-tier streaming completion must NOT write to L2; found an entry: {hit:?}"
+    );
 }

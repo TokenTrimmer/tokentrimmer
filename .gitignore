@@ -24,12 +24,15 @@ dist/
 
 # Local env + secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Claude Code session state (gitignored except the harness itself)
 .claude/AUDIT.log
 .claude/PAUSED
+.claude/STOP-CHAIN
+.claude/scheduled_tasks.lock
+.claude/worktrees/
 .claude/cost-ledger.jsonl
 .claude/sessions/
 .claude/settings.local.json

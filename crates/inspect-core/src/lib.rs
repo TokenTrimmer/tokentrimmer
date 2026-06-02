@@ -2,6 +2,7 @@
 //!
 //! See `docs/01-inspect-rule-catalog.md` for the rule taxonomy.
 
+pub mod ast;
 pub mod engine;
 pub mod output;
 pub mod parse;

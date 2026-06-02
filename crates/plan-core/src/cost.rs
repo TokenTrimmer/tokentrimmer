@@ -23,7 +23,11 @@ pub struct ProjectedCost {
 /// `pricing` directly. Cached-token rate falls back to the non-cached
 /// input rate when the pricing entry doesn't advertise a discount.
 #[must_use]
-pub fn project_cost(req: &RequestLog, _target_model: &str, pricing: &ModelPricing) -> ProjectedCost {
+pub fn project_cost(
+    req: &RequestLog,
+    _target_model: &str,
+    pricing: &ModelPricing,
+) -> ProjectedCost {
     let cached = req.cached_tokens.min(req.input_tokens);
     let non_cached_input = req.input_tokens.saturating_sub(cached);
     let cached_rate = pricing

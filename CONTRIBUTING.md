@@ -14,7 +14,7 @@ Thank you for your interest. TokenTrimmer is built in the open under Apache 2.0.
 # With Nix (preferred — locked toolchain matches CI)
 nix develop
 
-# Or without Nix: install Rust 1.83+, Node 20+, pnpm 9+, Docker
+# Or without Nix: install Rust 1.88+, Node 20+, pnpm 9+, Docker
 # Then bring up local services:
 make dev
 

@@ -7,9 +7,10 @@
 //! lands in a follow-up; the [`CacheProjection`] struct is shaped to grow
 //! into that without a breaking change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use crate::types::{CacheProjection, PlanConfig, RequestLog};
 
@@ -25,38 +26,7 @@ use crate::types::{CacheProjection, PlanConfig, RequestLog};
 #[must_use]
 pub fn project_l1_hits(requests: &[RequestLog], config: &PlanConfig) -> CacheProjection {
     let total = requests.len() as u32;
-    let Some(ttl_secs) = config.l1_ttl_seconds else {
-        return CacheProjection {
-            total,
-            projected_l1_hits: 0,
-            projected_l1_hit_rate: 0.0,
-        };
-    };
-    if requests.is_empty() {
-        return CacheProjection::default();
-    }
-    let ttl = chrono::Duration::seconds(i64::from(ttl_secs));
-
-    // Stable order by (ts, id) so determinism is preserved across input
-    // permutations.
-    let mut sorted: Vec<&RequestLog> = requests.iter().collect();
-    sorted.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
-
-    let mut last_seen: HashMap<String, DateTime<Utc>> = HashMap::new();
-    let mut hits: u32 = 0;
-    for req in sorted {
-        let key = normalized_key(req);
-        if let Some(prev_ts) = last_seen.get(&key) {
-            if req.ts.signed_duration_since(*prev_ts) <= ttl {
-                hits += 1;
-                // Hits don't reset the cache entry — the original miss
-                // populated it. Skip the insert.
-                continue;
-            }
-        }
-        last_seen.insert(key, req.ts);
-    }
-
+    let hits = project_l1_hit_ids(requests, config).len() as u32;
     let rate = if total == 0 {
         0.0
     } else {
@@ -67,6 +37,43 @@ pub fn project_l1_hits(requests: &[RequestLog], config: &PlanConfig) -> CachePro
         projected_l1_hits: hits,
         projected_l1_hit_rate: rate,
     }
+}
+
+/// Like [`project_l1_hits`] but returns the SET of request ids projected as L1
+/// cache hits, so the replay cost loop can zero each hit's projected cost — a
+/// cache hit serves the response for free. Same coarse-key + TTL algorithm as
+/// [`project_l1_hits`]; an empty set when L1 projection is opted out
+/// (`l1_ttl_seconds == None`) so default-config replays are unaffected.
+#[must_use]
+pub fn project_l1_hit_ids(requests: &[RequestLog], config: &PlanConfig) -> HashSet<Uuid> {
+    let mut hit_ids = HashSet::new();
+    let Some(ttl_secs) = config.l1_ttl_seconds else {
+        return hit_ids;
+    };
+    if requests.is_empty() {
+        return hit_ids;
+    }
+    let ttl = chrono::Duration::seconds(i64::from(ttl_secs));
+
+    // Stable order by (ts, id) so determinism is preserved across input
+    // permutations.
+    let mut sorted: Vec<&RequestLog> = requests.iter().collect();
+    sorted.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+
+    let mut last_seen: HashMap<String, DateTime<Utc>> = HashMap::new();
+    for req in sorted {
+        let key = normalized_key(req);
+        if let Some(prev_ts) = last_seen.get(&key) {
+            if req.ts.signed_duration_since(*prev_ts) <= ttl {
+                hit_ids.insert(req.id);
+                // Hits don't reset the cache entry — the original miss
+                // populated it. Skip the insert.
+                continue;
+            }
+        }
+        last_seen.insert(key, req.ts);
+    }
+    hit_ids
 }
 
 /// Coarse normalized cache key. Exact-match L1 in production hashes the
@@ -118,10 +125,7 @@ mod tests {
 
     #[test]
     fn no_ttl_means_zero_hits() {
-        let reqs = vec![
-            make_req(0, "m", 100, None),
-            make_req(1, "m", 100, None),
-        ];
+        let reqs = vec![make_req(0, "m", 100, None), make_req(1, "m", 100, None)];
         let cfg = PlanConfig::default();
         let p = project_l1_hits(&reqs, &cfg);
         assert_eq!(p.total, 2);
@@ -130,10 +134,7 @@ mod tests {
 
     #[test]
     fn second_identical_request_within_ttl_is_a_hit() {
-        let reqs = vec![
-            make_req(0, "m", 100, None),
-            make_req(30, "m", 100, None),
-        ];
+        let reqs = vec![make_req(0, "m", 100, None), make_req(30, "m", 100, None)];
         let cfg = PlanConfig {
             l1_ttl_seconds: Some(60),
             ..PlanConfig::default()
@@ -145,10 +146,7 @@ mod tests {
 
     #[test]
     fn request_outside_ttl_is_a_miss() {
-        let reqs = vec![
-            make_req(0, "m", 100, None),
-            make_req(120, "m", 100, None),
-        ];
+        let reqs = vec![make_req(0, "m", 100, None), make_req(120, "m", 100, None)];
         let cfg = PlanConfig {
             l1_ttl_seconds: Some(60),
             ..PlanConfig::default()
@@ -159,10 +157,7 @@ mod tests {
 
     #[test]
     fn different_shape_no_hit() {
-        let reqs = vec![
-            make_req(0, "m", 100, None),
-            make_req(1, "m", 101, None),
-        ];
+        let reqs = vec![make_req(0, "m", 100, None), make_req(1, "m", 101, None)];
         let cfg = PlanConfig {
             l1_ttl_seconds: Some(60),
             ..PlanConfig::default()

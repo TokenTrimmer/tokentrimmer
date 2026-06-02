@@ -58,6 +58,54 @@ This file is the human-curated counterpart to `.claude/INDEX.md` (auto-generated
 
 Lives in the sibling `tokentrimmer-cloud` repo. Not present here.
 
+### tt init installer
+
+| If you're doing | Read |
+|---|---|
+| Adding a new template | `crates/cli/templates/init/` (template files) + `crates/cli/src/init/templates.rs` (renderer) |
+| Adding a language detection signal | `crates/cli/src/init/detect.rs` |
+| Adjusting merge strategy for an existing file | `crates/cli/src/init/merge.rs` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackD-tt-init-installer-design.md` |
+
+### Cost preview
+
+| If you're doing | Read |
+|---|---|
+| Adding a model to pricing | the provider crate's `pricing.rs` (NOT `tt-preview`) |
+| Adjusting cache-hit defaults | `crates/preview/src/cache_projection.rs::DEFAULT_*` |
+| Adding a task class | `crates/preview/src/classifier.rs` |
+| API reference | `docs/04-cost-preview-api-reference.md` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackC-cost-preview-api-design.md` |
+
+### tt mcp
+
+| If you're doing | Read |
+|---|---|
+| Adding a tool | `crates/mcp/src/tools/find_route_for.rs` (worked example) + `tools/mod.rs::Tool` trait |
+| Adding a resource | `crates/mcp/src/resources/inspect_baseline.rs` + `resources/mod.rs::Resource` trait |
+| Adding a transport | `crates/mcp/src/transport/stdio.rs` (worked example) |
+| Spec | `docs/superpowers/specs/2026-05-28-trackA-mcp-server-design.md` |
+
+### tt proxy
+
+| If you're doing | Read |
+|---|---|
+| Adding a route | `crates/cli/src/proxy/routes/` (worked example: `anthropic.rs`) |
+| Adjusting Mode behavior | `crates/cli/src/proxy/config.rs::Mode` |
+| Session rollup math | `crates/cli/src/proxy/session.rs` + `crates/cli/src/proxy/tui.rs` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackB-claude-code-codex-proxy-design.md` |
+
+### tt retrieval (RAG)
+
+| If you're doing | Read |
+|---|---|
+| Chunking strategy | `crates/retrieval/src/chunking.rs` |
+| Embedding model swap | `crates/retrieval/src/embed.rs::EmbeddingClient` |
+| Custom store backend | `crates/retrieval/src/store/mod.rs::RetrievalStore` trait |
+| Tag parser | `crates/retrieval/src/tags.rs` |
+| Substitution orchestrator | `crates/retrieval/src/substitute.rs` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackE-rag-context-compression-design.md` |
+
 ---
 
 ## Cross-cutting concerns

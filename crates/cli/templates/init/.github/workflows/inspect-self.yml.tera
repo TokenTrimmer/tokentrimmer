@@ -1,0 +1,14 @@
+name: tt inspect
+on: [pull_request, push]
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tt CLI
+        run: |
+          curl -sSfL https://tokentrimmer.com/install.sh | sh
+      - name: Run tt inspect
+        run: |
+          tt inspect . --fail-on high

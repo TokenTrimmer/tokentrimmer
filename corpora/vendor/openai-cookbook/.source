@@ -1,0 +1,6 @@
+name = "openai-cookbook"
+url = "https://github.com/openai/openai-cookbook"
+ref = "HEAD"
+commit = "42bc4ed33a2d1ee308c1f614c073f1b5f760061b"
+glob = "examples/*.py"
+files = 8

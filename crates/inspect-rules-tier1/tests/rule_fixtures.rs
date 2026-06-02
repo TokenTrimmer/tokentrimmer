@@ -73,10 +73,7 @@ fn run_against_dir(rule: &dyn Rule, dir: &Path) -> Vec<(PathBuf, usize)> {
 
         // Synthesise a non-fixture path so rules' is_test_fixture() guards
         // do not suppress detection during the test.
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
 
         // For Markdown files under a rule's fixture directory, use a path that
         // looks like an agent-config file so that config rules match correctly.
@@ -154,7 +151,11 @@ fn check_config_no_agents_md() {
 
     let id = "config-no-agents-md";
     let root = fixture_root(id);
-    assert!(root.exists(), "rule {id}: no fixture dir at {}", root.display());
+    assert!(
+        root.exists(),
+        "rule {id}: no fixture dir at {}",
+        root.display()
+    );
 
     let detect_dir = root.join("should-detect");
     let no_detect_dir = root.join("should-not-detect");
@@ -191,7 +192,9 @@ fn check_config_no_agents_md() {
     // (no prior AGENTS.md seen). Use a synthetic path so is_test_fixture()
     // guards do not suppress findings.
     for path in &detect_files {
-        let Some(lang) = lang_for_ext(path) else { continue };
+        let Some(lang) = lang_for_ext(path) else {
+            continue;
+        };
         let rule = ConfigNoAgentsMdRule::new();
         if !rule.supported_languages().contains(&lang) {
             continue;
@@ -209,7 +212,9 @@ fn check_config_no_agents_md() {
 
     // Each should-not-detect file must produce 0 findings with a fresh rule.
     for path in &no_detect_files {
-        let Some(lang) = lang_for_ext(path) else { continue };
+        let Some(lang) = lang_for_ext(path) else {
+            continue;
+        };
         let rule = ConfigNoAgentsMdRule::new();
         if !rule.supported_languages().contains(&lang) {
             continue;
@@ -240,14 +245,14 @@ fn every_rule_has_min_fixtures_and_detects_correctly() {
     check_config_no_agents_md();
 }
 
-/// Verify `all_rules()` returns exactly 10 rules.
+/// Verify `all_rules()` returns exactly 19 rules.
 #[test]
-fn all_rules_count_is_10() {
+fn all_rules_count_is_19() {
     let rules = all_rules();
     assert_eq!(
         rules.len(),
-        10,
-        "all_rules() should return 10 rules, got {}",
+        19,
+        "all_rules() should return 19 rules, got {}",
         rules.len()
     );
 }
@@ -261,11 +266,20 @@ fn rule_ids_are_stable() {
         "lib-anthropic-sdk-no-cache-control",
         "model-flagship-for-classification",
         "model-flagship-for-extraction",
+        "model-deprecated",
         "output-no-max-tokens",
+        "prompt-no-output-constraint",
+        "prompt-bloated-system",
+        "prompt-verbose-few-shot",
         "conversation-unbounded-history",
         "agent-no-termination-condition",
         "config-no-agents-md",
         "config-agents-md-contains-secrets",
+        "config-agents-md-too-long",
+        "cache-anthropic-tools-not-cached",
+        "output-n-greater-than-one",
+        "model-reasoning-effort-default-high",
+        "prompt-dynamic-prefix-breaks-cache",
     ];
     let rule_ids: Vec<&str> = all_rules().iter().map(|r| r.id()).collect();
     // Check all expected IDs are present.

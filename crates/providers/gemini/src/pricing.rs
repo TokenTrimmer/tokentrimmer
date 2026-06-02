@@ -17,9 +17,11 @@
 //!
 //! `cached_input_per_million` is the cached-read rate (approximately 10% of
 //! the standard input rate). Cache-write surcharges are not exposed here.
+//!
+//! Rates come from the versioned, embedded pricing catalog
+//! (`tt_shared::pricing`); the headline rate is the ≤200K-token bracket.
 
-use chrono::Utc;
-use tt_shared::pricing::{Capability, ModelInfo, ModelPricing};
+use tt_shared::pricing::{catalog, Capability, ModelInfo, ModelPricing};
 
 /// The 200K token threshold above which the higher pricing bracket applies.
 /// Adapters log a debug message when exceeded; full per-request bracket pricing
@@ -27,42 +29,9 @@ use tt_shared::pricing::{Capability, ModelInfo, ModelPricing};
 pub const BRACKET_THRESHOLD_TOKENS: u64 = 200_000;
 
 /// Return the pricing entry for a known Gemini model, or `None` if
-/// unrecognized.
+/// unrecognized. Delegates to the shared catalog's current rate (≤200K bracket).
 pub fn pricing_for(model: &str) -> Option<ModelPricing> {
-    let now = Utc::now();
-    match model {
-        // gemini-3.1-flash-lite: lightweight, cost-efficient
-        // Input ≤200K: $0.25/1M | Output ≤200K: $1.50/1M
-        // Input >200K: $0.50/1M | Output >200K: $3.00/1M
-        // Cached read: $0.025/1M
-        "gemini-3.1-flash-lite" => Some(ModelPricing {
-            input_per_million: 0.25,
-            output_per_million: 1.50,
-            cached_input_per_million: Some(0.025),
-            effective_at: now,
-        }),
-        // gemini-3.5-flash: balanced performance and cost
-        // Input ≤200K: $1.50/1M | Output ≤200K: $9.00/1M
-        // Input >200K: $3.00/1M | Output >200K: $18.00/1M
-        // Cached read: $0.15/1M
-        "gemini-3.5-flash" => Some(ModelPricing {
-            input_per_million: 1.50,
-            output_per_million: 9.00,
-            cached_input_per_million: Some(0.15),
-            effective_at: now,
-        }),
-        // gemini-3.1-pro: highest capability, 2M context
-        // Input ≤200K: $2.00/1M | Output ≤200K: $12.00/1M
-        // Input >200K: $4.00/1M | Output >200K: $18.00/1M
-        // Cached read: $0.20/1M
-        "gemini-3.1-pro" => Some(ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 12.00,
-            cached_input_per_million: Some(0.20),
-            effective_at: now,
-        }),
-        _ => None,
-    }
+    catalog().latest("gemini", model)
 }
 
 /// Return all supported Gemini model descriptors.

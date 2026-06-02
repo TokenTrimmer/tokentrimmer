@@ -7,6 +7,115 @@ use serde::{Deserialize, Serialize};
 
 use crate::Usage;
 
+// ---------------------------------------------------------------------------
+// tt_extras cache-control types (Fix B / §2.7)
+// ---------------------------------------------------------------------------
+
+/// Cache behaviour requested by the caller via `tt_extras.cache`.
+///
+/// Absent (no `cache` key in `tt_extras`) is treated as [`CacheMode::Normal`].
+///
+/// JSON shape:
+/// ```json
+/// { "cache": { "mode": "bypass", "ttl_secs": 3600 } }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMode {
+    /// Normal read-write caching (default when key absent).
+    #[default]
+    Normal,
+    /// Skip lookup AND insert — always hit the provider, never populate cache.
+    Bypass,
+    /// Skip lookup, but DO insert (force-refresh stale entry).
+    Refresh,
+    /// Do lookup, but never insert (read-only cache consumer).
+    #[serde(rename = "read-only")]
+    ReadOnly,
+}
+
+/// Typed cache-control extracted from `tt_extras`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheControlConfig {
+    /// Requested cache behaviour.
+    #[serde(default)]
+    pub mode: CacheMode,
+    /// Override TTL for cache inserts. `None` = use the gateway default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+/// Parse [`CacheControlConfig`] from a request's `tt_extras` map.
+///
+/// Returns `None` when `tt_extras` does not contain a `"cache"` key.
+/// Returns the default config (normal mode, no TTL override) when the key is
+/// present but the value fails to deserialize — so a malformed field degrades
+/// gracefully rather than hard-failing.
+pub fn parse_cache_control(
+    extras: &HashMap<String, serde_json::Value>,
+) -> Option<CacheControlConfig> {
+    let val = extras.get("cache")?;
+    match serde_json::from_value::<CacheControlConfig>(val.clone()) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            // Log at warn level so operators can see bad payloads; fall back
+            // to normal (don't block the request).
+            tracing::warn!(
+                error = %e,
+                "tt_extras.cache deserialization failed — treating as normal"
+            );
+            Some(CacheControlConfig::default())
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_control_tests {
+    use super::*;
+
+    fn extras(json: &str) -> HashMap<String, serde_json::Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn no_cache_key_returns_none() {
+        assert!(parse_cache_control(&extras("{}")).is_none());
+    }
+
+    #[test]
+    fn bypass_mode_parsed() {
+        let cfg = parse_cache_control(&extras(r#"{"cache":{"mode":"bypass"}}"#)).unwrap();
+        assert_eq!(cfg.mode, CacheMode::Bypass);
+        assert!(cfg.ttl_secs.is_none());
+    }
+
+    #[test]
+    fn refresh_mode_with_ttl() {
+        let cfg = parse_cache_control(&extras(r#"{"cache":{"mode":"refresh","ttl_secs":3600}}"#))
+            .unwrap();
+        assert_eq!(cfg.mode, CacheMode::Refresh);
+        assert_eq!(cfg.ttl_secs, Some(3600));
+    }
+
+    #[test]
+    fn read_only_mode() {
+        let cfg = parse_cache_control(&extras(r#"{"cache":{"mode":"read-only"}}"#)).unwrap();
+        assert_eq!(cfg.mode, CacheMode::ReadOnly);
+    }
+
+    #[test]
+    fn absent_mode_defaults_to_normal() {
+        let cfg = parse_cache_control(&extras(r#"{"cache":{}}"#)).unwrap();
+        assert_eq!(cfg.mode, CacheMode::Normal);
+    }
+
+    #[test]
+    fn malformed_value_falls_back_to_default() {
+        let cfg = parse_cache_control(&extras(r#"{"cache":"not-an-object"}"#)).unwrap();
+        assert_eq!(cfg.mode, CacheMode::Normal);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,

@@ -63,7 +63,8 @@ fn stream_request() -> ChatCompletionRequest {
 }
 
 fn provider() -> GeminiProvider {
-    GeminiProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    GeminiProvider::new_allow_local(ClientConfig::default())
 }
 
 /// Build a Gemini SSE stream from text chunks.
@@ -81,8 +82,7 @@ fn text_sse_stream(text_chunks: &[&str], finish_reason: &str, usage_tokens: (u64
             ));
         } else {
             sse.push_str(&format!(
-                "data: {{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"{}\"}}]}},\"index\":0}}]}}\n\n",
-                text
+                "data: {{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"{text}\"}}]}},\"index\":0}}]}}\n\n"
             ));
         }
     }
@@ -399,9 +399,9 @@ async fn stream_server_closes_without_finish_reason() {
     let mut chunks = Vec::new();
     // This must complete without panic.
     while let Some(result) = stream.next().await {
-        match result {
-            Ok(c) => chunks.push(c),
-            Err(_) => {} // tolerate errors
+        // Tolerate errors; we only assert the stream completes without panic.
+        if let Ok(c) = result {
+            chunks.push(c);
         }
     }
 

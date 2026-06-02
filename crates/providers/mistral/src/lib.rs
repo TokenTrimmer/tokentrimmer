@@ -1,13 +1,13 @@
 //! Mistral provider adapter (OpenAI-compatible).
 //!
-//! Thin wrapper over [`tt_provider_openai::OpenAICompatibleProvider`] with
+//! Thin wrapper over [`tt_provider_compat::OpenAICompatibleProvider`] with
 //! Mistral's models, pricing, and default endpoint baked in.
 //!
 //! # Usage
 //!
 //! ```rust,no_run
 //! use tt_provider_mistral::MistralProvider;
-//! use tt_provider_openai::ClientConfig;
+//! use tt_provider_compat::ClientConfig;
 //!
 //! let provider = MistralProvider::new(ClientConfig::default());
 //! ```
@@ -15,9 +15,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use futures::stream::BoxStream;
-use tt_provider_openai::{CompatConfig, ClientConfig, OpenAICompatibleProvider};
+use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     pricing::{Capability, ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
@@ -46,6 +45,28 @@ impl MistralProvider {
             models: models(),
             pricing_table: pricing_table(),
             fee_multiplier: 1.0,
+            allow_local: false,
+        };
+        Self {
+            inner: OpenAICompatibleProvider::new(client_cfg, cfg),
+        }
+    }
+
+    /// Create an adapter that skips SSRF URL validation for tests targeting a
+    /// local mock server.
+    ///
+    /// # Warning
+    ///
+    /// Do not use in production code. This bypasses the SSRF guard.
+    #[doc(hidden)]
+    pub fn new_allow_local(client_cfg: ClientConfig) -> Self {
+        let cfg = CompatConfig {
+            id: "mistral",
+            default_base_url: DEFAULT_BASE_URL.to_string(),
+            models: models(),
+            pricing_table: pricing_table(),
+            fee_multiplier: 1.0,
+            allow_local: true,
         };
         Self {
             inner: OpenAICompatibleProvider::new(client_cfg, cfg),
@@ -164,55 +185,11 @@ fn models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Build the Mistral model→rate map from the shared versioned pricing catalog.
+/// Fed into the OpenAI-compatible inner client at construction.
 fn pricing_table() -> HashMap<String, ModelPricing> {
-    let now = Utc::now();
-    let mut table = HashMap::new();
-
-    table.insert(
-        "mistral-large-latest".to_string(),
-        ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 6.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "mistral-medium-latest".to_string(),
-        ModelPricing {
-            input_per_million: 0.70,
-            output_per_million: 2.10,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "mistral-small-latest".to_string(),
-        ModelPricing {
-            input_per_million: 0.20,
-            output_per_million: 0.60,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "codestral-latest".to_string(),
-        ModelPricing {
-            input_per_million: 0.30,
-            output_per_million: 0.90,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-    table.insert(
-        "pixtral-large-latest".to_string(),
-        ModelPricing {
-            input_per_million: 2.00,
-            output_per_million: 6.00,
-            cached_input_per_million: None,
-            effective_at: now,
-        },
-    );
-
-    table
+    tt_shared::pricing::catalog()
+        .latest_for_provider("mistral")
+        .into_iter()
+        .collect()
 }

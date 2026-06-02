@@ -6,7 +6,34 @@
 //! `tt_extras`) are deliberately excluded so that requests differing only in
 //! those fields share the same cache entry.
 //!
+//! ## Content normalization (key derivation ONLY)
+//!
+//! When building the canonical JSON object used for hashing, **text segments
+//! in message content are normalized** so that requests that are semantically
+//! identical but differ only in trivial ways (trailing whitespace, Unicode
+//! encoding form) hash to the same key.  The normalization applied is:
+//!
+//! 1. **Unicode NFC** — converts characters to Canonical Decomposition followed
+//!    by Canonical Composition (e.g. `é` as two code-points → one code-point).
+//! 2. **Trailing whitespace trim** — removes `\t`, `\n`, `\r`, space from the
+//!    end of each text segment.
+//!
+//! IMPORTANT: This normalization affects **only the bytes fed to the SHA-256
+//! hash**.  The request forwarded upstream to the provider is **never
+//! modified** — callers see their original content reflected back verbatim.
+//!
+//! ## Intentionally deferred: model-alias canonicalization
+//!
+//! Mapping dated model snapshots to floating aliases (e.g. `gpt-4o-2024-08-06`
+//! → `gpt-4o`) is NOT implemented here.  A dated snapshot and its floating
+//! alias can have different capabilities or system-prompt defaults; serving
+//! one model's cached response for another is a correctness risk.  This
+//! optimization is deferred until a registry-backed KNOWN-equivalent map can
+//! guarantee strict semantic equivalence between alias pairs.
+//!
 //! [`ChatCompletionRequest`]: tt_shared::messages::ChatCompletionRequest
+
+use unicode_normalization::UnicodeNormalization as _;
 
 use sha2::{Digest, Sha256};
 use tt_shared::messages::ChatCompletionRequest;
@@ -27,8 +54,7 @@ pub fn cache_key(req: &ChatCompletionRequest) -> String {
     let canonical = build_canonical(req);
     // serde_json::to_vec with sorted keys is not built-in; we serialize our
     // carefully constructed Value whose keys are already in a defined order.
-    let bytes = serde_json::to_vec(&canonical)
-        .expect("canonical Value is always serializable");
+    let bytes = serde_json::to_vec(&canonical).expect("canonical Value is always serializable");
     let digest = Sha256::digest(&bytes);
     hex::encode(digest)
 }
@@ -40,16 +66,99 @@ fn round6(v: f32) -> f64 {
     ((v as f64) * factor).round() / factor
 }
 
+/// Normalize a [`MessageContent`] value for **cache-key derivation only**.
+///
+/// Delegates text segments to [`normalize_text_for_key`]; non-text content
+/// parts (images, audio, etc.) are cloned as-is.
+fn normalize_message_content(
+    content: &tt_shared::messages::MessageContent,
+) -> tt_shared::messages::MessageContent {
+    use tt_shared::messages::{ContentPart, MessageContent};
+    match content {
+        MessageContent::Text(s) => MessageContent::Text(normalize_text_for_key(s)),
+        MessageContent::Parts(parts) => MessageContent::Parts(
+            parts
+                .iter()
+                .map(|p| match p {
+                    ContentPart::Text { text } => ContentPart::Text {
+                        text: normalize_text_for_key(text),
+                    },
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Normalize a text segment for **cache-key derivation only**.
+///
+/// Applies Unicode NFC normalization followed by trailing-whitespace trimming.
+/// The returned `String` is used only when building the canonical JSON object
+/// that is hashed to produce the cache key; the original string is forwarded
+/// to the upstream provider unchanged.
+///
+/// This merges requests that are identical except for:
+/// - Different Unicode encoding forms of the same character (NFC vs NFD).
+/// - Trailing whitespace characters (`\t`, `\n`, `\r`, space).
+///
+/// Leading whitespace and mid-content whitespace are intentionally preserved —
+/// a space at the start or inside a message can be semantically meaningful.
+fn normalize_text_for_key(s: &str) -> String {
+    // 1. Apply Unicode NFC: iterator yields NFC code points, collect to String.
+    let nfc: String = s.nfc().collect();
+    // 2. Trim trailing ASCII whitespace characters.
+    nfc.trim_end_matches([' ', '\t', '\n', '\r']).to_owned()
+}
+
 /// Build the canonical [`serde_json::Value`] used for key derivation.
 ///
 /// Keys are emitted in a fixed, alphabetically-sorted order so that the JSON
 /// bytes are deterministic regardless of field insertion order.
+///
+/// Text segments in messages are normalized via [`normalize_text_for_key`]
+/// (NFC + trailing-whitespace trim) before hashing.  The upstream request is
+/// never modified — normalization applies only to the bytes used for hashing.
 fn build_canonical(req: &ChatCompletionRequest) -> serde_json::Value {
     use serde_json::{json, Value};
+    use tt_shared::messages::Message;
 
-    // Serialize messages via serde so complex enum variants are handled correctly.
-    let messages: Value = serde_json::to_value(&req.messages)
-        .expect("messages always serializable");
+    // Normalize text segments in messages for key derivation, then serialize.
+    // We clone+patch the messages vec rather than the full request so that only
+    // the hashed representation is affected; the original `req` is untouched.
+    let normalized_messages: Vec<Message> = req
+        .messages
+        .iter()
+        .map(|msg| match msg {
+            Message::User { content, name } => Message::User {
+                name: name.clone(),
+                content: normalize_message_content(content),
+            },
+            Message::System { content } => Message::System {
+                content: normalize_message_content(content),
+            },
+            Message::Assistant {
+                content,
+                tool_calls,
+                name,
+            } => Message::Assistant {
+                name: name.clone(),
+                tool_calls: tool_calls.clone(),
+                content: content.as_ref().map(normalize_message_content),
+            },
+            Message::Tool {
+                content,
+                tool_call_id,
+            } => Message::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: normalize_message_content(content),
+            },
+        })
+        .collect();
+
+    // Serialize normalized messages via serde so complex enum variants are
+    // handled correctly.
+    let messages: Value =
+        serde_json::to_value(&normalized_messages).expect("messages always serializable");
 
     // Tools — empty vec becomes JSON null so it is omitted consistently.
     let tools: Value = if req.tools.is_empty() {
@@ -58,11 +167,11 @@ fn build_canonical(req: &ChatCompletionRequest) -> serde_json::Value {
         serde_json::to_value(&req.tools).expect("tools always serializable")
     };
 
-    let tool_choice: Value = serde_json::to_value(&req.tool_choice)
-        .expect("tool_choice always serializable");
+    let tool_choice: Value =
+        serde_json::to_value(&req.tool_choice).expect("tool_choice always serializable");
 
-    let response_format: Value = serde_json::to_value(&req.response_format)
-        .expect("response_format always serializable");
+    let response_format: Value =
+        serde_json::to_value(&req.response_format).expect("response_format always serializable");
 
     // Sort stop sequences for stability.
     let mut stop = req.stop.clone();

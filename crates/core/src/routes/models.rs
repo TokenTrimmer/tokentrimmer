@@ -40,6 +40,10 @@ pub async fn handler(State(state): State<AppState>) -> Json<ModelsResponse> {
             data.push(model_entry(&info, provider.id(), pricing));
         }
     }
+    // Registry iteration order is unspecified (HashMap), which would make the
+    // catalog response non-deterministic across restarts. Sort by
+    // (provider, model id) so clients, snapshots, and diffs see a stable list.
+    data.sort_by(|a, b| a.owned_by.cmp(&b.owned_by).then_with(|| a.id.cmp(&b.id)));
     Json(ModelsResponse {
         object: "list",
         data,

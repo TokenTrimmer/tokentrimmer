@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use httpmock::prelude::*;
-use tt_provider_openai::ClientConfig;
+use tt_provider_compat::ClientConfig;
 use tt_provider_openrouter::OpenRouterProvider;
 use tt_shared::{
     context::{ProviderCredentials, RequestContext, SecretString},
@@ -79,7 +79,8 @@ fn success_body() -> String {
 }
 
 fn provider() -> OpenRouterProvider {
-    OpenRouterProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    OpenRouterProvider::new_allow_local(ClientConfig::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +132,12 @@ async fn smoke_429_rate_limited() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 5_000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 5_000
+            }
+        ),
         "expected RateLimited{{5000}}, got {err:?}"
     );
 }
@@ -179,7 +185,11 @@ fn provider_id_is_openrouter() {
 fn models_list_contains_expected_models() {
     let p = provider();
     let models = p.models();
-    assert_eq!(models.len(), 5, "expected 5 OpenRouter models in static set");
+    assert_eq!(
+        models.len(),
+        5,
+        "expected 5 OpenRouter models in static set"
+    );
 
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert!(ids.contains(&"anthropic/claude-sonnet-4-6"));
@@ -198,8 +208,8 @@ fn pricing_table_correct_rates() {
     let p = provider();
 
     let claude = p
-        .pricing("anthropic/claude-sonnet-4-6")
-        .expect("pricing for claude-sonnet-4-6");
+        .pricing("anthropic/claude-sonnet-4.6")
+        .expect("pricing for claude-sonnet-4.6");
     assert_eq!(claude.input_per_million, 3.00);
     assert_eq!(claude.output_per_million, 15.00);
 
@@ -208,16 +218,16 @@ fn pricing_table_correct_rates() {
     assert_eq!(gpt55.output_per_million, 30.00);
 
     let gemini = p
-        .pricing("google/gemini-3.1-pro")
-        .expect("pricing for gemini-3.1-pro");
+        .pricing("google/gemini-3.1-pro-preview")
+        .expect("pricing for gemini-3.1-pro-preview");
     assert_eq!(gemini.input_per_million, 2.00);
     assert_eq!(gemini.output_per_million, 12.00);
 
     let llama = p
         .pricing("meta-llama/llama-3.3-70b-instruct")
         .expect("pricing for llama-3.3-70b");
-    assert_eq!(llama.input_per_million, 0.59);
-    assert_eq!(llama.output_per_million, 0.79);
+    assert_eq!(llama.input_per_million, 0.10);
+    assert_eq!(llama.output_per_million, 0.32);
 
     let mistral = p
         .pricing("mistralai/mistral-large")

@@ -85,7 +85,8 @@ fn success_body(cached_tokens: u64) -> String {
 }
 
 fn provider() -> OpenAiProvider {
-    OpenAiProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    OpenAiProvider::new_allow_local(ClientConfig::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +211,12 @@ async fn error_429_with_retry_after() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 5000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 5000
+            }
+        ),
         "expected RateLimited{{5000}}, got {err:?}"
     );
 }
@@ -239,7 +245,12 @@ async fn error_429_without_retry_after_defaults_1000ms() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 1000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 1000
+            }
+        ),
         "expected RateLimited{{1000}}, got {err:?}"
     );
 }
@@ -330,12 +341,18 @@ async fn error_400_invalid_request() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Streaming for reasoning models returns Unsupported (no HTTP call)
+// 9. Streaming for reasoning models is supported (o3 / o4-mini)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn streaming_reasoning_models_unsupported() {
+async fn streaming_reasoning_models_supported() {
     let server = MockServer::start();
+    let _mock = server.mock(|when, then| {
+        when.method(POST).path("/chat/completions");
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body("data: [DONE]\n\n");
+    });
     let ctx = make_ctx(&server.base_url());
 
     for model in ["o3", "o4-mini"] {
@@ -344,11 +361,11 @@ async fn streaming_reasoning_models_unsupported() {
 
         let result = provider().chat_completion_stream(req, &ctx).await;
 
-        assert!(result.is_err(), "model {model} should return Unsupported");
-        match result.err().expect("error") {
-            ProviderError::Unsupported(_) => {}
-            other => panic!("model {model}: expected Unsupported, got {other:?}"),
-        }
+        assert!(
+            result.is_ok(),
+            "model {model} should now stream, got {:?}",
+            result.err()
+        );
     }
 }
 
@@ -503,13 +520,19 @@ async fn embeddings_401_unauthorized() {
 fn embeddings_pricing_present() {
     let p = provider();
     let pricing = p.pricing("text-embedding-3-small");
-    assert!(pricing.is_some(), "text-embedding-3-small should have pricing");
+    assert!(
+        pricing.is_some(),
+        "text-embedding-3-small should have pricing"
+    );
     let pricing = pricing.unwrap();
     assert_eq!(pricing.input_per_million, 0.02, "should be $0.02/1M");
     assert_eq!(pricing.output_per_million, 0.00);
 
     let large = p.pricing("text-embedding-3-large");
-    assert!(large.is_some(), "text-embedding-3-large should have pricing");
+    assert!(
+        large.is_some(),
+        "text-embedding-3-large should have pricing"
+    );
     assert_eq!(large.unwrap().input_per_million, 0.13, "should be $0.13/1M");
 }
 
@@ -540,12 +563,16 @@ fn provider_id_and_models() {
 fn pricing_table_all_models_present() {
     let p = provider();
 
-    for model in ["gpt-5.5", "gpt-5.4", "gpt-4o", "gpt-4o-mini", "o3", "o4-mini"] {
+    for model in [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o3",
+        "o4-mini",
+    ] {
         let pricing = p.pricing(model);
-        assert!(
-            pricing.is_some(),
-            "missing pricing for model '{model}'"
-        );
+        assert!(pricing.is_some(), "missing pricing for model '{model}'");
     }
 
     // Unknown model returns None.
@@ -562,9 +589,10 @@ fn pricing_values_match_spec() {
     assert_eq!(gpt55.cached_input_per_million, Some(0.50));
 
     let o3 = p.pricing("o3").expect("o3 pricing");
-    assert_eq!(o3.input_per_million, 60.00);
-    assert_eq!(o3.output_per_million, 240.00);
-    assert_eq!(o3.cached_input_per_million, Some(15.00));
+    // o3 list price was cut to $2/$8/$0.50 (2026-05-31 catalog entry).
+    assert_eq!(o3.input_per_million, 2.00);
+    assert_eq!(o3.output_per_million, 8.00);
+    assert_eq!(o3.cached_input_per_million, Some(0.50));
 
     let mini = p.pricing("gpt-4o-mini").expect("gpt-4o-mini pricing");
     assert_eq!(mini.input_per_million, 0.15);

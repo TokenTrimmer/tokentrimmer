@@ -1,0 +1,5 @@
+# Daily / weekly cost circuit-breaker for autonomous AI loops in this repo.
+# Edit only after deciding any spike was justified.
+
+daily_cap_usd = 10
+weekly_cap_usd = 50

@@ -51,9 +51,10 @@
 //! Fine for the v1 corpus sizes the CLI replays. An HNSW upgrade lands in a
 //! later iteration when the bucket size becomes a bottleneck.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use crate::types::{L2Projection, L2SweepResult, PlanConfig, RequestLog};
 
@@ -99,28 +100,41 @@ pub fn project_l2_hits(requests: &[RequestLog], config: &PlanConfig) -> L2SweepR
     sorted.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
 
     let mut per_threshold: Vec<L2Projection> = Vec::with_capacity(config.l2_threshold_sweep.len());
-    let mut poisoning_total: u32 = 0;
+    // DEDUP: union of the distinct request ids flagged at *any* threshold.
+    // A request that poisons at multiple thresholds lands in the set once, so
+    // the aggregate reflects distinct candidate requests rather than the
+    // cross-sweep sum (which over-counts up to N× for an N-threshold sweep).
+    // BTreeSet (not HashSet) keeps the cardinality deterministic regardless of
+    // insertion order.
+    let mut distinct_poisoning: BTreeSet<Uuid> = BTreeSet::new();
 
     for &threshold in &config.l2_threshold_sweep {
-        let (proj, poisoning) = run_single_threshold(&sorted, threshold, ttl);
-        poisoning_total = poisoning_total.saturating_add(poisoning);
+        let proj = run_single_threshold(&sorted, threshold, ttl, &mut distinct_poisoning);
         per_threshold.push(proj);
     }
 
+    let poisoning_candidates = u32::try_from(distinct_poisoning.len()).unwrap_or(u32::MAX);
+
     L2SweepResult {
         per_threshold,
-        poisoning_candidates: poisoning_total,
+        poisoning_candidates,
     }
 }
 
 /// Run one threshold pass. The requests slice MUST already be sorted by
 /// `(ts, id)` — sorting is done once in [`project_l2_hits`] and reused
 /// across thresholds so the per-pass cost stays linear in the bucket size.
+///
+/// The returned [`L2Projection`] carries this threshold's own poisoning
+/// count. Each flagged request's id is also inserted into
+/// `distinct_poisoning` so the caller can report the deduplicated
+/// cross-sweep aggregate.
 fn run_single_threshold(
     sorted: &[&RequestLog],
     threshold: f32,
     ttl: chrono::Duration,
-) -> (L2Projection, u32) {
+    distinct_poisoning: &mut BTreeSet<Uuid>,
+) -> L2Projection {
     // BTreeMap (rather than HashMap) so iteration order — and thus any
     // future bucket-mutation order — stays deterministic. The buckets
     // themselves are Vecs kept in `ts`-ascending insertion order; we evict
@@ -161,6 +175,11 @@ fn run_single_threshold(
             let source = &bucket[idx];
             if outcomes_diverged(source, req) {
                 poisoning = poisoning.saturating_add(1);
+                // Record this request id for the deduplicated aggregate. The
+                // per-threshold `poisoning` count above still increments every
+                // time so each threshold reports its own (possibly repeated)
+                // candidate.
+                distinct_poisoning.insert(req.id);
             }
             // Hits do not reset / re-insert — the original miss already
             // populated the cache. The source entry keeps its `ts`.
@@ -179,13 +198,13 @@ fn run_single_threshold(
     } else {
         f64::from(hits) / f64::from(total_considered)
     };
-    let projection = L2Projection {
+    L2Projection {
         threshold,
         total: total_considered,
         projected_l2_hits: hits,
         projected_l2_hit_rate: rate,
-    };
-    (projection, poisoning)
+        poisoning_candidates: poisoning,
+    }
 }
 
 /// Cosine similarity between two equal-length vectors. The production
@@ -211,12 +230,16 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Cache-poisoning heuristic. See the module-level docs for the policy.
 fn outcomes_diverged(source: &LiveEntry, req: &RequestLog) -> bool {
-    let finish_diverged = match (source.finish_reason.as_deref(), req.finish_reason.as_deref()) {
+    let finish_diverged = match (
+        source.finish_reason.as_deref(),
+        req.finish_reason.as_deref(),
+    ) {
         (Some(a), Some(b)) => a != b,
         _ => false,
     };
     let tolerance = std::cmp::max(20, req.output_tokens / 4);
-    let token_delta = (i64::from(source.output_tokens) - i64::from(req.output_tokens)).unsigned_abs();
+    let token_delta =
+        (i64::from(source.output_tokens) - i64::from(req.output_tokens)).unsigned_abs();
     let tokens_diverged = token_delta > u64::from(tolerance);
     finish_diverged || tokens_diverged
 }
@@ -323,7 +346,10 @@ mod tests {
 
     #[test]
     fn empty_sweep_when_no_embeddings() {
-        let reqs = vec![req_with(1, 0, None, None, 10), req_with(2, 1, None, None, 10)];
+        let reqs = vec![
+            req_with(1, 0, None, None, 10),
+            req_with(2, 1, None, None, 10),
+        ];
         let cfg = PlanConfig {
             l2_ttl_seconds: Some(60),
             ..PlanConfig::default()
@@ -331,6 +357,71 @@ mod tests {
         let result = project_l2_hits(&reqs, &cfg);
         assert!(result.per_threshold.is_empty());
         assert_eq!(result.poisoning_candidates, 0);
+    }
+
+    #[test]
+    fn poisoning_reported_per_threshold_and_deduped_in_aggregate() {
+        // Two requests with identical embeddings (cosine == 1.0), so the
+        // second hits the first at *every* threshold in the sweep. Their
+        // outcomes diverge (finish_reason stop vs length) → the second is a
+        // poisoning candidate at every threshold it hits.
+        let emb = Some(vec![1.0_f32, 0.0, 0.0]);
+        let reqs = vec![
+            req_with(1, 0, emb.clone(), Some("length"), 100),
+            req_with(2, 1, emb.clone(), Some("stop"), 100),
+        ];
+        let cfg = PlanConfig {
+            l2_ttl_seconds: Some(600),
+            // Three thresholds the identical pair clears at all of them.
+            l2_threshold_sweep: vec![0.80, 0.90, 0.95],
+            ..PlanConfig::default()
+        };
+        let result = project_l2_hits(&reqs, &cfg);
+
+        // (a) Each per-threshold projection reports its OWN count. The pair
+        // hits + diverges at every threshold, so every row reports exactly 1.
+        assert_eq!(result.per_threshold.len(), 3);
+        for proj in &result.per_threshold {
+            assert_eq!(proj.projected_l2_hits, 1);
+            assert_eq!(
+                proj.poisoning_candidates, 1,
+                "threshold {} should report its own poisoning count",
+                proj.threshold
+            );
+        }
+
+        // (b) The aggregate counts the candidate request ONCE — not 3× (the
+        // old summed behaviour). One distinct poisoning-candidate request id.
+        assert_eq!(
+            result.poisoning_candidates, 1,
+            "aggregate must dedup across the sweep, not sum (would be 3)"
+        );
+    }
+
+    #[test]
+    fn poisoning_aggregate_counts_distinct_requests() {
+        // Two independent poisoning candidates (req 2 matches req 1, req 4
+        // matches req 3) — distinct ids → aggregate is 2. Each threshold
+        // reports both, but the aggregate stays 2 across the multi-threshold
+        // sweep rather than 2 * number_of_thresholds.
+        let a = Some(vec![1.0_f32, 0.0]);
+        let b = Some(vec![0.0_f32, 1.0]);
+        let reqs = vec![
+            req_with(1, 0, a.clone(), Some("length"), 100),
+            req_with(2, 1, a.clone(), Some("stop"), 100),
+            req_with(3, 2, b.clone(), Some("length"), 100),
+            req_with(4, 3, b.clone(), Some("stop"), 100),
+        ];
+        let cfg = PlanConfig {
+            l2_ttl_seconds: Some(600),
+            l2_threshold_sweep: vec![0.90, 0.95],
+            ..PlanConfig::default()
+        };
+        let result = project_l2_hits(&reqs, &cfg);
+        for proj in &result.per_threshold {
+            assert_eq!(proj.poisoning_candidates, 2);
+        }
+        assert_eq!(result.poisoning_candidates, 2);
     }
 
     #[test]

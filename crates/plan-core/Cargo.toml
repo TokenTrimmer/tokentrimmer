@@ -22,3 +22,6 @@ rand_chacha = "0.3"
 [dev-dependencies]
 insta.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

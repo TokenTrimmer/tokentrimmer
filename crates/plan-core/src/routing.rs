@@ -80,6 +80,7 @@ mod tests {
             then: RouteAction {
                 target_model: "x".into(),
                 force_cache_layer: None,
+                fallbacks: Vec::new(),
             },
         }
     }

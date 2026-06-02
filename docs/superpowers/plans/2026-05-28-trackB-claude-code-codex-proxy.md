@@ -1,0 +1,1056 @@
+# Track B — `tt proxy` Claude Code / Codex Proxy Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Ship `tt proxy` — a local HTTP listener (default port 31415) that speaks the OpenAI native API at `/v1/chat/completions` and Anthropic native API at `/v1/messages`, forwards requests to the hosted TokenTrimmer Gateway (or directly to the upstream provider in `--mode bypass`), and writes per-session cost rollups to `~/.tokentrimmer/sessions/`. On Ctrl-C, prints a TUI banner summarizing the session.
+
+**Architecture:** New module tree at `crates/cli/src/proxy/` extending the existing `tt` CLI binary. Axum-based listener; reqwest streaming forwarder; tokio for the async server; session log + rollup state in a `Mutex<HashMap>` keyed by trace_id. No new crate — extends `crates/cli/`.
+
+**Tech Stack:** Rust 1.88, Axum (existing in workspace), `reqwest` with stream support, `tokio`, `clap`, `crossterm` for the optional TUI banner, `dirs` for `~/.tokentrimmer/` resolution, `serde_json`, `tracing`. Tests use `httpmock` for upstream + curl-from-tokio for proxy-end.
+
+**Spec:** `docs/superpowers/specs/2026-05-28-trackB-claude-code-codex-proxy-design.md`.
+
+**Depends on:** Track C (cost preview endpoint) only for the optional `X-TT-Preview-Cost-Usd` header injection. The proxy works without it — the header is omitted when preview is unreachable.
+
+---
+
+## File Structure
+
+```
+crates/cli/
+├── Cargo.toml                              [modified — add reqwest stream, crossterm, dirs]
+└── src/
+    ├── main.rs                             [modified — register Proxy subcommand]
+    └── proxy/
+        ├── mod.rs                          [NEW — orchestrator + CLI args]
+        ├── listener.rs                     [NEW — Axum server + graceful shutdown]
+        ├── routes/
+        │   ├── mod.rs                      [NEW]
+        │   ├── anthropic.rs                [NEW — POST /v1/messages]
+        │   ├── openai.rs                   [NEW — POST /v1/chat/completions]
+        │   └── models.rs                   [NEW — GET /v1/models]
+        ├── forward.rs                      [NEW — reqwest streaming forward]
+        ├── session.rs                      [NEW — per-session log + rollup state]
+        ├── tui.rs                          [NEW — Ctrl-C banner]
+        └── config.rs                       [NEW — ~/.tokentrimmer/proxy.toml]
+```
+
+---
+
+## Task 1: Scaffold proxy module + deps
+
+**Files:**
+- Modify: `crates/cli/Cargo.toml`
+- Create: `crates/cli/src/proxy/{mod,listener,forward,session,tui,config}.rs`
+- Create: `crates/cli/src/proxy/routes/{mod,anthropic,openai,models}.rs`
+
+- [ ] **Step 1: Add deps to `crates/cli/Cargo.toml`**
+
+In `[dependencies]`:
+```toml
+crossterm = "0.28"
+dirs = "5.0"
+chrono = { workspace = true, features = ["serde"] }
+```
+
+`axum`, `reqwest`, `tokio`, `tracing`, `serde_json`, `thiserror` are already in cli's deps from prior work.
+
+- [ ] **Step 2: Create the module files**
+
+```bash
+mkdir -p crates/cli/src/proxy/routes
+for f in mod listener forward session tui config; do
+  echo "//! tt proxy — \`$f\` (scaffold)" > "crates/cli/src/proxy/$f.rs"
+done
+for f in mod anthropic openai models; do
+  echo "//! tt proxy routes — \`$f\` (scaffold)" > "crates/cli/src/proxy/routes/$f.rs"
+done
+```
+
+- [ ] **Step 3: Replace `crates/cli/src/proxy/mod.rs`**
+
+```rust
+//! `tt proxy` — local OpenAI/Anthropic-compatible listener.
+//!
+//! See `docs/superpowers/specs/2026-05-28-trackB-claude-code-codex-proxy-design.md`.
+
+pub mod config;
+pub mod forward;
+pub mod listener;
+pub mod routes;
+pub mod session;
+pub mod tui;
+```
+
+- [ ] **Step 4: Replace `crates/cli/src/proxy/routes/mod.rs`**
+
+```rust
+pub mod anthropic;
+pub mod models;
+pub mod openai;
+```
+
+- [ ] **Step 5: Compile check**
+
+`cargo check -p tt-cli`
+Expected: clean with unused warnings.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/cli/Cargo.toml crates/cli/src/proxy/
+git commit -m "feat(cli): scaffold tt proxy module tree
+
+Track B day-0. Empty modules to be filled.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 2: Config + mode enum
+
+**Files:** `crates/cli/src/proxy/config.rs`
+
+- [ ] **Step 1: Write the module + tests**
+
+```rust
+//! Runtime config for tt proxy. Mostly comes from CLI args; a few values
+//! (default session log path) resolve from ~/.tokentrimmer/.
+
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Forward to hosted TokenTrimmer Gateway (full features).
+    Gateway,
+    /// Forward to upstream provider directly (logging only).
+    Bypass,
+    /// /v1/chat/completions → gateway; everything else → bypass.
+    Hybrid,
+}
+
+impl Mode {
+    pub fn parse(s: &str) -> Option<Mode> {
+        match s.to_lowercase().as_str() {
+            "gateway" => Some(Mode::Gateway),
+            "bypass" => Some(Mode::Bypass),
+            "hybrid" => Some(Mode::Hybrid),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub bind: SocketAddr,
+    pub mode: Mode,
+    pub tt_api_key: Option<String>,
+    pub gateway_base_url: String,
+    pub upstream_anthropic: String,
+    pub upstream_openai: String,
+    pub session_log_dir: PathBuf,
+    pub no_tui: bool,
+    pub no_preview: bool,
+}
+
+impl Config {
+    pub fn build(
+        port: u16,
+        bind: IpAddr,
+        mode: Mode,
+        tt_api_key: Option<String>,
+        no_tui: bool,
+        no_preview: bool,
+        session_log_dir: Option<PathBuf>,
+    ) -> Self {
+        let default_log_dir = dirs::home_dir()
+            .map(|h| h.join(".tokentrimmer").join("sessions"))
+            .unwrap_or_else(|| PathBuf::from("./sessions"));
+        Self {
+            bind: SocketAddr::new(bind, port),
+            mode,
+            tt_api_key,
+            gateway_base_url: "https://tokentrimmer.fly.dev".into(),
+            upstream_anthropic: "https://api.anthropic.com".into(),
+            upstream_openai: "https://api.openai.com".into(),
+            session_log_dir: session_log_dir.unwrap_or(default_log_dir),
+            no_tui,
+            no_preview,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_modes() {
+        assert_eq!(Mode::parse("gateway"), Some(Mode::Gateway));
+        assert_eq!(Mode::parse("bypass"), Some(Mode::Bypass));
+        assert_eq!(Mode::parse("HYBRID"), Some(Mode::Hybrid));
+        assert_eq!(Mode::parse("nope"), None);
+    }
+
+    #[test]
+    fn build_sets_defaults() {
+        let cfg = Config::build(
+            31415,
+            "127.0.0.1".parse().unwrap(),
+            Mode::Gateway,
+            Some("k".into()),
+            false, false, None,
+        );
+        assert_eq!(cfg.bind.port(), 31415);
+        assert!(cfg.gateway_base_url.contains("tokentrimmer"));
+    }
+}
+```
+
+- [ ] **Step 2: Run tests**
+
+`cargo test -p tt-cli proxy::config`
+Expected: 2 passed.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/cli/src/proxy/config.rs
+git commit -m "feat(cli): tt proxy config + Mode enum
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 3: Session log + in-memory rollup
+
+**Files:** `crates/cli/src/proxy/session.rs`
+
+- [ ] **Step 1: Write the module + tests**
+
+```rust
+//! Per-session cost rollup. Appends one JSONL line per response; aggregates
+//! totals for the Ctrl-C banner.
+
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use chrono::Utc;
+use serde::Serialize;
+
+#[derive(Debug, Default, Clone)]
+pub struct Rollup {
+    pub requests: u32,
+    pub total_cost_usd: f64,
+    pub total_savings_usd: f64,
+    pub cache_hits: u32,
+    pub suggested_savings_usd: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogLine<'a> {
+    pub timestamp: String,
+    pub mode: &'a str,
+    pub route: &'a str,
+    pub model: Option<&'a str>,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub cost_usd: Option<f64>,
+    pub preview_cost_usd: Option<f64>,
+    pub cache_layer: Option<&'a str>,
+    pub suggested_route: Option<&'a str>,
+    pub suggested_savings_usd: Option<f64>,
+    pub trace_id: Option<&'a str>,
+}
+
+pub struct SessionLog {
+    path: PathBuf,
+    rollup: Mutex<Rollup>,
+}
+
+impl SessionLog {
+    pub fn new(dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        Ok(Self {
+            path: dir.join(format!("{date}.jsonl")),
+            rollup: Mutex::new(Rollup::default()),
+        })
+    }
+
+    pub fn append(&self, line: &LogLine<'_>) -> std::io::Result<()> {
+        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let json = serde_json::to_string(line).unwrap();
+        writeln!(f, "{json}")?;
+        let mut r = self.rollup.lock().unwrap();
+        r.requests += 1;
+        r.total_cost_usd += line.cost_usd.unwrap_or(0.0);
+        if matches!(line.cache_layer, Some("hit-l1" | "hit-l2")) {
+            r.cache_hits += 1;
+        }
+        r.suggested_savings_usd += line.suggested_savings_usd.unwrap_or(0.0);
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> Rollup { self.rollup.lock().unwrap().clone() }
+
+    pub fn path(&self) -> &Path { &self.path }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_writes_jsonl_line_and_updates_rollup() {
+        let d = tempfile::tempdir().unwrap();
+        let log = SessionLog::new(d.path()).unwrap();
+        log.append(&LogLine {
+            timestamp: "ts".into(),
+            mode: "gateway",
+            route: "POST /v1/messages",
+            model: Some("claude-haiku-4-5"),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cost_usd: Some(0.0001),
+            preview_cost_usd: Some(0.0001),
+            cache_layer: Some("hit-l1"),
+            suggested_route: None,
+            suggested_savings_usd: None,
+            trace_id: Some("t"),
+        }).unwrap();
+        let r = log.snapshot();
+        assert_eq!(r.requests, 1);
+        assert_eq!(r.cache_hits, 1);
+        let body = std::fs::read_to_string(log.path()).unwrap();
+        assert!(body.contains("claude-haiku-4-5"));
+    }
+}
+```
+
+- [ ] **Step 2: Run tests**
+
+`cargo test -p tt-cli proxy::session`
+Expected: 1 passed.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/cli/src/proxy/session.rs
+git commit -m "feat(cli): tt proxy session log + rollup
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 4: HTTP forwarder
+
+**Files:** `crates/cli/src/proxy/forward.rs`
+
+- [ ] **Step 1: Write the module + tests**
+
+```rust
+//! Stream-forward an HTTP request to an upstream URL, returning the upstream
+//! response shape (status, headers, body bytes-stream).
+
+use axum::body::Body;
+use axum::http::{HeaderMap, StatusCode};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ForwardError {
+    #[error("reqwest: {0}")]
+    Reqwest(#[from] reqwest::Error),
+    #[error("invalid upstream URL: {0}")]
+    Url(String),
+}
+
+pub struct ForwardedResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: reqwest::Response,
+}
+
+pub async fn forward_post(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    headers: HeaderMap,
+    body_bytes: bytes::Bytes,
+) -> Result<ForwardedResponse, ForwardError> {
+    let mut req = client.post(upstream_url).body(body_bytes);
+    // Carry-over content-type, authorization, user-agent. Reqwest will set
+    // host/length itself.
+    for (k, v) in headers.iter() {
+        if matches!(k.as_str(), "host" | "content-length") { continue; }
+        if let Ok(s) = v.to_str() {
+            req = req.header(k.as_str(), s);
+        }
+    }
+    let resp = req.send().await?;
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut hm = HeaderMap::new();
+    for (k, v) in resp.headers().iter() {
+        hm.insert(k.clone(), v.clone());
+    }
+    Ok(ForwardedResponse { status, headers: hm, body: resp })
+}
+
+/// Convert the upstream body stream into an Axum body. Streams chunks.
+pub fn into_axum_body(resp: reqwest::Response) -> Body {
+    Body::from_stream(resp.bytes_stream())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+
+    #[tokio::test]
+    async fn forward_round_trips_body_and_status() {
+        let server = MockServer::start_async().await;
+        let _m = server.mock_async(|when, then| {
+            when.method(POST).path("/v1/messages").body("hello");
+            then.status(200).body("upstream-resp");
+        }).await;
+        let client = reqwest::Client::new();
+        let mut h = HeaderMap::new();
+        h.insert("content-type", "text/plain".parse().unwrap());
+        let resp = forward_post(&client, &format!("{}/v1/messages", server.base_url()), h, "hello".into()).await.unwrap();
+        assert_eq!(resp.status, 200);
+        let body_bytes = resp.body.bytes().await.unwrap();
+        assert_eq!(&body_bytes[..], b"upstream-resp");
+    }
+}
+```
+
+- [ ] **Step 2: Add `bytes` dep**
+
+`bytes.workspace = true` in cli Cargo.toml `[dependencies]`. Add to workspace deps if missing.
+
+- [ ] **Step 3: Run tests**
+
+`cargo test -p tt-cli proxy::forward`
+Expected: 1 passed.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/cli/Cargo.toml crates/cli/src/proxy/forward.rs
+git commit -m "feat(cli): tt proxy HTTP forwarder
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 5: Anthropic route handler
+
+**Files:** `crates/cli/src/proxy/routes/anthropic.rs`
+
+- [ ] **Step 1: Write the handler**
+
+```rust
+//! POST /v1/messages — accept Anthropic native, forward to gateway or
+//! upstream per the active mode.
+
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+
+use crate::proxy::config::{Config, Mode};
+use crate::proxy::forward;
+use crate::proxy::session::{LogLine, SessionLog};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub http: reqwest::Client,
+    pub log: Arc<SessionLog>,
+}
+
+pub async fn post_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let upstream = upstream_url(&state.config, "/v1/messages");
+    let mut h = headers.clone();
+    if state.config.mode == Mode::Gateway {
+        if let Some(k) = &state.config.tt_api_key {
+            h.insert("authorization", format!("Bearer {k}").parse().unwrap());
+        }
+    }
+    match forward::forward_post(&state.http, &upstream, h, body).await {
+        Ok(resp) => {
+            let _ = state.log.append(&LogLine {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                mode: match state.config.mode {
+                    Mode::Gateway => "gateway",
+                    Mode::Bypass => "bypass",
+                    Mode::Hybrid => "hybrid",
+                },
+                route: "POST /v1/messages",
+                model: None, input_tokens: None, output_tokens: None,
+                cost_usd: resp.headers.get("x-tokentrimmer-cost-usd")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok()),
+                preview_cost_usd: None,
+                cache_layer: resp.headers.get("x-tokentrimmer-cache")
+                    .and_then(|v| v.to_str().ok()),
+                suggested_route: None,
+                suggested_savings_usd: None,
+                trace_id: resp.headers.get("x-tokentrimmer-trace-id")
+                    .and_then(|v| v.to_str().ok()),
+            });
+            let mut response_headers = resp.headers.clone();
+            response_headers.insert("x-tt-proxy-mode", match state.config.mode {
+                Mode::Gateway => "gateway".parse().unwrap(),
+                Mode::Bypass => "bypass".parse().unwrap(),
+                Mode::Hybrid => "hybrid".parse().unwrap(),
+            });
+            let body = forward::into_axum_body(resp.body);
+            (resp.status, response_headers, body).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error=%e, "anthropic forward failed");
+            let mut h = HeaderMap::new();
+            h.insert("x-tt-proxy-down", "true".parse().unwrap());
+            (axum::http::StatusCode::BAD_GATEWAY, h, format!("proxy upstream error: {e}")).into_response()
+        }
+    }
+}
+
+fn upstream_url(cfg: &Config, path: &str) -> String {
+    match cfg.mode {
+        Mode::Gateway | Mode::Hybrid => format!("{}{}", cfg.gateway_base_url, path),
+        Mode::Bypass => format!("{}{}", cfg.upstream_anthropic, path),
+    }
+}
+```
+
+- [ ] **Step 2: Compile check**
+
+`cargo check -p tt-cli`
+Expected: clean.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/cli/src/proxy/routes/anthropic.rs
+git commit -m "feat(cli): tt proxy /v1/messages handler
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 6: OpenAI route handler
+
+**Files:** `crates/cli/src/proxy/routes/openai.rs`
+
+- [ ] **Step 1: Write the handler**
+
+```rust
+//! POST /v1/chat/completions — accept OpenAI native, forward per mode.
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+
+use crate::proxy::config::Mode;
+use crate::proxy::forward;
+use crate::proxy::routes::anthropic::AppState;
+use crate::proxy::session::LogLine;
+
+pub async fn post_chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let upstream = match state.config.mode {
+        Mode::Gateway | Mode::Hybrid => format!("{}/v1/chat/completions", state.config.gateway_base_url),
+        Mode::Bypass => format!("{}/v1/chat/completions", state.config.upstream_openai),
+    };
+    let mut h = headers.clone();
+    if state.config.mode == Mode::Gateway {
+        if let Some(k) = &state.config.tt_api_key {
+            h.insert("authorization", format!("Bearer {k}").parse().unwrap());
+        }
+    }
+    match forward::forward_post(&state.http, &upstream, h, body).await {
+        Ok(resp) => {
+            let _ = state.log.append(&LogLine {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                mode: match state.config.mode {
+                    Mode::Gateway => "gateway", Mode::Bypass => "bypass", Mode::Hybrid => "hybrid",
+                },
+                route: "POST /v1/chat/completions",
+                model: None, input_tokens: None, output_tokens: None,
+                cost_usd: resp.headers.get("x-tokentrimmer-cost-usd")
+                    .and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()),
+                preview_cost_usd: None,
+                cache_layer: resp.headers.get("x-tokentrimmer-cache").and_then(|v| v.to_str().ok()),
+                suggested_route: None,
+                suggested_savings_usd: None,
+                trace_id: resp.headers.get("x-tokentrimmer-trace-id").and_then(|v| v.to_str().ok()),
+            });
+            let body = forward::into_axum_body(resp.body);
+            (resp.status, resp.headers, body).into_response()
+        }
+        Err(e) => {
+            let mut h = HeaderMap::new();
+            h.insert("x-tt-proxy-down", "true".parse().unwrap());
+            (axum::http::StatusCode::BAD_GATEWAY, h, format!("proxy upstream error: {e}")).into_response()
+        }
+    }
+}
+```
+
+- [ ] **Step 2: Models passthrough**
+
+`crates/cli/src/proxy/routes/models.rs`:
+
+```rust
+//! GET /v1/models — passthrough to upstream/gateway.
+
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+
+use crate::proxy::config::Mode;
+use crate::proxy::routes::anthropic::AppState;
+
+pub async fn get_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let upstream = match state.config.mode {
+        Mode::Gateway | Mode::Hybrid => format!("{}/v1/models", state.config.gateway_base_url),
+        Mode::Bypass => format!("{}/v1/models", state.config.upstream_openai),
+    };
+    let mut req = state.http.get(&upstream);
+    for (k, v) in headers.iter() {
+        if matches!(k.as_str(), "host") { continue; }
+        if let Ok(s) = v.to_str() { req = req.header(k.as_str(), s); }
+    }
+    if state.config.mode == Mode::Gateway {
+        if let Some(k) = &state.config.tt_api_key {
+            req = req.bearer_auth(k);
+        }
+    }
+    match req.send().await {
+        Ok(r) => {
+            let status = axum::http::StatusCode::from_u16(r.status().as_u16()).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let body = r.bytes().await.unwrap_or_default();
+            (status, body).into_response()
+        }
+        Err(_) => axum::http::StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+```
+
+- [ ] **Step 3: Compile**
+
+`cargo check -p tt-cli`
+Expected: clean.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/cli/src/proxy/routes/openai.rs crates/cli/src/proxy/routes/models.rs
+git commit -m "feat(cli): tt proxy /v1/chat/completions + /v1/models handlers
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 7: Listener + graceful shutdown
+
+**Files:** `crates/cli/src/proxy/listener.rs`
+
+- [ ] **Step 1: Write the listener**
+
+```rust
+//! Axum server with SIGTERM/SIGINT graceful shutdown.
+
+use std::sync::Arc;
+
+use axum::{routing::get, Router};
+use thiserror::Error;
+use tokio::signal;
+
+use crate::proxy::config::Config;
+use crate::proxy::routes::{anthropic, models, openai};
+use crate::proxy::session::SessionLog;
+
+#[derive(Debug, Error)]
+pub enum ListenerError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("session log: {0}")]
+    SessionLog(String),
+}
+
+pub async fn run(config: Config) -> Result<(), ListenerError> {
+    let log = SessionLog::new(&config.session_log_dir)
+        .map_err(|e| ListenerError::SessionLog(e.to_string()))?;
+    let log = Arc::new(log);
+    let state = anthropic::AppState {
+        config: Arc::new(config.clone()),
+        http: reqwest::Client::new(),
+        log: log.clone(),
+    };
+
+    let app = Router::new()
+        .route("/v1/messages", axum::routing::post(anthropic::post_messages))
+        .route("/v1/chat/completions", axum::routing::post(openai::post_chat_completions))
+        .route("/v1/models", get(models::get_models))
+        .route("/health", get(|| async { "ok" }))
+        .with_state(state);
+
+    tracing::info!(addr=%config.bind, "tt proxy listening");
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_then_banner(log, config.no_tui))
+        .await?;
+    Ok(())
+}
+
+async fn shutdown_then_banner(log: Arc<SessionLog>, no_tui: bool) {
+    let ctrl_c = async { let _ = signal::ctrl_c().await; };
+    #[cfg(unix)]
+    let term = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+    if !no_tui {
+        crate::proxy::tui::print_summary(&log.snapshot(), log.path());
+    }
+}
+```
+
+- [ ] **Step 2: Compile**
+
+`cargo check -p tt-cli`
+Expected: clean.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/cli/src/proxy/listener.rs
+git commit -m "feat(cli): tt proxy listener + graceful shutdown
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 8: TUI summary banner
+
+**Files:** `crates/cli/src/proxy/tui.rs`
+
+- [ ] **Step 1: Write the module**
+
+```rust
+//! Ctrl-C banner: brief session summary printed to stderr.
+
+use crate::proxy::session::Rollup;
+use std::path::Path;
+
+pub fn print_summary(r: &Rollup, log_path: &Path) {
+    let hit_rate = if r.requests > 0 {
+        (r.cache_hits as f64) / (r.requests as f64) * 100.0
+    } else { 0.0 };
+    let cache_savings = r.total_cost_usd * (hit_rate / 100.0);
+    let net_potential = r.suggested_savings_usd;
+    eprintln!();
+    eprintln!("┌─ tokentrimmer session summary ─────────────────────┐");
+    eprintln!("│  Requests:           {:<28}│", r.requests);
+    eprintln!("│  Total cost:         ${:<27.4}│", r.total_cost_usd);
+    eprintln!("│  Cached (L1+L2):     {} ({:.0}%){:<{w}}│",
+        r.cache_hits, hit_rate, "", w = 27 - format!("{} ({:.0}%)", r.cache_hits, hit_rate).len());
+    eprintln!("│  Cache savings:      ${:<27.4}│", cache_savings);
+    eprintln!("│  Suggested savings:  ${:<27.4}│", net_potential);
+    eprintln!("│                                                    │");
+    eprintln!("│  Session log: {:<37}│", log_path.display().to_string());
+    eprintln!("└────────────────────────────────────────────────────┘");
+}
+```
+
+- [ ] **Step 2: Compile**
+
+`cargo check -p tt-cli`
+Expected: clean.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/cli/src/proxy/tui.rs
+git commit -m "feat(cli): tt proxy Ctrl-C summary banner
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 9: CLI subcommand wiring
+
+**Files:** `crates/cli/src/main.rs`
+
+- [ ] **Step 1: Add `Proxy` to the `Command` enum**
+
+After the `Init { ... }` variant:
+
+```rust
+    /// Run a local OpenAI/Anthropic-compatible proxy on port 31415.
+    Proxy {
+        #[arg(long, default_value_t = 31415)]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value = "gateway")]
+        mode: String,
+        #[arg(long)]
+        tt_api_key: Option<String>,
+        #[arg(long)]
+        no_tui: bool,
+        #[arg(long)]
+        no_preview: bool,
+        #[arg(long)]
+        session_log: Option<String>,
+    },
+```
+
+- [ ] **Step 2: Dispatch in `main()`**
+
+```rust
+        Command::Proxy { port, bind, mode, tt_api_key, no_tui, no_preview, session_log } => {
+            use tt_cli::proxy::{config::Config, config::Mode, listener::run as run_listener};
+            let bind_addr: std::net::IpAddr = bind.parse().context("invalid --bind address")?;
+            let mode = Mode::parse(&mode).context("invalid --mode (gateway|bypass|hybrid)")?;
+            let api_key = tt_api_key.or_else(|| std::env::var("TT_API_KEY").ok());
+            if mode == Mode::Gateway && api_key.is_none() {
+                anyhow::bail!("--mode gateway requires --tt-api-key or TT_API_KEY env");
+            }
+            let cfg = Config::build(
+                port, bind_addr, mode, api_key, no_tui, no_preview,
+                session_log.map(std::path::PathBuf::from),
+            );
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("tokio runtime")?
+                .block_on(run_listener(cfg))
+                .context("tt proxy listener")?;
+        }
+```
+
+- [ ] **Step 3: Build + clippy**
+
+```
+cargo check -p tt-cli
+cargo clippy -p tt-cli -- -D warnings
+```
+
+Expected: clean.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/cli/src/main.rs
+git commit -m "feat(cli): wire \`tt proxy\` subcommand
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 10: Integration test (httpmock'd upstream)
+
+**Files:** `crates/cli/tests/proxy_smoke.rs`
+
+- [ ] **Step 1: Write the test**
+
+```rust
+//! End-to-end: start the proxy, point it at an httpmock upstream, fire a curl.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::body::Bytes;
+use httpmock::prelude::*;
+use tt_cli::proxy::{
+    config::{Config, Mode},
+    routes::anthropic::{AppState, post_messages},
+    session::SessionLog,
+};
+
+#[tokio::test]
+async fn anthropic_route_forwards_to_upstream_and_logs() {
+    let upstream = MockServer::start_async().await;
+    let _m = upstream.mock_async(|when, then| {
+        when.method(POST).path("/v1/messages");
+        then.status(200)
+            .header("x-tokentrimmer-cost-usd", "0.0001")
+            .header("x-tokentrimmer-cache", "miss")
+            .body("ok");
+    }).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        mode: Mode::Bypass,
+        tt_api_key: None,
+        gateway_base_url: "http://unused".into(),
+        upstream_anthropic: upstream.base_url(),
+        upstream_openai: "http://unused".into(),
+        session_log_dir: tmp.path().to_path_buf(),
+        no_tui: true,
+        no_preview: true,
+    };
+    let log = Arc::new(SessionLog::new(&cfg.session_log_dir).unwrap());
+    let state = AppState { config: Arc::new(cfg), http: reqwest::Client::new(), log: log.clone() };
+    let headers = axum::http::HeaderMap::new();
+    let resp = post_messages(axum::extract::State(state), headers, Bytes::from_static(b"req")).await;
+    let parts = resp.into_response();
+    assert_eq!(parts.status(), 200);
+    // Give the appender a moment if it spawns.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let snap = log.snapshot();
+    assert_eq!(snap.requests, 1);
+}
+```
+
+- [ ] **Step 2: Add `tempfile` to cli dev-deps** if missing.
+
+- [ ] **Step 3: Run**
+
+`cargo test -p tt-cli --test proxy_smoke`
+Expected: 1 passed.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/cli/Cargo.toml crates/cli/tests/proxy_smoke.rs
+git commit -m "test(cli): tt proxy end-to-end against httpmock'd upstream
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 11: Docs + final gate
+
+**Files:**
+- Create: `docs/tt-proxy-usage.md`
+- Modify: `.claude/CONTEXT_MAP.md`
+
+- [ ] **Step 1: Write `docs/tt-proxy-usage.md`**
+
+```markdown
+# tt proxy
+
+Local OpenAI/Anthropic-compatible listener that routes through the hosted
+TokenTrimmer Gateway and writes per-session cost rollups.
+
+## Quick start
+
+```bash
+tt proxy --mode gateway --tt-api-key tt_live_...
+export ANTHROPIC_BASE_URL=http://localhost:31415
+# or for Codex: export OPENAI_BASE_URL=http://localhost:31415
+```
+
+## Modes
+
+- `gateway` (default) — forward to hosted TT Gateway. Requires `--tt-api-key` or `TT_API_KEY`.
+- `bypass` — forward directly to the upstream provider. Logging only, no features.
+- `hybrid` — gateway for `/v1/chat/completions`, bypass for everything else.
+
+## Session log
+
+JSONL appended at `~/.tokentrimmer/sessions/YYYY-MM-DD.jsonl`. One line per request.
+On Ctrl-C the proxy prints a session summary (disable with `--no-tui`).
+```
+
+- [ ] **Step 2: Context-map entry**
+
+In `.claude/CONTEXT_MAP.md` Domains:
+
+```markdown
+### tt proxy
+
+| If you're doing | Read |
+|---|---|
+| Adding a route | `crates/cli/src/proxy/routes/` (worked example: `anthropic.rs`) |
+| Adjusting Mode behavior | `crates/cli/src/proxy/config.rs::Mode` |
+| Session rollup math | `crates/cli/src/proxy/session.rs` + `crates/cli/src/proxy/tui.rs` |
+| Spec | `docs/superpowers/specs/2026-05-28-trackB-claude-code-codex-proxy-design.md` |
+```
+
+- [ ] **Step 3: Full gate**
+
+```
+cargo fmt --check
+cargo clippy -p tt-cli -- -D warnings
+cargo test -p tt-cli
+./scripts/tt-inspect-self.sh
+```
+
+Expected: all pass.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add docs/tt-proxy-usage.md .claude/CONTEXT_MAP.md
+git commit -m "docs(proxy): usage + context map
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Task 12: Mark backlog item complete
+
+- [ ] **Step 1: Flip `[ ]` → `[x]` for `trackB-claude-code-codex-proxy` in `.claude/BACKLOG.md` and append `_Shipped 2026-MM-DD — Day-0 MVP (Anthropic + OpenAI native + gateway/bypass/hybrid modes; SSE preserved; session log + Ctrl-C banner)._`.**
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add .claude/BACKLOG.md
+git commit -m "backlog: trackB tt proxy Day-0 MVP shipped
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+## Spec coverage check
+
+| Spec section | Covered by |
+|---|---|
+| §4 architecture | Tasks 1–9 |
+| §5 CLI surface | Task 9 |
+| §6 request flow | Tasks 5, 6 (handlers) + Task 4 (forwarder) |
+| §7 session log + rollup | Task 3 |
+| §8 failure modes | Tasks 5, 6 (502 + `x-tt-proxy-down`) |
+| §9 testing | Tasks 2, 3, 4 (units) + Task 10 (integration) |
+| §10 rollout Day 0 | Tasks 1–12 |
+| §10 Day 7+ (`--mode bypass` only) | shipped today; --mode hybrid also routed |
+| Preview header injection from Track C | DEFERRED — wire via `--no-preview false` once Track C `/v1/preview` is reachable |
+
+The `crossterm` dep is wired in Cargo.toml for the TUI module but the Day-0 banner uses plain `eprintln!` — no actual crossterm calls. Keeping the dep gives the next iteration a runway for richer ANSI without another Cargo.toml change.

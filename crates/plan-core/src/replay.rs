@@ -31,15 +31,27 @@ use crate::{
 pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     validate(&input)?;
 
-    // Sort routes by priority descending — first match wins.
+    // Sort routes by priority descending — first match wins. Tie-break on
+    // the route's `id` (ascending) so equal-priority routes have a stable,
+    // config-intrinsic order independent of the caller's input array order.
+    // Without this, two logically-identical configs that differ only in the
+    // ordering of two equal-priority matching routes could resolve to
+    // different winners and thus different projected savings — violating the
+    // replay's "same config → bit-identical result" determinism contract.
     let mut routes = input.proposed_routes.clone();
-    routes.sort_by_key(|r| std::cmp::Reverse(r.priority));
+    routes.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
 
     // Walk requests in deterministic order (by id).
     let mut requests = input.requests.clone();
     requests.sort_by_key(|r| r.id);
 
-    let projection = project_requests(&requests, &routes, &input.pricing);
+    // Project L1 cache hits (exact-match) under the proposed TTL. A projected
+    // hit serves the response for free, so its projected cost is zeroed in the
+    // cost loop — otherwise a cache-adding diff would show $0 savings.
+    // (L2 semantic-hit cost-zeroing is a follow-up: it needs a per-request hit
+    // set at the chosen threshold, and L2 isn't wired in the live gateway yet.)
+    let cache_hit_ids = crate::cache_projection::project_l1_hit_ids(&requests, &input.config);
+    let projection = project_requests(&requests, &routes, &input.pricing, &cache_hit_ids);
 
     let mut aggregates = aggregate(&projection);
 
@@ -66,7 +78,19 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     let confidence_intervals = compute_cis(&projection, input.seed, input.bootstrap_iterations);
     let per_route_breakdown = build_per_route(projection.per_route);
 
-    let mut caveats = build_caveats(requests.len(), aggregates.requests_unprice_able);
+    // Carry the proposed routes through to the result so the apply path can
+    // persist them. We move the *original* (unsorted) input vec rather than
+    // the priority-sorted `routes` clone above — apply re-sorts at write time
+    // and we want to preserve the caller's authored ordering for round-trip
+    // fidelity. This is a partial move out of `input`; the remaining fields
+    // read below (`plan_id`, `org_id`, the window bounds) are all `Copy`.
+    let proposed_routes = input.proposed_routes;
+
+    let mut caveats = build_caveats(
+        requests.len(),
+        aggregates.requests_unprice_able,
+        projection.latency_unprojected,
+    );
     caveats.extend(wide_ci_caveats(&aggregates, &confidence_intervals));
 
     Ok(PlanResult {
@@ -83,6 +107,7 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         // `replay_with_quality`; bare `replay()` returns `None` here so the
         // existing JSON snapshot stays byte-identical.
         quality: None,
+        proposed_routes,
     })
 }
 
@@ -169,12 +194,16 @@ struct Projection {
     requests_rerouted: u32,
     requests_unchanged: u32,
     requests_unprice_able: u32,
+    /// Rerouted requests whose target model had no latency history in the
+    /// window — their latency is shown unchanged (can't be projected).
+    latency_unprojected: u32,
 }
 
 fn project_requests(
     requests: &[RequestLog],
     routes: &[ProposedRoute],
     pricing: &crate::types::PricingTable,
+    cache_hit_ids: &std::collections::HashSet<Uuid>,
 ) -> Projection {
     let cap = requests.len();
     let mut per_request_baseline = Vec::with_capacity(cap);
@@ -185,11 +214,20 @@ fn project_requests(
     let mut requests_rerouted: u32 = 0;
     let mut requests_unchanged: u32 = 0;
     let mut requests_unprice_able: u32 = 0;
+    let mut latency_unprojected: u32 = 0;
+
+    // Median latency per model across the window — used to project a rerouted
+    // request's latency from its TARGET model's history rather than echoing the
+    // original (baseline) model's latency.
+    let model_medians = model_median_latencies(requests);
 
     for req in requests {
         per_request_baseline.push(req.baseline_cost_usd);
-        per_request_latency.push(f64::from(req.latency_ms));
         per_request_cache_hit.push(if req.cached { 1.0 } else { 0.0 });
+
+        // A projected cache hit serves the response for free regardless of
+        // routing, so its projected cost is 0.
+        let is_cache_hit = cache_hit_ids.contains(&req.id);
 
         let matched = routing::match_route(req, routes);
         match matched {
@@ -197,7 +235,22 @@ fn project_requests(
                 let target_key = crate::types::pricing_key(&req.provider, &route.then.target_model);
                 if let Some(p) = pricing.get(&target_key) {
                     let projected = cost::project_cost(req, &route.then.target_model, p);
-                    per_request_projected.push(projected.cost_usd);
+                    let projected_cost = if is_cache_hit {
+                        0.0
+                    } else {
+                        projected.cost_usd
+                    };
+                    per_request_projected.push(projected_cost);
+                    // Project latency from the target model's window history;
+                    // fall back to the request's own latency (and flag it) when
+                    // the target model has no history to project from.
+                    match model_medians.get(route.then.target_model.as_str()) {
+                        Some(&med) => per_request_latency.push(med),
+                        None => {
+                            per_request_latency.push(f64::from(req.latency_ms));
+                            latency_unprojected += 1;
+                        }
+                    }
                     let bucket = per_route.entry(route.id).or_insert_with(|| PerRouteBucket {
                         route_id: route.id,
                         route_name: route.name.clone(),
@@ -207,17 +260,19 @@ fn project_requests(
                     });
                     bucket.matched += 1;
                     bucket.baseline_cost_usd += req.baseline_cost_usd;
-                    bucket.projected_cost_usd += projected.cost_usd;
+                    bucket.projected_cost_usd += projected_cost;
                     requests_rerouted += 1;
                 } else {
                     // No pricing for the target model — count as unchanged.
                     // Conservative invariant: never fabricate savings.
-                    per_request_projected.push(req.cost_usd);
+                    per_request_projected.push(if is_cache_hit { 0.0 } else { req.cost_usd });
+                    per_request_latency.push(f64::from(req.latency_ms));
                     requests_unprice_able += 1;
                 }
             }
             None => {
-                per_request_projected.push(req.cost_usd);
+                per_request_projected.push(if is_cache_hit { 0.0 } else { req.cost_usd });
+                per_request_latency.push(f64::from(req.latency_ms));
                 requests_unchanged += 1;
             }
         }
@@ -232,7 +287,28 @@ fn project_requests(
         requests_rerouted,
         requests_unchanged,
         requests_unprice_able,
+        latency_unprojected,
     }
+}
+
+/// Median latency (ms) per model across the window. Deterministic: sorts the
+/// per-model latencies and takes the upper-middle element. Empty input → empty
+/// map.
+fn model_median_latencies(requests: &[RequestLog]) -> HashMap<&str, f64> {
+    let mut by_model: HashMap<&str, Vec<u32>> = HashMap::new();
+    for r in requests {
+        by_model
+            .entry(r.model.as_str())
+            .or_default()
+            .push(r.latency_ms);
+    }
+    by_model
+        .into_iter()
+        .map(|(model, mut lat)| {
+            lat.sort_unstable();
+            (model, f64::from(lat[lat.len() / 2]))
+        })
+        .collect()
 }
 
 fn aggregate(p: &Projection) -> Aggregates {
@@ -281,12 +357,8 @@ fn compute_cis(p: &Projection, seed: u64, iterations: u32) -> ConfidenceInterval
         .zip(p.per_request_projected.iter())
         .map(|(b, pr)| (b - pr).max(0.0))
         .collect();
-    let (sv_lo_mean, sv_hi_mean) = bootstrap::bootstrap_ci(
-        &savings_per_req,
-        seed,
-        iterations,
-        (0.025, 0.975),
-    );
+    let (sv_lo_mean, sv_hi_mean) =
+        bootstrap::bootstrap_ci(&savings_per_req, seed, iterations, (0.025, 0.975));
     let savings_usd_95 = (sv_lo_mean * n, sv_hi_mean * n);
 
     // Savings pct: must bootstrap baseline + projected jointly because
@@ -375,7 +447,11 @@ fn build_per_route(buckets: HashMap<Uuid, PerRouteBucket>) -> Vec<PerRouteBreakd
     rows
 }
 
-fn build_caveats(sample_size: usize, requests_unprice_able: u32) -> Vec<String> {
+fn build_caveats(
+    sample_size: usize,
+    requests_unprice_able: u32,
+    latency_unprojected: u32,
+) -> Vec<String> {
     let mut caveats = Vec::new();
     if sample_size < 1000 {
         caveats.push(format!(
@@ -385,6 +461,11 @@ fn build_caveats(sample_size: usize, requests_unprice_able: u32) -> Vec<String> 
     if requests_unprice_able > 0 {
         caveats.push(format!(
             "{requests_unprice_able} request(s) routed to a target model with no pricing entry — counted as unchanged."
+        ));
+    }
+    if latency_unprojected > 0 {
+        caveats.push(format!(
+            "{latency_unprojected} rerouted request(s) had no latency history for the target model — their latency is shown unchanged, not projected."
         ));
     }
     caveats

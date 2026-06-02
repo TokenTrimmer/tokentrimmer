@@ -4,8 +4,8 @@
 //! point at it via `base_url`, and verifies the adapter's behavior including
 //! correct error mapping.
 //!
-//! The Gemini API key is passed as a query parameter (`?key=...`), not a
-//! header — tests verify this behavior.
+//! The Gemini API key is passed in the `x-goog-api-key` header (not a URL
+//! `?key=` query param) — tests verify this behavior.
 
 use std::collections::HashMap;
 
@@ -85,7 +85,8 @@ fn success_body() -> String {
 }
 
 fn provider() -> GeminiProvider {
-    GeminiProvider::new(ClientConfig::default())
+    // Tests use a local httpmock server — allow_local bypasses the SSRF guard.
+    GeminiProvider::new_allow_local(ClientConfig::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +100,7 @@ async fn success_200_with_cached_content_token_count() {
     let _mock = server.mock(|when, then| {
         when.method(POST)
             .path("/v1beta/models/gemini-3.1-pro:generateContent")
-            .query_param("key", "test-key");
+            .header("x-goog-api-key", "test-key");
         then.status(200)
             .header("Content-Type", "application/json")
             .body(success_body());
@@ -176,7 +177,12 @@ async fn error_429_rate_limited_default_retry_after() {
         .expect_err("should fail");
 
     assert!(
-        matches!(err, ProviderError::RateLimited { retry_after_ms: 1000 }),
+        matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_ms: 1000
+            }
+        ),
         "expected RateLimited{{1000}}, got {err:?}"
     );
 }
@@ -401,17 +407,17 @@ async fn embeddings_returns_unsupported() {
 }
 
 // ---------------------------------------------------------------------------
-// Auth: API key passed as query parameter
+// Auth: API key passed in the x-goog-api-key header, never the URL (§5.2)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn request_uses_api_key_as_query_param() {
+async fn request_uses_api_key_header() {
     let server = MockServer::start();
 
     let _mock = server.mock(|when, then| {
         when.method(POST)
             .path("/v1beta/models/gemini-3.1-pro:generateContent")
-            .query_param("key", "my-specific-test-key");
+            .header("x-goog-api-key", "my-specific-test-key");
         then.status(200)
             .header("Content-Type", "application/json")
             .body(success_body());
@@ -433,7 +439,7 @@ async fn request_uses_api_key_as_query_param() {
     let resp = provider()
         .chat_completion(minimal_request(), &ctx)
         .await
-        .expect("should succeed with query-param API key");
+        .expect("should succeed with x-goog-api-key header");
 
     assert!(resp.id.starts_with("chatcmpl-gem-"));
 }
@@ -464,5 +470,85 @@ async fn response_stop_reason_maps_correctly() {
         resp.choices[0].finish_reason.as_deref(),
         Some("stop"),
         "STOP should map to 'stop'"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SSRF guard: private / link-local base_url must be rejected before dispatch
+// ---------------------------------------------------------------------------
+
+/// A provider with `allow_local = false` (the production default) must reject
+/// private and link-local base_url values before sending any HTTP request.
+#[tokio::test]
+async fn ssrf_guard_rejects_link_local_base_url() {
+    // Production provider — allow_local is false.
+    let prod_provider = GeminiProvider::new(ClientConfig::default());
+
+    // Craft a context pointing at the AWS/GCP metadata endpoint.
+    let ctx = RequestContext {
+        trace_id: Uuid::new_v4(),
+        org_id: Uuid::new_v4(),
+        api_key_id: Uuid::new_v4(),
+        credentials: ProviderCredentials {
+            api_key: SecretString::new("test-key"),
+            base_url: Some("http://169.254.169.254/latest/meta-data".to_string()),
+            extra_headers: vec![],
+        },
+        tag: None,
+        deadline: None,
+    };
+
+    // Non-streaming path must be blocked before any HTTP dispatch.
+    let err = prod_provider
+        .chat_completion(minimal_request(), &ctx)
+        .await
+        .expect_err("link-local base_url must be rejected");
+
+    assert!(
+        matches!(err, ProviderError::InvalidRequest(_)),
+        "expected InvalidRequest for SSRF-blocked URL, got {err:?}"
+    );
+
+    // Streaming path must also be blocked.
+    let stream_result = prod_provider
+        .chat_completion_stream(minimal_request(), &ctx)
+        .await;
+
+    match stream_result {
+        Err(ProviderError::InvalidRequest(_)) => {} // expected
+        Err(other) => {
+            panic!("expected InvalidRequest for SSRF-blocked streaming URL, got {other:?}")
+        }
+        Ok(_) => panic!("link-local base_url must be rejected on streaming path too"),
+    }
+}
+
+/// A provider with `allow_local = false` must also reject loopback addresses
+/// when not in test mode.
+#[tokio::test]
+async fn ssrf_guard_rejects_loopback_when_not_allow_local() {
+    let prod_provider = GeminiProvider::new(ClientConfig::default());
+
+    let ctx = RequestContext {
+        trace_id: Uuid::new_v4(),
+        org_id: Uuid::new_v4(),
+        api_key_id: Uuid::new_v4(),
+        credentials: ProviderCredentials {
+            api_key: SecretString::new("test-key"),
+            base_url: Some("http://127.0.0.1:8080".to_string()),
+            extra_headers: vec![],
+        },
+        tag: None,
+        deadline: None,
+    };
+
+    let err = prod_provider
+        .chat_completion(minimal_request(), &ctx)
+        .await
+        .expect_err("loopback base_url must be rejected in production mode");
+
+    assert!(
+        matches!(err, ProviderError::InvalidRequest(_)),
+        "expected InvalidRequest for loopback URL, got {err:?}"
     );
 }

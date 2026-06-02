@@ -17,8 +17,9 @@
  * const client = new TokenTrimmer({ apiKey: 'tt_live_...' });
  *
  * const response = await client.chat.completions.create({
- *   model: 'claude-sonnet-4-6',
+ *   model: 'claude-haiku-4-5',
  *   messages: [{ role: 'user', content: 'Hello' }],
+ *   max_tokens: 1024,
  *   ttTag: 'feature=chat-support',
  * });
  *
@@ -80,6 +81,15 @@ export class TokenTrimmer extends OpenAI {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     this.chat.completions.create = (async (body: any, opts: any = {}) => {
       const { ttTag, ...rest } = body ?? {};
+      // Sensible default to prevent unbounded output. User-provided
+      // max_tokens / max_completion_tokens / max_output_tokens win.
+      if (
+        rest.max_tokens === undefined &&
+        rest.max_completion_tokens === undefined &&
+        rest.max_output_tokens === undefined
+      ) {
+        rest.max_tokens = 4096;
+      }
       const headers = { ...(opts?.headers ?? {}) } as Record<string, string>;
       if (typeof ttTag === 'string') {
         headers['X-TokenTrimmer-Tag'] = ttTag;

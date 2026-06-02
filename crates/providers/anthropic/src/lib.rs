@@ -23,8 +23,9 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use tracing::instrument;
 use tt_shared::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
-    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+    filter_extra_headers, validate_provider_url, ChatCompletionChunk, ChatCompletionRequest,
+    ChatCompletionResponse, EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing,
+    Provider, ProviderError, RequestContext,
 };
 
 pub use client::ClientConfig;
@@ -41,6 +42,10 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Create once with [`AnthropicProvider::new`] and share across requests.
 pub struct AnthropicProvider {
     client: Client,
+    /// When `true`, skip SSRF URL validation for private/loopback addresses.
+    /// Always `false` in production; set to `true` only in tests that target
+    /// a local mock server.
+    allow_local: bool,
 }
 
 impl AnthropicProvider {
@@ -53,7 +58,26 @@ impl AnthropicProvider {
     pub fn new(cfg: ClientConfig) -> Self {
         let client = client::build_client(&cfg)
             .expect("failed to build reqwest::Client for Anthropic adapter");
-        Self { client }
+        Self {
+            client,
+            allow_local: false,
+        }
+    }
+
+    /// Create an adapter that skips SSRF URL validation for tests targeting a
+    /// local mock server.
+    ///
+    /// # Warning
+    ///
+    /// Do not use in production code. This bypasses the SSRF guard.
+    #[doc(hidden)]
+    pub fn new_allow_local(cfg: ClientConfig) -> Self {
+        let client = client::build_client(&cfg)
+            .expect("failed to build reqwest::Client for Anthropic adapter");
+        Self {
+            client,
+            allow_local: true,
+        }
     }
 
     /// Resolve the base URL from credentials or fall back to the default.
@@ -90,7 +114,14 @@ impl Provider for AnthropicProvider {
         ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         let base_url = self.base_url(ctx);
-        let url = format!("{}/v1/messages", base_url);
+        // Validate customer-supplied base_url overrides; skip when using the
+        // compiled-in default (always safe) or when allow_local is set (tests).
+        if ctx.credentials.base_url.is_some() {
+            validate_provider_url(base_url, self.allow_local)
+                .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+        }
+
+        let url = format!("{base_url}/v1/messages");
 
         let body = translate::translate_request(req)?;
 
@@ -102,7 +133,7 @@ impl Provider for AnthropicProvider {
             .header("Content-Type", "application/json")
             .json(&body);
 
-        for (name, value) in &ctx.credentials.extra_headers {
+        for (name, value) in &filter_extra_headers(&ctx.credentials.extra_headers) {
             request_builder = request_builder.header(name, value);
         }
 
@@ -118,10 +149,7 @@ impl Provider for AnthropicProvider {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(errors::map_reqwest_error)?;
+        let response_text = response.text().await.map_err(errors::map_reqwest_error)?;
 
         if status >= 400 {
             return Err(errors::map_response_error(
@@ -145,7 +173,13 @@ impl Provider for AnthropicProvider {
         req: ChatCompletionRequest,
         ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
-        let base_url = self.base_url(ctx).to_string();
+        let base_url = self.base_url(ctx);
+        if ctx.credentials.base_url.is_some() {
+            validate_provider_url(base_url, self.allow_local)
+                .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+        }
+
+        let base_url = base_url.to_string();
         let client = self.client.clone();
         stream::stream_chat_completion(client, &base_url, req, ctx).await
     }

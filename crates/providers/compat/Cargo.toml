@@ -1,0 +1,32 @@
+[package]
+name = "tt-provider-compat"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OpenAI-wire-compatible provider machinery — shared by the OpenAI adapter and the Groq/Mistral/Together/OpenRouter adapters."
+
+[dependencies]
+tt-shared.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+httpmock.workspace = true
+insta.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true

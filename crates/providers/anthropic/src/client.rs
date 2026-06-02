@@ -11,7 +11,9 @@ use reqwest::Client;
 /// Configuration supplied to [`build_client`].
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Total request timeout (connect + read). Defaults to 120 s.
+    /// Per-read idle timeout: resets on each received chunk, so a long
+    /// streaming response is not cut off, while a stalled connection still
+    /// times out. (Not a total-request cap.) Defaults to 120 s.
     pub timeout: Duration,
     /// TCP connection timeout. Defaults to 10 s.
     pub connect_timeout: Duration,
@@ -33,7 +35,7 @@ impl Default for ClientConfig {
 /// across all requests.
 pub fn build_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
     Client::builder()
-        .timeout(cfg.timeout)
+        .read_timeout(cfg.timeout)
         .connect_timeout(cfg.connect_timeout)
         // Disable automatic redirects — the provider API should not redirect.
         .redirect(reqwest::redirect::Policy::none())

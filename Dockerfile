@@ -12,7 +12,7 @@
 #   docker run --rm -p 8080:8080 ghcr.io/tokentrimmer/tt-cli:dev tt gateway
 
 # --- 1. chef ----------------------------------------------------------------
-FROM rust:1.86-bookworm AS chef
+FROM rust:1.88-bookworm AS chef
 RUN cargo install --locked cargo-chef
 WORKDIR /app
 

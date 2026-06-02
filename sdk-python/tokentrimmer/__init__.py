@@ -19,8 +19,9 @@ Usage::
     client = TokenTrimmer(api_key="tt_live_...")
 
     response = client.chat.completions.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5",
         messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=1024,
         tt_tag="feature=chat-support",
     )
 
