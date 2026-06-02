@@ -76,8 +76,8 @@ pub enum UrlGuardError {
 /// (when `allow_local` is false), or points to a private/internal host.
 pub fn validate_provider_url(raw: &str, allow_local: bool) -> Result<(), UrlGuardError> {
     // Parse the URL.
-    let parsed = url::Url::parse(raw)
-        .map_err(|e| UrlGuardError::InvalidUrl(format!("{raw}: {e}")))?;
+    let parsed =
+        url::Url::parse(raw).map_err(|e| UrlGuardError::InvalidUrl(format!("{raw}: {e}")))?;
 
     // Extract scheme.
     let scheme = parsed.scheme();
@@ -236,7 +236,13 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
         return is_blocked_v4(v4);
     }
     // 64:ff9b::/96 — IPv4/IPv6 translation (RFC 6052)
-    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+    if seg[0] == 0x0064
+        && seg[1] == 0xff9b
+        && seg[2] == 0
+        && seg[3] == 0
+        && seg[4] == 0
+        && seg[5] == 0
+    {
         let v4 = Ipv4Addr::new(
             (seg[6] >> 8) as u8,
             (seg[6] & 0xff) as u8,
@@ -365,8 +371,8 @@ mod tests {
 
     #[test]
     fn rejects_cloud_metadata_ip() {
-        let err = validate_provider_url("https://169.254.169.254/latest/meta-data/", false)
-            .unwrap_err();
+        let err =
+            validate_provider_url("https://169.254.169.254/latest/meta-data/", false).unwrap_err();
         assert!(matches!(err, UrlGuardError::BlockedHost(_)), "got: {err}");
     }
 
@@ -378,8 +384,7 @@ mod tests {
 
     #[test]
     fn rejects_loopback_ipv4() {
-        let err =
-            validate_provider_url("https://127.0.0.1/v1", false).unwrap_err();
+        let err = validate_provider_url("https://127.0.0.1/v1", false).unwrap_err();
         assert!(matches!(err, UrlGuardError::BlockedHost(_)), "got: {err}");
     }
 
@@ -422,21 +427,32 @@ mod tests {
     #[test]
     fn rejects_localhost_hostname() {
         let err = validate_provider_url("https://localhost/v1", false).unwrap_err();
-        assert!(matches!(err, UrlGuardError::BlockedHostname(_)), "got: {err}");
+        assert!(
+            matches!(err, UrlGuardError::BlockedHostname(_)),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn rejects_dot_local_hostname() {
         let err = validate_provider_url("https://myhost.local/v1", false).unwrap_err();
-        assert!(matches!(err, UrlGuardError::BlockedHostname(_)), "got: {err}");
+        assert!(
+            matches!(err, UrlGuardError::BlockedHostname(_)),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn rejects_metadata_google_internal() {
-        let err =
-            validate_provider_url("https://metadata.google.internal/computeMetadata/v1/", false)
-                .unwrap_err();
-        assert!(matches!(err, UrlGuardError::BlockedHostname(_)), "got: {err}");
+        let err = validate_provider_url(
+            "https://metadata.google.internal/computeMetadata/v1/",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, UrlGuardError::BlockedHostname(_)),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -454,7 +470,10 @@ mod tests {
     #[test]
     fn rejects_ftp_scheme() {
         let err = validate_provider_url("ftp://example.com/v1", false).unwrap_err();
-        assert!(matches!(err, UrlGuardError::InsecureScheme(_)), "got: {err}");
+        assert!(
+            matches!(err, UrlGuardError::InsecureScheme(_)),
+            "got: {err}"
+        );
     }
 
     // -- filter_extra_headers --
@@ -516,7 +535,10 @@ mod tests {
             ("X-API-KEY".to_string(), "sk-...".to_string()),
         ];
         let filtered = filter_extra_headers(&headers);
-        assert!(filtered.is_empty(), "all auth headers should be dropped, got: {filtered:?}");
+        assert!(
+            filtered.is_empty(),
+            "all auth headers should be dropped, got: {filtered:?}"
+        );
     }
 
     #[test]

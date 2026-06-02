@@ -679,7 +679,9 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         state = state.with_tier_resolver(Arc::new(
             tt_core::tier_resolver::CachedTierResolver::new(resolver),
         ));
-        tracing::info!("tier resolver: Postgres-backed (per-org tier limits + budget caps enforced)");
+        tracing::info!(
+            "tier resolver: Postgres-backed (per-org tier limits + budget caps enforced)"
+        );
     } else {
         tracing::warn!("no DB pool; per-org tier limits + budget caps NOT enforced");
     }
@@ -1456,8 +1458,12 @@ mod plan_apply_tests {
             .suffix(".json")
             .tempfile()
             .expect("tempfile");
-        f.write_all(serde_json::to_string(&plan_example_json()).unwrap().as_bytes())
-            .unwrap();
+        f.write_all(
+            serde_json::to_string(&plan_example_json())
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
         f.flush().unwrap();
         f
     }

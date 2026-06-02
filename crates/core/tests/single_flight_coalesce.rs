@@ -97,9 +97,9 @@ impl Provider for CountingProvider {
             choices: vec![Choice {
                 index: 0,
                 message: Message::Assistant {
-                    content: Some(MessageContent::Text(
-                        format!("response from call #{call_n}"),
-                    )),
+                    content: Some(MessageContent::Text(format!(
+                        "response from call #{call_n}"
+                    ))),
                     tool_calls: vec![],
                     name: None,
                 },
@@ -213,7 +213,11 @@ async fn concurrent_identical_requests_dispatch_exactly_once() {
 
     // All must return 200.
     for (status, _) in &results {
-        assert_eq!(*status, StatusCode::OK, "all concurrent requests must succeed");
+        assert_eq!(
+            *status,
+            StatusCode::OK,
+            "all concurrent requests must succeed"
+        );
     }
 
     // Provider must have been called exactly once.
@@ -279,8 +283,8 @@ async fn concurrent_requests_all_receive_valid_json_body() {
                 let resp = app.oneshot(chat_req("valid json please")).await.unwrap();
                 assert_eq!(resp.status(), StatusCode::OK);
                 let bytes = to_bytes(resp.into_body(), 16 * 1024).await.unwrap();
-                let val: serde_json::Value = serde_json::from_slice(&bytes)
-                    .expect("response body must be valid JSON");
+                let val: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("response body must be valid JSON");
                 // Must have non-empty choices.
                 assert!(
                     !val["choices"].as_array().unwrap().is_empty(),

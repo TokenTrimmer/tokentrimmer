@@ -271,9 +271,7 @@ pub async fn apply_plan<S: PlanStore, A: AuditWriter>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        Aggregates, ConfidenceIntervals, PlanResult, RouteAction, RouteConditions,
-    };
+    use crate::types::{Aggregates, ConfidenceIntervals, PlanResult, RouteAction, RouteConditions};
     use chrono::Utc;
     use tt_telemetry::audit::{verify_chain, InMemoryAuditWriter};
 
@@ -499,10 +497,7 @@ mod tests {
             .expect("apply ok even with no routes");
 
         assert_eq!(store.status(plan_id).as_deref(), Some("applied"));
-        assert_eq!(
-            store.applied_routes(plan_id).expect("row exists").len(),
-            0
-        );
+        assert_eq!(store.applied_routes(plan_id).expect("row exists").len(), 0);
         let entries = audit.list(org_id).await.expect("list ok");
         assert_eq!(entries.len(), 1);
     }

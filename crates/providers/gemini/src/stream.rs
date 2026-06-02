@@ -220,7 +220,10 @@ fn process_sse_event(
         if line.is_empty() {
             continue;
         }
-        if let Some(data) = line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)) {
+        if let Some(data) = line
+            .strip_prefix("data:")
+            .map(|s| s.strip_prefix(' ').unwrap_or(s))
+        {
             data_line = Some(data.trim());
         }
     }
@@ -466,8 +469,11 @@ mod tests {
         let mut first = true;
         let outcomes = process_sse_event(event, "test-id", 0, "gemini-3.1-pro", &mut first);
         // Should yield the same role chunk + content chunk as the LF form.
-        assert_eq!(outcomes.len(), 2,
-            "CRLF-delimited Gemini event should yield role + content chunks");
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "CRLF-delimited Gemini event should yield role + content chunks"
+        );
         assert!(!first);
     }
 
@@ -477,7 +483,10 @@ mod tests {
         let event = b"data:{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]},\"index\":0}]}\n\n";
         let mut first = true;
         let outcomes = process_sse_event(event, "test-id", 0, "gemini-3.1-pro", &mut first);
-        assert_eq!(outcomes.len(), 2,
-            "no-space data: prefix should parse the same as data: with space");
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "no-space data: prefix should parse the same as data: with space"
+        );
     }
 }

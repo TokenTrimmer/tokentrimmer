@@ -259,9 +259,9 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
         .expect("x-tt-retrieval-tokens-saved header must be present on successful substitution")
         .to_str()
         .unwrap();
-    let tokens_saved: i64 = tokens_saved_str
-        .parse()
-        .unwrap_or_else(|_| panic!("x-tt-retrieval-tokens-saved must be an integer; got {tokens_saved_str:?}"));
+    let tokens_saved: i64 = tokens_saved_str.parse().unwrap_or_else(|_| {
+        panic!("x-tt-retrieval-tokens-saved must be an integer; got {tokens_saved_str:?}")
+    });
     assert_eq!(
         tokens_saved, 13,
         "net tokens saved must equal gross (20) minus embedding query cost (7) = 13; got {tokens_saved}"

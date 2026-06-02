@@ -294,8 +294,7 @@ mod tests {
             "bootstrap_iterations": 1000
         });
 
-        let json = serde_json::to_string_pretty(&plan_input_value)
-            .expect("should serialize");
+        let json = serde_json::to_string_pretty(&plan_input_value).expect("should serialize");
 
         // Deserialize as PlanInput — proves the shape is valid.
         let parsed: PlanInput =

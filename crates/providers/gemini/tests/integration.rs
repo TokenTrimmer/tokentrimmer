@@ -516,7 +516,9 @@ async fn ssrf_guard_rejects_link_local_base_url() {
 
     match stream_result {
         Err(ProviderError::InvalidRequest(_)) => {} // expected
-        Err(other) => panic!("expected InvalidRequest for SSRF-blocked streaming URL, got {other:?}"),
+        Err(other) => {
+            panic!("expected InvalidRequest for SSRF-blocked streaming URL, got {other:?}")
+        }
         Ok(_) => panic!("link-local base_url must be rejected on streaming path too"),
     }
 }

@@ -180,8 +180,7 @@ pub async fn stream_chat_completion(
 ) -> Result<ChunkStream, ProviderError> {
     let url = format!("{base_url}/v1/messages");
     let api_key = ctx.credentials.api_key.expose().to_string();
-    let extra_headers: Vec<(String, String)> =
-        filter_extra_headers(&ctx.credentials.extra_headers);
+    let extra_headers: Vec<(String, String)> = filter_extra_headers(&ctx.credentials.extra_headers);
 
     // Translate to the Anthropic wire shape with stream = true.
     let mut translated = translate::translate_request(req)?;
@@ -311,9 +310,15 @@ fn process_sse_event(event_bytes: &[u8], state: &mut Option<StreamState>) -> Sse
         if line.is_empty() {
             continue;
         }
-        if let Some(ev) = line.strip_prefix("event:").map(|s| s.strip_prefix(' ').unwrap_or(s)) {
+        if let Some(ev) = line
+            .strip_prefix("event:")
+            .map(|s| s.strip_prefix(' ').unwrap_or(s))
+        {
             event_type = Some(ev.trim());
-        } else if let Some(data) = line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)) {
+        } else if let Some(data) = line
+            .strip_prefix("data:")
+            .map(|s| s.strip_prefix(' ').unwrap_or(s))
+        {
             data_line = Some(data.trim());
         }
     }
@@ -678,8 +683,10 @@ mod tests {
         let event = b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n";
         let mut state = None;
         let outcome = process_sse_event(event, &mut state);
-        assert!(matches!(outcome, SseOutcome::Skip),
-            "CRLF-delimited ping event should still be skipped");
+        assert!(
+            matches!(outcome, SseOutcome::Skip),
+            "CRLF-delimited ping event should still be skipped"
+        );
     }
 
     #[test]
@@ -688,8 +695,10 @@ mod tests {
         let event = b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n";
         let mut state = None;
         let outcome = process_sse_event(event, &mut state);
-        assert!(matches!(outcome, SseOutcome::Done),
-            "CRLF message_stop must return Done");
+        assert!(
+            matches!(outcome, SseOutcome::Done),
+            "CRLF message_stop must return Done"
+        );
     }
 
     #[test]
@@ -698,8 +707,10 @@ mod tests {
         let event = b"event: message_stop\ndata:{\"type\":\"message_stop\"}\n\n";
         let mut state = None;
         let outcome = process_sse_event(event, &mut state);
-        assert!(matches!(outcome, SseOutcome::Done),
-            "data:{{...}} (no space) must parse the same as `data: {{...}}`");
+        assert!(
+            matches!(outcome, SseOutcome::Done),
+            "data:{{...}} (no space) must parse the same as `data: {{...}}`"
+        );
     }
 
     #[test]

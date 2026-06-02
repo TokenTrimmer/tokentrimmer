@@ -292,7 +292,11 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
 
     // L2 lookup is paid-tier only; inject a Pro-tier context so the hit fires.
     let response = app
-        .oneshot(chat_request_with_tier("counting-1", false, Some(CallerTier::Pro)))
+        .oneshot(chat_request_with_tier(
+            "counting-1",
+            false,
+            Some(CallerTier::Pro),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -325,8 +329,7 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
     // The primed entry above has input_tokens=100, output_tokens=50 so:
     //   baseline = (100 × $1 + 50 × $2) / 1_000_000 = 0.0002
     //   saved    = baseline  (cost is zero — no provider call on a hit)
-    let baseline_l2: f64 = response
-        .headers()["x-tokentrimmer-baseline-cost-usd"]
+    let baseline_l2: f64 = response.headers()["x-tokentrimmer-baseline-cost-usd"]
         .to_str()
         .unwrap()
         .parse()
@@ -340,8 +343,7 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         (baseline_l2 - expected_baseline).abs() < 1e-9,
         "L2 hit baseline should be synthetic $1/M·$2/M estimate ({expected_baseline}); got {baseline_l2}"
     );
-    let saved_l2: f64 = response
-        .headers()["x-tokentrimmer-saved-usd"]
+    let saved_l2: f64 = response.headers()["x-tokentrimmer-saved-usd"]
         .to_str()
         .unwrap()
         .parse()
@@ -507,10 +509,7 @@ async fn free_tier_streaming_does_not_write_l2() {
     let app = build_router(state);
 
     // No tier injected (tier=None → l2_allowed=false).
-    let response = app
-        .oneshot(chat_request("counting-1", true))
-        .await
-        .unwrap();
+    let response = app.oneshot(chat_request("counting-1", true)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     // Fully drain the SSE body so the stream completes and any background

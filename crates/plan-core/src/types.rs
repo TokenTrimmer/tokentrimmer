@@ -439,8 +439,7 @@ mod tests {
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
-            json,
-            r#"{"target_model":"x"}"#,
+            json, r#"{"target_model":"x"}"#,
             "None force_cache_layer and empty fallbacks must be omitted from JSON"
         );
     }

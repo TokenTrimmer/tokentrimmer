@@ -86,7 +86,8 @@ impl Rule for AgentNoTerminationConditionRule {
 
         for loop_info in loops {
             // Extract loop body text (scoped to this specific loop).
-            let loop_body_text = extract_loop_body(&lines, loop_info.body_start_line, loop_info.body_end_line);
+            let loop_body_text =
+                extract_loop_body(&lines, loop_info.body_start_line, loop_info.body_end_line);
 
             // Check for termination safeguards *within this loop's body only*.
             if has_termination_in_body(&loop_body_text) {
@@ -155,7 +156,10 @@ fn has_termination_in_body(body: &str) -> bool {
         let has_budget_check = body.lines().any(|line| {
             (line.contains("spent") || line.contains("cost") || line.contains("expense"))
                 && line.contains("budget")
-                && (line.contains(">") || line.contains("<") || line.contains(">=") || line.contains("<="))
+                && (line.contains(">")
+                    || line.contains("<")
+                    || line.contains(">=")
+                    || line.contains("<="))
         });
         if has_budget_check {
             return true;
@@ -167,7 +171,10 @@ fn has_termination_in_body(body: &str) -> bool {
         let has_timeout_check = body.lines().any(|line| {
             (line.contains("time.time()") || line.contains("time()") || line.contains("elapsed"))
                 && line.contains("timeout")
-                && (line.contains(">") || line.contains("<") || line.contains(">=") || line.contains("<="))
+                && (line.contains(">")
+                    || line.contains("<")
+                    || line.contains(">=")
+                    || line.contains("<="))
         });
         if has_timeout_check {
             return true;

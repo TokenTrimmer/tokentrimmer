@@ -290,11 +290,18 @@ async fn streaming_miss_populates_l1_and_subsequent_stream_is_fake_stream_hit() 
         .await
         .unwrap();
     assert_eq!(r1.status(), StatusCode::OK);
-    assert_eq!(calls.load(Ordering::Relaxed), 1, "first request should dispatch to provider");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "first request should dispatch to provider"
+    );
 
     // Drain the body to ensure the DropGuard fires and L1 insert completes.
     let body1 = drain(r1).await;
-    assert!(body1.contains("[DONE]"), "first stream should complete with [DONE]");
+    assert!(
+        body1.contains("[DONE]"),
+        "first stream should complete with [DONE]"
+    );
 
     // Give the spawned L1 insert time to complete.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -319,7 +326,10 @@ async fn streaming_miss_populates_l1_and_subsequent_stream_is_fake_stream_hit() 
 
     // Body should contain the cached content.
     let body2 = drain(r2).await;
-    assert!(body2.contains("[DONE]"), "L1 fake-stream should end with [DONE]");
+    assert!(
+        body2.contains("[DONE]"),
+        "L1 fake-stream should end with [DONE]"
+    );
     assert!(
         body2.contains("hello from stream"),
         "L1 fake-stream should carry the cached assistant text; got:\n{body2}"
@@ -446,10 +456,7 @@ async fn fake_stream_from_l1_hit_does_not_re_insert_or_dispatch() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Second stream request — still hits L1.
-    let r2 = app
-        .oneshot(stream_request("sc-model"))
-        .await
-        .unwrap();
+    let r2 = app.oneshot(stream_request("sc-model")).await.unwrap();
     assert_eq!(r2.status(), StatusCode::OK);
     let body2 = drain(r2).await;
     assert!(body2.contains("[DONE]"));

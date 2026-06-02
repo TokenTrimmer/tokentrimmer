@@ -213,7 +213,8 @@ mod tests {
         for class in &classes {
             let (_, rationale) = route(class);
             assert!(
-                rationale.contains("heuristic") || rationale.contains("Not based on your telemetry"),
+                rationale.contains("heuristic")
+                    || rationale.contains("Not based on your telemetry"),
                 "rationale for {class:?} must disclose heuristic basis: {rationale}"
             );
         }
@@ -314,12 +315,27 @@ mod tests {
 
     #[test]
     fn classify_keywords_hit_expected_classes() {
-        assert_eq!(classify_task("classify this email as spam"), TaskClass::Classification);
-        assert_eq!(classify_task("yes or no: is this valid?"), TaskClass::Classification);
-        assert_eq!(classify_task("extract the name and date as json"), TaskClass::Extraction);
-        assert_eq!(classify_task("refactor the function to use iterators"), TaskClass::Code);
+        assert_eq!(
+            classify_task("classify this email as spam"),
+            TaskClass::Classification
+        );
+        assert_eq!(
+            classify_task("yes or no: is this valid?"),
+            TaskClass::Classification
+        );
+        assert_eq!(
+            classify_task("extract the name and date as json"),
+            TaskClass::Extraction
+        );
+        assert_eq!(
+            classify_task("refactor the function to use iterators"),
+            TaskClass::Code
+        );
         assert_eq!(classify_task("debug this compile error"), TaskClass::Code);
-        assert_eq!(classify_task("analyze the tradeoffs between A and B"), TaskClass::Reasoning);
+        assert_eq!(
+            classify_task("analyze the tradeoffs between A and B"),
+            TaskClass::Reasoning
+        );
         assert_eq!(classify_task("tell me a joke"), TaskClass::General);
     }
 

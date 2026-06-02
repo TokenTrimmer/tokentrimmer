@@ -80,11 +80,7 @@ impl RetrievalAuditLog {
     }
 
     /// Decrypt a stored audit blob — used by the offline-audit read path.
-    pub fn decrypt(
-        &self,
-        org_id: Uuid,
-        blob: &[u8],
-    ) -> Result<String, RetrievalError> {
+    pub fn decrypt(&self, org_id: Uuid, blob: &[u8]) -> Result<String, RetrievalError> {
         decrypt_prompt(&self.master_key, org_id, blob)
     }
 }
@@ -105,11 +101,7 @@ fn aad(org_id: Uuid) -> Vec<u8> {
     buf
 }
 
-fn encrypt_prompt(
-    master: &[u8; 32],
-    org_id: Uuid,
-    plain: &str,
-) -> Result<Vec<u8>, RetrievalError> {
+fn encrypt_prompt(master: &[u8; 32], org_id: Uuid, plain: &str) -> Result<Vec<u8>, RetrievalError> {
     let key = derive_audit_key(master, org_id);
     let cipher = XChaCha20Poly1305::new((&key).into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -129,11 +121,7 @@ fn encrypt_prompt(
     Ok(blob)
 }
 
-fn decrypt_prompt(
-    master: &[u8; 32],
-    org_id: Uuid,
-    blob: &[u8],
-) -> Result<String, RetrievalError> {
+fn decrypt_prompt(master: &[u8; 32], org_id: Uuid, blob: &[u8]) -> Result<String, RetrievalError> {
     if blob.len() < NONCE_LEN {
         return Err(RetrievalError::Malformed("audit blob too short".into()));
     }

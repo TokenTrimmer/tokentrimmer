@@ -277,7 +277,10 @@ mod tests {
         );
 
         // Map must be empty after leader drops.
-        assert!(sf.inflight.is_empty(), "inflight map must be empty after leader error");
+        assert!(
+            sf.inflight.is_empty(),
+            "inflight map must be empty after leader error"
+        );
     }
 
     /// Two different keys must not coalesce — each request acts as its own
@@ -324,7 +327,10 @@ mod tests {
         assert_eq!(sf.inflight.len(), 1);
         guard.complete();
         // complete() calls Drop, which removes the entry.
-        assert!(sf.inflight.is_empty(), "entry must be removed after complete()");
+        assert!(
+            sf.inflight.is_empty(),
+            "entry must be removed after complete()"
+        );
     }
 
     /// Follower timeout: if the leader never completes within FOLLOWER_TIMEOUT,

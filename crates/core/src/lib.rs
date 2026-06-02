@@ -15,7 +15,10 @@ pub mod single_flight;
 pub mod state;
 pub mod tier_resolver;
 
-pub use budget::{tier_budget_limits, BudgetDecision, BudgetEnforcer, BudgetLimits, DynamicBudgetEnforcer, InMemoryBudgetEnforcer, SpendSink};
+pub use budget::{
+    tier_budget_limits, BudgetDecision, BudgetEnforcer, BudgetLimits, DynamicBudgetEnforcer,
+    InMemoryBudgetEnforcer, SpendSink,
+};
 pub use db::{connect, migrate, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};

@@ -625,11 +625,7 @@ mod tests {
     // ---- capability guard tests ----
 
     /// Build a `ModelInfo` with specific capabilities and context window.
-    fn model_info_with(
-        model: &'static str,
-        caps: Vec<Capability>,
-        max_input: u64,
-    ) -> ModelInfo {
+    fn model_info_with(model: &'static str, caps: Vec<Capability>, max_input: u64) -> ModelInfo {
         ModelInfo {
             id: model.to_string(),
             provider: "mock".to_string(),
@@ -725,14 +721,12 @@ mod tests {
         // Construct a vision request.
         let mut vision_req = req("text-model");
         vision_req.messages = vec![Message::User {
-            content: tt_shared::MessageContent::Parts(vec![
-                tt_shared::ContentPart::ImageUrl {
-                    image_url: tt_shared::messages::ImageUrl {
-                        url: "data:image/png;base64,abc".into(),
-                        detail: None,
-                    },
+            content: tt_shared::MessageContent::Parts(vec![tt_shared::ContentPart::ImageUrl {
+                image_url: tt_shared::messages::ImageUrl {
+                    url: "data:image/png;base64,abc".into(),
+                    detail: None,
                 },
-            ]),
+            }]),
             name: None,
         }];
 
@@ -748,11 +742,18 @@ mod tests {
             &vision_req,
             &ctx(),
             now(),
-            Some(CapCheck { required: &required, estimated_tokens: 0 }),
+            Some(CapCheck {
+                required: &required,
+                estimated_tokens: 0,
+            }),
         )
         .await
         .expect("vision-model should serve");
-        assert_eq!(provider.id(), "vision-prov", "text-only model must be skipped");
+        assert_eq!(
+            provider.id(),
+            "vision-prov",
+            "text-only model must be skipped"
+        );
         assert_eq!(resp.model, "vision-model");
     }
 
@@ -785,7 +786,10 @@ mod tests {
             &plain_req,
             &ctx(),
             now(),
-            Some(CapCheck { required: &required, estimated_tokens: est_tokens }),
+            Some(CapCheck {
+                required: &required,
+                estimated_tokens: est_tokens,
+            }),
         )
         .await
         .expect("large-model should serve");
@@ -847,11 +851,18 @@ mod tests {
             &tools_req,
             &ctx(),
             now(),
-            Some(CapCheck { required: &required, estimated_tokens: 0 }),
+            Some(CapCheck {
+                required: &required,
+                estimated_tokens: 0,
+            }),
         )
         .await
         .expect("capable model-c should serve");
-        assert_eq!(provider.id(), "tools-fb", "incapable fallback must be skipped");
+        assert_eq!(
+            provider.id(),
+            "tools-fb",
+            "incapable fallback must be skipped"
+        );
     }
 
     /// (d) Unknown-ModelInfo candidate (not in catalog) is permissive — not blocked.
@@ -911,7 +922,10 @@ mod tests {
             &plain,
             &ctx(),
             now(),
-            Some(CapCheck { required: &required, estimated_tokens: 0 }),
+            Some(CapCheck {
+                required: &required,
+                estimated_tokens: 0,
+            }),
         )
         .await
         .expect("known capable model should serve");
@@ -945,7 +959,10 @@ mod tests {
             &plain,
             &ctx(),
             now(),
-            Some(CapCheck { required: &required, estimated_tokens: 0 }),
+            Some(CapCheck {
+                required: &required,
+                estimated_tokens: 0,
+            }),
         )
         .await
         .expect("capable model should serve");
@@ -984,8 +1001,7 @@ mod tests {
             _req: ChatCompletionRequest,
             _: &RequestContext,
         ) -> Result<ChatCompletionResponse, ProviderError> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ProviderError::ProviderUpstream {
                 status: 503,
                 message: "always down".into(),
@@ -997,8 +1013,7 @@ mod tests {
             _: &RequestContext,
         ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
         {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ProviderError::ProviderUpstream {
                 status: 503,
                 message: "always down".into(),

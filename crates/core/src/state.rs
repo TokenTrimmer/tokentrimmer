@@ -14,8 +14,8 @@ use tt_telemetry::request_logs::RequestLogWriter;
 use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
 use crate::failover::CircuitBreaker;
 use crate::middleware::key_cache::{KeyVerifyCache, VerifyCache};
-use crate::single_flight::SingleFlight;
 use crate::registry::{register_default_providers, ProviderRegistry};
+use crate::single_flight::SingleFlight;
 use crate::tier_resolver::TierResolver;
 
 /// Default L2 cosine-similarity threshold per ADR-008 / spec §4.4.

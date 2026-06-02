@@ -522,11 +522,15 @@ mod prefix_collision_tests {
     #[async_trait]
     impl KeyStore for FailNTimesStore {
         async fn insert(&self, key: ApiKey) -> Result<(), KeyError> {
-            let remaining = self.remaining_failures.fetch_update(
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-                |v| if v > 0 { Some(v - 1) } else { None },
-            );
+            let remaining =
+                self.remaining_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                        if v > 0 {
+                            Some(v - 1)
+                        } else {
+                            None
+                        }
+                    });
             if remaining.is_ok() {
                 return Err(KeyError::PrefixCollision);
             }
@@ -537,7 +541,12 @@ mod prefix_collision_tests {
             self.inner.find_by_prefix(prefix).await
         }
 
-        async fn revoke(&self, id: Uuid, org_id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
+        async fn revoke(
+            &self,
+            id: Uuid,
+            org_id: Uuid,
+            at: DateTime<Utc>,
+        ) -> Result<bool, KeyError> {
             self.inner.revoke(id, org_id, at).await
         }
     }
@@ -585,7 +594,10 @@ mod prefix_collision_tests {
             .await
             .unwrap()
             .expect("original key must still be present");
-        assert_eq!(found.org_id, org_a, "key_a must not be overwritten by key_b");
+        assert_eq!(
+            found.org_id, org_a,
+            "key_a must not be overwritten by key_b"
+        );
         assert_eq!(found.hash, "hash-a", "hash must not be overwritten");
     }
 
@@ -733,7 +745,10 @@ mod revoke_org_scoping_tests {
         store.insert(key).await.unwrap();
 
         let updated = store.revoke(key_id, org, Utc::now()).await.unwrap();
-        assert!(updated, "should return true when key is active and org matches");
+        assert!(
+            updated,
+            "should return true when key is active and org matches"
+        );
 
         // Key must now be revoked.
         let found = store.find_by_prefix("tt_live_aaaa").await.unwrap().unwrap();

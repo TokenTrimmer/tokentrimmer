@@ -100,10 +100,7 @@ mod tests {
 
     #[test]
     fn model_not_found_and_timeout_still_fallback_eligible() {
-        assert!(ProviderError::ModelNotFound {
-            model: "x".into()
-        }
-        .is_fallback_eligible());
+        assert!(ProviderError::ModelNotFound { model: "x".into() }.is_fallback_eligible());
         assert!(ProviderError::Timeout { ms: 1000 }.is_fallback_eligible());
     }
 

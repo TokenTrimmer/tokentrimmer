@@ -76,11 +76,7 @@ pub trait ProviderCredentialStore: Send + Sync {
     /// the caller can skip writing an audit row). Default impl rejects with
     /// [`CredentialError::Store`] — read-only stores inherit it; writable stores
     /// (in-memory, Postgres) override. (rv-credentials-delete)
-    async fn delete(
-        &self,
-        _org_id: Uuid,
-        _provider_id: &str,
-    ) -> Result<bool, CredentialError> {
+    async fn delete(&self, _org_id: Uuid, _provider_id: &str) -> Result<bool, CredentialError> {
         Err(CredentialError::Store("store is read-only".into()))
     }
 

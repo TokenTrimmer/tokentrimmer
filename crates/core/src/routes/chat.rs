@@ -254,8 +254,7 @@ impl CacheBehavior {
         }
 
         // Fix B: parse caller's tt_extras.cache override.
-        let ctrl: CacheControlConfig = parse_cache_control(&req.tt_extras)
-            .unwrap_or_default();
+        let ctrl: CacheControlConfig = parse_cache_control(&req.tt_extras).unwrap_or_default();
 
         match ctrl.mode {
             CacheMode::Normal => Self {
@@ -363,9 +362,7 @@ pub async fn handler(
     let l2_allowed = matches!(
         caller_tier,
         Some(
-            tt_shared::CallerTier::Pro
-                | tt_shared::CallerTier::Team
-                | tt_shared::CallerTier::Scale
+            tt_shared::CallerTier::Pro | tt_shared::CallerTier::Team | tt_shared::CallerTier::Scale
         )
     );
     let credentials = resolve_credentials(&state, org_id, provider.id(), &raw_bearer).await;
@@ -459,51 +456,41 @@ pub async fn handler(
             let combined_text: String = req
                 .messages
                 .iter()
-                .map(|m| {
-                    match m {
-                        Message::User { content, .. } | Message::System { content } => {
-                            match content {
-                                MessageContent::Text(s) => s.as_str().to_owned(),
-                                MessageContent::Parts(parts) => parts
-                                    .iter()
-                                    .filter_map(|p| match p {
-                                        tt_shared::ContentPart::Text { text } => {
-                                            Some(text.as_str())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(""),
-                            }
-                        }
-                        Message::Assistant { content, .. } => match content {
-                            Some(MessageContent::Text(s)) => s.clone(),
-                            Some(MessageContent::Parts(parts)) => parts
-                                .iter()
-                                .filter_map(|p| match p {
-                                    tt_shared::ContentPart::Text { text } => {
-                                        Some(text.as_str())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join(""),
-                            None => String::new(),
-                        },
-                        Message::Tool { content, .. } => match content {
-                            MessageContent::Text(s) => s.clone(),
-                            MessageContent::Parts(parts) => parts
-                                .iter()
-                                .filter_map(|p| match p {
-                                    tt_shared::ContentPart::Text { text } => {
-                                        Some(text.as_str())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join(""),
-                        },
-                    }
+                .map(|m| match m {
+                    Message::User { content, .. } | Message::System { content } => match content {
+                        MessageContent::Text(s) => s.as_str().to_owned(),
+                        MessageContent::Parts(parts) => parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    },
+                    Message::Assistant { content, .. } => match content {
+                        Some(MessageContent::Text(s)) => s.clone(),
+                        Some(MessageContent::Parts(parts)) => parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        None => String::new(),
+                    },
+                    Message::Tool { content, .. } => match content {
+                        MessageContent::Text(s) => s.clone(),
+                        MessageContent::Parts(parts) => parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    },
                 })
                 .collect();
             tt_tokenize::estimate_tokens(provider_id_for_est, &combined_text) as i32
@@ -559,36 +546,35 @@ pub async fn handler(
         // only). Free/None callers write to L1 only. `sse.rs` already no-ops the
         // L2 insert when `ins.l2` is None, so setting it to None here is the
         // correct minimal fix (rv-streaming-l2-tier-gate).
-        let stream_cache_insert = if cache_behavior.do_insert
-            && (state.l1.is_some() || state.l2.is_some())
-        {
-            // Only populate the L2 handle and query text for paid-tier callers.
-            let l2_for_insert = if l2_allowed { state.l2.clone() } else { None };
-            let l2_query_text = l2_for_insert
-                .as_ref()
-                .and_then(|_| tt_cache::l2_context_text(&req));
-            let ttl = effective_ttl_secs(
-                cache_behavior.ttl_secs,
-                caller_tier,
-                state
-                    .l1
+        let stream_cache_insert =
+            if cache_behavior.do_insert && (state.l1.is_some() || state.l2.is_some()) {
+                // Only populate the L2 handle and query text for paid-tier callers.
+                let l2_for_insert = if l2_allowed { state.l2.clone() } else { None };
+                let l2_query_text = l2_for_insert
                     .as_ref()
-                    .map(|l| l.ttl_secs)
-                    .unwrap_or(L2_DEFAULT_TTL.as_secs()),
-            );
-            Some(CacheInsertContext {
-                l1: state.l1.clone(),
-                l2: l2_for_insert,
-                l1_key: l1_key.clone().unwrap_or_default(),
-                l2_query_text,
-                ttl_secs: ttl,
-                model: served_model.clone(),
-                provider_id: provider.id().to_string(),
-                org_id: ctx.org_id,
-            })
-        } else {
-            None
-        };
+                    .and_then(|_| tt_cache::l2_context_text(&req));
+                let ttl = effective_ttl_secs(
+                    cache_behavior.ttl_secs,
+                    caller_tier,
+                    state
+                        .l1
+                        .as_ref()
+                        .map(|l| l.ttl_secs)
+                        .unwrap_or(L2_DEFAULT_TTL.as_secs()),
+                );
+                Some(CacheInsertContext {
+                    l1: state.l1.clone(),
+                    l2: l2_for_insert,
+                    l1_key: l1_key.clone().unwrap_or_default(),
+                    l2_query_text,
+                    ttl_secs: ttl,
+                    model: served_model.clone(),
+                    provider_id: provider.id().to_string(),
+                    org_id: ctx.org_id,
+                })
+            } else {
+                None
+            };
 
         // Build a StreamLogContext whenever either telemetry or cache insertion
         // is needed. writer=None skips the request_logs row without preventing
@@ -1821,10 +1807,8 @@ mod cache_eligibility_tests {
     #[test]
     fn bypass_skips_both() {
         let mut req = base_req();
-        req.tt_extras.insert(
-            "cache".into(),
-            serde_json::json!({"mode": "bypass"}),
-        );
+        req.tt_extras
+            .insert("cache".into(), serde_json::json!({"mode": "bypass"}));
         let b = CacheBehavior::resolve(&req);
         assert!(!b.do_lookup);
         assert!(!b.do_insert);
@@ -1846,10 +1830,8 @@ mod cache_eligibility_tests {
     #[test]
     fn read_only_looks_up_never_inserts() {
         let mut req = base_req();
-        req.tt_extras.insert(
-            "cache".into(),
-            serde_json::json!({"mode": "read-only"}),
-        );
+        req.tt_extras
+            .insert("cache".into(), serde_json::json!({"mode": "read-only"}));
         let b = CacheBehavior::resolve(&req);
         assert!(b.do_lookup);
         assert!(!b.do_insert);
@@ -1860,10 +1842,8 @@ mod cache_eligibility_tests {
         // Even if caller says "refresh", temperature>0 means we skip both.
         let mut req = base_req();
         req.temperature = Some(1.0);
-        req.tt_extras.insert(
-            "cache".into(),
-            serde_json::json!({"mode": "refresh"}),
-        );
+        req.tt_extras
+            .insert("cache".into(), serde_json::json!({"mode": "refresh"}));
         let b = CacheBehavior::resolve(&req);
         assert!(!b.do_lookup);
         assert!(!b.do_insert);

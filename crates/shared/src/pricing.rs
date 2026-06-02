@@ -307,15 +307,13 @@ mod catalog_tests {
         // Non-Anthropic models have no documented write premium.
         let gpt4o = c.latest("openai", "gpt-4o").expect("gpt-4o present");
         assert_eq!(
-            gpt4o.cache_write_per_million,
-            None,
+            gpt4o.cache_write_per_million, None,
             "OpenAI has no cache-write premium"
         );
 
         let groq_llama = c.latest("groq", "llama-3.1-8b-instant").expect("present");
         assert_eq!(
-            groq_llama.cache_write_per_million,
-            None,
+            groq_llama.cache_write_per_million, None,
             "Groq has no cache-write premium"
         );
     }

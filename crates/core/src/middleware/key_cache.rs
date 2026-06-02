@@ -262,7 +262,13 @@ impl<C: Clock> KeyVerifyCache<C> {
         if !self.maybe_sweep_and_cap(now) {
             return;
         }
-        self.map.insert(hash, CacheEntry::Hit { ctx, inserted_at: now });
+        self.map.insert(
+            hash,
+            CacheEntry::Hit {
+                ctx,
+                inserted_at: now,
+            },
+        );
     }
 
     /// Insert a failed verification (wrong secret, not found, revoked).
@@ -274,7 +280,8 @@ impl<C: Clock> KeyVerifyCache<C> {
         if !self.maybe_sweep_and_cap(now) {
             return;
         }
-        self.map.insert(hash, CacheEntry::Failure { inserted_at: now });
+        self.map
+            .insert(hash, CacheEntry::Failure { inserted_at: now });
     }
 
     /// Sweep expired entries and check the soft cap.
@@ -510,7 +517,10 @@ mod tests {
             let hash = hash_token(&format!("tt_live_sweep_{i:09}"));
             cache.insert_failure(hash);
         }
-        assert!(cache.len() >= SWEEP_THRESHOLD, "pre-condition: map must be at/above threshold");
+        assert!(
+            cache.len() >= SWEEP_THRESHOLD,
+            "pre-condition: map must be at/above threshold"
+        );
 
         // Advance clock so every entry is expired.
         clock.advance(Duration::from_secs(NEGATIVE_TTL_SECS + 1));

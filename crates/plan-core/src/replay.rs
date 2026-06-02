@@ -39,11 +39,7 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     // different winners and thus different projected savings — violating the
     // replay's "same config → bit-identical result" determinism contract.
     let mut routes = input.proposed_routes.clone();
-    routes.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    routes.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
 
     // Walk requests in deterministic order (by id).
     let mut requests = input.requests.clone();

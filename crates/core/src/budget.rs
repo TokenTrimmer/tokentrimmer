@@ -523,8 +523,14 @@ mod tests {
         // SP-0 platform-admin bypass: all caps None, L2 on. No DB required.
         let l = BudgetLimits::internal_unlimited();
         assert_eq!(l.monthly_cap_usd, None, "internal must have no USD cap");
-        assert_eq!(l.max_requests_per_min, None, "internal must have no rpm cap");
-        assert_eq!(l.monthly_request_cap, None, "internal must have no monthly request cap");
+        assert_eq!(
+            l.max_requests_per_min, None,
+            "internal must have no rpm cap"
+        );
+        assert_eq!(
+            l.monthly_request_cap, None,
+            "internal must have no monthly request cap"
+        );
         assert!(l.l2_cache, "internal must have L2 cache enabled");
     }
 
@@ -561,7 +567,10 @@ mod tests {
     fn pro_tier_limits() {
         let l = tier_budget_limits("pro", "active");
         assert_eq!(l.max_requests_per_min, Some(600));
-        assert_eq!(l.monthly_request_cap, None, "paid tiers bill overage, no hard-stop");
+        assert_eq!(
+            l.monthly_request_cap, None,
+            "paid tiers bill overage, no hard-stop"
+        );
         assert!(l.l2_cache, "Pro has L2 cache");
     }
 
@@ -569,7 +578,10 @@ mod tests {
     fn team_and_scale_have_unlimited_rpm() {
         for tier in &["team", "scale"] {
             let l = tier_budget_limits(tier, "active");
-            assert_eq!(l.max_requests_per_min, None, "{tier} should have unlimited rpm");
+            assert_eq!(
+                l.max_requests_per_min, None,
+                "{tier} should have unlimited rpm"
+            );
             assert_eq!(l.monthly_request_cap, None);
             assert!(l.l2_cache);
         }
@@ -665,7 +677,10 @@ mod tests {
                 if total >= 10_000 {
                     break 'outer;
                 }
-                assert!(e2.check(org2, ts).is_allowed(), "request {total} at minute {minute}");
+                assert!(
+                    e2.check(org2, ts).is_allowed(),
+                    "request {total} at minute {minute}"
+                );
                 total += 1;
             }
         }
@@ -735,7 +750,9 @@ mod tests {
 
         // A real org with no spend should still be allowed (nil spend not recorded).
         assert!(
-            enforcer.check_with_limits(real_org, &limits, now).is_allowed(),
+            enforcer
+                .check_with_limits(real_org, &limits, now)
+                .is_allowed(),
             "nil org record must not affect real org"
         );
     }

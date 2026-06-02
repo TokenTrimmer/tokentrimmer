@@ -176,7 +176,10 @@ mod tests {
             has(".cursor/rules/x.md"),
             ".cursor/rules/x.md must be yielded"
         );
-        assert!(has(".github/README.md"), ".github/README.md must be yielded");
+        assert!(
+            has(".github/README.md"),
+            ".github/README.md must be yielded"
+        );
         assert!(has(".claude/z.md"), ".claude/z.md must be yielded");
 
         assert!(!has(".git/config"), ".git/config must be pruned");

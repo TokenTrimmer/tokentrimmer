@@ -98,9 +98,7 @@ impl UsageTrackingStream {
     /// for cache insertion. Returns `None` when no authoritative usage block arrived
     /// (i.e. stream was truncated / no terminal usage chunk), ensuring only cleanly
     /// completed streams with known token counts are cached.
-    pub(crate) fn cache_completion_data(
-        &self,
-    ) -> Option<(String, String, Usage)> {
+    pub(crate) fn cache_completion_data(&self) -> Option<(String, String, Usage)> {
         let (prompt_tokens, completion_tokens, cached_tokens) = self.authoritative?;
         let finish_reason = self.finish_reason.clone().unwrap_or_else(|| "stop".into());
         let text = self.output_text.clone();
@@ -299,8 +297,7 @@ impl TrackedEventStream {
             let guard = self.inner.lock().expect("tracking stream mutex poisoned");
             guard.snapshot()
         };
-        let cost_usd =
-            compute_streaming_cost(&usage, Some(pricing)) * self.fee_multiplier;
+        let cost_usd = compute_streaming_cost(&usage, Some(pricing)) * self.fee_multiplier;
         let baseline_cost_usd =
             compute_streaming_baseline(&usage, self.baseline_pricing.as_ref().or(Some(pricing)))
                 * self.fee_multiplier;
@@ -468,11 +465,9 @@ pub fn stream_response(
                 drop(inner);
 
                 // Apply provider surcharge to both cost and baseline (§2.13).
-                let cost_usd =
-                    compute_streaming_cost(&usage, pricing.as_ref()) * fee_multiplier;
+                let cost_usd = compute_streaming_cost(&usage, pricing.as_ref()) * fee_multiplier;
                 let baseline_cost_usd =
-                    compute_streaming_baseline(&usage, baseline_pricing.as_ref())
-                        * fee_multiplier;
+                    compute_streaming_baseline(&usage, baseline_pricing.as_ref()) * fee_multiplier;
 
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, cost_usd, Utc::now());
@@ -546,7 +541,9 @@ pub fn stream_response(
                         }
                     });
                     if has_tool_calls {
-                        tracing::debug!("streaming cache insert skipped: response contains tool calls");
+                        tracing::debug!(
+                            "streaming cache insert skipped: response contains tool calls"
+                        );
                         return;
                     }
 
@@ -1015,7 +1012,10 @@ mod tests {
         let scaled_baseline = base_baseline * fee;
 
         // base_cost = 1000/1e6 + 500*2/1e6 = 0.001 + 0.001 = 0.002
-        assert!((base_cost - 0.002_f64).abs() < 1e-9, "base_cost={base_cost}");
+        assert!(
+            (base_cost - 0.002_f64).abs() < 1e-9,
+            "base_cost={base_cost}"
+        );
         assert!(
             (scaled_cost - 0.002_f64 * 1.05).abs() < 1e-9,
             "scaled_cost={scaled_cost}"

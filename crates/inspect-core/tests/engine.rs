@@ -203,8 +203,7 @@ fn engine_scans_cursor_rules_but_not_git() {
     )
     .unwrap();
 
-    let engine =
-        Engine::new().with_rule(Box::new(ConfigAgentsMdContainsSecretsRule::new()));
+    let engine = Engine::new().with_rule(Box::new(ConfigAgentsMdContainsSecretsRule::new()));
     let findings = engine.scan(tmp.path());
 
     // Exactly one finding: the secret in .cursor/rules/secret.md.
@@ -266,7 +265,9 @@ fn engine_scan_output_is_deterministic_and_sorted() {
         fs::write(tmp.path().join(name), format!("# {name}\nx = 1\n")).unwrap();
     }
 
-    let engine = Engine::new().with_rule(Box::new(AllFilesRule { id: "determinism-rule" }));
+    let engine = Engine::new().with_rule(Box::new(AllFilesRule {
+        id: "determinism-rule",
+    }));
 
     let run1 = engine.scan(tmp.path());
     let run2 = engine.scan(tmp.path());
@@ -278,7 +279,10 @@ fn engine_scan_output_is_deterministic_and_sorted() {
     // Both runs must be identical (sorted order is stable).
     for (a, b) in run1.iter().zip(run2.iter()) {
         assert_eq!(a.file, b.file, "finding files must match across runs");
-        assert_eq!(a.rule_id, b.rule_id, "finding rule_ids must match across runs");
+        assert_eq!(
+            a.rule_id, b.rule_id,
+            "finding rule_ids must match across runs"
+        );
     }
 
     // Findings must be sorted by file path (the primary sort key).

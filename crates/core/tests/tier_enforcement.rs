@@ -28,15 +28,16 @@ use tt_auth::{
     InMemoryKeyStore,
 };
 use tt_core::{
-    build_router, tier_resolver::TierResolver, AppState, ProviderRegistry,
+    build_router,
+    tier_resolver::TierResolver,
     tier_resolver::{ResolvedTier, TierResolverError},
+    AppState, ProviderRegistry,
 };
 use tt_shared::{
     messages::{Choice, Message, MessageContent},
     pricing::Capability,
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-    EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError,
-    RequestContext, Usage,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
+    EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
 use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
 use uuid::Uuid;
@@ -238,13 +239,18 @@ async fn free_org_over_monthly_cap_returns_429() {
             if allowed >= cap {
                 break;
             }
-            let decision = state.dynamic_budget.check_with_limits(org, &free_limits, ts);
+            let decision = state
+                .dynamic_budget
+                .check_with_limits(org, &free_limits, ts);
             if matches!(decision, BudgetDecision::Allow { .. }) {
                 allowed += 1;
             }
         }
     }
-    assert_eq!(allowed, cap, "should have pre-filled exactly {cap} requests");
+    assert_eq!(
+        allowed, cap,
+        "should have pre-filled exactly {cap} requests"
+    );
 
     let app = build_router(state);
 
@@ -261,8 +267,7 @@ async fn free_org_over_monthly_cap_returns_429() {
         .expect("body");
     let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
     assert_eq!(
-        body["error"]["type"],
-        "monthly_quota_exceeded",
+        body["error"]["type"], "monthly_quota_exceeded",
         "should be monthly_quota_exceeded, got: {body}"
     );
 }
@@ -286,7 +291,9 @@ async fn free_org_over_rpm_returns_429() {
     let rpm = free_limits.max_requests_per_min.expect("free tier has rpm");
     let now = chrono::Utc::now();
     for _ in 0..rpm {
-        state.dynamic_budget.check_with_limits(org, &free_limits, now);
+        state
+            .dynamic_budget
+            .check_with_limits(org, &free_limits, now);
     }
 
     let app = build_router(state);
@@ -302,8 +309,7 @@ async fn free_org_over_rpm_returns_429() {
         .expect("body");
     let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
     assert_eq!(
-        body["error"]["type"],
-        "rate_limit_exceeded",
+        body["error"]["type"], "rate_limit_exceeded",
         "should be rate_limit_exceeded, got: {body}"
     );
 }
@@ -360,7 +366,10 @@ async fn tier_cache_serves_second_request_without_re_querying() {
     // After request 1 the counter should be at most 2 (or 1 if the two calls
     // share the cache entry); after request 2 it must not increase.
     let count_after_r1 = counter.load(Ordering::SeqCst);
-    assert!(count_after_r1 <= 2, "first request: inner calls should be ≤2, got {count_after_r1}");
+    assert!(
+        count_after_r1 <= 2,
+        "first request: inner calls should be ≤2, got {count_after_r1}"
+    );
 
     // Second request — everything from cache.
     let r2 = app.clone().oneshot(chat_request(&key)).await.expect("r2");

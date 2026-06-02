@@ -70,15 +70,23 @@ pub fn lookup(model: &str) -> Result<LookupHit, PreviewError> {
 pub fn lookup_with_provider(model: &str, provider: &str) -> Result<LookupHit, PreviewError> {
     let cfg = ClientConfig::default;
     let found = match provider {
-        "anthropic" => tt_provider_anthropic::pricing::pricing_for(model).map(|p| hit("anthropic", &p)),
+        "anthropic" => {
+            tt_provider_anthropic::pricing::pricing_for(model).map(|p| hit("anthropic", &p))
+        }
         "openai" => tt_provider_openai::pricing::pricing_for(model).map(|p| hit("openai", &p)),
         "gemini" => tt_provider_gemini::pricing::pricing_for(model).map(|p| hit("gemini", &p)),
-        "groq" => tt_provider_groq::GroqProvider::new(cfg()).pricing(model).map(|p| hit("groq", &p)),
-        "mistral" => tt_provider_mistral::MistralProvider::new(cfg()).pricing(model).map(|p| hit("mistral", &p)),
-        "together" => tt_provider_together::TogetherProvider::new(cfg()).pricing(model).map(|p| hit("together", &p)),
-        "openrouter" => {
-            tt_provider_openrouter::OpenRouterProvider::new(cfg()).pricing(model).map(|p| hit("openrouter", &p))
-        }
+        "groq" => tt_provider_groq::GroqProvider::new(cfg())
+            .pricing(model)
+            .map(|p| hit("groq", &p)),
+        "mistral" => tt_provider_mistral::MistralProvider::new(cfg())
+            .pricing(model)
+            .map(|p| hit("mistral", &p)),
+        "together" => tt_provider_together::TogetherProvider::new(cfg())
+            .pricing(model)
+            .map(|p| hit("together", &p)),
+        "openrouter" => tt_provider_openrouter::OpenRouterProvider::new(cfg())
+            .pricing(model)
+            .map(|p| hit("openrouter", &p)),
         _ => None,
     };
     found.ok_or_else(|| PreviewError::UnknownModel(model.to_string()))
@@ -125,7 +133,8 @@ mod tests {
     #[test]
     fn lookup_with_provider_attributes_to_named_provider() {
         // A known model resolves from its own provider's catalog.
-        let hit = lookup_with_provider("gpt-4o-mini", "openai").expect("openai carries gpt-4o-mini");
+        let hit =
+            lookup_with_provider("gpt-4o-mini", "openai").expect("openai carries gpt-4o-mini");
         assert_eq!(hit.provider, "openai");
         let hit = lookup_with_provider("claude-haiku-4-5", "anthropic")
             .expect("anthropic carries claude-haiku-4-5");

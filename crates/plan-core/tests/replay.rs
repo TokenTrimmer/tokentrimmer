@@ -524,12 +524,18 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
     // that field is the input document, not the projection. Before the
     // tiebreak, the winner (and so these projection numbers) flipped with the
     // array order; that is the bug being fixed.
-    let proj_ab =
-        serde_json::to_string(&(&res_ab.aggregates, &res_ab.confidence_intervals, &res_ab.per_route_breakdown))
-            .expect("serialize ab projection");
-    let proj_ba =
-        serde_json::to_string(&(&res_ba.aggregates, &res_ba.confidence_intervals, &res_ba.per_route_breakdown))
-            .expect("serialize ba projection");
+    let proj_ab = serde_json::to_string(&(
+        &res_ab.aggregates,
+        &res_ab.confidence_intervals,
+        &res_ab.per_route_breakdown,
+    ))
+    .expect("serialize ab projection");
+    let proj_ba = serde_json::to_string(&(
+        &res_ba.aggregates,
+        &res_ba.confidence_intervals,
+        &res_ba.per_route_breakdown,
+    ))
+    .expect("serialize ba projection");
     assert_eq!(
         proj_ab, proj_ba,
         "equal-priority route configs that differ only in array order must \

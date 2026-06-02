@@ -107,8 +107,7 @@ fn normalize_text_for_key(s: &str) -> String {
     // 1. Apply Unicode NFC: iterator yields NFC code points, collect to String.
     let nfc: String = s.nfc().collect();
     // 2. Trim trailing ASCII whitespace characters.
-    nfc.trim_end_matches([' ', '\t', '\n', '\r'])
-        .to_owned()
+    nfc.trim_end_matches([' ', '\t', '\n', '\r']).to_owned()
 }
 
 /// Build the canonical [`serde_json::Value`] used for key derivation.
@@ -144,9 +143,7 @@ fn build_canonical(req: &ChatCompletionRequest) -> serde_json::Value {
             } => Message::Assistant {
                 name: name.clone(),
                 tool_calls: tool_calls.clone(),
-                content: content
-                    .as_ref()
-                    .map(normalize_message_content),
+                content: content.as_ref().map(normalize_message_content),
             },
             Message::Tool {
                 content,

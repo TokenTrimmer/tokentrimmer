@@ -91,9 +91,8 @@ mod cache_control_tests {
 
     #[test]
     fn refresh_mode_with_ttl() {
-        let cfg =
-            parse_cache_control(&extras(r#"{"cache":{"mode":"refresh","ttl_secs":3600}}"#))
-                .unwrap();
+        let cfg = parse_cache_control(&extras(r#"{"cache":{"mode":"refresh","ttl_secs":3600}}"#))
+            .unwrap();
         assert_eq!(cfg.mode, CacheMode::Refresh);
         assert_eq!(cfg.ttl_secs, Some(3600));
     }
@@ -112,8 +111,7 @@ mod cache_control_tests {
 
     #[test]
     fn malformed_value_falls_back_to_default() {
-        let cfg =
-            parse_cache_control(&extras(r#"{"cache":"not-an-object"}"#)).unwrap();
+        let cfg = parse_cache_control(&extras(r#"{"cache":"not-an-object"}"#)).unwrap();
         assert_eq!(cfg.mode, CacheMode::Normal);
     }
 }

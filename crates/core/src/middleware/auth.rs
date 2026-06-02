@@ -106,9 +106,7 @@ pub async fn middleware(
                 let key_store = key_store.clone();
                 let key_id = ctx.key_id;
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        key_store.touch_last_used(key_id, chrono::Utc::now()).await
-                    {
+                    if let Err(e) = key_store.touch_last_used(key_id, chrono::Utc::now()).await {
                         tracing::warn!(error = %e, "touch_last_used failed");
                     }
                 });
@@ -332,7 +330,12 @@ mod tests {
                 .cloned())
         }
 
-        async fn revoke(&self, id: Uuid, org_id: Uuid, at: DateTime<Utc>) -> Result<bool, KeyError> {
+        async fn revoke(
+            &self,
+            id: Uuid,
+            org_id: Uuid,
+            at: DateTime<Utc>,
+        ) -> Result<bool, KeyError> {
             let mut g = self
                 .by_prefix
                 .lock()
@@ -421,7 +424,11 @@ mod tests {
             .oneshot(live_bearer(plaintext))
             .await
             .expect("resp1");
-        assert_eq!(resp1.status(), StatusCode::OK, "first request should succeed");
+        assert_eq!(
+            resp1.status(),
+            StatusCode::OK,
+            "first request should succeed"
+        );
 
         // Second request — cache warm, should skip argon2.
         let resp2 = router
@@ -429,7 +436,11 @@ mod tests {
             .oneshot(live_bearer(plaintext))
             .await
             .expect("resp2");
-        assert_eq!(resp2.status(), StatusCode::OK, "second request should succeed");
+        assert_eq!(
+            resp2.status(),
+            StatusCode::OK,
+            "second request should succeed"
+        );
 
         // find_by_prefix (= argon2 runs) called exactly once.
         assert_eq!(
@@ -457,20 +468,14 @@ mod tests {
         // Router 1 — first verify (cache miss → argon2).
         let state1 = state_with_store(store.clone());
         let router1 = build_router(state1);
-        let r1 = router1
-            .oneshot(live_bearer(plaintext))
-            .await
-            .expect("r1");
+        let r1 = router1.oneshot(live_bearer(plaintext)).await.expect("r1");
         assert_eq!(r1.status(), StatusCode::OK);
         assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
 
         // Router 2 — brand-new empty cache (simulates TTL expiry).
         let state2 = state_with_store(store.clone());
         let router2 = build_router(state2);
-        let r2 = router2
-            .oneshot(live_bearer(plaintext))
-            .await
-            .expect("r2");
+        let r2 = router2.oneshot(live_bearer(plaintext)).await.expect("r2");
         assert_eq!(r2.status(), StatusCode::OK);
         assert_eq!(
             store.find_count.load(Ordering::SeqCst),

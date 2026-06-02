@@ -15,12 +15,11 @@ pub fn parse(text: &str) -> Result<Vec<RetrievableTag>, RetrievalError> {
     // PAYLOAD is captured as group 2.
     let re = Regex::new(r#"(?ms)<retrievable\s+([^>]+?)>(.*?)</retrievable>"#)
         .map_err(|e| RetrievalError::Tag(e.to_string()))?;
-    let k_re =
-        Regex::new(r#"k="(\d+)""#).map_err(|e| RetrievalError::Tag(e.to_string()))?;
+    let k_re = Regex::new(r#"k="(\d+)""#).map_err(|e| RetrievalError::Tag(e.to_string()))?;
     let corpus_re =
         Regex::new(r#"corpus="([^"]+)""#).map_err(|e| RetrievalError::Tag(e.to_string()))?;
-    let sim_re =
-        Regex::new(r#"min_similarity="([^"]+)""#).map_err(|e| RetrievalError::Tag(e.to_string()))?;
+    let sim_re = Regex::new(r#"min_similarity="([^"]+)""#)
+        .map_err(|e| RetrievalError::Tag(e.to_string()))?;
 
     let mut out = Vec::new();
     for m in re.captures_iter(text) {
@@ -76,10 +75,9 @@ mod tests {
 
     #[test]
     fn per_tag_min_similarity_parsed() {
-        let t = parse(
-            r#"<retrievable corpus="x" k="3" min_similarity="0.75">payload</retrievable>"#,
-        )
-        .unwrap();
+        let t =
+            parse(r#"<retrievable corpus="x" k="3" min_similarity="0.75">payload</retrievable>"#)
+                .unwrap();
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].corpus, "x");
         assert_eq!(t[0].k, 3);

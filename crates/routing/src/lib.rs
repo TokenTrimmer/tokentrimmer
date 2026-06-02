@@ -349,8 +349,10 @@ mod tests {
             force_cache_layer: None,
         };
         let json = serde_json::to_string(&a).unwrap();
-        assert_eq!(json, r#"{"target_model":"x"}"#,
-            "empty fallbacks and None force_cache_layer must be omitted from JSON");
+        assert_eq!(
+            json, r#"{"target_model":"x"}"#,
+            "empty fallbacks and None force_cache_layer must be omitted from JSON"
+        );
     }
 
     /// (b) Old JSON that has only `target_model` still deserializes — serde
@@ -361,7 +363,10 @@ mod tests {
         let a: RouteAction = serde_json::from_str(json).unwrap();
         assert_eq!(a.target_model, "gpt-4o-mini");
         assert!(a.fallbacks.is_empty(), "fallbacks must default to empty");
-        assert!(a.force_cache_layer.is_none(), "force_cache_layer must default to None");
+        assert!(
+            a.force_cache_layer.is_none(),
+            "force_cache_layer must default to None"
+        );
     }
 
     /// (a) Full round-trip: a `RouteAction` with both new fields serializes to
@@ -376,8 +381,14 @@ mod tests {
         };
         let json = serde_json::to_string(&original).unwrap();
         // Both new fields must appear in the serialized JSON.
-        assert!(json.contains("\"fallbacks\""), "fallbacks must be present: {json}");
-        assert!(json.contains("\"force_cache_layer\""), "force_cache_layer must be present: {json}");
+        assert!(
+            json.contains("\"fallbacks\""),
+            "fallbacks must be present: {json}"
+        );
+        assert!(
+            json.contains("\"force_cache_layer\""),
+            "force_cache_layer must be present: {json}"
+        );
         let roundtripped: RouteAction = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped.target_model, original.target_model);
         assert_eq!(roundtripped.fallbacks, original.fallbacks);

@@ -392,7 +392,8 @@ async fn compat_embeddings_success() {
 async fn extra_headers_denylist_drops_auth_and_host() {
     let server = MockServer::start();
     let _mock = server.mock(|when, then| {
-        when.method(POST).path("/chat/completions")
+        when.method(POST)
+            .path("/chat/completions")
             // The custom header MUST arrive at the server.
             .header("x-custom-org", "org-123")
             // Authorization should NOT be overridden by extra_headers.

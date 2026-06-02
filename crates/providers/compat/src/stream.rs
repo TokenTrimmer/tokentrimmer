@@ -28,8 +28,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::pin::Pin;
 use tt_shared::{
-    filter_extra_headers, ChatCompletionChunk, ChatCompletionRequest, ProviderError,
-    RequestContext,
+    filter_extra_headers, ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext,
 };
 
 use crate::errors::{map_reqwest_error, map_response_error};
@@ -76,8 +75,7 @@ pub async fn stream_chat_completion(
 ) -> Result<ChunkStream, ProviderError> {
     let url = format!("{base_url}/chat/completions");
     let api_key = ctx.credentials.api_key.expose().to_string();
-    let extra_headers: Vec<(String, String)> =
-        filter_extra_headers(&ctx.credentials.extra_headers);
+    let extra_headers: Vec<(String, String)> = filter_extra_headers(&ctx.credentials.extra_headers);
 
     // Translate to the OpenAI wire shape, then override the stream flag.
     let mut translated = translate::translate_request(req)?;
@@ -242,7 +240,10 @@ fn parse_sse_event(event_bytes: &[u8]) -> Vec<SseEvent> {
             continue;
         }
 
-        if let Some(data) = line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)) {
+        if let Some(data) = line
+            .strip_prefix("data:")
+            .map(|s| s.strip_prefix(' ').unwrap_or(s))
+        {
             if data == "[DONE]" {
                 results.push(SseEvent::Done);
                 // Stop processing further lines in this event.
@@ -366,8 +367,10 @@ mod tests {
         let event = format!("data: {chunk_json}\r\n\r\n");
         let results = parse_sse_event(event.as_bytes());
         assert_eq!(results.len(), 1, "CRLF event should parse to one chunk");
-        assert!(matches!(&results[0], SseEvent::Chunk(c) if c.id == "c2"),
-            "CRLF-delimited event should parse identical to LF form");
+        assert!(
+            matches!(&results[0], SseEvent::Chunk(c) if c.id == "c2"),
+            "CRLF-delimited event should parse identical to LF form"
+        );
     }
 
     #[test]
@@ -376,9 +379,15 @@ mod tests {
         let chunk_json = r#"{"id":"c3","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#;
         let event = format!("data:{chunk_json}\n\n");
         let results = parse_sse_event(event.as_bytes());
-        assert_eq!(results.len(), 1, "no-space data: event should parse to one chunk");
-        assert!(matches!(&results[0], SseEvent::Chunk(c) if c.id == "c3"),
-            "data:{{...}} (no space) should parse the same as `data: {{...}}`");
+        assert_eq!(
+            results.len(),
+            1,
+            "no-space data: event should parse to one chunk"
+        );
+        assert!(
+            matches!(&results[0], SseEvent::Chunk(c) if c.id == "c3"),
+            "data:{{...}} (no space) should parse the same as `data: {{...}}`"
+        );
     }
 
     #[test]
