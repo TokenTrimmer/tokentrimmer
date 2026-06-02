@@ -135,7 +135,9 @@ impl Provider for RateLimitedProvider {
         _ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Err(ProviderError::RateLimited { retry_after_ms: 1000 })
+        Err(ProviderError::RateLimited {
+            retry_after_ms: 1000,
+        })
     }
     async fn embeddings(
         &self,
@@ -191,7 +193,10 @@ impl Provider for ServerErrorProvider {
         _ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Err(ProviderError::ProviderUpstream { status: 500, message: "internal server error".into() })
+        Err(ProviderError::ProviderUpstream {
+            status: 500,
+            message: "internal server error".into(),
+        })
     }
     async fn embeddings(
         &self,
@@ -273,10 +278,7 @@ async fn deterministic_invalid_request_is_negative_cached() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Second request — MUST be served from negative cache, NOT call provider.
-    let r2 = app
-        .oneshot(det_chat_request("bad-model"))
-        .await
-        .unwrap();
+    let r2 = app.oneshot(det_chat_request("bad-model")).await.unwrap();
     let status2 = r2.status();
     assert!(
         status2.is_client_error(),
@@ -291,8 +293,7 @@ async fn deterministic_invalid_request_is_negative_cached() {
     assert_eq!(
         cache_header,
         Some("neg-hit"),
-        "second request should be served from negative cache; got {:?}",
-        cache_header
+        "second request should be served from negative cache; got {cache_header:?}"
     );
 
     // Provider call count must be exactly 1 — the second request was short-circuited.
@@ -342,10 +343,7 @@ async fn rate_limit_error_is_never_negative_cached() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Second request — must NOT be served from any cache; provider must be called again.
-    let r2 = app
-        .oneshot(det_chat_request("rl-model"))
-        .await
-        .unwrap();
+    let r2 = app.oneshot(det_chat_request("rl-model")).await.unwrap();
     let status2 = r2.status();
     assert_eq!(
         status2,
@@ -407,10 +405,7 @@ async fn server_error_is_never_negative_cached() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Second request — must NOT be short-circuited from negative cache.
-    let r2 = app
-        .oneshot(det_chat_request("se-model"))
-        .await
-        .unwrap();
+    let r2 = app.oneshot(det_chat_request("se-model")).await.unwrap();
     assert!(
         r2.status().is_server_error(),
         "second request should still return 5xx; got {}",
@@ -467,10 +462,7 @@ async fn bypass_mode_skips_negative_caching() {
 
     // Second request WITH bypass mode — must call provider again; NOT served
     // from negative cache.
-    let r2 = app
-        .oneshot(bypass_chat_request("bad-model"))
-        .await
-        .unwrap();
+    let r2 = app.oneshot(bypass_chat_request("bad-model")).await.unwrap();
     assert!(
         r2.status().is_client_error(),
         "second bypass request should return client error; got {}",
@@ -505,14 +497,15 @@ async fn bypass_mode_skips_negative_caching() {
 /// request.
 #[tokio::test]
 async fn positive_cache_unaffected_by_negative_cache_logic() {
-
     struct SuccessProvider {
         calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
     impl Provider for SuccessProvider {
-        fn id(&self) -> &'static str { "success" }
+        fn id(&self) -> &'static str {
+            "success"
+        }
         fn models(&self) -> Vec<ModelInfo> {
             vec![ModelInfo {
                 id: "ok-model".into(),
@@ -564,7 +557,8 @@ async fn positive_cache_unaffected_by_negative_cache_logic() {
             &self,
             _req: ChatCompletionRequest,
             _ctx: &RequestContext,
-        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
             Err(ProviderError::Unsupported("no stream".into()))
         }
         async fn embeddings(
@@ -578,7 +572,9 @@ async fn positive_cache_unaffected_by_negative_cache_logic() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(SuccessProvider { calls: Arc::clone(&calls) }));
+    registry.register(Arc::new(SuccessProvider {
+        calls: Arc::clone(&calls),
+    }));
     let l1 = Arc::new(InMemoryL1Cache::new());
     let state = AppState::new(registry).with_l1(l1, None);
     let app = build_router(state);

@@ -227,13 +227,12 @@ impl TierResolver for PostgresTierResolver {
             });
         }
 
-        let row: Option<(String, String)> = sqlx::query_as(
-            r#"SELECT tier, status FROM subscriptions WHERE org_id = $1"#,
-        )
-        .bind(org_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| TierResolverError::Db { org_id, source })?;
+        let row: Option<(String, String)> =
+            sqlx::query_as(r#"SELECT tier, status FROM subscriptions WHERE org_id = $1"#)
+                .bind(org_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|source| TierResolverError::Db { org_id, source })?;
 
         // No subscription row → Free default (safe for unregistered orgs);
         // otherwise map (tier, status) → limits.
@@ -390,7 +389,7 @@ mod tests {
     impl TierResolver for StubResolver {
         async fn resolve(&self, _org_id: Uuid) -> Result<ResolvedTier, TierResolverError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            self.result.clone().map_err(|_| TierResolverError::Db {
+            self.result.map_err(|_| TierResolverError::Db {
                 org_id: Uuid::nil(),
                 source: sqlx::Error::RowNotFound,
             })
@@ -453,7 +452,11 @@ mod tests {
         // Free has a 10 000/mo hard stop; a *larger* user value must NOT loosen it.
         let mut free = BudgetLimits::free_tier();
         apply_cap_override(&mut free, None, Some(50_000));
-        assert_eq!(free.monthly_request_cap, Some(10_000), "must not loosen Free cap");
+        assert_eq!(
+            free.monthly_request_cap,
+            Some(10_000),
+            "must not loosen Free cap"
+        );
         // A smaller value tightens.
         let mut free2 = BudgetLimits::free_tier();
         apply_cap_override(&mut free2, None, Some(2_000));
@@ -487,7 +490,11 @@ mod tests {
         apply_cap_override(&mut l, Some(-5.0), None);
         assert_eq!(l.monthly_cap_usd, None, "negative must be ignored");
         apply_cap_override(&mut l, Some(0.0), None);
-        assert_eq!(l.monthly_cap_usd, Some(0.0), "zero is a valid (hard-stop) cap");
+        assert_eq!(
+            l.monthly_cap_usd,
+            Some(0.0),
+            "zero is a valid (hard-stop) cap"
+        );
     }
 
     // ── is_internal DB path ─────────────────────────────────────────────────
@@ -513,7 +520,11 @@ mod tests {
 
         // Second call within TTL — cache hit, inner NOT called again.
         cached.resolve(org).await.expect("second");
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "inner should not be called on cache hit");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "inner should not be called on cache hit"
+        );
     }
 
     #[tokio::test]
@@ -525,7 +536,11 @@ mod tests {
 
         cached.resolve(org).await.expect("first");
         cached.resolve(org).await.expect("second");
-        assert_eq!(counter.load(Ordering::SeqCst), 2, "zero-TTL must re-query on every call");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "zero-TTL must re-query on every call"
+        );
     }
 
     // ── resolve_or_free: fail-open ──────────────────────────────────────────

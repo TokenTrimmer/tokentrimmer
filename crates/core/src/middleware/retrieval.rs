@@ -21,8 +21,8 @@ use axum::response::Response;
 use tracing::{debug, warn};
 
 use tt_auth::ApiKeyContext;
-use tt_retrieval::embed::EmbeddingClient;
 use tt_retrieval::audit::RetrievalAuditLog;
+use tt_retrieval::embed::EmbeddingClient;
 use tt_retrieval::store::memory::MemoryStore;
 use tt_retrieval::store::postgres::PostgresStore;
 use tt_retrieval::store::RetrievalStore;
@@ -273,7 +273,8 @@ pub async fn maybe_substitute(
             }
             if report.low_confidence_skips > 0 {
                 if let Ok(v) = HeaderValue::from_str(&report.low_confidence_skips.to_string()) {
-                    resp.headers_mut().insert("x-tt-retrieval-low-confidence", v);
+                    resp.headers_mut()
+                        .insert("x-tt-retrieval-low-confidence", v);
                 }
             }
 
@@ -325,6 +326,12 @@ pub async fn maybe_substitute(
 
 #[cfg(test)]
 mod tests {
+    // Several tests below hold `ENV_LOCK` (a std Mutex serializing env-var
+    // access) across the awaited request, so the env var stays stable for the
+    // duration of the call. Only other test threads ever contend the lock, so
+    // there is no deadlock risk — the await-holding-lock lint does not apply.
+    #![allow(clippy::await_holding_lock)]
+
     use std::sync::{Arc, Mutex};
 
     use axum::body::Body;
@@ -373,7 +380,10 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(middleware::from_fn_with_state(state.clone(), maybe_substitute))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                maybe_substitute,
+            ))
             .with_state(state)
     }
 
@@ -404,7 +414,9 @@ mod tests {
 
         // Must emit the skipped header.
         assert_eq!(
-            resp.headers().get("x-tt-retrieval-skipped").map(|v| v.as_bytes()),
+            resp.headers()
+                .get("x-tt-retrieval-skipped")
+                .map(|v| v.as_bytes()),
             Some(b"no-auth".as_slice()),
             "expected x-tt-retrieval-skipped: no-auth when no ApiKeyContext and flag off"
         );
@@ -542,7 +554,9 @@ mod tests {
         let resp = router.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("x-tt-retrieval-enabled").map(|v| v.as_bytes()),
+            resp.headers()
+                .get("x-tt-retrieval-enabled")
+                .map(|v| v.as_bytes()),
             Some(&b"disabled"[..]),
             "disabled middleware must mark the response"
         );

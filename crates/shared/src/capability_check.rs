@@ -135,9 +135,7 @@ pub fn message_text_for_estimation(req: &ChatCompletionRequest) -> String {
     req.messages
         .iter()
         .map(|m| match m {
-            Message::User { content, .. } | Message::System { content } => {
-                extract_text(content)
-            }
+            Message::User { content, .. } | Message::System { content } => extract_text(content),
             Message::Assistant { content, .. } => {
                 content.as_ref().map(extract_text).unwrap_or_default()
             }
@@ -166,7 +164,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        messages::{ImageUrl, Tool, ToolCall, ToolCallFunction, ToolFunction, ResponseFormat},
+        messages::{ImageUrl, ResponseFormat, Tool, ToolCall, ToolCallFunction, ToolFunction},
         pricing::Capability,
         ModelInfo,
     };
@@ -350,9 +348,11 @@ mod tests {
 
     #[test]
     fn skip_reasons_lists_all_failures() {
-        let mut caps = RequiredCapabilities::default();
-        caps.vision = true;
-        caps.tools = true;
+        let caps = RequiredCapabilities {
+            vision: true,
+            tools: true,
+            ..Default::default()
+        };
         let reasons = caps.skip_reasons(&text_model(), 9999);
         assert!(reasons.contains(&"vision_not_supported"));
         assert!(reasons.contains(&"tools_not_supported"));

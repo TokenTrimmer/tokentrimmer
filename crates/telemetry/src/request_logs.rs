@@ -154,27 +154,27 @@ pub mod postgres {
     impl RequestLogWriter for PostgresRequestLogWriter {
         async fn write(&self, row: RequestLogRow) -> Result<(), RequestLogError> {
             sqlx::query(INSERT_SQL)
-                .bind(row.id)                        // $1
-                .bind(row.org_id)                    // $2
-                .bind(row.api_key_id)                // $3
-                .bind(row.ts)                        // $4
-                .bind(&row.provider)                 // $5
-                .bind(&row.model)                    // $6
-                .bind(row.input_tokens)              // $7
-                .bind(row.output_tokens)             // $8
-                .bind(row.cached_tokens)             // $9
-                .bind(row.cost_usd)                  // $10
-                .bind(row.baseline_cost_usd)         // $11
-                .bind(row.cached)                    // $12
-                .bind(row.cache_layer.as_deref())    // $13
-                .bind(row.route_id)                  // $14
-                .bind(row.latency_ms)                // $15
-                .bind(row.upstream_latency_ms)       // $16
-                .bind(row.status)                    // $17
-                .bind(row.tag.as_deref())            // $18
-                .bind(row.error_class.as_deref())    // $19
-                .bind(row.trace_id.as_deref())       // $20
-                .bind(row.truncated)                 // $21
+                .bind(row.id) // $1
+                .bind(row.org_id) // $2
+                .bind(row.api_key_id) // $3
+                .bind(row.ts) // $4
+                .bind(&row.provider) // $5
+                .bind(&row.model) // $6
+                .bind(row.input_tokens) // $7
+                .bind(row.output_tokens) // $8
+                .bind(row.cached_tokens) // $9
+                .bind(row.cost_usd) // $10
+                .bind(row.baseline_cost_usd) // $11
+                .bind(row.cached) // $12
+                .bind(row.cache_layer.as_deref()) // $13
+                .bind(row.route_id) // $14
+                .bind(row.latency_ms) // $15
+                .bind(row.upstream_latency_ms) // $16
+                .bind(row.status) // $17
+                .bind(row.tag.as_deref()) // $18
+                .bind(row.error_class.as_deref()) // $19
+                .bind(row.trace_id.as_deref()) // $20
+                .bind(row.truncated) // $21
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -243,7 +243,10 @@ mod tests {
         let mut row = sample_row();
         row.truncated = true;
         w.write(row).await.unwrap();
-        assert!(w.rows()[0].truncated, "truncated=true must survive write→read");
+        assert!(
+            w.rows()[0].truncated,
+            "truncated=true must survive write→read"
+        );
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the
@@ -263,9 +266,7 @@ mod tests {
 
         // --- count columns in the INSERT column list -------------------------
         // Find the text between the first '(' and its matching ')'.
-        let col_start = INSERT_SQL
-            .find('(')
-            .expect("INSERT_SQL must contain '('");
+        let col_start = INSERT_SQL.find('(').expect("INSERT_SQL must contain '('");
         let col_end = INSERT_SQL[col_start + 1..]
             .find(')')
             .expect("INSERT_SQL must contain closing ')'")
@@ -283,7 +284,7 @@ mod tests {
             while i < bytes.len() {
                 if bytes[i] == b'$' {
                     let rest = &INSERT_SQL[i + 1..];
-                    if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                         n += 1;
                     }
                 }

@@ -74,6 +74,10 @@ fn parse_sse_event(chunk: &str) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+// `session_id`/`messages_path`/`rpc_resp` are declared before their `select!`
+// loops and only assigned on the break arm; the initial `None` is structurally
+// required for the pre-loop declaration but never read — allow that here.
+#[allow(unused_assignments)]
 async fn sse_transport_tools_list_round_trip() {
     let (addr, server_handle) = spawn_sse_server().await;
 

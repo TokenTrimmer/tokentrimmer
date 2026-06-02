@@ -120,10 +120,8 @@ pub async fn substitute_in_messages(
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n");
 
-                let orig_tokens =
-                    estimate_tokens(EMBEDDING_PROVIDER, original_payload) as i64;
-                let repl_tokens =
-                    estimate_tokens(EMBEDDING_PROVIDER, &replacement) as i64;
+                let orig_tokens = estimate_tokens(EMBEDDING_PROVIDER, original_payload) as i64;
+                let repl_tokens = estimate_tokens(EMBEDDING_PROVIDER, &replacement) as i64;
                 let delta = orig_tokens - repl_tokens;
 
                 if delta <= 0 {
@@ -206,7 +204,8 @@ mod tests {
             .await
             .unwrap();
 
-        let original = r#"Hello <retrievable corpus="docs" k="1">original payload</retrievable> world"#;
+        let original =
+            r#"Hello <retrievable corpus="docs" k="1">original payload</retrievable> world"#;
         let mut messages = vec![json!({ "role": "user", "content": original })];
         let report = substitute_in_messages(&mut messages, org, &store, &embedder)
             .await
@@ -223,7 +222,10 @@ mod tests {
         );
         // Payload must be intact (the entire original string is preserved).
         let content = messages[0]["content"].as_str().unwrap();
-        assert_eq!(content, original, "content must be unchanged when no chunk clears the floor");
+        assert_eq!(
+            content, original,
+            "content must be unchanged when no chunk clears the floor"
+        );
     }
 
     // (b) Chunks at/above the floor ARE substituted.
@@ -250,8 +252,14 @@ mod tests {
         assert_eq!(report.substitutions, 1);
         assert_eq!(report.low_confidence_skips, 0);
         let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.contains("Retrieved-A"), "retrieved chunk must appear in content");
-        assert!(!content.contains("raw payload"), "original payload must be replaced");
+        assert!(
+            content.contains("Retrieved-A"),
+            "retrieved chunk must appear in content"
+        );
+        assert!(
+            !content.contains("raw payload"),
+            "original payload must be replaced"
+        );
     }
 
     // (c) Per-tag min_similarity override is honored over the default.
@@ -272,16 +280,23 @@ mod tests {
             .unwrap();
 
         // Tag asks for floor=0.8, so this chunk (sim≈0.707) should be skipped.
-        let original = r#"Q: <retrievable corpus="docs" k="1" min_similarity="0.8">fallback</retrievable>"#;
+        let original =
+            r#"Q: <retrievable corpus="docs" k="1" min_similarity="0.8">fallback</retrievable>"#;
         let mut messages = vec![json!({ "role": "user", "content": original })];
         let report = substitute_in_messages(&mut messages, org, &store, &embedder)
             .await
             .unwrap();
 
-        assert_eq!(report.substitutions, 0, "chunk below per-tag floor must not substitute");
+        assert_eq!(
+            report.substitutions, 0,
+            "chunk below per-tag floor must not substitute"
+        );
         assert_eq!(report.low_confidence_skips, 1);
         let content = messages[0]["content"].as_str().unwrap();
-        assert_eq!(content, original, "content must be unchanged when per-tag floor is not met");
+        assert_eq!(
+            content, original,
+            "content must be unchanged when per-tag floor is not met"
+        );
     }
 
     // (d) tokens_saved_estimate reflects only actually-substituted spans.
@@ -320,7 +335,10 @@ mod tests {
         assert_eq!(report.substitutions, 1);
         assert_eq!(report.low_confidence_skips, 1);
         // gross must be positive (original payload was longer than "Short")
-        assert!(report.gross_tokens_saved > 0, "expected positive gross token savings from substituted span");
+        assert!(
+            report.gross_tokens_saved > 0,
+            "expected positive gross token savings from substituted span"
+        );
         // skipped span contributes nothing to gross
     }
 
@@ -345,10 +363,7 @@ mod tests {
         // Query is a long sentence → embedding cost > 0.
         // Net must be <= 0.
         let long_query = "This is a fairly long surrounding context sentence to ensure the embedding query has a non-trivial token cost that will exceed any tiny gross savings.";
-        let content = format!(
-            r#"{} <retrievable corpus="docs" k="1">x</retrievable>"#,
-            long_query
-        );
+        let content = format!(r#"{long_query} <retrievable corpus="docs" k="1">x</retrievable>"#);
         let mut messages = vec![json!({ "role": "user", "content": content })];
         let report = substitute_in_messages(&mut messages, org, &store, &embedder)
             .await
@@ -427,11 +442,13 @@ mod tests {
         // tiktoken must give a different count than the chars/4 heuristic for "café".
         assert_ne!(
             tokenizer_estimate, char_div_4,
-            "tiktoken estimate ({}) must differ from chars/4 heuristic ({}) for \"café\"",
-            tokenizer_estimate, char_div_4
+            "tiktoken estimate ({tokenizer_estimate}) must differ from chars/4 heuristic ({char_div_4}) for \"café\""
         );
         // Also confirm the tokenizer gives a positive, plausible estimate.
-        assert!(tokenizer_estimate > 0, "tokenizer must return > 0 for non-empty text");
+        assert!(
+            tokenizer_estimate > 0,
+            "tokenizer must return > 0 for non-empty text"
+        );
     }
 
     // Regression: original substitution_replaces_payload_with_top_k_chunks still passes.
