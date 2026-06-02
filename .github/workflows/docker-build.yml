@@ -42,9 +42,11 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           EVENT: ${{ github.event_name }}
         run: |
-          tags="${REGISTRY}/${IMAGE_NAME}:${SHA}"
+          # GHCR/OCI repository names must be lowercase; the org is "TokenTrimmer".
+          image=$(printf '%s/%s' "$REGISTRY" "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          tags="${image}:${SHA}"
           if [ "$EVENT" = "push" ] && [ "$REF_NAME" = "main" ]; then
-            tags="${tags},${REGISTRY}/${IMAGE_NAME}:latest"
+            tags="${tags},${image}:latest"
           fi
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
 

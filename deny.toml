@@ -19,17 +19,42 @@ allow = [
     "CC0-1.0",
     "OpenSSL",
     "BSL-1.0",
+    # Permissive (data) license carried by transitive deps (e.g. webpki-roots
+    # cert data); Apache-2.0 compatible.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Every wildcard dependency in this tree is an internal `tt-*` crate depended
+# on by path with `version = "*"`. `allow-wildcard-paths` does NOT exempt them
+# (cargo-deny treats publishable crates' path deps as disallowed regardless),
+# so allow wildcards outright — there are no external `*` deps to guard against.
+wildcards = "allow"
 highlight = "all"
 
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+    # rustls-webpki cert/CRL parsing panics. All are transitive via
+    # sentry -> rustls 0.22, which pins rustls-webpki to the 0.102.x line; the
+    # fixes only exist on >= 0.103.x, unreachable without a sentry/rustls major
+    # bump. Low impact for us (HTTPS client to a trusted Sentry endpoint, not a
+    # TLS server validating attacker-controlled certs/CRLs). Revisit on a
+    # dependency-hygiene pass that bumps sentry to a rustls 0.23 line.
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0049",
+    # rsa "Marvin" timing side-channel (RUSTSEC-2023-0071). No patched version
+    # exists; pulled transitively (sqlx mysql auth — we use Postgres). Tracked.
+    "RUSTSEC-2023-0071",
+    # Unmaintained transitive deps with no adopted replacement yet (newer
+    # cargo-deny flags these as errors): async-std and rustls-pemfile.
+    "RUSTSEC-2025-0052",
+    "RUSTSEC-2025-0134",
+]
 
 [sources]
 unknown-registry = "deny"
