@@ -1,0 +1,120 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Deploy: gateway (public) → staging → prod   (Phase 2 automation)
+#
+# Flow (per cloud/docs/superpowers/specs/2026-06-02-local-staging-prod-pipeline-design.md):
+#   push to main ─▶ job `staging` : migrate staging DB → flyctl deploy fly.staging.toml
+#                       │ (auto)
+#                  job `prod`      : needs staging + MANUAL APPROVAL (GH Environment)
+#                                    migrate prod DB → flyctl deploy fly.toml
+#
+#   The gateway only owns the public.* schema, but it shares ONE Neon DB with the
+#   cloud surfaces, so migrations are applied via the strict `tt gateway
+#   --migrate-only` entrypoint against the Neon DIRECT (non-pooled) endpoint
+#   (session advisory locks). `flyctl deploy --remote-only` builds on Fly's remote
+#   builder, so the runner needs no Docker for the deploy itself; the `tt` binary
+#   is built locally only to run the migrator.
+#
+#   NOTE on cross-repo ordering: the design's full per-env order is
+#   migrate → tt-api → gateway → dashboard. tt-api + dashboard live in the cloud
+#   repo (cloud/.github/workflows/deploy.yml); this workflow owns the gateway leg.
+#
+# ── OPERATOR SETUP (one-time, done by a human — NOT by this workflow) ─────────
+#   1. FLY_API_TOKEN  (repo secret)
+#        Generate a deploy-scoped token:  fly tokens deploy
+#        (org `personal`; covers tokentrimmer + tokentrimmer-staging).
+#   2. GitHub Environment `production`  (Settings ▸ Environments ▸ New environment)
+#        Add a "Required reviewers" protection rule so the `prod` job pauses for a
+#        manual approval. WITHOUT this gate prod auto-deploys — do not remove
+#        `environment: production` from the prod job.
+#   3. DB migrate secrets (repo secrets), each the Neon DIRECT / non-pooled URL:
+#        STAGING_DATABASE_URL_DIRECT  → Neon `staging` branch, direct host.
+#        PROD_DATABASE_URL_DIRECT     → Neon `production` branch, direct host.
+#      (Per-PR ephemeral Neon DBs are wired on the cloud repo's neon-pr.yml, which
+#       also applies the gateway's migrations — the public repo keeps its
+#       throwaway-Postgres service container in ci.yml and needs no Neon secrets.)
+#
+# Never auto-deploy prod without the `production` environment gate.
+# ─────────────────────────────────────────────────────────────────────────────
+name: deploy (gateway)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # allow a manual re-run of the pipeline (still gated at prod)
+
+# One deploy at a time; never cancel an in-flight deploy.
+concurrency:
+  group: deploy-gateway
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── STAGING ────────────────────────────────────────────────────────────────
+  staging:
+    name: staging (migrate → deploy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Build `tt` from THIS commit so the embedded migrator (migrate! embeds SQL
+      # at compile time) reflects the migrations being deployed. The bin is `tt`.
+      - name: Build tt CLI (embeds current migrations)
+        run: cargo build -p tt-cli --bin tt --locked --release
+
+      - name: Apply staging migrations (Neon DIRECT endpoint)
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL_DIRECT }}
+        run: ./target/release/tt gateway --migrate-only
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy gateway → tokentrimmer-staging
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only --config fly.staging.toml
+
+      - name: Post-deploy staging smoke (wake scale-to-zero, check /health)
+        run: |
+          curl -sf --retry 8 --retry-all-errors --retry-delay 5 \
+            https://tokentrimmer-staging.fly.dev/health
+
+  # ── PROD ─────────────────────────────────────────────────────────────────────
+  # Gated by the `production` GitHub Environment → requires a manual approval
+  # before this job starts. A failed staging deploy blocks it via `needs`.
+  prod:
+    name: prod (migrate → deploy)
+    needs: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build tt CLI (embeds current migrations)
+        run: cargo build -p tt-cli --bin tt --locked --release
+
+      - name: Apply prod migrations (Neon DIRECT endpoint)
+        env:
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL_DIRECT }}
+        run: ./target/release/tt gateway --migrate-only
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy gateway → tokentrimmer
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only --config fly.toml
+
+      - name: Post-deploy prod smoke
+        run: |
+          curl -sf --retry 5 --retry-all-errors --retry-delay 5 \
+            https://tokentrimmer.fly.dev/health
