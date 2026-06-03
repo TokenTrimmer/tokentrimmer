@@ -47,3 +47,21 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Er
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     MIGRATOR.run(pool).await
 }
+
+/// Connect to `database_url` and run all pending migrations, then return.
+///
+/// Strict counterpart to the best-effort boot-time `migrate`: any connect or
+/// migration error propagates (callers exit non-zero). Used by
+/// `tt gateway --migrate-only` as the explicit, gated migration step in the
+/// deploy pipeline. `database_url` MUST be Neon's direct (non-pooled) endpoint
+/// — the migrator needs session-mode advisory locks.
+pub async fn migrate_only(database_url: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let pool = crate::connect(database_url, 2)
+        .await
+        .context("migrate-only: connect failed")?;
+    migrate(&pool)
+        .await
+        .context("migrate-only: migration failed")?;
+    Ok(())
+}

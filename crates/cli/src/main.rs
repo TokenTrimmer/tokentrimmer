@@ -17,7 +17,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the Gateway proxy server.
-    Gateway,
+    Gateway {
+        /// Apply DB migrations and exit (no server). Explicit, gated migration
+        /// step for the deploy pipeline; exits non-zero on failure.
+        #[arg(long)]
+        migrate_only: bool,
+    },
     /// Scan a codebase for token-waste patterns.
     Inspect {
         /// Path to scan (rule mode) or to scope the diff to (`--cost-diff` mode).
@@ -216,7 +221,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Gateway => {
+        Command::Gateway { migrate_only } => {
+            if migrate_only {
+                let url = config
+                    .database_url
+                    .as_deref()
+                    .context("--migrate-only requires DATABASE_URL")?;
+                tt_core::db::migrate_only(url).await?;
+                println!("migrations applied");
+                return Ok(());
+            }
             run_gateway(config).await?;
         }
         Command::Inspect {

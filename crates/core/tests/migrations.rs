@@ -65,3 +65,28 @@ fn migrator_includes_plan_runs_migration() {
         fourth.description,
     );
 }
+
+/// Strict migrate-only path: connects to a real DB, applies all migrations,
+/// returns Ok, and the schema is queryable.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn migrate_only_applies_schema() {
+    let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+    tt_core::migrate_only(&url)
+        .await
+        .expect("migrate_only should apply cleanly to an empty DB");
+    // Idempotent: a second run is a no-op, not an error.
+    tt_core::migrate_only(&url)
+        .await
+        .expect("migrate_only should be idempotent");
+    // Schema is present: the v1 migration creates request_logs.
+    let pool = tt_core::connect(&url, 2).await.expect("connect");
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema='public' AND table_name='request_logs')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert!(exists, "request_logs table should exist after migrate_only");
+}
