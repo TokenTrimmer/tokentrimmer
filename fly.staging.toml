@@ -1,0 +1,42 @@
+# Fly.io manifest for the TokenTrimmer Gateway — STAGING.
+#
+# Scale-to-zero (≈$0 idle): cold-start latency is acceptable on staging, unlike
+# prod (always-on per ADR-016). Single region iad to match prod.
+#
+# Deploy:  fly deploy --config fly.staging.toml
+# Secrets: DATABASE_URL (Neon `staging` branch, DIRECT endpoint), TT_MASTER_KEY.
+
+app            = "tokentrimmer-staging"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port      = 8080
+  force_https        = true
+  # Scale-to-zero for staging.
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes          = ["app"]
+
+  [http_service.concurrency]
+    type       = "requests"
+    soft_limit = 500
+    hard_limit = 1000
+
+  [[http_service.checks]]
+    interval     = "30s"
+    timeout      = "5s"
+    grace_period = "10s"
+    method       = "GET"
+    path         = "/health"
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "512mb"
+
+[env]
+  RUST_LOG  = "info,tt_core=info"
+  PORT      = "8080"
