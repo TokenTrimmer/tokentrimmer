@@ -179,7 +179,7 @@ Run the OpenAI-compatible proxy.
 PORT=8080 OPENAI_API_KEY=sk-... ./target/release/tt gateway
 ```
 
-Endpoints exposed: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/embeddings`, `POST /v1/preview`.
+Endpoints exposed: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/preview`, and `POST /v1/embeddings` *(currently returns **501 Not Implemented** — not yet dispatched to a provider)*.
 
 **Requires:** nothing to start (degraded dev mode). For full features: `DATABASE_URL`, `REDIS_URL`, and provider keys. See the self-host table above.
 
@@ -196,6 +196,16 @@ tt inspect ./my-project --fail-on=high
 
 # Write JSON (path ending in .json switches format automatically)
 tt inspect ./my-project --output findings.json --fail-on=critical
+```
+
+Two extra modes share the subcommand (both offline, no cloud dependency):
+
+```bash
+# Cost-diff: project the per-call cost change of model ids added/removed in a git diff
+tt inspect ./my-project --cost-diff --base origin/main --fail-on-cost-increase
+
+# Suggest-plan: scan for model strings and emit a PlanInput skeleton for `tt plan`
+tt inspect ./my-project --suggest-plan --output plan_input.json
 ```
 
 **Requires:** the `tt` binary and a path. No keys, no network, no services.
@@ -215,7 +225,7 @@ tt plan --input plan_input.json
 tt plan --input plan_input.json --output result.json
 ```
 
-> `tt plan --apply` is **not yet wired** — it prints a notice and exits 0. Apply changes via the dashboard once it ships.
+> `tt plan --apply` is **not yet wired** to the hosted backend — it prints the projection, then **exits non-zero** so CI/automation can't silently treat the config as applied. Apply changes via the dashboard once it ships.
 
 **Requires:** the `tt` binary and a `PlanInput` JSON file. No keys or services.
 
@@ -234,7 +244,7 @@ tt init --dry-run
 tt init --upgrade
 ```
 
-Useful flags: `--language python|typescript|rust|go|java|mixed` (override auto-detect), `--skip-baseline`, `--skip-hooks`, `--skip-workflows`, `--force`.
+Useful flags: `--path <dir>` (target a directory other than cwd), `--language <name>` and `--framework <name>` (override auto-detect), `--interactive` (prompt through choices), `--diff` (preview changes as a diff), `--skip-baseline`, `--skip-hooks`, `--skip-workflows`, `--force`.
 
 **Requires:** a git-controlled directory. `--skip-baseline` avoids running an Inspect scan during install.
 
@@ -338,7 +348,7 @@ const response = await client.chat.completions.create({
 console.log(response.tt.costUsd, response.tt.cache, response.tt.traceId);
 ```
 
-Both default to the hosted Gateway. For self-host, pass `base_url` / `baseURL` = `http://localhost:8080/v1` and your provider key. Every other OpenAI method (embeddings, streaming, tools, vision, async) works unchanged.
+Both default to the hosted Gateway. For self-host, pass `base_url` / `baseURL` = `http://localhost:8080/v1` and your provider key. Every other OpenAI method (streaming, tools, vision, async) works unchanged. (`embeddings` is the one exception — the Gateway's `/v1/embeddings` is a 501 stub today.)
 
 ---
 
