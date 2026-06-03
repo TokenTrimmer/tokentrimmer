@@ -116,17 +116,17 @@ dialoguer = "0.11"
 toml = "0.8"
 
 # Internal crate refs
-tt-shared = { path = "crates/shared" }
+tt-shared = { path = "crates/shared", version = "0.1" }
 tt-tokenize = { path = "crates/tokenize" }
 tt-core = { path = "crates/core" }
-tt-cache = { path = "crates/cache" }
+tt-cache = { path = "crates/cache", version = "0.1" }
 tt-routing = { path = "crates/routing" }
-tt-auth = { path = "crates/auth" }
-tt-telemetry = { path = "crates/telemetry" }
+tt-auth = { path = "crates/auth", version = "0.1" }
+tt-telemetry = { path = "crates/telemetry", version = "0.1" }
 tt-config = { path = "crates/config" }
-tt-inspect-core = { path = "crates/inspect-core" }
-tt-inspect-rules-tier1 = { path = "crates/inspect-rules-tier1" }
-tt-plan-core = { path = "crates/plan-core" }
+tt-inspect-core = { path = "crates/inspect-core", version = "0.1" }
+tt-inspect-rules-tier1 = { path = "crates/inspect-rules-tier1", version = "0.1" }
+tt-plan-core = { path = "crates/plan-core", version = "0.1" }
 tt-provider-compat = { path = "crates/providers/compat" }
 tt-provider-openai = { path = "crates/providers/openai" }
 tt-provider-anthropic = { path = "crates/providers/anthropic" }
