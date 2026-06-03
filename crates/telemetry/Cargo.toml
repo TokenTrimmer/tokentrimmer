@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "OpenTelemetry setup + audit log primitives (hash-chain + Ed25519 signatures)."
 
 [dependencies]
