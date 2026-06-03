@@ -19,7 +19,7 @@ pub use budget::{
     tier_budget_limits, BudgetDecision, BudgetEnforcer, BudgetLimits, DynamicBudgetEnforcer,
     InMemoryBudgetEnforcer, SpendSink,
 };
-pub use db::{connect, migrate, MIGRATOR};
+pub use db::{connect, migrate, migrate_only, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use middleware::retrieval::RetrievalState;
