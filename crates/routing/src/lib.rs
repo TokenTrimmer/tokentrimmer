@@ -76,7 +76,7 @@ pub struct RouteConditions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteAction {
     /// Rewrite to this model on the same provider as the request (v1 is
-    /// same-provider only — see ADR-007 / Plan design for the cross-provider
+    /// same-provider only — see ADR-018 / Plan design for the cross-provider
     /// constraint).
     pub target_model: String,
     /// Ordered fallback model ids, tried in order when the primary dispatch
