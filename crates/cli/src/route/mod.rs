@@ -145,8 +145,8 @@ fn print_routes(routes: &Value) {
         return;
     }
     println!(
-        "{:<38}  {:<22}  {:>4}  {:<8}  {}",
-        "ID", "NAME", "PRIO", "ENABLED", "TARGET"
+        "{:<38}  {:<22}  {:>4}  {:<8}  TARGET",
+        "ID", "NAME", "PRIO", "ENABLED"
     );
     for r in arr {
         println!(
