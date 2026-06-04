@@ -396,6 +396,8 @@ pub async fn handler(
     let requested_pricing = provider.pricing(&req.model);
     let route_match = apply_routing(&state, &ctx, &mut req).await;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
+    // A matched privacy route forces the request to skip the cache entirely.
+    let route_disable_cache = route_match.as_ref().is_some_and(|m| m.disable_cache);
     // Ordered fallback model ids from the matched route (empty = no failover).
     let route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
     if matched_route_id.is_some() {
@@ -412,7 +414,11 @@ pub async fn handler(
     // 2d. Determine cache behaviour for this request (Fix A §2.2 + Fix B §2.7).
     //     Resolved once here so all four call-sites (streaming L1 read,
     //     non-streaming L1 read, L2 read, L1/L2 insert) share a single decision.
-    let cache_behavior = CacheBehavior::resolve(&req);
+    let mut cache_behavior = CacheBehavior::resolve(&req);
+    if route_disable_cache {
+        cache_behavior.do_lookup = false;
+        cache_behavior.do_insert = false;
+    }
 
     // 3. Branch: streaming vs non-streaming.
     if req.stream {
@@ -1581,6 +1587,7 @@ fn clamp_latency_ms(started: Instant) -> i32 {
 struct RouteMatch {
     route_id: Uuid,
     fallbacks: Vec<String>,
+    disable_cache: bool,
 }
 
 /// Look up the org's routing engine (cached ~60s) and evaluate it against
@@ -1629,6 +1636,7 @@ async fn apply_routing(
     let m = engine.evaluate(req, ctx, input_tokens)?;
     let route_id = m.id;
     let fallbacks = m.then.fallbacks.clone();
+    let disable_cache = m.then.disable_cache;
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -1667,6 +1675,7 @@ async fn apply_routing(
     Some(RouteMatch {
         route_id,
         fallbacks,
+        disable_cache,
     })
 }
 
