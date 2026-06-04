@@ -13,6 +13,8 @@ pub struct AddArgs {
     pub to: Option<String>,
     pub when_has_images: bool,
     pub when_has_audio: bool,
+    pub when_tag: Option<String>,
+    pub disable_cache: bool,
     pub priority: u32,
     pub name: Option<String>,
     pub fallback: Vec<String>,
@@ -42,10 +44,16 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     if args.when_has_audio {
         when.insert("has_audio".into(), json!(true));
     }
+    if let Some(tag) = &args.when_tag {
+        when.insert("tag_equals".into(), json!(tag));
+    }
     let mut then = serde_json::Map::new();
     then.insert("target_model".into(), json!(target));
     if !args.fallback.is_empty() {
         then.insert("fallbacks".into(), json!(args.fallback));
+    }
+    if args.disable_cache {
+        then.insert("disable_cache".into(), json!(true));
     }
     Ok(json!({
         "name": args.name.clone().unwrap_or_else(|| default_name(args, &target)),
@@ -173,6 +181,8 @@ mod tests {
             to: None,
             when_has_images: false,
             when_has_audio: false,
+            when_tag: None,
+            disable_cache: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -193,6 +203,8 @@ mod tests {
             to: Some("gpt-4o-mini".into()),
             when_has_images: true,
             when_has_audio: false,
+            when_tag: None,
+            disable_cache: false,
             priority: 50,
             name: Some("vis".into()),
             fallback: vec!["gpt-4o".into()],
@@ -215,11 +227,53 @@ mod tests {
             to: None,
             when_has_images: false,
             when_has_audio: false,
+            when_tag: None,
+            disable_cache: false,
             priority: 100,
             name: None,
             fallback: vec![],
             disabled: false,
         });
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn disable_cache_and_when_tag_map_through() {
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-4o".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: Some("sensitive".into()),
+            disable_cache: true,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        })
+        .unwrap();
+        assert_eq!(body["when"]["tag_equals"], "sensitive");
+        assert_eq!(body["then"]["disable_cache"], true);
+    }
+
+    #[test]
+    fn disable_cache_omitted_when_false() {
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-4o".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: None,
+            disable_cache: false,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        })
+        .unwrap();
+        assert!(body["then"].get("disable_cache").is_none());
+        assert!(body["when"].get("tag_equals").is_none());
     }
 }
