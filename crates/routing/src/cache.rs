@@ -96,6 +96,32 @@ impl RoutingStore for CachingRoutingStore {
         let engine = self.engine_for(org_id).await?;
         Ok(engine.routes().to_vec())
     }
+
+    async fn list_all_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
+        self.inner.list_all_for_org(org_id).await
+    }
+
+    async fn create_route(
+        &self,
+        org_id: Uuid,
+        spec: crate::store::NewRoute,
+    ) -> Result<Route, RoutingStoreError> {
+        let created = self.inner.create_route(org_id, spec).await?;
+        self.invalidate(org_id).await;
+        Ok(created)
+    }
+
+    async fn get_route(&self, org_id: Uuid, id: Uuid) -> Result<Option<Route>, RoutingStoreError> {
+        self.inner.get_route(org_id, id).await
+    }
+
+    async fn delete_route(&self, org_id: Uuid, id: Uuid) -> Result<bool, RoutingStoreError> {
+        let removed = self.inner.delete_route(org_id, id).await?;
+        if removed {
+            self.invalidate(org_id).await;
+        }
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +213,37 @@ mod tests {
         );
         let e = cache.engine_for(Uuid::now_v7()).await.unwrap();
         assert!(e.routes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_invalidates_so_engine_sees_it() {
+        let backing = Arc::new(InMemoryRoutingStore::new());
+        let org = Uuid::now_v7();
+        let cache = CachingRoutingStore::with_ttl(
+            backing as Arc<dyn RoutingStore>,
+            Duration::from_secs(3600), // long TTL: only invalidation can refresh
+        );
+        // Warm the (empty) cache.
+        assert_eq!(cache.engine_for(org).await.unwrap().routes().len(), 0);
+        // Create through the caching store.
+        cache
+            .create_route(
+                org,
+                crate::store::NewRoute {
+                    name: "x".into(),
+                    priority: 10,
+                    enabled: true,
+                    when: RouteConditions::default(),
+                    then: RouteAction {
+                        target_model: "m".into(),
+                        fallbacks: vec![],
+                        force_cache_layer: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        // Without invalidation the long-TTL cache would still say 0.
+        assert_eq!(cache.engine_for(org).await.unwrap().routes().len(), 1);
     }
 }
