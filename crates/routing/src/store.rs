@@ -191,6 +191,72 @@ mod pg {
 
             Ok(rows.into_iter().filter_map(RouteRow::into_route).collect())
         }
+
+        async fn list_all_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
+            let rows = sqlx::query_as::<_, MgmtRouteRow>(
+                "SELECT id, name, priority, enabled, conditions, target \
+                 FROM routes WHERE org_id = $1 ORDER BY priority DESC, created_at ASC",
+            )
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            Ok(rows.into_iter().filter_map(MgmtRouteRow::into_route).collect())
+        }
+
+        async fn create_route(
+            &self,
+            org_id: Uuid,
+            spec: crate::store::NewRoute,
+        ) -> Result<Route, RoutingStoreError> {
+            let conditions = serde_json::to_value(&spec.when)
+                .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            let target = serde_json::to_value(&spec.then)
+                .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            let row = sqlx::query_as::<_, MgmtRouteRow>(
+                "INSERT INTO routes (org_id, name, priority, conditions, target, enabled) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 RETURNING id, name, priority, enabled, conditions, target",
+            )
+            .bind(org_id)
+            .bind(&spec.name)
+            .bind(i32::try_from(spec.priority).unwrap_or(i32::MAX))
+            .bind(&conditions)
+            .bind(&target)
+            .bind(spec.enabled)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            row.into_route()
+                .ok_or_else(|| RoutingStoreError::Backend("created route failed to decode".into()))
+        }
+
+        async fn get_route(
+            &self,
+            org_id: Uuid,
+            id: Uuid,
+        ) -> Result<Option<Route>, RoutingStoreError> {
+            let row = sqlx::query_as::<_, MgmtRouteRow>(
+                "SELECT id, name, priority, enabled, conditions, target \
+                 FROM routes WHERE org_id = $1 AND id = $2",
+            )
+            .bind(org_id)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            Ok(row.and_then(MgmtRouteRow::into_route))
+        }
+
+        async fn delete_route(&self, org_id: Uuid, id: Uuid) -> Result<bool, RoutingStoreError> {
+            let res = sqlx::query("DELETE FROM routes WHERE org_id = $1 AND id = $2")
+                .bind(org_id)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            Ok(res.rows_affected() > 0)
+        }
     }
 
     #[derive(sqlx::FromRow)]
@@ -223,6 +289,32 @@ mod pg {
                 name: self.name,
                 priority: u32::try_from(self.priority).unwrap_or(0),
                 enabled: true,
+                when,
+                then,
+            })
+        }
+    }
+
+    /// Like [`RouteRow`] but carries `enabled` (management lists disabled routes too).
+    #[derive(sqlx::FromRow)]
+    struct MgmtRouteRow {
+        id: Uuid,
+        name: String,
+        priority: i32,
+        enabled: bool,
+        conditions: sqlx::types::Json<serde_json::Value>,
+        target: sqlx::types::Json<serde_json::Value>,
+    }
+
+    impl MgmtRouteRow {
+        fn into_route(self) -> Option<Route> {
+            let when = serde_json::from_value::<RouteConditions>(self.conditions.0).ok()?;
+            let then = serde_json::from_value::<RouteAction>(self.target.0).ok()?;
+            Some(Route {
+                id: self.id,
+                name: self.name,
+                priority: u32::try_from(self.priority).unwrap_or(0),
+                enabled: self.enabled,
                 when,
                 then,
             })
