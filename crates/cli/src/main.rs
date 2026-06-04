@@ -163,6 +163,17 @@ enum Command {
         #[arg(long)]
         session_log: Option<String>,
     },
+    /// Manage routing rules via the hosted gateway (requires `tt login`).
+    Route {
+        #[command(subcommand)]
+        action: RouteAction,
+        /// Override the API key (else V0 resolution: env / ~/.tokentrimmer).
+        #[arg(long, global = true)]
+        tt_api_key: Option<String>,
+        /// Override the gateway base URL.
+        #[arg(long, global = true)]
+        tt_api_base: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +193,37 @@ enum RetrievalAction {
         k: usize,
         #[arg(long, env = "OPENAI_API_KEY")]
         openai_key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RouteAction {
+    /// List your routes.
+    List,
+    /// Show one route by id.
+    Show { id: String },
+    /// Delete one route by id.
+    Rm { id: String },
+    /// Add a route. Use --always <model>, or --from <m> --to <m>.
+    Add {
+        #[arg(long)]
+        always: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        when_has_images: bool,
+        #[arg(long)]
+        when_has_audio: bool,
+        #[arg(long, default_value_t = 100)]
+        priority: u32,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        fallback: Vec<String>,
+        #[arg(long)]
+        disabled: bool,
     },
 }
 
@@ -436,6 +478,40 @@ async fn main() -> anyhow::Result<()> {
                         } => cli_retrieval::search(&corpus, &query, k, &openai_key).await,
                     }
                 })?;
+        }
+        Command::Route {
+            action,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            use tt_cli::route::{AddArgs, RouteCmd};
+            let cmd = match action {
+                RouteAction::List => RouteCmd::List,
+                RouteAction::Show { id } => RouteCmd::Show(id),
+                RouteAction::Rm { id } => RouteCmd::Rm(id),
+                RouteAction::Add {
+                    always,
+                    from,
+                    to,
+                    when_has_images,
+                    when_has_audio,
+                    priority,
+                    name,
+                    fallback,
+                    disabled,
+                } => RouteCmd::Add(AddArgs {
+                    always,
+                    from,
+                    to,
+                    when_has_images,
+                    when_has_audio,
+                    priority,
+                    name,
+                    fallback,
+                    disabled,
+                }),
+            };
+            tt_cli::route::run(cmd, tt_api_key, tt_api_base).await?;
         }
         Command::Proxy {
             port,
