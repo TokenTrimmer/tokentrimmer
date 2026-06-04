@@ -239,7 +239,7 @@ mod tests {
                         target_model: "m".into(),
                         fallbacks: vec![],
                         force_cache_layer: None,
-                disable_cache: false,
+                        disable_cache: false,
                     },
                 },
             )

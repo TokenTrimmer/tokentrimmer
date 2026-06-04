@@ -53,7 +53,11 @@ impl Provider for CountingProvider {
             .collect()
     }
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
-        let (i, o) = if model == "gpt-4o" { (5.0, 15.0) } else { (0.15, 0.6) };
+        let (i, o) = if model == "gpt-4o" {
+            (5.0, 15.0)
+        } else {
+            (0.15, 0.6)
+        };
         Some(ModelPricing {
             input_per_million: i,
             output_per_million: o,
@@ -117,7 +121,8 @@ async fn issue_key(store: &InMemoryKeyStore, org: Uuid) -> String {
 }
 
 fn sensitive_request(model: &str, bearer: &str) -> Request<Body> {
-    let body = json!({ "model": model, "messages": [{"role":"user","content":"hi"}], "stream": false });
+    let body =
+        json!({ "model": model, "messages": [{"role":"user","content":"hi"}], "stream": false });
     Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")

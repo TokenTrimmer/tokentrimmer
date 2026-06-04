@@ -562,7 +562,10 @@ mod tests {
             force_cache_layer: None,
             disable_cache: false,
         };
-        assert_eq!(serde_json::to_string(&a).unwrap(), r#"{"target_model":"x"}"#);
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            r#"{"target_model":"x"}"#
+        );
         // Defaults false when absent.
         let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
         assert!(!parsed.disable_cache);
