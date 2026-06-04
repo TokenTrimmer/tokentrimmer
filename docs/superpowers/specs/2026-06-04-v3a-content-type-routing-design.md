@@ -43,9 +43,13 @@ CLI is the primary surface and now has a credential it can authenticate with (V0
   message — **not yet in `DECISIONS.md`**.
 - **Cloud routes CRUD** — `routes` table (`migrations/0002_routes.up.sql`) stores
   `conditions`/`target` as **JSONB** (no migration needed for new fields). Endpoints
-  (`server.rs:185-193`, under the `/v1/admin` router):
-  `POST /v1/admin/routes` (create), `GET /v1/admin/routes` (list),
-  `GET|PATCH|DELETE /v1/admin/routes/{id}`.
+  (`server.rs:185-193`): `POST/GET /v1/admin/routes`, `GET|PATCH|DELETE /v1/admin/routes/{id}`.
+  **These are gated by `admin::require_admin` (shared `TT_ADMIN_TOKEN`) and require a
+  caller-supplied `org_id`** — they are platform-operator endpoints, **not** a
+  user-key-authenticated API. There is **no `/v1/routes` user endpoint** in the
+  gateway today (only `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`,
+  `/v1/preview`, `/health`). A user-authenticated `tt route` CLI therefore needs a
+  **new** `/v1/routes` endpoint that derives `org_id` from the `tt_live_` key.
 - **CLI** — no `tt route` command; routes are dashboard/admin-API only. V0 added
   `tt_cli::context::ResolvedContext` (key + base URL resolution).
 - **Dashboard** — `cloud/apps/dashboard/src/pages/routes/index.astro` lists routes
@@ -78,6 +82,18 @@ semantic classification.
 tree (B, over-built, hard to give a simple UI) and a tagged enum list (C,
 unnecessary). Additive fields keep JSONB rows and existing routes valid, match the
 current engine, and let "simple vs complex" fall out of how many fields are set.
+
+### Implementation slicing (revised after discovering routes CRUD is admin-only)
+
+- **Plan 1 — content-type routing engine (public):** components 1–3 below + ADR +
+  gateway integration test. Modality routes become live immediately for any route
+  that can be created today (the dashboard's raw-JSON editor accepts the new
+  fields). Pure-logic + integration; high confidence.
+- **Plan 2 — user-facing routes API + CLI + dashboard (next):** a **new
+  `/v1/routes` endpoint that derives `org_id` from the `tt_live_` key** (the admin
+  CRUD requires the shared `TT_ADMIN_TOKEN` + a caller-supplied `org_id`, so it is
+  not usable by an end-user CLI), then the `tt route` CLI (component 5) on top, plus
+  cloud validation (component 4) and dashboard exposure (component 6).
 
 ### 1. Data model (`tt_routing` + `tt_plan_core`, in lockstep)
 
