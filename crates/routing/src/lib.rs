@@ -263,7 +263,11 @@ mod tests {
         };
         let eng = RoutingEngine::with_routes(vec![route]);
         assert!(eng
-            .evaluate(&make_req_with_part("gpt-4o", image_part()), &make_ctx(None), 100)
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
             .is_some());
         assert!(eng
             .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
@@ -284,7 +288,11 @@ mod tests {
             .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
             .is_some());
         assert!(eng
-            .evaluate(&make_req_with_part("gpt-4o", image_part()), &make_ctx(None), 100)
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
             .is_none());
     }
 
@@ -299,10 +307,18 @@ mod tests {
         };
         let eng = RoutingEngine::with_routes(vec![route]);
         assert!(eng
-            .evaluate(&make_req_with_part("gpt-4o", audio_part()), &make_ctx(None), 100)
+            .evaluate(
+                &make_req_with_part("gpt-4o", audio_part()),
+                &make_ctx(None),
+                100
+            )
             .is_some());
         assert!(eng
-            .evaluate(&make_req_with_part("gpt-4o", image_part()), &make_ctx(None), 100)
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
             .is_none());
     }
 
@@ -318,13 +334,21 @@ mod tests {
         };
         let eng = RoutingEngine::with_routes(vec![route]);
         assert!(eng
-            .evaluate(&make_req_with_part("gpt-4o", image_part()), &make_ctx(None), 100)
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
             .is_some());
         assert!(eng
             .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
             .is_none());
         assert!(eng
-            .evaluate(&make_req_with_part("other", image_part()), &make_ctx(None), 100)
+            .evaluate(
+                &make_req_with_part("other", image_part()),
+                &make_ctx(None),
+                100
+            )
             .is_none());
     }
 

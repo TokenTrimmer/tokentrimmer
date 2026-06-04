@@ -223,9 +223,15 @@ async fn setup(target_model: &str) -> (Arc<Mutex<Vec<String>>>, String, axum::Ro
 #[tokio::test]
 async fn image_request_routed_to_vision_target() {
     let (served, key, app) = setup("vision-mini").await;
-    let resp = app.oneshot(image_request("vision-pro", &key)).await.unwrap();
+    let resp = app
+        .oneshot(image_request("vision-pro", &key))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(served.lock().unwrap().clone(), vec!["vision-mini".to_string()]);
+    assert_eq!(
+        served.lock().unwrap().clone(),
+        vec!["vision-mini".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -233,7 +239,10 @@ async fn text_only_request_does_not_match_has_images_route() {
     let (served, key, app) = setup("vision-mini").await;
     let resp = app.oneshot(text_request("vision-pro", &key)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(served.lock().unwrap().clone(), vec!["vision-pro".to_string()]);
+    assert_eq!(
+        served.lock().unwrap().clone(),
+        vec!["vision-pro".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -241,7 +250,13 @@ async fn image_route_skipped_when_target_not_vision_capable() {
     // Capability guard: an image request requires vision; a text-only target is
     // skipped and the original model is dispatched.
     let (served, key, app) = setup("text-only").await;
-    let resp = app.oneshot(image_request("vision-pro", &key)).await.unwrap();
+    let resp = app
+        .oneshot(image_request("vision-pro", &key))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(served.lock().unwrap().clone(), vec!["vision-pro".to_string()]);
+    assert_eq!(
+        served.lock().unwrap().clone(),
+        vec!["vision-pro".to_string()]
+    );
 }
