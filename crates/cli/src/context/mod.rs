@@ -135,7 +135,11 @@ mod tests {
 
     #[test]
     fn key_precedence_flag_env_file_none() {
-        let (k, s) = resolve_key(Some("flagk".into()), Some("envk".into()), Some("filek".into()));
+        let (k, s) = resolve_key(
+            Some("flagk".into()),
+            Some("envk".into()),
+            Some("filek".into()),
+        );
         assert_eq!(k.unwrap().expose(), "flagk");
         assert_eq!(s, KeySource::Flag);
 
@@ -161,7 +165,11 @@ mod tests {
 
     #[test]
     fn base_precedence_and_default() {
-        let (b, s) = resolve_base(Some("https://flag".into()), Some("https://env".into()), None);
+        let (b, s) = resolve_base(
+            Some("https://flag".into()),
+            Some("https://env".into()),
+            None,
+        );
         assert_eq!(b, "https://flag");
         assert_eq!(s, BaseSource::Flag);
 

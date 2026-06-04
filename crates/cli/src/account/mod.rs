@@ -91,7 +91,10 @@ pub fn whoami() -> anyhow::Result<()> {
 pub fn logout() -> anyhow::Result<()> {
     let dir = store::config_dir();
     if store::delete_credentials(&dir)? {
-        println!("Logged out — removed {}.", dir.join("credentials.toml").display());
+        println!(
+            "Logged out — removed {}.",
+            dir.join("credentials.toml").display()
+        );
         println!(
             "Note: this only clears the local key; it does not revoke it server-side. \
              Revoke in the dashboard if it may be compromised."
@@ -108,7 +111,10 @@ mod tests {
 
     #[test]
     fn token_from_arg() {
-        assert_eq!(decide_token(Some("tt_live_x".into()), None).unwrap(), "tt_live_x");
+        assert_eq!(
+            decide_token(Some("tt_live_x".into()), None).unwrap(),
+            "tt_live_x"
+        );
     }
 
     #[test]
