@@ -161,6 +161,10 @@ pub struct RouteAction {
     /// present so the Plan result carries it through to apply without loss.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_cache_layer: Option<String>,
+    /// Mirror of `tt_routing::RouteAction::disable_cache`. The replay engine does
+    /// not yet model cache opt-out (follow-up); present for lossless round-trip.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_cache: bool,
 }
 
 /// Per-model pricing keyed by `"provider:model"`.
@@ -443,6 +447,7 @@ mod tests {
             target_model: "x".into(),
             force_cache_layer: None,
             fallbacks: Vec::new(),
+            disable_cache: false,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -474,6 +479,7 @@ mod tests {
             target_model: "claude-3-5-haiku".into(),
             force_cache_layer: Some("l1".into()),
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
+            disable_cache: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -488,6 +494,22 @@ mod tests {
         assert_eq!(roundtripped.target_model, original.target_model);
         assert_eq!(roundtripped.force_cache_layer, original.force_cache_layer);
         assert_eq!(roundtripped.fallbacks, original.fallbacks);
+    }
+
+    #[test]
+    fn route_action_disable_cache_round_trips() {
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.disable_cache, "defaults false");
+        let a = RouteAction {
+            target_model: "m".into(),
+            fallbacks: Vec::new(),
+            force_cache_layer: None,
+            disable_cache: true,
+        };
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(j.contains("\"disable_cache\":true"));
+        let back: RouteAction = serde_json::from_str(&j).unwrap();
+        assert!(back.disable_cache);
     }
 
     /// Cross-crate lossless round-trip: JSON produced by
