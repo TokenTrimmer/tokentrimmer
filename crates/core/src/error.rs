@@ -37,6 +37,12 @@ pub enum ApiError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 #[derive(Serialize)]
@@ -98,6 +104,18 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "internal_error",
+                m.clone(),
+            ),
+            ApiError::NotFound(m) => (
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                "not_found",
+                m.clone(),
+            ),
+            ApiError::ServiceUnavailable(m) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "service_unavailable",
                 m.clone(),
             ),
         };

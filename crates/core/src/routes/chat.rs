@@ -123,7 +123,9 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         | ApiError::Forbidden(_)
         | ApiError::ModelNotFound { .. }
         | ApiError::RateLimited { .. }
-        | ApiError::Internal(_) => false,
+        | ApiError::Internal(_)
+        | ApiError::NotFound(_)
+        | ApiError::ServiceUnavailable(_) => false,
     }
 }
 
@@ -146,6 +148,8 @@ fn error_status_code(err: &ApiError) -> u16 {
             _ => StatusCode::BAD_GATEWAY,
         },
         ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+        ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
     status.as_u16()
 }
