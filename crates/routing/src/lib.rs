@@ -15,11 +15,13 @@
 
 pub mod cache;
 pub mod store;
+pub mod validate;
 
 pub use cache::CachingRoutingStore;
 #[cfg(feature = "postgres")]
 pub use store::PostgresRoutingStore;
-pub use store::{InMemoryRoutingStore, RoutingStore, RoutingStoreError};
+pub use store::{InMemoryRoutingStore, NewRoute, RoutingStore, RoutingStoreError};
+pub use validate::{validate_capability, validate_same_provider, ValidationError};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
