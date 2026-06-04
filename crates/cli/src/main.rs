@@ -101,6 +101,19 @@ enum Command {
         #[arg(long, default_value_t = 31416)]
         sse_port: u16,
     },
+    /// Store a TokenTrimmer API key for this machine (browser login lands in V2).
+    Login {
+        /// The tt_live_/tt_test_ key. Use `-` to read it from stdin.
+        #[arg(long)]
+        token: Option<String>,
+        /// Persist a gateway base URL alongside the key.
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// Remove the locally stored API key (does not revoke it server-side).
+    Logout,
+    /// Show the resolved API key (masked), its source, and the gateway base URL.
+    Whoami,
     /// Install TokenTrimmer best-practices into the current repo.
     Init {
         #[arg(long)]
@@ -345,6 +358,15 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("unsupported MCP transport `{other}` (supported: stdio, sse)")
                 }
             }
+        }
+        Command::Login { token, base_url } => {
+            tt_cli::account::login_with_token(token, base_url)?;
+        }
+        Command::Logout => {
+            tt_cli::account::logout()?;
+        }
+        Command::Whoami => {
+            tt_cli::account::whoami()?;
         }
         Command::Init {
             path,
