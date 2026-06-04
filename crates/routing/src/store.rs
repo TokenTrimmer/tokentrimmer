@@ -51,13 +51,21 @@ pub trait RoutingStore: Send + Sync + std::fmt::Debug {
         ))
     }
     /// Management: create a route for `org_id`. Returns the created route.
-    async fn create_route(&self, _org_id: Uuid, _spec: NewRoute) -> Result<Route, RoutingStoreError> {
+    async fn create_route(
+        &self,
+        _org_id: Uuid,
+        _spec: NewRoute,
+    ) -> Result<Route, RoutingStoreError> {
         Err(RoutingStoreError::Backend(
             "management unsupported by this store".into(),
         ))
     }
     /// Management: fetch one route owned by `org_id`.
-    async fn get_route(&self, _org_id: Uuid, _id: Uuid) -> Result<Option<Route>, RoutingStoreError> {
+    async fn get_route(
+        &self,
+        _org_id: Uuid,
+        _id: Uuid,
+    ) -> Result<Option<Route>, RoutingStoreError> {
         Err(RoutingStoreError::Backend(
             "management unsupported by this store".into(),
         ))
@@ -123,7 +131,8 @@ impl RoutingStore for InMemoryRoutingStore {
 
     async fn get_route(&self, org_id: Uuid, id: Uuid) -> Result<Option<Route>, RoutingStoreError> {
         let g = self.inner.read().expect("inmemory routing store poisoned");
-        Ok(g.get(&org_id).and_then(|v| v.iter().find(|r| r.id == id).cloned()))
+        Ok(g.get(&org_id)
+            .and_then(|v| v.iter().find(|r| r.id == id).cloned()))
     }
 
     async fn delete_route(&self, org_id: Uuid, id: Uuid) -> Result<bool, RoutingStoreError> {
@@ -201,7 +210,10 @@ mod pg {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
-            Ok(rows.into_iter().filter_map(MgmtRouteRow::into_route).collect())
+            Ok(rows
+                .into_iter()
+                .filter_map(MgmtRouteRow::into_route)
+                .collect())
         }
 
         async fn create_route(

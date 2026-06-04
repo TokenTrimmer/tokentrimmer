@@ -47,7 +47,11 @@ impl Provider for RecordingProvider {
             .collect()
     }
     fn pricing(&self, model: &str) -> Option<ModelPricing> {
-        let (i, o) = if model == "gpt-4o" { (5.0, 15.0) } else { (0.15, 0.6) };
+        let (i, o) = if model == "gpt-4o" {
+            (5.0, 15.0)
+        } else {
+            (0.15, 0.6)
+        };
         Some(ModelPricing {
             input_per_million: i,
             output_per_million: o,
@@ -138,12 +142,17 @@ fn req(method: &str, uri: &str, key: Option<&str>, body: Option<Value>) -> Reque
     if let Some(k) = key {
         b = b.header("authorization", format!("Bearer {k}"));
     }
-    b.body(body.map(|v| Body::from(v.to_string())).unwrap_or(Body::empty()))
-        .unwrap()
+    b.body(
+        body.map(|v| Body::from(v.to_string()))
+            .unwrap_or(Body::empty()),
+    )
+    .unwrap()
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -232,12 +241,16 @@ async fn created_route_applies_immediately_without_ttl_wait() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::CREATED);
 
-    let chat = json!({ "model": "gpt-4o", "messages": [{"role":"user","content":"hi"}], "stream": false });
+    let chat =
+        json!({ "model": "gpt-4o", "messages": [{"role":"user","content":"hi"}], "stream": false });
     let r = app
         .oneshot(req("POST", "/v1/chat/completions", Some(&key), Some(chat)))
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     // Cache was invalidated on create → the brand-new route applied on the very next request.
-    assert_eq!(served.lock().unwrap().clone(), vec!["gpt-4o-mini".to_string()]);
+    assert_eq!(
+        served.lock().unwrap().clone(),
+        vec!["gpt-4o-mini".to_string()]
+    );
 }

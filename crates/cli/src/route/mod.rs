@@ -96,8 +96,11 @@ pub async fn run(
             println!("{}", serde_json::to_string_pretty(&route)?);
         }
         RouteCmd::Rm(id) => {
-            let _: Value =
-                send(http.delete(format!("{base}/v1/routes/{id}")).bearer_auth(&key)).await?;
+            let _: Value = send(
+                http.delete(format!("{base}/v1/routes/{id}"))
+                    .bearer_auth(&key),
+            )
+            .await?;
             println!("Removed route {id}.");
         }
         RouteCmd::Add(args) => {
