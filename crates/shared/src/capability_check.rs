@@ -403,7 +403,9 @@ mod tests {
         let mut req = base_req();
         req.messages = vec![Message::User {
             content: MessageContent::Parts(vec![
-                ContentPart::Text { text: "look".into() },
+                ContentPart::Text {
+                    text: "look".into(),
+                },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
                         url: "data:image/png;base64,abc".into(),
