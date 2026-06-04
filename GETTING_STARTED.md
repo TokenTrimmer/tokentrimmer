@@ -276,7 +276,7 @@ Register it with an MCP client:
 
 Tools: `preview_cost`, `find_route_for`, `inspect_diff`, `lookup_semantic_cache`, `simulate_plan`. Resources: `cost-ledger/last-7d`, `inspect/baseline`, plan history.
 
-**Requires:** a `tt_live_…` key (via `--tt-api-key` or `TT_API_KEY`). The hosted API base defaults to `https://tokentrimmer.fly.dev` (override with `--tt-api-base`).
+**Requires:** a `tt_live_…` key — run `tt login --token <KEY>`, or pass `--tt-api-key` / set `TT_API_KEY`. The hosted API base defaults to `https://api.tokentrimmer.com` (override with `--tt-api-base` or `TT_API_BASE`).
 
 ### 6. `tt proxy` — local listener for coding agents
 

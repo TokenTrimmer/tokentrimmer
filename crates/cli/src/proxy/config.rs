@@ -55,7 +55,7 @@ impl Config {
             bind: SocketAddr::new(bind, port),
             mode,
             tt_api_key,
-            gateway_base_url: "https://tokentrimmer.fly.dev".into(),
+            gateway_base_url: "https://api.tokentrimmer.com".into(),
             upstream_anthropic: "https://api.anthropic.com".into(),
             upstream_openai: "https://api.openai.com".into(),
             session_log_dir: session_log_dir.unwrap_or(default_log_dir),
