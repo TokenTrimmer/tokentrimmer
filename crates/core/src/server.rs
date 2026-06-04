@@ -42,6 +42,14 @@ pub fn build_router_with_retrieval(
         .route(
             "/v1/preview",
             axum::routing::post(crate::routes::preview::post_preview),
+        )
+        .route(
+            "/v1/routes",
+            get(routes::routes_api::list).post(routes::routes_api::create),
+        )
+        .route(
+            "/v1/routes/{id}",
+            get(routes::routes_api::get).delete(routes::routes_api::delete),
         );
 
     let base = match retrieval {

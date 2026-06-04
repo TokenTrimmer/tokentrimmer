@@ -6,4 +6,5 @@ pub mod embeddings;
 pub mod health;
 pub mod models;
 pub mod preview;
+pub mod routes_api;
 pub mod sse;
