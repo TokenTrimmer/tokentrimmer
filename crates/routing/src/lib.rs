@@ -64,11 +64,11 @@ pub struct RouteConditions {
     pub tag_equals: Option<String>,
     /// Match only if the request carries at least one image input part
     /// (`ContentPart::ImageUrl`). `Some(false)` requires no image; `None` ignores.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_images: Option<bool>,
     /// Match only if the request carries at least one audio input part
     /// (`ContentPart::InputAudio`). `Some(false)` requires no audio; `None` ignores.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_audio: Option<bool>,
 }
 

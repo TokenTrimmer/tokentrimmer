@@ -34,6 +34,13 @@ fn matches_conditions(req: &RequestLog, c: &RouteConditions) -> bool {
             return false;
         }
     }
+    // Modality conditions cannot be evaluated against historical RequestLog rows
+    // (no modality recorded). Treat ANY modality requirement as a non-match so
+    // Plan never over-projects savings. Follow-up: capture had_images/had_audio
+    // on request_logs to enable modality projection.
+    if c.has_images.is_some() || c.has_audio.is_some() {
+        return false;
+    }
     true
 }
 
@@ -196,5 +203,32 @@ mod tests {
         assert!(match_route(&req("m", 50, Some("api")), &routes).is_none());
         assert!(match_route(&req("x", 50, Some("ux")), &routes).is_none());
         assert!(match_route(&req("m", 150, Some("ux")), &routes).is_none());
+    }
+
+    #[test]
+    fn modality_condition_never_matches_historical_log() {
+        // RequestLog carries no modality, so a modality-conditioned route must
+        // not match — Plan stays conservative and never over-projects savings.
+        let r = route(
+            "img-only",
+            10,
+            true,
+            RouteConditions {
+                has_images: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(match_route(&req("m", 1, None), &[r]).is_none());
+
+        let r2 = route(
+            "no-img",
+            10,
+            true,
+            RouteConditions {
+                has_images: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(match_route(&req("m", 1, None), &[r2]).is_none());
     }
 }

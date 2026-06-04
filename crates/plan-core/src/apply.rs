@@ -287,6 +287,8 @@ mod tests {
                 input_tokens_lt: Some(2_000),
                 input_tokens_gt: None,
                 tag_equals: None,
+                has_images: None,
+                has_audio: None,
             },
             then: RouteAction {
                 target_model: "claude-haiku-4-5".into(),
