@@ -274,3 +274,18 @@ When a decision is reversed, mark the old one `Superseded by ADR-NNN` and write 
 - Revisit triggers: a contract requires column-level encryption beyond disk encryption, or responses become recoverable secrets (e.g. caching tool outputs with PII).
 
 **Pointers**: `crates/core/migrations/0002_cache_entries.up.sql`; `crates/cache/src/l2.rs`; `crates/retrieval/src/audit.rs` (reusable AEAD); follow-up `rv-l2-org-cache-optout` (per-org `semantic_cache_disabled` → force `cache_behavior.do_lookup=do_insert=false`, resolve alongside tier in `tier_resolver.rs`, gate before the L1/L2 branches in `chat.rs`).
+
+## ADR-018 — v1 routing is same-provider only (2026-06-04)
+
+**Status**: Adopted (formalizes a constraint that was already enforced in code).
+
+**Context**: The routing engine rewrites a request's `model` to a cheaper/target model. Cross-provider rewrites (e.g. `gpt-4o` → a Gemini model) need each provider's pricing reconciled before `tt_plan_core` can project savings honestly, and they change the credential/capability resolution path. The cloud create/patch handlers already reject cross-provider rewrites in `routes_admin.rs::validate_same_provider` (via `tt_shared::providers::infer_provider` / `known_to_differ`). This constraint was referenced in code and error messages as "ADR-007", but ADR-007 is actually the Apalis worker-queue decision — the routing constraint was never written down. This ADR records it under its correct number.
+
+**Decision**: v1 routing (including the V3a content-type slice) requires the target model to be on the **same provider** as the source. Cross-provider routing is a later slice (V3 roadmap), gated on unified cross-provider pricing in `tt_plan_core`.
+
+**Consequences**:
+- Content-type routes (`has_images`/`has_audio`, added in V3a-1) pick a same-provider model of the required capability; the runtime capability guard (`chat.rs` `apply_routing`) still skips a target lacking the capability.
+- The `tt_routing::RouteAction::target_model` doc comment is corrected from "ADR-007" to "ADR-018" in this change. The `cloud` error-message string (`routes_admin.rs:59`) and the cloud `HANDOFF.md` reference are updated in the V3a-2 (cloud) plan, since they live in the cloud repo.
+- Revisit trigger: cross-provider pricing is unified in Plan, enabling honest cross-provider savings projection.
+
+**Pointers**: `crates/routing/src/lib.rs` (`RouteAction::target_model`); `cloud/crates/api/src/routes_admin.rs::validate_same_provider`; `crates/shared/src/providers.rs`; roadmap `docs/superpowers/specs/2026-06-03-cli-platform-roadmap.md` (V3 cross-provider slice).
