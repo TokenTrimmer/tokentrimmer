@@ -95,8 +95,8 @@ enum Command {
         transport: String,
         #[arg(long)]
         tt_api_key: Option<String>,
-        #[arg(long, default_value = "https://tokentrimmer.fly.dev")]
-        tt_api_base: String,
+        #[arg(long)]
+        tt_api_base: Option<String>,
         /// Port to bind when using --transport sse (default 31416).
         #[arg(long, default_value_t = 31416)]
         sse_port: u16,
@@ -154,6 +154,8 @@ enum Command {
         mode: String,
         #[arg(long)]
         tt_api_key: Option<String>,
+        #[arg(long)]
+        tt_api_base: Option<String>,
         #[arg(long)]
         no_tui: bool,
         #[arg(long)]
@@ -299,8 +301,9 @@ async fn main() -> anyhow::Result<()> {
                 tools::{find_route_for, inspect_diff, lookup_semantic_cache, preview_cost},
                 Server,
             };
-            let api_key = tt_api_key.or_else(|| std::env::var("TT_API_KEY").ok());
-            let api_key = auth::validate_api_key(api_key)?;
+            let ctx = tt_cli::context::ResolvedContext::load(tt_api_key, tt_api_base)?;
+            let api_key = auth::validate_api_key(ctx.api_key_string())?;
+            let tt_api_base = ctx.base_url;
             let mut server = Server::new();
             server
                 .tools
@@ -439,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
             bind,
             mode,
             tt_api_key,
+            tt_api_base,
             no_tui,
             no_preview,
             session_log,
@@ -449,11 +453,15 @@ async fn main() -> anyhow::Result<()> {
             };
             let bind_addr: std::net::IpAddr = bind.parse().context("invalid --bind address")?;
             let mode = Mode::parse(&mode).context("invalid --mode (gateway|bypass|hybrid)")?;
-            let api_key = tt_api_key.or_else(|| std::env::var("TT_API_KEY").ok());
+            let ctx = tt_cli::context::ResolvedContext::load(tt_api_key, tt_api_base)?;
+            let api_key = ctx.api_key_string();
             if mode == Mode::Gateway && api_key.is_none() {
-                anyhow::bail!("--mode gateway requires --tt-api-key or TT_API_KEY env");
+                anyhow::bail!(
+                    "--mode gateway requires a key — run `tt login --token <KEY>`, \
+                     pass --tt-api-key, or set TT_API_KEY"
+                );
             }
-            let cfg = Config::build(
+            let mut cfg = Config::build(
                 port,
                 bind_addr,
                 mode,
@@ -462,6 +470,7 @@ async fn main() -> anyhow::Result<()> {
                 no_preview,
                 session_log.map(std::path::PathBuf::from),
             );
+            cfg.gateway_base_url = ctx.base_url;
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
