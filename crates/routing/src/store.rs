@@ -355,6 +355,7 @@ mod tests {
                 target_model: target.into(),
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
+                disable_cache: false,
             },
         }
     }
@@ -388,6 +389,7 @@ mod tests {
                 target_model: "m1".into(),
                 fallbacks: vec![],
                 force_cache_layer: None,
+                disable_cache: false,
             },
         };
         let created = s.create_route(org, spec).await.unwrap();
@@ -421,6 +423,7 @@ mod tests {
                         target_model: "m".into(),
                         fallbacks: vec![],
                         force_cache_layer: None,
+                disable_cache: false,
                     },
                 },
             )
