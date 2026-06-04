@@ -62,13 +62,21 @@ pub struct RouteConditions {
     /// Match only if `ctx.tag == Some(this)`.
     #[serde(default)]
     pub tag_equals: Option<String>,
+    /// Match only if the request carries at least one image input part
+    /// (`ContentPart::ImageUrl`). `Some(false)` requires no image; `None` ignores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_images: Option<bool>,
+    /// Match only if the request carries at least one audio input part
+    /// (`ContentPart::InputAudio`). `Some(false)` requires no audio; `None` ignores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_audio: Option<bool>,
 }
 
 /// What a matching [`Route`] does to the request before dispatch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteAction {
     /// Rewrite to this model on the same provider as the request (v1 is
-    /// same-provider only — see ADR-007 / Plan design for the cross-provider
+    /// same-provider only — see ADR-018 / Plan design for the cross-provider
     /// constraint).
     pub target_model: String,
     /// Ordered fallback model ids, tried in order when the primary dispatch
@@ -164,6 +172,16 @@ fn matches(
             return false;
         }
     }
+    if let Some(want) = c.has_images {
+        if tt_shared::capability_check::request_has_images(req) != want {
+            return false;
+        }
+    }
+    if let Some(want) = c.has_audio {
+        if tt_shared::capability_check::request_has_audio(req) != want {
+            return false;
+        }
+    }
     true
 }
 
@@ -172,6 +190,7 @@ mod tests {
     use super::*;
     use tt_shared::{
         context::{ProviderCredentials, SecretString},
+        messages::{ContentPart, ImageUrl, InputAudio},
         ChatCompletionRequest, Message, MessageContent,
     };
 
@@ -202,6 +221,135 @@ mod tests {
             }],
             ..serde_json::from_str(r#"{"model":"placeholder","messages":[]}"#).unwrap()
         }
+    }
+
+    fn make_req_with_part(model: &str, part: ContentPart) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
+            messages: vec![Message::User {
+                content: MessageContent::Parts(vec![part]),
+                name: None,
+            }],
+            ..serde_json::from_str(r#"{"model":"placeholder","messages":[]}"#).unwrap()
+        }
+    }
+
+    fn image_part() -> ContentPart {
+        ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,abc".into(),
+                detail: None,
+            },
+        }
+    }
+
+    fn audio_part() -> ContentPart {
+        ContentPart::InputAudio {
+            input_audio: InputAudio {
+                data: "abc".into(),
+                format: "wav".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn has_images_true_matches_only_image_requests() {
+        let route = Route {
+            when: RouteConditions {
+                has_images: Some(true),
+                ..Default::default()
+            },
+            ..make_route("vision", 10, vec![], "vision-mini")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_some());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_none());
+    }
+
+    #[test]
+    fn has_images_false_matches_only_non_image_requests() {
+        let route = Route {
+            when: RouteConditions {
+                has_images: Some(false),
+                ..Default::default()
+            },
+            ..make_route("text", 10, vec![], "cheap")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_some());
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn has_audio_true_matches_only_audio_requests() {
+        let route = Route {
+            when: RouteConditions {
+                has_audio: Some(true),
+                ..Default::default()
+            },
+            ..make_route("audio", 10, vec![], "audio-model")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("gpt-4o", audio_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_some());
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn modality_anded_with_model_in() {
+        let route = Route {
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                has_images: Some(true),
+                ..Default::default()
+            },
+            ..make_route("both", 10, vec!["gpt-4o"], "vision-mini")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_some());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_none());
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("other", image_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_none());
     }
 
     fn make_ctx(tag: Option<&str>) -> RequestContext {

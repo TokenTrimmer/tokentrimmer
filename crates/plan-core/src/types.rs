@@ -124,6 +124,13 @@ pub struct RouteConditions {
     /// Match only if `req.tag == Some(this)`.
     #[serde(default)]
     pub tag_equals: Option<String>,
+    /// Mirror of `tt_routing::RouteConditions::has_images`. Not evaluable in
+    /// replay (RequestLog records no modality) — see `routing::matches_conditions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_images: Option<bool>,
+    /// Mirror of `tt_routing::RouteConditions::has_audio`. See `has_images`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_audio: Option<bool>,
 }
 
 /// What a matching [`ProposedRoute`] does.

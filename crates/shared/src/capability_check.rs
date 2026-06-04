@@ -158,13 +158,52 @@ fn extract_text(content: &MessageContent) -> String {
     }
 }
 
+/// True when any message carries an image (`ContentPart::ImageUrl`) content part.
+///
+/// Distinct from [`RequiredCapabilities`], which collapses image **and** audio
+/// into a single `vision` flag; routing needs to tell the two modalities apart.
+pub fn request_has_images(req: &ChatCompletionRequest) -> bool {
+    req.messages
+        .iter()
+        .any(|m| content_of(m).is_some_and(has_image_part))
+}
+
+/// True when any message carries an audio (`ContentPart::InputAudio`) content part.
+pub fn request_has_audio(req: &ChatCompletionRequest) -> bool {
+    req.messages
+        .iter()
+        .any(|m| content_of(m).is_some_and(has_audio_part))
+}
+
+/// The content of a message, if it has any (Assistant content is optional).
+fn content_of(m: &Message) -> Option<&MessageContent> {
+    match m {
+        Message::User { content, .. }
+        | Message::System { content }
+        | Message::Tool { content, .. } => Some(content),
+        Message::Assistant { content, .. } => content.as_ref(),
+    }
+}
+
+fn has_image_part(c: &MessageContent) -> bool {
+    matches!(c, MessageContent::Parts(parts)
+        if parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })))
+}
+
+fn has_audio_part(c: &MessageContent) -> bool {
+    matches!(c, MessageContent::Parts(parts)
+        if parts.iter().any(|p| matches!(p, ContentPart::InputAudio { .. })))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
     use crate::{
-        messages::{ImageUrl, ResponseFormat, Tool, ToolCall, ToolCallFunction, ToolFunction},
+        messages::{
+            ImageUrl, InputAudio, ResponseFormat, Tool, ToolCall, ToolCallFunction, ToolFunction,
+        },
         pricing::Capability,
         ModelInfo,
     };
@@ -357,5 +396,49 @@ mod tests {
         assert!(reasons.contains(&"vision_not_supported"));
         assert!(reasons.contains(&"tools_not_supported"));
         assert!(reasons.contains(&"context_window_too_small"));
+    }
+
+    #[test]
+    fn request_has_images_detects_image_part() {
+        let mut req = base_req();
+        req.messages = vec![Message::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "look".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,abc".into(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+        assert!(request_has_images(&req));
+        assert!(!request_has_audio(&req));
+    }
+
+    #[test]
+    fn request_has_audio_detects_audio_part() {
+        let mut req = base_req();
+        req.messages = vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "abc".into(),
+                    format: "wav".into(),
+                },
+            }]),
+            name: None,
+        }];
+        assert!(request_has_audio(&req));
+        assert!(!request_has_images(&req));
+    }
+
+    #[test]
+    fn plain_text_request_has_no_modality() {
+        let req = base_req();
+        assert!(!request_has_images(&req));
+        assert!(!request_has_audio(&req));
     }
 }
