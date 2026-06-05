@@ -195,6 +195,20 @@ fn has_audio_part(c: &MessageContent) -> bool {
         if parts.iter().any(|p| matches!(p, ContentPart::InputAudio { .. })))
 }
 
+/// Concatenated text of the **user + system** messages — the caller-controlled
+/// input, used for content/topic routing. Assistant/tool turns are excluded so a
+/// model's own output can't spuriously trigger a topic route.
+pub fn request_input_text(req: &ChatCompletionRequest) -> String {
+    req.messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::User { content, .. } | Message::System { content } => Some(extract_text(content)),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -440,5 +454,28 @@ mod tests {
         let req = base_req();
         assert!(!request_has_images(&req));
         assert!(!request_has_audio(&req));
+    }
+
+    #[test]
+    fn request_input_text_user_and_system_only() {
+        let mut req = base_req();
+        req.messages = vec![
+            Message::System {
+                content: MessageContent::Text("sys ctx".into()),
+            },
+            Message::User {
+                content: MessageContent::Text("Confidential matter".into()),
+                name: None,
+            },
+            Message::Assistant {
+                content: Some(MessageContent::Text("legal advice".into())),
+                tool_calls: vec![],
+                name: None,
+            },
+        ];
+        let t = request_input_text(&req);
+        assert!(t.contains("sys ctx"));
+        assert!(t.contains("Confidential matter"));
+        assert!(!t.contains("legal advice"), "assistant output must be excluded");
     }
 }
