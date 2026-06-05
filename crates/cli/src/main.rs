@@ -228,6 +228,9 @@ enum RouteAction {
         /// Match only requests whose estimated cost (USD) is below this.
         #[arg(long)]
         when_cost_lt: Option<f64>,
+        /// Reject (402) any matched request whose estimated cost exceeds this (USD).
+        #[arg(long)]
+        max_cost: Option<f64>,
         /// Make matched requests skip TokenTrimmer's cache entirely (privacy).
         #[arg(long)]
         disable_cache: bool,
@@ -514,6 +517,7 @@ async fn main() -> anyhow::Result<()> {
                     when_prompt_contains,
                     when_cost_gt,
                     when_cost_lt,
+                    max_cost,
                     disable_cache,
                     priority,
                     name,
@@ -529,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
                     when_prompt_contains,
                     when_cost_gt,
                     when_cost_lt,
+                    max_cost,
                     disable_cache,
                     priority,
                     name,
@@ -911,6 +916,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     fallbacks: Vec::new(),
                     force_cache_layer: None,
                     disable_cache: false,
+                    max_cost_usd: None,
                 },
             }],
         );

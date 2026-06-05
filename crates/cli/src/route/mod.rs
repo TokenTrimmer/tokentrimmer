@@ -17,6 +17,7 @@ pub struct AddArgs {
     pub when_prompt_contains: Vec<String>,
     pub when_cost_gt: Option<f64>,
     pub when_cost_lt: Option<f64>,
+    pub max_cost: Option<f64>,
     pub disable_cache: bool,
     pub priority: u32,
     pub name: Option<String>,
@@ -69,6 +70,9 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     }
     if args.disable_cache {
         then.insert("disable_cache".into(), json!(true));
+    }
+    if let Some(v) = args.max_cost {
+        then.insert("max_cost_usd".into(), json!(v));
     }
     Ok(json!({
         "name": args.name.clone().unwrap_or_else(|| default_name(args, &target)),
@@ -200,6 +204,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            max_cost: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -225,6 +230,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            max_cost: None,
             disable_cache: false,
             priority: 50,
             name: Some("vis".into()),
@@ -252,6 +258,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            max_cost: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -273,6 +280,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            max_cost: None,
             disable_cache: true,
             priority: 100,
             name: None,
@@ -296,6 +304,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            max_cost: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -319,6 +328,7 @@ mod tests {
             when_prompt_contains: vec!["confidential".into(), "salary".into()],
             when_cost_gt: None,
             when_cost_lt: None,
+            max_cost: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -344,6 +354,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            max_cost: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -366,6 +377,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: Some(0.05),
             when_cost_lt: None,
+            max_cost: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -375,5 +387,28 @@ mod tests {
         .unwrap();
         assert_eq!(body["when"]["estimated_cost_gt"], 0.05);
         assert!(body["when"].get("estimated_cost_lt").is_none());
+    }
+
+    #[test]
+    fn max_cost_maps_to_then() {
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-4o-mini".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: None,
+            when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
+            max_cost: Some(0.1),
+            disable_cache: false,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        })
+        .unwrap();
+        assert_eq!(body["then"]["max_cost_usd"], 0.1);
     }
 }

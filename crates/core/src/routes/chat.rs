@@ -54,6 +54,16 @@ const L2_DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Used only to estimate request cost for cost-based route conditions.
 const DEFAULT_OUTPUT_TOKENS_ESTIMATE: u32 = 1000;
 
+/// Estimated request cost (USD): input tokens at the input rate + output tokens
+/// (from `max_tokens`, else the default) at the output rate. Shared by the
+/// pre-rewrite cost condition (V3d-2a) and the post-rewrite ceiling (V3d-2b).
+fn estimate_cost_usd(pricing: &ModelPricing, input_tokens: u32, max_tokens: Option<u32>) -> f64 {
+    let output_est = max_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS_ESTIMATE);
+    (f64::from(input_tokens) * pricing.input_per_million
+        + f64::from(output_est) * pricing.output_per_million)
+        / 1_000_000.0
+}
+
 /// TTL for negative-cache entries (deterministic 4xx errors).
 ///
 /// Short by design: a client error cached for too long would prevent legitimate
@@ -126,8 +136,10 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         | ApiError::PaymentRequired
         | ApiError::Forbidden(_)
         | ApiError::ModelNotFound { .. }
-        // Config-dependent (org may add the credential) — must not negative-cache.
+        // Config-dependent (org may add the credential / raise the ceiling) —
+        // must not negative-cache.
         | ApiError::MissingProviderCredential { .. }
+        | ApiError::CostLimitExceeded { .. }
         | ApiError::RateLimited { .. }
         | ApiError::Internal(_)
         | ApiError::NotFound(_)
@@ -146,6 +158,7 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
         ApiError::ModelNotFound { .. } => StatusCode::NOT_FOUND,
         ApiError::MissingProviderCredential { .. } => StatusCode::BAD_REQUEST,
+        ApiError::CostLimitExceeded { .. } => StatusCode::PAYMENT_REQUIRED,
         ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
         ApiError::Provider(pe) => match pe {
             ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
@@ -406,6 +419,13 @@ pub async fn handler(
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
     // A matched privacy route forces the request to skip the cache entirely.
     let route_disable_cache = route_match.as_ref().is_some_and(|m| m.disable_cache);
+    // Per-request cost ceiling (V3d-2b) + the token estimate, captured before
+    // `route_match` is consumed below.
+    let route_max_cost_usd = route_match.as_ref().and_then(|m| m.max_cost_usd);
+    let route_input_tokens = route_match
+        .as_ref()
+        .map(|m| m.input_tokens_estimate)
+        .unwrap_or(0);
     // Ordered fallback model ids from the matched route (empty = no failover).
     let route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
     if matched_route_id.is_some() {
@@ -428,6 +448,20 @@ pub async fn handler(
                     return Err(ApiError::MissingProviderCredential {
                         provider: provider.id().to_string(),
                     })
+                }
+            }
+        }
+        // Per-request cost ceiling (V3d-2b): reject when the rerouted model's
+        // estimated cost still exceeds the route's max_cost_usd. Permissive when
+        // pricing is unknown (can't prove an exceedance).
+        if let Some(ceiling) = route_max_cost_usd {
+            if let Some(pr) = provider.pricing(&req.model) {
+                let routed_cost = estimate_cost_usd(&pr, route_input_tokens, req.max_tokens);
+                if routed_cost > ceiling {
+                    return Err(ApiError::CostLimitExceeded {
+                        estimated_usd: routed_cost,
+                        ceiling_usd: ceiling,
+                    });
                 }
             }
         }
@@ -1674,6 +1708,8 @@ struct RouteMatch {
     route_id: Uuid,
     fallbacks: Vec<String>,
     disable_cache: bool,
+    max_cost_usd: Option<f64>,
+    input_tokens_estimate: u32,
 }
 
 /// Look up the org's routing engine (cached ~60s) and evaluate it against
@@ -1723,17 +1759,13 @@ async fn apply_routing(
     let estimated_cost_usd = req_provider
         .as_ref()
         .and_then(|p| p.pricing(&req.model))
-        .map(|pr| {
-            let output_est = req.max_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS_ESTIMATE);
-            (f64::from(input_tokens) * pr.input_per_million
-                + f64::from(output_est) * pr.output_per_million)
-                / 1_000_000.0
-        });
+        .map(|pr| estimate_cost_usd(&pr, input_tokens, req.max_tokens));
 
     let m = engine.evaluate_with_cost(req, ctx, input_tokens, estimated_cost_usd)?;
     let route_id = m.id;
     let fallbacks = m.then.fallbacks.clone();
     let disable_cache = m.then.disable_cache;
+    let max_cost_usd = m.then.max_cost_usd;
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -1773,6 +1805,8 @@ async fn apply_routing(
         route_id,
         fallbacks,
         disable_cache,
+        max_cost_usd,
+        input_tokens_estimate: input_tokens,
     })
 }
 

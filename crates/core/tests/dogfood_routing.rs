@@ -152,6 +152,7 @@ fn dogfood_routing_store() -> Arc<CachingRoutingStore> {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }],
     );

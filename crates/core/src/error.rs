@@ -32,6 +32,14 @@ pub enum ApiError {
     #[error("no upstream credential for provider {provider}")]
     MissingProviderCredential { provider: String },
 
+    #[error(
+        "estimated cost ${estimated_usd:.4} exceeds the ${ceiling_usd:.4} per-request ceiling"
+    )]
+    CostLimitExceeded {
+        estimated_usd: f64,
+        ceiling_usd: f64,
+    },
+
     #[error("rate limited (retry after {retry_after_ms} ms)")]
     RateLimited { retry_after_ms: u64 },
 
@@ -102,6 +110,17 @@ impl IntoResponse for ApiError {
                 "missing_provider_credential",
                 format!(
                     "No upstream credential configured for provider '{provider}', required by a matched route. Add it before routing to this provider."
+                ),
+            ),
+            ApiError::CostLimitExceeded {
+                estimated_usd,
+                ceiling_usd,
+            } => (
+                StatusCode::PAYMENT_REQUIRED,
+                "billing_error",
+                "cost_limit_exceeded",
+                format!(
+                    "Estimated request cost ${estimated_usd:.4} exceeds the configured ${ceiling_usd:.4} per-request ceiling."
                 ),
             ),
             ApiError::RateLimited { .. } => (

@@ -162,6 +162,7 @@ async fn setup(disable_cache: bool) -> (axum::Router, String, Arc<AtomicUsize>) 
                 fallbacks: vec![],
                 force_cache_layer: None,
                 disable_cache,
+                max_cost_usd: None,
             },
         }],
     );

@@ -393,6 +393,7 @@ async fn replay_with_quality_attaches_quality_field() {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
     let mut pricing = HashMap::new();
