@@ -1,0 +1,14 @@
+{
+  "findings": [
+    {
+      "confidence": 0.8999999761581421,
+      "file": "/Users/iansimon/Developer/TokenTrimmer/public/docs/04-gateway-api-reference.md",
+      "fix_hint": "Create an AGENTS.md (or CLAUDE.md) at the repo root describing the project, build commands, and coding conventions. Run `tt inspect --suggest-agents-md` for a generated starter.",
+      "line": 1,
+      "message": "This project uses LLM libraries but has no AGENTS.md, CLAUDE.md, or .cursorrules file. Without a project-context file, AI tools work blind and users must provide verbose prompts on every session.",
+      "rule_id": "config-no-agents-md",
+      "severity": "medium"
+    }
+  ],
+  "generated_at": "2026-06-03T23:14:13.284298+00:00"
+}
