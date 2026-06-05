@@ -208,6 +208,7 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -238,6 +239,7 @@ fn conservative_when_pricing_missing() {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
     let input = input_with_routes(vec![req], vec![route], HashMap::new(), 100);
@@ -272,6 +274,7 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -303,6 +306,7 @@ fn cross_provider_target_absent_is_conservative() {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
     let result = replay(input_with_routes(
@@ -315,6 +319,35 @@ fn cross_provider_target_absent_is_conservative() {
     assert_eq!(result.aggregates.requests_unprice_able, 1);
     assert_eq!(result.aggregates.requests_rerouted, 0);
     assert_eq!(result.aggregates.projected_savings_usd, 0.0);
+}
+
+#[test]
+fn route_over_ceiling_is_blocked_not_saved() {
+    // A request routed to a model whose projected cost exceeds max_cost_usd is
+    // counted unchanged (no fabricated savings) and surfaced as a would-block.
+    let req = make_req(1, 0, "claude-3-5-sonnet", 1_000_000, 1_000_000, 18.0, false);
+    let route = ProposedRoute {
+        id: det_uuid(100),
+        name: "capped".into(),
+        priority: 100,
+        enabled: true,
+        when: RouteConditions::default(),
+        then: RouteAction {
+            target_model: "claude-3-5-haiku".into(),
+            force_cache_layer: None,
+            fallbacks: Vec::new(),
+            disable_cache: false,
+            max_cost_usd: Some(0.01), // haiku on 1M/1M tokens still far exceeds $0.01
+        },
+    };
+    let mut pricing = HashMap::new();
+    let (k, v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    // Blocked → projected unchanged (no savings), and a caveat names it.
+    assert_eq!(result.aggregates.projected_savings_usd, 0.0);
+    assert!(result.caveats.iter().any(|c| c.contains("rejected")));
 }
 
 #[test]
@@ -357,6 +390,7 @@ fn rerouted_latency_projected_from_target_model_history() {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -432,6 +466,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
 
@@ -549,6 +584,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
     let route_b = ProposedRoute {
@@ -565,6 +601,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         },
     };
 

@@ -176,6 +176,11 @@ pub struct RouteAction {
     /// not yet model cache opt-out (follow-up); present for lossless round-trip.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_cache: bool,
+    /// Mirror of `tt_routing::RouteAction::max_cost_usd`. A matched request whose
+    /// projected cost exceeds this would be rejected at runtime — replay counts
+    /// it unchanged (no savings) and surfaces a caveat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
 }
 
 /// Per-model pricing keyed by `"provider:model"`.
@@ -459,6 +464,7 @@ mod tests {
             force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
+            max_cost_usd: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -491,6 +497,7 @@ mod tests {
             force_cache_layer: Some("l1".into()),
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
+            max_cost_usd: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -516,6 +523,7 @@ mod tests {
             fallbacks: Vec::new(),
             force_cache_layer: None,
             disable_cache: true,
+            max_cost_usd: None,
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(j.contains("\"disable_cache\":true"));
