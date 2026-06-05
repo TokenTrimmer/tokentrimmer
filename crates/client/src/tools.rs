@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::{
-    build_body, inject_tools, parse_cost, tool_result, ChatBuilder, ChatCompletionResponse,
-    Client, CostInfo, Error, Message, MessageContent, Result, Tool, ToolCall, ToolChoice,
+    build_body, inject_tools, parse_cost, tool_result, ChatBuilder, ChatCompletionResponse, Client,
+    CostInfo, Error, Message, MessageContent, Result, Tool, ToolCall, ToolChoice,
 };
 
 /// Executes the model's tool calls. Implement this for your tools.
@@ -72,13 +72,16 @@ impl ToolOutcome {
     /// The final answer text (`choices[0].message.content`), if any.
     #[must_use]
     pub fn text(&self) -> Option<&str> {
-        self.response.choices.first().and_then(|c| match &c.message {
-            Message::Assistant {
-                content: Some(MessageContent::Text(t)),
-                ..
-            } => Some(t.as_str()),
-            _ => None,
-        })
+        self.response
+            .choices
+            .first()
+            .and_then(|c| match &c.message {
+                Message::Assistant {
+                    content: Some(MessageContent::Text(t)),
+                    ..
+                } => Some(t.as_str()),
+                _ => None,
+            })
     }
 }
 
@@ -98,7 +101,11 @@ async fn send_round(
 ) -> Result<(ChatCompletionResponse, CostInfo)> {
     let mut body = build_body(model, messages, max_tokens, temperature, false);
     let none = ToolChoice::Auto("none".to_string());
-    let effective = if force_no_tools { Some(&none) } else { tool_choice };
+    let effective = if force_no_tools {
+        Some(&none)
+    } else {
+        tool_choice
+    };
     inject_tools(&mut body, tools, effective);
     let mut req = client
         .http
@@ -192,7 +199,10 @@ impl ChatBuilder<'_> {
                 messages.push(m);
             }
             for tc in &calls {
-                let result = match executor.call(&tc.function.name, &tc.function.arguments).await {
+                let result = match executor
+                    .call(&tc.function.name, &tc.function.arguments)
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => json!({ "error": e.to_string() }).to_string(),
                 };

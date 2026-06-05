@@ -594,7 +594,11 @@ mod tests {
     fn inject_tools_adds_fields() {
         let mut body = json!({ "model": "m", "messages": [] });
         let tools = vec![tool("f", "desc", json!({"type":"object"}))];
-        inject_tools(&mut body, &tools, Some(&ToolChoice::Auto("none".to_string())));
+        inject_tools(
+            &mut body,
+            &tools,
+            Some(&ToolChoice::Auto("none".to_string())),
+        );
         assert_eq!(body["tools"][0]["function"]["name"], "f");
         assert_eq!(body["tool_choice"], "none");
 
@@ -800,7 +804,11 @@ mod tests {
             .chat()
             .model("gpt-4o-mini")
             .message(user("weather in SF?"))
-            .tools(vec![tool("get_weather", "Look up weather", json!({"type":"object"}))])
+            .tools(vec![tool(
+                "get_weather",
+                "Look up weather",
+                json!({"type":"object"}),
+            )])
             .send()
             .await
             .unwrap();
