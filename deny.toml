@@ -54,6 +54,11 @@ ignore = [
     # cargo-deny flags these as errors): async-std and rustls-pemfile.
     "RUSTSEC-2025-0052",
     "RUSTSEC-2025-0134",
+    # number_prefix (k/M/G number formatting) — unmaintained, NOT vulnerable.
+    # Tiny, stable, single-purpose crate pulled transitively by `indicatif`
+    # (the spinner/progress lib used by tt-cli's ui module). No adopted
+    # replacement; revisit when indicatif drops it.
+    "RUSTSEC-2025-0119",
 ]
 
 [sources]
