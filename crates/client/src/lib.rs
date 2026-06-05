@@ -15,6 +15,9 @@ pub use tt_shared::messages::{
 pub use tt_shared::Usage;
 
 mod tools;
+/// Re-exported so downstream `impl ToolExecutor` blocks can annotate with
+/// `#[tt_client::async_trait]` without taking a direct `async-trait` dependency.
+pub use async_trait::async_trait;
 pub use tools::{AggregateCost, ToolExecutor, ToolOutcome};
 
 /// Build a `user` message.

@@ -10,7 +10,23 @@ use crate::{
     CostInfo, Error, Message, MessageContent, Result, Tool, ToolCall, ToolChoice,
 };
 
-/// Executes the model's tool calls. Implement this for your tools.
+/// Executes the model's tool calls. Implement this for your tools, annotating
+/// the impl with the re-exported [`async_trait`](crate::async_trait) macro:
+///
+/// ```
+/// use tt_client::{async_trait, ToolExecutor};
+///
+/// struct MyTools;
+///
+/// #[async_trait]
+/// impl ToolExecutor for MyTools {
+///     async fn call(&self, name: &str, _arguments: &str)
+///         -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+///     {
+///         Ok(format!("ran {name}"))
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ToolExecutor {
     /// Run the tool named `name` with the model's raw JSON `arguments` string,
