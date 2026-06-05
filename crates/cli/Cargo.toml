@@ -53,7 +53,7 @@ toml.workspace = true
 chrono.workspace = true
 crossterm = "0.28"
 console = "0.15"
-comfy-table = "7"
+comfy-table = { version = "7", features = ["custom_styling"] }
 indicatif = "0.17"
 dirs = "5.0"
 bytes.workspace = true

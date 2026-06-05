@@ -545,7 +545,10 @@ async fn main() -> anyhow::Result<()> {
                     disabled,
                 }),
             };
-            tt_cli::route::run(cmd, tt_api_key, tt_api_base).await?;
+            if let Err(e) = tt_cli::route::run(cmd, tt_api_key, tt_api_base).await {
+                tt_cli::ui::error(&format!("{e:#}"));
+                std::process::exit(1);
+            }
         }
         Command::Proxy {
             port,

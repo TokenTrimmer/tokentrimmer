@@ -117,14 +117,14 @@ pub async fn run(
             let sp = ui::spinner("Loading routes…");
             let routes: Value =
                 send(http.get(format!("{base}/v1/routes")).bearer_auth(&key)).await?;
-            sp.finish_and_clear();
+            drop(sp);
             print_routes(&routes);
         }
         RouteCmd::Show(id) => {
             let sp = ui::spinner("Loading route…");
             let route: Value =
                 send(http.get(format!("{base}/v1/routes/{id}")).bearer_auth(&key)).await?;
-            sp.finish_and_clear();
+            drop(sp);
             ui::heading(route["name"].as_str().unwrap_or(&id));
             println!("{}", serde_json::to_string_pretty(&route)?);
         }
@@ -135,7 +135,7 @@ pub async fn run(
                     .bearer_auth(&key),
             )
             .await?;
-            sp.finish_and_clear();
+            drop(sp);
             ui::success(&format!("Removed route {id}."));
         }
         RouteCmd::Add(args) => {
@@ -147,7 +147,7 @@ pub async fn run(
                     .json(&body),
             )
             .await?;
-            sp.finish_and_clear();
+            drop(sp);
             ui::success(&format!(
                 "Created route {} ({}).",
                 route["id"].as_str().unwrap_or("?"),
@@ -175,12 +175,17 @@ async fn send(req: reqwest::RequestBuilder) -> anyhow::Result<Value> {
 /// Pure: render the routes list as a styled table string.
 fn routes_table(routes: &Value) -> String {
     let Some(arr) = routes.as_array() else {
-        return ui::format_warn("unexpected response (not a list)");
+        return ui::muted().apply_to("(unexpected response)").to_string();
     };
     if arr.is_empty() {
-        return "No routes. Create one with `tt route add --from <model> --to <model>`.".into();
+        return ui::muted()
+            .apply_to("No routes. Create one with `tt route add --from <model> --to <model>`.")
+            .to_string();
     }
-    let mut t = ui::table(&["NAME", "ROUTE", "PRIO", "STATUS"]);
+    let mut t = ui::table(
+        &["NAME", "ROUTE", "PRIO", "STATUS"],
+        console::colors_enabled(),
+    );
     for r in arr {
         let name = r["name"].as_str().unwrap_or("?");
         let from = r["when"]["model_in"]
@@ -198,7 +203,7 @@ fn routes_table(routes: &Value) -> String {
         let status = if r["enabled"].as_bool().unwrap_or(false) {
             format!("{} on", ui::success_style().apply_to(ui::OK))
         } else {
-            ui::muted().apply_to(format!("{} off", ui::NO)).to_string()
+            format!("{} off", ui::muted().apply_to(ui::NO))
         };
         t.add_row(vec![
             ui::heading_style().apply_to(name).to_string(),
