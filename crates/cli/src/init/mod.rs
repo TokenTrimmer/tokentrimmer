@@ -17,6 +17,8 @@ use manifest::{classify_upgrade, Manifest, UpgradeAction};
 use merge::{append_gitignore, merge_settings_json};
 use templates::{render_all, RenderedFile};
 
+use crate::ui;
+
 #[derive(Debug, Error)]
 pub enum InitError {
     #[error("not a git repo: {0}")]
@@ -142,7 +144,11 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
                 }
                 new_manifest.record(&f.dest, &f.content);
                 written += 1;
-                println!("+ Wrote {} ({} bytes)", f.dest.display(), f.content.len());
+                ui::success(&format!(
+                    "Wrote {} ({} bytes)",
+                    f.dest.display(),
+                    f.content.len()
+                ));
             }
             UpgradeAction::SafeOverwrite => {
                 let new_content = if f.dest.file_name().is_some_and(|n| n == ".gitignore.append") {
@@ -154,7 +160,7 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
                         std::fs::write(&target_gitignore, &merged)?;
                     }
                     written += 1;
-                    println!("+ Updated .gitignore");
+                    ui::success("Updated .gitignore");
                     continue;
                 } else if f.dest.ends_with("settings.json") {
                     let existing = disk_current.as_deref().unwrap_or("{}");
@@ -171,10 +177,10 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
                 };
                 new_manifest.record(&f.dest, &new_content);
                 written += 1;
-                println!(
-                    "+ Updated {} (safe — unchanged from prior install)",
+                ui::success(&format!(
+                    "Updated {} (safe — unchanged from prior install)",
                     f.dest.display()
-                );
+                ));
             }
             UpgradeAction::UserModified => {
                 if opts.force {
@@ -183,13 +189,16 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
                     }
                     new_manifest.record(&f.dest, &f.content);
                     written += 1;
-                    println!("! Overwrote user-modified {} (--force)", f.dest.display());
+                    ui::warn(&format!(
+                        "Overwrote user-modified {} (--force)",
+                        f.dest.display()
+                    ));
                 } else {
                     skipped += 1;
-                    println!(
-                        "- Skipped {} (user-modified; --force to overwrite)",
+                    ui::info(&format!(
+                        "Skipped {} (user-modified; --force to overwrite)",
                         f.dest.display()
-                    );
+                    ));
                 }
             }
         }
@@ -211,13 +220,23 @@ pub fn run(opts: RunOptions) -> Result<RunReport, InitError> {
     };
 
     println!();
+    ui::heading("Done");
     println!(
-        "Detected: {:?} + frameworks {:?}",
-        detection.languages, detection.frameworks
+        "  {} {:?} + frameworks {:?}",
+        ui::muted().apply_to("detected:"),
+        detection.languages,
+        detection.frameworks
     );
-    println!("Files written: {written}, skipped: {skipped}");
+    println!(
+        "  {} {} written, {} skipped",
+        ui::muted().apply_to("files:   "),
+        ui::success_style().apply_to(written),
+        skipped
+    );
     if let Some(n) = baseline_findings {
-        println!("Inspect baseline: {n} findings -> .claude/inspect-baseline.json");
+        ui::info(&format!(
+            "Inspect baseline: {n} findings -> .claude/inspect-baseline.json"
+        ));
     }
 
     Ok(RunReport {
