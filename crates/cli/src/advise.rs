@@ -103,9 +103,11 @@ pub fn build_context_message(detected: &[ModelUsage], describe: Option<&str>) ->
 pub fn detect_models(root: &Path) -> Vec<ModelUsage> {
     let mut agg: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut files = 0usize;
-    let walk = walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !e.file_name().to_str().is_some_and(|n| SKIP_DIRS.contains(&n)));
+    let walk = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
+        !e.file_name()
+            .to_str()
+            .is_some_and(|n| SKIP_DIRS.contains(&n))
+    });
     for entry in walk.flatten() {
         if files >= MAX_FILES {
             break;
@@ -125,7 +127,11 @@ pub fn detect_models(root: &Path) -> Vec<ModelUsage> {
             continue;
         };
         files += 1;
-        let rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
         for id in scan_text_for_models(&text) {
             let e = agg.entry(id).or_insert((0, rel.clone()));
             e.0 += 1;
@@ -161,7 +167,9 @@ pub async fn run(
     let root = path.unwrap_or_else(|| ".".to_string());
     let detected = detect_models(Path::new(&root));
     if detected.is_empty() {
-        ui::note("no model usage detected in the code — advising from --describe / general guidance");
+        ui::note(
+            "no model usage detected in the code — advising from --describe / general guidance",
+        );
     } else {
         ui::note(&format!("scanned: {} model(s) referenced", detected.len()));
     }
@@ -189,7 +197,9 @@ mod tests {
                    var llamaindex = 1; pick "mistral-large-latest"; llama-3.3-70b"#;
         let ids = scan_text_for_models(t);
         assert!(ids.contains(&"gpt-4o-mini".to_string()), "{ids:?}");
-        assert!(ids.iter().any(|s| s.eq_ignore_ascii_case("claude-3-5-sonnet")));
+        assert!(ids
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("claude-3-5-sonnet")));
         assert!(ids.iter().any(|s| s.eq_ignore_ascii_case("o3-mini")));
         assert!(ids
             .iter()
@@ -197,7 +207,9 @@ mod tests {
         assert!(ids
             .iter()
             .any(|s| s.to_ascii_lowercase().starts_with("llama-3.3")));
-        assert!(!ids.iter().any(|s| s.to_ascii_lowercase().contains("llamaindex")));
+        assert!(!ids
+            .iter()
+            .any(|s| s.to_ascii_lowercase().contains("llamaindex")));
         assert!(scan_text_for_models("no models here").is_empty());
         assert_eq!(scan_text_for_models("gpt-4o gpt-4o").len(), 1); // de-duped
     }
@@ -220,7 +232,9 @@ mod tests {
         let found = detect_models(&dir);
         let ids: Vec<&str> = found.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"gpt-4o"), "{ids:?}");
-        assert!(ids.iter().any(|s| s.eq_ignore_ascii_case("claude-3-5-sonnet")));
+        assert!(ids
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("claude-3-5-sonnet")));
         // gpt-4o is only in src/a.py + src/b.rs (node_modules + README skipped) → 2 files
         let gpt = found.iter().find(|m| m.id == "gpt-4o").unwrap();
         assert_eq!(gpt.count, 2, "node_modules + README must be skipped");
