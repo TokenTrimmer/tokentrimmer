@@ -29,6 +29,22 @@ pub fn decide_token(arg: Option<String>, stdin: Option<String>) -> anyhow::Resul
     }
 }
 
+/// The OS-specific command to open `url` in the default browser. `None` for an
+/// unrecognized OS (the caller then just prints the URL).
+#[must_use]
+pub fn browser_command_for(os: &str, url: &str) -> Option<(&'static str, Vec<String>)> {
+    match os {
+        "macos" => Some(("open", vec![url.to_string()])),
+        "linux" => Some(("xdg-open", vec![url.to_string()])),
+        // The empty title arg keeps `start` from treating a quoted URL as a title.
+        "windows" => Some((
+            "cmd",
+            vec!["/C".into(), "start".into(), String::new(), url.to_string()],
+        )),
+        _ => None,
+    }
+}
+
 /// `tt login --token <KEY>` (browser login lands in V2). `--token -` reads the
 /// key from stdin (keeps it out of shell history). Optionally persists base URL.
 pub fn login_with_token(token: Option<String>, base_url: Option<String>) -> anyhow::Result<()> {
@@ -144,5 +160,29 @@ mod tests {
         assert!(decide_token(Some("   ".into()), None).is_err());
         assert!(decide_token(Some("-".into()), Some("\n".into())).is_err());
         assert!(decide_token(Some("-".into()), None).is_err());
+    }
+
+    #[test]
+    fn browser_command_per_os() {
+        assert_eq!(
+            browser_command_for("macos", "http://x"),
+            Some(("open", vec!["http://x".to_string()]))
+        );
+        assert_eq!(
+            browser_command_for("linux", "http://x"),
+            Some(("xdg-open", vec!["http://x".to_string()]))
+        );
+        let (prog, args) = browser_command_for("windows", "http://x").unwrap();
+        assert_eq!(prog, "cmd");
+        assert_eq!(
+            args,
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                String::new(),
+                "http://x".to_string()
+            ]
+        );
+        assert!(browser_command_for("plan9", "http://x").is_none());
     }
 }
