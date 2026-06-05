@@ -23,6 +23,7 @@ tt-provider-mistral.workspace = true
 tt-provider-groq.workspace = true
 tt-provider-together.workspace = true
 tt-provider-openrouter.workspace = true
+tt-provider-local.workspace = true
 
 sqlx.workspace = true
 blake3.workspace = true
