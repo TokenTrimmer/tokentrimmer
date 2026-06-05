@@ -97,6 +97,24 @@ pub fn heading(msg: &str) {
     println!("{}", format_heading(msg));
 }
 
+/// Success line content for STDERR (green ✓). Stderr-gated so a redirected
+/// `2>err.log` never receives ANSI.
+#[must_use]
+pub fn format_ok(msg: &str) -> String {
+    format!("{} {}", Style::new().green().for_stderr().apply_to(OK), msg)
+}
+
+/// Success line on STDERR — used for report summaries so it never pollutes the
+/// stdout report body.
+pub fn ok(msg: &str) {
+    eprintln!("{}", format_ok(msg));
+}
+
+/// Neutral/status line on STDERR (dim) — e.g. "wrote … to <file>".
+pub fn note(msg: &str) {
+    eprintln!("{}", Style::new().dim().for_stderr().apply_to(msg));
+}
+
 /// A `comfy-table` builder. With color enabled → rounded UTF-8 borders; when
 /// disabled (piped / `NO_COLOR`) → a borderless plain layout, so scripts and
 /// `grep` get clean columnar text instead of box-drawing characters.
@@ -170,6 +188,13 @@ mod tests {
         assert_eq!(format_success("done"), "✓ done");
         assert_eq!(format_error("nope"), "✗ nope");
         assert_eq!(format_warn("careful"), "! careful");
+    }
+
+    #[test]
+    fn ok_formatter_has_check_prefix() {
+        console::set_colors_enabled(false);
+        console::set_colors_enabled_stderr(false);
+        assert_eq!(format_ok("done"), "✓ done");
     }
 
     #[test]
