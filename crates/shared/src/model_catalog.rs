@@ -129,7 +129,9 @@ mod tests {
         assert_eq!(codestral.max_input_tokens, 256_000);
         let pixtral = c.model_info("mistral", "pixtral-large-latest").unwrap();
         assert!(pixtral.capabilities.contains(&Capability::Vision));
-        let deepseek = c.model_info("groq", "deepseek-r1-distill-llama-70b").unwrap();
+        let deepseek = c
+            .model_info("groq", "deepseek-r1-distill-llama-70b")
+            .unwrap();
         assert!(deepseek.capabilities.contains(&Capability::Reasoning));
         // namespaced ids are distinct (provider, model) keys
         let or_gemini = c.model_info("openrouter", "google/gemini-3.1-pro").unwrap();
