@@ -46,14 +46,56 @@ pub struct ModelUsage {
     pub example_file: String,
 }
 
+/// Dot-segment suffixes that mark a match as a filename/hostname, not a model id.
+const FILE_HOST_EXTS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rs", "go", "rb", "java", "kt", "php", "cs",
+    "json", "yaml", "yml", "toml", "md", "txt", "lock", "html", "css", "scss", "sh", "com", "net",
+    "org", "io", "dev", "example", "local",
+];
+/// Common second-segments that mean a `<prefix>-<word>` match is not a model id.
+const NON_MODEL_WORDS: &[&str] = &[
+    "config", "helper", "utils", "util", "client", "service", "handler", "manager", "loader",
+    "wrapper", "factory", "provider", "adapter", "key", "keys", "token", "tokens", "secret", "api",
+];
+
 fn model_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(gpt-[\w.\-]+|claude-[\w.\-]+|gemini-[\w.\-]+|o[1-9]-[\w.\-]+|mistral-[\w.\-]+|llama-?[0-9][\w.\-]*|text-embedding-[\w.\-]+)\b",
+            r"(?i)\b(gpt-[\w.\-]+|claude-[\w.\-]+|gemini-[\w.\-]+|o[1-9](?:-(?:mini|preview|pro|high|low|nano))?|mistral-[\w.\-]+|llama-?[0-9][\w.\-]*|deepseek-[\w.\-]+|grok-[\w.\-]+|qwen[\w.\-]*|command-r[\w.\-]*|text-embedding-[\w.\-]+)\b",
         )
         .expect("valid model regex")
     })
+}
+
+/// Reject regex matches that are actually filenames, hostnames, non-model words,
+/// or non-existent o-series numbers — the regex prefixes over-match by design.
+fn looks_like_model_id(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    if lower.contains('/') {
+        return false; // path / URL fragment
+    }
+    if let Some((_, ext)) = lower.rsplit_once('.') {
+        if FILE_HOST_EXTS.contains(&ext) {
+            return false; // foo.ts, creds.json, host.com, …
+        }
+    }
+    // o-series: only the real reasoning ids (o1 / o3 / o4), not o2-sensor etc.
+    if lower.starts_with('o') && lower.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
+        let base: String = lower
+            .chars()
+            .take_while(|c| *c == 'o' || c.is_ascii_digit())
+            .collect();
+        return matches!(base.as_str(), "o1" | "o3" | "o4");
+    }
+    // reject obvious non-model second segments (claude-config, gpt-helper, …)
+    if let Some((_, rest)) = lower.split_once('-') {
+        let second = rest.split(['-', '.']).next().unwrap_or(&rest);
+        if NON_MODEL_WORDS.contains(&second) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Extract known model-id mentions from `text` (de-duped, first-seen order).
@@ -63,6 +105,9 @@ pub fn scan_text_for_models(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for m in model_re().find_iter(text) {
         let id = m.as_str().to_string();
+        if !looks_like_model_id(&id) {
+            continue;
+        }
         if seen.insert(id.to_ascii_lowercase()) {
             out.push(id);
         }
@@ -197,25 +242,46 @@ mod tests {
 
     #[test]
     fn scan_extracts_model_ids() {
-        let t = r#"client.chat("gpt-4o-mini"); model = "claude-3-5-sonnet"; use o3-mini;
-                   var llamaindex = 1; pick "mistral-large-latest"; llama-3.3-70b"#;
+        let t = r#"client.chat("gpt-4o-mini"); model = "claude-3-5-sonnet"; use o3; o1;
+                   pick "mistral-large-latest"; llama-3.3-70b; "deepseek-r1"; grok-2; "qwen-2.5-72b""#;
         let ids = scan_text_for_models(t);
-        assert!(ids.contains(&"gpt-4o-mini".to_string()), "{ids:?}");
-        assert!(ids
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case("claude-3-5-sonnet")));
-        assert!(ids.iter().any(|s| s.eq_ignore_ascii_case("o3-mini")));
-        assert!(ids
-            .iter()
-            .any(|s| s.to_ascii_lowercase().starts_with("mistral-large")));
-        assert!(ids
-            .iter()
-            .any(|s| s.to_ascii_lowercase().starts_with("llama-3.3")));
-        assert!(!ids
-            .iter()
-            .any(|s| s.to_ascii_lowercase().contains("llamaindex")));
+        for want in [
+            "gpt-4o-mini",
+            "claude-3-5-sonnet",
+            "o3",
+            "o1",
+            "mistral-large-latest",
+            "llama-3.3-70b",
+            "deepseek-r1",
+            "grok-2",
+            "qwen-2.5-72b",
+        ] {
+            assert!(
+                ids.iter().any(|s| s.eq_ignore_ascii_case(want)),
+                "missing {want}: {ids:?}"
+            );
+        }
         assert!(scan_text_for_models("no models here").is_empty());
         assert_eq!(scan_text_for_models("gpt-4o gpt-4o").len(), 1); // de-duped
+    }
+
+    #[test]
+    fn scan_rejects_false_positives() {
+        // filenames, hostnames, non-model words, o2/o5 must NOT be detected
+        for c in [
+            "import claude-helper.ts",
+            "the o2-sensor reading",
+            "load gemini-credentials.json",
+            "https://api.gpt-4o.example.com/v1",
+            "claude-config",
+            "var llamaindex = 1",
+        ] {
+            assert!(
+                scan_text_for_models(c).is_empty(),
+                "{c:?} → {:?}",
+                scan_text_for_models(c)
+            );
+        }
     }
 
     #[test]
