@@ -108,6 +108,74 @@ pub fn trim_to_budget(conv: &mut Conversation, target: u32, provider: &str) -> u
     original - conv.messages.len()
 }
 
+/// Per-session context budget + warn/trim state.
+pub struct ContextState {
+    /// Explicit budget from `--max-context` / `/context <n>`; otherwise the
+    /// per-model window is used.
+    pub override_budget: Option<u32>,
+    warned: bool,
+}
+
+impl ContextState {
+    #[must_use]
+    pub fn new(override_budget: Option<u32>) -> Self {
+        Self {
+            override_budget,
+            warned: false,
+        }
+    }
+
+    /// Effective budget for `model`: the override if set, else the window table.
+    #[must_use]
+    pub fn budget(&self, model: &str) -> u32 {
+        self.override_budget.unwrap_or_else(|| model_window(model))
+    }
+
+    /// Estimated tokens for the conversation.
+    #[must_use]
+    pub fn estimate(&self, conv: &Conversation) -> u32 {
+        estimate_conversation_tokens(conv, ESTIMATE_PROVIDER)
+    }
+
+    /// Warn at 75%, auto-trim at 95% (down to ~70%). Call after the user turn is
+    /// pushed and before sending. Prints via `ui`; may mutate `conv` (trim).
+    pub fn manage(&mut self, conv: &mut Conversation) {
+        let budget = self.budget(&conv.model);
+        if budget == 0 {
+            return;
+        }
+        let est = self.estimate(conv);
+        let frac = f64::from(est) / f64::from(budget);
+        if frac > TRIM_FRAC {
+            let target = (f64::from(budget) * TRIM_TARGET_FRAC) as u32;
+            let dropped = trim_to_budget(conv, target, ESTIMATE_PROVIDER);
+            if dropped > 0 {
+                ui::note(&format!(
+                    "(context ~{est}/{budget} tok — trimmed {dropped} old message(s))"
+                ));
+            }
+            self.warned = false;
+        } else if frac > WARN_FRAC {
+            if !self.warned {
+                let pct = (frac * 100.0) as u32;
+                ui::warn(&format!(
+                    "context ~{est}/{budget} tok ({pct}%) — oldest turns auto-trim near the limit"
+                ));
+                self.warned = true;
+            }
+        } else {
+            self.warned = false;
+        }
+    }
+}
+
+/// Manual `/trim`: drop oldest turns to ~70% of the effective budget.
+#[must_use]
+pub fn manual_trim(conv: &mut Conversation, ctx: &ContextState) -> usize {
+    let target = (f64::from(ctx.budget(&conv.model)) * TRIM_TARGET_FRAC) as u32;
+    trim_to_budget(conv, target, ESTIMATE_PROVIDER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +188,35 @@ mod tests {
         assert_eq!(model_window("o1-preview"), 200_000);
         assert_eq!(model_window("gemini-2.0-pro"), 1_000_000);
         assert_eq!(model_window("some-unknown-model"), DEFAULT_CONTEXT_BUDGET);
+    }
+
+    #[test]
+    fn budget_uses_override_then_model() {
+        let with = ContextState::new(Some(64_000));
+        assert_eq!(with.budget("claude-3-5-sonnet"), 64_000); // override wins
+        let auto = ContextState::new(None);
+        assert_eq!(auto.budget("claude-3-5-sonnet"), 200_000); // model window
+        assert_eq!(auto.budget("mystery"), DEFAULT_CONTEXT_BUDGET);
+    }
+
+    #[test]
+    fn manage_warns_once_then_trims() {
+        console::set_colors_enabled(false);
+        let mut c = Conversation::new("gpt-4o-mini".into(), None);
+        c.push_user("a few words here to use some of the budget".into());
+        let est = estimate_conversation_tokens(&c, ESTIMATE_PROVIDER);
+        // budget chosen so the current size sits at ~80% → the warn band (75–95%)
+        let mut st = ContextState::new(Some((f64::from(est) / 0.80) as u32));
+        st.manage(&mut c);
+        assert!(st.warned, "should warn in the 75–95% band (est={est})");
+        // grow well past 95% → auto-trim
+        for i in 0..12 {
+            c.push_user(format!("more filler text number {i} to overflow the budget"));
+            c.push_assistant(format!("and a reply number {i} adding yet more context tokens"));
+        }
+        let before = c.messages.len();
+        st.manage(&mut c);
+        assert!(c.messages.len() < before, "manage should have trimmed");
     }
 
     #[test]
