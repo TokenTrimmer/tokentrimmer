@@ -72,6 +72,10 @@ pub struct RouteConditions {
     /// (`ContentPart::InputAudio`). `Some(false)` requires no audio; `None` ignores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_audio: Option<bool>,
+    /// Match if the request's user+system text contains ANY of these keywords
+    /// (case-insensitive substring). Empty = ignore.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_contains_any_of: Vec<String>,
 }
 
 /// What a matching [`Route`] does to the request before dispatch.
@@ -186,6 +190,16 @@ fn matches(
     }
     if let Some(want) = c.has_audio {
         if tt_shared::capability_check::request_has_audio(req) != want {
+            return false;
+        }
+    }
+    if !c.prompt_contains_any_of.is_empty() {
+        let text = tt_shared::capability_check::request_input_text(req).to_lowercase();
+        if !c
+            .prompt_contains_any_of
+            .iter()
+            .any(|kw| text.contains(&kw.to_lowercase()))
+        {
             return false;
         }
     }
@@ -594,5 +608,72 @@ mod tests {
         assert_eq!(gateway_action.target_model, "claude-3-5-haiku");
         assert_eq!(gateway_action.fallbacks, vec!["gpt-4o-mini"]);
         assert_eq!(gateway_action.force_cache_layer.as_deref(), Some("l1"));
+    }
+
+    fn make_req_text(model: &str, text: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
+            messages: vec![Message::User {
+                content: MessageContent::Text(text.into()),
+                name: None,
+            }],
+            ..serde_json::from_str(r#"{"model":"placeholder","messages":[]}"#).unwrap()
+        }
+    }
+
+    #[test]
+    fn prompt_contains_matches_case_insensitive_any() {
+        let route = Route {
+            when: RouteConditions {
+                prompt_contains_any_of: vec!["confidential".into(), "salary".into()],
+                ..Default::default()
+            },
+            ..make_route("topic", 10, vec![], "local")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate(
+                &make_req_text("gpt-4o", "This is a Confidential memo"),
+                &make_ctx(None),
+                100
+            )
+            .is_some());
+        assert!(eng
+            .evaluate(
+                &make_req_text("gpt-4o", "my SALARY is"),
+                &make_ctx(None),
+                100
+            )
+            .is_some());
+        assert!(eng
+            .evaluate(
+                &make_req_text("gpt-4o", "the weather today"),
+                &make_ctx(None),
+                100
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn prompt_contains_anded_with_model_in() {
+        let route = Route {
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                prompt_contains_any_of: vec!["confidential".into()],
+                ..Default::default()
+            },
+            ..make_route("both", 10, vec!["gpt-4o"], "local")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate(
+                &make_req_text("gpt-4o", "confidential"),
+                &make_ctx(None),
+                100
+            )
+            .is_some());
+        assert!(eng
+            .evaluate(&make_req_text("gpt-4o", "hello"), &make_ctx(None), 100)
+            .is_none());
     }
 }

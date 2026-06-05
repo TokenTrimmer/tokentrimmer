@@ -41,6 +41,19 @@ fn matches_conditions(req: &RequestLog, c: &RouteConditions) -> bool {
     if c.has_images.is_some() || c.has_audio.is_some() {
         return false;
     }
+    if !c.prompt_contains_any_of.is_empty() {
+        let Some(body) = &req.body else {
+            return false;
+        };
+        let text = body.to_lowercase();
+        if !c
+            .prompt_contains_any_of
+            .iter()
+            .any(|kw| text.contains(&kw.to_lowercase()))
+        {
+            return false;
+        }
+    }
     true
 }
 
@@ -231,5 +244,24 @@ mod tests {
             },
         );
         assert!(match_route(&req("m", 1, None), &[r2]).is_none());
+    }
+
+    #[test]
+    fn prompt_contains_matches_body_else_no_match() {
+        let r = route(
+            "topic",
+            10,
+            true,
+            RouteConditions {
+                prompt_contains_any_of: vec!["confidential".into()],
+                ..Default::default()
+            },
+        );
+        // No body → conservative no-match.
+        assert!(match_route(&req("m", 1, None), &[r.clone()]).is_none());
+        // Body containing the keyword (case-insensitive) → match.
+        let mut with_body = req("m", 1, None);
+        with_body.body = Some("This is CONFIDENTIAL".into());
+        assert!(match_route(&with_body, &[r]).is_some());
     }
 }

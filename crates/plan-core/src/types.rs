@@ -131,6 +131,10 @@ pub struct RouteConditions {
     /// Mirror of `tt_routing::RouteConditions::has_audio`. See `has_images`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_audio: Option<bool>,
+    /// Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. Replay
+    /// matches against `RequestLog.body` when present, else conservative no-match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_contains_any_of: Vec<String>,
 }
 
 /// What a matching [`ProposedRoute`] does.
