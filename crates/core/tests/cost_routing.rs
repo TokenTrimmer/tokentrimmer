@@ -260,5 +260,8 @@ async fn reroute_then_block_on_ceiling() {
     let blocked = app.oneshot(chat_req("gpt-4o", &key, 2000)).await.unwrap();
     assert_eq!(blocked.status(), StatusCode::PAYMENT_REQUIRED);
     // The over-budget request was never dispatched (only the served one ran).
-    assert_eq!(served.lock().unwrap().clone(), vec!["gpt-4o-mini".to_string()]);
+    assert_eq!(
+        served.lock().unwrap().clone(),
+        vec!["gpt-4o-mini".to_string()]
+    );
 }

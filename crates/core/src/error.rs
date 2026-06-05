@@ -32,7 +32,9 @@ pub enum ApiError {
     #[error("no upstream credential for provider {provider}")]
     MissingProviderCredential { provider: String },
 
-    #[error("estimated cost ${estimated_usd:.4} exceeds the ${ceiling_usd:.4} per-request ceiling")]
+    #[error(
+        "estimated cost ${estimated_usd:.4} exceeds the ${ceiling_usd:.4} per-request ceiling"
+    )]
     CostLimitExceeded {
         estimated_usd: f64,
         ceiling_usd: f64,

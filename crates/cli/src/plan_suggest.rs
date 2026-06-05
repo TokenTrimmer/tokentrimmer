@@ -56,6 +56,7 @@ pub fn suggestions_to_proposed_routes(
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         })
         .collect()

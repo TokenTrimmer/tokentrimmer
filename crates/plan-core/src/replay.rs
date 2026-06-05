@@ -279,7 +279,11 @@ fn project_requests(
                     // be rejected at runtime — count it unchanged (never a saving)
                     // and surface a caveat. Cache hits are served for free and are
                     // never blocked.
-                    if !is_cache_hit && route.then.max_cost_usd.is_some_and(|c| projected.cost_usd > c)
+                    if !is_cache_hit
+                        && route
+                            .then
+                            .max_cost_usd
+                            .is_some_and(|c| projected.cost_usd > c)
                     {
                         projected_cost = req.cost_usd;
                         would_block += 1;
