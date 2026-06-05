@@ -211,8 +211,12 @@ mod tests {
         assert!(st.warned, "should warn in the 75–95% band (est={est})");
         // grow well past 95% → auto-trim
         for i in 0..12 {
-            c.push_user(format!("more filler text number {i} to overflow the budget"));
-            c.push_assistant(format!("and a reply number {i} adding yet more context tokens"));
+            c.push_user(format!(
+                "more filler text number {i} to overflow the budget"
+            ));
+            c.push_assistant(format!(
+                "and a reply number {i} adding yet more context tokens"
+            ));
         }
         let before = c.messages.len();
         st.manage(&mut c);
@@ -230,7 +234,7 @@ mod tests {
         let dropped = trim_to_budget(&mut c, 20, ESTIMATE_PROVIDER); // tiny target
         assert!(dropped > 0 && c.messages.len() < before);
         assert_eq!(c.system.as_deref(), Some("be terse")); // system kept
-        // a clean boundary: first kept message is a User
+                                                           // a clean boundary: first kept message is a User
         assert!(matches!(c.messages.first(), Some(Message::User { .. })));
         // the most recent message (assistant reply #7) is preserved
         assert!(matches!(
@@ -264,7 +268,7 @@ mod tests {
         c.push_user("new question".into());
         c.push_assistant("new answer".into());
         trim_to_budget(&mut c, 5, ESTIMATE_PROVIDER); // force aggressive trim
-        // never start the window on a Tool or tool-call Assistant
+                                                      // never start the window on a Tool or tool-call Assistant
         assert!(!matches!(c.messages.first(), Some(Message::Tool { .. })));
         assert!(!matches!(
             c.messages.first(),

@@ -131,6 +131,9 @@ enum Command {
         /// Enable tool-calling from the start (find_route_for, preview_cost, inspect_diff).
         #[arg(long)]
         tools: bool,
+        /// Token budget for context management (default: the per-model window).
+        #[arg(long)]
+        max_context: Option<u32>,
         #[arg(long, global = true)]
         tt_api_key: Option<String>,
         #[arg(long, global = true)]
@@ -459,10 +462,20 @@ async fn main() -> anyhow::Result<()> {
             system,
             resume,
             tools,
+            max_context,
             tt_api_key,
             tt_api_base,
         } => {
-            tt_cli::chat::run(model, system, resume, tools, tt_api_key, tt_api_base).await?;
+            tt_cli::chat::run(
+                model,
+                system,
+                resume,
+                tools,
+                max_context,
+                tt_api_key,
+                tt_api_base,
+            )
+            .await?;
         }
         Command::Init {
             path,

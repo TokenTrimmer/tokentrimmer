@@ -91,6 +91,8 @@ pub enum Command {
     Retry,
     Copy,
     Tools(Option<bool>),
+    Context(Option<u32>),
+    Trim,
     Unknown(String),
     Chat(String),
 }
@@ -129,6 +131,8 @@ impl Command {
                 Some("off") | Some("false") | Some("disable") => Some(false),
                 _ => None,
             }),
+            "context" => Command::Context(arg.as_deref().and_then(|a| a.parse().ok())),
+            "trim" => Command::Trim,
             other => Command::Unknown(other.to_string()),
         }
     }
@@ -472,6 +476,8 @@ fn print_help() {
             "/tools [on|off]",
             "toggle tool-calling (find_route_for, preview_cost, inspect_diff)",
         ),
+        ("/context [n]", "show or set the token budget"),
+        ("/trim", "drop oldest turns to fit the budget"),
         ("/save [name]", "save this conversation"),
         ("/resume <name>", "load a saved conversation"),
         ("/sessions", "list saved conversations"),
@@ -492,6 +498,7 @@ pub async fn run(
     system: Option<String>,
     resume: Option<String>,
     tools: bool,
+    max_context: Option<u32>,
     flag_key: Option<String>,
     flag_base: Option<String>,
 ) -> anyhow::Result<()> {
@@ -514,6 +521,7 @@ pub async fn run(
     let mut ledger = Ledger::default();
     let registry = tools::build_registry();
     let mut tools_enabled = tools;
+    let mut ctx = budget::ContextState::new(max_context);
     ui::heading(&format!(
         "tt chat · {} via TokenTrimmer{}   (/help)",
         conv.model,
@@ -530,6 +538,7 @@ pub async fn run(
                     Command::Chat(t) if t.is_empty() => {}
                     Command::Chat(t) => {
                         conv.push_user(t);
+                        ctx.manage(&mut conv);
                         if !dispatch_turn(
                             &http,
                             &base,
@@ -590,6 +599,24 @@ pub async fn run(
                         }
                     }
                     Command::Cost => ui::info(&ledger.summary()),
+                    Command::Context(set) => {
+                        if let Some(n) = set {
+                            ctx.override_budget = Some(n);
+                            ui::info(&format!("context budget → {n} tokens"));
+                        } else {
+                            let budget = ctx.budget(&conv.model);
+                            let est = ctx.estimate(&conv);
+                            let pct = if budget > 0 { est * 100 / budget } else { 0 };
+                            ui::info(&format!(
+                                "context: ~{est} / {budget} tokens ({pct}%) [{}]",
+                                conv.model
+                            ));
+                        }
+                    }
+                    Command::Trim => {
+                        let dropped = budget::manual_trim(&mut conv, &ctx);
+                        ui::info(&format!("trimmed {dropped} old message(s)"));
+                    }
                     Command::Tools(set) => {
                         tools_enabled = set.unwrap_or(!tools_enabled);
                         if tools_enabled {
@@ -601,6 +628,7 @@ pub async fn run(
                     Command::Editor => match compose_in_editor() {
                         Ok(Some(t)) => {
                             conv.push_user(t);
+                            ctx.manage(&mut conv);
                             if !dispatch_turn(
                                 &http,
                                 &base,
