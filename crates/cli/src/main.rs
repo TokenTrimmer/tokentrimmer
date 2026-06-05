@@ -219,6 +219,9 @@ enum RouteAction {
         /// Match only requests tagged with this value (X-TokenTrimmer-Tag header).
         #[arg(long)]
         when_tag: Option<String>,
+        /// Match only requests whose prompt contains this keyword (repeatable).
+        #[arg(long)]
+        when_prompt_contains: Vec<String>,
         /// Make matched requests skip TokenTrimmer's cache entirely (privacy).
         #[arg(long)]
         disable_cache: bool,
@@ -502,6 +505,7 @@ async fn main() -> anyhow::Result<()> {
                     when_has_images,
                     when_has_audio,
                     when_tag,
+                    when_prompt_contains,
                     disable_cache,
                     priority,
                     name,
@@ -514,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
                     when_has_images,
                     when_has_audio,
                     when_tag,
+                    when_prompt_contains,
                     disable_cache,
                     priority,
                     name,
