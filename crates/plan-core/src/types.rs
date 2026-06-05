@@ -146,10 +146,9 @@ pub struct RouteConditions {
 /// reordering).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteAction {
-    /// Rewrite to this model on the same provider as the request. v1 is
-    /// same-provider only — cross-provider routing lands in a follow-up
-    /// because cost projection needs each provider's pricing table and we
-    /// want one source of truth here.
+    /// Rewrite to this model. May target a different provider than the request
+    /// (V3d-1). Cost projection resolves the target's own provider from the
+    /// pricing table; a target absent from the table is counted unchanged.
     pub target_model: String,
     /// Ordered fallback model ids, mirroring `tt_routing::RouteAction::fallbacks`.
     /// The replay engine does not yet simulate fallback firing (follow-up:

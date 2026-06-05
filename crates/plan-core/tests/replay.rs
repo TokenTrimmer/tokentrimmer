@@ -305,7 +305,13 @@ fn cross_provider_target_absent_is_conservative() {
             disable_cache: false,
         },
     };
-    let result = replay(input_with_routes(vec![req], vec![route], HashMap::new(), 100)).unwrap();
+    let result = replay(input_with_routes(
+        vec![req],
+        vec![route],
+        HashMap::new(),
+        100,
+    ))
+    .unwrap();
     assert_eq!(result.aggregates.requests_unprice_able, 1);
     assert_eq!(result.aggregates.requests_rerouted, 0);
     assert_eq!(result.aggregates.projected_savings_usd, 0.0);

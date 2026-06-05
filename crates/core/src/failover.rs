@@ -147,7 +147,10 @@ pub async fn dispatch_with_failover(
     candidates: &[String],
     req: &ChatCompletionRequest,
     ctx: &RequestContext,
-    credentials_by_provider: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    credentials_by_provider: &std::collections::HashMap<
+        String,
+        tt_shared::context::ProviderCredentials,
+    >,
     now: DateTime<Utc>,
     cap_check: Option<CapCheck<'_>>,
 ) -> Result<(Arc<dyn Provider>, ChatCompletionResponse), ProviderError> {
@@ -201,8 +204,10 @@ pub async fn dispatch_with_failover(
         cand_ctx.credentials = cand_creds.clone();
         let mut attempt_req = req.clone();
         attempt_req.model = model.clone();
-        let result =
-            with_retry(retry, || provider.chat_completion(attempt_req.clone(), &cand_ctx)).await;
+        let result = with_retry(retry, || {
+            provider.chat_completion(attempt_req.clone(), &cand_ctx)
+        })
+        .await;
         match result {
             Ok(resp) => {
                 breaker.record_success(provider.id());
@@ -252,7 +257,10 @@ pub async fn dispatch_stream_with_failover(
     candidates: &[String],
     req: &ChatCompletionRequest,
     ctx: &RequestContext,
-    credentials_by_provider: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    credentials_by_provider: &std::collections::HashMap<
+        String,
+        tt_shared::context::ProviderCredentials,
+    >,
     now: DateTime<Utc>,
     cap_check: Option<CapCheck<'_>>,
 ) -> Result<

@@ -442,18 +442,24 @@ pub async fn handler(
         let candidates: Vec<String> = std::iter::once(req.model.clone())
             .chain(route_fallbacks.iter().cloned())
             .collect();
-        let mut map = std::collections::HashMap::new();
+        // Distinct candidate providers, first-seen order — resolve each one's
+        // credential once.
+        let mut provider_ids: Vec<String> = Vec::new();
         for m in &candidates {
             if let Some(p) = state.registry.resolve(m) {
                 let pid = p.id().to_string();
-                if !map.contains_key(&pid) {
-                    if let Some(c) =
-                        resolve_credentials_for(&state, org_id, &pid, &raw_bearer, pid == source_provider_id)
-                            .await
-                    {
-                        map.insert(pid, c);
-                    }
+                if !provider_ids.contains(&pid) {
+                    provider_ids.push(pid);
                 }
+            }
+        }
+        let mut map = std::collections::HashMap::new();
+        for pid in provider_ids {
+            let allow_bearer = pid == source_provider_id;
+            if let Some(c) =
+                resolve_credentials_for(&state, org_id, &pid, &raw_bearer, allow_bearer).await
+            {
+                map.insert(pid, c);
             }
         }
         (candidates, map)

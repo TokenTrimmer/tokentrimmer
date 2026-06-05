@@ -237,7 +237,10 @@ async fn cross_provider_uses_target_credential() {
     let r = app.oneshot(chat("gpt-4o", &key, false)).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     // Dispatched to anthropic (the target) with ANTHROPIC's key — not OpenAI's.
-    assert_eq!(anthropic_keys.lock().unwrap().clone(), vec!["ANT".to_string()]);
+    assert_eq!(
+        anthropic_keys.lock().unwrap().clone(),
+        vec!["ANT".to_string()]
+    );
     assert!(openai_keys.lock().unwrap().is_empty());
     assert_eq!(
         r.headers()["x-tokentrimmer-provider"].to_str().unwrap(),
