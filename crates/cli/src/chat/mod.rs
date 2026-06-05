@@ -177,6 +177,19 @@ impl Conversation {
     }
 }
 
+/// Drain complete SSE frames (separated by a blank line) from the byte buffer,
+/// each decoded as a trimmed `String`. Incomplete trailing bytes stay in `buf`,
+/// so a multi-byte UTF-8 char (or a frame) split across network chunks is never
+/// decoded mid-sequence.
+fn drain_frames(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
+        let frame: Vec<u8> = buf.drain(..idx + 2).collect();
+        out.push(String::from_utf8_lossy(&frame).trim_end().to_string());
+    }
+    out
+}
+
 /// Stream one turn. Prints the assistant text live and the cost footer, and
 /// returns the full reply for history. Returns `Err` (turn failed) on a non-2xx
 /// gateway response so the caller can drop the unanswered user message.
@@ -214,16 +227,14 @@ async fn stream_turn(
 
     let mut stream = resp.bytes_stream();
     let mut spinner = Some(ui::spinner("…"));
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut reply = String::new();
     let mut usage: Option<UsageInfo> = None;
 
     'outer: while let Some(chunk) = stream.next().await {
-        let bytes = chunk.context("stream error")?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(idx) = buf.find("\n\n") {
-            let frame: String = buf.drain(..idx + 2).collect();
-            match parse_sse_frame(frame.trim_end()) {
+        buf.extend_from_slice(&chunk.context("stream error")?);
+        for frame in drain_frames(&mut buf) {
+            match parse_sse_frame(&frame) {
                 StreamEvent::Delta(t) => {
                     spinner.take(); // clear the spinner on the first token
                     print!("{t}");
@@ -400,6 +411,22 @@ mod tests {
         assert_eq!(s, "· gpt-4o-mini · 30 tok · $0.0001 · saved 75%");
         let s2 = format_turn_footer("gpt-4o", 5, 5, 0.001, 0.0, 0.0);
         assert_eq!(s2, "· gpt-4o · 10 tok · $0.0010");
+    }
+
+    #[test]
+    fn drain_frames_handles_chunk_split_multibyte() {
+        // "café" (é = 2 bytes) + frame terminator, split across two chunks so
+        // the second chunk starts mid-é and mid-terminator.
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}\n\n".as_bytes();
+        let (a, b) = full.split_at(full.len() - 3);
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(a);
+        assert!(drain_frames(&mut buf).is_empty(), "no complete frame yet");
+        buf.extend_from_slice(b);
+        let frames = drain_frames(&mut buf);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(parse_sse_frame(&frames[0]), StreamEvent::Delta(t) if t == "café"));
+        assert!(buf.is_empty());
     }
 
     #[test]
