@@ -11,6 +11,8 @@ use tt_shared::messages::{Message, MessageContent};
 use crate::context::ResolvedContext;
 use crate::ui;
 
+pub mod session;
+
 const DEFAULT_CHAT_MODEL: &str = "gpt-4o-mini";
 
 /// Cost/usage payload from the gateway's terminal `tokentrimmer.usage` SSE event.
@@ -79,6 +81,10 @@ pub enum Command {
     Exit,
     Model(Option<String>),
     System(Option<String>),
+    Save(Option<String>),
+    Resume(String),
+    Sessions,
+    Cost,
     Unknown(String),
     Chat(String),
 }
@@ -102,6 +108,13 @@ impl Command {
             "exit" | "quit" | "q" => Command::Exit,
             "model" => Command::Model(arg),
             "system" => Command::System(arg),
+            "save" => Command::Save(arg),
+            "resume" | "load" => match arg {
+                Some(n) => Command::Resume(n),
+                None => Command::Unknown("resume (usage: /resume <name>)".to_string()),
+            },
+            "sessions" => Command::Sessions,
+            "cost" => Command::Cost,
             other => Command::Unknown(other.to_string()),
         }
     }
@@ -131,7 +144,8 @@ pub fn format_turn_footer(
     ui::muted().apply_to(s).to_string()
 }
 
-/// In-memory conversation state.
+/// In-memory conversation state (also the on-disk session format).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
     pub model: String,
     pub system: Option<String>,
@@ -177,6 +191,36 @@ impl Conversation {
     }
 }
 
+/// Running cost/savings totals for the current chat session.
+#[derive(Default)]
+pub struct Ledger {
+    pub turns: u32,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub baseline_usd: f64,
+}
+
+impl Ledger {
+    pub fn add(&mut self, u: &UsageInfo) {
+        self.turns += 1;
+        self.cost_usd += u.cost_usd;
+        self.saved_usd += u.saved_usd;
+        self.baseline_usd += u.baseline_cost_usd;
+    }
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let pct = if self.baseline_usd > 0.0 {
+            (self.saved_usd / self.baseline_usd * 100.0).round()
+        } else {
+            0.0
+        };
+        format!(
+            "session: {} turn(s) · ${:.4} spent · saved ${:.4} ({pct:.0}%)",
+            self.turns, self.cost_usd, self.saved_usd
+        )
+    }
+}
+
 /// Drain complete SSE frames (separated by a blank line) from the byte buffer,
 /// each decoded as a trimmed `String`. Incomplete trailing bytes stay in `buf`,
 /// so a multi-byte UTF-8 char (or a frame) split across network chunks is never
@@ -198,7 +242,7 @@ async fn stream_turn(
     base: &str,
     key: &str,
     conv: &Conversation,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<UsageInfo>)> {
     let body = json!({
         "model": conv.model,
         "messages": conv.wire_messages(),
@@ -250,7 +294,7 @@ async fn stream_turn(
     }
     drop(spinner);
     println!();
-    if let Some(u) = usage {
+    if let Some(u) = &usage {
         println!(
             "{}",
             format_turn_footer(
@@ -263,7 +307,7 @@ async fn stream_turn(
             )
         );
     }
-    Ok(reply)
+    Ok((reply, usage))
 }
 
 fn print_help() {
@@ -273,6 +317,10 @@ fn print_help() {
         ("/clear", "reset the conversation"),
         ("/model [m]", "show or switch the requested model"),
         ("/system [s]", "show or set the system prompt"),
+        ("/save [name]", "save this conversation"),
+        ("/resume <name>", "load a saved conversation"),
+        ("/sessions", "list saved conversations"),
+        ("/cost", "session cost + savings so far"),
         ("/exit", "quit (or Ctrl-D)"),
     ] {
         println!(
@@ -287,6 +335,7 @@ fn print_help() {
 pub async fn run(
     model: Option<String>,
     system: Option<String>,
+    resume: Option<String>,
     flag_key: Option<String>,
     flag_base: Option<String>,
 ) -> anyhow::Result<()> {
@@ -297,10 +346,16 @@ pub async fn run(
     let base = ctx.base_url.trim_end_matches('/').to_string();
     let http = reqwest::Client::new();
 
-    let mut conv = Conversation::new(
-        model.unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string()),
-        system,
-    );
+    let mut conv = match resume {
+        Some(n) => {
+            session::load(&session::sessions_dir(), &n).with_context(|| format!("resume `{n}`"))?
+        }
+        None => Conversation::new(
+            model.unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string()),
+            system,
+        ),
+    };
+    let mut ledger = Ledger::default();
     ui::heading(&format!(
         "tt chat · {} via TokenTrimmer   (/help)",
         conv.model
@@ -317,7 +372,12 @@ pub async fn run(
                     Command::Chat(t) => {
                         conv.push_user(t);
                         match stream_turn(&http, &base, &key, &conv).await {
-                            Ok(reply) => conv.push_assistant(reply),
+                            Ok((reply, usage)) => {
+                                conv.push_assistant(reply);
+                                if let Some(u) = usage {
+                                    ledger.add(&u);
+                                }
+                            }
                             Err(e) => {
                                 ui::error(&format!("{e:#}"));
                                 conv.messages.pop(); // drop the unanswered user turn
@@ -342,6 +402,34 @@ pub async fn run(
                         Some(s) => ui::info(&format!("system: {s}")),
                         None => ui::info("(no system prompt)"),
                     },
+                    Command::Save(name) => {
+                        let n = name.unwrap_or_else(|| session::auto_name(&conv));
+                        match session::save(&session::sessions_dir(), &n, &conv) {
+                            Ok(p) => ui::success(&format!("saved session → {}", p.display())),
+                            Err(e) => ui::error(&format!("{e:#}")),
+                        }
+                    }
+                    Command::Resume(name) => match session::load(&session::sessions_dir(), &name) {
+                        Ok(c) => {
+                            conv = c;
+                            ui::info(&format!("(resumed · {} messages)", conv.messages.len()));
+                        }
+                        Err(e) => ui::error(&format!("{e:#}")),
+                    },
+                    Command::Sessions => {
+                        let metas = session::list(&session::sessions_dir()).unwrap_or_default();
+                        if metas.is_empty() {
+                            ui::info("no saved sessions");
+                        } else {
+                            let mut t =
+                                ui::table(&["NAME", "MODEL", "TURNS"], console::colors_enabled());
+                            for m in metas {
+                                t.add_row(vec![m.name, m.model, m.turns.to_string()]);
+                            }
+                            println!("{t}");
+                        }
+                    }
+                    Command::Cost => ui::info(&ledger.summary()),
                     Command::Exit => break,
                     Command::Unknown(c) => {
                         ui::warn(&format!("unknown command /{c} — /help for commands"))
@@ -427,6 +515,26 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(matches!(parse_sse_frame(&frames[0]), StreamEvent::Delta(t) if t == "café"));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn ledger_accumulates() {
+        console::set_colors_enabled(false);
+        let u = UsageInfo {
+            cost_usd: 0.001,
+            baseline_cost_usd: 0.004,
+            saved_usd: 0.003,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_tokens: 0,
+        };
+        let mut l = Ledger::default();
+        l.add(&u);
+        l.add(&u);
+        assert_eq!(l.turns, 2);
+        let s = l.summary();
+        assert!(s.contains("2 turn"), "{s}");
+        assert!(s.contains("75%"), "{s}");
     }
 
     #[test]
