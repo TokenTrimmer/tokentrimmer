@@ -81,18 +81,23 @@ pub fn windows_map(models: &[CatalogModel]) -> HashMap<String, u32> {
         .collect()
 }
 
-/// Fetch the catalog from the gateway's `GET /v1/models`.
+/// Fetch the catalog from the gateway's `GET /v1/models`. The key is optional —
+/// `/v1/models` is public, so logged-out callers can still list it. A short
+/// per-request timeout keeps a hung/black-holed gateway from stalling the caller
+/// (e.g. `tt chat` startup); it bounds only this call, not the shared client's
+/// long-lived streaming requests.
 pub async fn fetch_catalog(
     http: &reqwest::Client,
     base: &str,
-    key: &str,
+    key: Option<&str>,
 ) -> anyhow::Result<Vec<CatalogModel>> {
-    let resp = http
+    let mut req = http
         .get(format!("{base}/v1/models"))
-        .bearer_auth(key)
-        .send()
-        .await
-        .context("request /v1/models")?;
+        .timeout(std::time::Duration::from_secs(5));
+    if let Some(k) = key {
+        req = req.bearer_auth(k);
+    }
+    let resp = req.send().await.context("request /v1/models")?;
     if !resp.status().is_success() {
         anyhow::bail!("gateway returned {} for /v1/models", resp.status());
     }
@@ -115,12 +120,11 @@ pub fn format_window(tokens: u64) -> String {
 /// `tt models` — fetch and print the gateway model catalog as a table.
 pub async fn run(flag_key: Option<String>, flag_base: Option<String>) -> anyhow::Result<()> {
     let ctx = ResolvedContext::load(flag_key, flag_base)?;
-    let key = ctx
-        .api_key_string()
-        .context("no API key — run `tt login --token <KEY>` or set TT_API_KEY")?;
+    // `/v1/models` is public — send the key if we have one, but don't require it.
+    let key = ctx.api_key_string();
     let base = ctx.base_url.trim_end_matches('/').to_string();
     let http = reqwest::Client::new();
-    let models = fetch_catalog(&http, &base, &key).await?;
+    let models = fetch_catalog(&http, &base, key.as_deref()).await?;
 
     let mut table = ui::table(
         &["MODEL", "PROVIDER", "CONTEXT", "CAPS", "$IN/1M", "$OUT/1M"],
@@ -184,9 +188,31 @@ mod tests {
                 .body(SAMPLE);
         });
         let http = reqwest::Client::new();
-        let models = fetch_catalog(&http, &server.base_url(), "k").await.unwrap();
+        let models = fetch_catalog(&http, &server.base_url(), Some("k"))
+            .await
+            .unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[1].id, "claude-haiku-4-5");
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_works_without_key() {
+        // /v1/models is public — a keyless fetch must still work (no Authorization).
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models").matches(|req| {
+                !req.headers.as_ref().is_some_and(|h| {
+                    h.iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                })
+            });
+            then.status(200).body(SAMPLE);
+        });
+        let http = reqwest::Client::new();
+        let models = fetch_catalog(&http, &server.base_url(), None)
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 2);
     }
 
     #[tokio::test]
@@ -197,7 +223,9 @@ mod tests {
             then.status(503).body("nope");
         });
         let http = reqwest::Client::new();
-        assert!(fetch_catalog(&http, &server.base_url(), "k").await.is_err());
+        assert!(fetch_catalog(&http, &server.base_url(), Some("k"))
+            .await
+            .is_err());
     }
 
     #[test]

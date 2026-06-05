@@ -523,7 +523,7 @@ pub async fn run(
     let mut tools_enabled = tools;
     // Best-effort: real per-model windows from the gateway catalog. On any
     // failure (offline / old gateway / pre-auth) fall back to the prefix table.
-    let catalog_windows = match crate::catalog::fetch_catalog(&http, &base, &key).await {
+    let catalog_windows = match crate::catalog::fetch_catalog(&http, &base, Some(&key)).await {
         Ok(models) => crate::catalog::windows_map(&models),
         Err(_) => std::collections::HashMap::new(),
     };
