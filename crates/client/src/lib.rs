@@ -203,7 +203,12 @@ impl ChatBuilder<'_> {
     /// [`Error::Request`] on transport failure, [`Error::Status`] on a non-2xx
     /// response, [`Error::Decode`] if the body isn't a chat completion.
     pub async fn send(self) -> Result<ChatOutcome> {
-        let body = build_body(&self.model, &self.messages, self.max_tokens, self.temperature);
+        let body = build_body(
+            &self.model,
+            &self.messages,
+            self.max_tokens,
+            self.temperature,
+        );
         let mut req = self
             .client
             .http
@@ -245,13 +250,16 @@ impl ChatOutcome {
     /// The first choice's assistant text, if any.
     #[must_use]
     pub fn text(&self) -> Option<&str> {
-        self.response.choices.first().and_then(|c| match &c.message {
-            Message::Assistant {
-                content: Some(MessageContent::Text(t)),
-                ..
-            } => Some(t.as_str()),
-            _ => None,
-        })
+        self.response
+            .choices
+            .first()
+            .and_then(|c| match &c.message {
+                Message::Assistant {
+                    content: Some(MessageContent::Text(t)),
+                    ..
+                } => Some(t.as_str()),
+                _ => None,
+            })
     }
 
     /// Savings as a percentage of the baseline, when both are known.
@@ -270,9 +278,15 @@ mod tests {
 
     #[test]
     fn message_helpers() {
-        assert!(matches!(user("hi"), Message::User { content: MessageContent::Text(t), .. } if t == "hi"));
-        assert!(matches!(system("s"), Message::System { content: MessageContent::Text(t) } if t == "s"));
-        assert!(matches!(assistant("a"), Message::Assistant { content: Some(MessageContent::Text(t)), .. } if t == "a"));
+        assert!(
+            matches!(user("hi"), Message::User { content: MessageContent::Text(t), .. } if t == "hi")
+        );
+        assert!(
+            matches!(system("s"), Message::System { content: MessageContent::Text(t) } if t == "s")
+        );
+        assert!(
+            matches!(assistant("a"), Message::Assistant { content: Some(MessageContent::Text(t)), .. } if t == "a")
+        );
     }
 
     #[test]
