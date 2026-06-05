@@ -108,6 +108,36 @@ pub fn format_window(tokens: u64) -> String {
     }
 }
 
+/// `tt models` — fetch and print the gateway model catalog as a table.
+pub async fn run(flag_key: Option<String>, flag_base: Option<String>) -> anyhow::Result<()> {
+    let ctx = ResolvedContext::load(flag_key, flag_base)?;
+    let key = ctx
+        .api_key_string()
+        .context("no API key — run `tt login --token <KEY>` or set TT_API_KEY")?;
+    let base = ctx.base_url.trim_end_matches('/').to_string();
+    let http = reqwest::Client::new();
+    let models = fetch_catalog(&http, &base, &key).await?;
+
+    let mut table = ui::table(
+        &["MODEL", "PROVIDER", "CONTEXT", "CAPS", "$IN/1M", "$OUT/1M"],
+        console::colors_enabled(),
+    );
+    for m in &models {
+        let price = |p: Option<f64>| p.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+        table.add_row(vec![
+            m.id.clone(),
+            m.provider.clone(),
+            format_window(m.max_input_tokens),
+            m.capabilities.join(","),
+            price(m.input_per_million),
+            price(m.output_per_million),
+        ]);
+    }
+    println!("{table}");
+    ui::note(&format!("{} models", models.len()));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
