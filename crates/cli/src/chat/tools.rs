@@ -96,6 +96,132 @@ pub fn format_tool_call(name: &str, args: &str) -> String {
         .to_string()
 }
 
+fn header_f64(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
+    h.get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+}
+
+/// Run one chat turn with tools enabled: a non-streamed call/execute loop.
+/// Returns `true` on success. On any failure the conversation is truncated
+/// back to its entry length (no partial tool messages), matching `do_turn`'s
+/// contract so the caller's "pop the user on false" stays correct.
+pub async fn run_tool_turn(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    conv: &mut Conversation,
+    reg: &Registry,
+    ledger: &mut Ledger,
+) -> bool {
+    let start_len = conv.messages.len();
+    let tools = tools_json(reg);
+    for _round in 0..MAX_ROUNDS {
+        let body = json!({
+            "model": conv.model,
+            "messages": conv.wire_messages(),
+            "tools": tools,
+            "stream": false,
+        });
+        let resp = match http
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                ui::error(&format!("request to gateway failed: {e}"));
+                conv.messages.truncate(start_len);
+                return false;
+            }
+        };
+        let served_model = resp
+            .headers()
+            .get("x-tokentrimmer-model-used")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(&conv.model)
+            .to_string();
+        let cost = header_f64(resp.headers(), "x-tokentrimmer-cost-usd");
+        let saved = header_f64(resp.headers(), "x-tokentrimmer-saved-usd").unwrap_or(0.0);
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            ui::error(&format!("gateway returned {status}: {}", text.trim()));
+            conv.messages.truncate(start_len);
+            return false;
+        }
+        let v: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                ui::error(&format!("invalid gateway response: {e}"));
+                conv.messages.truncate(start_len);
+                return false;
+            }
+        };
+        let message = &v["choices"][0]["message"];
+        let calls = parse_tool_calls(message);
+        let in_tok = v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+        let out_tok = v["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+        let usage = cost.map(|c| usage_from_parts(c, saved, in_tok, out_tok));
+        if let Some(u) = &usage {
+            ledger.add(u);
+        }
+
+        if calls.is_empty() {
+            let content = message["content"].as_str().unwrap_or_default();
+            println!("{content}");
+            conv.push_assistant(content.to_string());
+            if let Some(u) = &usage {
+                println!(
+                    "{}",
+                    format_turn_footer(
+                        &served_model,
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cost_usd,
+                        u.saved_usd,
+                        u.baseline_cost_usd
+                    )
+                );
+            }
+            return true;
+        }
+
+        // assistant turn that requests tools — preserve any accompanying text
+        let content = message["content"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| MessageContent::Text(s.to_string()));
+        conv.messages.push(Message::Assistant {
+            content,
+            tool_calls: calls.clone(),
+            name: None,
+        });
+        for tc in &calls {
+            println!(
+                "{}",
+                format_tool_call(&tc.function.name, &tc.function.arguments)
+            );
+            let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
+            let out = match reg.call(&tc.function.name, args).await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e.to_string() }),
+            };
+            let out_str = out.to_string();
+            let preview: String = out_str.chars().take(120).collect();
+            println!("{}", ui::muted().apply_to(format!("  {preview}")));
+            conv.messages.push(Message::Tool {
+                content: MessageContent::Text(out_str),
+                tool_call_id: tc.id.clone(),
+            });
+        }
+    }
+    ui::warn("tool loop hit the round cap");
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

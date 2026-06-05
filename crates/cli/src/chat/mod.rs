@@ -89,6 +89,7 @@ pub enum Command {
     Editor,
     Retry,
     Copy,
+    Tools(Option<bool>),
     Unknown(String),
     Chat(String),
 }
@@ -122,6 +123,11 @@ impl Command {
             "editor" | "e" => Command::Editor,
             "retry" | "r" => Command::Retry,
             "copy" | "y" => Command::Copy,
+            "tools" => Command::Tools(match arg.as_deref() {
+                Some("on") | Some("true") | Some("enable") => Some(true),
+                Some("off") | Some("false") | Some("disable") => Some(false),
+                _ => None,
+            }),
             other => Command::Unknown(other.to_string()),
         }
     }
@@ -408,6 +414,23 @@ async fn do_turn(
     }
 }
 
+/// Route a turn to the tool-calling loop (tools on) or the streamed path (off).
+async fn dispatch_turn(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    conv: &mut Conversation,
+    ledger: &mut Ledger,
+    reg: &tt_mcp::tools::Registry,
+    tools_enabled: bool,
+) -> bool {
+    if tools_enabled {
+        tools::run_tool_turn(http, base, key, conv, reg, ledger).await
+    } else {
+        do_turn(http, base, key, conv, ledger).await
+    }
+}
+
 /// Open `$VISUAL`/`$EDITOR` (fallback `vi`) on a temp file and return the
 /// composed text, or `None` when left empty / the editor exits non-zero.
 fn compose_in_editor() -> anyhow::Result<Option<String>> {
@@ -444,6 +467,10 @@ fn print_help() {
         ("/editor", "compose a multi-line message in $VISUAL/$EDITOR"),
         ("/retry", "re-run the last turn"),
         ("/copy", "copy the last reply to the clipboard"),
+        (
+            "/tools [on|off]",
+            "toggle tool-calling (find_route_for, preview_cost, inspect_diff)",
+        ),
         ("/save [name]", "save this conversation"),
         ("/resume <name>", "load a saved conversation"),
         ("/sessions", "list saved conversations"),
@@ -463,6 +490,7 @@ pub async fn run(
     model: Option<String>,
     system: Option<String>,
     resume: Option<String>,
+    tools: bool,
     flag_key: Option<String>,
     flag_base: Option<String>,
 ) -> anyhow::Result<()> {
@@ -483,9 +511,12 @@ pub async fn run(
         ),
     };
     let mut ledger = Ledger::default();
+    let registry = tools::build_registry();
+    let mut tools_enabled = tools;
     ui::heading(&format!(
-        "tt chat · {} via TokenTrimmer   (/help)",
-        conv.model
+        "tt chat · {} via TokenTrimmer{}   (/help)",
+        conv.model,
+        if tools_enabled { " · tools on" } else { "" }
     ));
 
     let mut rl = rustyline::DefaultEditor::new().context("init readline")?;
@@ -498,7 +529,7 @@ pub async fn run(
                     Command::Chat(t) if t.is_empty() => {}
                     Command::Chat(t) => {
                         conv.push_user(t);
-                        if !do_turn(&http, &base, &key, &mut conv, &mut ledger).await {
+                        if !dispatch_turn(&http, &base, &key, &mut conv, &mut ledger, &registry, tools_enabled).await {
                             conv.messages.pop(); // drop the unanswered user turn
                         }
                     }
@@ -548,10 +579,18 @@ pub async fn run(
                         }
                     }
                     Command::Cost => ui::info(&ledger.summary()),
+                    Command::Tools(set) => {
+                        tools_enabled = set.unwrap_or(!tools_enabled);
+                        if tools_enabled {
+                            ui::info("tools: on (find_route_for, preview_cost, inspect_diff)");
+                        } else {
+                            ui::info("tools: off");
+                        }
+                    }
                     Command::Editor => match compose_in_editor() {
                         Ok(Some(t)) => {
                             conv.push_user(t);
-                            if !do_turn(&http, &base, &key, &mut conv, &mut ledger).await {
+                            if !dispatch_turn(&http, &base, &key, &mut conv, &mut ledger, &registry, tools_enabled).await {
                                 conv.messages.pop();
                             }
                         }
@@ -560,7 +599,7 @@ pub async fn run(
                     },
                     Command::Retry => match prepare_retry(&mut conv) {
                         RetryPlan::Ready { restore } => {
-                            if !do_turn(&http, &base, &key, &mut conv, &mut ledger).await {
+                            if !dispatch_turn(&http, &base, &key, &mut conv, &mut ledger, &registry, tools_enabled).await {
                                 // Failed retry → no-op on history: restore the
                                 // prior reply so we never leave a dangling user
                                 // turn or lose a good answer.
