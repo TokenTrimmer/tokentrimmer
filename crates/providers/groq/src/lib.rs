@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
-    pricing::{Capability, ModelInfo, ModelPricing},
+    pricing::{ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, Provider, ProviderError, RequestContext,
 };
@@ -120,57 +120,7 @@ impl Provider for GroqProvider {
 // ---------------------------------------------------------------------------
 
 fn models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "llama-3.3-70b-versatile".to_string(),
-            provider: "groq".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "llama-3.1-8b-instant".to_string(),
-            provider: "groq".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "deepseek-r1-distill-llama-70b".to_string(),
-            provider: "groq".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-                Capability::Reasoning,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "mixtral-8x7b-32768".to_string(),
-            provider: "groq".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 32_768,
-            max_output_tokens: 4_096,
-        },
-    ]
+    tt_shared::model_catalog::model_catalog().for_provider("groq")
 }
 
 /// Build the Groq model→rate map from the shared versioned pricing catalog.
