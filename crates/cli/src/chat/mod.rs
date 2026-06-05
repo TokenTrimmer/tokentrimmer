@@ -231,6 +231,28 @@ impl Ledger {
     }
 }
 
+/// Prepare the conversation to re-run the last turn: drop a trailing assistant
+/// reply if present. Returns true iff the conversation now ends with a user
+/// message (something to retry).
+fn prepare_retry(conv: &mut Conversation) -> bool {
+    if matches!(conv.messages.last(), Some(Message::Assistant { .. })) {
+        conv.messages.pop();
+    }
+    matches!(conv.messages.last(), Some(Message::User { .. }))
+}
+
+/// The text of the most recent assistant reply, if any.
+#[must_use]
+fn last_assistant_text(conv: &Conversation) -> Option<String> {
+    conv.messages.iter().rev().find_map(|m| match m {
+        Message::Assistant {
+            content: Some(MessageContent::Text(t)),
+            ..
+        } => Some(t.clone()),
+        _ => None,
+    })
+}
+
 /// Drain complete SSE frames (separated by a blank line) from the byte buffer,
 /// each decoded as a trimmed `String`. Incomplete trailing bytes stay in `buf`,
 /// so a multi-byte UTF-8 char (or a frame) split across network chunks is never
@@ -545,6 +567,29 @@ mod tests {
         let s = l.summary();
         assert!(s.contains("2 turn"), "{s}");
         assert!(s.contains("75%"), "{s}");
+    }
+
+    #[test]
+    fn prepare_retry_drops_assistant_keeps_user() {
+        let mut c = Conversation::new("m".into(), None);
+        assert!(!prepare_retry(&mut c), "empty conv: nothing to retry");
+        c.push_user("hi".into());
+        c.push_assistant("yo".into());
+        assert!(prepare_retry(&mut c), "should drop assistant, user remains");
+        assert_eq!(c.messages.len(), 1);
+        assert!(prepare_retry(&mut c), "user still present, no assistant to pop");
+        assert_eq!(c.messages.len(), 1);
+    }
+
+    #[test]
+    fn last_assistant_text_finds_latest() {
+        let mut c = Conversation::new("m".into(), None);
+        assert!(last_assistant_text(&c).is_none());
+        c.push_user("hi".into());
+        c.push_assistant("first".into());
+        c.push_user("more".into());
+        c.push_assistant("second".into());
+        assert_eq!(last_assistant_text(&c).as_deref(), Some("second"));
     }
 
     #[test]
