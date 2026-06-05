@@ -1403,7 +1403,9 @@ fn run_audit_verify(
     if !chain_path.exists() {
         tt_cli::ui::note(&format!("no chain to verify ({chain_path_str} not found)"));
         if let Some(o) = org {
-            tt_cli::ui::note(&format!("(org filter --org={o} noted; no entries to filter)"));
+            tt_cli::ui::note(&format!(
+                "(org filter --org={o} noted; no entries to filter)"
+            ));
         }
         return Ok(());
     }
@@ -1448,7 +1450,10 @@ fn run_audit_verify(
 
     match tt_telemetry::audit::verify_chain(&parsed.entries, &verifying_key) {
         Ok(()) => {
-            tt_cli::ui::ok(&format!("chain OK — all {} entries verified", parsed.entries.len()));
+            tt_cli::ui::ok(&format!(
+                "chain OK — all {} entries verified",
+                parsed.entries.len()
+            ));
         }
         Err(e) => {
             anyhow::bail!("chain verification FAILED: {e}");
