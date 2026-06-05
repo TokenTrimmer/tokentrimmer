@@ -90,7 +90,7 @@ fn looks_like_model_id(id: &str) -> bool {
     }
     // reject obvious non-model second segments (claude-config, gpt-helper, …)
     if let Some((_, rest)) = lower.split_once('-') {
-        let second = rest.split(['-', '.']).next().unwrap_or(&rest);
+        let second = rest.split(['-', '.']).next().unwrap_or(rest);
         if NON_MODEL_WORDS.contains(&second) {
             return false;
         }
