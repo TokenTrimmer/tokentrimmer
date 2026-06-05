@@ -1,6 +1,6 @@
 //! Typed Rust client for the TokenTrimmer gateway. OpenAI-compatible chat that
 //! returns a typed [`CostInfo`] parsed from the `x-tokentrimmer-*` headers, plus
-//! the `X-TokenTrimmer-Tag`/`-Route` extensions as first-class builder options.
+//! the `X-TokenTrimmer-Tag` extension as a first-class builder option.
 
 use futures::StreamExt as _;
 use reqwest::header::HeaderMap;
@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 // Re-export every tt-shared type reachable through the public API (so embedders
 // don't need a direct `tt-shared` dependency to read `outcome.response`).
 pub use tt_shared::messages::{
-    ChatCompletionResponse, Choice, ContentPart, Message, MessageContent, ToolCall,
-    ToolCallFunction,
+    ChatCompletionResponse, Choice, ContentPart, ImageUrl, InputAudio, Message, MessageContent,
+    ToolCall, ToolCallFunction,
 };
 pub use tt_shared::Usage;
 
@@ -383,12 +383,37 @@ pub struct ChatStream {
     header_cost: CostInfo,
 }
 
+// `inner` is a boxed `dyn Stream` (not `Debug`), so derive can't apply — hand-roll
+// one over the inspectable fields so `Result<ChatStream>` stays `unwrap_err`-able.
+impl std::fmt::Debug for ChatStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatStream")
+            .field("buf_len", &self.buf.len())
+            .field("pending", &self.pending.len())
+            .field("done", &self.done)
+            .field("header_cost", &self.header_cost)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ChatStream {
     /// Header-based cost/trace (`model_used`, `provider`, `trace_id`) — known
     /// before the body streams.
     #[must_use]
     pub fn header_cost(&self) -> &CostInfo {
         &self.header_cost
+    }
+
+    /// Parse every complete frame currently in `buf`, queueing the events.
+    fn drain_into_pending(&mut self) {
+        for frame in drain_frames(&mut self.buf) {
+            match parse_sse_frame(&frame) {
+                Frame::Delta(t) => self.pending.push_back(StreamEvent::Delta(t)),
+                Frame::Usage(u) => self.pending.push_back(StreamEvent::Usage(u)),
+                Frame::Done => self.done = true,
+                Frame::Ignore => {}
+            }
+        }
     }
 
     /// The next [`StreamEvent`], or `None` at end of stream.
@@ -406,17 +431,20 @@ impl ChatStream {
             match self.inner.next().await {
                 Some(Ok(chunk)) => {
                     self.buf.extend_from_slice(&chunk);
-                    for frame in drain_frames(&mut self.buf) {
-                        match parse_sse_frame(&frame) {
-                            Frame::Delta(t) => self.pending.push_back(StreamEvent::Delta(t)),
-                            Frame::Usage(u) => self.pending.push_back(StreamEvent::Usage(u)),
-                            Frame::Done => self.done = true,
-                            Frame::Ignore => {}
-                        }
-                    }
+                    self.drain_into_pending();
                 }
                 Some(Err(e)) => return Err(Error::Request(e)),
-                None => self.done = true,
+                None => {
+                    // SSE allows a stream to end without a trailing blank line —
+                    // EOF itself terminates the final event. Flush the residual
+                    // frame (append a synthetic separator so `drain_frames` sees
+                    // it) so a terminal `tokentrimmer.usage`/delta isn't dropped.
+                    if !self.buf.is_empty() {
+                        self.buf.extend_from_slice(b"\n\n");
+                        self.drain_into_pending();
+                    }
+                    self.done = true;
+                }
             }
         }
     }
@@ -597,6 +625,48 @@ mod tests {
         let client = Client::new(server.base_url(), "k");
         let result = client.chat().model("m").message(user("hi")).stream().await;
         assert!(matches!(result, Err(Error::Status { status: 500, .. })));
+    }
+
+    #[tokio::test]
+    async fn stream_flushes_unterminated_final_frame_at_eof() {
+        // Server closes right after the usage frame, with NO trailing blank line.
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "event: tokentrimmer.usage\n",
+            "data: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":7,\"output_tokens\":1,\"cached_tokens\":0}",
+        );
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse);
+        });
+
+        let client = Client::new(server.base_url(), "k");
+        let mut stream = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .stream()
+            .await
+            .unwrap();
+
+        let mut text = String::new();
+        let mut usage: Option<StreamUsage> = None;
+        while let Some(ev) = stream.next().await.unwrap() {
+            match ev {
+                StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::Usage(u) => usage = Some(u),
+            }
+        }
+        assert_eq!(text, "Hi");
+        assert_eq!(
+            usage
+                .expect("terminal usage event survives EOF")
+                .input_tokens,
+            7
+        );
     }
 
     #[tokio::test]
