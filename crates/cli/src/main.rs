@@ -307,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
                     .as_deref()
                     .context("--migrate-only requires DATABASE_URL")?;
                 tt_core::db::migrate_only(url).await?;
-                println!("migrations applied");
+                tt_cli::ui::success("migrations applied");
                 return Ok(());
             }
             run_gateway(config).await?;
