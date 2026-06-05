@@ -81,7 +81,7 @@ fn looks_like_model_id(id: &str) -> bool {
         }
     }
     // o-series: only the real reasoning ids (o1 / o3 / o4), not o2-sensor etc.
-    if lower.starts_with('o') && lower.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
+    if lower.starts_with('o') && lower.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit()) {
         let base: String = lower
             .chars()
             .take_while(|c| *c == 'o' || c.is_ascii_digit())
