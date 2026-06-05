@@ -253,6 +253,65 @@ fn conservative_when_pricing_missing() {
 }
 
 #[test]
+fn cross_provider_route_prices_target_by_its_own_provider() {
+    // openai/gpt-4o request, routed to anthropic/claude-haiku-4-5. Both priced.
+    // Must reroute and project savings (not count unprice_able).
+    let mut req = make_req(1, 0, "gpt-4o", 1000, 100, 0.0045, false);
+    req.provider = "openai".into();
+    let route = ProposedRoute {
+        id: det_uuid(100),
+        name: "x-provider".into(),
+        priority: 100,
+        enabled: true,
+        when: RouteConditions {
+            model_in: vec!["gpt-4o".into()],
+            ..Default::default()
+        },
+        then: RouteAction {
+            target_model: "claude-haiku-4-5".into(),
+            force_cache_layer: None,
+            fallbacks: Vec::new(),
+            disable_cache: false,
+        },
+    };
+    let mut pricing = HashMap::new();
+    let (k, v) = pricing_with("anthropic", "claude-haiku-4-5", 0.25, 1.25);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    assert_eq!(result.aggregates.requests_rerouted, 1);
+    assert_eq!(result.aggregates.requests_unprice_able, 0);
+    assert!(result.aggregates.projected_savings_usd > 0.0);
+}
+
+#[test]
+fn cross_provider_target_absent_is_conservative() {
+    // Same cross-provider route but the target pricing is missing entirely.
+    let mut req = make_req(1, 0, "gpt-4o", 1000, 100, 0.0045, false);
+    req.provider = "openai".into();
+    let route = ProposedRoute {
+        id: det_uuid(100),
+        name: "x-provider".into(),
+        priority: 100,
+        enabled: true,
+        when: RouteConditions {
+            model_in: vec!["gpt-4o".into()],
+            ..Default::default()
+        },
+        then: RouteAction {
+            target_model: "claude-haiku-4-5".into(),
+            force_cache_layer: None,
+            fallbacks: Vec::new(),
+            disable_cache: false,
+        },
+    };
+    let result = replay(input_with_routes(vec![req], vec![route], HashMap::new(), 100)).unwrap();
+    assert_eq!(result.aggregates.requests_unprice_able, 1);
+    assert_eq!(result.aggregates.requests_rerouted, 0);
+    assert_eq!(result.aggregates.projected_savings_usd, 0.0);
+}
+
+#[test]
 fn rerouted_latency_projected_from_target_model_history() {
     // 3 premium (900ms) + 3 cheap (100ms) requests; route premium -> cheap.
     // The cheap model HAS history in the window, so rerouted premium requests
