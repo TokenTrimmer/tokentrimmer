@@ -5084,8 +5084,11 @@ dependencies = [
 name = "tt-client"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures",
  "httpmock",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

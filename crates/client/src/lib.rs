@@ -1,15 +1,16 @@
 //! Typed Rust client for the TokenTrimmer gateway. OpenAI-compatible chat that
 //! returns a typed [`CostInfo`] parsed from the `x-tokentrimmer-*` headers, plus
-//! the `X-TokenTrimmer-Tag`/`-Route` extensions as first-class builder options.
+//! the `X-TokenTrimmer-Tag` extension as a first-class builder option.
 
+use futures::StreamExt as _;
 use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
 // Re-export every tt-shared type reachable through the public API (so embedders
 // don't need a direct `tt-shared` dependency to read `outcome.response`).
 pub use tt_shared::messages::{
-    ChatCompletionResponse, Choice, ContentPart, Message, MessageContent, ToolCall,
-    ToolCallFunction,
+    ChatCompletionResponse, Choice, ContentPart, ImageUrl, InputAudio, Message, MessageContent,
+    ToolCall, ToolCallFunction,
 };
 pub use tt_shared::Usage;
 
@@ -84,8 +85,9 @@ pub fn build_body(
     messages: &[Message],
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    stream: bool,
 ) -> Value {
-    let mut body = json!({ "model": model, "messages": messages, "stream": false });
+    let mut body = json!({ "model": model, "messages": messages, "stream": stream });
     if let Some(mt) = max_tokens {
         body["max_tokens"] = json!(mt);
     }
@@ -93,6 +95,84 @@ pub fn build_body(
         body["temperature"] = json!(t);
     }
     body
+}
+
+/// The terminal `tokentrimmer.usage` SSE event payload (streaming cost/usage).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StreamUsage {
+    pub cost_usd: f64,
+    pub baseline_cost_usd: f64,
+    pub saved_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+/// An event yielded by [`ChatStream::next`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum StreamEvent {
+    /// A chunk of assistant text.
+    Delta(String),
+    /// The terminal cost/usage event.
+    Usage(StreamUsage),
+}
+
+/// Internal parse result for one SSE frame.
+enum Frame {
+    Delta(String),
+    Usage(StreamUsage),
+    Done,
+    Ignore,
+}
+
+/// Parse a single SSE frame (the text between `\n\n` separators).
+fn parse_sse_frame(frame: &str) -> Frame {
+    let mut event_name: Option<&str> = None;
+    let mut data = String::new();
+    for line in frame.lines() {
+        if let Some(v) = line.strip_prefix("event:") {
+            event_name = Some(v.trim());
+        } else if let Some(v) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(v.strip_prefix(' ').unwrap_or(v));
+        }
+    }
+    let data = data.trim();
+    if data.is_empty() {
+        return Frame::Ignore;
+    }
+    if data == "[DONE]" {
+        return Frame::Done;
+    }
+    if event_name == Some("tokentrimmer.usage") {
+        return serde_json::from_str::<StreamUsage>(data)
+            .map(Frame::Usage)
+            .unwrap_or(Frame::Ignore);
+    }
+    let v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Frame::Ignore,
+    };
+    match v["choices"][0]["delta"]["content"].as_str() {
+        Some(c) if !c.is_empty() => Frame::Delta(c.to_string()),
+        _ => Frame::Ignore,
+    }
+}
+
+/// Drain complete SSE frames (separated by a blank line) from the byte buffer.
+/// Incomplete trailing bytes stay in `buf`, so a multi-byte UTF-8 char (or a
+/// frame) split across network chunks is never decoded mid-sequence.
+fn drain_frames(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
+        let frame: Vec<u8> = buf.drain(..idx + 2).collect();
+        out.push(String::from_utf8_lossy(&frame).trim_end().to_string());
+    }
+    out
 }
 
 /// Errors from a [`Client`] call.
@@ -219,6 +299,7 @@ impl ChatBuilder<'_> {
             &self.messages,
             self.max_tokens,
             self.temperature,
+            false,
         );
         let mut req = self
             .client
@@ -245,6 +326,127 @@ impl ChatBuilder<'_> {
             .await
             .map_err(Error::Decode)?;
         Ok(ChatOutcome { response, cost })
+    }
+
+    /// Send the request and stream the response. Yields [`StreamEvent::Delta`]
+    /// text chunks then the terminal [`StreamEvent::Usage`] cost event.
+    ///
+    /// # Errors
+    /// Same as [`send`](Self::send): `MissingModel` / `Request` / `Status`.
+    pub async fn stream(self) -> Result<ChatStream> {
+        if self.model.trim().is_empty() {
+            return Err(Error::MissingModel);
+        }
+        let body = build_body(
+            &self.model,
+            &self.messages,
+            self.max_tokens,
+            self.temperature,
+            true,
+        );
+        let mut req = self
+            .client
+            .http
+            .post(format!("{}/v1/chat/completions", self.client.base))
+            .bearer_auth(&self.client.key)
+            .json(&body);
+        if let Some(tag) = &self.tag {
+            req = req.header("X-TokenTrimmer-Tag", tag);
+        }
+        let resp = req.send().await.map_err(Error::Request)?;
+        let header_cost = parse_cost(resp.headers());
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Status {
+                status: status.as_u16(),
+                body,
+                cost: Box::new(header_cost),
+            });
+        }
+        Ok(ChatStream {
+            inner: Box::pin(resp.bytes_stream()),
+            buf: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            done: false,
+            header_cost,
+        })
+    }
+}
+
+/// A live chat stream. Iterate with [`ChatStream::next`].
+pub struct ChatStream {
+    inner: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+    buf: Vec<u8>,
+    pending: std::collections::VecDeque<StreamEvent>,
+    done: bool,
+    header_cost: CostInfo,
+}
+
+// `inner` is a boxed `dyn Stream` (not `Debug`), so derive can't apply — hand-roll
+// one over the inspectable fields so `Result<ChatStream>` stays `unwrap_err`-able.
+impl std::fmt::Debug for ChatStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatStream")
+            .field("buf_len", &self.buf.len())
+            .field("pending", &self.pending.len())
+            .field("done", &self.done)
+            .field("header_cost", &self.header_cost)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChatStream {
+    /// Header-based cost/trace (`model_used`, `provider`, `trace_id`) — known
+    /// before the body streams.
+    #[must_use]
+    pub fn header_cost(&self) -> &CostInfo {
+        &self.header_cost
+    }
+
+    /// Parse every complete frame currently in `buf`, queueing the events.
+    fn drain_into_pending(&mut self) {
+        for frame in drain_frames(&mut self.buf) {
+            match parse_sse_frame(&frame) {
+                Frame::Delta(t) => self.pending.push_back(StreamEvent::Delta(t)),
+                Frame::Usage(u) => self.pending.push_back(StreamEvent::Usage(u)),
+                Frame::Done => self.done = true,
+                Frame::Ignore => {}
+            }
+        }
+    }
+
+    /// The next [`StreamEvent`], or `None` at end of stream.
+    ///
+    /// # Errors
+    /// [`Error::Request`] if the underlying byte stream errors.
+    pub async fn next(&mut self) -> Result<Option<StreamEvent>> {
+        loop {
+            if let Some(ev) = self.pending.pop_front() {
+                return Ok(Some(ev));
+            }
+            if self.done {
+                return Ok(None);
+            }
+            match self.inner.next().await {
+                Some(Ok(chunk)) => {
+                    self.buf.extend_from_slice(&chunk);
+                    self.drain_into_pending();
+                }
+                Some(Err(e)) => return Err(Error::Request(e)),
+                None => {
+                    // SSE allows a stream to end without a trailing blank line —
+                    // EOF itself terminates the final event. Flush the residual
+                    // frame (append a synthetic separator so `drain_frames` sees
+                    // it) so a terminal `tokentrimmer.usage`/delta isn't dropped.
+                    if !self.buf.is_empty() {
+                        self.buf.extend_from_slice(b"\n\n");
+                        self.drain_into_pending();
+                    }
+                    self.done = true;
+                }
+            }
+        }
     }
 }
 
@@ -367,6 +569,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_yields_deltas_then_usage() {
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "event: tokentrimmer.usage\n",
+            "data: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":10,\"output_tokens\":2,\"cached_tokens\":0}\n\n",
+            "data: [DONE]\n\n",
+        );
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"stream\":true");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .body(sse);
+        });
+
+        let client = Client::new(server.base_url(), "k");
+        let mut stream = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .stream()
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.header_cost().model_used.as_deref(),
+            Some("gpt-4o-mini")
+        );
+
+        let mut text = String::new();
+        let mut usage: Option<StreamUsage> = None;
+        while let Some(ev) = stream.next().await.unwrap() {
+            match ev {
+                StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::Usage(u) => usage = Some(u),
+            }
+        }
+        assert_eq!(text, "Hello");
+        let u = usage.expect("usage event");
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn stream_surfaces_status_error() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(500).body("boom");
+        });
+        let client = Client::new(server.base_url(), "k");
+        let result = client.chat().model("m").message(user("hi")).stream().await;
+        assert!(matches!(result, Err(Error::Status { status: 500, .. })));
+    }
+
+    #[tokio::test]
+    async fn stream_flushes_unterminated_final_frame_at_eof() {
+        // Server closes right after the usage frame, with NO trailing blank line.
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "event: tokentrimmer.usage\n",
+            "data: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":7,\"output_tokens\":1,\"cached_tokens\":0}",
+        );
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse);
+        });
+
+        let client = Client::new(server.base_url(), "k");
+        let mut stream = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .stream()
+            .await
+            .unwrap();
+
+        let mut text = String::new();
+        let mut usage: Option<StreamUsage> = None;
+        while let Some(ev) = stream.next().await.unwrap() {
+            match ev {
+                StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::Usage(u) => usage = Some(u),
+            }
+        }
+        assert_eq!(text, "Hi");
+        assert_eq!(
+            usage
+                .expect("terminal usage event survives EOF")
+                .input_tokens,
+            7
+        );
+    }
+
+    #[tokio::test]
     async fn send_without_model_errors_before_any_request() {
         // no .model() → MissingModel, no network touched (dead base is fine)
         let client = Client::new("http://127.0.0.1:1", "k");
@@ -393,13 +696,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_sse_frames() {
+        assert!(matches!(
+            parse_sse_frame(r#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#),
+            Frame::Delta(t) if t == "Hi"
+        ));
+        let usage = "event: tokentrimmer.usage\ndata: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":10,\"output_tokens\":20,\"cached_tokens\":0}";
+        assert!(matches!(
+            parse_sse_frame(usage),
+            Frame::Usage(u) if u.input_tokens == 10 && (u.saved_usd - 0.0003).abs() < 1e-9
+        ));
+        assert!(matches!(parse_sse_frame("data: [DONE]"), Frame::Done));
+        assert!(matches!(
+            parse_sse_frame(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#),
+            Frame::Ignore
+        ));
+        assert!(matches!(parse_sse_frame(""), Frame::Ignore));
+    }
+
+    #[test]
+    fn drain_frames_handles_chunk_split_multibyte() {
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}\n\n".as_bytes();
+        let (a, b) = full.split_at(full.len() - 3);
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(a);
+        assert!(drain_frames(&mut buf).is_empty(), "no complete frame yet");
+        buf.extend_from_slice(b);
+        let frames = drain_frames(&mut buf);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(parse_sse_frame(&frames[0]), Frame::Delta(t) if t == "café"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn build_body_shape() {
-        let b = build_body("gpt-4o", &[user("hi")], None, None);
+        let b = build_body("gpt-4o", &[user("hi")], None, None, false);
         assert_eq!(b["model"], "gpt-4o");
         assert_eq!(b["stream"], false);
         assert!(b["messages"].is_array());
         assert!(b.get("max_tokens").is_none());
-        let b2 = build_body("m", &[], Some(256), Some(0.2));
+        let b2 = build_body("m", &[], Some(256), Some(0.2), true);
+        assert_eq!(b2["stream"], true);
         assert_eq!(b2["max_tokens"], 256);
         assert!((b2["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
     }
