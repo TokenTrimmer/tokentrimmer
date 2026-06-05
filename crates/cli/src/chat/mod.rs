@@ -12,6 +12,7 @@ use crate::context::ResolvedContext;
 use crate::ui;
 
 pub mod session;
+pub mod tools;
 
 const DEFAULT_CHAT_MODEL: &str = "gpt-4o-mini";
 
