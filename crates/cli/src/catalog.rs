@@ -58,7 +58,11 @@ pub fn parse_catalog(json: &str) -> anyhow::Result<Vec<CatalogModel>> {
             max_output_tokens: e.tokentrimmer.max_output_tokens,
             capabilities: e.tokentrimmer.capabilities,
             input_per_million: e.tokentrimmer.pricing.as_ref().map(|p| p.input_per_million),
-            output_per_million: e.tokentrimmer.pricing.as_ref().map(|p| p.output_per_million),
+            output_per_million: e
+                .tokentrimmer
+                .pricing
+                .as_ref()
+                .map(|p| p.output_per_million),
         })
         .collect())
 }
