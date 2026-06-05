@@ -5,8 +5,13 @@
 use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
-pub use tt_shared::messages::Message;
-use tt_shared::messages::{ChatCompletionResponse, MessageContent};
+// Re-export every tt-shared type reachable through the public API (so embedders
+// don't need a direct `tt-shared` dependency to read `outcome.response`).
+pub use tt_shared::messages::{
+    ChatCompletionResponse, Choice, ContentPart, Message, MessageContent, ToolCall,
+    ToolCallFunction,
+};
+pub use tt_shared::Usage;
 
 /// Build a `user` message.
 #[must_use]
@@ -92,11 +97,21 @@ pub fn build_body(
 
 /// Errors from a [`Client`] call.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
+    /// No model was set on the builder — call `.model(...)`.
+    #[error("model is required — call `.model(...)`")]
+    MissingModel,
     #[error("request to the gateway failed: {0}")]
     Request(#[source] reqwest::Error),
+    /// A non-2xx response. `cost` carries the `x-tokentrimmer-*` telemetry
+    /// (incl. `trace_id`) the gateway sends on errors too.
     #[error("gateway returned {status}: {body}")]
-    Status { status: u16, body: String },
+    Status {
+        status: u16,
+        body: String,
+        cost: Box<CostInfo>,
+    },
     #[error("failed to decode the gateway response: {0}")]
     Decode(#[source] reqwest::Error),
 }
@@ -142,7 +157,6 @@ impl Client {
             max_tokens: None,
             temperature: None,
             tag: None,
-            route: None,
         }
     }
 }
@@ -155,7 +169,6 @@ pub struct ChatBuilder<'a> {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     tag: Option<String>,
-    route: Option<String>,
 }
 
 impl ChatBuilder<'_> {
@@ -190,19 +203,17 @@ impl ChatBuilder<'_> {
         self.tag = Some(tag.into());
         self
     }
-    /// `X-TokenTrimmer-Route` — force a named route.
-    #[must_use]
-    pub fn route(mut self, route: impl Into<String>) -> Self {
-        self.route = Some(route.into());
-        self
-    }
 
     /// Send the request and return the typed response + cost.
     ///
     /// # Errors
-    /// [`Error::Request`] on transport failure, [`Error::Status`] on a non-2xx
-    /// response, [`Error::Decode`] if the body isn't a chat completion.
+    /// [`Error::MissingModel`] if no model was set, [`Error::Request`] on
+    /// transport failure, [`Error::Status`] on a non-2xx response (carrying any
+    /// cost/trace telemetry), [`Error::Decode`] if the body isn't a completion.
     pub async fn send(self) -> Result<ChatOutcome> {
+        if self.model.trim().is_empty() {
+            return Err(Error::MissingModel);
+        }
         let body = build_body(
             &self.model,
             &self.messages,
@@ -218,9 +229,6 @@ impl ChatBuilder<'_> {
         if let Some(tag) = &self.tag {
             req = req.header("X-TokenTrimmer-Tag", tag);
         }
-        if let Some(route) = &self.route {
-            req = req.header("X-TokenTrimmer-Route", route);
-        }
         let resp = req.send().await.map_err(Error::Request)?;
         let cost = parse_cost(resp.headers());
         let status = resp.status();
@@ -229,6 +237,7 @@ impl ChatBuilder<'_> {
             return Err(Error::Status {
                 status: status.as_u16(),
                 body,
+                cost: Box::new(cost),
             });
         }
         let response = resp
@@ -355,6 +364,14 @@ mod tests {
         assert_eq!(out.cost.cost_usd, Some(0.0001));
         assert!((out.savings_pct().unwrap() - 75.0).abs() < 1e-9);
         assert_eq!(out.response.model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn send_without_model_errors_before_any_request() {
+        // no .model() → MissingModel, no network touched (dead base is fine)
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let err = client.chat().message(user("hi")).send().await.unwrap_err();
+        assert!(matches!(err, Error::MissingModel), "{err:?}");
     }
 
     #[tokio::test]
