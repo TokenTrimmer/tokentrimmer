@@ -29,6 +29,9 @@ pub enum ApiError {
     #[error("model not found: {model}")]
     ModelNotFound { model: String },
 
+    #[error("no upstream credential for provider {provider}")]
+    MissingProviderCredential { provider: String },
+
     #[error("rate limited (retry after {retry_after_ms} ms)")]
     RateLimited { retry_after_ms: u64 },
 
@@ -92,6 +95,14 @@ impl IntoResponse for ApiError {
                 "invalid_request_error",
                 "model_not_found",
                 format!("Model '{model}' is not registered with any configured provider"),
+            ),
+            ApiError::MissingProviderCredential { provider } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "missing_provider_credential",
+                format!(
+                    "No upstream credential configured for provider '{provider}', required by a matched route. Add it before routing to this provider."
+                ),
             ),
             ApiError::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,

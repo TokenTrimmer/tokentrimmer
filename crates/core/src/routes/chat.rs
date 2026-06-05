@@ -122,6 +122,8 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         | ApiError::PaymentRequired
         | ApiError::Forbidden(_)
         | ApiError::ModelNotFound { .. }
+        // Config-dependent (org may add the credential) — must not negative-cache.
+        | ApiError::MissingProviderCredential { .. }
         | ApiError::RateLimited { .. }
         | ApiError::Internal(_)
         | ApiError::NotFound(_)
@@ -139,6 +141,7 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::PaymentRequired => StatusCode::PAYMENT_REQUIRED,
         ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
         ApiError::ModelNotFound { .. } => StatusCode::NOT_FOUND,
+        ApiError::MissingProviderCredential { .. } => StatusCode::BAD_REQUEST,
         ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
         ApiError::Provider(pe) => match pe {
             ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
@@ -369,9 +372,10 @@ pub async fn handler(
             tt_shared::CallerTier::Pro | tt_shared::CallerTier::Team | tt_shared::CallerTier::Scale
         )
     );
+    let source_provider_id = provider.id().to_string();
     let credentials = resolve_credentials(&state, org_id, provider.id(), &raw_bearer).await;
 
-    let ctx = RequestContext {
+    let mut ctx = RequestContext {
         trace_id,
         org_id,
         api_key_id,
@@ -401,14 +405,28 @@ pub async fn handler(
     // Ordered fallback model ids from the matched route (empty = no failover).
     let route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
     if matched_route_id.is_some() {
-        // Provider may have changed if the rewrite crossed providers (v1
-        // routes are same-provider, but the registry is the source of truth).
+        // Provider may change when a route crosses providers (V3d-1); the
+        // registry is the source of truth.
         provider = state
             .registry
             .resolve(&req.model)
             .ok_or_else(|| ApiError::ModelNotFound {
                 model: req.model.clone(),
             })?;
+        // Cross-provider rewrite: the credentials resolved above are for the
+        // source provider. For a single-provider dispatch, re-resolve for the
+        // target and fail closed if the org has no credential (never forward
+        // the source key). The failover path resolves per-candidate below.
+        if route_fallbacks.is_empty() && provider.id() != source_provider_id {
+            match resolve_credentials_for(&state, org_id, provider.id(), &raw_bearer, false).await {
+                Some(c) => ctx.credentials = c,
+                None => {
+                    return Err(ApiError::MissingProviderCredential {
+                        provider: provider.id().to_string(),
+                    })
+                }
+            }
+        }
     }
 
     // 2d. Determine cache behaviour for this request (Fix A §2.2 + Fix B §2.7).
@@ -1467,17 +1485,40 @@ async fn resolve_credentials(
     provider_id: &str,
     raw_bearer: &str,
 ) -> ProviderCredentials {
+    // Source-provider resolution always allows the raw-Bearer fallback (legacy
+    // BYO-key passthrough). `expect` is safe: allow_bearer_fallback=true never
+    // returns None.
+    resolve_credentials_for(state, org_id, provider_id, raw_bearer, true)
+        .await
+        .expect("bearer fallback yields Some")
+}
+
+/// Resolve upstream credentials for `provider_id`. Returns `None` only when the
+/// store has no entry AND `allow_bearer_fallback` is false — i.e. a cross-
+/// provider target whose key we must not substitute with the source provider's
+/// bearer.
+async fn resolve_credentials_for(
+    state: &AppState,
+    org_id: Uuid,
+    provider_id: &str,
+    raw_bearer: &str,
+    allow_bearer_fallback: bool,
+) -> Option<ProviderCredentials> {
     if let Some(store) = state.credential_store.as_ref() {
         match store.get(org_id, provider_id).await {
-            Ok(Some(c)) => return c,
+            Ok(Some(c)) => return Some(c),
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %e, "credential store lookup failed"),
         }
     }
-    ProviderCredentials {
-        api_key: SecretString::new(raw_bearer.to_string()),
-        base_url: None,
-        extra_headers: Vec::new(),
+    if allow_bearer_fallback {
+        Some(ProviderCredentials {
+            api_key: SecretString::new(raw_bearer.to_string()),
+            base_url: None,
+            extra_headers: Vec::new(),
+        })
+    } else {
+        None
     }
 }
 
