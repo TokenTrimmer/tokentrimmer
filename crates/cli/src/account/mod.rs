@@ -49,11 +49,8 @@ pub fn browser_command_for(os: &str, url: &str) -> Option<(&'static str, Vec<Str
     }
 }
 
-/// `tt login --token <KEY>` (browser login lands in V2). `--token -` reads the
-/// key from stdin (keeps it out of shell history). Optionally persists base URL.
-///
 /// Validate + persist a raw key (and optional base URL), printing the result.
-/// Shared by the `--token` and browser paths.
+/// Shared by the `--token` and browser login paths.
 fn store_key(raw: &str, base_url: Option<String>) -> anyhow::Result<()> {
     let validated = tt_mcp::auth::validate_api_key(Some(raw.to_string()))
         .map_err(|e| anyhow::anyhow!("invalid key: {e}"))?;
@@ -99,7 +96,9 @@ fn browser_login(base_url: Option<String>, no_browser: bool) -> anyhow::Result<(
     if !no_browser {
         open_browser(DASHBOARD_KEYS_URL);
     }
-    ui::note(&format!("If your browser didn't open, visit: {DASHBOARD_KEYS_URL}"));
+    ui::note(&format!(
+        "If your browser didn't open, visit: {DASHBOARD_KEYS_URL}"
+    ));
     let key = dialoguer::Password::new()
         .with_prompt("Paste your API key")
         .interact()
