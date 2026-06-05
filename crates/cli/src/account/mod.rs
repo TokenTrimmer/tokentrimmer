@@ -4,6 +4,7 @@
 use anyhow::Context as _;
 
 use crate::context::{self, store};
+use crate::ui;
 
 /// Pure decision: resolve the token text from the `--token` arg and (when the
 /// arg is `-`) the stdin contents. Errors on a missing / blank token.
@@ -55,12 +56,12 @@ pub fn login_with_token(token: Option<String>, base_url: Option<String>) -> anyh
         store::save_config(&dir, b.trim())?;
     }
     let base = store::load_config(&dir)?.unwrap_or_else(|| context::DEFAULT_BASE_URL.to_string());
-    println!(
+    ui::success(&format!(
         "Logged in. Stored {} in {} (base: {}).",
         context::mask_key(&validated),
         dir.join("credentials.toml").display(),
         base,
-    );
+    ));
     Ok(())
 }
 
@@ -69,19 +70,34 @@ pub fn whoami() -> anyhow::Result<()> {
     let ctx = context::ResolvedContext::load(None, None)?;
     match &ctx.api_key {
         Some(k) => {
-            println!("Logged in.");
+            ui::heading("Logged in");
             println!(
-                "  key:    {} (source: {})",
+                "  {} {} (source: {})",
+                ui::muted().apply_to("key:   "),
                 context::mask_key(k.expose()),
                 ctx.key_source
             );
-            println!("  base:   {} (source: {})", ctx.base_url, ctx.base_source);
-            println!("  config: {}", store::config_dir().display());
+            println!(
+                "  {} {} (source: {})",
+                ui::muted().apply_to("base:  "),
+                ctx.base_url,
+                ctx.base_source
+            );
+            println!(
+                "  {} {}",
+                ui::muted().apply_to("config:"),
+                store::config_dir().display()
+            );
             Ok(())
         }
         None => {
-            println!("Not logged in. Run `tt login --token <KEY>` or set TT_API_KEY.");
-            println!("  base: {} (source: {})", ctx.base_url, ctx.base_source);
+            ui::warn("Not logged in. Run `tt login --token <KEY>` or set TT_API_KEY.");
+            eprintln!(
+                "  {} {} (source: {})",
+                ui::muted().apply_to("base:"),
+                ctx.base_url,
+                ctx.base_source
+            );
             std::process::exit(1);
         }
     }
@@ -91,16 +107,16 @@ pub fn whoami() -> anyhow::Result<()> {
 pub fn logout() -> anyhow::Result<()> {
     let dir = store::config_dir();
     if store::delete_credentials(&dir)? {
-        println!(
+        ui::success(&format!(
             "Logged out — removed {}.",
             dir.join("credentials.toml").display()
-        );
-        println!(
+        ));
+        ui::info(
             "Note: this only clears the local key; it does not revoke it server-side. \
-             Revoke in the dashboard if it may be compromised."
+             Revoke in the dashboard if it may be compromised.",
         );
     } else {
-        println!("Not logged in (nothing to remove).");
+        ui::info("Not logged in (nothing to remove).");
     }
     Ok(())
 }
