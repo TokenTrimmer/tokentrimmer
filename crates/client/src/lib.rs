@@ -568,7 +568,10 @@ mod tests {
             .stream()
             .await
             .unwrap();
-        assert_eq!(stream.header_cost().model_used.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(
+            stream.header_cost().model_used.as_deref(),
+            Some("gpt-4o-mini")
+        );
 
         let mut text = String::new();
         let mut usage: Option<StreamUsage> = None;
