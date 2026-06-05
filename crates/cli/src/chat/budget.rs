@@ -21,7 +21,10 @@ const ESTIMATE_PROVIDER: &str = "openai";
 /// exact live windows are the live-catalog's (V4) job.
 #[must_use]
 pub fn model_window(model: &str) -> u32 {
-    let m = model.to_ascii_lowercase();
+    // Accept provider-namespaced ids ("openai/gpt-4o", "anthropic/claude-…",
+    // "google/gemini-…") by matching on the last path segment.
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    let m = bare.to_ascii_lowercase();
     let s = |p: &str| m.starts_with(p);
     if s("gpt-5") {
         256_000
@@ -44,27 +47,39 @@ fn conversation_text(conv: &Conversation) -> String {
         out.push('\n');
     }
     for m in &conv.messages {
-        let text = match m {
+        match m {
             Message::System {
                 content: MessageContent::Text(t),
-            } => Some(t),
-            Message::User {
+            }
+            | Message::User {
                 content: MessageContent::Text(t),
                 ..
-            } => Some(t),
+            }
+            | Message::Tool {
+                content: MessageContent::Text(t),
+                ..
+            } => {
+                out.push_str(t);
+                out.push('\n');
+            }
             Message::Assistant {
-                content: Some(MessageContent::Text(t)),
+                content,
+                tool_calls,
                 ..
-            } => Some(t),
-            Message::Tool {
-                content: MessageContent::Text(t),
-                ..
-            } => Some(t),
-            _ => None,
-        };
-        if let Some(t) = text {
-            out.push_str(t);
-            out.push('\n');
+            } => {
+                if let Some(MessageContent::Text(t)) = content {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+                // tool-call name + arguments are real tokens too
+                for tc in tool_calls {
+                    out.push_str(&tc.function.name);
+                    out.push('\n');
+                    out.push_str(&tc.function.arguments);
+                    out.push('\n');
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -118,7 +133,9 @@ impl ContextState {
     #[must_use]
     pub fn new(override_budget: Option<u32>) -> Self {
         Self {
-            override_budget,
+            // A 0 budget would disable management / divide by zero — treat it as
+            // "unset" so it falls back to the per-model window.
+            override_budget: override_budget.filter(|&n| n > 0),
             warned: false,
         }
     }
@@ -148,11 +165,18 @@ impl ContextState {
             let target = (f64::from(budget) * TRIM_TARGET_FRAC) as u32;
             let dropped = trim_to_budget(conv, target, ESTIMATE_PROVIDER);
             if dropped > 0 {
-                ui::note(&format!(
-                    "(context ~{est}/{budget} tok — trimmed {dropped} old message(s))"
+                // Auto-trim drops history, so make it as visible as the 75% warn.
+                ui::warn(&format!(
+                    "context ~{est}/{budget} tok — trimmed {dropped} old message(s)"
                 ));
+                self.warned = false;
+            } else if !self.warned {
+                // A single turn already exceeds budget — can't trim; say so once.
+                ui::warn(&format!(
+                    "context ~{est}/{budget} tok — over budget but only one turn remains"
+                ));
+                self.warned = true;
             }
-            self.warned = false;
         } else if frac > WARN_FRAC {
             if !self.warned {
                 let pct = (frac * 100.0) as u32;
@@ -186,6 +210,17 @@ mod tests {
         assert_eq!(model_window("o1-preview"), 200_000);
         assert_eq!(model_window("gemini-2.0-pro"), 1_000_000);
         assert_eq!(model_window("some-unknown-model"), DEFAULT_CONTEXT_BUDGET);
+        // provider-namespaced ids match on the last segment
+        assert_eq!(model_window("openai/gpt-4o"), 128_000);
+        assert_eq!(model_window("anthropic/claude-3-5-sonnet"), 200_000);
+        assert_eq!(model_window("google/gemini-1.5-pro"), 1_000_000);
+    }
+
+    #[test]
+    fn zero_budget_falls_back_to_model_window() {
+        let st = ContextState::new(Some(0));
+        assert_eq!(st.override_budget, None);
+        assert_eq!(st.budget("gpt-4o-mini"), 128_000);
     }
 
     #[test]

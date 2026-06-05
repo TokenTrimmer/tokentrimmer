@@ -537,6 +537,7 @@ pub async fn run(
                 match Command::parse(&line) {
                     Command::Chat(t) if t.is_empty() => {}
                     Command::Chat(t) => {
+                        let snapshot = conv.messages.clone();
                         conv.push_user(t);
                         ctx.manage(&mut conv);
                         if !dispatch_turn(
@@ -550,7 +551,9 @@ pub async fn run(
                         )
                         .await
                         {
-                            conv.messages.pop(); // drop the unanswered user turn
+                            // failed turn → no-op on history: drop the user turn
+                            // AND undo any trim manage() did before sending.
+                            conv.messages = snapshot;
                         }
                     }
                     Command::Help => print_help(),
@@ -600,13 +603,16 @@ pub async fn run(
                     }
                     Command::Cost => ui::info(&ledger.summary()),
                     Command::Context(set) => {
-                        if let Some(n) = set {
+                        if let Some(0) = set {
+                            ctx.override_budget = None;
+                            ui::info("context budget cleared → using the per-model window");
+                        } else if let Some(n) = set {
                             ctx.override_budget = Some(n);
                             ui::info(&format!("context budget → {n} tokens"));
                         } else {
                             let budget = ctx.budget(&conv.model);
                             let est = ctx.estimate(&conv);
-                            let pct = if budget > 0 { est * 100 / budget } else { 0 };
+                            let pct = (f64::from(est) / f64::from(budget) * 100.0) as u32;
                             ui::info(&format!(
                                 "context: ~{est} / {budget} tokens ({pct}%) [{}]",
                                 conv.model
@@ -627,6 +633,7 @@ pub async fn run(
                     }
                     Command::Editor => match compose_in_editor() {
                         Ok(Some(t)) => {
+                            let snapshot = conv.messages.clone();
                             conv.push_user(t);
                             ctx.manage(&mut conv);
                             if !dispatch_turn(
@@ -640,7 +647,7 @@ pub async fn run(
                             )
                             .await
                             {
-                                conv.messages.pop();
+                                conv.messages = snapshot; // no-op on history
                             }
                         }
                         Ok(None) => ui::info("(editor: nothing sent)"),
