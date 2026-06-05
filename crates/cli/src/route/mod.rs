@@ -5,6 +5,7 @@ use anyhow::Context as _;
 use serde_json::{json, Value};
 
 use crate::context::ResolvedContext;
+use crate::ui;
 
 /// Flags for `tt route add`. Mirrors the clap args in `main.rs`.
 pub struct AddArgs {
@@ -113,36 +114,45 @@ pub async fn run(
 
     match cmd {
         RouteCmd::List => {
+            let sp = ui::spinner("Loading routes…");
             let routes: Value =
                 send(http.get(format!("{base}/v1/routes")).bearer_auth(&key)).await?;
+            sp.finish_and_clear();
             print_routes(&routes);
         }
         RouteCmd::Show(id) => {
+            let sp = ui::spinner("Loading route…");
             let route: Value =
                 send(http.get(format!("{base}/v1/routes/{id}")).bearer_auth(&key)).await?;
+            sp.finish_and_clear();
+            ui::heading(route["name"].as_str().unwrap_or(&id));
             println!("{}", serde_json::to_string_pretty(&route)?);
         }
         RouteCmd::Rm(id) => {
+            let sp = ui::spinner("Removing route…");
             let _: Value = send(
                 http.delete(format!("{base}/v1/routes/{id}"))
                     .bearer_auth(&key),
             )
             .await?;
-            println!("Removed route {id}.");
+            sp.finish_and_clear();
+            ui::success(&format!("Removed route {id}."));
         }
         RouteCmd::Add(args) => {
             let body = build_new_route(&args)?;
+            let sp = ui::spinner("Creating route…");
             let route: Value = send(
                 http.post(format!("{base}/v1/routes"))
                     .bearer_auth(&key)
                     .json(&body),
             )
             .await?;
-            println!(
+            sp.finish_and_clear();
+            ui::success(&format!(
                 "Created route {} ({}).",
                 route["id"].as_str().unwrap_or("?"),
                 route["name"].as_str().unwrap_or("?")
-            );
+            ));
         }
     }
     Ok(())
@@ -162,29 +172,50 @@ async fn send(req: reqwest::RequestBuilder) -> anyhow::Result<Value> {
     serde_json::from_str(&text).context("decode gateway response")
 }
 
-fn print_routes(routes: &Value) {
+/// Pure: render the routes list as a styled table string.
+fn routes_table(routes: &Value) -> String {
     let Some(arr) = routes.as_array() else {
-        println!("(no routes)");
-        return;
+        return ui::format_warn("unexpected response (not a list)");
     };
     if arr.is_empty() {
-        println!("No routes. Create one with `tt route add --from <model> --to <model>`.");
-        return;
+        return "No routes. Create one with `tt route add --from <model> --to <model>`.".into();
     }
-    println!(
-        "{:<38}  {:<22}  {:>4}  {:<8}  TARGET",
-        "ID", "NAME", "PRIO", "ENABLED"
-    );
+    let mut t = ui::table(&["NAME", "ROUTE", "PRIO", "STATUS"]);
     for r in arr {
-        println!(
-            "{:<38}  {:<22}  {:>4}  {:<8}  {}",
-            r["id"].as_str().unwrap_or("?"),
-            r["name"].as_str().unwrap_or("?"),
-            r["priority"].as_u64().unwrap_or(0),
-            r["enabled"].as_bool().unwrap_or(false),
-            r["then"]["target_model"].as_str().unwrap_or("?"),
+        let name = r["name"].as_str().unwrap_or("?");
+        let from = r["when"]["model_in"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("*");
+        let target = r["then"]["target_model"].as_str().unwrap_or("?");
+        let route_cell = format!(
+            "{} {} {}",
+            ui::accent().apply_to(from),
+            ui::ARROW,
+            ui::accent().apply_to(target)
         );
+        let status = if r["enabled"].as_bool().unwrap_or(false) {
+            format!("{} on", ui::success_style().apply_to(ui::OK))
+        } else {
+            ui::muted().apply_to(format!("{} off", ui::NO)).to_string()
+        };
+        t.add_row(vec![
+            ui::heading_style().apply_to(name).to_string(),
+            route_cell,
+            r["priority"].as_u64().unwrap_or(0).to_string(),
+            status,
+        ]);
     }
+    format!(
+        "{}\n{}",
+        ui::format_heading(&format!("ROUTES {} {}", ui::BULLET, arr.len())),
+        t
+    )
+}
+
+fn print_routes(routes: &Value) {
+    println!("{}", routes_table(routes));
 }
 
 #[cfg(test)]
@@ -410,5 +441,29 @@ mod tests {
         })
         .unwrap();
         assert_eq!(body["then"]["max_cost_usd"], 0.1);
+    }
+
+    #[test]
+    fn routes_table_renders_names_targets_and_status() {
+        console::set_colors_enabled(false);
+        let routes = json!([
+            { "id": "a", "name": "vis", "priority": 100, "enabled": true,
+              "when": {"model_in":["gpt-4o"]}, "then": {"target_model":"gpt-4o-mini"} },
+            { "id": "b", "name": "capped", "priority": 50, "enabled": false,
+              "when": {}, "then": {"target_model":"claude-haiku"} },
+        ]);
+        let out = routes_table(&routes);
+        assert!(out.contains("vis"));
+        assert!(out.contains("gpt-4o-mini"));
+        assert!(out.contains("on"));
+        assert!(out.contains("off"));
+        assert!(out.contains('→')); // from → target
+    }
+
+    #[test]
+    fn routes_table_empty_state() {
+        console::set_colors_enabled(false);
+        let out = routes_table(&json!([]));
+        assert!(out.contains("No routes"));
     }
 }

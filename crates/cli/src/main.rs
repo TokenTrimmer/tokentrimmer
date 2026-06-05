@@ -12,6 +12,9 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Disable colored output.
+    #[arg(long, global = true)]
+    no_color: bool,
 }
 
 #[derive(Subcommand)]
@@ -295,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    tt_cli::ui::init(cli.no_color);
     match cli.command {
         Command::Gateway { migrate_only } => {
             if migrate_only {
