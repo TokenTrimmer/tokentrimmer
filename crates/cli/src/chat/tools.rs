@@ -204,7 +204,8 @@ pub async fn run_tool_turn(
                 "{}",
                 format_tool_call(&tc.function.name, &tc.function.arguments)
             );
-            let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
+            let args: Value =
+                serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
             let out = match reg.call(&tc.function.name, args).await {
                 Ok(v) => v,
                 Err(e) => json!({ "error": e.to_string() }),

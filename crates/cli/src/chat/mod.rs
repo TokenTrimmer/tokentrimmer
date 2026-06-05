@@ -529,7 +529,17 @@ pub async fn run(
                     Command::Chat(t) if t.is_empty() => {}
                     Command::Chat(t) => {
                         conv.push_user(t);
-                        if !dispatch_turn(&http, &base, &key, &mut conv, &mut ledger, &registry, tools_enabled).await {
+                        if !dispatch_turn(
+                            &http,
+                            &base,
+                            &key,
+                            &mut conv,
+                            &mut ledger,
+                            &registry,
+                            tools_enabled,
+                        )
+                        .await
+                        {
                             conv.messages.pop(); // drop the unanswered user turn
                         }
                     }
@@ -590,7 +600,17 @@ pub async fn run(
                     Command::Editor => match compose_in_editor() {
                         Ok(Some(t)) => {
                             conv.push_user(t);
-                            if !dispatch_turn(&http, &base, &key, &mut conv, &mut ledger, &registry, tools_enabled).await {
+                            if !dispatch_turn(
+                                &http,
+                                &base,
+                                &key,
+                                &mut conv,
+                                &mut ledger,
+                                &registry,
+                                tools_enabled,
+                            )
+                            .await
+                            {
                                 conv.messages.pop();
                             }
                         }
@@ -599,7 +619,17 @@ pub async fn run(
                     },
                     Command::Retry => match prepare_retry(&mut conv) {
                         RetryPlan::Ready { restore } => {
-                            if !dispatch_turn(&http, &base, &key, &mut conv, &mut ledger, &registry, tools_enabled).await {
+                            if !dispatch_turn(
+                                &http,
+                                &base,
+                                &key,
+                                &mut conv,
+                                &mut ledger,
+                                &registry,
+                                tools_enabled,
+                            )
+                            .await
+                            {
                                 // Failed retry → no-op on history: restore the
                                 // prior reply so we never leave a dangling user
                                 // turn or lose a good answer.
