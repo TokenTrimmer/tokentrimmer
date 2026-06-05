@@ -96,6 +96,84 @@ pub fn build_body(
     body
 }
 
+/// The terminal `tokentrimmer.usage` SSE event payload (streaming cost/usage).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StreamUsage {
+    pub cost_usd: f64,
+    pub baseline_cost_usd: f64,
+    pub saved_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+/// An event yielded by [`ChatStream::next`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum StreamEvent {
+    /// A chunk of assistant text.
+    Delta(String),
+    /// The terminal cost/usage event.
+    Usage(StreamUsage),
+}
+
+/// Internal parse result for one SSE frame.
+enum Frame {
+    Delta(String),
+    Usage(StreamUsage),
+    Done,
+    Ignore,
+}
+
+/// Parse a single SSE frame (the text between `\n\n` separators).
+fn parse_sse_frame(frame: &str) -> Frame {
+    let mut event_name: Option<&str> = None;
+    let mut data = String::new();
+    for line in frame.lines() {
+        if let Some(v) = line.strip_prefix("event:") {
+            event_name = Some(v.trim());
+        } else if let Some(v) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(v.strip_prefix(' ').unwrap_or(v));
+        }
+    }
+    let data = data.trim();
+    if data.is_empty() {
+        return Frame::Ignore;
+    }
+    if data == "[DONE]" {
+        return Frame::Done;
+    }
+    if event_name == Some("tokentrimmer.usage") {
+        return serde_json::from_str::<StreamUsage>(data)
+            .map(Frame::Usage)
+            .unwrap_or(Frame::Ignore);
+    }
+    let v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Frame::Ignore,
+    };
+    match v["choices"][0]["delta"]["content"].as_str() {
+        Some(c) if !c.is_empty() => Frame::Delta(c.to_string()),
+        _ => Frame::Ignore,
+    }
+}
+
+/// Drain complete SSE frames (separated by a blank line) from the byte buffer.
+/// Incomplete trailing bytes stay in `buf`, so a multi-byte UTF-8 char (or a
+/// frame) split across network chunks is never decoded mid-sequence.
+fn drain_frames(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
+        let frame: Vec<u8> = buf.drain(..idx + 2).collect();
+        out.push(String::from_utf8_lossy(&frame).trim_end().to_string());
+    }
+    out
+}
+
 /// Errors from a [`Client`] call.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -392,6 +470,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Status { status: 429, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn parse_sse_frames() {
+        assert!(matches!(
+            parse_sse_frame(r#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#),
+            Frame::Delta(t) if t == "Hi"
+        ));
+        let usage = "event: tokentrimmer.usage\ndata: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":10,\"output_tokens\":20,\"cached_tokens\":0}";
+        assert!(matches!(
+            parse_sse_frame(usage),
+            Frame::Usage(u) if u.input_tokens == 10 && (u.saved_usd - 0.0003).abs() < 1e-9
+        ));
+        assert!(matches!(parse_sse_frame("data: [DONE]"), Frame::Done));
+        assert!(matches!(
+            parse_sse_frame(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#),
+            Frame::Ignore
+        ));
+        assert!(matches!(parse_sse_frame(""), Frame::Ignore));
+    }
+
+    #[test]
+    fn drain_frames_handles_chunk_split_multibyte() {
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}\n\n".as_bytes();
+        let (a, b) = full.split_at(full.len() - 3);
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(a);
+        assert!(drain_frames(&mut buf).is_empty(), "no complete frame yet");
+        buf.extend_from_slice(b);
+        let frames = drain_frames(&mut buf);
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(parse_sse_frame(&frames[0]), Frame::Delta(t) if t == "café"));
+        assert!(buf.is_empty());
     }
 
     #[test]
