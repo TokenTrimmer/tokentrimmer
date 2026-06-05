@@ -9,7 +9,7 @@ use tt_mcp::tools::find_route_for::FindRouteForTool;
 use tt_mcp::tools::inspect_diff::InspectDiffTool;
 use tt_mcp::tools::preview_cost::PreviewCostTool;
 use tt_mcp::tools::Registry;
-use tt_shared::messages::{Message, MessageContent, ToolCall, ToolCallFunction};
+use tt_shared::messages::{Message, MessageContent, ToolCall};
 
 use super::{format_turn_footer, Conversation, Ledger, UsageInfo};
 use crate::ui;
@@ -27,48 +27,12 @@ pub fn build_registry() -> Registry {
     r
 }
 
-/// Build the OpenAI `tools` array from the registry's tool definitions.
-#[must_use]
-pub fn tools_json(reg: &Registry) -> Vec<Value> {
+/// Build the SDK `tools` from the registry's tool definitions.
+fn registry_tools(reg: &Registry) -> Vec<tt_client::Tool> {
     reg.list()
         .into_iter()
-        .map(|d| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": d.name,
-                    "description": d.description,
-                    "parameters": d.input_schema,
-                }
-            })
-        })
+        .map(|d| tt_client::tool(d.name, d.description, d.input_schema))
         .collect()
-}
-
-/// Extract `ToolCall`s from a response `message` (`choices[0].message`).
-/// Entries missing an `id` or function `name` are skipped.
-#[must_use]
-pub fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
-    message["tool_calls"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|tc| {
-                    Some(ToolCall {
-                        id: tc["id"].as_str()?.to_string(),
-                        r#type: tc["type"].as_str().unwrap_or("function").to_string(),
-                        function: ToolCallFunction {
-                            name: tc["function"]["name"].as_str()?.to_string(),
-                            arguments: tc["function"]["arguments"]
-                                .as_str()
-                                .unwrap_or("{}")
-                                .to_string(),
-                        },
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Build a `UsageInfo` from a non-streamed response: cost/saved/baseline come
@@ -102,12 +66,6 @@ pub fn format_tool_call(name: &str, args: &str) -> String {
     ui::muted()
         .apply_to(format!("{} {name}({a})", ui::ARROW))
         .to_string()
-}
-
-fn header_f64(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
-    h.get(name)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
 }
 
 /// Per-turn cost accumulator. A tool turn spans several gateway calls but is one
@@ -149,61 +107,53 @@ struct Round {
     calls: Vec<ToolCall>,
     content: String,
     usage: Option<UsageInfo>,
+    /// The typed assistant message the SDK returned (carries content +
+    /// tool_calls), pushed to history verbatim when the round requests tools.
+    assistant_msg: Option<Message>,
 }
 
-/// Send one non-streamed request and parse it. `force_no_tools` sets
-/// `tool_choice:"none"` so the model must answer with text — used to close out a
-/// turn that hit the round cap.
+/// Send one non-streamed request through the SDK and parse it. `force_no_tools`
+/// sets `tool_choice:"none"` so the model must answer with text — used to close
+/// out a turn that hit the round cap.
 async fn send_round(
-    http: &reqwest::Client,
-    base: &str,
-    key: &str,
+    client: &tt_client::Client,
     conv: &Conversation,
-    tools: &[Value],
+    tools: &[tt_client::Tool],
     force_no_tools: bool,
 ) -> anyhow::Result<Round> {
-    let mut body = json!({
-        "model": conv.model,
-        "messages": conv.wire_messages(),
-        "tools": tools,
-        "stream": false,
-    });
+    let mut builder = client
+        .chat()
+        .model(&conv.model)
+        .messages(conv.wire_messages())
+        .tools(tools.to_vec());
     if force_no_tools {
-        body["tool_choice"] = json!("none");
+        builder = builder.tool_choice(tt_client::ToolChoice::Auto("none".to_string()));
     }
-    let resp = http
-        .post(format!("{base}/v1/chat/completions"))
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await
-        .context("request to gateway failed")?;
-    let served_model = resp
-        .headers()
-        .get("x-tokentrimmer-model-used")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(&conv.model)
-        .to_string();
-    let cost = header_f64(resp.headers(), "x-tokentrimmer-cost-usd");
-    let saved = header_f64(resp.headers(), "x-tokentrimmer-saved-usd").unwrap_or(0.0);
-    let baseline = header_f64(resp.headers(), "x-tokentrimmer-baseline-cost-usd");
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("gateway returned {status}: {}", text.trim());
-    }
-    let v: Value = resp.json().await.context("invalid gateway response")?;
-    let message = &v["choices"][0]["message"];
-    let calls = parse_tool_calls(message);
-    let content = message["content"].as_str().unwrap_or_default().to_string();
-    let in_tok = v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
-    let out_tok = v["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-    let usage = cost.map(|c| usage_from_parts(c, saved, baseline, in_tok, out_tok));
+    let out = builder.send().await.context("request to gateway failed")?;
+
+    let served_model = out
+        .cost
+        .model_used
+        .clone()
+        .unwrap_or_else(|| conv.model.clone());
+    let calls = out.tool_calls().to_vec();
+    let content = out.text().unwrap_or_default().to_string();
+    let usage = out.cost.cost_usd.map(|c| {
+        usage_from_parts(
+            c,
+            out.cost.saved_usd.unwrap_or(0.0),
+            out.cost.baseline_cost_usd,
+            out.response.usage.prompt_tokens,
+            out.response.usage.completion_tokens,
+        )
+    });
+    let assistant_msg = out.response.choices.first().map(|ch| ch.message.clone());
     Ok(Round {
         served_model,
         calls,
         content,
         usage,
+        assistant_msg,
     })
 }
 
@@ -242,19 +192,17 @@ fn finish_turn(
 /// is truncated back to its entry length (no partial tool messages), matching
 /// `do_turn`'s contract so the caller's "pop the user on false" stays correct.
 pub async fn run_tool_turn(
-    http: &reqwest::Client,
-    base: &str,
-    key: &str,
+    client: &tt_client::Client,
     conv: &mut Conversation,
     reg: &Registry,
     ledger: &mut Ledger,
 ) -> bool {
     let start_len = conv.messages.len();
-    let tools = tools_json(reg);
+    let tools = registry_tools(reg);
     let mut turn = TurnTotals::default();
 
     for _round in 0..MAX_ROUNDS {
-        let round = match send_round(http, base, key, conv, &tools, false).await {
+        let round = match send_round(client, conv, &tools, false).await {
             Ok(r) => r,
             Err(e) => {
                 ui::error(&format!("{e:#}"));
@@ -275,14 +223,11 @@ pub async fn run_tool_turn(
             return true;
         }
 
-        // assistant turn that requests tools — preserve any accompanying text
-        let content =
-            (!round.content.is_empty()).then(|| MessageContent::Text(round.content.clone()));
-        conv.messages.push(Message::Assistant {
-            content,
-            tool_calls: round.calls.clone(),
-            name: None,
-        });
+        // push the assistant message the SDK returned verbatim (already typed,
+        // carrying any accompanying text + the tool_calls)
+        if let Some(m) = round.assistant_msg.clone() {
+            conv.messages.push(m);
+        }
         for tc in &round.calls {
             println!(
                 "{}",
@@ -307,7 +252,7 @@ pub async fn run_tool_turn(
     // Round cap hit: force a final text answer so the turn never ends on a
     // dangling tool result.
     ui::warn("tool loop hit the round cap — requesting a final answer");
-    match send_round(http, base, key, conv, &tools, true).await {
+    match send_round(client, conv, &tools, true).await {
         Ok(round) => {
             if let Some(u) = &round.usage {
                 turn.add(u);
@@ -336,24 +281,6 @@ pub async fn run_tool_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_tool_calls_extracts_and_skips_malformed() {
-        let msg = json!({
-            "tool_calls": [
-                { "id": "call_1", "type": "function",
-                  "function": { "name": "find_route_for", "arguments": "{\"task_description\":\"sort a list\"}" } },
-                { "type": "function", "function": { "name": "nope" } } // no id → skipped
-            ]
-        });
-        let calls = parse_tool_calls(&msg);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].function.name, "find_route_for");
-        assert!(calls[0].function.arguments.contains("sort a list"));
-        // no tool_calls field → empty
-        assert!(parse_tool_calls(&json!({"content": "hi"})).is_empty());
-    }
 
     #[test]
     fn usage_baseline_from_header_or_derived() {
@@ -394,8 +321,9 @@ mod tests {
                 .header("x-tokentrimmer-cost-usd", "0.0001")
                 .header("x-tokentrimmer-saved-usd", "0.0003")
                 .json_body(json!({
-                    "choices": [{ "message": { "role": "assistant", "content": "Use Haiku." } }],
-                    "usage": { "prompt_tokens": 12, "completion_tokens": 4 }
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Use Haiku." } }],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16 }
                 }));
         });
         // Round 1 (no tool result yet): the broad mock returns a tool_call.
@@ -405,13 +333,14 @@ mod tests {
                 .header("content-type", "application/json")
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")
                 .json_body(json!({
-                    "choices": [{ "message": {
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": {
                         "role": "assistant", "content": null,
                         "tool_calls": [{ "id": "c1", "type": "function",
                             "function": { "name": "find_route_for",
                                 "arguments": "{\"task_description\":\"classify sentiment\"}" } }]
                     }}],
-                    "usage": { "prompt_tokens": 5, "completion_tokens": 1 }
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6 }
                 }));
         });
 
@@ -419,9 +348,9 @@ mod tests {
         conv.push_user("what model for sentiment?".into());
         let reg = build_registry();
         let mut ledger = Ledger::default();
-        let http = reqwest::Client::new();
+        let client = tt_client::Client::new(server.base_url(), "k");
 
-        let ok = run_tool_turn(&http, &server.base_url(), "k", &mut conv, &reg, &mut ledger).await;
+        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;
         assert!(ok);
         // [User, Assistant(tool_calls), Tool(result), Assistant("Use Haiku.")]
         assert_eq!(conv.messages.len(), 4);
@@ -451,8 +380,9 @@ mod tests {
                 .header("x-tokentrimmer-cost-usd", "0.0001")
                 .header("x-tokentrimmer-saved-usd", "0.0002")
                 .json_body(json!({
-                    "choices": [{ "message": { "role": "assistant", "content": "Final answer." } }],
-                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Final answer." } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
                 }));
         });
         // Every normal request keeps requesting a tool (never converges); each
@@ -465,13 +395,14 @@ mod tests {
                 .header("x-tokentrimmer-cost-usd", "0.0001")
                 .header("x-tokentrimmer-saved-usd", "0.0002")
                 .json_body(json!({
-                    "choices": [{ "message": {
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": {
                         "role": "assistant", "content": null,
                         "tool_calls": [{ "id": "c1", "type": "function",
                             "function": { "name": "find_route_for",
                                 "arguments": "{\"task_description\":\"loop\"}" } }]
                     }}],
-                    "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
                 }));
         });
 
@@ -479,9 +410,9 @@ mod tests {
         conv.push_user("go".into());
         let reg = build_registry();
         let mut ledger = Ledger::default();
-        let http = reqwest::Client::new();
+        let client = tt_client::Client::new(server.base_url(), "k");
 
-        let ok = run_tool_turn(&http, &server.base_url(), "k", &mut conv, &reg, &mut ledger).await;
+        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;
         assert!(ok);
         // Must end with a real assistant answer, never a dangling Tool message.
         assert!(
@@ -511,8 +442,8 @@ mod tests {
         let start = conv.messages.len();
         let reg = build_registry();
         let mut ledger = Ledger::default();
-        let http = reqwest::Client::new();
-        let ok = run_tool_turn(&http, &server.base_url(), "k", &mut conv, &reg, &mut ledger).await;
+        let client = tt_client::Client::new(server.base_url(), "k");
+        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;
         assert!(!ok);
         assert_eq!(
             conv.messages.len(),
@@ -522,25 +453,19 @@ mod tests {
     }
 
     #[test]
-    fn tools_json_advertises_three_tools() {
+    fn registry_tools_advertises_three_tools() {
         let reg = build_registry();
-        let t = tools_json(&reg);
+        let t = registry_tools(&reg);
         assert_eq!(t.len(), 3);
-        let names: Vec<&str> = t
-            .iter()
-            .map(|v| v["function"]["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = t.iter().map(|x| x.function.name.as_str()).collect();
         assert!(names.contains(&"find_route_for"));
         assert!(names.contains(&"preview_cost"));
         assert!(names.contains(&"inspect_diff"));
         // schema carried through
         let fr = t
             .iter()
-            .find(|v| v["function"]["name"] == "find_route_for")
+            .find(|x| x.function.name == "find_route_for")
             .unwrap();
-        assert_eq!(
-            fr["function"]["parameters"]["required"][0],
-            "task_description"
-        );
+        assert_eq!(fr.function.parameters["required"][0], "task_description");
     }
 }
