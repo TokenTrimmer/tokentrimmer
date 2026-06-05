@@ -44,9 +44,97 @@ pub fn tools_json(reg: &Registry) -> Vec<Value> {
         .collect()
 }
 
+/// Extract `ToolCall`s from a response `message` (`choices[0].message`).
+/// Entries missing an `id` or function `name` are skipped.
+#[must_use]
+pub fn parse_tool_calls(message: &Value) -> Vec<ToolCall> {
+    message["tool_calls"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|tc| {
+                    Some(ToolCall {
+                        id: tc["id"].as_str()?.to_string(),
+                        r#type: tc["type"].as_str().unwrap_or("function").to_string(),
+                        function: ToolCallFunction {
+                            name: tc["function"]["name"].as_str()?.to_string(),
+                            arguments: tc["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or("{}")
+                                .to_string(),
+                        },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build a `UsageInfo` from a non-streamed response: cost/saved come from the
+/// gateway headers, tokens from the body's `usage`; baseline = cost + saved.
+#[must_use]
+pub fn usage_from_parts(cost_usd: f64, saved_usd: f64, in_tok: u64, out_tok: u64) -> UsageInfo {
+    UsageInfo {
+        cost_usd,
+        baseline_cost_usd: cost_usd + saved_usd,
+        saved_usd,
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+        cached_tokens: 0,
+    }
+}
+
+/// The muted one-line preview shown when the model calls a tool.
+#[must_use]
+pub fn format_tool_call(name: &str, args: &str) -> String {
+    let mut a: String = args.chars().take(80).collect();
+    if a.len() < args.len() {
+        a.push('…');
+    }
+    ui::muted()
+        .apply_to(format!("{} {name}({a})", ui::ARROW))
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tool_calls_extracts_and_skips_malformed() {
+        let msg = json!({
+            "tool_calls": [
+                { "id": "call_1", "type": "function",
+                  "function": { "name": "find_route_for", "arguments": "{\"task_description\":\"sort a list\"}" } },
+                { "type": "function", "function": { "name": "nope" } } // no id → skipped
+            ]
+        });
+        let calls = parse_tool_calls(&msg);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "find_route_for");
+        assert!(calls[0].function.arguments.contains("sort a list"));
+        // no tool_calls field → empty
+        assert!(parse_tool_calls(&json!({"content": "hi"})).is_empty());
+    }
+
+    #[test]
+    fn usage_baseline_is_cost_plus_saved() {
+        let u = usage_from_parts(0.001, 0.003, 10, 20);
+        assert!((u.baseline_cost_usd - 0.004).abs() < 1e-9);
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 20);
+    }
+
+    #[test]
+    fn format_tool_call_has_name_and_truncates() {
+        console::set_colors_enabled(false);
+        let line = format_tool_call("find_route_for", "{\"task_description\":\"x\"}");
+        assert!(line.contains("find_route_for"), "{line}");
+        let long = "a".repeat(200);
+        let l2 = format_tool_call("preview_cost", &long);
+        assert!(l2.contains('…'), "should truncate: {l2}");
+    }
 
     #[test]
     fn tools_json_advertises_three_tools() {
