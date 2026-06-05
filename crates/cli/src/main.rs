@@ -112,6 +112,9 @@ enum Command {
         /// Persist a gateway base URL alongside the key.
         #[arg(long)]
         base_url: Option<String>,
+        /// Don't open a browser; just print the URL to visit (headless/SSH).
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Remove the locally stored API key (does not revoke it server-side).
     Logout,
@@ -455,8 +458,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Login { token, base_url } => {
-            tt_cli::account::login_with_token(token, base_url)?;
+        Command::Login {
+            token,
+            base_url,
+            no_browser,
+        } => {
+            tt_cli::account::login(token, base_url, no_browser)?;
         }
         Command::Logout => {
             tt_cli::account::logout()?;
