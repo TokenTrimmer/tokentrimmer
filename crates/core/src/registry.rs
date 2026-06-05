@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tt_provider_anthropic::{AnthropicProvider, ClientConfig as AnthropicClientConfig};
 use tt_provider_gemini::{ClientConfig as GeminiClientConfig, GeminiProvider};
 use tt_provider_groq::GroqProvider;
+use tt_provider_local::{LocalBackend, LocalProvider};
 use tt_provider_mistral::MistralProvider;
 use tt_provider_openai::{ClientConfig as OpenAiClientConfig, OpenAiProvider};
 use tt_provider_openrouter::OpenRouterProvider;
@@ -62,6 +63,7 @@ impl ProviderRegistry {
     /// dispatch.
     pub fn resolve(&self, model: &str) -> Option<Arc<dyn Provider>> {
         self.by_model(model)
+            .or_else(|| tt_shared::providers::local_backend(model).and_then(|id| self.by_id(id)))
             .or_else(|| tt_shared::providers::infer_provider(model).and_then(|id| self.by_id(id)))
     }
 
@@ -193,8 +195,56 @@ pub fn register_providers(registry: &mut ProviderRegistry, cfg: &ProvidersConfig
         registry.register(Arc::new(OpenRouterProvider::new(oai_cfg())));
     }
 
-    // Local (deferred):
-    // registry.register(Arc::new(LocalProvider::new(...)));
+    // Local backends register only when their base-URL env var is set.
+    register_local_providers(registry, &LocalProviders::from_env());
+}
+
+/// Self-hosted local backends, each registered only when its base URL is set
+/// (`TT_LOCAL_OLLAMA_URL`, `TT_LOCAL_VLLM_URL`, `TT_LOCAL_LMSTUDIO_URL`).
+#[derive(Debug, Clone, Default)]
+pub struct LocalProviders {
+    pub ollama: Option<String>,
+    pub vllm: Option<String>,
+    pub lmstudio: Option<String>,
+}
+
+impl LocalProviders {
+    /// Read the three base-URL env vars; an unset/empty var leaves that backend off.
+    pub fn from_env() -> Self {
+        let v = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+        Self {
+            ollama: v("TT_LOCAL_OLLAMA_URL"),
+            vllm: v("TT_LOCAL_VLLM_URL"),
+            lmstudio: v("TT_LOCAL_LMSTUDIO_URL"),
+        }
+    }
+}
+
+/// Register a `LocalProvider` for each configured backend (longer client
+/// timeout for cold-start latency).
+pub fn register_local_providers(registry: &mut ProviderRegistry, cfg: &LocalProviders) {
+    let cc = LocalProvider::suggested_client_config();
+    if let Some(url) = &cfg.ollama {
+        registry.register(Arc::new(LocalProvider::with_base_url(
+            LocalBackend::Ollama,
+            url.clone(),
+            cc.clone(),
+        )));
+    }
+    if let Some(url) = &cfg.vllm {
+        registry.register(Arc::new(LocalProvider::with_base_url(
+            LocalBackend::Vllm,
+            url.clone(),
+            cc.clone(),
+        )));
+    }
+    if let Some(url) = &cfg.lmstudio {
+        registry.register(Arc::new(LocalProvider::with_base_url(
+            LocalBackend::LmStudio,
+            url.clone(),
+            cc.clone(),
+        )));
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +278,32 @@ mod config_tests {
         assert!(reg.by_id("groq").is_some());
         assert!(reg.by_id("openai").is_none());
         assert!(reg.by_id("anthropic").is_none());
+    }
+
+    #[test]
+    fn resolves_local_prefixed_model_to_registered_backend() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(std::sync::Arc::new(tt_provider_local::LocalProvider::new(
+            tt_provider_local::LocalBackend::Ollama,
+            tt_provider_openai::ClientConfig::default(),
+        )));
+        assert!(reg.resolve("ollama/llama3.1:8b").is_some());
+        // Unregistered backend → None (gateway not configured for it).
+        assert!(reg.resolve("vllm/qwen").is_none());
+    }
+
+    #[test]
+    fn register_local_providers_honors_configured_urls() {
+        let mut reg = ProviderRegistry::new();
+        register_local_providers(
+            &mut reg,
+            &LocalProviders {
+                ollama: Some("http://localhost:11434/v1".into()),
+                vllm: None,
+                lmstudio: None,
+            },
+        );
+        assert!(reg.by_id("ollama").is_some());
+        assert!(reg.by_id("vllm").is_none());
     }
 }

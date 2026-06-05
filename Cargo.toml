@@ -135,6 +135,7 @@ tt-provider-mistral = { path = "crates/providers/mistral" }
 tt-provider-groq = { path = "crates/providers/groq" }
 tt-provider-together = { path = "crates/providers/together" }
 tt-provider-openrouter = { path = "crates/providers/openrouter" }
+tt-provider-local = { path = "crates/providers/local" }
 tt-preview = { path = "crates/preview" }
 tt-mcp = { path = "crates/mcp" }
 tt-retrieval = { path = "crates/retrieval" }
