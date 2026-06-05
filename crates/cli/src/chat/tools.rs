@@ -262,6 +262,88 @@ mod tests {
         assert!(l2.contains('…'), "should truncate: {l2}");
     }
 
+    use httpmock::prelude::*;
+
+    #[tokio::test]
+    async fn tool_loop_executes_then_answers() {
+        let server = MockServer::start_async().await;
+        // Define the MORE SPECIFIC mock first: round 2's request carries a tool
+        // result (`"role":"tool"`) — it returns the final text answer.
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"tool\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .header("x-tokentrimmer-cost-usd", "0.0001")
+                .header("x-tokentrimmer-saved-usd", "0.0003")
+                .json_body(json!({
+                    "choices": [{ "message": { "role": "assistant", "content": "Use Haiku." } }],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 4 }
+                }));
+        });
+        // Round 1 (no tool result yet): the broad mock returns a tool_call.
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .json_body(json!({
+                    "choices": [{ "message": {
+                        "role": "assistant", "content": null,
+                        "tool_calls": [{ "id": "c1", "type": "function",
+                            "function": { "name": "find_route_for",
+                                "arguments": "{\"task_description\":\"classify sentiment\"}" } }]
+                    }}],
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 1 }
+                }));
+        });
+
+        let mut conv = Conversation::new("gpt-4o-mini".into(), None);
+        conv.push_user("what model for sentiment?".into());
+        let reg = build_registry();
+        let mut ledger = Ledger::default();
+        let http = reqwest::Client::new();
+
+        let ok = run_tool_turn(&http, &server.base_url(), "k", &mut conv, &reg, &mut ledger).await;
+        assert!(ok);
+        // [User, Assistant(tool_calls), Tool(result), Assistant("Use Haiku.")]
+        assert_eq!(conv.messages.len(), 4);
+        assert!(
+            matches!(conv.messages[1], Message::Assistant { ref tool_calls, .. } if !tool_calls.is_empty())
+        );
+        assert!(
+            matches!(&conv.messages[2], Message::Tool { content: MessageContent::Text(t), .. } if t.contains("model"))
+        );
+        assert!(
+            matches!(&conv.messages[3], Message::Assistant { content: Some(MessageContent::Text(t)), .. } if t == "Use Haiku.")
+        );
+        assert_eq!(ledger.turns, 1); // only the final round carried cost headers
+    }
+
+    #[tokio::test]
+    async fn tool_loop_rolls_back_on_error() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(500).body("boom");
+        });
+        let mut conv = Conversation::new("gpt-4o-mini".into(), None);
+        conv.push_user("hi".into());
+        let start = conv.messages.len();
+        let reg = build_registry();
+        let mut ledger = Ledger::default();
+        let http = reqwest::Client::new();
+        let ok = run_tool_turn(&http, &server.base_url(), "k", &mut conv, &reg, &mut ledger).await;
+        assert!(!ok);
+        assert_eq!(
+            conv.messages.len(),
+            start,
+            "history must be unchanged on failure"
+        );
+    }
+
     #[test]
     fn tools_json_advertises_three_tools() {
         let reg = build_registry();
