@@ -2,6 +2,8 @@
 //! conversation fills a per-model budget, and trim the oldest turns before the
 //! limit. The gateway remains the authoritative gate; this is advisory.
 
+use std::collections::HashMap;
+
 use tt_shared::messages::{Message, MessageContent};
 
 use crate::chat::Conversation;
@@ -124,26 +126,33 @@ pub fn trim_to_budget(conv: &mut Conversation, target: u32, provider: &str) -> u
 /// Per-session context budget + warn/trim state.
 pub struct ContextState {
     /// Explicit budget from `--max-context` / `/context <n>`; otherwise the
-    /// per-model window is used.
+    /// catalog window, else the prefix table.
     pub override_budget: Option<u32>,
+    /// Model id → input window from the live gateway catalog (`/v1/models`);
+    /// empty when the catalog is unavailable.
+    catalog_windows: HashMap<String, u32>,
     warned: bool,
 }
 
 impl ContextState {
     #[must_use]
-    pub fn new(override_budget: Option<u32>) -> Self {
+    pub fn new(override_budget: Option<u32>, catalog_windows: HashMap<String, u32>) -> Self {
         Self {
             // A 0 budget would disable management / divide by zero — treat it as
-            // "unset" so it falls back to the per-model window.
+            // "unset" so it falls back to the catalog / per-model window.
             override_budget: override_budget.filter(|&n| n > 0),
+            catalog_windows,
             warned: false,
         }
     }
 
-    /// Effective budget for `model`: the override if set, else the window table.
+    /// Effective budget for `model`: explicit override → live catalog window →
+    /// the per-model prefix table (offline fallback).
     #[must_use]
     pub fn budget(&self, model: &str) -> u32 {
-        self.override_budget.unwrap_or_else(|| model_window(model))
+        self.override_budget
+            .or_else(|| self.catalog_windows.get(model).copied())
+            .unwrap_or_else(|| model_window(model))
     }
 
     /// Estimated tokens for the conversation.
@@ -218,16 +227,27 @@ mod tests {
 
     #[test]
     fn zero_budget_falls_back_to_model_window() {
-        let st = ContextState::new(Some(0));
+        let st = ContextState::new(Some(0), HashMap::new());
         assert_eq!(st.override_budget, None);
         assert_eq!(st.budget("gpt-4o-mini"), 128_000);
     }
 
     #[test]
+    fn budget_precedence_override_catalog_prefix() {
+        let mut cat = HashMap::new();
+        cat.insert("custom-model".to_string(), 333_000u32);
+        let st = ContextState::new(None, cat.clone());
+        assert_eq!(st.budget("custom-model"), 333_000); // live catalog window
+        assert_eq!(st.budget("gpt-4o-mini"), 128_000); // not in catalog → prefix table
+        let ov = ContextState::new(Some(50_000), cat);
+        assert_eq!(ov.budget("custom-model"), 50_000); // override beats catalog
+    }
+
+    #[test]
     fn budget_uses_override_then_model() {
-        let with = ContextState::new(Some(64_000));
+        let with = ContextState::new(Some(64_000), HashMap::new());
         assert_eq!(with.budget("claude-3-5-sonnet"), 64_000); // override wins
-        let auto = ContextState::new(None);
+        let auto = ContextState::new(None, HashMap::new());
         assert_eq!(auto.budget("claude-3-5-sonnet"), 200_000); // model window
         assert_eq!(auto.budget("mystery"), DEFAULT_CONTEXT_BUDGET);
     }
@@ -239,7 +259,7 @@ mod tests {
         c.push_user("a few words here to use some of the budget".into());
         let est = estimate_conversation_tokens(&c, ESTIMATE_PROVIDER);
         // budget chosen so the current size sits at ~80% → the warn band (75–95%)
-        let mut st = ContextState::new(Some((f64::from(est) / 0.80) as u32));
+        let mut st = ContextState::new(Some((f64::from(est) / 0.80) as u32), HashMap::new());
         st.manage(&mut c);
         assert!(st.warned, "should warn in the 75–95% band (est={est})");
         // grow well past 95% → auto-trim

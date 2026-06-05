@@ -139,6 +139,13 @@ enum Command {
         #[arg(long, global = true)]
         tt_api_base: Option<String>,
     },
+    /// List the gateway's model catalog (context windows, capabilities, pricing).
+    Models {
+        #[arg(long)]
+        tt_api_key: Option<String>,
+        #[arg(long)]
+        tt_api_base: Option<String>,
+    },
     /// Install TokenTrimmer best-practices into the current repo.
     Init {
         #[arg(long)]
@@ -476,6 +483,12 @@ async fn main() -> anyhow::Result<()> {
                 tt_api_base,
             )
             .await?;
+        }
+        Command::Models {
+            tt_api_key,
+            tt_api_base,
+        } => {
+            tt_cli::catalog::run(tt_api_key, tt_api_base).await?;
         }
         Command::Init {
             path,
