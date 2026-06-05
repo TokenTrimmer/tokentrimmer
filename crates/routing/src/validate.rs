@@ -24,6 +24,11 @@ pub fn validate_same_provider(
     when: &RouteConditions,
     then: &RouteAction,
 ) -> Result<(), ValidationError> {
+    // Routing to a local model is a deliberate cross-provider exception for
+    // privacy (V3b) — never blocked by the same-provider rule (ADR-018).
+    if tt_shared::providers::local_backend(&then.target_model).is_some() {
+        return Ok(());
+    }
     for src in &when.model_in {
         if known_to_differ(src, &then.target_model) {
             return Err(ValidationError::CrossProvider {
@@ -107,6 +112,18 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_same_provider(&when, &action("qwen-2.5-72b")).is_ok());
+    }
+
+    #[test]
+    fn local_target_is_exempt_from_same_provider() {
+        let when = RouteConditions {
+            model_in: vec!["gpt-4o".into()],
+            ..Default::default()
+        };
+        // Routing an OpenAI model to a local model is allowed (privacy exception).
+        assert!(validate_same_provider(&when, &action("ollama/llama3.1:8b")).is_ok());
+        // A genuine cross-provider (non-local) rewrite is still rejected.
+        assert!(validate_same_provider(&when, &action("claude-haiku-4-5")).is_err());
     }
 
     #[test]
