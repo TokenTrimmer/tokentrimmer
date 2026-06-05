@@ -264,7 +264,11 @@ fn print_help() {
         ("/system [s]", "show or set the system prompt"),
         ("/exit", "quit (or Ctrl-D)"),
     ] {
-        println!("  {}  {}", ui::accent().apply_to(c), ui::muted().apply_to(d));
+        println!(
+            "  {}  {}",
+            ui::accent().apply_to(c),
+            ui::muted().apply_to(d)
+        );
     }
 }
 
@@ -381,7 +385,9 @@ mod tests {
         assert!(matches!(Command::parse("/help"), Command::Help));
         assert!(matches!(Command::parse("/clear"), Command::Clear));
         assert!(matches!(Command::parse("/exit"), Command::Exit));
-        assert!(matches!(Command::parse("/model gpt-4o"), Command::Model(Some(m)) if m == "gpt-4o"));
+        assert!(
+            matches!(Command::parse("/model gpt-4o"), Command::Model(Some(m)) if m == "gpt-4o")
+        );
         assert!(matches!(Command::parse("/model"), Command::Model(None)));
         assert!(matches!(Command::parse("/nope"), Command::Unknown(c) if c == "nope"));
         assert!(matches!(Command::parse("hello there"), Command::Chat(t) if t == "hello there"));
