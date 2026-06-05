@@ -73,6 +73,21 @@ pub fn known_to_differ(a: &str, b: &str) -> bool {
     }
 }
 
+/// If `model` is a local-backend-prefixed id (`ollama/…`, `vllm/…`,
+/// `lmstudio/…`) with a non-empty model name, return the backend id; else None.
+/// Single source of truth for local routing — used by the registry resolver,
+/// the same-provider exemption, and `LocalProvider`'s prefix strip.
+pub fn local_backend(model: &str) -> Option<&'static str> {
+    for id in ["ollama", "vllm", "lmstudio"] {
+        if let Some(rest) = model.strip_prefix(id).and_then(|r| r.strip_prefix('/')) {
+            if !rest.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +148,16 @@ mod tests {
         assert!(!known_to_differ("gpt-4o", "llama-3.3-70b"));
         assert!(!known_to_differ("custom-1", "custom-2"));
         assert!(!known_to_differ("custom-1", "gpt-4o"));
+    }
+
+    #[test]
+    fn local_backend_recognizes_prefixes() {
+        assert_eq!(local_backend("ollama/llama3.1:8b"), Some("ollama"));
+        assert_eq!(local_backend("vllm/Qwen2.5-7B"), Some("vllm"));
+        assert_eq!(local_backend("lmstudio/phi-4"), Some("lmstudio"));
+        assert_eq!(local_backend("ollama"), None);
+        assert_eq!(local_backend("ollama/"), None);
+        assert_eq!(local_backend("gpt-4o"), None);
+        assert_eq!(local_backend(""), None);
     }
 }
