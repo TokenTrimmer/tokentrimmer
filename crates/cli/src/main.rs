@@ -104,7 +104,7 @@ enum Command {
         #[arg(long, default_value_t = 31416)]
         sse_port: u16,
     },
-    /// Store a TokenTrimmer API key for this machine (browser login lands in V2).
+    /// Log in: opens the dashboard to create an API key (paste it back), or pass --token <KEY>.
     Login {
         /// The tt_live_/tt_test_ key. Use `-` to read it from stdin.
         #[arg(long)]

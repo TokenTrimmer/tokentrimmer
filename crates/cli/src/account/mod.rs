@@ -86,7 +86,11 @@ fn open_browser(url: &str) -> bool {
 /// `tt login` with no `--token`: open the dashboard keys page + read the pasted
 /// key (hidden). Interactive only — non-interactive callers use `--token`.
 fn browser_login(base_url: Option<String>, no_browser: bool) -> anyhow::Result<()> {
-    if !console::user_attended() {
+    use std::io::IsTerminal as _;
+    // The hidden paste renders on stderr and reads from the controlling
+    // terminal; require both stdin and stderr to be a TTY so piped/redirected
+    // callers get a clear "use --token" instead of a surprise prompt or error.
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         anyhow::bail!(
             "browser login needs an interactive terminal — use `tt login --token <KEY>` \
              (create a key at {DASHBOARD_KEYS_URL})"
