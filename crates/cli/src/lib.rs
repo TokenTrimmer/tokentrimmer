@@ -2,6 +2,7 @@
 //! modules for integration tests and the `tt` binary.
 
 pub mod account;
+pub mod advise;
 pub mod catalog;
 pub mod chat;
 pub mod context;

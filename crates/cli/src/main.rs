@@ -149,6 +149,21 @@ enum Command {
         #[arg(long)]
         tt_api_base: Option<String>,
     },
+    /// AI cost/routing advisor: scan a repo + recommend optimizations (read-only).
+    Advise {
+        /// Repo path to scan (default: current directory).
+        path: Option<String>,
+        /// Describe what the app does (adds context for the advisor).
+        #[arg(long)]
+        describe: Option<String>,
+        /// Advisor model (default: gpt-4o-mini).
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        tt_api_key: Option<String>,
+        #[arg(long)]
+        tt_api_base: Option<String>,
+    },
     /// Install TokenTrimmer best-practices into the current repo.
     Init {
         #[arg(long)]
@@ -496,6 +511,15 @@ async fn main() -> anyhow::Result<()> {
             tt_api_base,
         } => {
             tt_cli::catalog::run(tt_api_key, tt_api_base).await?;
+        }
+        Command::Advise {
+            path,
+            describe,
+            model,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            tt_cli::advise::run(path, describe, model, tt_api_key, tt_api_base).await?;
         }
         Command::Init {
             path,
