@@ -21,7 +21,7 @@
 //! Rates come from the versioned, embedded pricing catalog
 //! (`tt_shared::pricing`); the headline rate is the ≤200K-token bracket.
 
-use tt_shared::pricing::{catalog, Capability, ModelInfo, ModelPricing};
+use tt_shared::pricing::{catalog, ModelInfo, ModelPricing};
 
 /// The 200K token threshold above which the higher pricing bracket applies.
 /// Adapters log a debug message when exceeded; full per-request bracket pricing
@@ -36,37 +36,5 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
 
 /// Return all supported Gemini model descriptors.
 pub fn all_models() -> Vec<ModelInfo> {
-    let capabilities = vec![
-        Capability::Text,
-        Capability::Vision,
-        Capability::Tools,
-        Capability::JsonMode,
-        Capability::Streaming,
-        Capability::PromptCaching,
-    ];
-
-    vec![
-        ModelInfo {
-            id: "gemini-3.1-flash-lite".to_string(),
-            provider: "gemini".to_string(),
-            capabilities: capabilities.clone(),
-            max_input_tokens: 1_000_000,
-            max_output_tokens: 8192,
-        },
-        ModelInfo {
-            id: "gemini-3.5-flash".to_string(),
-            provider: "gemini".to_string(),
-            capabilities: capabilities.clone(),
-            max_input_tokens: 1_000_000,
-            max_output_tokens: 8192,
-        },
-        ModelInfo {
-            id: "gemini-3.1-pro".to_string(),
-            provider: "gemini".to_string(),
-            capabilities,
-            max_input_tokens: 2_000_000,
-            // Conservative: pro has 65536 in reasoning mode; use 8192 for non-reasoning
-            max_output_tokens: 8192,
-        },
-    ]
+    tt_shared::model_catalog::model_catalog().for_provider("gemini")
 }

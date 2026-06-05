@@ -832,6 +832,18 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         state = state.with_l1(l1, None);
     }
 
+    // Surface a stale embedded pricing catalog (the dormant freshness signal).
+    const PRICING_STALE_DAYS: i64 = 90;
+    let newest_pricing = tt_shared::pricing::catalog().catalog_max_effective_at();
+    if let Some(d) = newest_pricing {
+        if tt_shared::pricing::is_stale(Some(d), chrono::Utc::now(), PRICING_STALE_DAYS) {
+            tracing::warn!(
+                newest_effective_at = %d,
+                "pricing catalog is over {PRICING_STALE_DAYS} days old — rates may be stale; refresh data/pricing.toml"
+            );
+        }
+    }
+
     // Provider credentials: chained store — Postgres primary (when DB +
     // `TT_MASTER_KEY` are configured), env-backed fallback (single-tenant
     // dogfooding from the operator's own `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`

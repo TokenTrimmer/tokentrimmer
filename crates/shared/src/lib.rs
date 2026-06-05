@@ -7,6 +7,7 @@ pub mod capability_check;
 pub mod context;
 pub mod error;
 pub mod messages;
+pub mod model_catalog;
 pub mod pricing;
 pub mod provider;
 pub mod providers;
@@ -21,6 +22,7 @@ pub use messages::{
     ChatCompletionResponse, Choice, ContentPart, EmbeddingsRequest, EmbeddingsResponse, Message,
     MessageContent, Tool, ToolCall, ToolChoice,
 };
+pub use model_catalog::{model_catalog, ModelCatalog};
 pub use pricing::{ModelInfo, ModelPricing};
 pub use provider::Provider;
 pub use url_guard::{

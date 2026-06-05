@@ -34,7 +34,7 @@ pub struct ModelPricing {
     pub effective_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelInfo {
     pub id: String,
     pub provider: String,
@@ -191,10 +191,29 @@ pub fn catalog() -> &'static PricingCatalog {
     })
 }
 
+/// Whether `newest` (the catalog's max `effective_at`) is more than `max_days`
+/// before `now`. An empty catalog (`None`) is treated as not stale.
+#[must_use]
+pub fn is_stale(newest: Option<DateTime<Utc>>, now: DateTime<Utc>, max_days: i64) -> bool {
+    match newest {
+        Some(d) => (now - d).num_days() > max_days,
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn is_stale_thresholds() {
+        use chrono::Duration;
+        let now: DateTime<Utc> = "2026-06-05T00:00:00Z".parse().unwrap();
+        assert!(!is_stale(None, now, 90)); // empty catalog: not stale
+        assert!(!is_stale(Some(now - Duration::days(10)), now, 90));
+        assert!(is_stale(Some(now - Duration::days(100)), now, 90));
+    }
 
     #[test]
     fn embedded_catalog_parses_and_is_populated() {
