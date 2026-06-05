@@ -3,7 +3,7 @@
 //! refresh is a `data/pricing.toml` edit, not a code change. Model descriptors
 //! (capabilities / token limits) stay typed in Rust below.
 
-use tt_shared::pricing::{catalog, Capability, ModelInfo, ModelPricing};
+use tt_shared::pricing::{catalog, ModelInfo, ModelPricing};
 
 /// Return the pricing entry for a known OpenAI model, or `None` if unrecognized.
 ///
@@ -16,102 +16,5 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
 
 /// Return all supported OpenAI model descriptors, including embedding models.
 pub fn all_models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "gpt-5.5".to_string(),
-            provider: "openai".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Vision,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-                Capability::PromptCaching,
-            ],
-            max_input_tokens: 200_000,
-            max_output_tokens: 16_000,
-        },
-        ModelInfo {
-            id: "gpt-5.4".to_string(),
-            provider: "openai".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Vision,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-                Capability::PromptCaching,
-            ],
-            max_input_tokens: 200_000,
-            max_output_tokens: 16_000,
-        },
-        ModelInfo {
-            id: "gpt-4o".to_string(),
-            provider: "openai".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Vision,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-                Capability::PromptCaching,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 16_000,
-        },
-        ModelInfo {
-            id: "gpt-4o-mini".to_string(),
-            provider: "openai".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Vision,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-                Capability::PromptCaching,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 16_000,
-        },
-        ModelInfo {
-            id: "o3".to_string(),
-            provider: "openai".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Reasoning,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 200_000,
-            max_output_tokens: 100_000,
-        },
-        ModelInfo {
-            id: "o4-mini".to_string(),
-            provider: "openai".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Reasoning,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 200_000,
-            max_output_tokens: 100_000,
-        },
-        ModelInfo {
-            id: "text-embedding-3-small".to_string(),
-            provider: "openai".to_string(),
-            capabilities: vec![Capability::Text],
-            max_input_tokens: 8_191,
-            max_output_tokens: 0,
-        },
-        ModelInfo {
-            id: "text-embedding-3-large".to_string(),
-            provider: "openai".to_string(),
-            capabilities: vec![Capability::Text],
-            max_input_tokens: 8_191,
-            max_output_tokens: 0,
-        },
-    ]
+    tt_shared::model_catalog::model_catalog().for_provider("openai")
 }
