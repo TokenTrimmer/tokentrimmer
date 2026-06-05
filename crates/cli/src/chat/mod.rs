@@ -144,6 +144,16 @@ pub fn format_turn_footer(
     ui::muted().apply_to(s).to_string()
 }
 
+/// Build the OSC52 terminal escape that copies `text` to the system clipboard.
+/// Works locally and over SSH — no platform clipboard dependency. Best-effort:
+/// terminals that don't support OSC52 simply ignore it.
+#[must_use]
+pub fn osc52_copy(text: &str) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;c;{b64}\x07")
+}
+
 /// In-memory conversation state (also the on-disk session format).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
@@ -535,6 +545,14 @@ mod tests {
         let s = l.summary();
         assert!(s.contains("2 turn"), "{s}");
         assert!(s.contains("75%"), "{s}");
+    }
+
+    #[test]
+    fn osc52_wraps_base64() {
+        let s = osc52_copy("hi");
+        assert!(s.starts_with("\x1b]52;c;"), "{s:?}");
+        assert!(s.ends_with('\x07'), "{s:?}");
+        assert!(s.contains("aGk="), "base64 of 'hi' missing: {s:?}");
     }
 
     #[test]
