@@ -195,6 +195,7 @@ async fn route_to_local_dispatches_to_ollama_provider() {
                 target_model: "ollama/llama3.1:8b".into(),
                 fallbacks: vec![],
                 force_cache_layer: None,
+                disable_cache: false,
             },
         }],
     );
