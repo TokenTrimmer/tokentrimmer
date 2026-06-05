@@ -48,3 +48,7 @@ coverage/
 
 # Build artifacts
 *.pdb
+
+# Python bytecode (scripts/)
+__pycache__/
+*.pyc

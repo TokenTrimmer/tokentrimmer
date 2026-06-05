@@ -1,0 +1,71 @@
+name: Model catalog refresh
+
+# Monthly: reconcile models.toml context windows against OpenRouter's live
+# models API (scripts/refresh_models.py) and open a REVIEWED PR on drift —
+# preserving the human-gated, auditable catalog posture (the gateway never
+# fetches a catalog at runtime). Also runs the script's unit tests on PRs.
+on:
+  schedule:
+    - cron: '0 9 8 * *' # 09:00 UTC on the 8th (offset from pricing-drift on the 1st)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'scripts/refresh_models.py'
+      - 'scripts/test_refresh_models.py'
+      - 'crates/shared/data/models.toml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  test:
+    name: refresh script unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12' # tomllib needs >=3.11
+      - run: python3 scripts/test_refresh_models.py
+
+  refresh:
+    name: open a PR if context windows drifted
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply window updates and open/refresh a PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/refresh_models.py --write
+          if git diff --quiet; then
+            echo "no context-window drift — nothing to do"
+            exit 0
+          fi
+          BRANCH="chore/model-catalog-refresh"
+          # Never clobber a refresh branch that already exists — a PR may be open
+          # with reviewer commits (e.g. an updated pinned test). Skip instead of
+          # force-pushing over it; the existing PR already carries the drift.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "refresh branch '$BRANCH' already exists — a PR is pending review; skipping"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add crates/shared/data/models.toml
+          git commit -m "chore: refresh model context windows from OpenRouter"
+          git push -u origin "$BRANCH"
+          # Open a PR only if there is no OPEN one for this head — a prior MERGED
+          # PR on the same branch name must not suppress a new one.
+          if ! gh pr list --head "$BRANCH" --state open --json number -q '.[0].number' | grep -q .; then
+            gh pr create \
+              --title "chore: refresh model context windows from OpenRouter" \
+              --body "Automated context-window refresh (scripts/refresh_models.py) vs OpenRouter's live models API. Review the deltas; if a model_catalog spot-check test pins a changed window, update it in this PR. NOTE: a GITHUB_TOKEN-created PR does not auto-trigger CI — re-run checks (or have branch protection require them) before merging." \
+              --label automated
+          fi
