@@ -466,12 +466,8 @@ async fn main() -> anyhow::Result<()> {
                 dry_run,
                 tt_cli_version: env!("CARGO_PKG_VERSION").to_string(),
             };
-            let report = run(opts).context("tt init failed")?;
-            println!();
-            println!(
-                "Done. {} written, {} skipped.",
-                report.files_written, report.files_skipped
-            );
+            // `init::run` already prints a styled summary (V1b); no second one.
+            run(opts).context("tt init failed")?;
         }
         Command::Retrieval { action } => {
             use tt_cli::retrieval as cli_retrieval;
@@ -1022,11 +1018,33 @@ fn run_inspect(path: &str, fail_on: &str, output: Option<&str>) -> anyhow::Resul
         Some(p) if !p.is_empty() && p != "-" => {
             std::fs::write(p, &formatted)
                 .map_err(|e| anyhow::anyhow!("failed to write output to {p}: {e}"))?;
-            eprintln!("wrote {} finding(s) to {p}", findings.len());
+            tt_cli::ui::note(&format!("wrote {} finding(s) to {p}", findings.len()));
         }
         _ => {
             print!("{formatted}");
         }
+    }
+
+    // Colored severity summary on stderr (the stdout report body stays plain).
+    let count = |s: Severity| findings.iter().filter(|f| f.severity == s).count();
+    let (c, h, m, l) = (
+        count(Severity::Critical),
+        count(Severity::High),
+        count(Severity::Medium),
+        count(Severity::Low),
+    );
+    if findings.is_empty() {
+        tt_cli::ui::ok("Clean — no findings");
+    } else if c > 0 {
+        tt_cli::ui::error(&format!(
+            "{} finding(s) · {c} critical · {h} high · {m} medium · {l} low",
+            findings.len()
+        ));
+    } else {
+        tt_cli::ui::warn(&format!(
+            "{} finding(s) · {h} high · {m} medium · {l} low",
+            findings.len()
+        ));
     }
 
     let above: Vec<_> = findings
@@ -1059,7 +1077,7 @@ fn run_suggest_plan(path: &str, output: Option<&str>) -> anyhow::Result<()> {
         Some(p) if !p.is_empty() && p != "-" => {
             std::fs::write(p, &json)
                 .map_err(|e| anyhow::anyhow!("failed to write plan input to {p}: {e}"))?;
-            eprintln!("wrote plan-input skeleton to {p}  (edit org_id + requests, then: tt plan --input {p})");
+            tt_cli::ui::note(&format!("wrote plan-input skeleton to {p}  (edit org_id + requests, then: tt plan --input {p})"));
         }
         _ => {
             print!("{json}");
@@ -1108,9 +1126,23 @@ fn run_cost_diff(
         Some(p) if !p.is_empty() && p != "-" => {
             std::fs::write(p, &formatted)
                 .map_err(|e| anyhow::anyhow!("failed to write output to {p}: {e}"))?;
-            eprintln!("wrote cost-diff report to {p}");
+            tt_cli::ui::note(&format!("wrote cost-diff report to {p}"));
         }
         _ => print!("{formatted}"),
+    }
+
+    if report.is_increase() {
+        tt_cli::ui::warn(&format!(
+            "Net +${:.6} per call projected",
+            report.net_projected_usd
+        ));
+    } else if report.net_projected_usd < 0.0 {
+        tt_cli::ui::ok(&format!(
+            "Net −${:.6} per call projected",
+            report.net_projected_usd.abs()
+        ));
+    } else {
+        tt_cli::ui::note("No net per-call cost change projected.");
     }
 
     if fail_on_cost_increase && report.is_increase() {
@@ -1168,11 +1200,24 @@ fn run_plan(
     match output {
         Some(p) if p != "-" => {
             std::fs::write(p, &payload)?;
-            eprintln!("wrote plan result to {p}");
+            tt_cli::ui::note(&format!("wrote plan result to {p}"));
         }
         _ => {
             print!("{payload}");
         }
+    }
+
+    let agg = &result.aggregates;
+    if agg.projected_savings_usd > 0.0 {
+        tt_cli::ui::ok(&format!(
+            "Projected savings ${:.4} ({:.1}%) · {} of {} requests rerouted",
+            agg.projected_savings_usd,
+            agg.projected_savings_pct,
+            agg.requests_rerouted,
+            result.sample_size
+        ));
+    } else {
+        tt_cli::ui::note("No projected savings for this config.");
     }
 
     // `--apply` is not wired to a hosted backend yet. The projection above is
@@ -1356,9 +1401,11 @@ fn run_audit_verify(
     let chain_path_str = path.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
     let chain_path = Path::new(chain_path_str);
     if !chain_path.exists() {
-        println!("no chain to verify ({chain_path_str} not found)");
+        tt_cli::ui::note(&format!("no chain to verify ({chain_path_str} not found)"));
         if let Some(o) = org {
-            println!("(org filter --org={o} noted; no entries to filter)");
+            tt_cli::ui::note(&format!(
+                "(org filter --org={o} noted; no entries to filter)"
+            ));
         }
         return Ok(());
     }
@@ -1376,7 +1423,7 @@ fn run_audit_verify(
             .trim()
             .to_string()
     } else if let Some(h) = parsed.preamble_verifying_key {
-        println!("verifying-key sourced from export preamble");
+        tt_cli::ui::note("verifying-key sourced from export preamble");
         h
     } else {
         anyhow::bail!(
@@ -1393,15 +1440,20 @@ fn run_audit_verify(
     let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_array)
         .map_err(|e| anyhow::anyhow!("invalid Ed25519 verifying key: {e}"))?;
 
-    println!("loaded {} entries", parsed.entries.len());
+    tt_cli::ui::note(&format!("loaded {} entries", parsed.entries.len()));
 
     if let Some(o) = org {
-        println!("(--org={o} noted; filtering is deferred — verifies full chain)");
+        tt_cli::ui::note(&format!(
+            "(--org={o} noted; filtering is deferred — verifies full chain)"
+        ));
     }
 
     match tt_telemetry::audit::verify_chain(&parsed.entries, &verifying_key) {
         Ok(()) => {
-            println!("chain OK — all {} entries verified", parsed.entries.len());
+            tt_cli::ui::ok(&format!(
+                "chain OK — all {} entries verified",
+                parsed.entries.len()
+            ));
         }
         Err(e) => {
             anyhow::bail!("chain verification FAILED: {e}");
