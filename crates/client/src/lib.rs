@@ -84,8 +84,9 @@ pub fn build_body(
     messages: &[Message],
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    stream: bool,
 ) -> Value {
-    let mut body = json!({ "model": model, "messages": messages, "stream": false });
+    let mut body = json!({ "model": model, "messages": messages, "stream": stream });
     if let Some(mt) = max_tokens {
         body["max_tokens"] = json!(mt);
     }
@@ -219,6 +220,7 @@ impl ChatBuilder<'_> {
             &self.messages,
             self.max_tokens,
             self.temperature,
+            false,
         );
         let mut req = self
             .client
@@ -394,12 +396,13 @@ mod tests {
 
     #[test]
     fn build_body_shape() {
-        let b = build_body("gpt-4o", &[user("hi")], None, None);
+        let b = build_body("gpt-4o", &[user("hi")], None, None, false);
         assert_eq!(b["model"], "gpt-4o");
         assert_eq!(b["stream"], false);
         assert!(b["messages"].is_array());
         assert!(b.get("max_tokens").is_none());
-        let b2 = build_body("m", &[], Some(256), Some(0.2));
+        let b2 = build_body("m", &[], Some(256), Some(0.2), true);
+        assert_eq!(b2["stream"], true);
         assert_eq!(b2["max_tokens"], 256);
         assert!((b2["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
     }
