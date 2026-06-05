@@ -21,7 +21,7 @@ pub use cache::CachingRoutingStore;
 #[cfg(feature = "postgres")]
 pub use store::PostgresRoutingStore;
 pub use store::{InMemoryRoutingStore, NewRoute, RoutingStore, RoutingStoreError};
-pub use validate::{validate_capability, validate_same_provider, ValidationError};
+pub use validate::{validate_capability, ValidationError};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -81,9 +81,9 @@ pub struct RouteConditions {
 /// What a matching [`Route`] does to the request before dispatch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteAction {
-    /// Rewrite to this model on the same provider as the request (v1 is
-    /// same-provider only — see ADR-018 / Plan design for the cross-provider
-    /// constraint).
+    /// Rewrite to this model. May target a different provider than the request
+    /// (V3d-1 cross-provider routing); the target is capability-checked and
+    /// dispatch/savings use the target's own provider.
     pub target_model: String,
     /// Ordered fallback model ids, tried in order when the primary dispatch
     /// fails with a fallback-eligible error (provider down / 5xx / timeout).
