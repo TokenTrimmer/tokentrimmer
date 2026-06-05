@@ -342,6 +342,31 @@ async fn stream_turn(
     Ok((reply, usage))
 }
 
+/// Stream the current conversation: print live, push the assistant reply, and
+/// update the ledger. Returns true on success. The caller decides whether to
+/// drop the pending user turn on failure.
+async fn do_turn(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    conv: &mut Conversation,
+    ledger: &mut Ledger,
+) -> bool {
+    match stream_turn(http, base, key, conv).await {
+        Ok((reply, usage)) => {
+            conv.push_assistant(reply);
+            if let Some(u) = usage {
+                ledger.add(&u);
+            }
+            true
+        }
+        Err(e) => {
+            ui::error(&format!("{e:#}"));
+            false
+        }
+    }
+}
+
 fn print_help() {
     ui::heading("commands");
     for (c, d) in [
@@ -403,17 +428,8 @@ pub async fn run(
                     Command::Chat(t) if t.is_empty() => {}
                     Command::Chat(t) => {
                         conv.push_user(t);
-                        match stream_turn(&http, &base, &key, &conv).await {
-                            Ok((reply, usage)) => {
-                                conv.push_assistant(reply);
-                                if let Some(u) = usage {
-                                    ledger.add(&u);
-                                }
-                            }
-                            Err(e) => {
-                                ui::error(&format!("{e:#}"));
-                                conv.messages.pop(); // drop the unanswered user turn
-                            }
+                        if !do_turn(&http, &base, &key, &mut conv, &mut ledger).await {
+                            conv.messages.pop(); // drop the unanswered user turn
                         }
                     }
                     Command::Help => print_help(),
