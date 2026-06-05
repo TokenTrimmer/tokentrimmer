@@ -16,6 +16,7 @@ members = [
     "crates/mcp",
     "crates/ts-types",
     "crates/tokenize",
+    "crates/client",
     "crates/providers/compat",
     "crates/providers/openai",
     "crates/providers/anthropic",
