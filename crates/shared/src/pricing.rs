@@ -34,7 +34,7 @@ pub struct ModelPricing {
     pub effective_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelInfo {
     pub id: String,
     pub provider: String,

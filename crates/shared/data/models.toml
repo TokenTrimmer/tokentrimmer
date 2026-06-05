@@ -1,0 +1,116 @@
+# Model metadata catalog — per-(provider, model) context windows + capabilities.
+# RATES live in pricing.toml; this file is METADATA ONLY. Embedded at build time
+# (see model_catalog.rs) and parsed once into the ModelCatalog — the single
+# source of truth for ModelInfo across provider adapters and GET /v1/models.
+#
+# Schema — one [[model]] per (provider, model):
+#   provider          = registry provider id ("openai", "anthropic", "gemini", …)
+#   model             = exact model id the provider matches on
+#   max_input_tokens  = context window (input) upper bound
+#   max_output_tokens = completion upper bound (0 for embedding models)
+#   capabilities      = snake_case Capability names: text, vision, audio, tools,
+#                       json_mode, streaming, reasoning, prompt_caching
+#
+# V4b-1 covers the native adapters (openai, anthropic, gemini); compat providers
+# (mistral, groq, together, openrouter) are added in V4b-2.
+
+# ── OpenAI ──────────────────────────────────────────────────────────────────
+[[model]]
+provider = "openai"
+model = "gpt-5.5"
+max_input_tokens = 200000
+max_output_tokens = 16000
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "openai"
+model = "gpt-5.4"
+max_input_tokens = 200000
+max_output_tokens = 16000
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "openai"
+model = "gpt-4o"
+max_input_tokens = 128000
+max_output_tokens = 16000
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "openai"
+model = "gpt-4o-mini"
+max_input_tokens = 128000
+max_output_tokens = 16000
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "openai"
+model = "o3"
+max_input_tokens = 200000
+max_output_tokens = 100000
+capabilities = ["text", "tools", "json_mode", "reasoning", "streaming"]
+
+[[model]]
+provider = "openai"
+model = "o4-mini"
+max_input_tokens = 200000
+max_output_tokens = 100000
+capabilities = ["text", "tools", "json_mode", "reasoning", "streaming"]
+
+[[model]]
+provider = "openai"
+model = "text-embedding-3-small"
+max_input_tokens = 8191
+max_output_tokens = 0
+capabilities = ["text"]
+
+[[model]]
+provider = "openai"
+model = "text-embedding-3-large"
+max_input_tokens = 8191
+max_output_tokens = 0
+capabilities = ["text"]
+
+# ── Anthropic ───────────────────────────────────────────────────────────────
+[[model]]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+max_input_tokens = 200000
+max_output_tokens = 8192
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+max_input_tokens = 200000
+max_output_tokens = 8192
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "anthropic"
+model = "claude-opus-4-7"
+max_input_tokens = 200000
+max_output_tokens = 8192
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+# ── Gemini ──────────────────────────────────────────────────────────────────
+[[model]]
+provider = "gemini"
+model = "gemini-3.1-flash-lite"
+max_input_tokens = 1000000
+max_output_tokens = 8192
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "gemini"
+model = "gemini-3.5-flash"
+max_input_tokens = 1000000
+max_output_tokens = 8192
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "gemini"
+model = "gemini-3.1-pro"
+max_input_tokens = 2000000
+max_output_tokens = 8192
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
