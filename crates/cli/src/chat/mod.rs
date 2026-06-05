@@ -660,7 +660,10 @@ mod tests {
         c.push_assistant("yo".into());
         assert!(prepare_retry(&mut c), "should drop assistant, user remains");
         assert_eq!(c.messages.len(), 1);
-        assert!(prepare_retry(&mut c), "user still present, no assistant to pop");
+        assert!(
+            prepare_retry(&mut c),
+            "user still present, no assistant to pop"
+        );
         assert_eq!(c.messages.len(), 1);
     }
 
