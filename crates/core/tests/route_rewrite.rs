@@ -190,6 +190,7 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }],
     );
@@ -265,6 +266,7 @@ async fn routed_request_reports_savings_against_original_model() {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }],
     );
@@ -372,6 +374,7 @@ async fn route_for_other_org_does_not_match() {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }],
     );
@@ -424,6 +427,7 @@ async fn route_skipped_when_no_resolvable_org() {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }],
     );
@@ -506,6 +510,7 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }],
     );

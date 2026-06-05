@@ -140,6 +140,7 @@ fn failover_routing_store() -> Arc<CachingRoutingStore> {
                 fallbacks: vec!["fallback-model".into()],
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }],
     );

@@ -111,6 +111,11 @@ pub struct RouteAction {
     /// shared cache. Default false; omitted from JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_cache: bool,
+    /// Hard per-request ceiling (USD). After this route's rewrite, if the
+    /// rerouted model's estimated cost still exceeds this, the gateway rejects
+    /// the request (402) instead of dispatching. `None` = no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
 }
 
 /// Rule engine. Hold routes sorted by descending priority; iterate to find
@@ -265,6 +270,7 @@ mod tests {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }
     }
@@ -553,6 +559,7 @@ mod tests {
             fallbacks: Vec::new(),
             force_cache_layer: None,
             disable_cache: false,
+            max_cost_usd: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -585,6 +592,7 @@ mod tests {
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             force_cache_layer: Some("l1".into()),
             disable_cache: false,
+            max_cost_usd: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         // Both new fields must appear in the serialized JSON.
@@ -610,6 +618,7 @@ mod tests {
             fallbacks: Vec::new(),
             force_cache_layer: None,
             disable_cache: false,
+            max_cost_usd: None,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -710,6 +719,17 @@ mod tests {
         assert!(eng
             .evaluate(&make_req_text("gpt-4o", "hello"), &make_ctx(None), 100)
             .is_none());
+    }
+
+    #[test]
+    fn max_cost_usd_round_trips_and_omits_when_none() {
+        let mut a = make_route("x", 10, vec![], "gpt-4o-mini").then;
+        assert!(!serde_json::to_string(&a).unwrap().contains("max_cost_usd"));
+        a.max_cost_usd = Some(0.1);
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(j.contains("\"max_cost_usd\":0.1"));
+        let back: RouteAction = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.max_cost_usd, Some(0.1));
     }
 
     #[test]

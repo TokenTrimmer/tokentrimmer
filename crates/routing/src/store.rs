@@ -356,6 +356,7 @@ mod tests {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }
     }
@@ -390,6 +391,7 @@ mod tests {
                 fallbacks: vec![],
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         };
         let created = s.create_route(org, spec).await.unwrap();
@@ -424,6 +426,7 @@ mod tests {
                         fallbacks: vec![],
                         force_cache_layer: None,
                         disable_cache: false,
+                        max_cost_usd: None,
                     },
                 },
             )

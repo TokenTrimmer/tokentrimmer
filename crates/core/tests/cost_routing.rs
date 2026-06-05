@@ -168,6 +168,7 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
                 disable_cache: false,
+                max_cost_usd: None,
             },
         }],
     );
@@ -199,4 +200,65 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
         "gpt-4o",
         "cheap request should pass through unrouted"
     );
+}
+
+#[tokio::test]
+async fn reroute_then_block_on_ceiling() {
+    let served = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        served: Arc::clone(&served),
+    }));
+    let raw = InMemoryKeyStore::new();
+    let org = Uuid::now_v7();
+    let key = issue_key_for(&raw, org).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw);
+
+    // Downgrade expensive gpt-4o → gpt-4o-mini, with a tight $0.0008 ceiling on
+    // the rerouted cost.
+    let backing = Arc::new(InMemoryRoutingStore::new());
+    backing.set_routes(
+        org,
+        vec![Route {
+            id: Uuid::now_v7(),
+            name: "downgrade-and-cap".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                estimated_cost_gt: Some(0.005),
+                ..Default::default()
+            },
+            then: RouteAction {
+                target_model: "gpt-4o-mini".into(),
+                fallbacks: Vec::new(),
+                force_cache_layer: None,
+                disable_cache: false,
+                max_cost_usd: Some(0.0008),
+            },
+        }],
+    );
+    let routing = Arc::new(CachingRoutingStore::new(backing as Arc<dyn RoutingStore>));
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_routing_store(routing),
+    );
+
+    // max_tokens=500 → gpt-4o est ≈ $0.0075 (>0.005 → reroute); mini est ≈ $0.0003 (<0.0008 → served).
+    let ok = app
+        .clone()
+        .oneshot(chat_req("gpt-4o", &key, 500))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(
+        ok.headers()["x-tokentrimmer-model-used"].to_str().unwrap(),
+        "gpt-4o-mini"
+    );
+
+    // max_tokens=2000 → gpt-4o est ≈ $0.030 (reroute); mini est ≈ $0.0012 (>0.0008 → 402).
+    let blocked = app.oneshot(chat_req("gpt-4o", &key, 2000)).await.unwrap();
+    assert_eq!(blocked.status(), StatusCode::PAYMENT_REQUIRED);
+    // The over-budget request was never dispatched (only the served one ran).
+    assert_eq!(served.lock().unwrap().clone(), vec!["gpt-4o-mini".to_string()]);
 }
