@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
-    pricing::{Capability, ModelInfo, ModelPricing},
+    pricing::{ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, Provider, ProviderError, RequestContext,
 };
@@ -155,68 +155,7 @@ impl Provider for OpenRouterProvider {
 // ---------------------------------------------------------------------------
 
 fn models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "anthropic/claude-sonnet-4-6".to_string(),
-            provider: "openrouter".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 200_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "openai/gpt-5.5".to_string(),
-            provider: "openrouter".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 200_000,
-            max_output_tokens: 16_000,
-        },
-        ModelInfo {
-            id: "google/gemini-3.1-pro".to_string(),
-            provider: "openrouter".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 1_000_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "meta-llama/llama-3.3-70b-instruct".to_string(),
-            provider: "openrouter".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "mistralai/mistral-large".to_string(),
-            provider: "openrouter".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 4_096,
-        },
-    ]
+    tt_shared::model_catalog::model_catalog().for_provider("openrouter")
 }
 
 /// Build the OpenRouter model→rate map from the shared versioned pricing

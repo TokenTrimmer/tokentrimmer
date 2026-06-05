@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
-    pricing::{Capability, ModelInfo, ModelPricing},
+    pricing::{ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, Provider, ProviderError, RequestContext,
 };
@@ -120,56 +120,7 @@ impl Provider for TogetherProvider {
 // ---------------------------------------------------------------------------
 
 fn models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo".to_string(),
-            provider: "together".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo".to_string(),
-            provider: "together".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "Qwen/Qwen2.5-72B-Instruct-Turbo".to_string(),
-            provider: "together".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 32_768,
-            max_output_tokens: 4_096,
-        },
-        ModelInfo {
-            id: "deepseek-ai/DeepSeek-V3".to_string(),
-            provider: "together".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 64_000,
-            max_output_tokens: 8_192,
-        },
-    ]
+    tt_shared::model_catalog::model_catalog().for_provider("together")
 }
 
 /// Build the Together model→rate map from the shared versioned pricing

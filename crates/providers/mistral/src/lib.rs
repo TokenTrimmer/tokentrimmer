@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
-    pricing::{Capability, ModelInfo, ModelPricing},
+    pricing::{ModelInfo, ModelPricing},
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, Provider, ProviderError, RequestContext,
 };
@@ -120,69 +120,7 @@ impl Provider for MistralProvider {
 // ---------------------------------------------------------------------------
 
 fn models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "mistral-large-latest".to_string(),
-            provider: "mistral".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 4_096,
-        },
-        ModelInfo {
-            id: "mistral-medium-latest".to_string(),
-            provider: "mistral".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 4_096,
-        },
-        ModelInfo {
-            id: "mistral-small-latest".to_string(),
-            provider: "mistral".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 4_096,
-        },
-        ModelInfo {
-            id: "codestral-latest".to_string(),
-            provider: "mistral".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 256_000,
-            max_output_tokens: 8_192,
-        },
-        ModelInfo {
-            id: "pixtral-large-latest".to_string(),
-            provider: "mistral".to_string(),
-            capabilities: vec![
-                Capability::Text,
-                Capability::Vision,
-                Capability::Tools,
-                Capability::JsonMode,
-                Capability::Streaming,
-            ],
-            max_input_tokens: 128_000,
-            max_output_tokens: 4_096,
-        },
-    ]
+    tt_shared::model_catalog::model_catalog().for_provider("mistral")
 }
 
 /// Build the Mistral model→rate map from the shared versioned pricing catalog.

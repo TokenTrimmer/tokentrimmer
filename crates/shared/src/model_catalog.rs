@@ -108,14 +108,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_catalog_parses_native_providers() {
+    fn embedded_catalog_parses_all_providers() {
         let c = model_catalog();
-        assert_eq!(c.len(), 14, "native model count");
+        assert_eq!(c.len(), 32, "native (14) + compat (18)");
         assert_eq!(c.for_provider("openai").len(), 8);
         assert_eq!(c.for_provider("anthropic").len(), 3);
         assert_eq!(c.for_provider("gemini").len(), 3);
+        assert_eq!(c.for_provider("mistral").len(), 5);
+        assert_eq!(c.for_provider("groq").len(), 4);
+        assert_eq!(c.for_provider("together").len(), 4);
+        assert_eq!(c.for_provider("openrouter").len(), 5);
         assert!(c.for_provider("nonesuch").is_empty());
         assert!(!c.is_empty());
+    }
+
+    #[test]
+    fn spot_check_compat_models() {
+        let c = model_catalog();
+        let codestral = c.model_info("mistral", "codestral-latest").unwrap();
+        assert_eq!(codestral.max_input_tokens, 256_000);
+        let pixtral = c.model_info("mistral", "pixtral-large-latest").unwrap();
+        assert!(pixtral.capabilities.contains(&Capability::Vision));
+        let deepseek = c
+            .model_info("groq", "deepseek-r1-distill-llama-70b")
+            .unwrap();
+        assert!(deepseek.capabilities.contains(&Capability::Reasoning));
+        // namespaced ids are distinct (provider, model) keys
+        let or_gemini = c.model_info("openrouter", "google/gemini-3.1-pro").unwrap();
+        assert_eq!(or_gemini.max_input_tokens, 1_000_000);
+        let together_v3 = c.model_info("together", "deepseek-ai/DeepSeek-V3").unwrap();
+        assert_eq!(together_v3.max_input_tokens, 64_000);
     }
 
     #[test]
