@@ -6,7 +6,7 @@ use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
 pub use tt_shared::messages::Message;
-use tt_shared::messages::MessageContent;
+use tt_shared::messages::{ChatCompletionResponse, MessageContent};
 
 /// Build a `user` message.
 #[must_use]
@@ -90,6 +90,180 @@ pub fn build_body(
     body
 }
 
+/// Errors from a [`Client`] call.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("request to the gateway failed: {0}")]
+    Request(#[source] reqwest::Error),
+    #[error("gateway returned {status}: {body}")]
+    Status { status: u16, body: String },
+    #[error("failed to decode the gateway response: {0}")]
+    Decode(#[source] reqwest::Error),
+}
+
+/// Result alias for `tt-client`.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// A typed TokenTrimmer gateway client.
+pub struct Client {
+    http: reqwest::Client,
+    base: String,
+    key: String,
+}
+
+impl Client {
+    /// New client for `base` (e.g. `https://api.tokentrimmer.com`) with `key`.
+    #[must_use]
+    pub fn new(base: impl Into<String>, key: impl Into<String>) -> Self {
+        Self::with_http_client(reqwest::Client::new(), base, key)
+    }
+
+    /// New client reusing an existing `reqwest::Client`.
+    #[must_use]
+    pub fn with_http_client(
+        http: reqwest::Client,
+        base: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Self {
+        Self {
+            http,
+            base: base.into().trim_end_matches('/').to_string(),
+            key: key.into(),
+        }
+    }
+
+    /// Start building a chat completion.
+    #[must_use]
+    pub fn chat(&self) -> ChatBuilder<'_> {
+        ChatBuilder {
+            client: self,
+            model: String::new(),
+            messages: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            tag: None,
+            route: None,
+        }
+    }
+}
+
+/// Fluent builder for a chat completion. See [`Client::chat`].
+pub struct ChatBuilder<'a> {
+    client: &'a Client,
+    model: String,
+    messages: Vec<Message>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    tag: Option<String>,
+    route: Option<String>,
+}
+
+impl ChatBuilder<'_> {
+    #[must_use]
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+    #[must_use]
+    pub fn messages(mut self, messages: Vec<Message>) -> Self {
+        self.messages = messages;
+        self
+    }
+    #[must_use]
+    pub fn message(mut self, message: Message) -> Self {
+        self.messages.push(message);
+        self
+    }
+    #[must_use]
+    pub fn max_tokens(mut self, n: u32) -> Self {
+        self.max_tokens = Some(n);
+        self
+    }
+    #[must_use]
+    pub fn temperature(mut self, t: f32) -> Self {
+        self.temperature = Some(t);
+        self
+    }
+    /// `X-TokenTrimmer-Tag` — free-form cost-attribution tag.
+    #[must_use]
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = Some(tag.into());
+        self
+    }
+    /// `X-TokenTrimmer-Route` — force a named route.
+    #[must_use]
+    pub fn route(mut self, route: impl Into<String>) -> Self {
+        self.route = Some(route.into());
+        self
+    }
+
+    /// Send the request and return the typed response + cost.
+    ///
+    /// # Errors
+    /// [`Error::Request`] on transport failure, [`Error::Status`] on a non-2xx
+    /// response, [`Error::Decode`] if the body isn't a chat completion.
+    pub async fn send(self) -> Result<ChatOutcome> {
+        let body = build_body(&self.model, &self.messages, self.max_tokens, self.temperature);
+        let mut req = self
+            .client
+            .http
+            .post(format!("{}/v1/chat/completions", self.client.base))
+            .bearer_auth(&self.client.key)
+            .json(&body);
+        if let Some(tag) = &self.tag {
+            req = req.header("X-TokenTrimmer-Tag", tag);
+        }
+        if let Some(route) = &self.route {
+            req = req.header("X-TokenTrimmer-Route", route);
+        }
+        let resp = req.send().await.map_err(Error::Request)?;
+        let cost = parse_cost(resp.headers());
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let response = resp
+            .json::<ChatCompletionResponse>()
+            .await
+            .map_err(Error::Decode)?;
+        Ok(ChatOutcome { response, cost })
+    }
+}
+
+/// A completed chat call: the typed response plus parsed cost/savings.
+#[derive(Debug, Clone)]
+pub struct ChatOutcome {
+    pub response: ChatCompletionResponse,
+    pub cost: CostInfo,
+}
+
+impl ChatOutcome {
+    /// The first choice's assistant text, if any.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        self.response.choices.first().and_then(|c| match &c.message {
+            Message::Assistant {
+                content: Some(MessageContent::Text(t)),
+                ..
+            } => Some(t.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Savings as a percentage of the baseline, when both are known.
+    #[must_use]
+    pub fn savings_pct(&self) -> Option<f64> {
+        match (self.cost.saved_usd, self.cost.baseline_cost_usd) {
+            (Some(s), Some(b)) if b > 0.0 => Some(s / b * 100.0),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +296,69 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-tokentrimmer-cost-usd", "n/a".parse().unwrap());
         assert_eq!(parse_cost(&h).cost_usd, None);
+    }
+
+    use httpmock::prelude::*;
+
+    fn sample_response() -> serde_json::Value {
+        json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 1_700_000_000_i64,
+            "model": "gpt-4o-mini",
+            "choices": [{ "index": 0,
+                "message": { "role": "assistant", "content": "Hello there." },
+                "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+        })
+    }
+
+    #[tokio::test]
+    async fn send_returns_typed_response_and_cost() {
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("x-tokentrimmer-tag", "feature=demo"); // tag forwarded
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-tokentrimmer-cost-usd", "0.0001")
+                .header("x-tokentrimmer-baseline-cost-usd", "0.0004")
+                .header("x-tokentrimmer-saved-usd", "0.0003")
+                .json_body(sample_response());
+        });
+
+        let client = Client::new(server.base_url(), "tt_live_test");
+        let out = client
+            .chat()
+            .model("gpt-4o-mini")
+            .messages(vec![user("hi")])
+            .tag("feature=demo")
+            .send()
+            .await
+            .unwrap();
+
+        m.assert();
+        assert_eq!(out.text(), Some("Hello there."));
+        assert_eq!(out.cost.cost_usd, Some(0.0001));
+        assert!((out.savings_pct().unwrap() - 75.0).abs() < 1e-9);
+        assert_eq!(out.response.model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn send_surfaces_status_error() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(429).body("rate limited");
+        });
+        let client = Client::new(server.base_url(), "k");
+        let err = client
+            .chat()
+            .model("m")
+            .message(user("hi"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Status { status: 429, .. }), "{err:?}");
     }
 
     #[test]
