@@ -27,9 +27,7 @@ pub fn model_window(model: &str) -> u32 {
         256_000
     } else if s("gpt-4o") || s("gpt-4.1") || s("gpt-4-turbo") {
         128_000
-    } else if s("o1") || s("o3") || s("o4") {
-        200_000
-    } else if s("claude") {
+    } else if s("o1") || s("o3") || s("o4") || s("claude") {
         200_000
     } else if s("gemini") {
         1_000_000
@@ -267,8 +265,8 @@ mod tests {
         c.push_assistant("old answer".into());
         c.push_user("new question".into());
         c.push_assistant("new answer".into());
-        trim_to_budget(&mut c, 5, ESTIMATE_PROVIDER); // force aggressive trim
-                                                      // never start the window on a Tool or tool-call Assistant
+        let _ = trim_to_budget(&mut c, 5, ESTIMATE_PROVIDER); // force aggressive trim
+                                                              // never start the window on a Tool or tool-call Assistant
         assert!(!matches!(c.messages.first(), Some(Message::Tool { .. })));
         assert!(!matches!(
             c.messages.first(),
