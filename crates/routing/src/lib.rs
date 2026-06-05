@@ -95,6 +95,11 @@ pub struct RouteAction {
     /// `tt_routing::RouteAction` without dropping the value on apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_cache_layer: Option<String>,
+    /// When true, a request this route matches skips L1+L2 entirely (no lookup,
+    /// no insert) — for privacy/sensitive traffic that must not persist in the
+    /// shared cache. Default false; omitted from JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_cache: bool,
 }
 
 /// Rule engine. Hold routes sorted by descending priority; iterate to find
@@ -210,6 +215,7 @@ mod tests {
                 target_model: target.into(),
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
+                disable_cache: false,
             },
         }
     }
@@ -497,6 +503,7 @@ mod tests {
             target_model: "x".into(),
             fallbacks: Vec::new(),
             force_cache_layer: None,
+            disable_cache: false,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -528,6 +535,7 @@ mod tests {
             target_model: "claude-haiku-4-5".into(),
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             force_cache_layer: Some("l1".into()),
+            disable_cache: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         // Both new fields must appear in the serialized JSON.
@@ -543,6 +551,32 @@ mod tests {
         assert_eq!(roundtripped.target_model, original.target_model);
         assert_eq!(roundtripped.fallbacks, original.fallbacks);
         assert_eq!(roundtripped.force_cache_layer, original.force_cache_layer);
+    }
+
+    #[test]
+    fn route_action_disable_cache_defaults_false_and_omits() {
+        // Omitted from JSON when false (back-compat: existing rows unchanged).
+        let a = RouteAction {
+            target_model: "x".into(),
+            fallbacks: Vec::new(),
+            force_cache_layer: None,
+            disable_cache: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            r#"{"target_model":"x"}"#
+        );
+        // Defaults false when absent.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.disable_cache);
+        // Present when true.
+        let b = RouteAction {
+            disable_cache: true,
+            ..a
+        };
+        assert!(serde_json::to_string(&b)
+            .unwrap()
+            .contains("\"disable_cache\":true"));
     }
 
     /// Cross-crate lossless round-trip: JSON produced by `tt_routing::RouteAction`

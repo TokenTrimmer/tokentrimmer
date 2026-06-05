@@ -207,6 +207,7 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             target_model: "claude-3-5-haiku".into(),
             force_cache_layer: None,
             fallbacks: Vec::new(),
+            disable_cache: false,
         },
     };
     let mut pricing = HashMap::new();
@@ -236,6 +237,7 @@ fn conservative_when_pricing_missing() {
             target_model: "nonexistent-model".into(),
             force_cache_layer: None,
             fallbacks: Vec::new(),
+            disable_cache: false,
         },
     };
     let input = input_with_routes(vec![req], vec![route], HashMap::new(), 100);
@@ -289,6 +291,7 @@ fn rerouted_latency_projected_from_target_model_history() {
             target_model: "cheap-model".into(),
             force_cache_layer: None,
             fallbacks: Vec::new(),
+            disable_cache: false,
         },
     };
     let mut pricing = HashMap::new();
@@ -363,6 +366,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             target_model: "claude-3-5-haiku".into(),
             force_cache_layer: None,
             fallbacks: Vec::new(),
+            disable_cache: false,
         },
     };
 
@@ -479,6 +483,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             target_model: "claude-3-5-haiku".into(),
             force_cache_layer: None,
             fallbacks: Vec::new(),
+            disable_cache: false,
         },
     };
     let route_b = ProposedRoute {
@@ -494,6 +499,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             target_model: "claude-3-haiku-pricier".into(),
             force_cache_layer: None,
             fallbacks: Vec::new(),
+            disable_cache: false,
         },
     };
 

@@ -55,6 +55,7 @@ pub fn suggestions_to_proposed_routes(
                 target_model: s.model.clone(),
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
+                disable_cache: false,
             },
         })
         .collect()
