@@ -117,6 +117,19 @@ enum Command {
     Logout,
     /// Show the resolved API key (masked), its source, and the gateway base URL.
     Whoami,
+    /// Interactive chat through the gateway (streams responses + shows savings).
+    Chat {
+        /// Model to request (the gateway may route it). Default: gpt-4o-mini.
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional system prompt for the conversation.
+        #[arg(long)]
+        system: Option<String>,
+        #[arg(long, global = true)]
+        tt_api_key: Option<String>,
+        #[arg(long, global = true)]
+        tt_api_base: Option<String>,
+    },
     /// Install TokenTrimmer best-practices into the current repo.
     Init {
         #[arg(long)]
@@ -434,6 +447,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Whoami => {
             tt_cli::account::whoami()?;
+        }
+        Command::Chat {
+            model,
+            system,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            tt_cli::chat::run(model, system, tt_api_key, tt_api_base).await?;
         }
         Command::Init {
             path,
