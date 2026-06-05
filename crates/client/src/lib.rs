@@ -14,6 +14,9 @@ pub use tt_shared::messages::{
 };
 pub use tt_shared::Usage;
 
+mod tools;
+pub use tools::{AggregateCost, ToolExecutor, ToolOutcome};
+
 /// Build a `user` message.
 #[must_use]
 pub fn user(content: impl Into<String>) -> Message {
