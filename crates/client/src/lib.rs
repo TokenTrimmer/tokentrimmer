@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 // don't need a direct `tt-shared` dependency to read `outcome.response`).
 pub use tt_shared::messages::{
     ChatCompletionResponse, Choice, ContentPart, ImageUrl, InputAudio, Message, MessageContent,
-    ToolCall, ToolCallFunction,
+    Tool, ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
 };
 pub use tt_shared::Usage;
 
@@ -38,6 +38,28 @@ pub fn assistant(content: impl Into<String>) -> Message {
         content: Some(MessageContent::Text(content.into())),
         tool_calls: Vec::new(),
         name: None,
+    }
+}
+
+/// Build a function `tool` definition to advertise to the model.
+#[must_use]
+pub fn tool(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Tool {
+    Tool {
+        r#type: "function".to_string(),
+        function: ToolFunction {
+            name: name.into(),
+            description: Some(description.into()),
+            parameters,
+        },
+    }
+}
+
+/// Build a `tool` result message answering the call `tool_call_id`.
+#[must_use]
+pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Message {
+    Message::Tool {
+        content: MessageContent::Text(content.into()),
+        tool_call_id: tool_call_id.into(),
     }
 }
 
@@ -498,6 +520,21 @@ mod tests {
         assert!(
             matches!(assistant("a"), Message::Assistant { content: Some(MessageContent::Text(t)), .. } if t == "a")
         );
+    }
+
+    #[test]
+    fn tool_constructors() {
+        let t = tool("get_weather", "Look up weather", json!({"type":"object"}));
+        assert_eq!(t.r#type, "function");
+        assert_eq!(t.function.name, "get_weather");
+        assert_eq!(t.function.description.as_deref(), Some("Look up weather"));
+        assert_eq!(t.function.parameters["type"], "object");
+
+        assert!(matches!(
+            tool_result("call_1", "42"),
+            Message::Tool { content: MessageContent::Text(c), tool_call_id }
+                if c == "42" && tool_call_id == "call_1"
+        ));
     }
 
     #[test]
