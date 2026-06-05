@@ -6,6 +6,10 @@ use anyhow::Context as _;
 use crate::context::{self, store};
 use crate::ui;
 
+/// The dashboard page where a user mints an API key (the cloud dashboard; the
+/// public gateway only verifies keys). One-line change if the route differs.
+const DASHBOARD_KEYS_URL: &str = "https://app.tokentrimmer.com/keys";
+
 /// Pure decision: resolve the token text from the `--token` arg and (when the
 /// arg is `-`) the stdin contents. Errors on a missing / blank token.
 pub fn decide_token(arg: Option<String>, stdin: Option<String>) -> anyhow::Result<String> {
@@ -29,27 +33,27 @@ pub fn decide_token(arg: Option<String>, stdin: Option<String>) -> anyhow::Resul
     }
 }
 
-/// `tt login --token <KEY>` (browser login lands in V2). `--token -` reads the
-/// key from stdin (keeps it out of shell history). Optionally persists base URL.
-pub fn login_with_token(token: Option<String>, base_url: Option<String>) -> anyhow::Result<()> {
-    if token.is_none() {
-        anyhow::bail!(
-            "browser login arrives in V2 — use `tt login --token <KEY>` for now \
-             (get a key at app.tokentrimmer.com)"
-        );
+/// The OS-specific command to open `url` in the default browser. `None` for an
+/// unrecognized OS (the caller then just prints the URL).
+#[must_use]
+pub fn browser_command_for(os: &str, url: &str) -> Option<(&'static str, Vec<String>)> {
+    match os {
+        "macos" => Some(("open", vec![url.to_string()])),
+        "linux" => Some(("xdg-open", vec![url.to_string()])),
+        // The empty title arg keeps `start` from treating a quoted URL as a title.
+        "windows" => Some((
+            "cmd",
+            vec!["/C".into(), "start".into(), String::new(), url.to_string()],
+        )),
+        _ => None,
     }
-    let stdin = if token.as_deref() == Some("-") {
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
-            .context("read token from stdin")?;
-        Some(s)
-    } else {
-        None
-    };
-    let raw = decide_token(token, stdin)?;
-    let validated = tt_mcp::auth::validate_api_key(Some(raw))
-        .map_err(|e| anyhow::anyhow!("invalid key: {e}"))?;
+}
 
+/// Validate + persist a raw key (and optional base URL), printing the result.
+/// Shared by the `--token` and browser login paths.
+fn store_key(raw: &str, base_url: Option<String>) -> anyhow::Result<()> {
+    let validated = tt_mcp::auth::validate_api_key(Some(raw.to_string()))
+        .map_err(|e| anyhow::anyhow!("invalid key: {e}"))?;
     let dir = store::config_dir();
     store::save_credentials(&dir, &validated)?;
     if let Some(b) = base_url.filter(|s| !s.trim().is_empty()) {
@@ -63,6 +67,69 @@ pub fn login_with_token(token: Option<String>, base_url: Option<String>) -> anyh
         base,
     ));
     Ok(())
+}
+
+/// Best-effort: open `url` in the default browser. Returns whether it launched.
+fn open_browser(url: &str) -> bool {
+    let Some((prog, args)) = browser_command_for(std::env::consts::OS, url) else {
+        return false;
+    };
+    std::process::Command::new(prog)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `tt login` with no `--token`: open the dashboard keys page + read the pasted
+/// key (hidden). Interactive only — non-interactive callers use `--token`.
+fn browser_login(base_url: Option<String>, no_browser: bool) -> anyhow::Result<()> {
+    use std::io::IsTerminal as _;
+    // The hidden paste renders on stderr and reads from the controlling
+    // terminal; require both stdin and stderr to be a TTY so piped/redirected
+    // callers get a clear "use --token" instead of a surprise prompt or error.
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        anyhow::bail!(
+            "browser login needs an interactive terminal — use `tt login --token <KEY>` \
+             (create a key at {DASHBOARD_KEYS_URL})"
+        );
+    }
+    ui::info("Opening the TokenTrimmer dashboard to create an API key…");
+    if !no_browser {
+        open_browser(DASHBOARD_KEYS_URL);
+    }
+    ui::note(&format!(
+        "If your browser didn't open, visit: {DASHBOARD_KEYS_URL}"
+    ));
+    let key = dialoguer::Password::new()
+        .with_prompt("Paste your API key")
+        .interact()
+        .context("read API key")?;
+    store_key(key.trim(), base_url)
+}
+
+/// `tt login`. With `--token` (or `--token -` for stdin) it stores that key;
+/// without, it runs the browser-assisted flow.
+pub fn login(
+    token: Option<String>,
+    base_url: Option<String>,
+    no_browser: bool,
+) -> anyhow::Result<()> {
+    let Some(tok) = token else {
+        return browser_login(base_url, no_browser);
+    };
+    let stdin = if tok == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+            .context("read token from stdin")?;
+        Some(s)
+    } else {
+        None
+    };
+    let raw = decide_token(Some(tok), stdin)?;
+    store_key(&raw, base_url)
 }
 
 /// `tt whoami` — local only (no network in V0). Exit 1 when no key is configured.
@@ -144,5 +211,29 @@ mod tests {
         assert!(decide_token(Some("   ".into()), None).is_err());
         assert!(decide_token(Some("-".into()), Some("\n".into())).is_err());
         assert!(decide_token(Some("-".into()), None).is_err());
+    }
+
+    #[test]
+    fn browser_command_per_os() {
+        assert_eq!(
+            browser_command_for("macos", "http://x"),
+            Some(("open", vec!["http://x".to_string()]))
+        );
+        assert_eq!(
+            browser_command_for("linux", "http://x"),
+            Some(("xdg-open", vec!["http://x".to_string()]))
+        );
+        let (prog, args) = browser_command_for("windows", "http://x").unwrap();
+        assert_eq!(prog, "cmd");
+        assert_eq!(
+            args,
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                String::new(),
+                "http://x".to_string()
+            ]
+        );
+        assert!(browser_command_for("plan9", "http://x").is_none());
     }
 }

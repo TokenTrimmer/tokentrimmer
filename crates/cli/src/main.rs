@@ -104,7 +104,7 @@ enum Command {
         #[arg(long, default_value_t = 31416)]
         sse_port: u16,
     },
-    /// Store a TokenTrimmer API key for this machine (browser login lands in V2).
+    /// Log in: opens the dashboard to create an API key (paste it back), or pass --token <KEY>.
     Login {
         /// The tt_live_/tt_test_ key. Use `-` to read it from stdin.
         #[arg(long)]
@@ -112,6 +112,9 @@ enum Command {
         /// Persist a gateway base URL alongside the key.
         #[arg(long)]
         base_url: Option<String>,
+        /// Don't open a browser; just print the URL to visit (headless/SSH).
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Remove the locally stored API key (does not revoke it server-side).
     Logout,
@@ -455,8 +458,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Login { token, base_url } => {
-            tt_cli::account::login_with_token(token, base_url)?;
+        Command::Login {
+            token,
+            base_url,
+            no_browser,
+        } => {
+            tt_cli::account::login(token, base_url, no_browser)?;
         }
         Command::Logout => {
             tt_cli::account::logout()?;
