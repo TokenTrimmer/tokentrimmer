@@ -208,14 +208,17 @@ async fn unauthenticated_is_rejected() {
 }
 
 #[tokio::test]
-async fn cross_provider_target_rejected() {
+async fn cross_provider_target_accepted() {
+    // V3d-1: cross-provider routes are allowed. A gpt-4o -> claude-haiku-4-5
+    // route creates successfully (capability guard is permissive on the
+    // unknown target; the same-provider gate is gone).
     let (app, key, _) = app_with_key().await;
     let spec = json!({ "name": "x", "when": {"model_in":["gpt-4o"]}, "then": {"target_model":"claude-haiku-4-5"} });
     let r = app
         .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(r.status(), StatusCode::CREATED);
 }
 
 #[tokio::test]

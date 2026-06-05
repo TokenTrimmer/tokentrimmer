@@ -147,6 +147,10 @@ pub async fn dispatch_with_failover(
     candidates: &[String],
     req: &ChatCompletionRequest,
     ctx: &RequestContext,
+    credentials_by_provider: &std::collections::HashMap<
+        String,
+        tt_shared::context::ProviderCredentials,
+    >,
     now: DateTime<Utc>,
     cap_check: Option<CapCheck<'_>>,
 ) -> Result<(Arc<dyn Provider>, ChatCompletionResponse), ProviderError> {
@@ -184,9 +188,26 @@ pub async fn dispatch_with_failover(
         if breaker.is_open(provider.id(), now) {
             continue;
         }
+        // Per-candidate upstream credentials: each candidate may live on a
+        // different provider than the request (cross-provider failover). Skip a
+        // candidate the org has no credential for rather than forwarding a
+        // wrong key.
+        let Some(cand_creds) = credentials_by_provider.get(provider.id()) else {
+            tracing::info!(
+                model = %model,
+                provider = %provider.id(),
+                "failover_skip: no upstream credential for candidate provider"
+            );
+            continue;
+        };
+        let mut cand_ctx = ctx.clone();
+        cand_ctx.credentials = cand_creds.clone();
         let mut attempt_req = req.clone();
         attempt_req.model = model.clone();
-        let result = with_retry(retry, || provider.chat_completion(attempt_req.clone(), ctx)).await;
+        let result = with_retry(retry, || {
+            provider.chat_completion(attempt_req.clone(), &cand_ctx)
+        })
+        .await;
         match result {
             Ok(resp) => {
                 breaker.record_success(provider.id());
@@ -236,6 +257,10 @@ pub async fn dispatch_stream_with_failover(
     candidates: &[String],
     req: &ChatCompletionRequest,
     ctx: &RequestContext,
+    credentials_by_provider: &std::collections::HashMap<
+        String,
+        tt_shared::context::ProviderCredentials,
+    >,
     now: DateTime<Utc>,
     cap_check: Option<CapCheck<'_>>,
 ) -> Result<
@@ -279,10 +304,24 @@ pub async fn dispatch_stream_with_failover(
         if breaker.is_open(provider.id(), now) {
             continue;
         }
+        // Per-candidate upstream credentials: each candidate may live on a
+        // different provider than the request (cross-provider failover). Skip a
+        // candidate the org has no credential for rather than forwarding a
+        // wrong key.
+        let Some(cand_creds) = credentials_by_provider.get(provider.id()) else {
+            tracing::info!(
+                model = %model,
+                provider = %provider.id(),
+                "failover_skip: no upstream credential for candidate provider"
+            );
+            continue;
+        };
+        let mut cand_ctx = ctx.clone();
+        cand_ctx.credentials = cand_creds.clone();
         let mut attempt_req = req.clone();
         attempt_req.model = model.clone();
         let result = with_retry(retry, || {
-            provider.chat_completion_stream(attempt_req.clone(), ctx)
+            provider.chat_completion_stream(attempt_req.clone(), &cand_ctx)
         })
         .await;
         match result {
@@ -455,6 +494,37 @@ mod tests {
         }
     }
 
+    /// Credential map covering every provider id used by the failover tests, so
+    /// each candidate has an upstream credential. These tests predate V3d-1
+    /// per-candidate credentials and don't exercise the skip-on-missing path;
+    /// the dummy key matches `ctx()` so behavior is unchanged.
+    fn all_creds() -> std::collections::HashMap<String, tt_shared::context::ProviderCredentials> {
+        let c = tt_shared::context::ProviderCredentials {
+            api_key: tt_shared::context::SecretString::new("k"),
+            base_url: None,
+            extra_headers: vec![],
+        };
+        [
+            "pa",
+            "pb",
+            "pc",
+            "prov",
+            "x",
+            "flaky",
+            "failing-prov",
+            "flaky-model",
+            "large-prov",
+            "small-prov",
+            "text-fb",
+            "text-prov",
+            "tools-fb",
+            "vision-prov",
+        ]
+        .into_iter()
+        .map(|id| (id.to_string(), c.clone()))
+        .collect()
+    }
+
     fn req(model: &str) -> ChatCompletionRequest {
         serde_json::from_str(&format!(r#"{{"model":"{model}","messages":[]}}"#)).unwrap()
     }
@@ -490,6 +560,7 @@ mod tests {
             &candidates,
             &req("model-a"),
             &ctx(),
+            &all_creds(),
             now(),
             None,
         )
@@ -521,6 +592,7 @@ mod tests {
             &candidates,
             &req("model-a"),
             &ctx(),
+            &all_creds(),
             now(),
             None,
         )
@@ -553,6 +625,7 @@ mod tests {
             &candidates,
             &req("model-a"),
             &ctx(),
+            &all_creds(),
             now(),
             None,
         )
@@ -584,6 +657,7 @@ mod tests {
             &candidates,
             &req("model-a"),
             &ctx(),
+            &all_creds(),
             now(),
             None,
         )
@@ -614,6 +688,7 @@ mod tests {
             &candidates,
             &req("model-a"),
             &ctx(),
+            &all_creds(),
             now(),
             None,
         )
@@ -741,6 +816,7 @@ mod tests {
             &candidates,
             &vision_req,
             &ctx(),
+            &all_creds(),
             now(),
             Some(CapCheck {
                 required: &required,
@@ -785,6 +861,7 @@ mod tests {
             &candidates,
             &plain_req,
             &ctx(),
+            &all_creds(),
             now(),
             Some(CapCheck {
                 required: &required,
@@ -850,6 +927,7 @@ mod tests {
             &candidates,
             &tools_req,
             &ctx(),
+            &all_creds(),
             now(),
             Some(CapCheck {
                 required: &required,
@@ -921,6 +999,7 @@ mod tests {
             &candidates,
             &plain,
             &ctx(),
+            &all_creds(),
             now(),
             Some(CapCheck {
                 required: &required,
@@ -958,6 +1037,7 @@ mod tests {
             &candidates,
             &plain,
             &ctx(),
+            &all_creds(),
             now(),
             Some(CapCheck {
                 required: &required,
@@ -1076,6 +1156,7 @@ mod tests {
             &candidates,
             &req("model-a"),
             &ctx(),
+            &all_creds(),
             now(),
             None,
         )
@@ -1201,6 +1282,7 @@ mod tests {
             &candidates,
             &req("flaky-model"),
             &ctx(),
+            &all_creds(),
             now(),
             None,
         )
@@ -1247,6 +1329,7 @@ mod tests {
             &candidates,
             &req("failing-model"),
             &ctx(),
+            &all_creds(),
             now(),
             None,
         )

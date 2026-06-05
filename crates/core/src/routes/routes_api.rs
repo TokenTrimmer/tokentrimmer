@@ -7,7 +7,7 @@ use axum::{
     Extension, Json,
 };
 use tt_auth::ApiKeyContext;
-use tt_routing::{validate_capability, validate_same_provider, NewRoute, Route, RoutingStore};
+use tt_routing::{validate_capability, NewRoute, Route, RoutingStore};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
@@ -47,8 +47,6 @@ pub async fn create(
     Json(spec): Json<NewRoute>,
 ) -> ApiResult<(axum::http::StatusCode, Json<Route>)> {
     let org = require_org(ctx)?;
-    validate_same_provider(&spec.when, &spec.then)
-        .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
     let registry = state.registry.clone();
     validate_capability(&spec.when, &spec.then, |m| registry.model_info(m).cloned())
         .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;

@@ -221,6 +221,23 @@ fn project_requests(
     // original (baseline) model's latency.
     let model_medians = model_median_latencies(requests);
 
+    // Map each priced model to its provider, derived from the pricing-table keys
+    // ("{provider}:{model}"; provider ids never contain ':'). Built from SORTED
+    // keys so the first-wins choice on a duplicate model id is deterministic (the
+    // replay's bit-identical contract). Used to price a cross-provider route's
+    // target by the target's OWN provider rather than the request's provider.
+    let model_to_provider: HashMap<&str, &str> = {
+        let mut keys: Vec<&str> = pricing.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut m: HashMap<&str, &str> = HashMap::new();
+        for k in keys {
+            if let Some((prov, model)) = k.split_once(':') {
+                m.entry(model).or_insert(prov);
+            }
+        }
+        m
+    };
+
     for req in requests {
         per_request_baseline.push(req.baseline_cost_usd);
         per_request_cache_hit.push(if req.cached { 1.0 } else { 0.0 });
@@ -232,7 +249,20 @@ fn project_requests(
         let matched = routing::match_route(req, routes);
         match matched {
             Some(route) => {
-                let target_key = crate::types::pricing_key(&req.provider, &route.then.target_model);
+                // Prefer the same-provider key (keeps same-provider replays
+                // byte-identical); else resolve the target's own provider so a
+                // cross-provider route is priced correctly.
+                let same_provider_key =
+                    crate::types::pricing_key(&req.provider, &route.then.target_model);
+                let target_key = if pricing.contains_key(&same_provider_key) {
+                    same_provider_key
+                } else {
+                    let target_provider = model_to_provider
+                        .get(route.then.target_model.as_str())
+                        .copied()
+                        .unwrap_or(req.provider.as_str());
+                    crate::types::pricing_key(target_provider, &route.then.target_model)
+                };
                 if let Some(p) = pricing.get(&target_key) {
                     let projected = cost::project_cost(req, &route.then.target_model, p);
                     let projected_cost = if is_cache_hit {
