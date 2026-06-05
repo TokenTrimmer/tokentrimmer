@@ -85,6 +85,9 @@ pub enum Command {
     Resume(String),
     Sessions,
     Cost,
+    Editor,
+    Retry,
+    Copy,
     Unknown(String),
     Chat(String),
 }
@@ -115,6 +118,9 @@ impl Command {
             },
             "sessions" => Command::Sessions,
             "cost" => Command::Cost,
+            "editor" | "e" => Command::Editor,
+            "retry" | "r" => Command::Retry,
+            "copy" | "y" => Command::Copy,
             other => Command::Unknown(other.to_string()),
         }
     }
@@ -367,6 +373,28 @@ async fn do_turn(
     }
 }
 
+/// Open `$VISUAL`/`$EDITOR` (fallback `vi`) on a temp file and return the
+/// composed text, or `None` when left empty / the editor exits non-zero.
+fn compose_in_editor() -> anyhow::Result<Option<String>> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut path = std::env::temp_dir();
+    path.push(format!("tt-chat-{}.md", std::process::id()));
+    std::fs::write(&path, b"").with_context(|| format!("create {}", path.display()))?;
+    let status = std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("launch editor `{editor}`"))?;
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::remove_file(&path).ok();
+    if !status.success() {
+        return Ok(None);
+    }
+    let text = text.trim().to_string();
+    Ok(if text.is_empty() { None } else { Some(text) })
+}
+
 fn print_help() {
     ui::heading("commands");
     for (c, d) in [
@@ -374,6 +402,9 @@ fn print_help() {
         ("/clear", "reset the conversation"),
         ("/model [m]", "show or switch the requested model"),
         ("/system [s]", "show or set the system prompt"),
+        ("/editor", "compose a multi-line message in $EDITOR"),
+        ("/retry", "re-run the last turn"),
+        ("/copy", "copy the last reply to the clipboard"),
         ("/save [name]", "save this conversation"),
         ("/resume <name>", "load a saved conversation"),
         ("/sessions", "list saved conversations"),
@@ -478,6 +509,32 @@ pub async fn run(
                         }
                     }
                     Command::Cost => ui::info(&ledger.summary()),
+                    Command::Editor => match compose_in_editor() {
+                        Ok(Some(t)) => {
+                            conv.push_user(t);
+                            if !do_turn(&http, &base, &key, &mut conv, &mut ledger).await {
+                                conv.messages.pop();
+                            }
+                        }
+                        Ok(None) => ui::info("(editor: nothing sent)"),
+                        Err(e) => ui::error(&format!("{e:#}")),
+                    },
+                    Command::Retry => {
+                        if prepare_retry(&mut conv) {
+                            do_turn(&http, &base, &key, &mut conv, &mut ledger).await;
+                        } else {
+                            ui::warn("nothing to retry");
+                        }
+                    }
+                    Command::Copy => match last_assistant_text(&conv) {
+                        Some(text) => {
+                            print!("{}", osc52_copy(&text));
+                            use std::io::Write as _;
+                            let _ = std::io::stdout().flush();
+                            ui::info("(copied last reply to clipboard)");
+                        }
+                        None => ui::warn("nothing to copy"),
+                    },
                     Command::Exit => break,
                     Command::Unknown(c) => {
                         ui::warn(&format!("unknown command /{c} — /help for commands"))
@@ -583,6 +640,16 @@ mod tests {
         let s = l.summary();
         assert!(s.contains("2 turn"), "{s}");
         assert!(s.contains("75%"), "{s}");
+    }
+
+    #[test]
+    fn command_parse_ergonomics() {
+        assert!(matches!(Command::parse("/editor"), Command::Editor));
+        assert!(matches!(Command::parse("/e"), Command::Editor));
+        assert!(matches!(Command::parse("/retry"), Command::Retry));
+        assert!(matches!(Command::parse("/r"), Command::Retry));
+        assert!(matches!(Command::parse("/copy"), Command::Copy));
+        assert!(matches!(Command::parse("/y"), Command::Copy));
     }
 
     #[test]
