@@ -329,11 +329,7 @@ async fn stream_turn(
 /// Stream the current conversation: print live, push the assistant reply, and
 /// update the ledger. Returns true on success. The caller decides whether to
 /// drop the pending user turn on failure.
-async fn do_turn(
-    client: &tt_client::Client,
-    conv: &mut Conversation,
-    ledger: &mut Ledger,
-) -> bool {
+async fn do_turn(client: &tt_client::Client, conv: &mut Conversation, ledger: &mut Ledger) -> bool {
     match stream_turn(client, conv).await {
         Ok((reply, usage)) => {
             conv.push_assistant(reply);
@@ -475,14 +471,8 @@ pub async fn run(
                         let snapshot = conv.messages.clone();
                         conv.push_user(t);
                         ctx.manage(&mut conv);
-                        if !dispatch_turn(
-                            &client,
-                            &mut conv,
-                            &mut ledger,
-                            &registry,
-                            tools_enabled,
-                        )
-                        .await
+                        if !dispatch_turn(&client, &mut conv, &mut ledger, &registry, tools_enabled)
+                            .await
                         {
                             // failed turn → no-op on history: drop the user turn
                             // AND undo any trim manage() did before sending.
