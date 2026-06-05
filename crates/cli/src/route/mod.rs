@@ -15,6 +15,8 @@ pub struct AddArgs {
     pub when_has_audio: bool,
     pub when_tag: Option<String>,
     pub when_prompt_contains: Vec<String>,
+    pub when_cost_gt: Option<f64>,
+    pub when_cost_lt: Option<f64>,
     pub disable_cache: bool,
     pub priority: u32,
     pub name: Option<String>,
@@ -53,6 +55,12 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
             "prompt_contains_any_of".into(),
             json!(args.when_prompt_contains),
         );
+    }
+    if let Some(v) = args.when_cost_gt {
+        when.insert("estimated_cost_gt".into(), json!(v));
+    }
+    if let Some(v) = args.when_cost_lt {
+        when.insert("estimated_cost_lt".into(), json!(v));
     }
     let mut then = serde_json::Map::new();
     then.insert("target_model".into(), json!(target));
@@ -190,6 +198,8 @@ mod tests {
             when_has_audio: false,
             when_tag: None,
             when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -213,6 +223,8 @@ mod tests {
             when_has_audio: false,
             when_tag: None,
             when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
             disable_cache: false,
             priority: 50,
             name: Some("vis".into()),
@@ -238,6 +250,8 @@ mod tests {
             when_has_audio: false,
             when_tag: None,
             when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -257,6 +271,8 @@ mod tests {
             when_has_audio: false,
             when_tag: Some("sensitive".into()),
             when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
             disable_cache: true,
             priority: 100,
             name: None,
@@ -278,6 +294,8 @@ mod tests {
             when_has_audio: false,
             when_tag: None,
             when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -299,6 +317,8 @@ mod tests {
             when_has_audio: false,
             when_tag: None,
             when_prompt_contains: vec!["confidential".into(), "salary".into()],
+            when_cost_gt: None,
+            when_cost_lt: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -322,6 +342,8 @@ mod tests {
             when_has_audio: false,
             when_tag: None,
             when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
             disable_cache: false,
             priority: 100,
             name: None,
@@ -330,5 +352,28 @@ mod tests {
         })
         .unwrap();
         assert!(body["when"].get("prompt_contains_any_of").is_none());
+    }
+
+    #[test]
+    fn cost_conditions_map_through() {
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-4o-mini".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: None,
+            when_prompt_contains: vec![],
+            when_cost_gt: Some(0.05),
+            when_cost_lt: None,
+            disable_cache: false,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        })
+        .unwrap();
+        assert_eq!(body["when"]["estimated_cost_gt"], 0.05);
+        assert!(body["when"].get("estimated_cost_lt").is_none());
     }
 }

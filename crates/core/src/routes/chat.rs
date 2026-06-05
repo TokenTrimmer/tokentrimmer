@@ -50,6 +50,10 @@ use crate::{
 /// auth layer surfaces the caller's tier.
 const L2_DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Pre-flight output-token estimate when a request doesn't set `max_tokens`.
+/// Used only to estimate request cost for cost-based route conditions.
+const DEFAULT_OUTPUT_TOKENS_ESTIMATE: u32 = 1000;
+
 /// TTL for negative-cache entries (deterministic 4xx errors).
 ///
 /// Short by design: a client error cached for too long would prevent legitimate
@@ -1706,16 +1710,27 @@ async fn apply_routing(
     // (tiktoken for openai/anthropic, chars/4 elsewhere) instead of a separate
     // heuristic. Tokenizer choice is keyed on the originally-requested model's
     // provider (resolved before any rewrite).
-    let provider_id = state
-        .registry
-        .resolve(&req.model)
-        .map(|p| p.id())
-        .unwrap_or("");
+    let req_provider = state.registry.resolve(&req.model);
+    let provider_id = req_provider.as_ref().map(|p| p.id()).unwrap_or("");
     let input_tokens = last_user_message_text(req)
         .map(|s| tt_tokenize::estimate_tokens(provider_id, s))
         .unwrap_or(0);
 
-    let m = engine.evaluate(req, ctx, input_tokens)?;
+    // Estimated request cost (USD) on the originally-requested model, for
+    // cost-based route conditions. Output tokens are unknown pre-flight: use
+    // `max_tokens` when set, else a default. `None` when the model has no pricing
+    // — cost conditions then never fire (mirrors other unknown-data conditions).
+    let estimated_cost_usd = req_provider
+        .as_ref()
+        .and_then(|p| p.pricing(&req.model))
+        .map(|pr| {
+            let output_est = req.max_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS_ESTIMATE);
+            (f64::from(input_tokens) * pr.input_per_million
+                + f64::from(output_est) * pr.output_per_million)
+                / 1_000_000.0
+        });
+
+    let m = engine.evaluate_with_cost(req, ctx, input_tokens, estimated_cost_usd)?;
     let route_id = m.id;
     let fallbacks = m.then.fallbacks.clone();
     let disable_cache = m.then.disable_cache;

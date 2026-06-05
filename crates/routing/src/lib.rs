@@ -76,6 +76,13 @@ pub struct RouteConditions {
     /// (case-insensitive substring). Empty = ignore.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompt_contains_any_of: Vec<String>,
+    /// Match only if the request's estimated cost (USD) is greater than this.
+    /// Unknown cost (caller passed `None`) never matches a cost condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_gt: Option<f64>,
+    /// Match only if the request's estimated cost (USD) is less than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_lt: Option<f64>,
 }
 
 /// What a matching [`Route`] does to the request before dispatch.
@@ -152,9 +159,25 @@ impl RoutingEngine {
         ctx: &RequestContext,
         input_tokens_estimate: u32,
     ) -> Option<&Route> {
+        // No cost signal — cost conditions never fire (see `evaluate_with_cost`).
+        self.evaluate_with_cost(req, ctx, input_tokens_estimate, None)
+    }
+
+    /// Like [`RoutingEngine::evaluate`] but with a pre-flight cost estimate (USD)
+    /// for `estimated_cost_gt` / `estimated_cost_lt` conditions. `None` means the
+    /// cost is unknown (e.g. the requested model has no pricing) — cost
+    /// conditions then never match, mirroring the engine's other "unknown data →
+    /// don't match" stances.
+    pub fn evaluate_with_cost(
+        &self,
+        req: &ChatCompletionRequest,
+        ctx: &RequestContext,
+        input_tokens_estimate: u32,
+        estimated_cost_usd: Option<f64>,
+    ) -> Option<&Route> {
         self.routes
             .iter()
-            .find(|r| r.enabled && matches(r, req, ctx, input_tokens_estimate))
+            .find(|r| r.enabled && matches(r, req, ctx, input_tokens_estimate, estimated_cost_usd))
     }
 }
 
@@ -163,6 +186,7 @@ fn matches(
     req: &ChatCompletionRequest,
     ctx: &RequestContext,
     input_tokens: u32,
+    estimated_cost_usd: Option<f64>,
 ) -> bool {
     let c = &r.when;
     if !c.model_in.is_empty() && !c.model_in.iter().any(|m| m == &req.model) {
@@ -175,6 +199,17 @@ fn matches(
     }
     if let Some(t) = c.input_tokens_gt {
         if input_tokens <= t {
+            return false;
+        }
+    }
+    if let Some(t) = c.estimated_cost_gt {
+        // Unknown cost never matches a cost condition.
+        if !matches!(estimated_cost_usd, Some(cost) if cost > t) {
+            return false;
+        }
+    }
+    if let Some(t) = c.estimated_cost_lt {
+        if !matches!(estimated_cost_usd, Some(cost) if cost < t) {
             return false;
         }
     }
@@ -674,6 +709,52 @@ mod tests {
             .is_some());
         assert!(eng
             .evaluate(&make_req_text("gpt-4o", "hello"), &make_ctx(None), 100)
+            .is_none());
+    }
+
+    #[test]
+    fn cost_gt_matches_above_threshold_only() {
+        let route = Route {
+            when: RouteConditions {
+                estimated_cost_gt: Some(0.02),
+                ..Default::default()
+            },
+            ..make_route("expensive", 10, vec![], "cheaper")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        // est 0.03 > 0.02 → match; 0.01 !> 0.02 → no match; unknown cost → no match.
+        assert!(eng
+            .evaluate_with_cost(&make_req("gpt-4o"), &make_ctx(None), 100, Some(0.03))
+            .is_some());
+        assert!(eng
+            .evaluate_with_cost(&make_req("gpt-4o"), &make_ctx(None), 100, Some(0.01))
+            .is_none());
+        assert!(eng
+            .evaluate_with_cost(&make_req("gpt-4o"), &make_ctx(None), 100, None)
+            .is_none());
+    }
+
+    #[test]
+    fn cost_lt_anded_with_model_in() {
+        let route = Route {
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                estimated_cost_lt: Some(0.05),
+                ..Default::default()
+            },
+            ..make_route("cheap-small", 10, vec![], "target")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate_with_cost(&make_req("gpt-4o"), &make_ctx(None), 100, Some(0.01))
+            .is_some());
+        // cost not below threshold → no match
+        assert!(eng
+            .evaluate_with_cost(&make_req("gpt-4o"), &make_ctx(None), 100, Some(0.09))
+            .is_none());
+        // wrong model → no match
+        assert!(eng
+            .evaluate_with_cost(&make_req("claude-x"), &make_ctx(None), 100, Some(0.01))
             .is_none());
     }
 }

@@ -222,6 +222,12 @@ enum RouteAction {
         /// Match only requests whose prompt contains this keyword (repeatable).
         #[arg(long)]
         when_prompt_contains: Vec<String>,
+        /// Match only requests whose estimated cost (USD) exceeds this.
+        #[arg(long)]
+        when_cost_gt: Option<f64>,
+        /// Match only requests whose estimated cost (USD) is below this.
+        #[arg(long)]
+        when_cost_lt: Option<f64>,
         /// Make matched requests skip TokenTrimmer's cache entirely (privacy).
         #[arg(long)]
         disable_cache: bool,
@@ -506,6 +512,8 @@ async fn main() -> anyhow::Result<()> {
                     when_has_audio,
                     when_tag,
                     when_prompt_contains,
+                    when_cost_gt,
+                    when_cost_lt,
                     disable_cache,
                     priority,
                     name,
@@ -519,6 +527,8 @@ async fn main() -> anyhow::Result<()> {
                     when_has_audio,
                     when_tag,
                     when_prompt_contains,
+                    when_cost_gt,
+                    when_cost_lt,
                     disable_cache,
                     priority,
                     name,

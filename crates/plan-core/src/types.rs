@@ -135,6 +135,14 @@ pub struct RouteConditions {
     /// matches against `RequestLog.body` when present, else conservative no-match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompt_contains_any_of: Vec<String>,
+    /// Mirror of `tt_routing::RouteConditions::estimated_cost_gt`. Evaluated
+    /// against `RequestLog.baseline_cost_usd` (the request's logged cost on its
+    /// original model) — accurately projectable, unlike modality/topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_gt: Option<f64>,
+    /// Mirror of `tt_routing::RouteConditions::estimated_cost_lt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_lt: Option<f64>,
 }
 
 /// What a matching [`ProposedRoute`] does.

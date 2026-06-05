@@ -290,6 +290,8 @@ mod tests {
                 has_images: None,
                 has_audio: None,
                 prompt_contains_any_of: vec![],
+                estimated_cost_gt: None,
+                estimated_cost_lt: None,
             },
             then: RouteAction {
                 target_model: "claude-haiku-4-5".into(),
