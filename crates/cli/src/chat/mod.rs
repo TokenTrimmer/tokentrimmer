@@ -1,10 +1,14 @@
 //! `tt chat` — interactive chat REPL routed through the TokenTrimmer gateway,
 //! surfacing per-turn cost + savings from the gateway's streaming usage event.
 
+use anyhow::Context as _;
+use futures::StreamExt as _;
 use serde::Deserialize;
+use serde_json::json;
 
 use tt_shared::messages::{Message, MessageContent};
 
+use crate::context::ResolvedContext;
 use crate::ui;
 
 const DEFAULT_CHAT_MODEL: &str = "gpt-4o-mini";
@@ -171,6 +175,173 @@ impl Conversation {
         v.extend(self.messages.iter().cloned());
         v
     }
+}
+
+/// Stream one turn. Prints the assistant text live and the cost footer, and
+/// returns the full reply for history. Returns `Err` (turn failed) on a non-2xx
+/// gateway response so the caller can drop the unanswered user message.
+async fn stream_turn(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+    conv: &Conversation,
+) -> anyhow::Result<String> {
+    let body = json!({
+        "model": conv.model,
+        "messages": conv.wire_messages(),
+        "stream": true,
+    });
+    let resp = http
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .context("request to gateway failed")?;
+
+    let served_model = resp
+        .headers()
+        .get("x-tokentrimmer-model-used")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&conv.model)
+        .to_string();
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("gateway returned {status}: {}", text.trim());
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut spinner = Some(ui::spinner("…"));
+    let mut buf = String::new();
+    let mut reply = String::new();
+    let mut usage: Option<UsageInfo> = None;
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let bytes = chunk.context("stream error")?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(idx) = buf.find("\n\n") {
+            let frame: String = buf.drain(..idx + 2).collect();
+            match parse_sse_frame(frame.trim_end()) {
+                StreamEvent::Delta(t) => {
+                    spinner.take(); // clear the spinner on the first token
+                    print!("{t}");
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    reply.push_str(&t);
+                }
+                StreamEvent::Usage(u) => usage = Some(u),
+                StreamEvent::Done => break 'outer,
+                StreamEvent::Ignore => {}
+            }
+        }
+    }
+    drop(spinner);
+    println!();
+    if let Some(u) = usage {
+        println!(
+            "{}",
+            format_turn_footer(
+                &served_model,
+                u.input_tokens,
+                u.output_tokens,
+                u.cost_usd,
+                u.saved_usd,
+                u.baseline_cost_usd
+            )
+        );
+    }
+    Ok(reply)
+}
+
+fn print_help() {
+    ui::heading("commands");
+    for (c, d) in [
+        ("/help", "show this help"),
+        ("/clear", "reset the conversation"),
+        ("/model [m]", "show or switch the requested model"),
+        ("/system [s]", "show or set the system prompt"),
+        ("/exit", "quit (or Ctrl-D)"),
+    ] {
+        println!("  {}  {}", ui::accent().apply_to(c), ui::muted().apply_to(d));
+    }
+}
+
+/// Entry point for `tt chat`.
+pub async fn run(
+    model: Option<String>,
+    system: Option<String>,
+    flag_key: Option<String>,
+    flag_base: Option<String>,
+) -> anyhow::Result<()> {
+    let ctx = ResolvedContext::load(flag_key, flag_base)?;
+    let key = ctx
+        .api_key_string()
+        .context("no API key — run `tt login --token <KEY>` or set TT_API_KEY")?;
+    let base = ctx.base_url.trim_end_matches('/').to_string();
+    let http = reqwest::Client::new();
+
+    let mut conv = Conversation::new(
+        model.unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string()),
+        system,
+    );
+    ui::heading(&format!(
+        "tt chat · {} via TokenTrimmer   (/help)",
+        conv.model
+    ));
+
+    let mut rl = rustyline::DefaultEditor::new().context("init readline")?;
+    let prompt = ui::accent().apply_to("› ").to_string();
+    loop {
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                match Command::parse(&line) {
+                    Command::Chat(t) if t.is_empty() => {}
+                    Command::Chat(t) => {
+                        conv.push_user(t);
+                        match stream_turn(&http, &base, &key, &conv).await {
+                            Ok(reply) => conv.push_assistant(reply),
+                            Err(e) => {
+                                ui::error(&format!("{e:#}"));
+                                conv.messages.pop(); // drop the unanswered user turn
+                            }
+                        }
+                    }
+                    Command::Help => print_help(),
+                    Command::Clear => {
+                        conv.clear();
+                        ui::info("(conversation cleared)");
+                    }
+                    Command::Model(Some(m)) => {
+                        conv.model = m;
+                        ui::info(&format!("model → {}", conv.model));
+                    }
+                    Command::Model(None) => ui::info(&format!("model: {}", conv.model)),
+                    Command::System(Some(s)) => {
+                        conv.system = Some(s);
+                        ui::info("(system prompt set)");
+                    }
+                    Command::System(None) => match &conv.system {
+                        Some(s) => ui::info(&format!("system: {s}")),
+                        None => ui::info("(no system prompt)"),
+                    },
+                    Command::Exit => break,
+                    Command::Unknown(c) => {
+                        ui::warn(&format!("unknown command /{c} — /help for commands"))
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => continue, // Ctrl-C: cancel line
+            Err(rustyline::error::ReadlineError::Eof) => break,            // Ctrl-D: quit
+            Err(e) => {
+                ui::error(&format!("input error: {e}"));
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
