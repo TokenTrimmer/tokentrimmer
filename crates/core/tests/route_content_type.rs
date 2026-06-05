@@ -205,6 +205,7 @@ async fn setup(target_model: &str) -> (Arc<Mutex<Vec<String>>>, String, axum::Ro
                 target_model: target_model.into(),
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
+                disable_cache: false,
             },
         }],
     );

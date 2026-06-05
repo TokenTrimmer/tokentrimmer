@@ -74,6 +74,7 @@ mod tests {
             target_model: target.into(),
             fallbacks: vec![],
             force_cache_layer: None,
+            disable_cache: false,
         }
     }
     fn vision_model(id: &str) -> ModelInfo {

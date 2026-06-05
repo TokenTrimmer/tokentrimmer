@@ -294,6 +294,7 @@ mod tests {
                 target_model: "claude-haiku-4-5".into(),
                 force_cache_layer: None,
                 fallbacks: Vec::new(),
+                disable_cache: false,
             },
         }]
     }

@@ -141,6 +141,7 @@ mod tests {
                 target_model: target.into(),
                 fallbacks: Vec::new(),
                 force_cache_layer: None,
+                disable_cache: false,
             },
         }
     }
@@ -238,6 +239,7 @@ mod tests {
                         target_model: "m".into(),
                         fallbacks: vec![],
                         force_cache_layer: None,
+                        disable_cache: false,
                     },
                 },
             )

@@ -216,6 +216,12 @@ enum RouteAction {
         when_has_images: bool,
         #[arg(long)]
         when_has_audio: bool,
+        /// Match only requests tagged with this value (X-TokenTrimmer-Tag header).
+        #[arg(long)]
+        when_tag: Option<String>,
+        /// Make matched requests skip TokenTrimmer's cache entirely (privacy).
+        #[arg(long)]
+        disable_cache: bool,
         #[arg(long, default_value_t = 100)]
         priority: u32,
         #[arg(long)]
@@ -495,6 +501,8 @@ async fn main() -> anyhow::Result<()> {
                     to,
                     when_has_images,
                     when_has_audio,
+                    when_tag,
+                    disable_cache,
                     priority,
                     name,
                     fallback,
@@ -505,6 +513,8 @@ async fn main() -> anyhow::Result<()> {
                     to,
                     when_has_images,
                     when_has_audio,
+                    when_tag,
+                    disable_cache,
                     priority,
                     name,
                     fallback,
@@ -885,6 +895,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     target_model: "llama-3.1-8b-instant".into(),
                     fallbacks: Vec::new(),
                     force_cache_layer: None,
+                    disable_cache: false,
                 },
             }],
         );
