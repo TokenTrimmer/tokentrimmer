@@ -29,6 +29,17 @@ fn matches_conditions(req: &RequestLog, c: &RouteConditions) -> bool {
             return false;
         }
     }
+    // Cost is a logged field, so cost conditions project accurately (no caveat).
+    if let Some(t) = c.estimated_cost_gt {
+        if req.baseline_cost_usd <= t {
+            return false;
+        }
+    }
+    if let Some(t) = c.estimated_cost_lt {
+        if req.baseline_cost_usd >= t {
+            return false;
+        }
+    }
     if let Some(tag) = &c.tag_equals {
         if req.tag.as_deref() != Some(tag.as_str()) {
             return false;
@@ -263,5 +274,44 @@ mod tests {
         let mut with_body = req("m", 1, None);
         with_body.body = Some("This is CONFIDENTIAL".into());
         assert!(match_route(&with_body, &[r]).is_some());
+    }
+
+    #[test]
+    fn cost_gt_matches_on_baseline_cost() {
+        // Unlike modality/topic, cost IS logged — evaluate against baseline_cost_usd.
+        let r = route(
+            "expensive",
+            10,
+            true,
+            RouteConditions {
+                estimated_cost_gt: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let mut hi = req("m", 100, None);
+        hi.baseline_cost_usd = 0.03;
+        let mut lo = req("m", 100, None);
+        lo.baseline_cost_usd = 0.01;
+        assert!(match_route(&hi, std::slice::from_ref(&r)).is_some());
+        assert!(match_route(&lo, &[r]).is_none());
+    }
+
+    #[test]
+    fn cost_lt_matches_below_threshold() {
+        let r = route(
+            "cheap",
+            10,
+            true,
+            RouteConditions {
+                estimated_cost_lt: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let mut lo = req("m", 100, None);
+        lo.baseline_cost_usd = 0.01;
+        let mut hi = req("m", 100, None);
+        hi.baseline_cost_usd = 0.05;
+        assert!(match_route(&lo, std::slice::from_ref(&r)).is_some());
+        assert!(match_route(&hi, &[r]).is_none());
     }
 }
