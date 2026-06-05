@@ -2,6 +2,7 @@
 //! returns a typed [`CostInfo`] parsed from the `x-tokentrimmer-*` headers, plus
 //! the `X-TokenTrimmer-Tag`/`-Route` extensions as first-class builder options.
 
+use futures::StreamExt as _;
 use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
@@ -326,6 +327,99 @@ impl ChatBuilder<'_> {
             .map_err(Error::Decode)?;
         Ok(ChatOutcome { response, cost })
     }
+
+    /// Send the request and stream the response. Yields [`StreamEvent::Delta`]
+    /// text chunks then the terminal [`StreamEvent::Usage`] cost event.
+    ///
+    /// # Errors
+    /// Same as [`send`](Self::send): `MissingModel` / `Request` / `Status`.
+    pub async fn stream(self) -> Result<ChatStream> {
+        if self.model.trim().is_empty() {
+            return Err(Error::MissingModel);
+        }
+        let body = build_body(
+            &self.model,
+            &self.messages,
+            self.max_tokens,
+            self.temperature,
+            true,
+        );
+        let mut req = self
+            .client
+            .http
+            .post(format!("{}/v1/chat/completions", self.client.base))
+            .bearer_auth(&self.client.key)
+            .json(&body);
+        if let Some(tag) = &self.tag {
+            req = req.header("X-TokenTrimmer-Tag", tag);
+        }
+        let resp = req.send().await.map_err(Error::Request)?;
+        let header_cost = parse_cost(resp.headers());
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Status {
+                status: status.as_u16(),
+                body,
+                cost: Box::new(header_cost),
+            });
+        }
+        Ok(ChatStream {
+            inner: Box::pin(resp.bytes_stream()),
+            buf: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            done: false,
+            header_cost,
+        })
+    }
+}
+
+/// A live chat stream. Iterate with [`ChatStream::next`].
+pub struct ChatStream {
+    inner: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+    buf: Vec<u8>,
+    pending: std::collections::VecDeque<StreamEvent>,
+    done: bool,
+    header_cost: CostInfo,
+}
+
+impl ChatStream {
+    /// Header-based cost/trace (`model_used`, `provider`, `trace_id`) — known
+    /// before the body streams.
+    #[must_use]
+    pub fn header_cost(&self) -> &CostInfo {
+        &self.header_cost
+    }
+
+    /// The next [`StreamEvent`], or `None` at end of stream.
+    ///
+    /// # Errors
+    /// [`Error::Request`] if the underlying byte stream errors.
+    pub async fn next(&mut self) -> Result<Option<StreamEvent>> {
+        loop {
+            if let Some(ev) = self.pending.pop_front() {
+                return Ok(Some(ev));
+            }
+            if self.done {
+                return Ok(None);
+            }
+            match self.inner.next().await {
+                Some(Ok(chunk)) => {
+                    self.buf.extend_from_slice(&chunk);
+                    for frame in drain_frames(&mut self.buf) {
+                        match parse_sse_frame(&frame) {
+                            Frame::Delta(t) => self.pending.push_back(StreamEvent::Delta(t)),
+                            Frame::Usage(u) => self.pending.push_back(StreamEvent::Usage(u)),
+                            Frame::Done => self.done = true,
+                            Frame::Ignore => {}
+                        }
+                    }
+                }
+                Some(Err(e)) => return Err(Error::Request(e)),
+                None => self.done = true,
+            }
+        }
+    }
 }
 
 /// A completed chat call: the typed response plus parsed cost/savings.
@@ -444,6 +538,62 @@ mod tests {
         assert_eq!(out.cost.cost_usd, Some(0.0001));
         assert!((out.savings_pct().unwrap() - 75.0).abs() < 1e-9);
         assert_eq!(out.response.model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn stream_yields_deltas_then_usage() {
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "event: tokentrimmer.usage\n",
+            "data: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":10,\"output_tokens\":2,\"cached_tokens\":0}\n\n",
+            "data: [DONE]\n\n",
+        );
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"stream\":true");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .body(sse);
+        });
+
+        let client = Client::new(server.base_url(), "k");
+        let mut stream = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .stream()
+            .await
+            .unwrap();
+        assert_eq!(stream.header_cost().model_used.as_deref(), Some("gpt-4o-mini"));
+
+        let mut text = String::new();
+        let mut usage: Option<StreamUsage> = None;
+        while let Some(ev) = stream.next().await.unwrap() {
+            match ev {
+                StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::Usage(u) => usage = Some(u),
+            }
+        }
+        assert_eq!(text, "Hello");
+        let u = usage.expect("usage event");
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn stream_surfaces_status_error() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(500).body("boom");
+        });
+        let client = Client::new(server.base_url(), "k");
+        let result = client.chat().model("m").message(user("hi")).stream().await;
+        assert!(matches!(result, Err(Error::Status { status: 500, .. })));
     }
 
     #[tokio::test]
