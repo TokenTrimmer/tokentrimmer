@@ -11,6 +11,8 @@ use tt_shared::messages::{Message, MessageContent};
 use crate::context::ResolvedContext;
 use crate::ui;
 
+pub mod session;
+
 const DEFAULT_CHAT_MODEL: &str = "gpt-4o-mini";
 
 /// Cost/usage payload from the gateway's terminal `tokentrimmer.usage` SSE event.
@@ -131,7 +133,8 @@ pub fn format_turn_footer(
     ui::muted().apply_to(s).to_string()
 }
 
-/// In-memory conversation state.
+/// In-memory conversation state (also the on-disk session format).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
     pub model: String,
     pub system: Option<String>,
