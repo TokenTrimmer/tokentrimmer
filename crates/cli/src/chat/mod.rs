@@ -11,6 +11,7 @@ use tt_shared::messages::{Message, MessageContent};
 use crate::context::ResolvedContext;
 use crate::ui;
 
+pub mod budget;
 pub mod session;
 pub mod tools;
 
