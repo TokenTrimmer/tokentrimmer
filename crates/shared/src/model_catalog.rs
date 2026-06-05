@@ -34,20 +34,30 @@ pub struct ModelCatalog {
 }
 
 impl ModelCatalog {
-    /// Parse a catalog from TOML text (exposed for tests).
+    /// Parse a catalog from TOML text (exposed for tests). Rejects a duplicate
+    /// `(provider, model)` so a bad edit fails loudly (the embedded catalog is
+    /// validated by `model_catalog()`'s `expect` + a unit test), mirroring the
+    /// uniqueness `PricingCatalog` gets for free from its keyed map.
     pub fn parse(toml_text: &str) -> Result<Self, toml::de::Error> {
+        use serde::de::Error as _;
         let raw: RawCatalog = toml::from_str(toml_text)?;
-        let models = raw
-            .model
-            .into_iter()
-            .map(|m| ModelInfo {
+        let mut seen = std::collections::HashSet::new();
+        let mut models = Vec::with_capacity(raw.model.len());
+        for m in raw.model {
+            if !seen.insert((m.provider.clone(), m.model.clone())) {
+                return Err(toml::de::Error::custom(format!(
+                    "duplicate model in models.toml: {}/{}",
+                    m.provider, m.model
+                )));
+            }
+            models.push(ModelInfo {
                 id: m.model,
                 provider: m.provider,
                 capabilities: m.capabilities,
                 max_input_tokens: m.max_input_tokens,
                 max_output_tokens: m.max_output_tokens,
-            })
-            .collect();
+            });
+        }
         Ok(Self { models })
     }
 
@@ -106,6 +116,27 @@ mod tests {
         assert_eq!(c.for_provider("gemini").len(), 3);
         assert!(c.for_provider("nonesuch").is_empty());
         assert!(!c.is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_models() {
+        let toml = r#"
+            [[model]]
+            provider = "openai"
+            model = "gpt-4o"
+            max_input_tokens = 128000
+            max_output_tokens = 16000
+            capabilities = ["text"]
+
+            [[model]]
+            provider = "openai"
+            model = "gpt-4o"
+            max_input_tokens = 99999
+            max_output_tokens = 1
+            capabilities = ["text"]
+        "#;
+        let err = ModelCatalog::parse(toml).unwrap_err();
+        assert!(err.to_string().contains("duplicate model"), "{err}");
     }
 
     #[test]
