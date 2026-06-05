@@ -104,9 +104,13 @@ pub fn detect_models(root: &Path) -> Vec<ModelUsage> {
     let mut agg: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut files = 0usize;
     let walk = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
-        !e.file_name()
-            .to_str()
-            .is_some_and(|n| SKIP_DIRS.contains(&n))
+        // Never prune the root itself (it may be named like a skip dir, e.g.
+        // running inside a "build" dir); only prune skip-named subdirectories.
+        e.depth() == 0
+            || !e
+                .file_name()
+                .to_str()
+                .is_some_and(|n| SKIP_DIRS.contains(&n))
     });
     for entry in walk.flatten() {
         if files >= MAX_FILES {
