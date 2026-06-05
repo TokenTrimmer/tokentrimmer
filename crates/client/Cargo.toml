@@ -1,0 +1,20 @@
+[package]
+name = "tt-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Typed Rust client for the TokenTrimmer gateway (OpenAI-compatible chat + cost/savings surfacing)."
+
+[dependencies]
+tt-shared.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+httpmock.workspace = true
+
+[lints]
+workspace = true
