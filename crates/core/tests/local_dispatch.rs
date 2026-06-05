@@ -205,7 +205,8 @@ async fn route_to_local_dispatches_to_ollama_provider() {
             .with_routing_store(routing),
     );
 
-    let body = json!({ "model": "gpt-4o", "messages": [{"role":"user","content":"hi"}], "stream": false });
+    let body =
+        json!({ "model": "gpt-4o", "messages": [{"role":"user","content":"hi"}], "stream": false });
     let r = app
         .oneshot(
             Request::builder()

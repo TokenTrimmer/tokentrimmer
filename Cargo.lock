@@ -4920,6 +4920,7 @@ dependencies = [
  "tt-provider-anthropic",
  "tt-provider-gemini",
  "tt-provider-groq",
+ "tt-provider-local",
  "tt-provider-mistral",
  "tt-provider-openai",
  "tt-provider-openrouter",

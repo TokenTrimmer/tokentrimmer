@@ -7,10 +7,10 @@ use std::sync::Arc;
 use tt_provider_anthropic::{AnthropicProvider, ClientConfig as AnthropicClientConfig};
 use tt_provider_gemini::{ClientConfig as GeminiClientConfig, GeminiProvider};
 use tt_provider_groq::GroqProvider;
+use tt_provider_local::{LocalBackend, LocalProvider};
 use tt_provider_mistral::MistralProvider;
 use tt_provider_openai::{ClientConfig as OpenAiClientConfig, OpenAiProvider};
 use tt_provider_openrouter::OpenRouterProvider;
-use tt_provider_local::{LocalBackend, LocalProvider};
 use tt_provider_together::TogetherProvider;
 use tt_shared::{ModelInfo, Provider};
 

@@ -128,7 +128,10 @@ impl LocalProvider {
 /// unchanged. Local backends serve bare model names — the gateway routes to
 /// `ollama/llama3` but Ollama expects `llama3`.
 pub(crate) fn strip_backend_prefix(backend: LocalBackend, model: &str) -> String {
-    match model.strip_prefix(backend.id()).and_then(|r| r.strip_prefix('/')) {
+    match model
+        .strip_prefix(backend.id())
+        .and_then(|r| r.strip_prefix('/'))
+    {
         Some(rest) if !rest.is_empty() => rest.to_string(),
         _ => model.to_string(),
     }
