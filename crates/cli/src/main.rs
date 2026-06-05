@@ -125,6 +125,9 @@ enum Command {
         /// Optional system prompt for the conversation.
         #[arg(long)]
         system: Option<String>,
+        /// Resume a saved session by name (see /sessions).
+        #[arg(long)]
+        resume: Option<String>,
         #[arg(long, global = true)]
         tt_api_key: Option<String>,
         #[arg(long, global = true)]
@@ -451,10 +454,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Chat {
             model,
             system,
+            resume,
             tt_api_key,
             tt_api_base,
         } => {
-            tt_cli::chat::run(model, system, tt_api_key, tt_api_base).await?;
+            tt_cli::chat::run(model, system, resume, tt_api_key, tt_api_base).await?;
         }
         Command::Init {
             path,
