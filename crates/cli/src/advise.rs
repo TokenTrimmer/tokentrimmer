@@ -97,6 +97,52 @@ pub fn build_context_message(detected: &[ModelUsage], describe: Option<&str>) ->
     s
 }
 
+/// Scan `root` for model-id usage across source files, skipping vendor dirs and
+/// over-large files. Returns ids aggregated by file count, most-used first.
+#[must_use]
+pub fn detect_models(root: &Path) -> Vec<ModelUsage> {
+    let mut agg: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let mut files = 0usize;
+    let walk = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !e.file_name().to_str().is_some_and(|n| SKIP_DIRS.contains(&n)));
+    for entry in walk.flatten() {
+        if files >= MAX_FILES {
+            break;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !SCAN_EXTS.contains(&ext) {
+            continue;
+        }
+        if entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_FILE_BYTES {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        files += 1;
+        let rel = path.strip_prefix(root).unwrap_or(path).display().to_string();
+        for id in scan_text_for_models(&text) {
+            let e = agg.entry(id).or_insert((0, rel.clone()));
+            e.0 += 1;
+        }
+    }
+    let mut out: Vec<ModelUsage> = agg
+        .into_iter()
+        .map(|(id, (count, example_file))| ModelUsage {
+            id,
+            count,
+            example_file,
+        })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +164,31 @@ mod tests {
         assert!(!ids.iter().any(|s| s.to_ascii_lowercase().contains("llamaindex")));
         assert!(scan_text_for_models("no models here").is_empty());
         assert_eq!(scan_text_for_models("gpt-4o gpt-4o").len(), 1); // de-duped
+    }
+
+    #[test]
+    fn detect_models_walks_and_skips_vendor_dirs() {
+        let dir = std::env::temp_dir().join(format!("tt-advise-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/foo")).unwrap();
+        std::fs::write(dir.join("src/a.py"), "m = \"gpt-4o\"\n").unwrap();
+        std::fs::write(
+            dir.join("src/b.rs"),
+            "let m = \"gpt-4o\"; // and claude-3-5-sonnet\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("node_modules/foo/x.js"), "\"gpt-4o\"\n").unwrap(); // skipped
+        std::fs::write(dir.join("README.md"), "uses gpt-4o\n").unwrap(); // wrong ext, skipped
+
+        let found = detect_models(&dir);
+        let ids: Vec<&str> = found.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"gpt-4o"), "{ids:?}");
+        assert!(ids.iter().any(|s| s.eq_ignore_ascii_case("claude-3-5-sonnet")));
+        // gpt-4o is only in src/a.py + src/b.rs (node_modules + README skipped) → 2 files
+        let gpt = found.iter().find(|m| m.id == "gpt-4o").unwrap();
+        assert_eq!(gpt.count, 2, "node_modules + README must be skipped");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
