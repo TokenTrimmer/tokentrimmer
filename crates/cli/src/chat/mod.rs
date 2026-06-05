@@ -160,6 +160,25 @@ pub fn osc52_copy(text: &str) -> String {
     format!("\x1b]52;c;{b64}\x07")
 }
 
+/// xterm discards OSC52 payloads beyond ~74 994 base64 chars; cap the raw reply
+/// conservatively (base64 inflates ~4/3×) so `/copy` never silently truncates.
+const OSC52_MAX_BYTES: usize = 55 * 1024;
+
+/// Wrap a bare OSC52 sequence for tmux/screen passthrough so `/copy` works
+/// inside a multiplexer. Env is read at the call site so this stays pure.
+#[must_use]
+fn wrap_osc52_for_mux(seq: String, in_tmux: bool, term: &str) -> String {
+    if in_tmux {
+        // tmux DCS passthrough: ESC P tmux ; <seq, each ESC doubled> ESC \
+        format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
+    } else if term.starts_with("screen") {
+        // screen DCS chunk: ESC P <seq> ESC \
+        format!("\x1bP{seq}\x1b\\")
+    } else {
+        seq
+    }
+}
+
 /// In-memory conversation state (also the on-disk session format).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
@@ -237,14 +256,29 @@ impl Ledger {
     }
 }
 
-/// Prepare the conversation to re-run the last turn: drop a trailing assistant
-/// reply if present. Returns true iff the conversation now ends with a user
-/// message (something to retry).
-fn prepare_retry(conv: &mut Conversation) -> bool {
-    if matches!(conv.messages.last(), Some(Message::Assistant { .. })) {
-        conv.messages.pop();
+/// What `/retry` should do, computed by [`prepare_retry`].
+#[derive(Debug)]
+enum RetryPlan {
+    /// Re-run the last turn. `restore` holds the assistant reply that was
+    /// removed (push it back to undo a failed retry), or `None` when the
+    /// trailing turn was an unanswered user message.
+    Ready { restore: Option<Message> },
+    /// No user turn in history — nothing to retry.
+    Nothing,
+}
+
+/// Prepare the conversation to re-run the last turn. A trailing assistant reply
+/// is popped and returned in `restore` so that a *failed* retry can be made a
+/// no-op on history (no dangling user turn — two consecutive user messages
+/// break the Anthropic/Gemini APIs — and no lost answer).
+fn prepare_retry(conv: &mut Conversation) -> RetryPlan {
+    match conv.messages.last() {
+        Some(Message::Assistant { .. }) => RetryPlan::Ready {
+            restore: conv.messages.pop(),
+        },
+        Some(Message::User { .. }) => RetryPlan::Ready { restore: None },
+        _ => RetryPlan::Nothing,
     }
-    matches!(conv.messages.last(), Some(Message::User { .. }))
 }
 
 /// The text of the most recent assistant reply, if any.
@@ -379,15 +413,19 @@ fn compose_in_editor() -> anyhow::Result<Option<String>> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());
-    let mut path = std::env::temp_dir();
-    path.push(format!("tt-chat-{}.md", std::process::id()));
-    std::fs::write(&path, b"").with_context(|| format!("create {}", path.display()))?;
+    // O_EXCL + 0600 + a randomized name (no symlink/predictable-path attack),
+    // auto-removed on drop so every return path cleans up.
+    let file = tempfile::Builder::new()
+        .prefix("tt-chat-")
+        .suffix(".md")
+        .tempfile()
+        .context("create temp file for editor")?;
+    let path = file.path().to_path_buf();
     let status = std::process::Command::new(&editor)
         .arg(&path)
         .status()
         .with_context(|| format!("launch editor `{editor}`"))?;
     let text = std::fs::read_to_string(&path).unwrap_or_default();
-    std::fs::remove_file(&path).ok();
     if !status.success() {
         return Ok(None);
     }
@@ -402,7 +440,7 @@ fn print_help() {
         ("/clear", "reset the conversation"),
         ("/model [m]", "show or switch the requested model"),
         ("/system [s]", "show or set the system prompt"),
-        ("/editor", "compose a multi-line message in $EDITOR"),
+        ("/editor", "compose a multi-line message in $VISUAL/$EDITOR"),
         ("/retry", "re-run the last turn"),
         ("/copy", "copy the last reply to the clipboard"),
         ("/save [name]", "save this conversation"),
@@ -519,22 +557,43 @@ pub async fn run(
                         Ok(None) => ui::info("(editor: nothing sent)"),
                         Err(e) => ui::error(&format!("{e:#}")),
                     },
-                    Command::Retry => {
-                        if prepare_retry(&mut conv) {
-                            do_turn(&http, &base, &key, &mut conv, &mut ledger).await;
-                        } else {
-                            ui::warn("nothing to retry");
+                    Command::Retry => match prepare_retry(&mut conv) {
+                        RetryPlan::Ready { restore } => {
+                            if !do_turn(&http, &base, &key, &mut conv, &mut ledger).await {
+                                // Failed retry → no-op on history: restore the
+                                // prior reply so we never leave a dangling user
+                                // turn or lose a good answer.
+                                if let Some(a) = restore {
+                                    conv.messages.push(a);
+                                }
+                            }
+                        }
+                        RetryPlan::Nothing => ui::warn("nothing to retry"),
+                    },
+                    Command::Copy => {
+                        match last_assistant_text(&conv).filter(|t| !t.trim().is_empty()) {
+                            None => ui::warn("nothing to copy"),
+                            Some(_) if !console::user_attended() => {
+                                ui::warn("/copy needs an interactive terminal")
+                            }
+                            Some(text) if text.len() > OSC52_MAX_BYTES => ui::warn(&format!(
+                                "reply too large to copy ({} KB; OSC52 cap ~{} KB)",
+                                text.len() / 1024,
+                                OSC52_MAX_BYTES / 1024
+                            )),
+                            Some(text) => {
+                                let seq = wrap_osc52_for_mux(
+                                    osc52_copy(&text),
+                                    std::env::var_os("TMUX").is_some(),
+                                    &std::env::var("TERM").unwrap_or_default(),
+                                );
+                                print!("{seq}");
+                                use std::io::Write as _;
+                                let _ = std::io::stdout().flush();
+                                ui::info("(sent to clipboard — needs an OSC52-capable terminal)");
+                            }
                         }
                     }
-                    Command::Copy => match last_assistant_text(&conv) {
-                        Some(text) => {
-                            print!("{}", osc52_copy(&text));
-                            use std::io::Write as _;
-                            let _ = std::io::stdout().flush();
-                            ui::info("(copied last reply to clipboard)");
-                        }
-                        None => ui::warn("nothing to copy"),
-                    },
                     Command::Exit => break,
                     Command::Unknown(c) => {
                         ui::warn(&format!("unknown command /{c} — /help for commands"))
@@ -653,18 +712,44 @@ mod tests {
     }
 
     #[test]
-    fn prepare_retry_drops_assistant_keeps_user() {
+    fn prepare_retry_pops_and_classifies() {
         let mut c = Conversation::new("m".into(), None);
-        assert!(!prepare_retry(&mut c), "empty conv: nothing to retry");
+        assert!(matches!(prepare_retry(&mut c), RetryPlan::Nothing));
         c.push_user("hi".into());
         c.push_assistant("yo".into());
-        assert!(prepare_retry(&mut c), "should drop assistant, user remains");
-        assert_eq!(c.messages.len(), 1);
-        assert!(
+        // ends with assistant → pop it, hand it back for restore-on-failure
+        assert!(matches!(
             prepare_retry(&mut c),
-            "user still present, no assistant to pop"
-        );
+            RetryPlan::Ready { restore: Some(_) }
+        ));
+        assert_eq!(c.messages.len(), 1); // assistant popped, user remains
+                                         // now ends with a user (unanswered) → ready, nothing to restore
+        assert!(matches!(
+            prepare_retry(&mut c),
+            RetryPlan::Ready { restore: None }
+        ));
         assert_eq!(c.messages.len(), 1);
+    }
+
+    #[test]
+    fn osc52_mux_wrapping() {
+        let bare = osc52_copy("x");
+        // outside a multiplexer → unchanged
+        assert_eq!(
+            wrap_osc52_for_mux(bare.clone(), false, "xterm-256color"),
+            bare
+        );
+        // tmux → DCS passthrough with each inner ESC doubled
+        let t = wrap_osc52_for_mux(bare.clone(), true, "screen");
+        assert!(t.starts_with("\x1bPtmux;"), "{t:?}");
+        assert!(t.ends_with("\x1b\\"), "{t:?}");
+        assert!(
+            t.contains("\x1b\x1b]52"),
+            "inner ESC must be doubled: {t:?}"
+        );
+        // screen (no tmux) → DCS chunk
+        let s = wrap_osc52_for_mux(bare, false, "screen.xterm");
+        assert!(s.starts_with("\x1bP") && s.ends_with("\x1b\\"), "{s:?}");
     }
 
     #[test]

@@ -1,0 +1,4 @@
+version = "0.1.0"
+
+[installed]
+".gitignore.append" = "af2746d34c1b3d62abf51d1ca85208e88d617360fbc74553c33c529b264213da"
