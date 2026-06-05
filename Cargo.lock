@@ -5064,6 +5064,7 @@ dependencies = [
  "tracing-subscriber",
  "tt-auth",
  "tt-cache",
+ "tt-client",
  "tt-config",
  "tt-core",
  "tt-inspect-core",

@@ -30,6 +30,7 @@ tt-plan-core.workspace = true
 tt-preview.workspace = true
 tt-mcp.workspace = true
 tt-tokenize.workspace = true
+tt-client.workspace = true
 reqwest.workspace = true
 regex.workspace = true
 
