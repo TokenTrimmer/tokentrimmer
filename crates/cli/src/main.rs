@@ -128,6 +128,9 @@ enum Command {
         /// Resume a saved session by name (see /sessions).
         #[arg(long)]
         resume: Option<String>,
+        /// Enable tool-calling from the start (find_route_for, preview_cost, inspect_diff).
+        #[arg(long)]
+        tools: bool,
         #[arg(long, global = true)]
         tt_api_key: Option<String>,
         #[arg(long, global = true)]
@@ -455,10 +458,11 @@ async fn main() -> anyhow::Result<()> {
             model,
             system,
             resume,
+            tools,
             tt_api_key,
             tt_api_base,
         } => {
-            tt_cli::chat::run(model, system, resume, tt_api_key, tt_api_base).await?;
+            tt_cli::chat::run(model, system, resume, tools, tt_api_key, tt_api_base).await?;
         }
         Command::Init {
             path,
