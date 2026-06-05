@@ -521,7 +521,13 @@ pub async fn run(
     let mut ledger = Ledger::default();
     let registry = tools::build_registry();
     let mut tools_enabled = tools;
-    let mut ctx = budget::ContextState::new(max_context);
+    // Best-effort: real per-model windows from the gateway catalog. On any
+    // failure (offline / old gateway / pre-auth) fall back to the prefix table.
+    let catalog_windows = match crate::catalog::fetch_catalog(&http, &base, &key).await {
+        Ok(models) => crate::catalog::windows_map(&models),
+        Err(_) => std::collections::HashMap::new(),
+    };
+    let mut ctx = budget::ContextState::new(max_context, catalog_windows);
     ui::heading(&format!(
         "tt chat · {} via TokenTrimmer{}   (/help)",
         conv.model,
