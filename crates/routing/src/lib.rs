@@ -639,7 +639,11 @@ mod tests {
             )
             .is_some());
         assert!(eng
-            .evaluate(&make_req_text("gpt-4o", "my SALARY is"), &make_ctx(None), 100)
+            .evaluate(
+                &make_req_text("gpt-4o", "my SALARY is"),
+                &make_ctx(None),
+                100
+            )
             .is_some());
         assert!(eng
             .evaluate(
@@ -662,7 +666,11 @@ mod tests {
         };
         let eng = RoutingEngine::with_routes(vec![route]);
         assert!(eng
-            .evaluate(&make_req_text("gpt-4o", "confidential"), &make_ctx(None), 100)
+            .evaluate(
+                &make_req_text("gpt-4o", "confidential"),
+                &make_ctx(None),
+                100
+            )
             .is_some());
         assert!(eng
             .evaluate(&make_req_text("gpt-4o", "hello"), &make_ctx(None), 100)

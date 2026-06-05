@@ -202,7 +202,9 @@ pub fn request_input_text(req: &ChatCompletionRequest) -> String {
     req.messages
         .iter()
         .filter_map(|m| match m {
-            Message::User { content, .. } | Message::System { content } => Some(extract_text(content)),
+            Message::User { content, .. } | Message::System { content } => {
+                Some(extract_text(content))
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -476,6 +478,9 @@ mod tests {
         let t = request_input_text(&req);
         assert!(t.contains("sys ctx"));
         assert!(t.contains("Confidential matter"));
-        assert!(!t.contains("legal advice"), "assistant output must be excluded");
+        assert!(
+            !t.contains("legal advice"),
+            "assistant output must be excluded"
+        );
     }
 }
