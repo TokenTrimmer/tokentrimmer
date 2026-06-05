@@ -347,11 +347,13 @@ pub async fn run(
     let http = reqwest::Client::new();
 
     let mut conv = match resume {
-        Some(n) => session::load(&session::sessions_dir(), &n)
-            .with_context(|| format!("resume `{n}`"))?,
-        None => {
-            Conversation::new(model.unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string()), system)
+        Some(n) => {
+            session::load(&session::sessions_dir(), &n).with_context(|| format!("resume `{n}`"))?
         }
+        None => Conversation::new(
+            model.unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string()),
+            system,
+        ),
     };
     let mut ledger = Ledger::default();
     ui::heading(&format!(
@@ -407,24 +409,20 @@ pub async fn run(
                             Err(e) => ui::error(&format!("{e:#}")),
                         }
                     }
-                    Command::Resume(name) => {
-                        match session::load(&session::sessions_dir(), &name) {
-                            Ok(c) => {
-                                conv = c;
-                                ui::info(&format!("(resumed · {} messages)", conv.messages.len()));
-                            }
-                            Err(e) => ui::error(&format!("{e:#}")),
+                    Command::Resume(name) => match session::load(&session::sessions_dir(), &name) {
+                        Ok(c) => {
+                            conv = c;
+                            ui::info(&format!("(resumed · {} messages)", conv.messages.len()));
                         }
-                    }
+                        Err(e) => ui::error(&format!("{e:#}")),
+                    },
                     Command::Sessions => {
                         let metas = session::list(&session::sessions_dir()).unwrap_or_default();
                         if metas.is_empty() {
                             ui::info("no saved sessions");
                         } else {
-                            let mut t = ui::table(
-                                &["NAME", "MODEL", "TURNS"],
-                                console::colors_enabled(),
-                            );
+                            let mut t =
+                                ui::table(&["NAME", "MODEL", "TURNS"], console::colors_enabled());
                             for m in metas {
                                 t.add_row(vec![m.name, m.model, m.turns.to_string()]);
                             }
