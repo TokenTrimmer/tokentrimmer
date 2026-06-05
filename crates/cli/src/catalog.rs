@@ -77,6 +77,25 @@ pub fn windows_map(models: &[CatalogModel]) -> HashMap<String, u32> {
         .collect()
 }
 
+/// Fetch the catalog from the gateway's `GET /v1/models`.
+pub async fn fetch_catalog(
+    http: &reqwest::Client,
+    base: &str,
+    key: &str,
+) -> anyhow::Result<Vec<CatalogModel>> {
+    let resp = http
+        .get(format!("{base}/v1/models"))
+        .bearer_auth(key)
+        .send()
+        .await
+        .context("request /v1/models")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("gateway returned {} for /v1/models", resp.status());
+    }
+    let body = resp.text().await.context("read /v1/models body")?;
+    parse_catalog(&body)
+}
+
 /// Compact token-count display: `128000 → "128k"`, `1000000 → "1M"`.
 #[must_use]
 pub fn format_window(tokens: u64) -> String {
@@ -117,6 +136,34 @@ mod tests {
         assert_eq!(m[0].input_per_million, Some(0.15));
         assert_eq!(m[1].input_per_million, None); // pricing: null
         assert!(parse_catalog("not json").is_err());
+    }
+
+    use httpmock::prelude::*;
+
+    #[tokio::test]
+    async fn fetch_catalog_parses_mock() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(SAMPLE);
+        });
+        let http = reqwest::Client::new();
+        let models = fetch_catalog(&http, &server.base_url(), "k").await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[1].id, "claude-haiku-4-5");
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_errors_on_5xx() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(503).body("nope");
+        });
+        let http = reqwest::Client::new();
+        assert!(fetch_catalog(&http, &server.base_url(), "k").await.is_err());
     }
 
     #[test]
