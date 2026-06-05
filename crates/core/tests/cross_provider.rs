@@ -266,3 +266,121 @@ async fn cross_provider_missing_credential_fails_closed() {
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     assert!(anthropic_keys.lock().unwrap().is_empty());
 }
+
+/// Build an app whose route is `gpt-4o -> claude-haiku-4-5` with a
+/// `gemini-2.5-flash` fallback. The anthropic primary can be made to fail so
+/// dispatch falls over to gemini.
+#[allow(clippy::too_many_arguments)]
+fn build_failover(
+    org: Uuid,
+    key_store: Arc<dyn KeyStore>,
+    cred_store: Arc<dyn ProviderCredentialStore>,
+    anthropic_fail: bool,
+    anthropic_keys: Arc<Mutex<Vec<String>>>,
+    gemini_keys: Arc<Mutex<Vec<String>>>,
+) -> axum::Router {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(Mock {
+        id: "openai",
+        model: "gpt-4o",
+        input_price: 5.0,
+        output_price: 15.0,
+        seen_keys: Arc::new(Mutex::new(Vec::new())),
+        fail: false,
+    }));
+    registry.register(Arc::new(Mock {
+        id: "anthropic",
+        model: "claude-haiku-4-5",
+        input_price: 0.25,
+        output_price: 1.25,
+        seen_keys: anthropic_keys,
+        fail: anthropic_fail,
+    }));
+    registry.register(Arc::new(Mock {
+        id: "gemini",
+        model: "gemini-2.5-flash",
+        input_price: 0.1,
+        output_price: 0.4,
+        seen_keys: gemini_keys,
+        fail: false,
+    }));
+    let backing = Arc::new(InMemoryRoutingStore::new());
+    backing.set_routes(
+        org,
+        vec![route("claude-haiku-4-5", vec!["gemini-2.5-flash".into()])],
+    );
+    let routing = Arc::new(CachingRoutingStore::new(backing as Arc<dyn RoutingStore>));
+    build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_credential_store(cred_store)
+            .with_routing_store(routing),
+    )
+}
+
+#[tokio::test]
+async fn failover_candidate_uses_its_own_provider_credential() {
+    let raw = InMemoryKeyStore::new();
+    let org = Uuid::now_v7();
+    let key = issue_key_for(&raw, org).await;
+    let store = InMemoryProviderCredentialStore::new();
+    store.insert(org, "openai", creds("OAI"));
+    store.insert(org, "anthropic", creds("ANT"));
+    store.insert(org, "gemini", creds("GEM"));
+    let anthropic_keys = Arc::new(Mutex::new(Vec::new()));
+    let gemini_keys = Arc::new(Mutex::new(Vec::new()));
+    let app = build_failover(
+        org,
+        Arc::new(raw),
+        Arc::new(store),
+        /*anthropic_fail=*/ true,
+        Arc::clone(&anthropic_keys),
+        Arc::clone(&gemini_keys),
+    );
+
+    let r = app.oneshot(chat("gpt-4o", &key, false)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    // Primary (anthropic) was tried with ANT (possibly retried), failed; fell
+    // over to gemini with GEM. Each candidate saw only its OWN provider's key —
+    // never the source openai key.
+    let ant = anthropic_keys.lock().unwrap().clone();
+    assert!(
+        !ant.is_empty() && ant.iter().all(|k| k == "ANT"),
+        "anthropic must see only its own key, got {ant:?}"
+    );
+    let gem = gemini_keys.lock().unwrap().clone();
+    assert!(
+        !gem.is_empty() && gem.iter().all(|k| k == "GEM"),
+        "gemini must see only its own key, got {gem:?}"
+    );
+    assert_eq!(
+        r.headers()["x-tokentrimmer-provider"].to_str().unwrap(),
+        "gemini"
+    );
+}
+
+#[tokio::test]
+async fn failover_skips_candidate_without_credential() {
+    let raw = InMemoryKeyStore::new();
+    let org = Uuid::now_v7();
+    let key = issue_key_for(&raw, org).await;
+    let store = InMemoryProviderCredentialStore::new();
+    store.insert(org, "openai", creds("OAI"));
+    store.insert(org, "anthropic", creds("ANT")); // no gemini credential
+    let anthropic_keys = Arc::new(Mutex::new(Vec::new()));
+    let gemini_keys = Arc::new(Mutex::new(Vec::new()));
+    let app = build_failover(
+        org,
+        Arc::new(raw),
+        Arc::new(store),
+        /*anthropic_fail=*/ true,
+        Arc::clone(&anthropic_keys),
+        Arc::clone(&gemini_keys),
+    );
+
+    let r = app.oneshot(chat("gpt-4o", &key, false)).await.unwrap();
+    // anthropic failed; gemini has no credential so it is skipped (never called);
+    // no candidate succeeds -> upstream error surfaced (5xx), gemini untouched.
+    assert!(gemini_keys.lock().unwrap().is_empty());
+    assert!(r.status().is_server_error());
+}

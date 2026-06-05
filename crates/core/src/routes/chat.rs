@@ -429,6 +429,36 @@ pub async fn handler(
         }
     }
 
+    // For a failover chain, pre-resolve upstream credentials for every distinct
+    // provider in the candidate set. The raw-Bearer fallback is allowed only for
+    // the source provider (the bearer is its key); cross-provider candidates with
+    // no stored credential are skipped during dispatch.
+    let (failover_candidates, failover_creds): (
+        Vec<String>,
+        std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) = if route_fallbacks.is_empty() {
+        (Vec::new(), std::collections::HashMap::new())
+    } else {
+        let candidates: Vec<String> = std::iter::once(req.model.clone())
+            .chain(route_fallbacks.iter().cloned())
+            .collect();
+        let mut map = std::collections::HashMap::new();
+        for m in &candidates {
+            if let Some(p) = state.registry.resolve(m) {
+                let pid = p.id().to_string();
+                if !map.contains_key(&pid) {
+                    if let Some(c) =
+                        resolve_credentials_for(&state, org_id, &pid, &raw_bearer, pid == source_provider_id)
+                            .await
+                    {
+                        map.insert(pid, c);
+                    }
+                }
+            }
+        }
+        (candidates, map)
+    };
+
     // 2d. Determine cache behaviour for this request (Fix A §2.2 + Fix B §2.7).
     //     Resolved once here so all four call-sites (streaming L1 read,
     //     non-streaming L1 read, L2 read, L1/L2 insert) share a single decision.
@@ -538,9 +568,6 @@ pub async fn handler(
             .await?;
             (provider, req.model.clone(), stream)
         } else {
-            let candidates: Vec<String> = std::iter::once(req.model.clone())
-                .chain(route_fallbacks.iter().cloned())
-                .collect();
             // Build the capability check for the streaming failover path.
             let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
             let cap_est_tokens = estimated_input_tokens.max(0) as u64;
@@ -548,9 +575,10 @@ pub async fn handler(
                 &state.registry,
                 &state.breaker,
                 &RetryPolicy::default(),
-                &candidates,
+                &failover_candidates,
                 &req,
                 &ctx,
+                &failover_creds,
                 Utc::now(),
                 Some(crate::failover::CapCheck {
                     required: &cap_required,
@@ -869,9 +897,6 @@ pub async fn handler(
             .map(|resp| (provider, resp))
             .map_err(ApiError::from)
         } else {
-            let candidates: Vec<String> = std::iter::once(req.model.clone())
-                .chain(route_fallbacks.iter().cloned())
-                .collect();
             // Build the capability check for the failover path.
             let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
             let cap_est_tokens = {
@@ -882,9 +907,10 @@ pub async fn handler(
                 &state.registry,
                 &state.breaker,
                 &RetryPolicy::default(),
-                &candidates,
+                &failover_candidates,
                 &req,
                 &ctx,
+                &failover_creds,
                 Utc::now(),
                 Some(crate::failover::CapCheck {
                     required: &cap_required,
@@ -1493,10 +1519,17 @@ async fn resolve_credentials(
         .expect("bearer fallback yields Some")
 }
 
-/// Resolve upstream credentials for `provider_id`. Returns `None` only when the
-/// store has no entry AND `allow_bearer_fallback` is false — i.e. a cross-
-/// provider target whose key we must not substitute with the source provider's
-/// bearer.
+/// Resolve upstream credentials for `provider_id`.
+///
+/// With a credential store configured (the hosted per-org model), a store hit
+/// wins; on a miss the raw-Bearer fallback applies only when
+/// `allow_bearer_fallback` is true (the source provider's key is its own), so a
+/// cross-provider target with no stored key returns `None` (fail closed — we
+/// must not forward the source key to a different provider).
+///
+/// With **no** store configured (dev / dogfood / BYO-key passthrough) there is
+/// no per-provider credential model to enforce, so the raw Bearer is forwarded
+/// to every provider — never fail-closed.
 async fn resolve_credentials_for(
     state: &AppState,
     org_id: Uuid,
@@ -1504,21 +1537,23 @@ async fn resolve_credentials_for(
     raw_bearer: &str,
     allow_bearer_fallback: bool,
 ) -> Option<ProviderCredentials> {
-    if let Some(store) = state.credential_store.as_ref() {
-        match store.get(org_id, provider_id).await {
-            Ok(Some(c)) => return Some(c),
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "credential store lookup failed"),
+    let bearer = || ProviderCredentials {
+        api_key: SecretString::new(raw_bearer.to_string()),
+        base_url: None,
+        extra_headers: Vec::new(),
+    };
+    let Some(store) = state.credential_store.as_ref() else {
+        // Legacy passthrough: no per-org credential store.
+        return Some(bearer());
+    };
+    match store.get(org_id, provider_id).await {
+        Ok(Some(c)) => Some(c),
+        Ok(None) if allow_bearer_fallback => Some(bearer()),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "credential store lookup failed");
+            allow_bearer_fallback.then(bearer)
         }
-    }
-    if allow_bearer_fallback {
-        Some(ProviderCredentials {
-            api_key: SecretString::new(raw_bearer.to_string()),
-            base_url: None,
-            extra_headers: Vec::new(),
-        })
-    } else {
-        None
     }
 }
 
