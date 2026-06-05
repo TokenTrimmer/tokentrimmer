@@ -125,11 +125,20 @@ def _replace_window(text: str, provider: str, model: str, new_val: int) -> str:
     pat_m = re.compile(rf'(?m)^model = "{re.escape(model)}"\s*$')
     for i, part in enumerate(parts):
         if pat_p.search(part) and pat_m.search(part):
-            parts[i] = re.sub(
+            new_part, n = re.subn(
                 r"(?m)^(max_input_tokens = )\d+", rf"\g<1>{new_val}", part, count=1
             )
-            break
-    return "".join(parts)
+            if n == 0:
+                raise ValueError(
+                    f"[[model]] block for {provider}/{model} has no max_input_tokens line"
+                )
+            parts[i] = new_part
+            return "".join(parts)
+    # detect_window_drift parsed this row from the same file, so a miss here means
+    # the format changed — fail loud rather than silently write nothing.
+    raise ValueError(
+        f"no [[model]] block found for {provider}/{model} — models.toml format may have changed"
+    )
 
 
 def main(argv: list[str]) -> int:

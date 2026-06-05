@@ -56,6 +56,11 @@ class TestApply(unittest.TestCase):
         self.assertEqual(parsed["model"][0]["max_input_tokens"], 130000)
         self.assertEqual(parsed["model"][1]["max_input_tokens"], 128000)
 
+    def test_missing_block_raises(self):
+        # A fix for a (provider, model) not present must fail loud, not no-op.
+        with self.assertRaises(ValueError):
+            apply_window_fixes(self.SAMPLE, [Drift("nope", "nope", 1, 2)])
+
 
 if __name__ == "__main__":
     unittest.main()

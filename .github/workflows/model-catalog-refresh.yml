@@ -47,14 +47,25 @@ jobs:
             echo "no context-window drift — nothing to do"
             exit 0
           fi
+          BRANCH="chore/model-catalog-refresh"
+          # Never clobber a refresh branch that already exists — a PR may be open
+          # with reviewer commits (e.g. an updated pinned test). Skip instead of
+          # force-pushing over it; the existing PR already carries the drift.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "refresh branch '$BRANCH' already exists — a PR is pending review; skipping"
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BRANCH="chore/model-catalog-refresh"
           git checkout -b "$BRANCH"
           git add crates/shared/data/models.toml
           git commit -m "chore: refresh model context windows from OpenRouter"
-          git push -f -u origin "$BRANCH"
-          gh pr view "$BRANCH" >/dev/null 2>&1 || gh pr create \
-            --title "chore: refresh model context windows from OpenRouter" \
-            --body "Automated context-window refresh (scripts/refresh_models.py) vs OpenRouter's live models API. Review the deltas; if a model_catalog spot-check test pins a changed window, update it in this PR. NOTE: a GITHUB_TOKEN-created PR does not auto-trigger CI — re-run checks or push an empty commit to validate." \
-            --label automated
+          git push -u origin "$BRANCH"
+          # Open a PR only if there is no OPEN one for this head — a prior MERGED
+          # PR on the same branch name must not suppress a new one.
+          if ! gh pr list --head "$BRANCH" --state open --json number -q '.[0].number' | grep -q .; then
+            gh pr create \
+              --title "chore: refresh model context windows from OpenRouter" \
+              --body "Automated context-window refresh (scripts/refresh_models.py) vs OpenRouter's live models API. Review the deltas; if a model_catalog spot-check test pins a changed window, update it in this PR. NOTE: a GITHUB_TOKEN-created PR does not auto-trigger CI — re-run checks (or have branch protection require them) before merging." \
+              --label automated
+          fi
