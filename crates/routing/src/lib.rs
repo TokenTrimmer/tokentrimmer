@@ -175,9 +175,9 @@ impl RoutingEngine {
         input_tokens_estimate: u32,
         estimated_cost_usd: Option<f64>,
     ) -> Option<&Route> {
-        self.routes.iter().find(|r| {
-            r.enabled && matches(r, req, ctx, input_tokens_estimate, estimated_cost_usd)
-        })
+        self.routes
+            .iter()
+            .find(|r| r.enabled && matches(r, req, ctx, input_tokens_estimate, estimated_cost_usd))
     }
 }
 
