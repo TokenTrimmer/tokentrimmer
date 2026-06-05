@@ -10,9 +10,15 @@ use serde_json::{json, Value};
 // don't need a direct `tt-shared` dependency to read `outcome.response`).
 pub use tt_shared::messages::{
     ChatCompletionResponse, Choice, ContentPart, ImageUrl, InputAudio, Message, MessageContent,
-    ToolCall, ToolCallFunction,
+    Tool, ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
 };
 pub use tt_shared::Usage;
+
+mod tools;
+/// Re-exported so downstream `impl ToolExecutor` blocks can annotate with
+/// `#[tt_client::async_trait]` without taking a direct `async-trait` dependency.
+pub use async_trait::async_trait;
+pub use tools::{AggregateCost, ToolExecutor, ToolOutcome};
 
 /// Build a `user` message.
 #[must_use]
@@ -38,6 +44,28 @@ pub fn assistant(content: impl Into<String>) -> Message {
         content: Some(MessageContent::Text(content.into())),
         tool_calls: Vec::new(),
         name: None,
+    }
+}
+
+/// Build a function `tool` definition to advertise to the model.
+#[must_use]
+pub fn tool(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Tool {
+    Tool {
+        r#type: "function".to_string(),
+        function: ToolFunction {
+            name: name.into(),
+            description: Some(description.into()),
+            parameters,
+        },
+    }
+}
+
+/// Build a `tool` result message answering the call `tool_call_id`.
+#[must_use]
+pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Message {
+    Message::Tool {
+        content: MessageContent::Text(content.into()),
+        tool_call_id: tool_call_id.into(),
     }
 }
 
@@ -95,6 +123,19 @@ pub fn build_body(
         body["temperature"] = json!(t);
     }
     body
+}
+
+/// Inject `tools`/`tool_choice` onto a request body. No-ops on an empty tool
+/// list; a `None` choice is left off. Serialization of these plain structs is
+/// infallible in practice, so a `Null` fallback keeps this panic-free without a
+/// serde error variant (the gateway ignores `tool_choice: null`).
+fn inject_tools(body: &mut Value, tools: &[Tool], tool_choice: Option<&ToolChoice>) {
+    if !tools.is_empty() {
+        body["tools"] = serde_json::to_value(tools).unwrap_or(Value::Null);
+    }
+    if let Some(tc) = tool_choice {
+        body["tool_choice"] = serde_json::to_value(tc).unwrap_or(Value::Null);
+    }
 }
 
 /// The terminal `tokentrimmer.usage` SSE event payload (streaming cost/usage).
@@ -237,6 +278,9 @@ impl Client {
             max_tokens: None,
             temperature: None,
             tag: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            max_tool_rounds: 8,
         }
     }
 }
@@ -249,6 +293,9 @@ pub struct ChatBuilder<'a> {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     tag: Option<String>,
+    tools: Vec<Tool>,
+    tool_choice: Option<ToolChoice>,
+    max_tool_rounds: usize,
 }
 
 impl ChatBuilder<'_> {
@@ -284,6 +331,26 @@ impl ChatBuilder<'_> {
         self
     }
 
+    /// Advertise function `tools` to the model.
+    #[must_use]
+    pub fn tools(mut self, tools: impl IntoIterator<Item = Tool>) -> Self {
+        self.tools = tools.into_iter().collect();
+        self
+    }
+    /// Constrain tool selection (`auto`/`none`/`required`/a specific function).
+    #[must_use]
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
+        self
+    }
+    /// Max gateway round-trips in [`run_tools`](Self::run_tools) before a forced
+    /// final answer (default 8).
+    #[must_use]
+    pub fn max_tool_rounds(mut self, n: usize) -> Self {
+        self.max_tool_rounds = n;
+        self
+    }
+
     /// Send the request and return the typed response + cost.
     ///
     /// # Errors
@@ -294,13 +361,14 @@ impl ChatBuilder<'_> {
         if self.model.trim().is_empty() {
             return Err(Error::MissingModel);
         }
-        let body = build_body(
+        let mut body = build_body(
             &self.model,
             &self.messages,
             self.max_tokens,
             self.temperature,
             false,
         );
+        inject_tools(&mut body, &self.tools, self.tool_choice.as_ref());
         let mut req = self
             .client
             .http
@@ -473,6 +541,16 @@ impl ChatOutcome {
             })
     }
 
+    /// The first choice's requested tool calls (empty when the model asked for
+    /// none, or there are no choices).
+    #[must_use]
+    pub fn tool_calls(&self) -> &[ToolCall] {
+        match self.response.choices.first().map(|c| &c.message) {
+            Some(Message::Assistant { tool_calls, .. }) => tool_calls,
+            _ => &[],
+        }
+    }
+
     /// Savings as a percentage of the baseline, when both are known.
     #[must_use]
     pub fn savings_pct(&self) -> Option<f64> {
@@ -498,6 +576,40 @@ mod tests {
         assert!(
             matches!(assistant("a"), Message::Assistant { content: Some(MessageContent::Text(t)), .. } if t == "a")
         );
+    }
+
+    #[test]
+    fn tool_constructors() {
+        let t = tool("get_weather", "Look up weather", json!({"type":"object"}));
+        assert_eq!(t.r#type, "function");
+        assert_eq!(t.function.name, "get_weather");
+        assert_eq!(t.function.description.as_deref(), Some("Look up weather"));
+        assert_eq!(t.function.parameters["type"], "object");
+
+        assert!(matches!(
+            tool_result("call_1", "42"),
+            Message::Tool { content: MessageContent::Text(c), tool_call_id }
+                if c == "42" && tool_call_id == "call_1"
+        ));
+    }
+
+    #[test]
+    fn inject_tools_adds_fields() {
+        let mut body = json!({ "model": "m", "messages": [] });
+        let tools = vec![tool("f", "desc", json!({"type":"object"}))];
+        inject_tools(
+            &mut body,
+            &tools,
+            Some(&ToolChoice::Auto("none".to_string())),
+        );
+        assert_eq!(body["tools"][0]["function"]["name"], "f");
+        assert_eq!(body["tool_choice"], "none");
+
+        // empty tools + no choice → nothing added
+        let mut bare = json!({ "model": "m" });
+        inject_tools(&mut bare, &[], None);
+        assert!(bare.get("tools").is_none());
+        assert!(bare.get("tool_choice").is_none());
     }
 
     #[test]
@@ -667,6 +779,46 @@ mod tests {
                 .input_tokens,
             7
         );
+    }
+
+    #[tokio::test]
+    async fn send_advertises_tools_and_surfaces_calls() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"get_weather\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "c1", "object": "chat.completion", "created": 1_700_000_000_i64,
+                    "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "finish_reason": "tool_calls", "message": {
+                        "role": "assistant", "content": null,
+                        "tool_calls": [{ "id": "call_1", "type": "function",
+                            "function": { "name": "get_weather", "arguments": "{\"city\":\"SF\"}" } }]
+                    }}],
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6 }
+                }));
+        });
+
+        let client = Client::new(server.base_url(), "k");
+        let out = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("weather in SF?"))
+            .tools(vec![tool(
+                "get_weather",
+                "Look up weather",
+                json!({"type":"object"}),
+            )])
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(out.tool_calls().len(), 1);
+        assert_eq!(out.tool_calls()[0].function.name, "get_weather");
+        assert!(out.text().is_none()); // content was null
     }
 
     #[tokio::test]
