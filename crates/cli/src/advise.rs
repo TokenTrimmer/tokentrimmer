@@ -143,6 +143,42 @@ pub fn detect_models(root: &Path) -> Vec<ModelUsage> {
     out
 }
 
+/// `tt advise` entry point: scan the repo, then run one tool-grounded turn.
+pub async fn run(
+    path: Option<String>,
+    describe: Option<String>,
+    model: Option<String>,
+    flag_key: Option<String>,
+    flag_base: Option<String>,
+) -> anyhow::Result<()> {
+    let ctx = ResolvedContext::load(flag_key, flag_base)?;
+    let key = ctx
+        .api_key_string()
+        .context("no API key — run `tt login` or set TT_API_KEY")?;
+    let base = ctx.base_url.trim_end_matches('/').to_string();
+    let http = reqwest::Client::new();
+
+    let root = path.unwrap_or_else(|| ".".to_string());
+    let detected = detect_models(Path::new(&root));
+    if detected.is_empty() {
+        ui::note("no model usage detected in the code — advising from --describe / general guidance");
+    } else {
+        ui::note(&format!("scanned: {} model(s) referenced", detected.len()));
+    }
+
+    let mut conv = Conversation::new(
+        model.unwrap_or_else(|| ADVISOR_MODEL.to_string()),
+        Some(ADVISOR_SYSTEM.to_string()),
+    );
+    conv.push_user(build_context_message(&detected, describe.as_deref()));
+
+    let reg = tools::build_registry();
+    let mut ledger = Ledger::default();
+    ui::heading("TokenTrimmer advisor");
+    tools::run_tool_turn(&http, &base, &key, &mut conv, &reg, &mut ledger).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
