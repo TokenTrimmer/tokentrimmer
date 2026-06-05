@@ -2,6 +2,7 @@
 //! modules for integration tests and the `tt` binary.
 
 pub mod account;
+pub mod catalog;
 pub mod chat;
 pub mod context;
 pub mod cost_diff;
