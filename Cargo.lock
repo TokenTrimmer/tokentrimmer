@@ -5075,6 +5075,7 @@ dependencies = [
  "tt-routing",
  "tt-shared",
  "tt-telemetry",
+ "tt-tokenize",
  "uuid",
  "walkdir",
 ]

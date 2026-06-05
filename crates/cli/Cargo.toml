@@ -29,6 +29,7 @@ tt-inspect-rules-tier1.workspace = true
 tt-plan-core.workspace = true
 tt-preview.workspace = true
 tt-mcp.workspace = true
+tt-tokenize.workspace = true
 reqwest.workspace = true
 regex.workspace = true
 
