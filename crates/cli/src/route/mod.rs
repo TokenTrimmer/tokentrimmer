@@ -14,6 +14,7 @@ pub struct AddArgs {
     pub when_has_images: bool,
     pub when_has_audio: bool,
     pub when_tag: Option<String>,
+    pub when_prompt_contains: Vec<String>,
     pub disable_cache: bool,
     pub priority: u32,
     pub name: Option<String>,
@@ -46,6 +47,12 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     }
     if let Some(tag) = &args.when_tag {
         when.insert("tag_equals".into(), json!(tag));
+    }
+    if !args.when_prompt_contains.is_empty() {
+        when.insert(
+            "prompt_contains_any_of".into(),
+            json!(args.when_prompt_contains),
+        );
     }
     let mut then = serde_json::Map::new();
     then.insert("target_model".into(), json!(target));
@@ -182,6 +189,7 @@ mod tests {
             when_has_images: false,
             when_has_audio: false,
             when_tag: None,
+            when_prompt_contains: vec![],
             disable_cache: false,
             priority: 100,
             name: None,
@@ -204,6 +212,7 @@ mod tests {
             when_has_images: true,
             when_has_audio: false,
             when_tag: None,
+            when_prompt_contains: vec![],
             disable_cache: false,
             priority: 50,
             name: Some("vis".into()),
@@ -228,6 +237,7 @@ mod tests {
             when_has_images: false,
             when_has_audio: false,
             when_tag: None,
+            when_prompt_contains: vec![],
             disable_cache: false,
             priority: 100,
             name: None,
@@ -246,6 +256,7 @@ mod tests {
             when_has_images: false,
             when_has_audio: false,
             when_tag: Some("sensitive".into()),
+            when_prompt_contains: vec![],
             disable_cache: true,
             priority: 100,
             name: None,
@@ -266,6 +277,7 @@ mod tests {
             when_has_images: false,
             when_has_audio: false,
             when_tag: None,
+            when_prompt_contains: vec![],
             disable_cache: false,
             priority: 100,
             name: None,
@@ -275,5 +287,48 @@ mod tests {
         .unwrap();
         assert!(body["then"].get("disable_cache").is_none());
         assert!(body["when"].get("tag_equals").is_none());
+    }
+
+    #[test]
+    fn when_prompt_contains_maps_to_condition() {
+        let body = build_new_route(&AddArgs {
+            always: Some("ollama/llama3".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: None,
+            when_prompt_contains: vec!["confidential".into(), "salary".into()],
+            disable_cache: false,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        })
+        .unwrap();
+        assert_eq!(
+            body["when"]["prompt_contains_any_of"],
+            json!(["confidential", "salary"])
+        );
+    }
+
+    #[test]
+    fn when_prompt_contains_omitted_when_empty() {
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-4o".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: None,
+            when_prompt_contains: vec![],
+            disable_cache: false,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        })
+        .unwrap();
+        assert!(body["when"].get("prompt_contains_any_of").is_none());
     }
 }
