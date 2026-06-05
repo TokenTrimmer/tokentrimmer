@@ -80,18 +80,26 @@ impl LocalProvider {
     /// when appropriate. We do NOT silently raise the default here so that
     /// behavior stays predictable across providers.
     pub fn new(backend: LocalBackend, client_cfg: ClientConfig) -> Self {
+        Self::with_base_url(backend, backend.default_base_url(), client_cfg)
+    }
+
+    /// Like [`LocalProvider::new`] but with an explicit `base_url` (e.g. from
+    /// `TT_LOCAL_OLLAMA_URL`). Self-hosted gateways point this at their backend.
+    pub fn with_base_url(
+        backend: LocalBackend,
+        base_url: impl Into<String>,
+        client_cfg: ClientConfig,
+    ) -> Self {
         let cfg = CompatConfig {
             id: backend.id(),
-            default_base_url: backend.default_base_url().to_string(),
-            // Local backends serve whatever model the user has loaded. We do
-            // not enumerate a static catalogue — the registry resolves models
-            // by name at request time.
+            default_base_url: base_url.into(),
+            // Local backends serve whatever model the user has loaded — no
+            // static catalogue; the registry resolves models by name at request
+            // time. Pricing table empty (zero-cost fallback). allow_local lets
+            // localhost / private IPs through.
             models: Vec::new(),
-            // Pricing is generated on demand from `pricing()` below. The
-            // table is empty; the fallback returns zero for any model.
             pricing_table: HashMap::new(),
             fee_multiplier: 1.0,
-            // Local providers target localhost — allow http and private IPs.
             allow_local: true,
         };
         Self {
@@ -113,6 +121,16 @@ impl LocalProvider {
             timeout: Duration::from_secs(300),
             ..ClientConfig::default()
         }
+    }
+}
+
+/// Remove a leading `"<backend.id()>/"` from `model`; otherwise return it
+/// unchanged. Local backends serve bare model names — the gateway routes to
+/// `ollama/llama3` but Ollama expects `llama3`.
+pub(crate) fn strip_backend_prefix(backend: LocalBackend, model: &str) -> String {
+    match model.strip_prefix(backend.id()).and_then(|r| r.strip_prefix('/')) {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => model.to_string(),
     }
 }
 
@@ -142,17 +160,19 @@ impl Provider for LocalProvider {
 
     async fn chat_completion(
         &self,
-        req: ChatCompletionRequest,
+        mut req: ChatCompletionRequest,
         ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
+        req.model = strip_backend_prefix(self.backend, &req.model);
         self.inner.chat_completion(req, ctx).await
     }
 
     async fn chat_completion_stream(
         &self,
-        req: ChatCompletionRequest,
+        mut req: ChatCompletionRequest,
         ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        req.model = strip_backend_prefix(self.backend, &req.model);
         self.inner.chat_completion_stream(req, ctx).await
     }
 
@@ -220,5 +240,33 @@ mod tests {
     fn suggested_client_config_has_long_timeout() {
         let cfg = LocalProvider::suggested_client_config();
         assert!(cfg.timeout.as_secs() >= 60);
+    }
+
+    #[test]
+    fn strips_backend_prefix() {
+        assert_eq!(
+            strip_backend_prefix(LocalBackend::Ollama, "ollama/llama3.1:8b"),
+            "llama3.1:8b"
+        );
+        // Bare model name (no prefix) is forwarded unchanged.
+        assert_eq!(
+            strip_backend_prefix(LocalBackend::Ollama, "llama3.1:8b"),
+            "llama3.1:8b"
+        );
+        // A different backend's prefix is NOT stripped by this backend.
+        assert_eq!(
+            strip_backend_prefix(LocalBackend::Vllm, "ollama/llama3"),
+            "ollama/llama3"
+        );
+    }
+
+    #[test]
+    fn with_base_url_overrides_default() {
+        let p = LocalProvider::with_base_url(
+            LocalBackend::Ollama,
+            "http://gpu-box:11434/v1",
+            ClientConfig::default(),
+        );
+        assert_eq!(p.id(), "ollama");
     }
 }
