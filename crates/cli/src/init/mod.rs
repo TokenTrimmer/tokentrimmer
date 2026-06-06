@@ -1,11 +1,14 @@
 //! `tt init` — install the TokenTrimmer best-practices harness into a repo.
 
+pub mod ai;
 pub mod baseline;
 pub mod detect;
 pub mod manifest;
 pub mod merge;
 pub mod prompts;
 pub mod templates;
+
+pub use ai::ai_tailor;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
