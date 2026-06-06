@@ -1320,24 +1320,6 @@ fn synthetic_baseline_from_usage(usage: &Usage) -> f64 {
     input + output
 }
 
-/// Extract the trailing user message's text content for embedding. Returns
-/// `None` if the request has no user messages or the last user message is
-/// multimodal-only (no text parts).
-fn last_user_message_text(req: &ChatCompletionRequest) -> Option<&str> {
-    for msg in req.messages.iter().rev() {
-        if let Message::User { content, .. } = msg {
-            return match content {
-                MessageContent::Text(s) => Some(s.as_str()),
-                MessageContent::Parts(parts) => parts.iter().find_map(|p| match p {
-                    tt_shared::ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                }),
-            };
-        }
-    }
-    None
-}
-
 /// Build the response for an L2 cache hit. Re-deserializes the cached body
 /// and stamps the standard X-TokenTrimmer-* headers, with `Cache: hit-l2`.
 fn build_hit_l2_response(
@@ -1792,17 +1774,22 @@ pub(crate) async fn apply_routing(
         }
     };
 
-    // Input-tokens estimate for the route conditions. The engine deliberately
-    // leaves tokenization to callers; we delegate to the shared `tt-tokenize`
-    // estimator so routing decisions use the SAME count `/v1/preview` reports
-    // (tiktoken for openai/anthropic, chars/4 elsewhere) instead of a separate
-    // heuristic. Tokenizer choice is keyed on the originally-requested model's
+    // Input-tokens estimate for the route conditions. Counts the ENTIRE prompt
+    // (system + every turn) via the shared `message_text_for_estimation` helper —
+    // the SAME text live dispatch and the capability guard below tokenize, so a
+    // route decision mirrors what actually gets dispatched (and billed). (`/v1/
+    // preview` reports a near-identical count, but inserts per-message/part newline
+    // separators, so it can differ by ~1 char per message near a token boundary.)
+    // Counting only the last user message undercounts multi-turn / large-system-
+    // prompt requests, under-firing cost conditions and the route `max_cost_usd`
+    // ceiling. Tokenizer choice is keyed on the originally-requested model's
     // provider (resolved before any rewrite).
     let req_provider = state.registry.resolve(&req.model);
     let provider_id = req_provider.as_ref().map(|p| p.id()).unwrap_or("");
-    let input_tokens = last_user_message_text(req)
-        .map(|s| tt_tokenize::estimate_tokens(provider_id, s))
-        .unwrap_or(0);
+    let input_tokens = {
+        let combined = tt_shared::message_text_for_estimation(req);
+        tt_tokenize::estimate_tokens(provider_id, &combined)
+    };
 
     // Estimated request cost (USD) on the originally-requested model, for
     // cost-based route conditions. Output tokens are unknown pre-flight: use
@@ -1824,10 +1811,7 @@ pub(crate) async fn apply_routing(
     // is unknown (not in the catalog) we are permissive — only skip when
     // we positively know a capability is missing.
     let required_caps = tt_shared::RequiredCapabilities::from_request(req);
-    let estimated_tokens = {
-        let combined = tt_shared::message_text_for_estimation(req);
-        tt_tokenize::estimate_tokens(provider_id, &combined) as u64
-    };
+    let estimated_tokens = u64::from(input_tokens);
     if let Some(info) = state.registry.model_info(&m.then.target_model) {
         if !required_caps.satisfied_by(info, estimated_tokens) {
             let reasons = required_caps.skip_reasons(info, estimated_tokens);
