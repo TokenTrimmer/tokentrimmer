@@ -282,6 +282,7 @@ impl Client {
             max_tokens: None,
             temperature: None,
             tag: None,
+            cost_limit: None,
             tools: Vec::new(),
             tool_choice: None,
             max_tool_rounds: 8,
@@ -297,6 +298,7 @@ pub struct ChatBuilder<'a> {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     tag: Option<String>,
+    cost_limit: Option<f64>,
     tools: Vec<Tool>,
     tool_choice: Option<ToolChoice>,
     max_tool_rounds: usize,
@@ -332,6 +334,13 @@ impl ChatBuilder<'_> {
     #[must_use]
     pub fn tag(mut self, tag: impl Into<String>) -> Self {
         self.tag = Some(tag.into());
+        self
+    }
+    /// `X-TokenTrimmer-Cost-Limit-Usd` — the gateway rejects the request with
+    /// `402` if its estimated cost exceeds `usd`.
+    #[must_use]
+    pub fn cost_limit(mut self, usd: f64) -> Self {
+        self.cost_limit = Some(usd);
         self
     }
 
@@ -382,6 +391,9 @@ impl ChatBuilder<'_> {
         if let Some(tag) = &self.tag {
             req = req.header("X-TokenTrimmer-Tag", tag);
         }
+        if let Some(limit) = self.cost_limit {
+            req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
+        }
         let resp = req.send().await.map_err(Error::Request)?;
         let cost = parse_cost(resp.headers());
         let status = resp.status();
@@ -424,6 +436,9 @@ impl ChatBuilder<'_> {
             .json(&body);
         if let Some(tag) = &self.tag {
             req = req.header("X-TokenTrimmer-Tag", tag);
+        }
+        if let Some(limit) = self.cost_limit {
+            req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
         }
         let resp = req.send().await.map_err(Error::Request)?;
         let header_cost = parse_cost(resp.headers());
@@ -823,6 +838,80 @@ mod tests {
         assert_eq!(out.tool_calls().len(), 1);
         assert_eq!(out.tool_calls()[0].function.name, "get_weather");
         assert!(out.text().is_none()); // content was null
+    }
+
+    #[tokio::test]
+    async fn send_sends_cost_limit_header() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("x-tokentrimmer-cost-limit-usd", "0.05");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(sample_response());
+        });
+        let client = Client::new(server.base_url(), "k");
+        let out = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .cost_limit(0.05)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(out.response.model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn cost_limit_402_surfaces_as_status() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(402).body("cost limit exceeded");
+        });
+        let client = Client::new(server.base_url(), "k");
+        let result = client
+            .chat()
+            .model("m")
+            .message(user("hi"))
+            .cost_limit(0.0001)
+            .send()
+            .await;
+        assert!(matches!(result, Err(Error::Status { status: 402, .. })));
+    }
+
+    #[tokio::test]
+    async fn stream_sends_cost_limit_header() {
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("x-tokentrimmer-cost-limit-usd", "0.05");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse);
+        });
+        let client = Client::new(server.base_url(), "k");
+        let mut stream = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .cost_limit(0.05)
+            .stream()
+            .await
+            .unwrap();
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await.unwrap() {
+            if let StreamEvent::Delta(t) = ev {
+                text.push_str(&t);
+            }
+        }
+        assert_eq!(text, "Hi");
     }
 
     #[tokio::test]
