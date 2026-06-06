@@ -10,14 +10,18 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
 
 use tower::util::ServiceExt;
-use tt_auth::credentials::InMemoryProviderCredentialStore;
+use tt_auth::credentials::{InMemoryProviderCredentialStore, ProviderCredentialStore};
 use tt_auth::{
     keys::{issue, Environment},
     InMemoryKeyStore, KeyStore,
 };
 use tt_core::{build_router, AppState, ProviderRegistry};
+use tt_routing::{
+    CachingRoutingStore, InMemoryRoutingStore, Route, RouteAction, RouteConditions, RoutingStore,
+};
 use tt_shared::{
-    messages::{Choice, Message, MessageContent},
+    context::{ProviderCredentials, SecretString},
+    messages::{Choice, EmbeddingData, Message, MessageContent},
     pricing::Capability,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
@@ -25,11 +29,12 @@ use tt_shared::{
 use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
 use uuid::Uuid;
 
-/// A provider that records its call count. `owns_model` controls whether it
-/// claims `gpt-4o` in `models()` (and thus the `by_model` registry entry).
+/// A provider that records its call count. `model` is the id it claims in
+/// `models()` (and thus the `by_model` registry entry); `None` makes it
+/// reachable only by id (the pin path).
 struct FakeProvider {
     id: &'static str,
-    owns_model: bool,
+    model: Option<&'static str>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -39,11 +44,11 @@ impl Provider for FakeProvider {
         self.id
     }
     fn models(&self) -> Vec<ModelInfo> {
-        if !self.owns_model {
+        let Some(model) = self.model else {
             return vec![];
-        }
+        };
         vec![ModelInfo {
-            id: "gpt-4o".into(),
+            id: model.into(),
             provider: self.id.into(),
             capabilities: vec![Capability::Text],
             max_input_tokens: 4096,
@@ -97,10 +102,26 @@ impl Provider for FakeProvider {
     }
     async fn embeddings(
         &self,
-        _r: EmbeddingsRequest,
+        req: EmbeddingsRequest,
         _c: &RequestContext,
     ) -> Result<EmbeddingsResponse, ProviderError> {
-        Err(ProviderError::Unsupported("no".into()))
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(EmbeddingsResponse {
+            object: "list".into(),
+            data: vec![EmbeddingData {
+                object: "embedding".into(),
+                index: 0,
+                embedding: vec![0.0, 0.1, 0.2],
+            }],
+            model: req.model,
+            usage: Usage {
+                prompt_tokens: 3,
+                completion_tokens: 0,
+                total_tokens: 3,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+            },
+        })
     }
 }
 
@@ -128,12 +149,12 @@ async fn harness(with_cred_store: bool) -> Harness {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(FakeProvider {
         id: "alpha",
-        owns_model: true,
+        model: Some("gpt-4o"),
         calls: Arc::clone(&alpha_calls),
     }));
     registry.register(Arc::new(FakeProvider {
         id: "beta",
-        owns_model: false,
+        model: None,
         calls: Arc::clone(&beta_calls),
     }));
 
@@ -241,4 +262,148 @@ async fn cross_provider_pin_without_credential_fails_closed() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(h.beta_calls.load(Ordering::Relaxed), 0, "must not dispatch");
+}
+
+fn embeddings_request(provider_header: Option<&str>, key: &str) -> Request<Body> {
+    let body = json!({ "model": "gpt-4o", "input": "hello" });
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {key}"));
+    if let Some(p) = provider_header {
+        b = b.header("x-tokentrimmer-provider", p);
+    }
+    b.body(Body::from(body.to_string())).unwrap()
+}
+
+#[tokio::test]
+async fn embeddings_pin_overrides_serving_provider() {
+    let h = harness(false).await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(embeddings_request(Some("beta"), &h.key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-tokentrimmer-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("beta")
+    );
+    assert_eq!(h.beta_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(h.alpha_calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn embeddings_cross_provider_pin_without_credential_fails_closed() {
+    let h = harness(true).await; // empty credential store
+    let resp = h
+        .app
+        .clone()
+        .oneshot(embeddings_request(Some("beta"), &h.key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(h.beta_calls.load(Ordering::Relaxed), 0, "must not dispatch");
+}
+
+/// Regression for the cross-provider credential leak: a route that crosses
+/// providers AND declares fallbacks defers per-candidate credential resolution,
+/// leaving `ctx.credentials` holding the SOURCE key. Pinning the already-routed
+/// target must still re-resolve the target's credential and fail closed — never
+/// forward the source key. (Pre-fix, the `pinned == current` short-circuit left
+/// the stale source key and dispatched it to the target.)
+#[tokio::test]
+async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential() {
+    let alpha_calls = Arc::new(AtomicUsize::new(0));
+    let beta_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(FakeProvider {
+        id: "alpha",
+        model: Some("gpt-4o"),
+        calls: Arc::clone(&alpha_calls),
+    }));
+    registry.register(Arc::new(FakeProvider {
+        id: "beta",
+        model: Some("gpt-4o-mini"),
+        calls: Arc::clone(&beta_calls),
+    }));
+
+    let raw = InMemoryKeyStore::new();
+    let org = Uuid::now_v7();
+    let key = issue_key(&raw, org).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw);
+
+    // Credential store has ONLY the source provider's key (alpha), not beta's.
+    let cred_store = InMemoryProviderCredentialStore::new();
+    cred_store
+        .put(
+            org,
+            "alpha",
+            "k",
+            ProviderCredentials {
+                api_key: SecretString::new("alpha-secret".to_string()),
+                base_url: None,
+                extra_headers: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+    // Route: tag=sensitive → gpt-4o-mini (beta), WITH a fallback chain (non-empty
+    // fallbacks trigger the deferred per-candidate credential path).
+    let backing = Arc::new(InMemoryRoutingStore::new());
+    backing.set_routes(
+        org,
+        vec![Route {
+            id: Uuid::now_v7(),
+            name: "cross".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                tag_equals: Some("sensitive".into()),
+                ..Default::default()
+            },
+            then: RouteAction {
+                target_model: "gpt-4o-mini".into(),
+                fallbacks: vec!["gpt-4o".into()],
+                force_cache_layer: None,
+                disable_cache: false,
+                max_cost_usd: None,
+            },
+        }],
+    );
+    let routing = Arc::new(CachingRoutingStore::new(backing as Arc<dyn RoutingStore>));
+
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_credential_store(Arc::new(cred_store))
+            .with_routing_store(routing),
+    );
+
+    // model gpt-4o (source=alpha), tag=sensitive (routes to beta), pin=beta.
+    let body =
+        json!({ "model": "gpt-4o", "messages": [{"role":"user","content":"hi"}], "stream": false });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {key}"))
+        .header("x-tokentrimmer-tag", "sensitive")
+        .header("x-tokentrimmer-provider", "beta")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    // beta has no stored credential → must fail closed, never dispatch with alpha's key.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        beta_calls.load(Ordering::Relaxed),
+        0,
+        "beta must not be dispatched with the source provider's credential"
+    );
 }

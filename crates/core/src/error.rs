@@ -109,7 +109,7 @@ impl IntoResponse for ApiError {
                 "invalid_request_error",
                 "missing_provider_credential",
                 format!(
-                    "No upstream credential configured for provider '{provider}', required by a matched route. Add it before routing to this provider."
+                    "No upstream credential configured for provider '{provider}'. Add it before routing or pinning requests to this provider."
                 ),
             ),
             ApiError::CostLimitExceeded {

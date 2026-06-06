@@ -92,7 +92,14 @@ pub(crate) fn provider_override_from_header(headers: &HeaderMap) -> Option<Strin
 /// when it differs from `current`, the credentials to use. The pin overrides the
 /// routed/inferred provider (the routed model is kept). Cross-provider pins
 /// re-resolve the target's stored credentials and fail closed (never forward the
-/// source key); pinning back to the source restores source credentials.
+/// source key); a pin to the source provider restores source credentials.
+///
+/// When a pin is present this ALWAYS returns `Some(credentials)` for the pinned
+/// provider — even when it equals `current` — because routing may have left
+/// `ctx.credentials` holding the SOURCE provider's key (the cross-provider
+/// re-resolve in the routing block is deferred to per-candidate failover when a
+/// route declares fallbacks). Returning `None` there would forward the source
+/// key to the pinned target. The caller must apply the returned credentials.
 ///
 /// # Errors
 /// - [`ApiError::InvalidRequest`] if `pinned_id` is not a known provider id.
@@ -116,14 +123,13 @@ pub(crate) async fn apply_provider_override(
         .registry
         .by_id(pinned_id)
         .ok_or_else(|| ApiError::InvalidRequest(format!("unknown provider: {pinned_id}")))?;
-    if pinned.id() == current.id() {
-        return Ok((current, None));
-    }
+    // Always (re)resolve credentials for the pinned provider so they can never be
+    // out of sync with the dispatched provider (see the note above). Cross-provider
+    // pins require the target's stored credential and fail closed; a pin to the
+    // source provider resolves source credentials (bearer fallback OK).
     let creds = if pinned.id() == source_provider_id {
-        // Pin back to the source provider — source credentials (bearer fallback OK).
         resolve_credentials(state, org_id, source_provider_id, raw_bearer).await
     } else {
-        // Cross-provider pin — require the target's stored credential, fail closed.
         resolve_credentials_for(state, org_id, pinned.id(), raw_bearer, false)
             .await
             .ok_or_else(|| ApiError::MissingProviderCredential {
