@@ -68,6 +68,7 @@ pub async fn stream_chat_completion(
     // Translate to the Gemini wire shape.
     let body = translate::translate_request(req)?;
 
+    translate::validate_model_id(&model)?;
     let url = format!("{base_url}/v1beta/models/{model}:streamGenerateContent?alt=sse");
 
     let body_bytes = serde_json::to_vec(&body)
