@@ -97,6 +97,24 @@ pub(crate) fn route_override_from_header(headers: &HeaderMap) -> Option<String> 
         .filter(|s| !s.is_empty())
 }
 
+/// `X-TokenTrimmer-Fallback` — comma-separated override of the route's fallback
+/// chain (bare model ids). Absent/blank → None (keep the route chain).
+pub(crate) fn fallback_override_from_header(headers: &HeaderMap) -> Option<Vec<String>> {
+    let raw = headers
+        .get("x-tokentrimmer-fallback")
+        .and_then(|v| v.to_str().ok())?;
+    let chain: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if chain.is_empty() {
+        None
+    } else {
+        Some(chain)
+    }
+}
+
 /// Apply an `X-TokenTrimmer-Provider` pin. Returns the provider to dispatch and,
 /// when it differs from `current`, the credentials to use. The pin overrides the
 /// routed/inferred provider (the routed model is kept). Cross-provider pins
@@ -625,8 +643,14 @@ pub async fn handler(
         ctx.credentials = c;
     }
     if provider_pin.is_some() {
-        // An explicit provider pin must not fail over to a different provider.
+        // An explicit provider pin must not fail over to a different provider, and
+        // it suppresses the `X-TokenTrimmer-Fallback` override too: the failover
+        // path re-resolves the primary candidate by model id and so cannot honor a
+        // pinned primary provider. The pin wins (single-provider dispatch).
         route_fallbacks.clear();
+    } else if let Some(chain) = fallback_override_from_header(&headers) {
+        // `X-TokenTrimmer-Fallback` overrides the route-derived chain (no pin).
+        route_fallbacks = chain;
     }
 
     // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header.
@@ -2114,6 +2138,20 @@ mod cache_header_tests {
 mod provider_override_tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn fallback_override_header_parsing() {
+        let mut h = HeaderMap::new();
+        assert_eq!(fallback_override_from_header(&h), None);
+        h.insert("x-tokentrimmer-fallback", "a, b ,c".parse().unwrap());
+        assert_eq!(
+            fallback_override_from_header(&h),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        let mut blank = HeaderMap::new();
+        blank.insert("x-tokentrimmer-fallback", " , ".parse().unwrap());
+        assert_eq!(fallback_override_from_header(&blank), None);
+    }
 
     #[test]
     fn route_override_header_parsing() {
