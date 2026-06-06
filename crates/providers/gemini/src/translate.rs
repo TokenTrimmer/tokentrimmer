@@ -533,13 +533,23 @@ fn translate_user_content(content: MessageContent) -> Result<Vec<GeminiPart>, Pr
                         gemini_parts.push(GeminiPart::Text(text));
                     }
                     ContentPart::ImageUrl { image_url } => {
-                        // For v1: support URL only via fileData.
-                        // Base64 data URIs are a follow-up.
-                        let mime_type = guess_mime_from_url(&image_url.url);
-                        gemini_parts.push(GeminiPart::FileData(GeminiFileData {
-                            mime_type,
-                            file_uri: image_url.url,
-                        }));
+                        // A base64 `data:` URI is sent as inlineData; a remote
+                        // URL is sent as fileData.
+                        match tt_shared::messages::parse_data_url(&image_url.url) {
+                            Some((mime_type, data)) => {
+                                gemini_parts.push(GeminiPart::InlineData(GeminiInlineData {
+                                    mime_type,
+                                    data,
+                                }));
+                            }
+                            None => {
+                                let mime_type = guess_mime_from_url(&image_url.url);
+                                gemini_parts.push(GeminiPart::FileData(GeminiFileData {
+                                    mime_type,
+                                    file_uri: image_url.url,
+                                }));
+                            }
+                        }
                     }
                     ContentPart::InputAudio { .. } => {
                         return Err(ProviderError::Unsupported(

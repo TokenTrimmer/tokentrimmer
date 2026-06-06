@@ -339,6 +339,27 @@ pub struct EmbeddingData {
     pub embedding: Vec<f32>,
 }
 
+/// Parse a base64 `data:` URL into `(media_type, base64_payload)`.
+///
+/// Returns `None` for non-`data:` URLs, non-base64 data URLs, or a malformed/
+/// empty media type. Provider adapters use this to forward inline image bytes
+/// as the provider's native base64 image part instead of mistakenly sending the
+/// whole `data:` URI as a *remote* URL reference (which the upstream rejects).
+#[must_use]
+pub fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    // Only base64 payloads are supported (the canonical image transport).
+    let media_with_params = meta.strip_suffix(";base64")?;
+    // Drop any RFC-2397 media-type parameters (e.g. `;charset=utf-8`) — providers
+    // expect a bare MIME type like `image/png` in the base64 image part.
+    let media_type = media_with_params.split(';').next().unwrap_or("");
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type.to_string(), data.to_string()))
+}
+
 #[cfg(test)]
 mod embeddings_default_tests {
     use super::*;
@@ -351,5 +372,23 @@ mod embeddings_default_tests {
         assert!(!r.stream);
         assert!(r.tools.is_empty());
         assert!(r.max_tokens.is_none());
+    }
+
+    #[test]
+    fn parse_data_url_extracts_media_type_and_payload() {
+        assert_eq!(
+            parse_data_url("data:image/png;base64,iVBORw0KGgo="),
+            Some(("image/png".to_string(), "iVBORw0KGgo=".to_string()))
+        );
+        // Non-data URLs and non-base64 / malformed data URLs return None.
+        assert_eq!(parse_data_url("https://example.com/cat.png"), None);
+        assert_eq!(parse_data_url("data:image/png,notbase64"), None);
+        assert_eq!(parse_data_url("data:;base64,abc"), None);
+        assert_eq!(parse_data_url("data:image/png;base64,"), None);
+        // Media-type parameters are stripped to a bare MIME type.
+        assert_eq!(
+            parse_data_url("data:image/png;charset=utf-8;base64,iVBORw0KGgo="),
+            Some(("image/png".to_string(), "iVBORw0KGgo=".to_string()))
+        );
     }
 }

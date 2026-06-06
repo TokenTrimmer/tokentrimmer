@@ -40,6 +40,48 @@ fn make_request(model: &str, messages: Vec<Message>) -> ChatCompletionRequest {
 }
 
 #[test]
+fn data_url_image_becomes_inline_data_not_file_data() {
+    let req = make_request(
+        "gemini-3.1-pro",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(s.contains(r#""inlineData""#), "expected inlineData: {s}");
+    assert!(s.contains(r#""mimeType":"image/png""#), "{s}");
+    assert!(s.contains(r#""data":"iVBORw0KGgo=""#), "{s}");
+    assert!(!s.contains(r#""fileData""#), "must not be fileData: {s}");
+}
+
+#[test]
+fn remote_url_image_stays_file_data() {
+    let req = make_request(
+        "gemini-3.1-pro",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/cat.png".into(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(s.contains(r#""fileData""#), "expected fileData: {s}");
+    assert!(s.contains("https://example.com/cat.png"), "{s}");
+}
+
+#[test]
 fn validate_model_id_accepts_real_ids_rejects_injection() {
     use tt_provider_gemini::translate::validate_model_id;
     // Real Gemini ids pass.

@@ -93,14 +93,15 @@ pub enum AnthropicContentBlock {
     },
 }
 
-/// Image source descriptor for Anthropic.
+/// Image source descriptor for Anthropic: a remote `url` or inline `base64`
+/// bytes (serialized as `{"type":"url",...}` / `{"type":"base64",...}`).
 #[derive(Debug, Serialize)]
-pub struct AnthropicImageSource {
-    /// `"url"` for remote images (base64 is a future extension).
-    #[serde(rename = "type")]
-    pub source_type: String,
-    /// The URL of the image.
-    pub url: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicImageSource {
+    /// Remote image URL.
+    Url { url: String },
+    /// Inline base64-encoded image bytes.
+    Base64 { media_type: String, data: String },
 }
 
 /// A system block in the `system` array.
@@ -376,12 +377,15 @@ fn translate_content_blocks(
                         blocks.push(AnthropicContentBlock::Text { text });
                     }
                     ContentPart::ImageUrl { image_url } => {
-                        blocks.push(AnthropicContentBlock::Image {
-                            source: AnthropicImageSource {
-                                source_type: "url".to_string(),
-                                url: image_url.url,
-                            },
-                        });
+                        // A base64 `data:` URI must be sent as an inline base64
+                        // source, not as a remote URL (Anthropic rejects that).
+                        let source = match tt_shared::messages::parse_data_url(&image_url.url) {
+                            Some((media_type, data)) => {
+                                AnthropicImageSource::Base64 { media_type, data }
+                            }
+                            None => AnthropicImageSource::Url { url: image_url.url },
+                        };
+                        blocks.push(AnthropicContentBlock::Image { source });
                     }
                     ContentPart::InputAudio { .. } => {
                         return Err(ProviderError::Unsupported(
