@@ -329,7 +329,10 @@ mod tests {
         let eng = RoutingEngine::with_routes(vec![enabled, disabled]);
         assert!(eng.find_by_name("alpha").is_some());
         assert_eq!(eng.find_by_name("alpha").unwrap().name, "alpha");
-        assert!(eng.find_by_name("beta").is_none(), "disabled route not found");
+        assert!(
+            eng.find_by_name("beta").is_none(),
+            "disabled route not found"
+        );
         assert!(eng.find_by_name("missing").is_none());
     }
 

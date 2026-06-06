@@ -1091,9 +1091,9 @@ pub async fn handler(
                                                 ),
                                             );
                                             return Ok(with_route_matched(
-                                build_hit_l1_response(entry, trace_id),
-                                route_matched_name.as_deref(),
-                            ));
+                                                build_hit_l1_response(entry, trace_id),
+                                                route_matched_name.as_deref(),
+                                            ));
                                         }
                                         Err(e) => {
                                             tracing::warn!(
@@ -1706,8 +1706,7 @@ pub(crate) fn compute_cost(
 fn with_route_matched(mut resp: Response, name: Option<&str>) -> Response {
     if let Some(name) = name {
         if let Ok(v) = name.parse() {
-            resp.headers_mut()
-                .insert("x-tokentrimmer-route-matched", v);
+            resp.headers_mut().insert("x-tokentrimmer-route-matched", v);
         }
     }
     resp
@@ -2085,7 +2084,10 @@ mod provider_override_tests {
         let mut h = HeaderMap::new();
         assert_eq!(route_override_from_header(&h), None);
         // case-preserved (route names are case-sensitive labels), trimmed.
-        h.insert("x-tokentrimmer-route", "  Cheap-For-Short ".parse().unwrap());
+        h.insert(
+            "x-tokentrimmer-route",
+            "  Cheap-For-Short ".parse().unwrap(),
+        );
         assert_eq!(
             route_override_from_header(&h).as_deref(),
             Some("Cheap-For-Short")
