@@ -1,9 +1,13 @@
 //! Per-model token estimation.
 //!
-//! The actual counting now lives in the shared [`tt_tokenize`] crate so
-//! `/v1/preview`, live dispatch, and routing all agree on the estimate. This
-//! module just adapts preview's [`Message`] shape into text and maps the
-//! shared confidence onto preview's public [`EstimationConfidence`].
+//! The actual counting lives in the shared [`tt_tokenize`] crate, so `/v1/preview`,
+//! live dispatch, and routing all use the same tokenizer. The text they feed it is
+//! nearly identical, but this module's `concat_message_text` inserts a newline
+//! after every message and every text part, so preview's count can differ by ~1
+//! char per message from the dispatch/routing estimate
+//! (`tt_shared::message_text_for_estimation`, which uses no separators). This
+//! module adapts preview's [`Message`] shape into text and maps the shared
+//! confidence onto preview's public [`EstimationConfidence`].
 
 use crate::types::{EstimationConfidence, Message};
 

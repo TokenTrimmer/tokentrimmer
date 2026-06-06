@@ -1776,11 +1776,14 @@ pub(crate) async fn apply_routing(
 
     // Input-tokens estimate for the route conditions. Counts the ENTIRE prompt
     // (system + every turn) via the shared `message_text_for_estimation` helper —
-    // the SAME text `/v1/preview`, live dispatch, and the capability guard below
-    // all tokenize. Counting only the last user message undercounts multi-turn /
-    // large-system-prompt requests, under-firing cost conditions and the route
-    // `max_cost_usd` ceiling. Tokenizer choice is keyed on the originally-requested
-    // model's provider (resolved before any rewrite).
+    // the SAME text live dispatch and the capability guard below tokenize, so a
+    // route decision mirrors what actually gets dispatched (and billed). (`/v1/
+    // preview` reports a near-identical count, but inserts per-message/part newline
+    // separators, so it can differ by ~1 char per message near a token boundary.)
+    // Counting only the last user message undercounts multi-turn / large-system-
+    // prompt requests, under-firing cost conditions and the route `max_cost_usd`
+    // ceiling. Tokenizer choice is keyed on the originally-requested model's
+    // provider (resolved before any rewrite).
     let req_provider = state.registry.resolve(&req.model);
     let provider_id = req_provider.as_ref().map(|p| p.id()).unwrap_or("");
     let input_tokens = {
