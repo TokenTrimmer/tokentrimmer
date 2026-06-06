@@ -130,7 +130,9 @@ mod tests {
     async fn embed_without_model_errors_before_any_request() {
         // dead base — no network is touched because the model is empty.
         let client = Client::new("http://127.0.0.1:1", "k");
-        let result = client.embed("  ", EmbeddingInput::Single("hi".into())).await;
+        let result = client
+            .embed("  ", EmbeddingInput::Single("hi".into()))
+            .await;
         assert!(matches!(result, Err(Error::MissingModel)));
     }
 }

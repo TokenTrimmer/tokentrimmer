@@ -43,12 +43,13 @@ pub async fn handler(
     Json(mut req): Json<EmbeddingsRequest>,
 ) -> ApiResult<Response> {
     // 1. Resolve provider (re-resolved after routing may rewrite the model).
-    let mut provider = state
-        .registry
-        .resolve(&req.model)
-        .ok_or_else(|| ApiError::ModelNotFound {
-            model: req.model.clone(),
-        })?;
+    let mut provider =
+        state
+            .registry
+            .resolve(&req.model)
+            .ok_or_else(|| ApiError::ModelNotFound {
+                model: req.model.clone(),
+            })?;
 
     // 2. Bearer + trace id.
     let raw_bearer = headers
