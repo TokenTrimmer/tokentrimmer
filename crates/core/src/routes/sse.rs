@@ -73,6 +73,11 @@ pub(crate) struct UsageTrackingStream {
     /// The `finish_reason` string from the terminal chunk (e.g. `"stop"`).
     /// Used to reconstruct a `ChatCompletionResponse` for cache insertion.
     pub(crate) finish_reason: Option<String>,
+    /// True once any chunk delta carried tool calls. Tool-call responses are
+    /// non-deterministic and the streamed reconstruction can't faithfully rebuild
+    /// them, so such responses are never cached (parity with the non-streaming
+    /// `response_has_tool_calls` exclusion).
+    saw_tool_calls: bool,
 }
 
 impl UsageTrackingStream {
@@ -91,6 +96,7 @@ impl UsageTrackingStream {
             authoritative: None,
             finished: false,
             finish_reason: None,
+            saw_tool_calls: false,
         }
     }
 
@@ -99,6 +105,11 @@ impl UsageTrackingStream {
     /// (i.e. stream was truncated / no terminal usage chunk), ensuring only cleanly
     /// completed streams with known token counts are cached.
     pub(crate) fn cache_completion_data(&self) -> Option<(String, String, Usage)> {
+        // Never cache tool-call responses (non-deterministic; the streamed
+        // reconstruction drops tool_calls). Mirrors the non-streaming exclusion.
+        if self.saw_tool_calls {
+            return None;
+        }
         let (prompt_tokens, completion_tokens, cached_tokens) = self.authoritative?;
         let finish_reason = self.finish_reason.clone().unwrap_or_else(|| "stop".into());
         let text = self.output_text.clone();
@@ -149,10 +160,14 @@ impl Stream for UsageTrackingStream {
                 }
             }
             // Accumulate output text from content deltas for fallback
-            // token estimation (§2.12).
+            // token estimation (§2.12). Also flag tool calls so the response is
+            // excluded from caching (it can't be faithfully reconstructed).
             for choice in &chunk.choices {
                 if let Some(ref content) = choice.delta.content {
                     self.output_text.push_str(content);
+                }
+                if !choice.delta.tool_calls.is_empty() {
+                    self.saw_tool_calls = true;
                 }
             }
             // Authoritative usage from terminal chunk overrides byte count.
@@ -936,6 +951,48 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.cached_tokens, 2);
         assert!(tracker.finished);
+    }
+
+    #[tokio::test]
+    async fn tool_call_stream_is_excluded_from_cache() {
+        use tt_shared::messages::{ToolCall, ToolCallFunction};
+        let chunks = vec![Ok(ChatCompletionChunk {
+            id: "x".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        r#type: "function".into(),
+                        function: ToolCallFunction {
+                            name: "f".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: Some(tt_shared::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+            }),
+        })];
+        let stream = futures::stream::iter(chunks).boxed();
+        let mut tracker = UsageTrackingStream::new(stream, 10, 0, "openai");
+        let _ = tracker.next().await;
+        // Authoritative usage arrived, but a tool call was seen → never cache.
+        assert!(
+            tracker.cache_completion_data().is_none(),
+            "tool-call streaming responses must be excluded from caching"
+        );
     }
 
     /// §2.12 — when no authoritative usage arrives (e.g. client abort),
