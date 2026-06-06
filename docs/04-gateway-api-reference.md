@@ -405,7 +405,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Tag` | Free-form tag for cost attribution | Honored | `feature=chat-support,user=u_123` |
 | `X-TokenTrimmer-Cost-Limit-Usd` | Reject (402) if estimated cost > limit | Honored | `0.05` |
 | `X-TokenTrimmer-Cache` | Override cache behavior for this request (overrides the request-body `tt_extras.cache`; a privacy route's `disable_cache` still wins). | Honored | `bypass` / `force-write` / `read-only` / `disabled` |
-| `X-TokenTrimmer-Route` | Force a specific named route | Planned (not yet honored) | `cheap-for-short` |
+| `X-TokenTrimmer-Route` | Force a specific named route, ignoring its conditions (unknown name → `400`; chat completions only). | Honored | `cheap-for-short` |
 | `X-TokenTrimmer-Provider` | Pin the upstream provider for this request (routing still sets the model). Requires that provider's stored credential for cross-provider pins (else `400`); disables route fallbacks. Unknown provider → `400`. | Honored | `anthropic` |
 | `X-TokenTrimmer-Fallback` | Comma-separated fallback chain override | Planned (not yet honored) | `openai/gpt-4o,anthropic/claude-3-5-sonnet` |
 | `X-TokenTrimmer-Timeout-Ms` | Per-request timeout override (max 600000) | Planned (not yet honored) | `30000` |
@@ -423,7 +423,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Cost-Usd` | on dispatched/cached responses | `0.0034` |
 | `X-TokenTrimmer-Baseline-Cost-Usd` | on dispatched/cached responses | `0.0218` |
 | `X-TokenTrimmer-Saved-Usd` | on dispatched/cached responses | `0.0184` |
-| `X-TokenTrimmer-Route-Matched` | Planned (not yet emitted) | `cheap-for-short` |
+| `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
 | `X-TokenTrimmer-Warnings` | Planned (not yet emitted) | `param_dropped:frequency_penalty,response_format_downgrade` |
 
 `X-TokenTrimmer-Trace-Id` and `X-TokenTrimmer-Latency-Ms` are present on every
