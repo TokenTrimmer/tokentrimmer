@@ -47,6 +47,50 @@ fn user_text(text: &str) -> Message {
 }
 
 #[test]
+fn data_url_image_becomes_base64_source_not_remote_url() {
+    let req = make_request(
+        "claude-sonnet-4-6",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(
+        s.contains(r#""type":"base64""#),
+        "expected base64 source: {s}"
+    );
+    assert!(s.contains(r#""media_type":"image/png""#), "{s}");
+    assert!(s.contains(r#""data":"iVBORw0KGgo=""#), "{s}");
+}
+
+#[test]
+fn remote_url_image_stays_url_source() {
+    let req = make_request(
+        "claude-sonnet-4-6",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/cat.png".into(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(s.contains(r#""type":"url""#), "expected url source: {s}");
+    assert!(s.contains("https://example.com/cat.png"), "{s}");
+}
+
+#[test]
 fn anthropic_does_not_support_response_schema() {
     use tt_provider_anthropic::{AnthropicProvider, ClientConfig};
     use tt_shared::Provider;
