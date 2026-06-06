@@ -465,6 +465,56 @@ mod tests {
         assert_eq!(envelope["error"]["code"], "model_not_found");
     }
 
+    fn chat_request_with(model: &str, max_tokens: u32, cost_limit: Option<&str>) -> Request<Body> {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "the quick brown fox" }],
+            "max_tokens": max_tokens,
+            "stream": false,
+        });
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(cl) = cost_limit {
+            b = b.header("x-tokentrimmer-cost-limit-usd", cl);
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cost_limit_header_rejects_over_limit() {
+        // mock pricing $1/M in, $2/M out; max_tokens 1000 → est ≈ $0.002 > 1e-9.
+        let response = app_with_mock()
+            .oneshot(chat_request_with("mock-model-1", 1000, Some("0.000000001")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], "cost_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn cost_limit_header_allows_under_limit() {
+        let response = app_with_mock()
+            .oneshot(chat_request_with("mock-model-1", 1000, Some("100")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cost_limit_header_absent_is_noop() {
+        let response = app_with_mock()
+            .oneshot(chat_request_with("mock-model-1", 1000, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn embeddings_dispatch_returns_200_with_headers() {
         let body = serde_json::json!({ "model": "mock-model-1", "input": "hello" });

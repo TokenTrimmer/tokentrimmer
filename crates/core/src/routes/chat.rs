@@ -68,6 +68,37 @@ pub(crate) fn estimate_cost_usd(
         / 1_000_000.0
 }
 
+/// Parse `X-TokenTrimmer-Cost-Limit-Usd` (a positive USD ceiling), if present
+/// and well-formed. Malformed / non-positive values are ignored (no limit).
+pub(crate) fn cost_limit_from_header(headers: &HeaderMap) -> Option<f64> {
+    headers
+        .get("x-tokentrimmer-cost-limit-usd")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+}
+
+/// Reject with 402 when the estimated request cost exceeds the header limit.
+/// Permissive when pricing is unknown (can't prove an exceedance) — same
+/// semantics as the route `max_cost_usd` ceiling.
+pub(crate) fn enforce_cost_limit(
+    limit: Option<f64>,
+    pricing: Option<&ModelPricing>,
+    input_tokens: u32,
+    max_tokens: Option<u32>,
+) -> ApiResult<()> {
+    if let (Some(limit), Some(pr)) = (limit, pricing) {
+        let est = estimate_cost_usd(pr, input_tokens, max_tokens);
+        if est > limit {
+            return Err(ApiError::CostLimitExceeded {
+                estimated_usd: est,
+                ceiling_usd: limit,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// TTL for negative-cache entries (deterministic 4xx errors).
 ///
 /// Short by design: a client error cached for too long would prevent legitimate
@@ -469,6 +500,20 @@ pub async fn handler(
                 }
             }
         }
+    }
+
+    // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header.
+    // Applies to every request (routed or not), priced on the final model.
+    {
+        let cl_input_tokens = last_user_message_text(&req)
+            .map(|s| tt_tokenize::estimate_tokens(provider.id(), s))
+            .unwrap_or(0);
+        enforce_cost_limit(
+            cost_limit_from_header(&headers),
+            provider.pricing(&req.model).as_ref(),
+            cl_input_tokens,
+            req.max_tokens,
+        )?;
     }
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
