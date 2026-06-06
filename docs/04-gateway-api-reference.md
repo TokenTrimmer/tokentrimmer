@@ -297,7 +297,7 @@ Or with schema:
 }
 ```
 
-_(Planned)_ If routed to a provider that doesn't support schema mode, Gateway will return `X-TokenTrimmer-Warnings: response_format_downgrade` and fall back to `json_object`. (Today, providers that reject `response_format` outright — e.g. Anthropic — drop it and emit `param_dropped:response_format`.)
+If routed to a provider that doesn't support schema mode, Gateway rewrites `response_format` to `json_object` (dropping the schema) before dispatch and emits `X-TokenTrimmer-Warnings: response_format_downgrade`. (Providers that reject `response_format` outright — e.g. Anthropic — instead drop it and emit `param_dropped:response_format`.)
 
 ---
 
@@ -437,8 +437,9 @@ the gateway altered the request before dispatch. Currently the gateway emits one
 the gateway drops during translation — e.g. Anthropic drops `n`, `seed`,
 `response_format`, `presence_penalty`, and `frequency_penalty`; Gemini drops `n`,
 `seed`, `presence_penalty`, `frequency_penalty`, and `user`; reasoning models
-(`o3`, `o4-mini`) drop `temperature`. The `response_format_downgrade` and
-`temperature_clamped` tokens are planned follow-ups.
+(`o3`, `o4-mini`) drop `temperature`. A `response_format_downgrade` token is
+emitted when a `json_schema` request is routed to a provider that supports only
+`json_object`. The `temperature_clamped` token is a planned follow-up.
 
 ### 6.3 Cache control semantics
 

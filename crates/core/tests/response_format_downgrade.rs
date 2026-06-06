@@ -184,6 +184,9 @@ async fn dropped_response_format_is_not_downgraded() {
         .get("x-tokentrimmer-warnings")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(warn.contains("param_dropped:response_format"), "got: {warn}");
+    assert!(
+        warn.contains("param_dropped:response_format"),
+        "got: {warn}"
+    );
     assert!(!warn.contains("response_format_downgrade"), "got: {warn}");
 }
