@@ -43,6 +43,10 @@ pub enum ApiError {
     #[error("rate limited (retry after {retry_after_ms} ms)")]
     RateLimited { retry_after_ms: u64 },
 
+    /// A caller-set per-request deadline (`X-TokenTrimmer-Timeout-Ms`) elapsed.
+    #[error("request timed out after {ms} ms")]
+    RequestTimeout { ms: u64 },
+
     #[error("upstream provider: {0}")]
     Provider(#[from] ProviderError),
 
@@ -128,6 +132,12 @@ impl IntoResponse for ApiError {
                 "rate_limit_error",
                 "rate_limit_exceeded",
                 self.to_string(),
+            ),
+            ApiError::RequestTimeout { ms } => (
+                StatusCode::REQUEST_TIMEOUT,
+                "timeout_error",
+                "request_timeout",
+                format!("Request exceeded the {ms} ms X-TokenTrimmer-Timeout-Ms deadline."),
             ),
             ApiError::Provider(err) => map_provider_error(err),
             ApiError::Internal(m) => (

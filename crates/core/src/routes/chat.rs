@@ -115,6 +115,18 @@ pub(crate) fn fallback_override_from_header(headers: &HeaderMap) -> Option<Vec<S
     }
 }
 
+/// `X-TokenTrimmer-Timeout-Ms` — per-request upstream timeout in ms (1..=600000).
+/// Invalid / non-positive / over-max → None (no per-request timeout; the global
+/// 600s limit still applies).
+pub(crate) fn timeout_ms_from_header(headers: &HeaderMap) -> Option<u64> {
+    const MAX_TIMEOUT_MS: u64 = 600_000;
+    headers
+        .get("x-tokentrimmer-timeout-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0 && *ms <= MAX_TIMEOUT_MS)
+}
+
 /// Apply an `X-TokenTrimmer-Provider` pin. Returns the provider to dispatch and,
 /// when it differs from `current`, the credentials to use. The pin overrides the
 /// routed/inferred provider (the routed model is kept). Cross-provider pins
@@ -264,6 +276,7 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         | ApiError::MissingProviderCredential { .. }
         | ApiError::CostLimitExceeded { .. }
         | ApiError::RateLimited { .. }
+        | ApiError::RequestTimeout { .. }
         | ApiError::Internal(_)
         | ApiError::NotFound(_)
         | ApiError::ServiceUnavailable(_) => false,
@@ -283,6 +296,7 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::MissingProviderCredential { .. } => StatusCode::BAD_REQUEST,
         ApiError::CostLimitExceeded { .. } => StatusCode::PAYMENT_REQUIRED,
         ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+        ApiError::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
         ApiError::Provider(pe) => match pe {
             ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProviderError::ProviderUpstream { status, .. } => {
@@ -503,6 +517,8 @@ pub async fn handler(
     let provider_pin = provider_override_from_header(&headers);
     // Forced route (X-TokenTrimmer-Route) — passed into apply_routing below.
     let forced_route = route_override_from_header(&headers);
+    // Per-request upstream deadline (X-TokenTrimmer-Timeout-Ms).
+    let request_timeout = timeout_ms_from_header(&headers).map(std::time::Duration::from_millis);
 
     // 2a. Sandbox short-circuit: `tt_test_*` keys return a deterministic
     //     synthetic response without contacting any real provider — for
@@ -556,7 +572,7 @@ pub async fn handler(
             .get("x-tokentrimmer-tag")
             .and_then(|v| v.to_str().ok())
             .map(String::from),
-        deadline: None,
+        deadline: request_timeout,
     };
 
     // 2c. Routing engine. Rewrite `req.model` if the org has a matching
@@ -818,34 +834,38 @@ pub async fn handler(
         // mid-stream error cannot move to another provider); otherwise retry
         // the single provider. `provider`/`served_model` are rebound to whoever
         // actually served so cost/telemetry attribute correctly.
-        let (provider, served_model, stream) = if route_fallbacks.is_empty() {
-            // Retry the initial stream establishment on transient errors (before
-            // any chunk is yielded); mid-stream errors are not retried.
-            let stream = with_retry(&RetryPolicy::default(), || {
-                provider.chat_completion_stream(req.clone(), &ctx)
-            })
-            .await?;
-            (provider, req.model.clone(), stream)
-        } else {
-            // Build the capability check for the streaming failover path.
-            let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
-            let cap_est_tokens = estimated_input_tokens.max(0) as u64;
-            crate::failover::dispatch_stream_with_failover(
-                &state.registry,
-                &state.breaker,
-                &RetryPolicy::default(),
-                &failover_candidates,
-                &req,
-                &ctx,
-                &failover_creds,
-                Utc::now(),
-                Some(crate::failover::CapCheck {
-                    required: &cap_required,
-                    estimated_tokens: cap_est_tokens,
-                }),
-            )
-            .await?
-        };
+        let (provider, served_model, stream) = with_request_timeout(request_timeout, async {
+            if route_fallbacks.is_empty() {
+                // Retry the initial stream establishment on transient errors (before
+                // any chunk is yielded); mid-stream errors are not retried.
+                let stream = with_retry(&RetryPolicy::default(), || {
+                    provider.chat_completion_stream(req.clone(), &ctx)
+                })
+                .await?;
+                Ok((provider, req.model.clone(), stream))
+            } else {
+                // Build the capability check for the streaming failover path.
+                let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
+                let cap_est_tokens = estimated_input_tokens.max(0) as u64;
+                crate::failover::dispatch_stream_with_failover(
+                    &state.registry,
+                    &state.breaker,
+                    &RetryPolicy::default(),
+                    &failover_candidates,
+                    &req,
+                    &ctx,
+                    &failover_creds,
+                    Utc::now(),
+                    Some(crate::failover::CapCheck {
+                        required: &cap_required,
+                        estimated_tokens: cap_est_tokens,
+                    }),
+                )
+                .await
+                .map_err(ApiError::from)
+            }
+        })
+        .await?;
 
         // Build the cache-insert context for the streaming miss path
         // (§rv-l2-streaming-cache-write). On clean completion the DropGuard
@@ -1160,37 +1180,40 @@ pub async fn handler(
         //     circuit breaker is open; otherwise dispatch the single provider
         //     with retry. `provider` is rebound to whichever provider actually
         //     served the request so cost/headers/telemetry below reflect it.
-        let dispatch_result: ApiResult<_> = if route_fallbacks.is_empty() {
-            with_retry(&RetryPolicy::default(), || {
-                provider.chat_completion(req.clone(), &ctx)
-            })
-            .await
-            .map(|resp| (provider, resp))
-            .map_err(ApiError::from)
-        } else {
-            // Build the capability check for the failover path.
-            let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
-            let cap_est_tokens = {
-                let combined = tt_shared::message_text_for_estimation(&req);
-                tt_tokenize::estimate_tokens(provider.id(), &combined) as u64
-            };
-            crate::failover::dispatch_with_failover(
-                &state.registry,
-                &state.breaker,
-                &RetryPolicy::default(),
-                &failover_candidates,
-                &req,
-                &ctx,
-                &failover_creds,
-                Utc::now(),
-                Some(crate::failover::CapCheck {
-                    required: &cap_required,
-                    estimated_tokens: cap_est_tokens,
-                }),
-            )
-            .await
-            .map_err(ApiError::from)
-        };
+        let dispatch_result: ApiResult<_> = with_request_timeout(request_timeout, async {
+            if route_fallbacks.is_empty() {
+                with_retry(&RetryPolicy::default(), || {
+                    provider.chat_completion(req.clone(), &ctx)
+                })
+                .await
+                .map(|resp| (provider, resp))
+                .map_err(ApiError::from)
+            } else {
+                // Build the capability check for the failover path.
+                let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
+                let cap_est_tokens = {
+                    let combined = tt_shared::message_text_for_estimation(&req);
+                    tt_tokenize::estimate_tokens(provider.id(), &combined) as u64
+                };
+                crate::failover::dispatch_with_failover(
+                    &state.registry,
+                    &state.breaker,
+                    &RetryPolicy::default(),
+                    &failover_candidates,
+                    &req,
+                    &ctx,
+                    &failover_creds,
+                    Utc::now(),
+                    Some(crate::failover::CapCheck {
+                        required: &cap_required,
+                        estimated_tokens: cap_est_tokens,
+                    }),
+                )
+                .await
+                .map_err(ApiError::from)
+            }
+        })
+        .await;
 
         // 3c-neg. Negative-cache write on deterministic client errors.
         //
@@ -1725,6 +1748,22 @@ pub(crate) fn compute_cost(
 }
 
 /// Insert all six required `X-TokenTrimmer-*` response headers.
+/// Run `fut` under an optional per-request deadline; on expiry return 408.
+pub(crate) async fn with_request_timeout<T>(
+    timeout: Option<std::time::Duration>,
+    fut: impl std::future::Future<Output = ApiResult<T>>,
+) -> ApiResult<T> {
+    match timeout {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(ApiError::RequestTimeout {
+                ms: d.as_millis().min(u128::from(u64::MAX)) as u64,
+            }),
+        },
+        None => fut.await,
+    }
+}
+
 /// Stamp `X-TokenTrimmer-Route-Matched` with the applied route's name (no-op when
 /// `name` is `None` or not header-safe).
 fn with_route_matched(mut resp: Response, name: Option<&str>) -> Response {
@@ -2103,6 +2142,19 @@ mod cache_header_tests {
 mod provider_override_tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn timeout_ms_header_parsing() {
+        let mut h = HeaderMap::new();
+        assert_eq!(timeout_ms_from_header(&h), None);
+        h.insert("x-tokentrimmer-timeout-ms", " 30000 ".parse().unwrap());
+        assert_eq!(timeout_ms_from_header(&h), Some(30_000));
+        for bad in ["0", "700000", "abc", "-5"] {
+            let mut b = HeaderMap::new();
+            b.insert("x-tokentrimmer-timeout-ms", bad.parse().unwrap());
+            assert_eq!(timeout_ms_from_header(&b), None, "{bad} must be rejected");
+        }
+    }
 
     #[test]
     fn fallback_override_header_parsing() {

@@ -25,7 +25,7 @@ use crate::middleware::trace::TraceId;
 use crate::routes::chat::{
     apply_provider_override, apply_routing, attach_cost_headers, compute_cost,
     cost_limit_from_header, enforce_cost_limit, estimate_cost_usd, provider_override_from_header,
-    resolve_credentials, resolve_credentials_for,
+    resolve_credentials, resolve_credentials_for, timeout_ms_from_header, with_request_timeout,
 };
 use crate::{ApiError, ApiResult, AppState};
 
@@ -136,7 +136,7 @@ pub async fn handler(
             .get("x-tokentrimmer-tag")
             .and_then(|v| v.to_str().ok())
             .map(String::from),
-        deadline: None,
+        deadline: timeout_ms_from_header(&headers).map(std::time::Duration::from_millis),
     };
 
     // 4. Baseline pricing on the ORIGINAL model, before routing rewrites it.
@@ -223,7 +223,10 @@ pub async fn handler(
     // 6. Dispatch. Capture the served model + its pricing before `req` moves.
     let served_model = req.model.clone();
     let routed_pricing = provider.pricing(&served_model);
-    let resp = provider.embeddings(req, &ctx).await?;
+    let resp = with_request_timeout(ctx.deadline, async {
+        provider.embeddings(req, &ctx).await.map_err(ApiError::from)
+    })
+    .await?;
 
     // 7. Cost + headers + spend. Baseline against the original model when routed.
     let baseline_pricing = if matched {
