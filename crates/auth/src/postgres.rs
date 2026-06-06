@@ -71,6 +71,32 @@ pub enum CredentialStoreError {
     /// Stored row's `extra_headers` JSON was malformed.
     #[error("extra_headers parse: {0}")]
     ExtraHeaders(#[from] serde_json::Error),
+
+    /// Caller-supplied `base_url` / `extra_headers` failed validation at write
+    /// time (SSRF guard / denied header). Rejected before persisting.
+    #[error("invalid credential: {0}")]
+    Invalid(String),
+}
+
+/// Validate caller-supplied credential inputs before persisting. Rejects a
+/// `base_url` that fails the SSRF guard and any denied `extra_headers`, so bad
+/// input fails loudly at write time instead of silently at dispatch. Credentials
+/// are for cloud upstreams (local providers are env-configured, not stored), so
+/// loopback/private base_urls are rejected (`allow_local = false`).
+fn validate_credential_inputs(
+    base_url: Option<&str>,
+    extra_headers: &[(String, String)],
+) -> Result<(), CredentialStoreError> {
+    if let Some(url) = base_url {
+        tt_shared::url_guard::validate_provider_url(url, false)
+            .map_err(|e| CredentialStoreError::Invalid(format!("base_url: {e}")))?;
+    }
+    if let Some(name) = tt_shared::url_guard::find_denied_header(extra_headers) {
+        return Err(CredentialStoreError::Invalid(format!(
+            "denied extra header: {name}"
+        )));
+    }
+    Ok(())
 }
 
 impl From<CredentialStoreError> for CredentialError {
@@ -137,6 +163,7 @@ impl PostgresProviderCredentialStore {
         base_url: Option<&str>,
         extra_headers: &[(String, String)],
     ) -> Result<Uuid, CredentialStoreError> {
+        validate_credential_inputs(base_url, extra_headers)?;
         let derived = self.derive_key(org_id, provider);
         let cipher = XChaCha20Poly1305::new((&derived).into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -627,6 +654,32 @@ mod key_store_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_credential_inputs_accepts_clean_inputs() {
+        assert!(validate_credential_inputs(
+            Some("https://api.anthropic.com"),
+            &[("x-beta".into(), "1".into())]
+        )
+        .is_ok());
+        assert!(validate_credential_inputs(None, &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_credential_inputs_rejects_loopback_base_url() {
+        assert!(matches!(
+            validate_credential_inputs(Some("http://localhost:8080"), &[]),
+            Err(CredentialStoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn validate_credential_inputs_rejects_denied_header() {
+        assert!(matches!(
+            validate_credential_inputs(None, &[("proxy-connection".into(), "x".into())]),
+            Err(CredentialStoreError::Invalid(_))
+        ));
+    }
 
     /// Round-trip: encrypt under one key, decrypt under the same key.
     #[tokio::test]

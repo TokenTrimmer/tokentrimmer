@@ -153,6 +153,7 @@ impl Provider for GeminiProvider {
         let api_key = ctx.credentials.api_key.expose().to_string();
         let model = req.model.clone();
 
+        translate::validate_model_id(&model)?;
         let url = format!("{base_url}/v1beta/models/{model}:generateContent");
 
         let body = translate::translate_request(req)?;

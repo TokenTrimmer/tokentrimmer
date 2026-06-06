@@ -40,6 +40,27 @@ fn make_request(model: &str, messages: Vec<Message>) -> ChatCompletionRequest {
 }
 
 #[test]
+fn validate_model_id_accepts_real_ids_rejects_injection() {
+    use tt_provider_gemini::translate::validate_model_id;
+    // Real Gemini ids pass.
+    assert!(validate_model_id("gemini-3.1-pro").is_ok());
+    assert!(validate_model_id("gemini-3.5-flash").is_ok());
+    assert!(validate_model_id("gemini-1.5-pro-002").is_ok());
+    // Path/query/fragment/whitespace injection is rejected.
+    for bad in [
+        "",
+        "../models/x",
+        "a/b",
+        "a?x=1",
+        "a#frag",
+        "a b",
+        "a:generateContent",
+    ] {
+        assert!(validate_model_id(bad).is_err(), "should reject {bad:?}");
+    }
+}
+
+#[test]
 fn gemini_supports_response_schema() {
     use tt_provider_gemini::{ClientConfig, GeminiProvider};
     use tt_shared::Provider;

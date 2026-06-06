@@ -321,6 +321,25 @@ pub struct GeminiUsageMetadata {
 // Request translation: canonical → Gemini
 // ---------------------------------------------------------------------------
 
+/// Validate a model id before it is interpolated into the Gemini REST URL path
+/// `/v1beta/models/<model>:generateContent`. Only ASCII alphanumerics and the
+/// characters `. _ -` are allowed, so a crafted model id cannot inject extra
+/// path, query, or fragment segments. Returns `ProviderError::InvalidRequest`
+/// for anything else.
+pub fn validate_model_id(model: &str) -> Result<(), ProviderError> {
+    let ok = !model.is_empty()
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ProviderError::InvalidRequest(format!(
+            "invalid Gemini model id {model:?}: only [A-Za-z0-9._-] is allowed"
+        )))
+    }
+}
+
 /// Translate a [`tt_shared::ChatCompletionRequest`] into a [`GeminiRequest`]
 /// ready to serialize and POST.
 ///
