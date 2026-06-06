@@ -16,7 +16,7 @@ pub use tt_shared::messages::{
 pub use tt_shared::Usage;
 
 mod embeddings;
-pub use embeddings::EmbedOutcome;
+pub use embeddings::{EmbedBuilder, EmbedOutcome};
 
 mod tools;
 /// Re-exported so downstream `impl ToolExecutor` blocks can annotate with
