@@ -124,6 +124,14 @@ impl Provider for AnthropicProvider {
         out
     }
 
+    fn supports_response_schema(&self) -> bool {
+        // Anthropic has no OpenAI-style `response_format` field at all — it is
+        // dropped entirely (see `dropped_params`), so this is operationally moot
+        // (the gateway's downgrade guard skips a dropped param), but `false` is
+        // the honest answer.
+        false
+    }
+
     /// Non-streaming chat completion via `POST /v1/messages`.
     ///
     /// Translates the canonical request to Anthropic's wire format, sends it,
