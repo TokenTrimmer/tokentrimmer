@@ -97,6 +97,8 @@ impl AuditWriter for InMemoryAuditWriter {
             .map_err(|_| AuditError::Storage("mutex poisoned".to_string()))?;
 
         let chain = guard.entry(org_id).or_default();
+        // 0-based, gap-free per-org sequence (next index == current length).
+        let seq = chain.len() as i64;
 
         // Genesis uses 32 zero bytes; subsequent entries use the previous hash.
         let (prev_hash_str, prev_hash_bytes): (String, [u8; 32]) = match chain.last() {
@@ -123,6 +125,7 @@ impl AuditWriter for InMemoryAuditWriter {
             actor: &actor,
             event: &event,
             payload: &payload,
+            seq,
         };
 
         let hash = compute_hash(&prev_hash_bytes, &fields)?;
@@ -137,6 +140,7 @@ impl AuditWriter for InMemoryAuditWriter {
         let entry = AuditEntry {
             id,
             org_id,
+            seq,
             timestamp,
             actor,
             event,

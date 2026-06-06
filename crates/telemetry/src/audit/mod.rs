@@ -37,6 +37,8 @@ pub struct AuditEntry {
     pub id: Uuid,
     /// Organization this entry belongs to.
     pub org_id: Uuid,
+    /// Monotonic per-org sequence number (0-based, gap-free).
+    pub seq: i64,
     /// Wall-clock time the entry was written (UTC, RFC 3339).
     pub timestamp: DateTime<Utc>,
     /// Actor that caused the event.
@@ -102,12 +104,33 @@ pub enum VerifyError {
         /// Zero-based index of the offending entry.
         index: usize,
     },
+    /// An entry's `seq` is not the expected gap-free successor (0 for genesis,
+    /// `prev.seq + 1` otherwise) — a gap signals a deleted/reordered entry.
+    #[error("entry {index} has wrong seq (expected {expected}, got {got})")]
+    SeqGap {
+        /// Zero-based index of the offending entry.
+        index: usize,
+        /// The seq value that was expected.
+        expected: i64,
+        /// The seq value actually stored.
+        got: i64,
+    },
     /// An entry's Ed25519 signature is invalid.
     #[error("entry {0} signature invalid: {1}")]
     BadSignature(usize, String),
     /// Hex decoding failed for a stored hash or signature.
     #[error("hex decode failed at entry {0}: {1}")]
     Hex(usize, String),
+    /// The chain does not reach the expected anchor tip — its last entry's
+    /// seq/hash differs, or it is shorter than `anchor.seq + 1` entries
+    /// (tail-truncation or whole-chain deletion).
+    #[error("chain does not reach anchor tip: expected len {expected_len}, got {got_len}")]
+    TruncatedChain {
+        /// Entries the anchor implies (`anchor.seq + 1`).
+        expected_len: i64,
+        /// Entries actually present.
+        got_len: i64,
+    },
 }
 
 // ─── Canonical serialization helpers ─────────────────────────────────────────
@@ -150,6 +173,7 @@ pub fn canonical_payload_bytes(
         "actor": entry_fields.actor,
         "event": entry_fields.event,
         "payload": entry_fields.payload,
+        "seq": entry_fields.seq,
     });
     canonical_bytes(&obj)
 }
@@ -170,6 +194,9 @@ pub struct PayloadFields<'a> {
     pub event: &'a str,
     /// Arbitrary payload.
     pub payload: &'a serde_json::Value,
+    /// Monotonic per-org sequence number (0-based). Bound into the hash so an
+    /// entry's position cannot be changed without breaking its signature.
+    pub seq: i64,
 }
 
 /// Compute the BLAKE3 hash for an entry.
@@ -205,6 +232,16 @@ pub fn verify_chain(
     let genesis_prev = "0".repeat(64);
 
     for (i, entry) in entries.iter().enumerate() {
+        // ── 0. seq must be gap-free and monotonic ─────────────────────────────
+        let expected_seq = if i == 0 { 0 } else { entries[i - 1].seq + 1 };
+        if entry.seq != expected_seq {
+            return Err(VerifyError::SeqGap {
+                index: i,
+                expected: expected_seq,
+                got: entry.seq,
+            });
+        }
+
         // ── 1. prev_hash linkage ──────────────────────────────────────────────
         let expected_prev = if i == 0 {
             genesis_prev.clone()
@@ -239,6 +276,7 @@ pub fn verify_chain(
             actor: &entry.actor,
             event: &entry.event,
             payload: &entry.payload,
+            seq: entry.seq,
         };
 
         let computed = compute_hash(&prev_bytes, &fields)
@@ -263,4 +301,56 @@ pub fn verify_chain(
     }
 
     Ok(())
+}
+
+/// A captured "tip" of an audit chain — the last entry's `seq` + `hash`.
+///
+/// Capture one after a write (via [`TipAnchor::from_entry`]), anchor it where an
+/// attacker with DB write access cannot also roll it back (an append-only / WORM
+/// sink — see the deferred `post-scale-s3-object-lock` work), and later pass it
+/// to [`verify_chain_with_anchor`] to detect tail-truncation / whole-chain
+/// deletion (which plain [`verify_chain`] cannot see).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TipAnchor {
+    /// `seq` of the expected last entry.
+    pub seq: i64,
+    /// Hex-encoded BLAKE3 `hash` of the expected last entry.
+    pub hash: String,
+}
+
+impl TipAnchor {
+    /// Capture the current tip from the chain's last entry.
+    #[must_use]
+    pub fn from_entry(entry: &AuditEntry) -> Self {
+        Self {
+            seq: entry.seq,
+            hash: entry.hash.clone(),
+        }
+    }
+}
+
+/// Verify a chain AND assert it still reaches `anchor`'s tip with no missing
+/// tail. Runs [`verify_chain`] first, then checks the last entry's `(seq, hash)`
+/// equals the anchor and that exactly `anchor.seq + 1` entries are present.
+///
+/// This is what makes tail-truncation and whole-chain deletion detectable, given
+/// a trustworthy `anchor` captured earlier. An empty/short chain, or a tip that
+/// does not match, returns [`VerifyError::TruncatedChain`].
+pub fn verify_chain_with_anchor(
+    entries: &[AuditEntry],
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    anchor: &TipAnchor,
+) -> Result<(), VerifyError> {
+    let expected_len = anchor.seq + 1;
+    let got_len = entries.len() as i64;
+    let tip_ok = entries
+        .last()
+        .is_some_and(|last| last.seq == anchor.seq && last.hash == anchor.hash);
+    if !tip_ok || got_len != expected_len {
+        return Err(VerifyError::TruncatedChain {
+            expected_len,
+            got_len,
+        });
+    }
+    verify_chain(entries, verifying_key)
 }

@@ -19,6 +19,100 @@ fn payload() -> serde_json::Value {
     serde_json::json!({ "note": "test" })
 }
 
+// ─── 0. seq is bound into the canonical (signed) payload ──────────────────────
+
+#[test]
+fn canonical_payload_includes_seq() {
+    use chrono::Utc;
+    use tt_telemetry::audit::{canonical_payload_bytes, PayloadFields};
+
+    let id = Uuid::nil();
+    let org = Uuid::nil();
+    let ts = Utc::now();
+    let actor = Actor::System;
+    let p = serde_json::json!({ "k": "v" });
+    let mk = |seq| {
+        canonical_payload_bytes(&PayloadFields {
+            id,
+            org_id: org,
+            timestamp: ts,
+            actor: &actor,
+            event: "e",
+            payload: &p,
+            seq,
+        })
+        .unwrap()
+    };
+    assert_ne!(
+        mk(0),
+        mk(1),
+        "seq must change the canonical bytes (so it is hashed + signed)"
+    );
+}
+
+// ─── 0b. seq gap / tail-truncation detection ──────────────────────────────────
+
+#[tokio::test]
+async fn test_seq_gap_detected() {
+    let writer = InMemoryAuditWriter::new();
+    let vk = writer.verifying_key();
+    let org = Uuid::new_v4();
+    for i in 0..3 {
+        writer
+            .write(org, system(), format!("e{i}"), payload())
+            .await
+            .unwrap();
+    }
+    let mut entries = writer.list(org).await.unwrap();
+    // Drop the middle entry → remaining seqs are 0,2 (a gap); prev_hash also breaks.
+    entries.remove(1);
+    let err = verify_chain(&entries, &vk).expect_err("gap must fail");
+    assert!(
+        matches!(
+            err,
+            VerifyError::SeqGap { .. } | VerifyError::BrokenChain { .. }
+        ),
+        "got {err:?}"
+    );
+}
+
+// ─── 0c. tip anchor detects truncation / whole-chain deletion ─────────────────
+
+#[tokio::test]
+async fn test_tip_anchor_detects_truncation() {
+    use tt_telemetry::audit::{verify_chain_with_anchor, TipAnchor};
+    let writer = InMemoryAuditWriter::new();
+    let vk = writer.verifying_key();
+    let org = Uuid::new_v4();
+    for i in 0..3 {
+        writer
+            .write(org, system(), format!("e{i}"), payload())
+            .await
+            .unwrap();
+    }
+    let entries = writer.list(org).await.unwrap();
+    let anchor = TipAnchor::from_entry(entries.last().unwrap());
+
+    // Full chain verifies against its own tip.
+    verify_chain_with_anchor(&entries, &vk, &anchor).expect("full chain matches anchor");
+
+    // Drop the last entry → chain no longer reaches the recorded tip.
+    let truncated = &entries[..entries.len() - 1];
+    let err = verify_chain_with_anchor(truncated, &vk, &anchor)
+        .expect_err("truncated chain must fail against the old tip");
+    assert!(
+        matches!(err, VerifyError::TruncatedChain { .. }),
+        "got {err:?}"
+    );
+
+    // Empty chain + anchor → also TruncatedChain.
+    let err2 = verify_chain_with_anchor(&[], &vk, &anchor).expect_err("empty must fail");
+    assert!(
+        matches!(err2, VerifyError::TruncatedChain { .. }),
+        "got {err2:?}"
+    );
+}
+
 // ─── 1. Round-trip single entry ───────────────────────────────────────────────
 
 #[tokio::test]
