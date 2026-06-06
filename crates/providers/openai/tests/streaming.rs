@@ -436,7 +436,11 @@ async fn stream_tool_call_delta() {
                 .is_some_and(|ch| !ch.delta.tool_calls.is_empty())
         })
         .collect();
-    assert_eq!(tool_chunks.len(), 1, "expected one reassembled tool-call chunk");
+    assert_eq!(
+        tool_chunks.len(),
+        1,
+        "expected one reassembled tool-call chunk"
+    );
 
     let tc = &tool_chunks[0].choices[0].delta.tool_calls;
     assert_eq!(tc.len(), 1);

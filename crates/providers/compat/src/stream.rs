@@ -637,14 +637,17 @@ mod tests {
         )
         .is_none());
         // frag 2: args fragment, no id → swallowed
-        assert!(
-            handle_raw_chunk(&mut acc, raw_chunk(vec![frag(0, None, None, "{\"a\":")], None))
-                .is_none()
-        );
+        assert!(handle_raw_chunk(
+            &mut acc,
+            raw_chunk(vec![frag(0, None, None, "{\"a\":")], None)
+        )
+        .is_none());
         // frag 3: closing args + finish → drained
-        let out =
-            handle_raw_chunk(&mut acc, raw_chunk(vec![frag(0, None, None, "1}")], Some("tool_calls")))
-                .expect("complete chunk");
+        let out = handle_raw_chunk(
+            &mut acc,
+            raw_chunk(vec![frag(0, None, None, "1}")], Some("tool_calls")),
+        )
+        .expect("complete chunk");
         let tc = &out.choices[0].delta.tool_calls;
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0].id, "call_1");
