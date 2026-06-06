@@ -67,6 +67,7 @@ pub fn build_router_with_retrieval(
         middleware::auth::middleware,
     ))
     .layer(axum::middleware::from_fn(middleware::trace::middleware))
+    .layer(axum::middleware::from_fn(middleware::latency::middleware))
     .layer(TraceLayer::new_for_http())
     .layer(TimeoutLayer::with_status_code(
         StatusCode::GATEWAY_TIMEOUT,
@@ -480,6 +481,32 @@ mod tests {
             b = b.header("x-tokentrimmer-cost-limit-usd", cl);
         }
         b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn latency_header_present_on_success_and_error() {
+        // Success (dispatch) — header present + parseable.
+        let ok = app_with_mock()
+            .oneshot(chat_request("mock-model-1", false))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let _ms: u64 = ok.headers()["x-tokentrimmer-latency-ms"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("latency-ms parseable");
+
+        // Error (unknown model → 404) — middleware still stamps the header.
+        let err = app_with_mock()
+            .oneshot(chat_request("does-not-exist", false))
+            .await
+            .unwrap();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(
+            err.headers().contains_key("x-tokentrimmer-latency-ms"),
+            "latency header must be present even on error responses"
+        );
     }
 
     #[tokio::test]
