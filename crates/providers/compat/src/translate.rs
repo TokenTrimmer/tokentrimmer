@@ -25,6 +25,16 @@ pub fn is_reasoning_model(model: &str) -> bool {
     matches!(model, "o3" | "o4-mini")
 }
 
+/// Params the compat layer silently drops for `req`. Reasoning models
+/// (`o3`/`o4-mini`) reject `temperature` (see [`translate_request`]).
+pub fn dropped_params(req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+    if is_reasoning_model(&req.model) && req.temperature.is_some() {
+        vec!["temperature".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Outbound request
 // ---------------------------------------------------------------------------
@@ -244,6 +254,22 @@ mod tests {
             user: None,
             tt_extras: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn dropped_params_temperature_only_for_reasoning_models() {
+        // Reasoning model + temperature set → dropped.
+        let req = base_request("o3");
+        assert_eq!(dropped_params(&req), vec!["temperature".to_string()]);
+
+        // Non-reasoning model: temperature is forwarded, not dropped.
+        let req2 = base_request("gpt-4o");
+        assert!(dropped_params(&req2).is_empty());
+
+        // Reasoning model but no temperature set → nothing dropped.
+        let mut req3 = base_request("o4-mini");
+        req3.temperature = None;
+        assert!(dropped_params(&req3).is_empty());
     }
 
     #[test]

@@ -946,10 +946,12 @@ pub async fn handler(
             None
         };
 
-        Ok(with_route_matched(
+        let mut resp = with_route_matched(
             sse::stream_response(stream, &provider, trace_id, log_ctx),
             route_matched_name.as_deref(),
-        ))
+        );
+        attach_warnings(resp.headers_mut(), provider.as_ref(), &req, &served_model);
+        Ok(resp)
     } else {
         // 3a. L1 exact-match cache. Cheapest lookup — try first. Gated on
         //     cache eligibility (Fix A §2.2) and tt_extras.cache mode (Fix B §2.7).
@@ -1473,6 +1475,12 @@ pub async fn handler(
                     .insert("x-tokentrimmer-route-matched", v);
             }
         }
+        attach_warnings(
+            http_response.headers_mut(),
+            provider.as_ref(),
+            &req,
+            &model_used,
+        );
         Ok(http_response)
     }
 }
@@ -1481,6 +1489,41 @@ pub async fn handler(
 /// isolated within a shared Redis instance.
 fn namespaced_l1_key(org_id: Uuid, req: &ChatCompletionRequest) -> String {
     format!("{}:{}", org_id, cache_key(req))
+}
+
+/// Attach `X-TokenTrimmer-Warnings` for params the provider drops.
+/// Each dropped param is a `param_dropped:<name>` token; tokens are
+/// comma-joined. No-op when nothing is dropped. (B2/B3 will append more
+/// tokens — `response_format_downgrade`, `temperature_clamped` — here.)
+///
+/// `served_model` is the model that actually served the request — under
+/// cross-model failover this differs from `req.model`, and some drops
+/// (reasoning-model `temperature`) are model-dependent, so they must be
+/// evaluated against the served model, not the originally-requested one.
+fn attach_warnings(
+    headers: &mut axum::http::HeaderMap,
+    provider: &dyn tt_shared::Provider,
+    req: &ChatCompletionRequest,
+    served_model: &str,
+) {
+    let dropped = if req.model == served_model {
+        provider.dropped_params(req)
+    } else {
+        // Failover rebound to a different model — evaluate drops against it.
+        let mut served = req.clone();
+        served.model = served_model.to_string();
+        provider.dropped_params(&served)
+    };
+    let tokens: Vec<String> = dropped
+        .into_iter()
+        .map(|p| format!("param_dropped:{p}"))
+        .collect();
+    if tokens.is_empty() {
+        return;
+    }
+    if let Ok(v) = tokens.join(",").parse() {
+        headers.insert("x-tokentrimmer-warnings", v);
+    }
 }
 
 /// Build the response for an L1 cache hit.

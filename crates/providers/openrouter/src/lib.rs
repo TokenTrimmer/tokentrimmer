@@ -119,6 +119,10 @@ impl Provider for OpenRouterProvider {
         self.inner.pricing(model)
     }
 
+    fn dropped_params(&self, req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+        self.inner.dropped_params(req)
+    }
+
     fn fee_multiplier(&self) -> f64 {
         self.inner.fee_multiplier()
     }

@@ -46,6 +46,33 @@ fn user_text(text: &str) -> Message {
     }
 }
 
+#[test]
+fn dropped_params_reports_present_fields_but_not_response_format() {
+    use tt_provider_gemini::{ClientConfig, GeminiProvider};
+    use tt_shared::Provider;
+
+    let provider = GeminiProvider::new(ClientConfig::default());
+    let mut req = make_request("gemini-3.1-pro", vec![]);
+    // Gemini TRANSLATES response_format, so it must NOT be reported.
+    req.response_format = Some(ResponseFormat {
+        r#type: "json_object".into(),
+        json_schema: None,
+    });
+    req.frequency_penalty = Some(0.2);
+    req.seed = Some(7);
+    req.user = Some("u1".into());
+    let mut got = provider.dropped_params(&req);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "frequency_penalty".to_string(),
+            "seed".to_string(),
+            "user".to_string()
+        ]
+    );
+}
+
 fn assistant_text(text: &str) -> Message {
     Message::Assistant {
         content: Some(MessageContent::Text(text.to_string())),
