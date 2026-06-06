@@ -1554,9 +1554,10 @@ fn maybe_clamp_temperature(
         return;
     }
     let (lo, hi) = provider.temperature_range();
-    let clamped = t.clamp(lo, hi);
-    if (clamped - t).abs() > f32::EPSILON {
-        req.temperature = Some(clamped);
+    // Detect out-of-range directly (no float-equality): catches every overshoot,
+    // including a single-ulp one, and leaves a NaN untouched.
+    if t < lo || t > hi {
+        req.temperature = Some(t.clamp(lo, hi));
         warnings.push("temperature_clamped".to_string());
     }
 }
