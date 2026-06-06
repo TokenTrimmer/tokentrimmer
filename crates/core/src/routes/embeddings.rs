@@ -151,7 +151,7 @@ pub async fn handler(
         }],
         ..Default::default()
     };
-    let route_match = apply_routing(&state, &ctx, &mut synth).await;
+    let route_match = apply_routing(&state, &ctx, &mut synth, None).await?;
     req.model = synth.model; // adopt the routed model
     let matched = route_match.is_some();
     if matched {

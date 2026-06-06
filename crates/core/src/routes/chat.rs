@@ -483,6 +483,8 @@ pub async fn handler(
 
     // Explicit provider pin (X-TokenTrimmer-Provider), applied after routing below.
     let provider_pin = provider_override_from_header(&headers);
+    // Forced route (X-TokenTrimmer-Route) — passed into apply_routing below.
+    let forced_route = route_override_from_header(&headers);
 
     // 2a. Sandbox short-circuit: `tt_test_*` keys return a deterministic
     //     synthetic response without contacting any real provider — for
@@ -550,8 +552,12 @@ pub async fn handler(
     // of collapsing to ~0 (which happens when baseline is priced against the
     // cheap routed-to model).
     let requested_pricing = provider.pricing(&req.model);
-    let route_match = apply_routing(&state, &ctx, &mut req).await;
+    let route_match = apply_routing(&state, &ctx, &mut req, forced_route.as_deref()).await?;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
+    // The applied route's name (forced or condition-matched) for the
+    // `X-TokenTrimmer-Route-Matched` response header, captured before
+    // `route_match` is consumed below.
+    let route_matched_name = route_match.as_ref().map(|m| m.route_name.clone());
     // A matched privacy route forces the request to skip the cache entirely.
     let route_disable_cache = route_match.as_ref().is_some_and(|m| m.disable_cache);
     // Per-request cost ceiling (V3d-2b) + the token estimate, captured before
@@ -724,7 +730,10 @@ pub async fn handler(
                         );
                         let fake = sse::fake_stream_from_response(entry.response);
                         // L1 hit already logged above; no need for a second row.
-                        return Ok(sse::stream_response(fake, &provider, trace_id, None));
+                        return Ok(with_route_matched(
+                            sse::stream_response(fake, &provider, trace_id, None),
+                            route_matched_name.as_deref(),
+                        ));
                     }
                 }
             }
@@ -893,7 +902,10 @@ pub async fn handler(
             None
         };
 
-        Ok(sse::stream_response(stream, &provider, trace_id, log_ctx))
+        Ok(with_route_matched(
+            sse::stream_response(stream, &provider, trace_id, log_ctx),
+            route_matched_name.as_deref(),
+        ))
     } else {
         // 3a. L1 exact-match cache. Cheapest lookup — try first. Gated on
         //     cache eligibility (Fix A §2.2) and tt_extras.cache mode (Fix B §2.7).
@@ -940,7 +952,7 @@ pub async fn handler(
                                 if let Ok(v) = "neg-hit".parse() {
                                     resp.headers_mut().insert("x-tokentrimmer-cache", v);
                                 }
-                                return Ok(resp);
+                                return Ok(with_route_matched(resp, route_matched_name.as_deref()));
                             }
                             Err(e) => {
                                 // Deserialization failure is non-fatal; fall through.
@@ -978,7 +990,10 @@ pub async fn handler(
                                     matched_route_id,
                                 ),
                             );
-                            return Ok(build_hit_l1_response(entry, trace_id));
+                            return Ok(with_route_matched(
+                                build_hit_l1_response(entry, trace_id),
+                                route_matched_name.as_deref(),
+                            ));
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, key = %key, "l1 cache entry failed to deserialize");
@@ -1019,7 +1034,10 @@ pub async fn handler(
                                     matched_route_id,
                                 ),
                             );
-                            return build_hit_l2_response(entry, similarity, trace_id);
+                            return Ok(with_route_matched(
+                                build_hit_l2_response(entry, similarity, trace_id)?,
+                                route_matched_name.as_deref(),
+                            ));
                         }
                     }
                 }
@@ -1072,7 +1090,10 @@ pub async fn handler(
                                                     matched_route_id,
                                                 ),
                                             );
-                                            return Ok(build_hit_l1_response(entry, trace_id));
+                                            return Ok(with_route_matched(
+                                build_hit_l1_response(entry, trace_id),
+                                route_matched_name.as_deref(),
+                            ));
                                         }
                                         Err(e) => {
                                             tracing::warn!(
@@ -1398,6 +1419,13 @@ pub async fn handler(
                 .headers_mut()
                 .insert("x-tokentrimmer-cache", v);
         }
+        if let Some(name) = route_matched_name.as_deref() {
+            if let Ok(v) = name.parse() {
+                http_response
+                    .headers_mut()
+                    .insert("x-tokentrimmer-route-matched", v);
+            }
+        }
         Ok(http_response)
     }
 }
@@ -1673,6 +1701,18 @@ pub(crate) fn compute_cost(
 }
 
 /// Insert all six required `X-TokenTrimmer-*` response headers.
+/// Stamp `X-TokenTrimmer-Route-Matched` with the applied route's name (no-op when
+/// `name` is `None` or not header-safe).
+fn with_route_matched(mut resp: Response, name: Option<&str>) -> Response {
+    if let Some(name) = name {
+        if let Ok(v) = name.parse() {
+            resp.headers_mut()
+                .insert("x-tokentrimmer-route-matched", v);
+        }
+    }
+    resp
+}
+
 pub(crate) fn attach_cost_headers(
     headers: &mut axum::http::HeaderMap,
     trace_id: Uuid,
@@ -1870,6 +1910,7 @@ fn clamp_latency_ms(started: Instant) -> i32 {
 /// declared no failover targets.
 pub(crate) struct RouteMatch {
     pub(crate) route_id: Uuid,
+    pub(crate) route_name: String,
     pub(crate) fallbacks: Vec<String>,
     pub(crate) disable_cache: bool,
     pub(crate) max_cost_usd: Option<f64>,
@@ -1886,21 +1927,33 @@ pub(crate) struct RouteMatch {
 /// - the request has no resolvable org (synthetic context),
 /// - the backend errors (we log + fall through — never fail user traffic),
 /// - or no enabled route matches.
+/// A forced route that can't be honored is a `400`; absence of routing is fine
+/// for an unforced request.
+fn forced_miss(forced: Option<&str>) -> ApiResult<Option<RouteMatch>> {
+    match forced {
+        Some(name) => Err(ApiError::InvalidRequest(format!("unknown route: {name}"))),
+        None => Ok(None),
+    }
+}
+
 pub(crate) async fn apply_routing(
     state: &AppState,
     ctx: &RequestContext,
     req: &mut ChatCompletionRequest,
-) -> Option<RouteMatch> {
-    let store = state.routing_store.as_ref()?;
+    forced_route: Option<&str>,
+) -> ApiResult<Option<RouteMatch>> {
+    let Some(store) = state.routing_store.as_ref() else {
+        return forced_miss(forced_route);
+    };
     if ctx.org_id == Uuid::nil() {
-        return None;
+        return forced_miss(forced_route);
     }
 
     let engine = match store.engine_for(ctx.org_id).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(error = %e, org_id = %ctx.org_id, "routing store lookup failed — passing request through unrouted");
-            return None;
+            return Ok(None); // never fail user traffic on a transient backend error
         }
     };
 
@@ -1930,8 +1983,18 @@ pub(crate) async fn apply_routing(
         .and_then(|p| p.pricing(&req.model))
         .map(|pr| estimate_cost_usd(&pr, input_tokens, req.max_tokens));
 
-    let m = engine.evaluate_with_cost(req, ctx, input_tokens, estimated_cost_usd)?;
+    // `m` is `&Route` (inferred from the engine accessors below) regardless of arm.
+    let m = match forced_route {
+        Some(name) => engine
+            .find_by_name(name)
+            .ok_or_else(|| ApiError::InvalidRequest(format!("unknown route: {name}")))?,
+        None => match engine.evaluate_with_cost(req, ctx, input_tokens, estimated_cost_usd) {
+            Some(r) => r,
+            None => return Ok(None),
+        },
+    };
     let route_id = m.id;
+    let route_name = m.name.clone();
     let fallbacks = m.then.fallbacks.clone();
     let disable_cache = m.then.disable_cache;
     let max_cost_usd = m.then.max_cost_usd;
@@ -1954,7 +2017,7 @@ pub(crate) async fn apply_routing(
             );
             // Do not rewrite req.model — return None so the request
             // continues with the original model.
-            return None;
+            return Ok(None);
         }
     }
 
@@ -1967,13 +2030,14 @@ pub(crate) async fn apply_routing(
         fallbacks = ?fallbacks,
         "routing rewrite"
     );
-    Some(RouteMatch {
+    Ok(Some(RouteMatch {
         route_id,
+        route_name,
         fallbacks,
         disable_cache,
         max_cost_usd,
         input_tokens_estimate: input_tokens,
-    })
+    }))
 }
 
 #[cfg(test)]
