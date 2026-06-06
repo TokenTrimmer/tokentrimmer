@@ -9,6 +9,7 @@ use axum::http::{Request, StatusCode};
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
 
+use tower::util::ServiceExt;
 use tt_auth::credentials::InMemoryProviderCredentialStore;
 use tt_auth::{
     keys::{issue, Environment},
@@ -22,7 +23,6 @@ use tt_shared::{
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
 use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
-use tower::util::ServiceExt;
 use uuid::Uuid;
 
 /// A provider that records its call count. `owns_model` controls whether it
