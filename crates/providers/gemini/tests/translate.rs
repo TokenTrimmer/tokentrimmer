@@ -46,6 +46,16 @@ fn gemini_supports_response_schema() {
     assert!(GeminiProvider::new(ClientConfig::default()).supports_response_schema());
 }
 
+#[test]
+fn gemini_temperature_range_is_default_wide() {
+    use tt_provider_gemini::{ClientConfig, GeminiProvider};
+    use tt_shared::Provider;
+    assert_eq!(
+        GeminiProvider::new(ClientConfig::default()).temperature_range(),
+        (0.0, 2.0)
+    );
+}
+
 fn user_text(text: &str) -> Message {
     Message::User {
         content: MessageContent::Text(text.to_string()),

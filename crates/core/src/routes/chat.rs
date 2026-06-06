@@ -690,6 +690,7 @@ pub async fn handler(
     // warnings (B2: response_format_downgrade; B3 will add temperature_clamped).
     let mut warnings: Vec<String> = Vec::new();
     maybe_downgrade_response_format(&mut req, provider.as_ref(), &mut warnings);
+    maybe_clamp_temperature(&mut req, provider.as_ref(), &mut warnings);
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
     // provider in the candidate set. The raw-Bearer fallback is allowed only for
@@ -1531,6 +1532,34 @@ fn maybe_downgrade_response_format(
         json_schema: None,
     });
     warnings.push("response_format_downgrade".to_string());
+}
+
+/// Clamp `req.temperature` to the routed provider's accepted range, recording a
+/// `temperature_clamped` warning when the value actually changed. Skips a
+/// temperature that the provider drops outright (reasoning models — B1
+/// param_dropped) so the two warnings don't both fire.
+fn maybe_clamp_temperature(
+    req: &mut ChatCompletionRequest,
+    provider: &dyn tt_shared::Provider,
+    warnings: &mut Vec<String>,
+) {
+    let Some(t) = req.temperature else {
+        return;
+    };
+    if provider
+        .dropped_params(req)
+        .iter()
+        .any(|p| p == "temperature")
+    {
+        return;
+    }
+    let (lo, hi) = provider.temperature_range();
+    // Detect out-of-range directly (no float-equality): catches every overshoot,
+    // including a single-ulp one, and leaves a NaN untouched.
+    if t < lo || t > hi {
+        req.temperature = Some(t.clamp(lo, hi));
+        warnings.push("temperature_clamped".to_string());
+    }
 }
 
 /// Attach `X-TokenTrimmer-Warnings`: the model-dependent `param_dropped:<name>`

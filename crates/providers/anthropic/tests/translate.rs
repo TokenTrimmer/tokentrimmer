@@ -54,6 +54,16 @@ fn anthropic_does_not_support_response_schema() {
 }
 
 #[test]
+fn anthropic_temperature_range_is_zero_to_one() {
+    use tt_provider_anthropic::{AnthropicProvider, ClientConfig};
+    use tt_shared::Provider;
+    assert_eq!(
+        AnthropicProvider::new(ClientConfig::default()).temperature_range(),
+        (0.0, 1.0)
+    );
+}
+
+#[test]
 fn dropped_params_reports_present_openai_only_fields() {
     use tt_provider_anthropic::{AnthropicProvider, ClientConfig};
     use tt_shared::{messages::ResponseFormat, Provider};
