@@ -127,6 +127,35 @@ async fn success_200_with_cached_content_token_count() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Customer extra_headers are forwarded (denylist-filtered)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forwards_customer_extra_headers() {
+    let server = MockServer::start();
+
+    // The mock matches ONLY when the customer header is present, so a passing
+    // request proves the adapter forwarded it.
+    let _mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1beta/models/gemini-3.1-pro:generateContent")
+            .header("x-goog-api-key", "test-key")
+            .header("x-customer-tenant", "acme");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .body(success_body());
+    });
+
+    let mut ctx = make_ctx(&server.base_url());
+    ctx.credentials.extra_headers = vec![("x-customer-tenant".to_string(), "acme".to_string())];
+    let resp = provider().chat_completion(minimal_request(), &ctx).await;
+    assert!(
+        resp.is_ok(),
+        "mock requires the forwarded extra header; got {resp:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. 401 → Unauthorized
 // ---------------------------------------------------------------------------
 

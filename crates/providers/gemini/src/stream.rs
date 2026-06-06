@@ -22,6 +22,7 @@ use futures::{Stream, StreamExt};
 use reqwest::Client;
 use std::pin::Pin;
 use tt_shared::{
+    filter_extra_headers,
     messages::{ChunkChoice, ChunkDelta, ToolCall, ToolCallFunction},
     ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext, Usage,
 };
@@ -74,14 +75,15 @@ pub async fn stream_chat_completion(
     let body_bytes = serde_json::to_vec(&body)
         .map_err(|e| ProviderError::Internal(format!("failed to serialize stream body: {e}")))?;
 
-    let response = client
+    let mut request_builder = client
         .post(&url)
         .header("Content-Type", "application/json")
         .header("x-goog-api-key", &api_key)
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(map_reqwest_error)?;
+        .body(body_bytes);
+    for (name, value) in &filter_extra_headers(&ctx.credentials.extra_headers) {
+        request_builder = request_builder.header(name, value);
+    }
+    let response = request_builder.send().await.map_err(map_reqwest_error)?;
 
     let status = response.status().as_u16();
     let retry_after = response
