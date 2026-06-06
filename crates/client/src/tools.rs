@@ -114,6 +114,7 @@ async fn send_round(
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     tag: Option<&str>,
+    cost_limit: Option<f64>,
 ) -> Result<(ChatCompletionResponse, CostInfo)> {
     let mut body = build_body(model, messages, max_tokens, temperature, false);
     let none = ToolChoice::Auto("none".to_string());
@@ -130,6 +131,9 @@ async fn send_round(
         .json(&body);
     if let Some(t) = tag {
         req = req.header("X-TokenTrimmer-Tag", t);
+    }
+    if let Some(limit) = cost_limit {
+        req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
     }
     let resp = req.send().await.map_err(Error::Request)?;
     let cost = parse_cost(resp.headers());
@@ -170,6 +174,7 @@ impl ChatBuilder<'_> {
             max_tokens,
             temperature,
             tag,
+            cost_limit,
             tools,
             tool_choice,
             max_tool_rounds,
@@ -189,6 +194,7 @@ impl ChatBuilder<'_> {
                 max_tokens,
                 temperature,
                 tag,
+                cost_limit,
             )
             .await?;
             rounds += 1;
@@ -237,6 +243,7 @@ impl ChatBuilder<'_> {
             max_tokens,
             temperature,
             tag,
+            cost_limit,
         )
         .await?;
         rounds += 1;
@@ -435,6 +442,31 @@ mod tests {
         // the fed-back tool result carries the error, loop did NOT abort
         assert!(matches!(&out.messages[2],
             Message::Tool { content: MessageContent::Text(t), .. } if t.contains("error") && t.contains("exploded")));
+    }
+
+    #[tokio::test]
+    async fn run_tools_sends_cost_limit_header() {
+        let server = MockServer::start_async().await;
+        // Require the header; return an immediate text answer (no tool calls) so
+        // the loop completes in one round.
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("x-tokentrimmer-cost-limit-usd", "0.05");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(text_response("done"));
+        });
+        let client = Client::new(server.base_url(), "k");
+        let out = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .cost_limit(0.05)
+            .run_tools(&Canned("x"))
+            .await
+            .unwrap();
+        assert_eq!(out.text(), Some("done"));
     }
 
     #[tokio::test]
