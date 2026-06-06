@@ -19,9 +19,16 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 
 Verified-open items remaining after the F1–F12 series + post-roadmap queue (#38–#41) closed out most of the prior "deferred" list. Each runs the full brainstorm→spec→plan→TDD→adversarial-review→green-CI→PR flow.
 
-- [ ] [P2] [ttc-chatstream-stream-impl] rust-crate-builder: Implement `futures::Stream for ChatStream` in `crates/client/src/lib.rs` (today `ChatStream` only exposes `next()`; the inner field is already a boxed `futures::Stream`). Lets callers use `StreamExt` combinators / `for_each` / `collect`. Keep the existing `next()` + `header_cost()`. (est: $0.40)
-- [ ] [P2] [gw-warnings-header] rust-crate-builder: Emit the `X-TokenTrimmer-Warnings` **response** header (doc'd "Planned (not yet emitted)", 04-gateway-api-reference.md:427). Surface param-drop notices (`param_dropped:<names>`) + the existing `response_format_downgrade` (currently only described in prose at :150/:300). Flip the doc row to Honored. (est: $0.80)
+- [x] [P2] [ttc-chatstream-stream-impl] rust-crate-builder: Implement `futures::Stream for ChatStream` in `crates/client/src/lib.rs` (today `ChatStream` only exposes `next()`; the inner field is already a boxed `futures::Stream`). Lets callers use `StreamExt` combinators / `for_each` / `collect`. Keep the existing `next()` + `header_cost()`. (est: $0.40) — DONE #58 (G-A; + FusedStream).
+- [x] [P2] [gw-warnings-header] rust-crate-builder: Emit the `X-TokenTrimmer-Warnings` **response** header (doc'd "Planned (not yet emitted)", 04-gateway-api-reference.md:427). Surface param-drop notices (`param_dropped:<names>`) + the existing `response_format_downgrade` (currently only described in prose at :150/:300). Flip the doc row to Honored. (est: $0.80) — DONE decomposed B1/B2/B3: param_dropped #59, response_format_downgrade #60/#61, temperature_clamped #62.
 - [ ] [P3] [gw-traceparent-ingest] rust-crate-builder: Honor the `X-TokenTrimmer-Trace-Parent` **request** header (doc'd "Planned (not yet honored)", 04-gateway-api-reference.md:412) — ingest the W3C traceparent and thread it through the existing trace middleware. Flip the doc row to Honored. (est: $0.80)
+
+## Audit follow-ups (2026-06-06) — from the multi-agent audit (`docs/reviews/2026-06-06-audit-checklist.md`)
+
+- [ ] [P2] [gw-metrics-endpoint] rust-crate-builder: Implement the documented `GET /metrics` Prometheus endpoint (04-gateway-api-reference.md:820-827 + architecture-spec:1159 advertise it but it does NOT exist in `crates/core/src/server.rs`). Expose the counters the telemetry crate already maintains (requests, latency histogram, cache hit/miss, failover, $0-priced-catalog-miss). Prerequisite for `post-scale-slo-proof`. (audit: pub-docs/backlog-completeness) (est: $1.00)
+- [ ] [P2] [gw-gdpr-delete-export] rust-crate-builder: Self-serve "delete my org / export my data" flow (cascade-delete request_logs, audit, cache_entries; subscription teardown; export request_logs+reports as CSV/JSON) + a documented data-retention window. Pairs with `rv-l2-org-cache-optout`. Required for a multi-tenant billing platform. (audit: backlog-completeness) (est: $1.50)
+- [ ] [P0] [beta-go-live-runbook] ops: Single tracked checklist enumerating the human steps to unblock the four externally-BLOCKED P0 gates in order (deploy staging → run e2e smoke → enable Free tier → onboard alpha org → start the 14-day reconciliation + Inspect-FP windows). Consolidates the scattered [BLOCKED] lines. (audit: backlog-completeness) (est: —)
+- [ ] [P2→ up from P3] [rv-l2-org-cache-optout] (priority bump): privacy/compliance control (per-org `semantic_cache_disabled`), not just perf — see line 78. Prioritize alongside `gw-gdpr-delete-export`.
 
 ---
 
