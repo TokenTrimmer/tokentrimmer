@@ -438,8 +438,11 @@ the gateway drops during translation — e.g. Anthropic drops `n`, `seed`,
 `response_format`, `presence_penalty`, and `frequency_penalty`; Gemini drops `n`,
 `seed`, `presence_penalty`, `frequency_penalty`, and `user`; reasoning models
 (`o3`, `o4-mini`) drop `temperature`. A `response_format_downgrade` token is
-emitted when a `json_schema` request is routed to a provider that supports only
-`json_object`. The `temperature_clamped` token is a planned follow-up.
+emitted when a `json_schema` request is routed to a provider declared
+`json_object`-only; the built-in adapters either forward the schema (OpenAI,
+Gemini, the OpenAI-compatible providers) or drop `response_format` outright
+(Anthropic), so this fires only for providers explicitly marked object-only. The
+`temperature_clamped` token is a planned follow-up.
 
 ### 6.3 Cache control semantics
 
