@@ -34,9 +34,9 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use tracing::instrument;
 use tt_shared::{
-    validate_provider_url, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-    EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError,
-    RequestContext,
+    filter_extra_headers, validate_provider_url, ChatCompletionChunk, ChatCompletionRequest,
+    ChatCompletionResponse, EmbeddingsRequest, EmbeddingsResponse, ModelInfo, ModelPricing,
+    Provider, ProviderError, RequestContext,
 };
 
 pub use client::ClientConfig;
@@ -158,12 +158,18 @@ impl Provider for GeminiProvider {
 
         let body = translate::translate_request(req)?;
 
-        let response = self
+        let mut request_builder = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("x-goog-api-key", &api_key)
-            .json(&body)
+            .json(&body);
+        // Forward customer-supplied extra headers (denylist-filtered), matching
+        // the OpenAI/Anthropic/compat adapters.
+        for (name, value) in &filter_extra_headers(&ctx.credentials.extra_headers) {
+            request_builder = request_builder.header(name, value);
+        }
+        let response = request_builder
             .send()
             .await
             .map_err(errors::map_reqwest_error)?;
