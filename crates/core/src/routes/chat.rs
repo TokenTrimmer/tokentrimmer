@@ -686,6 +686,11 @@ pub async fn handler(
         )?;
     }
 
+    // Normalize the request for the routed provider and collect any pre-dispatch
+    // warnings (B2: response_format_downgrade; B3 will add temperature_clamped).
+    let mut warnings: Vec<String> = Vec::new();
+    maybe_downgrade_response_format(&mut req, provider.as_ref(), &mut warnings);
+
     // For a failover chain, pre-resolve upstream credentials for every distinct
     // provider in the candidate set. The raw-Bearer fallback is allowed only for
     // the source provider (the bearer is its key); cross-provider candidates with
@@ -950,7 +955,13 @@ pub async fn handler(
             sse::stream_response(stream, &provider, trace_id, log_ctx),
             route_matched_name.as_deref(),
         );
-        attach_warnings(resp.headers_mut(), provider.as_ref(), &req, &served_model);
+        attach_warnings(
+            resp.headers_mut(),
+            provider.as_ref(),
+            &req,
+            &served_model,
+            &warnings,
+        );
         Ok(resp)
     } else {
         // 3a. L1 exact-match cache. Cheapest lookup — try first. Gated on
@@ -1480,6 +1491,7 @@ pub async fn handler(
             provider.as_ref(),
             &req,
             &model_used,
+            &warnings,
         );
         Ok(http_response)
     }
@@ -1491,10 +1503,39 @@ fn namespaced_l1_key(org_id: Uuid, req: &ChatCompletionRequest) -> String {
     format!("{}:{}", org_id, cache_key(req))
 }
 
-/// Attach `X-TokenTrimmer-Warnings` for params the provider drops.
-/// Each dropped param is a `param_dropped:<name>` token; tokens are
-/// comma-joined. No-op when nothing is dropped. (B2/B3 will append more
-/// tokens — `response_format_downgrade`, `temperature_clamped` — here.)
+/// If `req` asks for `response_format: json_schema` but the routed provider
+/// supports only `json_object`, rewrite it to `json_object` (dropping the
+/// schema) and record a `response_format_downgrade` warning. Providers that
+/// drop `response_format` outright (Anthropic) are left to B1's param_dropped.
+fn maybe_downgrade_response_format(
+    req: &mut ChatCompletionRequest,
+    provider: &dyn tt_shared::Provider,
+    warnings: &mut Vec<String>,
+) {
+    let is_schema = req
+        .response_format
+        .as_ref()
+        .is_some_and(|rf| rf.r#type == "json_schema");
+    if !is_schema || provider.supports_response_schema() {
+        return;
+    }
+    if provider
+        .dropped_params(req)
+        .iter()
+        .any(|p| p == "response_format")
+    {
+        return;
+    }
+    req.response_format = Some(tt_shared::messages::ResponseFormat {
+        r#type: "json_object".to_string(),
+        json_schema: None,
+    });
+    warnings.push("response_format_downgrade".to_string());
+}
+
+/// Attach `X-TokenTrimmer-Warnings`: the model-dependent `param_dropped:<name>`
+/// tokens (computed here against `served_model`) plus any pre-dispatch `extra`
+/// tokens (e.g. `response_format_downgrade`). Comma-joined; no-op when empty.
 ///
 /// `served_model` is the model that actually served the request — under
 /// cross-model failover this differs from `req.model`, and some drops
@@ -1505,6 +1546,7 @@ fn attach_warnings(
     provider: &dyn tt_shared::Provider,
     req: &ChatCompletionRequest,
     served_model: &str,
+    extra: &[String],
 ) {
     let dropped = if req.model == served_model {
         provider.dropped_params(req)
@@ -1514,10 +1556,11 @@ fn attach_warnings(
         served.model = served_model.to_string();
         provider.dropped_params(&served)
     };
-    let tokens: Vec<String> = dropped
+    let mut tokens: Vec<String> = dropped
         .into_iter()
         .map(|p| format!("param_dropped:{p}"))
         .collect();
+    tokens.extend(extra.iter().cloned());
     if tokens.is_empty() {
         return;
     }

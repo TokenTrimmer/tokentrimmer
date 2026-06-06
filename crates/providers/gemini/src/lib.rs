@@ -131,6 +131,10 @@ impl Provider for GeminiProvider {
         out
     }
 
+    fn supports_response_schema(&self) -> bool {
+        true
+    }
+
     /// Non-streaming chat completion via
     /// `POST /v1beta/models/{model}:generateContent` (key in `x-goog-api-key` header).
     ///

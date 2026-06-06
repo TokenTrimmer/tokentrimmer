@@ -40,6 +40,14 @@ pub trait Provider: Send + Sync {
         Vec::new()
     }
 
+    /// Whether this provider faithfully honors `response_format: json_schema`
+    /// (structured outputs). Default `false`: the gateway downgrades to
+    /// `json_object` (with a `response_format_downgrade` warning) for providers
+    /// that don't. Override `true` only where schema mode genuinely works.
+    fn supports_response_schema(&self) -> bool {
+        false
+    }
+
     /// Non-streaming chat completion.
     async fn chat_completion(
         &self,
