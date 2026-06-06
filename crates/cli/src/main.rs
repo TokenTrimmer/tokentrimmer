@@ -212,6 +212,16 @@ enum Command {
         skip_workflows: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Tailor the generated config with an AI pass over the repo (needs an API key).
+        #[arg(long)]
+        ai: bool,
+        /// Model for the --ai pass (default: gpt-4o-mini).
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        tt_api_key: Option<String>,
+        #[arg(long)]
+        tt_api_base: Option<String>,
     },
     /// RAG corpus management.
     Retrieval {
@@ -579,13 +589,17 @@ async fn main() -> anyhow::Result<()> {
             skip_hooks,
             skip_workflows,
             dry_run,
+            ai,
+            model,
+            tt_api_key,
+            tt_api_base,
         } => {
             use tt_cli::init::{run, RunOptions};
             let root = path
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().unwrap());
             let opts = RunOptions {
-                root,
+                root: root.clone(),
                 language_override: language,
                 framework_override: framework,
                 interactive,
@@ -600,6 +614,12 @@ async fn main() -> anyhow::Result<()> {
             };
             // `init::run` already prints a styled summary (V1b); no second one.
             run(opts).context("tt init failed")?;
+            // Opt-in AI pass: tailors the just-written artifacts. Skipped on a dry run.
+            if ai && !dry_run {
+                tt_cli::init::ai_tailor(&root, model, tt_api_key, tt_api_base)
+                    .await
+                    .context("tt init --ai pass failed")?;
+            }
         }
         Command::Retrieval { action } => {
             use tt_cli::retrieval as cli_retrieval;
