@@ -60,7 +60,7 @@ construction and the failover loop consume `route_fallbacks` as-is.
 - **Cross-provider safety:** a header fallback whose provider the org has no stored credential for is skipped during dispatch (the source key is never forwarded cross-provider) — the existing `resolve_credentials_for(..., allow_bearer_fallback = pid == source)` guard. In legacy no-store mode the bearer is forwarded to every candidate (unchanged passthrough semantics).
 - **Unknown / typo'd fallback models** are skipped (consistent with route fallbacks — best-effort), not a `400`.
 - **Enables failover with no route:** a non-empty header chain makes `route_fallbacks` non-empty, so the failover path runs even when no route matched.
-- **Pin + fallback:** the pin still sets the primary provider; the header chain (applied after the pin's clear) is used for failover.
+- **Pin + fallback:** a provider pin **wins** — the fallback header is ignored when `X-TokenTrimmer-Provider` is set. (The failover path re-resolves the primary candidate by model id, so it cannot honor a pinned primary provider; rather than silently drop the pin, the pin's single-provider, no-failover behavior takes precedence. Resolved per F9 adversarial review.)
 - Applies to both streaming and non-streaming (both branch on `route_fallbacks`).
 
 ## Testing

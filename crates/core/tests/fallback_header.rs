@@ -168,6 +168,63 @@ async fn fallback_header_enables_failover_without_route() {
 }
 
 #[tokio::test]
+async fn provider_pin_suppresses_fallback_header() {
+    // A provider pin wins over X-TokenTrimmer-Fallback: the request dispatches to
+    // the pinned provider with no failover (the failover path can't honor a pinned
+    // primary), so the header's chain is ignored.
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let pinned_calls = Arc::new(AtomicUsize::new(0));
+    let other_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockProvider {
+        id: "primary",
+        models: &["m-primary"],
+        fails: false,
+        calls: Arc::clone(&primary_calls),
+    }));
+    registry.register(Arc::new(MockProvider {
+        id: "pinned",
+        models: &["m-pinned"],
+        fails: false,
+        calls: Arc::clone(&pinned_calls),
+    }));
+    registry.register(Arc::new(MockProvider {
+        id: "other",
+        models: &["m-other"],
+        fails: false,
+        calls: Arc::clone(&other_calls),
+    }));
+    let app = build_router(AppState::new(registry));
+
+    // Pin to `pinned`; also supply a fallback header → header must be ignored.
+    let body = json!({ "model": "m-primary", "messages": [{"role":"user","content":"hi"}], "stream": false });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-tokentrimmer-provider", "pinned")
+        .header("x-tokentrimmer-fallback", "m-other")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-tokentrimmer-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("pinned"),
+        "pinned provider must serve"
+    );
+    assert_eq!(pinned_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        other_calls.load(Ordering::Relaxed),
+        0,
+        "fallback header must be ignored under a provider pin"
+    );
+}
+
+#[tokio::test]
 async fn fallback_header_overrides_route_chain() {
     let primary_calls = Arc::new(AtomicUsize::new(0));
     let routefb_calls = Arc::new(AtomicUsize::new(0));

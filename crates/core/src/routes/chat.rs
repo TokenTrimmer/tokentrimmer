@@ -643,13 +643,13 @@ pub async fn handler(
         ctx.credentials = c;
     }
     if provider_pin.is_some() {
-        // An explicit provider pin must not fail over to a different provider.
+        // An explicit provider pin must not fail over to a different provider, and
+        // it suppresses the `X-TokenTrimmer-Fallback` override too: the failover
+        // path re-resolves the primary candidate by model id and so cannot honor a
+        // pinned primary provider. The pin wins (single-provider dispatch).
         route_fallbacks.clear();
-    }
-    // `X-TokenTrimmer-Fallback` overrides the route-derived chain. Applied AFTER
-    // the pin's clear, so an explicit chain opts back into failover even when a
-    // provider is pinned (the pin still set the primary provider above).
-    if let Some(chain) = fallback_override_from_header(&headers) {
+    } else if let Some(chain) = fallback_override_from_header(&headers) {
+        // `X-TokenTrimmer-Fallback` overrides the route-derived chain (no pin).
         route_fallbacks = chain;
     }
 
