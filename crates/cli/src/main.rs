@@ -149,6 +149,30 @@ enum Command {
         #[arg(long)]
         tt_api_base: Option<String>,
     },
+    /// Embed text via the gateway and print a cost summary (or --json vectors).
+    Embed {
+        /// Text to embed. One arg → single; many → a batch. Omit to read stdin.
+        input: Vec<String>,
+        /// Embedding model (default: text-embedding-3-small).
+        #[arg(long)]
+        model: Option<String>,
+        /// Reduce output dimensions (Matryoshka models).
+        #[arg(long)]
+        dimensions: Option<u32>,
+        /// Wire encoding format (e.g. "float" or "base64").
+        #[arg(long)]
+        encoding_format: Option<String>,
+        /// Reject (402) if the estimated cost exceeds this many USD.
+        #[arg(long)]
+        cost_limit: Option<f64>,
+        /// Print the full EmbeddingsResponse JSON to stdout (summary → stderr).
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        tt_api_key: Option<String>,
+        #[arg(long)]
+        tt_api_base: Option<String>,
+    },
     /// AI cost/routing advisor: scan a repo + recommend optimizations (read-only).
     Advise {
         /// Repo path to scan (default: current directory).
@@ -520,6 +544,28 @@ async fn main() -> anyhow::Result<()> {
             tt_api_base,
         } => {
             tt_cli::advise::run(path, describe, model, tt_api_key, tt_api_base).await?;
+        }
+        Command::Embed {
+            input,
+            model,
+            dimensions,
+            encoding_format,
+            cost_limit,
+            json,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            tt_cli::embed::run(
+                input,
+                model,
+                dimensions,
+                encoding_format,
+                cost_limit,
+                json,
+                tt_api_key,
+                tt_api_base,
+            )
+            .await?;
         }
         Command::Init {
             path,
