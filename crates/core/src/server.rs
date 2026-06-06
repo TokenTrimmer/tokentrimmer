@@ -100,7 +100,7 @@ mod tests {
     use futures::stream::StreamExt;
     use std::sync::Arc;
     use tt_shared::{
-        messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
+        messages::{Choice, ChunkChoice, ChunkDelta, EmbeddingData, Message, MessageContent},
         pricing::Capability,
         ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
         EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
@@ -235,10 +235,25 @@ mod tests {
 
         async fn embeddings(
             &self,
-            _req: EmbeddingsRequest,
+            req: EmbeddingsRequest,
             _ctx: &RequestContext,
         ) -> Result<EmbeddingsResponse, ProviderError> {
-            Err(ProviderError::Unsupported("mock has no embeddings".into()))
+            Ok(EmbeddingsResponse {
+                object: "list".into(),
+                data: vec![EmbeddingData {
+                    object: "embedding".into(),
+                    index: 0,
+                    embedding: vec![0.1, 0.2, 0.3],
+                }],
+                model: req.model,
+                usage: Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 0,
+                    total_tokens: 100,
+                    cached_tokens: 0,
+                    cache_creation_input_tokens: None,
+                },
+            })
         }
     }
 
@@ -451,12 +466,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embeddings_returns_501_not_implemented() {
-        let body = serde_json::json!({
-            "model": "text-embedding-3-small",
-            "input": "hello",
-        });
-        let response = app()
+    async fn embeddings_dispatch_returns_200_with_headers() {
+        let body = serde_json::json!({ "model": "mock-model-1", "input": "hello" });
+        let response = app_with_mock()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -467,8 +479,38 @@ mod tests {
             )
             .await
             .unwrap();
-        // 501 Not Implemented — not a misleading 404 (§4.15).
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        for h in [
+            "x-tokentrimmer-trace-id",
+            "x-tokentrimmer-provider",
+            "x-tokentrimmer-model-used",
+            "x-tokentrimmer-cost-usd",
+            "x-tokentrimmer-baseline-cost-usd",
+            "x-tokentrimmer-saved-usd",
+        ] {
+            assert!(response.headers().contains_key(h), "missing header {h}");
+        }
+        assert_eq!(
+            response.headers()["x-tokentrimmer-model-used"]
+                .to_str()
+                .unwrap(),
+            "mock-model-1"
+        );
+        // 100 input tokens × $1.0/M (mock pricing) = $0.0001.
+        let cost: f64 = response.headers()["x-tokentrimmer-cost-usd"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((cost - 0.0001).abs() < 1e-9, "cost = {cost}");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["data"][0]["embedding"][0], 0.1);
+        assert_eq!(v["model"], "mock-model-1");
     }
 
     // ── Dispatch tests (new — w6-gateway-dispatch) ─────────────────────────────
