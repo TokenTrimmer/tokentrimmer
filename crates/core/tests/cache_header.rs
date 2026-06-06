@@ -205,7 +205,7 @@ async fn header_read_only_does_not_write() {
 async fn header_disabled_skips_read_and_write() {
     let (app, calls) = app_with_l1(false);
     warm(&app).await; // calls == 1, cache populated
-    // disabled must NOT read the warm cache.
+                      // disabled must NOT read the warm cache.
     let r = app
         .clone()
         .oneshot(req(Some("disabled"), None, None))
@@ -219,13 +219,17 @@ async fn header_disabled_skips_read_and_write() {
 async fn header_bypass_skips_read_but_writes() {
     let (app, calls) = app_with_l1(false);
     warm(&app).await; // calls == 1
-    // bypass skips the lookup → provider called again...
+                      // bypass skips the lookup → provider called again...
     let r = app
         .clone()
         .oneshot(req(Some("bypass"), None, None))
         .await
         .unwrap();
-    assert_ne!(cache_hdr(&r).as_deref(), Some("hit-l1"), "bypass skips lookup");
+    assert_ne!(
+        cache_hdr(&r).as_deref(),
+        Some("hit-l1"),
+        "bypass skips lookup"
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     tokio::time::sleep(Duration::from_millis(50)).await;
     // ...but it refreshed the cache → a normal request now hits.
@@ -292,9 +296,9 @@ async fn force_write_does_not_cache_tool_calls() {
 async fn header_beats_body_tt_extras() {
     let (app, calls) = app_with_l1(false);
     warm(&app).await; // calls == 1, cache populated
-    // Body `tt_extras.cache.mode = "bypass"` (CacheMode::Bypass → no lookup) would
-    // skip the read; the header `read-only` reads. Header wins → hit. (Body uses
-    // CacheMode names — bypass/read-only/refresh/normal — NOT the header names.)
+                      // Body `tt_extras.cache.mode = "bypass"` (CacheMode::Bypass → no lookup) would
+                      // skip the read; the header `read-only` reads. Header wins → hit. (Body uses
+                      // CacheMode names — bypass/read-only/refresh/normal — NOT the header names.)
     let r = app
         .clone()
         .oneshot(req(Some("read-only"), None, Some("bypass")))
