@@ -58,7 +58,7 @@ fn parse_ai_config(text: &str) -> Option<AiConfig> {
 /// comments. Whole integers keep the bash cost-cap hook parsing them.
 fn apply_budget_caps(content: &str, cfg: &AiConfig) -> String {
     let round = |v: f64| -> u64 { v.max(0.0).round() as u64 };
-    content
+    let mut out = content
         .lines()
         .map(|line| {
             let key = line.split('=').next().unwrap_or("").trim();
@@ -75,42 +75,53 @@ fn apply_budget_caps(content: &str, cfg: &AiConfig) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    // `lines()` drops a trailing newline; restore it so the file keeps its
+    // POSIX final-newline (the template ends with one).
+    if content.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
-/// Build the AI section (wrapped in the markers).
+/// Build the AI section (wrapped in the markers). The body is sanitized of any
+/// marker strings the model may have injected (via `notes`/`reason`/etc.), so the
+/// only `AI_START`/`AI_END` in the output are our wrappers — keeping
+/// [`upsert_marked_section`] idempotent on re-runs.
 fn render_ai_section(detected: &[ModelUsage], cfg: &AiConfig) -> String {
-    let mut s = String::new();
-    s.push_str(AI_START);
-    s.push_str("\n## TokenTrimmer (AI) recommendations\n\n");
+    let mut body = String::from("## TokenTrimmer (AI) recommendations\n\n");
     if detected.is_empty() {
-        s.push_str("No model usage was detected in the codebase.\n\n");
+        body.push_str("No model usage was detected in the codebase.\n\n");
     } else {
-        s.push_str("Detected models:\n");
+        body.push_str("Detected models:\n");
         for m in detected {
-            s.push_str(&format!(
+            body.push_str(&format!(
                 "- `{}` ({} file(s), e.g. {})\n",
                 m.id, m.count, m.example_file
             ));
         }
-        s.push('\n');
+        body.push('\n');
     }
     if !cfg.routes.is_empty() {
-        s.push_str("Recommended routes (apply in your TokenTrimmer dashboard):\n");
+        body.push_str("Recommended routes (apply in your TokenTrimmer dashboard):\n");
         for r in &cfg.routes {
             match &r.reason {
-                Some(reason) => s.push_str(&format!("- `{}` → `{}` — {}\n", r.from, r.to, reason)),
-                None => s.push_str(&format!("- `{}` → `{}`\n", r.from, r.to)),
+                Some(reason) => {
+                    body.push_str(&format!("- `{}` → `{}` — {}\n", r.from, r.to, reason))
+                }
+                None => body.push_str(&format!("- `{}` → `{}`\n", r.from, r.to)),
             }
         }
-        s.push('\n');
+        body.push('\n');
     }
     if let Some(notes) = &cfg.notes {
-        s.push_str(notes);
-        s.push('\n');
+        body.push_str(notes);
+        body.push('\n');
     }
-    s.push_str(AI_END);
-    s
+    // Defend idempotency: a malicious/garbled model reply could embed our markers
+    // in free-text — strip them so re-runs still match exactly one block.
+    let body = body.replace(AI_START, "").replace(AI_END, "");
+    format!("{AI_START}\n{body}{AI_END}")
 }
 
 /// Insert (append) the section, or replace the existing marked block. Idempotent.
@@ -256,6 +267,32 @@ mod tests {
         assert!(out.contains("weekly_cap_usd = 50"), "untouched: {out}");
         let both = apply_budget_caps(orig, &cfg(Some(3.0), Some(20.0)));
         assert!(both.contains("daily_cap_usd = 3") && both.contains("weekly_cap_usd = 20"));
+        // Trailing newline is preserved (was present) / absent (was absent).
+        assert!(out.ends_with('\n'), "trailing newline preserved: {out:?}");
+        assert!(
+            !apply_budget_caps("daily_cap_usd = 1", &cfg(Some(2.0), None)).ends_with('\n'),
+            "no trailing newline added when input had none"
+        );
+    }
+
+    #[test]
+    fn render_ai_section_strips_injected_markers_and_stays_idempotent() {
+        // A model reply whose `notes` embeds our end-marker must not break the
+        // single-block invariant.
+        let mut c = cfg(Some(1.0), Some(2.0));
+        c.notes = Some(format!("sneaky {AI_END} text"));
+        let section = render_ai_section(&[], &c);
+        assert_eq!(
+            section.matches(AI_END).count(),
+            1,
+            "only the wrapper end: {section}"
+        );
+        assert_eq!(section.matches(AI_START).count(), 1);
+        // Upsert twice → still exactly one block.
+        let once = upsert_marked_section("# AGENTS\n", &section);
+        let twice = upsert_marked_section(&once, &render_ai_section(&[], &c));
+        assert_eq!(twice.matches(AI_START).count(), 1, "idempotent: {twice}");
+        assert_eq!(twice.matches(AI_END).count(), 1);
     }
 
     #[test]
