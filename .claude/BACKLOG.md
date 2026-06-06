@@ -15,6 +15,16 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 
 ---
 
+## Post-F-series follow-ups (2026-06-06)
+
+Verified-open items remaining after the F1–F12 series + post-roadmap queue (#38–#41) closed out most of the prior "deferred" list. Each runs the full brainstorm→spec→plan→TDD→adversarial-review→green-CI→PR flow.
+
+- [ ] [P2] [ttc-chatstream-stream-impl] rust-crate-builder: Implement `futures::Stream for ChatStream` in `crates/client/src/lib.rs` (today `ChatStream` only exposes `next()`; the inner field is already a boxed `futures::Stream`). Lets callers use `StreamExt` combinators / `for_each` / `collect`. Keep the existing `next()` + `header_cost()`. (est: $0.40)
+- [ ] [P2] [gw-warnings-header] rust-crate-builder: Emit the `X-TokenTrimmer-Warnings` **response** header (doc'd "Planned (not yet emitted)", 04-gateway-api-reference.md:427). Surface param-drop notices (`param_dropped:<names>`) + the existing `response_format_downgrade` (currently only described in prose at :150/:300). Flip the doc row to Honored. (est: $0.80)
+- [ ] [P3] [gw-traceparent-ingest] rust-crate-builder: Honor the `X-TokenTrimmer-Trace-Parent` **request** header (doc'd "Planned (not yet honored)", 04-gateway-api-reference.md:412) — ingest the W3C traceparent and thread it through the existing trace middleware. Flip the doc row to Honored. (est: $0.80)
+
+---
+
 ## Review follow-ups (2026-05-30) — public repo (gateway, cache, routing, plan, inspect, retrieval, auth, preview, MCP, CLI, providers)
 
 ### P0 — critical / highest-leverage
