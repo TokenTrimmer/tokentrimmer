@@ -88,6 +88,15 @@ pub(crate) fn provider_override_from_header(headers: &HeaderMap) -> Option<Strin
         .filter(|s| !s.is_empty())
 }
 
+/// `X-TokenTrimmer-Route` — an exact route name to force (case-sensitive).
+pub(crate) fn route_override_from_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-tokentrimmer-route")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Apply an `X-TokenTrimmer-Provider` pin. Returns the provider to dispatch and,
 /// when it differs from `current`, the credentials to use. The pin overrides the
 /// routed/inferred provider (the routed model is kept). Cross-provider pins
@@ -2006,6 +2015,21 @@ mod cache_header_tests {
 mod provider_override_tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn route_override_header_parsing() {
+        let mut h = HeaderMap::new();
+        assert_eq!(route_override_from_header(&h), None);
+        // case-preserved (route names are case-sensitive labels), trimmed.
+        h.insert("x-tokentrimmer-route", "  Cheap-For-Short ".parse().unwrap());
+        assert_eq!(
+            route_override_from_header(&h).as_deref(),
+            Some("Cheap-For-Short")
+        );
+        let mut empty = HeaderMap::new();
+        empty.insert("x-tokentrimmer-route", "   ".parse().unwrap());
+        assert_eq!(route_override_from_header(&empty), None);
+    }
 
     #[test]
     fn provider_override_header_parsing() {
