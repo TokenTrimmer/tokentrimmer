@@ -67,7 +67,6 @@ pub fn build_router_with_retrieval(
         middleware::auth::middleware,
     ))
     .layer(axum::middleware::from_fn(middleware::trace::middleware))
-    .layer(axum::middleware::from_fn(middleware::latency::middleware))
     .layer(TraceLayer::new_for_http())
     .layer(TimeoutLayer::with_status_code(
         StatusCode::GATEWAY_TIMEOUT,
@@ -83,6 +82,10 @@ pub fn build_router_with_retrieval(
     // large-context chat requests (256k-token windows can exceed it). Sized
     // for the largest supported context; returns 413 on exceed. (§4.15)
     .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+    // Outermost app middleware: stamps `X-TokenTrimmer-Latency-Ms` on EVERY
+    // response — including the timeout 504 and body-limit 413 produced by the
+    // layers it wraps (the later `.layer()` is the outer one in axum/tower).
+    .layer(axum::middleware::from_fn(middleware::latency::middleware))
     .with_state(state)
 }
 
@@ -522,6 +525,36 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], "cost_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn cost_limit_counts_full_prompt_not_just_last_message() {
+        // A large system prompt + a tiny trailing user message. The limit is set
+        // so the 402 trips ONLY when the FULL prompt is counted — estimating from
+        // just the last user message (the prior bug) would undercount and pass.
+        let big_system = "word ".repeat(400); // ~2000 chars → ~500 tokens (mock = chars/4)
+        let body = serde_json::json!({
+            "model": "mock-model-1",
+            "messages": [
+                { "role": "system", "content": big_system },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 1,
+            "stream": false,
+        });
+        let response = app_with_mock()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("x-tokentrimmer-cost-limit-usd", "0.0001")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     }
 
     #[tokio::test]

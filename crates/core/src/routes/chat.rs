@@ -504,10 +504,13 @@ pub async fn handler(
 
     // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header.
     // Applies to every request (routed or not), priced on the final model.
+    // Estimate input tokens from the ENTIRE prompt (system + all turns), matching
+    // the streaming/failover paths — counting only the last user message would
+    // undercount multi-turn / large-system-prompt requests and let an over-limit
+    // request slip past the cap.
     {
-        let cl_input_tokens = last_user_message_text(&req)
-            .map(|s| tt_tokenize::estimate_tokens(provider.id(), s))
-            .unwrap_or(0);
+        let combined = tt_shared::message_text_for_estimation(&req);
+        let cl_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
         enforce_cost_limit(
             cost_limit_from_header(&headers),
             provider.pricing(&req.model).as_ref(),
