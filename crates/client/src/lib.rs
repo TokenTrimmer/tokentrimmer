@@ -160,6 +160,8 @@ pub struct StreamUsage {
 pub enum StreamEvent {
     /// A chunk of assistant text.
     Delta(String),
+    /// Complete tool call(s) the model requested (emitted at finish).
+    ToolCalls(Vec<ToolCall>),
     /// The terminal cost/usage event.
     Usage(StreamUsage),
 }
@@ -167,6 +169,7 @@ pub enum StreamEvent {
 /// Internal parse result for one SSE frame.
 enum Frame {
     Delta(String),
+    ToolCalls(Vec<ToolCall>),
     Usage(StreamUsage),
     Done,
     Ignore,
@@ -202,6 +205,15 @@ fn parse_sse_frame(frame: &str) -> Frame {
         Ok(v) => v,
         Err(_) => return Frame::Ignore,
     };
+    if let Some(tcs) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+        if !tcs.is_empty() {
+            if let Ok(calls) = serde_json::from_value::<Vec<ToolCall>>(Value::Array(tcs.clone())) {
+                if !calls.is_empty() {
+                    return Frame::ToolCalls(calls);
+                }
+            }
+        }
+    }
     match v["choices"][0]["delta"]["content"].as_str() {
         Some(c) if !c.is_empty() => Frame::Delta(c.to_string()),
         _ => Frame::Ignore,
@@ -499,6 +511,7 @@ impl ChatStream {
         for frame in drain_frames(&mut self.buf) {
             match parse_sse_frame(&frame) {
                 Frame::Delta(t) => self.pending.push_back(StreamEvent::Delta(t)),
+                Frame::ToolCalls(t) => self.pending.push_back(StreamEvent::ToolCalls(t)),
                 Frame::Usage(u) => self.pending.push_back(StreamEvent::Usage(u)),
                 Frame::Done => self.done = true,
                 Frame::Ignore => {}
@@ -740,6 +753,7 @@ mod tests {
         while let Some(ev) = stream.next().await.unwrap() {
             match ev {
                 StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::ToolCalls(_) => {}
                 StreamEvent::Usage(u) => usage = Some(u),
             }
         }
@@ -791,6 +805,7 @@ mod tests {
         while let Some(ev) = stream.next().await.unwrap() {
             match ev {
                 StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::ToolCalls(_) => {}
                 StreamEvent::Usage(u) => usage = Some(u),
             }
         }
@@ -955,6 +970,16 @@ mod tests {
             Frame::Usage(u) if u.input_tokens == 10 && (u.saved_usd - 0.0003).abs() < 1e-9
         ));
         assert!(matches!(parse_sse_frame("data: [DONE]"), Frame::Done));
+        // A tool-calls delta frame → Frame::ToolCalls with the complete call.
+        let tool = r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        assert!(matches!(
+            parse_sse_frame(tool),
+            Frame::ToolCalls(calls)
+                if calls.len() == 1
+                    && calls[0].id == "call_1"
+                    && calls[0].function.name == "get_weather"
+                    && calls[0].function.arguments == "{\"city\":\"SF\"}"
+        ));
         assert!(matches!(
             parse_sse_frame(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#),
             Frame::Ignore
