@@ -100,11 +100,17 @@ async fn test_tip_anchor_detects_truncation() {
     let truncated = &entries[..entries.len() - 1];
     let err = verify_chain_with_anchor(truncated, &vk, &anchor)
         .expect_err("truncated chain must fail against the old tip");
-    assert!(matches!(err, VerifyError::TruncatedChain { .. }), "got {err:?}");
+    assert!(
+        matches!(err, VerifyError::TruncatedChain { .. }),
+        "got {err:?}"
+    );
 
     // Empty chain + anchor → also TruncatedChain.
     let err2 = verify_chain_with_anchor(&[], &vk, &anchor).expect_err("empty must fail");
-    assert!(matches!(err2, VerifyError::TruncatedChain { .. }), "got {err2:?}");
+    assert!(
+        matches!(err2, VerifyError::TruncatedChain { .. }),
+        "got {err2:?}"
+    );
 }
 
 // ─── 1. Round-trip single entry ───────────────────────────────────────────────
