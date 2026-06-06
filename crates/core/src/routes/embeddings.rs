@@ -15,9 +15,11 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use tt_auth::ApiKeyContext;
-// `EmbeddingInput` is only exported from `tt_shared::messages` (not the crate root).
-use tt_shared::messages::{EmbeddingInput, Message, MessageContent};
-use tt_shared::{ChatCompletionRequest, EmbeddingsRequest, RequestContext};
+// `EmbeddingInput`/`EmbeddingData` are only exported from `tt_shared::messages`.
+use tt_shared::messages::{EmbeddingData, EmbeddingInput, Message, MessageContent};
+use tt_shared::{
+    ChatCompletionRequest, EmbeddingsRequest, EmbeddingsResponse, RequestContext, Usage,
+};
 
 use crate::middleware::trace::TraceId;
 use crate::routes::chat::{
@@ -33,6 +35,50 @@ fn input_as_text(input: &EmbeddingInput) -> String {
         EmbeddingInput::Single(s) => s.clone(),
         EmbeddingInput::Batch(v) => v.join("\n"),
     }
+}
+
+/// Deterministic synthetic embeddings for `tt_test_*` sandbox keys — no provider
+/// call, zero cost. One small fixed vector per input item. Honors the documented
+/// sandbox contract (docs/04-gateway-api-reference.md: "Embeddings return
+/// deterministic vectors"); mirrors the chat handler's `sandbox_response`.
+fn sandbox_embeddings_response(req: &EmbeddingsRequest, trace_id: Uuid) -> Response {
+    let n = match &req.input {
+        EmbeddingInput::Single(_) => 1,
+        EmbeddingInput::Batch(v) => v.len(),
+    };
+    let data: Vec<EmbeddingData> = (0..n)
+        .map(|i| EmbeddingData {
+            object: "embedding".into(),
+            index: u32::try_from(i).unwrap_or(0),
+            embedding: vec![0.0, 0.1, 0.2, 0.3],
+        })
+        .collect();
+    let response = EmbeddingsResponse {
+        object: "list".into(),
+        data,
+        model: req.model.clone(),
+        usage: Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        },
+    };
+    let mut http = Json(response).into_response();
+    attach_cost_headers(
+        http.headers_mut(),
+        trace_id,
+        "sandbox",
+        &req.model,
+        0.0,
+        0.0,
+        0.0,
+    );
+    if let Ok(v) = "sandbox".parse() {
+        http.headers_mut().insert("x-tokentrimmer-cache", v);
+    }
+    http
 }
 
 pub async fn handler(
@@ -66,6 +112,12 @@ pub async fn handler(
     } else {
         Uuid::now_v7()
     };
+
+    // 2a. Sandbox short-circuit: `tt_test_*` keys return deterministic synthetic
+    //     embeddings without contacting any real provider (mirrors chat.rs).
+    if raw_bearer.starts_with("tt_test_") {
+        return Ok(sandbox_embeddings_response(&req, trace_id));
+    }
 
     // 3. Identity + credentials (embeddings aren't cached, so no caller_tier/L2).
     let (org_id, api_key_id) = match auth_ctx.as_deref() {

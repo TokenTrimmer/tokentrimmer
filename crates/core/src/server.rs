@@ -513,6 +513,39 @@ mod tests {
         assert_eq!(v["model"], "mock-model-1");
     }
 
+    #[tokio::test]
+    async fn embeddings_sandbox_key_short_circuits() {
+        let body = serde_json::json!({ "model": "mock-model-1", "input": "hello" });
+        let response = app_with_mock()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer tt_test_abc123")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // The sandbox short-circuit reports provider "sandbox"; a real dispatch
+        // through MockProvider would report "mock" — proving no provider call.
+        assert_eq!(
+            response.headers()["x-tokentrimmer-provider"]
+                .to_str()
+                .unwrap(),
+            "sandbox"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["data"][0]["embedding"].is_array());
+        assert_eq!(v["model"], "mock-model-1");
+    }
+
     // ── Dispatch tests (new — w6-gateway-dispatch) ─────────────────────────────
 
     /// Non-streaming dispatch returns 200 with JSON body and all six
