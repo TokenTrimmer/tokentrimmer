@@ -119,6 +119,7 @@ toml = "0.8"
 # Internal crate refs
 tt-shared = { path = "crates/shared", version = "0.1" }
 tt-tokenize = { path = "crates/tokenize" }
+tt-client = { path = "crates/client" }
 tt-core = { path = "crates/core" }
 tt-cache = { path = "crates/cache", version = "0.1" }
 tt-routing = { path = "crates/routing" }

@@ -211,7 +211,7 @@ pub async fn run(
         .api_key_string()
         .context("no API key — run `tt login` or set TT_API_KEY")?;
     let base = ctx.base_url.trim_end_matches('/').to_string();
-    let http = reqwest::Client::new();
+    let client = tt_client::Client::new(base.clone(), key.clone());
 
     let root = path.unwrap_or_else(|| ".".to_string());
     let detected = detect_models(Path::new(&root));
@@ -232,7 +232,7 @@ pub async fn run(
     let reg = tools::build_registry();
     let mut ledger = Ledger::default();
     ui::heading("TokenTrimmer advisor");
-    tools::run_tool_turn(&http, &base, &key, &mut conv, &reg, &mut ledger).await;
+    tools::run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;
     Ok(())
 }
 

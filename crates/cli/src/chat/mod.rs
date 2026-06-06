@@ -2,9 +2,7 @@
 //! surfacing per-turn cost + savings from the gateway's streaming usage event.
 
 use anyhow::Context as _;
-use futures::StreamExt as _;
 use serde::Deserialize;
-use serde_json::json;
 
 use tt_shared::messages::{Message, MessageContent};
 
@@ -29,49 +27,16 @@ pub struct UsageInfo {
     pub cached_tokens: u64,
 }
 
-/// One parsed SSE frame from the gateway stream.
-#[derive(Debug)]
-pub enum StreamEvent {
-    Delta(String),
-    Usage(UsageInfo),
-    Done,
-    Ignore,
-}
-
-/// Parse a single SSE frame (the text between `\n\n` separators).
-#[must_use]
-pub fn parse_sse_frame(frame: &str) -> StreamEvent {
-    let mut event_name: Option<&str> = None;
-    let mut data = String::new();
-    for line in frame.lines() {
-        if let Some(v) = line.strip_prefix("event:") {
-            event_name = Some(v.trim());
-        } else if let Some(v) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(v.strip_prefix(' ').unwrap_or(v));
+impl From<tt_client::StreamUsage> for UsageInfo {
+    fn from(u: tt_client::StreamUsage) -> Self {
+        Self {
+            cost_usd: u.cost_usd,
+            baseline_cost_usd: u.baseline_cost_usd,
+            saved_usd: u.saved_usd,
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cached_tokens: u.cached_tokens,
         }
-    }
-    let data = data.trim();
-    if data.is_empty() {
-        return StreamEvent::Ignore;
-    }
-    if data == "[DONE]" {
-        return StreamEvent::Done;
-    }
-    if event_name == Some("tokentrimmer.usage") {
-        return serde_json::from_str::<UsageInfo>(data)
-            .map(StreamEvent::Usage)
-            .unwrap_or(StreamEvent::Ignore);
-    }
-    let v: serde_json::Value = match serde_json::from_str(data) {
-        Ok(v) => v,
-        Err(_) => return StreamEvent::Ignore,
-    };
-    match v["choices"][0]["delta"]["content"].as_str() {
-        Some(c) if !c.is_empty() => StreamEvent::Delta(c.to_string()),
-        _ => StreamEvent::Ignore,
     }
 }
 
@@ -305,75 +270,42 @@ fn last_assistant_text(conv: &Conversation) -> Option<String> {
     })
 }
 
-/// Drain complete SSE frames (separated by a blank line) from the byte buffer,
-/// each decoded as a trimmed `String`. Incomplete trailing bytes stay in `buf`,
-/// so a multi-byte UTF-8 char (or a frame) split across network chunks is never
-/// decoded mid-sequence.
-fn drain_frames(buf: &mut Vec<u8>) -> Vec<String> {
-    let mut out = Vec::new();
-    while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
-        let frame: Vec<u8> = buf.drain(..idx + 2).collect();
-        out.push(String::from_utf8_lossy(&frame).trim_end().to_string());
-    }
-    out
-}
-
 /// Stream one turn. Prints the assistant text live and the cost footer, and
 /// returns the full reply for history. Returns `Err` (turn failed) on a non-2xx
 /// gateway response so the caller can drop the unanswered user message.
 async fn stream_turn(
-    http: &reqwest::Client,
-    base: &str,
-    key: &str,
+    client: &tt_client::Client,
     conv: &Conversation,
 ) -> anyhow::Result<(String, Option<UsageInfo>)> {
-    let body = json!({
-        "model": conv.model,
-        "messages": conv.wire_messages(),
-        "stream": true,
-    });
-    let resp = http
-        .post(format!("{base}/v1/chat/completions"))
-        .bearer_auth(key)
-        .json(&body)
-        .send()
+    let mut stream = client
+        .chat()
+        .model(&conv.model)
+        .messages(conv.wire_messages())
+        .stream()
         .await
         .context("request to gateway failed")?;
 
-    let served_model = resp
-        .headers()
-        .get("x-tokentrimmer-model-used")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(&conv.model)
-        .to_string();
+    let served_model = stream
+        .header_cost()
+        .model_used
+        .clone()
+        .unwrap_or_else(|| conv.model.clone());
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("gateway returned {status}: {}", text.trim());
-    }
-
-    let mut stream = resp.bytes_stream();
     let mut spinner = Some(ui::spinner("…"));
-    let mut buf: Vec<u8> = Vec::new();
     let mut reply = String::new();
     let mut usage: Option<UsageInfo> = None;
 
-    'outer: while let Some(chunk) = stream.next().await {
-        buf.extend_from_slice(&chunk.context("stream error")?);
-        for frame in drain_frames(&mut buf) {
-            match parse_sse_frame(&frame) {
-                StreamEvent::Delta(t) => {
-                    spinner.take(); // clear the spinner on the first token
-                    print!("{t}");
-                    use std::io::Write as _;
-                    let _ = std::io::stdout().flush();
-                    reply.push_str(&t);
-                }
-                StreamEvent::Usage(u) => usage = Some(u),
-                StreamEvent::Done => break 'outer,
-                StreamEvent::Ignore => {}
+    while let Some(ev) = stream.next().await.context("stream error")? {
+        match ev {
+            tt_client::StreamEvent::Delta(t) => {
+                spinner.take(); // clear the spinner on the first token
+                print!("{t}");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                reply.push_str(&t);
             }
+            tt_client::StreamEvent::Usage(u) => usage = Some(UsageInfo::from(u)),
+            _ => {} // StreamEvent is #[non_exhaustive] (external crate) → wildcard required
         }
     }
     drop(spinner);
@@ -397,14 +329,8 @@ async fn stream_turn(
 /// Stream the current conversation: print live, push the assistant reply, and
 /// update the ledger. Returns true on success. The caller decides whether to
 /// drop the pending user turn on failure.
-async fn do_turn(
-    http: &reqwest::Client,
-    base: &str,
-    key: &str,
-    conv: &mut Conversation,
-    ledger: &mut Ledger,
-) -> bool {
-    match stream_turn(http, base, key, conv).await {
+async fn do_turn(client: &tt_client::Client, conv: &mut Conversation, ledger: &mut Ledger) -> bool {
+    match stream_turn(client, conv).await {
         Ok((reply, usage)) => {
             conv.push_assistant(reply);
             if let Some(u) = usage {
@@ -421,18 +347,16 @@ async fn do_turn(
 
 /// Route a turn to the tool-calling loop (tools on) or the streamed path (off).
 async fn dispatch_turn(
-    http: &reqwest::Client,
-    base: &str,
-    key: &str,
+    client: &tt_client::Client,
     conv: &mut Conversation,
     ledger: &mut Ledger,
     reg: &tt_mcp::tools::Registry,
     tools_enabled: bool,
 ) -> bool {
     if tools_enabled {
-        tools::run_tool_turn(http, base, key, conv, reg, ledger).await
+        tools::run_tool_turn(client, conv, reg, ledger).await
     } else {
-        do_turn(http, base, key, conv, ledger).await
+        do_turn(client, conv, ledger).await
     }
 }
 
@@ -508,6 +432,7 @@ pub async fn run(
         .context("no API key — run `tt login --token <KEY>` or set TT_API_KEY")?;
     let base = ctx.base_url.trim_end_matches('/').to_string();
     let http = reqwest::Client::new();
+    let client = tt_client::Client::new(base.clone(), key.clone());
 
     let mut conv = match resume {
         Some(n) => {
@@ -546,16 +471,8 @@ pub async fn run(
                         let snapshot = conv.messages.clone();
                         conv.push_user(t);
                         ctx.manage(&mut conv);
-                        if !dispatch_turn(
-                            &http,
-                            &base,
-                            &key,
-                            &mut conv,
-                            &mut ledger,
-                            &registry,
-                            tools_enabled,
-                        )
-                        .await
+                        if !dispatch_turn(&client, &mut conv, &mut ledger, &registry, tools_enabled)
+                            .await
                         {
                             // failed turn → no-op on history: drop the user turn
                             // AND undo any trim manage() did before sending.
@@ -643,9 +560,7 @@ pub async fn run(
                             conv.push_user(t);
                             ctx.manage(&mut conv);
                             if !dispatch_turn(
-                                &http,
-                                &base,
-                                &key,
+                                &client,
                                 &mut conv,
                                 &mut ledger,
                                 &registry,
@@ -662,9 +577,7 @@ pub async fn run(
                     Command::Retry => match prepare_retry(&mut conv) {
                         RetryPlan::Ready { restore } => {
                             if !dispatch_turn(
-                                &http,
-                                &base,
-                                &key,
+                                &client,
                                 &mut conv,
                                 &mut ledger,
                                 &registry,
@@ -727,32 +640,35 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_content_delta() {
-        let f = r#"data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}"#;
-        assert!(matches!(parse_sse_frame(f), StreamEvent::Delta(t) if t == "Hi"));
-    }
+    use httpmock::prelude::*;
 
-    #[test]
-    fn parse_usage_event() {
-        let f = "event: tokentrimmer.usage\ndata: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":10,\"output_tokens\":20,\"cached_tokens\":0}";
-        match parse_sse_frame(f) {
-            StreamEvent::Usage(u) => {
-                assert_eq!(u.input_tokens, 10);
-                assert!((u.saved_usd - 0.0003).abs() < 1e-9);
-            }
-            other => panic!("expected Usage, got {other:?}"),
-        }
-    }
+    #[tokio::test]
+    async fn stream_turn_streams_reply_and_usage() {
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "event: tokentrimmer.usage\n",
+            "data: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":10,\"output_tokens\":2,\"cached_tokens\":0}\n\n",
+            "data: [DONE]\n\n",
+        );
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .body(sse);
+        });
 
-    #[test]
-    fn parse_done_and_ignore() {
-        assert!(matches!(parse_sse_frame("data: [DONE]"), StreamEvent::Done));
-        assert!(matches!(
-            parse_sse_frame(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#),
-            StreamEvent::Ignore
-        ));
-        assert!(matches!(parse_sse_frame(""), StreamEvent::Ignore));
+        let client = tt_client::Client::new(server.base_url(), "k");
+        let mut conv = Conversation::new("gpt-4o-mini".into(), None);
+        conv.push_user("hi".into());
+
+        let (reply, usage) = stream_turn(&client, &conv).await.unwrap();
+        assert_eq!(reply, "Hello");
+        let u = usage.expect("usage event");
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 2);
     }
 
     #[test]
@@ -775,22 +691,6 @@ mod tests {
         assert_eq!(s, "· gpt-4o-mini · 30 tok · $0.0001 · saved 75%");
         let s2 = format_turn_footer("gpt-4o", 5, 5, 0.001, 0.0, 0.0);
         assert_eq!(s2, "· gpt-4o · 10 tok · $0.0010");
-    }
-
-    #[test]
-    fn drain_frames_handles_chunk_split_multibyte() {
-        // "café" (é = 2 bytes) + frame terminator, split across two chunks so
-        // the second chunk starts mid-é and mid-terminator.
-        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}\n\n".as_bytes();
-        let (a, b) = full.split_at(full.len() - 3);
-        let mut buf: Vec<u8> = Vec::new();
-        buf.extend_from_slice(a);
-        assert!(drain_frames(&mut buf).is_empty(), "no complete frame yet");
-        buf.extend_from_slice(b);
-        let frames = drain_frames(&mut buf);
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(parse_sse_frame(&frames[0]), StreamEvent::Delta(t) if t == "café"));
-        assert!(buf.is_empty());
     }
 
     #[test]
