@@ -31,9 +31,9 @@ feature/adapter work (cache-decision wiring, route-by-name, provider override wi
 cross-provider credentials, fallback chains, `RequestContext.deadline` enforcement
 in adapters) for a future slice.
 
-## Part A — Shared helpers (`crates/core/src/routes/chat.rs`)
+## Part A — Cost-limit helpers (`crates/core/src/routes/chat.rs`)
 
-Three small `pub(crate)` helpers (so the embeddings handler reuses them):
+Two small `pub(crate)` helpers (so the embeddings handler reuses them):
 
 ```rust
 /// Parse `X-TokenTrimmer-Cost-Limit-Usd` (a positive USD ceiling), if present.
@@ -66,17 +66,43 @@ pub(crate) fn enforce_cost_limit(
     Ok(())
 }
 
-/// Attach `X-TokenTrimmer-Latency-Ms` from a request-start instant.
-pub(crate) fn attach_latency_header(headers: &mut HeaderMap, started: std::time::Instant) {
-    let ms = started.elapsed().as_millis();
-    if let Ok(v) = ms.to_string().parse() {
-        headers.insert("x-tokentrimmer-latency-ms", v);
-    }
-}
 ```
 
 (`estimate_cost_usd`, `ApiError`, `ApiResult`, `ModelPricing` are already in scope
 in `chat.rs`; `last_user_message_text` is already defined there.)
+
+## Part A2 — Latency middleware (`crates/core/src/middleware/latency.rs`)
+
+`X-TokenTrimmer-Latency-Ms` is implemented as a **response middleware** (mirroring
+the existing `trace` middleware), not per-handler insertion. The handler-side
+`attach_cost_headers` sites live in free functions (`build_hit_l1_response`,
+`sandbox_response`, …) where `request_started` isn't in scope, so threading it
+everywhere would be invasive and incomplete. A middleware times every request and
+sets the header on **every** response — success, cache hit, sandbox, or error —
+which is exactly the "always present" contract.
+
+```rust
+use axum::{extract::Request, http::{HeaderName, HeaderValue}, middleware::Next, response::Response};
+
+pub const LATENCY_HEADER: HeaderName = HeaderName::from_static("x-tokentrimmer-latency-ms");
+
+pub async fn middleware(req: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let mut response = next.run(req).await;
+    let ms = started.elapsed().as_millis();
+    if let Ok(value) = HeaderValue::from_str(&ms.to_string()) {
+        response.headers_mut().insert(LATENCY_HEADER, value);
+    }
+    response
+}
+```
+
+Wire-up:
+- `crates/core/src/middleware/mod.rs`: add `pub mod latency;`.
+- `crates/core/src/server.rs` `build_router_with_retrieval`: add
+  `.layer(axum::middleware::from_fn(middleware::latency::middleware))` adjacent to
+  the existing `.layer(axum::middleware::from_fn(middleware::trace::middleware))`
+  (line ~69).
 
 ## Part B — Chat handler wiring
 
@@ -92,27 +118,22 @@ in `chat.rs`; `last_user_message_text` is already defined there.)
    This applies to every request (routed or not), independent of any route ceiling.
    It is checked on the final (post-routing) model + provider.
 
-2. **Latency.** Immediately after each `attach_cost_headers(...)` call in the
-   handler (dispatch, cache-hit, sandbox paths — `request_started` is in scope),
-   add `attach_latency_header(<resp>.headers_mut(), request_started);`.
+(Latency needs no per-handler wiring — the Part A2 middleware covers it.)
 
 ## Part C — Embeddings handler wiring (`routes/embeddings.rs`)
 
-1. Add `let request_started = std::time::Instant::now();` at the top.
-2. **Cost limit.** After the routing block, before dispatch:
-   ```rust
-   let cl_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &input_as_text(&req.input));
-   enforce_cost_limit(
-       cost_limit_from_header(&headers),
-       provider.pricing(&req.model).as_ref(),
-       cl_input_tokens,
-       None, // embeddings have no output tokens
-   )?;
-   ```
-   (Import the helpers from `crate::routes::chat`.)
-3. **Latency.** After the dispatch `attach_cost_headers(...)` call and in
-   `sandbox_embeddings_response`, add `attach_latency_header(http.headers_mut(), request_started)`.
-   (Thread `request_started` into `sandbox_embeddings_response`.)
+**Cost limit only** (latency is handled by the middleware). After the routing
+block, before dispatch:
+```rust
+let cl_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &input_as_text(&req.input));
+enforce_cost_limit(
+    cost_limit_from_header(&headers),
+    provider.pricing(&req.model).as_ref(),
+    cl_input_tokens,
+    None, // embeddings have no output tokens
+)?;
+```
+(Import the helpers from `crate::routes::chat`.)
 
 ## Part D — Doc-fix (`docs/04-gateway-api-reference.md`)
 
@@ -127,9 +148,10 @@ reality. Add a **Status** column (or an inline "(planned)" marker) per row:
   `Baseline-Cost-Usd`, `Saved-Usd`, `Latency-Ms`.
 - §6.2 planned: `Route-Matched`, `Warnings`.
 - Correct the line "Customers can rely on these headers being present in every
-  response (success or error)" to accurately state that the cost/latency/trace
-  headers are attached on responses that reach dispatch/cache/sandbox, and are not
-  guaranteed on early validation errors (4xx before dispatch).
+  response (success or error)": `Trace-Id` and `Latency-Ms` ARE on every response
+  (middleware); the cost/provider/model/cache headers are attached on responses
+  that reach dispatch/cache/sandbox and are not guaranteed on early validation
+  errors (4xx before dispatch).
 
 ## Error handling
 
@@ -164,7 +186,8 @@ additive; the cost-limit check is a no-op without the header).
 ## Out of scope
 
 - Honoring the "Planned" headers (separate future slices).
-- Setting cost/latency headers on early-error (pre-dispatch 4xx) responses — the
-  docs are corrected to match current behavior instead.
+- Setting the COST headers on early-error (pre-dispatch 4xx) responses — the docs
+  are corrected to match current behavior instead. (`Latency-Ms` and `Trace-Id`
+  ARE on every response via middleware.)
 - Any change to the SDK (`tt-client` doesn't send these request headers yet;
   adding `.cost_limit()` to the builder is a possible follow-up, not this slice).
