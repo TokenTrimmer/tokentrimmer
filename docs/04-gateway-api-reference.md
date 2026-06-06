@@ -404,7 +404,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 |---|---|---|---|
 | `X-TokenTrimmer-Tag` | Free-form tag for cost attribution | Honored | `feature=chat-support,user=u_123` |
 | `X-TokenTrimmer-Cost-Limit-Usd` | Reject (402) if estimated cost > limit | Honored | `0.05` |
-| `X-TokenTrimmer-Cache` | Override cache behavior for this request | Planned (not yet honored) | `bypass` / `force-write` / `read-only` / `disabled` |
+| `X-TokenTrimmer-Cache` | Override cache behavior for this request (overrides the request-body `tt_extras.cache`; a privacy route's `disable_cache` still wins). | Honored | `bypass` / `force-write` / `read-only` / `disabled` |
 | `X-TokenTrimmer-Route` | Force a specific named route | Planned (not yet honored) | `cheap-for-short` |
 | `X-TokenTrimmer-Provider` | Pin the upstream provider for this request (routing still sets the model). Requires that provider's stored credential for cross-provider pins (else `400`); disables route fallbacks. Unknown provider → `400`. | Honored | `anthropic` |
 | `X-TokenTrimmer-Fallback` | Comma-separated fallback chain override | Planned (not yet honored) | `openai/gpt-4o,anthropic/claude-3-5-sonnet` |
@@ -434,8 +434,8 @@ early validation errors (4xx returned before dispatch).
 ### 6.3 Cache control semantics
 
 `X-TokenTrimmer-Cache` values:
-- `bypass` — skip cache lookup, still write result to cache (the same as default but explicit)
-- `force-write` — write to cache even for normally non-cacheable requests (USE WITH CAUTION; can poison cache)
+- `bypass` — skip the cache lookup, but still write/refresh the result (forces a fresh upstream call, then repopulates the cache)
+- `force-write` — write to cache even for normally-ineligible requests (e.g. `temperature` > 0, `n` > 1, `seed` set). Tool-call responses are still never cached. USE WITH CAUTION; can poison the shared cache.
 - `read-only` — look up cache but never write
 - `disabled` — neither read nor write cache for this request
 
