@@ -646,6 +646,12 @@ pub async fn handler(
         // An explicit provider pin must not fail over to a different provider.
         route_fallbacks.clear();
     }
+    // `X-TokenTrimmer-Fallback` overrides the route-derived chain. Applied AFTER
+    // the pin's clear, so an explicit chain opts back into failover even when a
+    // provider is pinned (the pin still set the primary provider above).
+    if let Some(chain) = fallback_override_from_header(&headers) {
+        route_fallbacks = chain;
+    }
 
     // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header.
     // Applies to every request (routed or not), priced on the final model.
