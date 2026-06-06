@@ -391,16 +391,20 @@ async fn stream_midstream_malformed_json_continues() {
 async fn stream_tool_call_delta() {
     let server = MockServer::start();
 
-    // Simulate a two-chunk tool call: first chunk has the function name,
-    // second has partial arguments.
+    // Real OpenAI shape: first frag carries id/type/name + empty args; the
+    // continuations carry ONLY index + an `arguments` fragment (no id/name).
     let sse_body = concat!(
         "data: {\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"created\":1716681600,",
         "\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":",
-        "[{\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},",
+        "[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},",
         "\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"created\":1716681600,",
         "\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":",
-        "[{\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}]},",
+        "[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]},",
+        "\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"created\":1716681600,",
+        "\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":",
+        "[{\"index\":0,\"function\":{\"arguments\":\"\\\"NYC\\\"}\"}}]},",
         "\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n"
     );
@@ -423,25 +427,100 @@ async fn stream_tool_call_delta() {
         chunks.push(result.expect("no stream error"));
     }
 
-    assert_eq!(chunks.len(), 2, "expected 2 tool-call chunks");
-
-    // First chunk has a tool call with name.
-    let first_tool_calls = &chunks[0].choices[0].delta.tool_calls;
-    assert_eq!(first_tool_calls.len(), 1);
-    assert_eq!(first_tool_calls[0].id, "call_abc");
-    assert_eq!(first_tool_calls[0].function.name, "get_weather");
-    assert_eq!(first_tool_calls[0].function.arguments, "");
-
-    // Second chunk has partial arguments.
-    let second_tool_calls = &chunks[1].choices[0].delta.tool_calls;
-    assert_eq!(second_tool_calls.len(), 1);
-    assert!(second_tool_calls[0].function.arguments.contains("NYC"));
+    // Fragments are accumulated and emitted as ONE complete tool-call chunk.
+    let tool_chunks: Vec<_> = chunks
+        .iter()
+        .filter(|c| {
+            c.choices
+                .first()
+                .is_some_and(|ch| !ch.delta.tool_calls.is_empty())
+        })
+        .collect();
     assert_eq!(
-        chunks[1].choices[0].finish_reason.as_deref(),
-        Some("tool_calls")
+        tool_chunks.len(),
+        1,
+        "expected one reassembled tool-call chunk"
     );
 
-    assert_json_snapshot!("stream_tool_call_chunks", &chunks);
+    let tc = &tool_chunks[0].choices[0].delta.tool_calls;
+    assert_eq!(tc.len(), 1);
+    assert_eq!(tc[0].id, "call_abc");
+    assert_eq!(tc[0].r#type, "function");
+    assert_eq!(tc[0].function.name, "get_weather");
+    assert_eq!(tc[0].function.arguments, "{\"city\":\"NYC\"}");
+    assert_eq!(
+        tool_chunks[0].choices[0].finish_reason.as_deref(),
+        Some("tool_calls")
+    );
+}
+
+#[tokio::test]
+async fn stream_two_tool_calls_by_index() {
+    let server = MockServer::start();
+    let sse_body = concat!(
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"fa\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"fb\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let _mock = server.mock(|when, then| {
+        when.method(POST).path("/chat/completions");
+        then.status(200)
+            .header("Content-Type", "text/event-stream")
+            .body(sse_body);
+    });
+    let ctx = make_ctx(&server.base_url());
+    let mut stream = provider()
+        .chat_completion_stream(stream_request("gpt-4o"), &ctx)
+        .await
+        .expect("stream");
+    let mut tool_calls = Vec::new();
+    while let Some(r) = stream.next().await {
+        let c = r.expect("no error");
+        if let Some(ch) = c.choices.first() {
+            tool_calls.extend(ch.delta.tool_calls.clone());
+        }
+    }
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0].id, "call_a"); // index 0 first
+    assert_eq!(tool_calls[1].id, "call_b");
+}
+
+#[tokio::test]
+async fn stream_content_then_tool_call() {
+    let server = MockServer::start();
+    let sse_body = concat!(
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Let me check\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let _mock = server.mock(|when, then| {
+        when.method(POST).path("/chat/completions");
+        then.status(200)
+            .header("Content-Type", "text/event-stream")
+            .body(sse_body);
+    });
+    let ctx = make_ctx(&server.base_url());
+    let mut stream = provider()
+        .chat_completion_stream(stream_request("gpt-4o"), &ctx)
+        .await
+        .expect("stream");
+    let mut content = String::new();
+    let mut tool_call_count = 0;
+    while let Some(r) = stream.next().await {
+        let c = r.expect("no error");
+        if let Some(ch) = c.choices.first() {
+            if let Some(t) = &ch.delta.content {
+                content.push_str(t);
+            }
+            tool_call_count += ch.delta.tool_calls.len();
+        }
+    }
+    assert_eq!(content, "Let me check", "content chunk still streams");
+    assert_eq!(tool_call_count, 1, "tool call reassembled");
 }
 
 // ---------------------------------------------------------------------------
