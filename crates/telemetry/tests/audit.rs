@@ -50,6 +50,32 @@ fn canonical_payload_includes_seq() {
     );
 }
 
+// ─── 0b. seq gap / tail-truncation detection ──────────────────────────────────
+
+#[tokio::test]
+async fn test_seq_gap_detected() {
+    let writer = InMemoryAuditWriter::new();
+    let vk = writer.verifying_key();
+    let org = Uuid::new_v4();
+    for i in 0..3 {
+        writer
+            .write(org, system(), format!("e{i}"), payload())
+            .await
+            .unwrap();
+    }
+    let mut entries = writer.list(org).await.unwrap();
+    // Drop the middle entry → remaining seqs are 0,2 (a gap); prev_hash also breaks.
+    entries.remove(1);
+    let err = verify_chain(&entries, &vk).expect_err("gap must fail");
+    assert!(
+        matches!(
+            err,
+            VerifyError::SeqGap { .. } | VerifyError::BrokenChain { .. }
+        ),
+        "got {err:?}"
+    );
+}
+
 // ─── 1. Round-trip single entry ───────────────────────────────────────────────
 
 #[tokio::test]

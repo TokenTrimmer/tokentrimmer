@@ -104,6 +104,17 @@ pub enum VerifyError {
         /// Zero-based index of the offending entry.
         index: usize,
     },
+    /// An entry's `seq` is not the expected gap-free successor (0 for genesis,
+    /// `prev.seq + 1` otherwise) — a gap signals a deleted/reordered entry.
+    #[error("entry {index} has wrong seq (expected {expected}, got {got})")]
+    SeqGap {
+        /// Zero-based index of the offending entry.
+        index: usize,
+        /// The seq value that was expected.
+        expected: i64,
+        /// The seq value actually stored.
+        got: i64,
+    },
     /// An entry's Ed25519 signature is invalid.
     #[error("entry {0} signature invalid: {1}")]
     BadSignature(usize, String),
@@ -211,6 +222,16 @@ pub fn verify_chain(
     let genesis_prev = "0".repeat(64);
 
     for (i, entry) in entries.iter().enumerate() {
+        // ── 0. seq must be gap-free and monotonic ─────────────────────────────
+        let expected_seq = if i == 0 { 0 } else { entries[i - 1].seq + 1 };
+        if entry.seq != expected_seq {
+            return Err(VerifyError::SeqGap {
+                index: i,
+                expected: expected_seq,
+                got: entry.seq,
+            });
+        }
+
         // ── 1. prev_hash linkage ──────────────────────────────────────────────
         let expected_prev = if i == 0 {
             genesis_prev.clone()
