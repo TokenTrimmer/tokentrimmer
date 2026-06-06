@@ -168,7 +168,7 @@ where
                                     break;
                                 }
                                 SseEvent::Chunk(raw) => {
-                                    if let Some(c) = handle_raw_chunk(&mut acc, raw) {
+                                    for c in handle_raw_chunk(&mut acc, raw) {
                                         yield Ok(c);
                                     }
                                 }
@@ -195,7 +195,7 @@ where
                         for event in parse_sse_event(&buffer) {
                             match event {
                                 SseEvent::Chunk(raw) => {
-                                    if let Some(c) = handle_raw_chunk(&mut acc, raw) {
+                                    for c in handle_raw_chunk(&mut acc, raw) {
                                         yield Ok(c);
                                     }
                                 }
@@ -334,11 +334,13 @@ struct ChunkMeta {
     model: String,
 }
 
-/// Accumulates streaming tool-call fragments (keyed by OpenAI `index`) until the
-/// call is complete, then drains them into one canonical chunk.
+/// Accumulates streaming tool-call fragments (keyed by `(choice index, tool-call
+/// index)`) until the call is complete, then drains them into one canonical
+/// chunk. Keying on the choice index too keeps `n>1` choices from colliding (each
+/// streams its own tool calls starting at tool index 0).
 #[derive(Default)]
 struct ToolAccum {
-    calls: BTreeMap<u32, PartialToolCall>,
+    calls: BTreeMap<(u32, u32), PartialToolCall>,
     meta: Option<ChunkMeta>,
 }
 
@@ -353,7 +355,7 @@ impl ToolAccum {
         for choice in &raw.choices {
             for tc in &choice.delta.tool_calls {
                 saw_fragment = true;
-                let e = self.calls.entry(tc.index).or_default();
+                let e = self.calls.entry((choice.index, tc.index)).or_default();
                 if let Some(id) = &tc.id {
                     if !id.is_empty() {
                         e.id = id.clone();
@@ -386,7 +388,8 @@ impl ToolAccum {
         }
     }
 
-    /// Drain the accumulated calls into one chunk (index-ordered via BTreeMap).
+    /// Drain the accumulated calls into one chunk, one `ChunkChoice` per choice
+    /// index (BTreeMap key order keeps choices and tool calls index-ordered).
     /// Returns `None` when nothing is accumulated.
     fn drain(
         &mut self,
@@ -397,48 +400,99 @@ impl ToolAccum {
             return None;
         }
         let meta = self.meta.take()?;
-        let tool_calls: Vec<ToolCall> = std::mem::take(&mut self.calls)
-            .into_values()
-            .map(PartialToolCall::into_tool_call)
+        // Group tool calls by their choice index, preserving tool-index order.
+        let mut by_choice: BTreeMap<u32, Vec<ToolCall>> = BTreeMap::new();
+        for ((choice_index, _tool_index), partial) in std::mem::take(&mut self.calls) {
+            by_choice
+                .entry(choice_index)
+                .or_default()
+                .push(partial.into_tool_call());
+        }
+        let choices = by_choice
+            .into_iter()
+            .map(|(index, tool_calls)| ChunkChoice {
+                index,
+                delta: ChunkDelta {
+                    role: None,
+                    content: None,
+                    tool_calls,
+                },
+                finish_reason: finish_reason.clone(),
+            })
             .collect();
         Some(ChatCompletionChunk {
             id: meta.id,
             object: meta.object,
             created: meta.created,
             model: meta.model,
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: None,
-                    content: None,
-                    tool_calls,
-                },
-                finish_reason,
-            }],
+            choices,
             usage,
         })
     }
 }
 
-/// Process one raw chunk against the accumulator, returning a canonical chunk to
-/// forward (or `None` when the chunk is a mid-accumulation tool fragment that is
-/// swallowed until the call completes).
-fn handle_raw_chunk(acc: &mut ToolAccum, raw: RawChunk) -> Option<ChatCompletionChunk> {
+/// Build a content/role-only canonical chunk from a raw chunk that also carried a
+/// tool-call fragment, so role (`{"role":"assistant", tool_calls:[…]}` — OpenAI's
+/// standard first tool delta) and any text are forwarded rather than swallowed.
+/// `tool_calls` is stripped (those flow through [`ToolAccum`]) and `finish_reason`
+/// is dropped (it rides with the drained tool-call chunk). Returns `None` when no
+/// choice carries role or content.
+fn content_chunk(raw: &RawChunk) -> Option<ChatCompletionChunk> {
+    if !raw
+        .choices
+        .iter()
+        .any(|c| c.delta.role.is_some() || c.delta.content.is_some())
+    {
+        return None;
+    }
+    Some(ChatCompletionChunk {
+        id: raw.id.clone(),
+        object: raw.object.clone(),
+        created: raw.created,
+        model: raw.model.clone(),
+        choices: raw
+            .choices
+            .iter()
+            .map(|c| ChunkChoice {
+                index: c.index,
+                delta: ChunkDelta {
+                    role: c.delta.role.clone(),
+                    content: c.delta.content.clone(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: None,
+            })
+            .collect(),
+        usage: None,
+    })
+}
+
+/// Process one raw chunk against the accumulator, returning the canonical chunks
+/// to forward. Usually 0 or 1, but a chunk that carries role/content *and* a
+/// tool-call fragment yields the content chunk plus (on finish) the drained
+/// tool-call chunk. A mid-accumulation tool fragment with no role/content yields
+/// nothing (swallowed until the call completes).
+fn handle_raw_chunk(acc: &mut ToolAccum, raw: RawChunk) -> Vec<ChatCompletionChunk> {
     let has_tool_frag = raw.choices.iter().any(|c| !c.delta.tool_calls.is_empty());
     let finish_reason = raw.choices.iter().find_map(|c| c.finish_reason.clone());
 
     if has_tool_frag {
+        let mut out = Vec::new();
+        // Preserve any role/content riding alongside the tool fragment.
+        if let Some(c) = content_chunk(&raw) {
+            out.push(c);
+        }
         acc.merge(&raw);
         if finish_reason.is_some() {
-            return acc.drain(finish_reason, raw.usage);
+            out.extend(acc.drain(finish_reason, raw.usage));
         }
-        return None; // swallow until complete
+        return out;
     }
     // A finish_reason may arrive on a separate chunk after the fragments.
     if finish_reason.is_some() && !acc.is_empty() {
-        return acc.drain(finish_reason, raw.usage);
+        return acc.drain(finish_reason, raw.usage).into_iter().collect();
     }
-    Some(raw.into_canonical())
+    vec![raw.into_canonical()]
 }
 
 /// Outcome of processing one line in an SSE event.
@@ -635,26 +689,29 @@ mod tests {
             &mut acc,
             raw_chunk(vec![frag(0, Some("call_1"), Some("f"), "")], None)
         )
-        .is_none());
+        .is_empty());
         // frag 2: args fragment, no id → swallowed
         assert!(handle_raw_chunk(
             &mut acc,
             raw_chunk(vec![frag(0, None, None, "{\"a\":")], None)
         )
-        .is_none());
+        .is_empty());
         // frag 3: closing args + finish → drained
         let out = handle_raw_chunk(
             &mut acc,
             raw_chunk(vec![frag(0, None, None, "1}")], Some("tool_calls")),
-        )
-        .expect("complete chunk");
-        let tc = &out.choices[0].delta.tool_calls;
+        );
+        assert_eq!(out.len(), 1);
+        let tc = &out[0].choices[0].delta.tool_calls;
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0].id, "call_1");
         assert_eq!(tc[0].r#type, "function");
         assert_eq!(tc[0].function.name, "f");
         assert_eq!(tc[0].function.arguments, "{\"a\":1}");
-        assert_eq!(out.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            out[0].choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
         assert!(acc.is_empty());
     }
 
@@ -669,9 +726,9 @@ mod tests {
             &mut acc,
             raw_chunk(vec![frag(1, Some("b"), Some("fb"), "{}")], None),
         );
-        let out = handle_raw_chunk(&mut acc, raw_chunk(vec![], Some("tool_calls")))
-            .expect("complete chunk");
-        let tc = &out.choices[0].delta.tool_calls;
+        let out = handle_raw_chunk(&mut acc, raw_chunk(vec![], Some("tool_calls")));
+        assert_eq!(out.len(), 1);
+        let tc = &out[0].choices[0].delta.tool_calls;
         assert_eq!(tc.len(), 2);
         assert_eq!(tc[0].id, "a"); // index 0 first
         assert_eq!(tc[1].id, "b");
@@ -696,9 +753,85 @@ mod tests {
             }],
             usage: None,
         };
-        let out = handle_raw_chunk(&mut acc, raw).expect("forwarded");
-        assert_eq!(out.choices[0].delta.content.as_deref(), Some("Hi"));
-        assert!(out.choices[0].delta.tool_calls.is_empty());
+        let out = handle_raw_chunk(&mut acc, raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].choices[0].delta.content.as_deref(), Some("Hi"));
+        assert!(out[0].choices[0].delta.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn handle_preserves_role_riding_with_tool_fragment() {
+        // OpenAI's first tool delta is `{role:"assistant", tool_calls:[…]}`. The
+        // role must be forwarded, not swallowed with the fragment.
+        let mut acc = ToolAccum::default();
+        let first = RawChunk {
+            id: "c".into(),
+            object: "chat.completion.chunk".into(),
+            created: 1,
+            model: "gpt-4o".into(),
+            choices: vec![RawChoice {
+                index: 0,
+                delta: RawDelta {
+                    role: Some("assistant".into()),
+                    content: None,
+                    tool_calls: vec![frag(0, Some("call_1"), Some("f"), "{}")],
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let out = handle_raw_chunk(&mut acc, first);
+        // One chunk: the role/content carrier (the tool fragment is swallowed).
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].choices[0].delta.role.as_deref(), Some("assistant"));
+        assert!(out[0].choices[0].delta.tool_calls.is_empty());
+
+        // The fragment then drains on finish.
+        let done = handle_raw_chunk(&mut acc, raw_chunk(vec![], Some("tool_calls")));
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].choices[0].delta.tool_calls.len(), 1);
+        assert_eq!(done[0].choices[0].delta.tool_calls[0].id, "call_1");
+    }
+
+    #[test]
+    fn handle_keys_tool_calls_by_choice_index() {
+        // n>1: two choices each stream a tool call at tool-index 0 — they must NOT
+        // collide; drain emits one ChunkChoice per choice index.
+        let mut acc = ToolAccum::default();
+        let raw = RawChunk {
+            id: "c".into(),
+            object: "chat.completion.chunk".into(),
+            created: 1,
+            model: "gpt-4o".into(),
+            choices: vec![
+                RawChoice {
+                    index: 0,
+                    delta: RawDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: vec![frag(0, Some("call_0"), Some("f0"), "{}")],
+                    },
+                    finish_reason: Some("tool_calls".into()),
+                },
+                RawChoice {
+                    index: 1,
+                    delta: RawDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: vec![frag(0, Some("call_1"), Some("f1"), "{}")],
+                    },
+                    finish_reason: Some("tool_calls".into()),
+                },
+            ],
+            usage: None,
+        };
+        let out = handle_raw_chunk(&mut acc, raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].choices.len(), 2, "one ChunkChoice per choice index");
+        assert_eq!(out[0].choices[0].index, 0);
+        assert_eq!(out[0].choices[0].delta.tool_calls[0].id, "call_0");
+        assert_eq!(out[0].choices[1].index, 1);
+        assert_eq!(out[0].choices[1].delta.tool_calls[0].id, "call_1");
     }
 
     #[test]
