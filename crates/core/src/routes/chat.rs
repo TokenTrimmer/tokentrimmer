@@ -671,6 +671,15 @@ pub async fn handler(
     //     Resolved once here so all four call-sites (streaming L1 read,
     //     non-streaming L1 read, L2 read, L1/L2 insert) share a single decision.
     let mut cache_behavior = CacheBehavior::resolve(&req);
+    // `X-TokenTrimmer-Cache` overrides the request-body decision (header beats
+    // body). force-write=(true,true) here overrides the eligibility gate that
+    // `resolve()` may have applied; the tool-call exclusion at insert time is
+    // unaffected, so tool-call responses are still never cached.
+    if let Some((lookup, insert)) = cache_override_from_header(&headers)? {
+        cache_behavior.do_lookup = lookup;
+        cache_behavior.do_insert = insert;
+    }
+    // A privacy route's disable_cache wins over both body and header.
     if route_disable_cache {
         cache_behavior.do_lookup = false;
         cache_behavior.do_insert = false;
