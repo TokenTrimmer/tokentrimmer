@@ -132,6 +132,11 @@ impl Provider for AnthropicProvider {
         false
     }
 
+    fn temperature_range(&self) -> (f32, f32) {
+        // Anthropic rejects temperature > 1.0.
+        (0.0, 1.0)
+    }
+
     /// Non-streaming chat completion via `POST /v1/messages`.
     ///
     /// Translates the canonical request to Anthropic's wire format, sends it,

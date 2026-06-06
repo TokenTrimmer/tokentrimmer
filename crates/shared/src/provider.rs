@@ -51,6 +51,16 @@ pub trait Provider: Send + Sync {
         true
     }
 
+    /// The provider's accepted `temperature` range `(min, max)`. The gateway
+    /// clamps an out-of-range request value to this and emits
+    /// `temperature_clamped`. Default `(0.0, 2.0)` — the widest common range
+    /// (OpenAI/Gemini). Override only with a narrower range you are confident is
+    /// correct, so the gateway never wrongly tightens a provider whose true max
+    /// is uncertain.
+    fn temperature_range(&self) -> (f32, f32) {
+        (0.0, 2.0)
+    }
+
     /// Non-streaming chat completion.
     async fn chat_completion(
         &self,
