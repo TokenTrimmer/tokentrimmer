@@ -57,7 +57,6 @@ crossterm = "0.28"
 console = "0.15"
 comfy-table = { version = "7", features = ["custom_styling"] }
 indicatif = "0.17"
-futures.workspace = true
 rustyline = "14"
 dirs = "5.0"
 base64 = "0.22"
