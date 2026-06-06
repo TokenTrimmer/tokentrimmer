@@ -148,7 +148,7 @@ Follows the OpenAI Chat Completions schema. Full reference:
 **Provider-specific parameter handling:**
 
 - Parameters not supported by the routed provider are silently dropped, with a `X-TokenTrimmer-Warnings` response header noting the drop.
-- _(Planned)_ Parameters with different ranges across providers (e.g., temperature) are clamped to the provider's valid range, with a `temperature_clamped` warning.
+- Parameters with different ranges across providers (e.g., temperature) are clamped to the provider's valid range, with a `temperature_clamped` warning (e.g. Anthropic caps `temperature` at 1.0).
 - For Anthropic-routed requests, `max_tokens` is required by Anthropic but optional here; Gateway defaults to 4096 if omitted.
 
 ### 3.3 Response (non-streaming)
@@ -441,8 +441,10 @@ the gateway drops during translation — e.g. Anthropic drops `n`, `seed`,
 emitted when a `json_schema` request is routed to a provider declared
 `json_object`-only; the built-in adapters either forward the schema (OpenAI,
 Gemini, the OpenAI-compatible providers) or drop `response_format` outright
-(Anthropic), so this fires only for providers explicitly marked object-only. The
-`temperature_clamped` token is a planned follow-up.
+(Anthropic), so this fires only for providers explicitly marked object-only. A
+`temperature_clamped` token is emitted when the request's `temperature` is
+clamped to the routed provider's accepted range (e.g. a `1.5` request to
+Anthropic, whose max is `1.0`).
 
 ### 6.3 Cache control semantics
 
