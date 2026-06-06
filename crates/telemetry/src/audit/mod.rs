@@ -37,6 +37,8 @@ pub struct AuditEntry {
     pub id: Uuid,
     /// Organization this entry belongs to.
     pub org_id: Uuid,
+    /// Monotonic per-org sequence number (0-based, gap-free).
+    pub seq: i64,
     /// Wall-clock time the entry was written (UTC, RFC 3339).
     pub timestamp: DateTime<Utc>,
     /// Actor that caused the event.
@@ -150,6 +152,7 @@ pub fn canonical_payload_bytes(
         "actor": entry_fields.actor,
         "event": entry_fields.event,
         "payload": entry_fields.payload,
+        "seq": entry_fields.seq,
     });
     canonical_bytes(&obj)
 }
@@ -170,6 +173,9 @@ pub struct PayloadFields<'a> {
     pub event: &'a str,
     /// Arbitrary payload.
     pub payload: &'a serde_json::Value,
+    /// Monotonic per-org sequence number (0-based). Bound into the hash so an
+    /// entry's position cannot be changed without breaking its signature.
+    pub seq: i64,
 }
 
 /// Compute the BLAKE3 hash for an entry.
@@ -239,6 +245,7 @@ pub fn verify_chain(
             actor: &entry.actor,
             event: &entry.event,
             payload: &entry.payload,
+            seq: entry.seq,
         };
 
         let computed = compute_hash(&prev_bytes, &fields)

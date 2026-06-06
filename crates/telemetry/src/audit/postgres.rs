@@ -109,6 +109,7 @@ impl AuditWriter for PostgresAuditWriter {
             actor: &actor,
             event: &event,
             payload: &payload,
+            seq: next_seq,
         };
 
         let hash = compute_hash(&prev_hash_bytes, &fields)?;
@@ -148,6 +149,7 @@ impl AuditWriter for PostgresAuditWriter {
         Ok(AuditEntry {
             id,
             org_id,
+            seq: next_seq,
             timestamp,
             actor,
             event,
@@ -185,7 +187,6 @@ struct AuditRow {
     prev_hash: String,
     hash: String,
     signature: String,
-    #[allow(dead_code)]
     seq: i64,
 }
 
@@ -195,6 +196,7 @@ impl AuditRow {
         Ok(AuditEntry {
             id: self.id,
             org_id: self.org_id,
+            seq: self.seq,
             timestamp: self.ts,
             actor,
             event: self.event,

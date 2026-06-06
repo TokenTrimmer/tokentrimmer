@@ -19,6 +19,37 @@ fn payload() -> serde_json::Value {
     serde_json::json!({ "note": "test" })
 }
 
+// ─── 0. seq is bound into the canonical (signed) payload ──────────────────────
+
+#[test]
+fn canonical_payload_includes_seq() {
+    use chrono::Utc;
+    use tt_telemetry::audit::{canonical_payload_bytes, PayloadFields};
+
+    let id = Uuid::nil();
+    let org = Uuid::nil();
+    let ts = Utc::now();
+    let actor = Actor::System;
+    let p = serde_json::json!({ "k": "v" });
+    let mk = |seq| {
+        canonical_payload_bytes(&PayloadFields {
+            id,
+            org_id: org,
+            timestamp: ts,
+            actor: &actor,
+            event: "e",
+            payload: &p,
+            seq,
+        })
+        .unwrap()
+    };
+    assert_ne!(
+        mk(0),
+        mk(1),
+        "seq must change the canonical bytes (so it is hashed + signed)"
+    );
+}
+
 // ─── 1. Round-trip single entry ───────────────────────────────────────────────
 
 #[tokio::test]
