@@ -350,7 +350,10 @@ pub fn parse_data_url(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(',')?;
     // Only base64 payloads are supported (the canonical image transport).
-    let media_type = meta.strip_suffix(";base64")?;
+    let media_with_params = meta.strip_suffix(";base64")?;
+    // Drop any RFC-2397 media-type parameters (e.g. `;charset=utf-8`) — providers
+    // expect a bare MIME type like `image/png` in the base64 image part.
+    let media_type = media_with_params.split(';').next().unwrap_or("");
     if media_type.is_empty() || data.is_empty() {
         return None;
     }
@@ -382,5 +385,10 @@ mod embeddings_default_tests {
         assert_eq!(parse_data_url("data:image/png,notbase64"), None);
         assert_eq!(parse_data_url("data:;base64,abc"), None);
         assert_eq!(parse_data_url("data:image/png;base64,"), None);
+        // Media-type parameters are stripped to a bare MIME type.
+        assert_eq!(
+            parse_data_url("data:image/png;charset=utf-8;base64,iVBORw0KGgo="),
+            Some(("image/png".to_string(), "iVBORw0KGgo=".to_string()))
+        );
     }
 }
