@@ -9,10 +9,14 @@ use serde_json::{json, Value};
 // Re-export every tt-shared type reachable through the public API (so embedders
 // don't need a direct `tt-shared` dependency to read `outcome.response`).
 pub use tt_shared::messages::{
-    ChatCompletionResponse, Choice, ContentPart, ImageUrl, InputAudio, Message, MessageContent,
-    Tool, ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
+    ChatCompletionResponse, Choice, ContentPart, EmbeddingData, EmbeddingInput, EmbeddingsRequest,
+    EmbeddingsResponse, ImageUrl, InputAudio, Message, MessageContent, Tool, ToolCall,
+    ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
 };
 pub use tt_shared::Usage;
+
+mod embeddings;
+pub use embeddings::EmbedOutcome;
 
 mod tools;
 /// Re-exported so downstream `impl ToolExecutor` blocks can annotate with
