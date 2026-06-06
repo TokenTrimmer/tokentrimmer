@@ -623,6 +623,27 @@ mod tests {
         assert_eq!(v["model"], "mock-model-1");
     }
 
+    #[tokio::test]
+    async fn embeddings_cost_limit_rejects_over_limit() {
+        let body = serde_json::json!({
+            "model": "mock-model-1",
+            "input": "the quick brown fox jumps over the lazy dog"
+        });
+        let response = app_with_mock()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .header("x-tokentrimmer-cost-limit-usd", "0.000000001")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
     // ── Dispatch tests (new — w6-gateway-dispatch) ─────────────────────────────
 
     /// Non-streaming dispatch returns 200 with JSON body and all six
