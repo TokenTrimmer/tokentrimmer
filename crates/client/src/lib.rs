@@ -1077,7 +1077,13 @@ mod tests {
                 .body(sse);
         });
         let client = Client::new(server.base_url(), "k");
-        let mut stream = client.chat().model("m").message(user("hi")).stream().await.unwrap();
+        let mut stream = client
+            .chat()
+            .model("m")
+            .message(user("hi"))
+            .stream()
+            .await
+            .unwrap();
         assert!(!stream.is_terminated(), "fresh stream is not terminated");
         // Drain via the inherent next() until end.
         while stream.next().await.unwrap().is_some() {}
@@ -1097,7 +1103,13 @@ mod tests {
                 .body(sse);
         });
         let client = Client::new(server.base_url(), "k");
-        let stream = client.chat().model("m").message(user("hi")).stream().await.unwrap();
+        let stream = client
+            .chat()
+            .model("m")
+            .message(user("hi"))
+            .stream()
+            .await
+            .unwrap();
         let text = stream
             .filter_map(|ev| async move {
                 match ev {
