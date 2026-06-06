@@ -1,9 +1,10 @@
 //! Embeddings: `Client::embed` posts to `/v1/embeddings` and returns the typed
 //! response plus the gateway's cost/savings headers.
 
-use serde_json::json;
-
-use crate::{parse_cost, Client, CostInfo, EmbeddingInput, EmbeddingsResponse, Error, Result};
+use crate::{
+    parse_cost, Client, CostInfo, EmbeddingInput, EmbeddingsRequest, EmbeddingsResponse, Error,
+    Result,
+};
 
 /// A completed embeddings call: the typed response plus parsed cost/savings.
 #[derive(Debug, Clone)]
@@ -20,31 +21,104 @@ impl EmbedOutcome {
 }
 
 impl Client {
-    /// Embed `input` with `model`. Returns the vectors + cost.
+    /// Start building an embeddings request:
+    /// `client.embeddings().model(m).input(i).dimensions(256).send()`.
+    #[must_use]
+    pub fn embeddings(&self) -> EmbedBuilder<'_> {
+        EmbedBuilder {
+            client: self,
+            model: String::new(),
+            input: None,
+            dimensions: None,
+            encoding_format: None,
+            cost_limit: None,
+        }
+    }
+
+    /// Embed `input` with `model` — a convenience for
+    /// `embeddings().model(model).input(input).send()`.
     ///
     /// # Errors
-    /// [`Error::MissingModel`] if `model` is empty, [`Error::Request`] on
-    /// transport failure, [`Error::Status`] on a non-2xx response (carrying the
-    /// cost/trace telemetry), [`Error::Decode`] if the body isn't a valid
-    /// embeddings response.
+    /// See [`EmbedBuilder::send`].
     pub async fn embed(
         &self,
         model: impl Into<String>,
         input: EmbeddingInput,
     ) -> Result<EmbedOutcome> {
-        let model = model.into();
-        if model.trim().is_empty() {
+        self.embeddings().model(model).input(input).send().await
+    }
+}
+
+/// Fluent builder for an embeddings request. See [`Client::embeddings`].
+pub struct EmbedBuilder<'a> {
+    client: &'a Client,
+    model: String,
+    input: Option<EmbeddingInput>,
+    dimensions: Option<u32>,
+    encoding_format: Option<String>,
+    cost_limit: Option<f64>,
+}
+
+impl EmbedBuilder<'_> {
+    #[must_use]
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+    #[must_use]
+    pub fn input(mut self, input: EmbeddingInput) -> Self {
+        self.input = Some(input);
+        self
+    }
+    /// Reduce the embedding to `n` dimensions (Matryoshka models).
+    #[must_use]
+    pub fn dimensions(mut self, n: u32) -> Self {
+        self.dimensions = Some(n);
+        self
+    }
+    /// Wire encoding format (e.g. `"float"` or `"base64"`).
+    #[must_use]
+    pub fn encoding_format(mut self, format: impl Into<String>) -> Self {
+        self.encoding_format = Some(format.into());
+        self
+    }
+    /// `X-TokenTrimmer-Cost-Limit-Usd` — the gateway rejects with `402` if the
+    /// estimated cost exceeds `usd`.
+    #[must_use]
+    pub fn cost_limit(mut self, usd: f64) -> Self {
+        self.cost_limit = Some(usd);
+        self
+    }
+
+    /// Send the request and return the vectors + cost.
+    ///
+    /// # Errors
+    /// [`Error::MissingModel`] / [`Error::MissingInput`] (pre-flight),
+    /// [`Error::Request`] on transport failure, [`Error::Status`] on a non-2xx
+    /// response (carrying cost/trace), [`Error::Decode`] on an invalid body.
+    pub async fn send(self) -> Result<EmbedOutcome> {
+        if self.model.trim().is_empty() {
             return Err(Error::MissingModel);
         }
-        let body = json!({ "model": model, "input": input });
-        let resp = self
+        let Some(input) = self.input else {
+            return Err(Error::MissingInput);
+        };
+        let req = EmbeddingsRequest {
+            model: self.model,
+            input,
+            dimensions: self.dimensions,
+            encoding_format: self.encoding_format,
+        };
+        let mut http_req = self
+            .client
             .http
-            .post(format!("{}/v1/embeddings", self.base))
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(Error::Request)?;
+            .post(format!("{}/v1/embeddings", self.client.base))
+            .bearer_auth(&self.client.key)
+            .json(&req);
+        if let Some(limit) = self.cost_limit {
+            http_req = http_req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
+        }
+        let resp = http_req.send().await.map_err(Error::Request)?;
         let cost = parse_cost(resp.headers());
         let status = resp.status();
         if !status.is_success() {
@@ -68,6 +142,7 @@ mod tests {
     use super::*;
     use crate::Client;
     use httpmock::prelude::*;
+    use serde_json::json;
 
     fn embeddings_body() -> serde_json::Value {
         json!({
@@ -112,6 +187,74 @@ mod tests {
             out.cost.model_used.as_deref(),
             Some("text-embedding-3-small")
         );
+    }
+
+    #[tokio::test]
+    async fn embeddings_builder_sends_dimensions_and_encoding_format() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/embeddings")
+                .body_contains("\"dimensions\":256")
+                .body_contains("\"encoding_format\":\"float\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(embeddings_body());
+        });
+        let client = Client::new(server.base_url(), "k");
+        let out = client
+            .embeddings()
+            .model("text-embedding-3-small")
+            .input(EmbeddingInput::Single("hi".into()))
+            .dimensions(256)
+            .encoding_format("float")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(out.vectors().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn embed_builder_sends_cost_limit_header() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/embeddings")
+                .header("x-tokentrimmer-cost-limit-usd", "0.01");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(embeddings_body());
+        });
+        let client = Client::new(server.base_url(), "k");
+        // The mock requires the header, so `.send()` only succeeds if it was sent.
+        let out = client
+            .embeddings()
+            .model("text-embedding-3-small")
+            .input(EmbeddingInput::Single("hi".into()))
+            .cost_limit(0.01)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(out.vectors().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn embed_builder_missing_input_errors() {
+        // dead base — no network because input is unset.
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let result = client.embeddings().model("m").send().await;
+        assert!(matches!(result, Err(Error::MissingInput)));
+    }
+
+    #[tokio::test]
+    async fn embed_builder_missing_model_errors() {
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let result = client
+            .embeddings()
+            .input(EmbeddingInput::Single("hi".into()))
+            .send()
+            .await;
+        assert!(matches!(result, Err(Error::MissingModel)));
     }
 
     #[tokio::test]
