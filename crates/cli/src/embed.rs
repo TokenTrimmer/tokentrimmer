@@ -3,8 +3,10 @@
 //! is covered by tt-client's own tests, so the tested surface here is the two
 //! pure helpers below.
 
+use anyhow::Context as _;
 use tt_client::{EmbedOutcome, EmbeddingInput};
 
+use crate::context::ResolvedContext;
 use crate::ui;
 
 const DEFAULT_MODEL: &str = "text-embedding-3-small";
@@ -48,6 +50,64 @@ fn format_embed_summary(out: &EmbedOutcome, requested_model: &str) -> String {
     ui::muted()
         .apply_to(parts.join(&format!(" {} ", ui::BULLET)))
         .to_string()
+}
+
+/// Embed `input` (or stdin) and print a cost summary — or, with `--json`, the
+/// full `EmbeddingsResponse` to stdout and the summary to stderr.
+///
+/// # Errors
+/// Surfaces a missing API key, a `402` cost-limit rejection, or any transport /
+/// gateway error from the SDK.
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    input: Vec<String>,
+    model: Option<String>,
+    dimensions: Option<u32>,
+    encoding_format: Option<String>,
+    cost_limit: Option<f64>,
+    json: bool,
+    flag_key: Option<String>,
+    flag_base: Option<String>,
+) -> anyhow::Result<()> {
+    let ctx = ResolvedContext::load(flag_key, flag_base)?;
+    let key = ctx
+        .api_key_string()
+        .context("no API key — run `tt login` or set TT_API_KEY")?;
+    let base = ctx.base_url.trim_end_matches('/').to_string();
+    let client = tt_client::Client::new(base, key);
+
+    let stdin_text = if input.is_empty() {
+        Some(std::io::read_to_string(std::io::stdin()).context("failed to read stdin")?)
+    } else {
+        None
+    };
+    let assembled = assemble_input(&input, stdin_text.as_deref())
+        .context("no input — pass text as an argument or pipe it on stdin")?;
+
+    let requested_model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let mut builder = client
+        .embeddings()
+        .model(requested_model.clone())
+        .input(assembled);
+    if let Some(n) = dimensions {
+        builder = builder.dimensions(n);
+    }
+    if let Some(f) = encoding_format {
+        builder = builder.encoding_format(f);
+    }
+    if let Some(c) = cost_limit {
+        builder = builder.cost_limit(c);
+    }
+    let out = builder.send().await?;
+
+    let summary = format_embed_summary(&out, &requested_model);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&out.response)?);
+        ui::note(&summary);
+    } else {
+        println!("{summary}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
