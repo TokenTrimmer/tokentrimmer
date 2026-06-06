@@ -32,6 +32,14 @@ pub trait Provider: Send + Sync {
         1.0
     }
 
+    /// Names of request params this adapter **silently drops** for `req`
+    /// during translation because the upstream provider rejects them. The
+    /// gateway emits each as `X-TokenTrimmer-Warnings: param_dropped:<name>`.
+    /// Default: nothing dropped.
+    fn dropped_params(&self, _req: &ChatCompletionRequest) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Non-streaming chat completion.
     async fn chat_completion(
         &self,

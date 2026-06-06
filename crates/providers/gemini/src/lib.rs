@@ -110,6 +110,27 @@ impl Provider for GeminiProvider {
         pricing::pricing_for(model)
     }
 
+    fn dropped_params(&self, req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+        // Mirror translate.rs: Gemini drops these; response_format is translated.
+        let mut out = Vec::new();
+        if req.n.is_some() {
+            out.push("n".to_string());
+        }
+        if req.seed.is_some() {
+            out.push("seed".to_string());
+        }
+        if req.presence_penalty.is_some() {
+            out.push("presence_penalty".to_string());
+        }
+        if req.frequency_penalty.is_some() {
+            out.push("frequency_penalty".to_string());
+        }
+        if req.user.is_some() {
+            out.push("user".to_string());
+        }
+        out
+    }
+
     /// Non-streaming chat completion via
     /// `POST /v1beta/models/{model}:generateContent` (key in `x-goog-api-key` header).
     ///

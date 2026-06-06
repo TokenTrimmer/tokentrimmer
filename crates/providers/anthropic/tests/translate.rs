@@ -46,6 +46,35 @@ fn user_text(text: &str) -> Message {
     }
 }
 
+#[test]
+fn dropped_params_reports_present_openai_only_fields() {
+    use tt_provider_anthropic::{AnthropicProvider, ClientConfig};
+    use tt_shared::{messages::ResponseFormat, Provider};
+
+    let provider = AnthropicProvider::new(ClientConfig::default());
+    let mut req = make_request("claude-sonnet-4-6", vec![]);
+    req.response_format = Some(ResponseFormat {
+        r#type: "json_object".into(),
+        json_schema: None,
+    });
+    req.presence_penalty = Some(0.1);
+    req.n = Some(2);
+    let mut got = provider.dropped_params(&req);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "n".to_string(),
+            "presence_penalty".to_string(),
+            "response_format".to_string()
+        ]
+    );
+
+    // Nothing set → nothing dropped.
+    let req2 = make_request("claude-sonnet-4-6", vec![]);
+    assert!(provider.dropped_params(&req2).is_empty());
+}
+
 fn assistant_text(text: &str) -> Message {
     Message::Assistant {
         content: Some(MessageContent::Text(text.to_string())),

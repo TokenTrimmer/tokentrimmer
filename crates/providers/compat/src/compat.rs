@@ -155,6 +155,10 @@ impl Provider for OpenAICompatibleProvider {
         self.cfg.pricing_table.get(model).cloned()
     }
 
+    fn dropped_params(&self, req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+        crate::translate::dropped_params(req)
+    }
+
     /// Non-streaming chat completion via `POST /chat/completions`.
     ///
     /// Translates the canonical request, sends it to the provider's endpoint

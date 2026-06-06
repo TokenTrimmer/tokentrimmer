@@ -103,6 +103,27 @@ impl Provider for AnthropicProvider {
         pricing::pricing_for(model)
     }
 
+    fn dropped_params(&self, req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+        // Mirror translate.rs: Anthropic rejects these OpenAI-only fields.
+        let mut out = Vec::new();
+        if req.n.is_some() {
+            out.push("n".to_string());
+        }
+        if req.seed.is_some() {
+            out.push("seed".to_string());
+        }
+        if req.response_format.is_some() {
+            out.push("response_format".to_string());
+        }
+        if req.presence_penalty.is_some() {
+            out.push("presence_penalty".to_string());
+        }
+        if req.frequency_penalty.is_some() {
+            out.push("frequency_penalty".to_string());
+        }
+        out
+    }
+
     /// Non-streaming chat completion via `POST /v1/messages`.
     ///
     /// Translates the canonical request to Anthropic's wire format, sends it,

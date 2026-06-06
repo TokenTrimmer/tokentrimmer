@@ -102,6 +102,11 @@ impl Provider for OpenAiProvider {
         pricing::pricing_for(model)
     }
 
+    fn dropped_params(&self, req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+        // Same reasoning-model temperature drop as the compat layer.
+        translate::dropped_params(req)
+    }
+
     /// Non-streaming chat completion via `POST /chat/completions`.
     ///
     /// Strips `tt_extras`, applies reasoning-model parameter fixups, sends the

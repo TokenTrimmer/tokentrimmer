@@ -88,6 +88,10 @@ impl Provider for TogetherProvider {
         self.inner.pricing(model)
     }
 
+    fn dropped_params(&self, req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+        self.inner.dropped_params(req)
+    }
+
     async fn chat_completion(
         &self,
         req: ChatCompletionRequest,
