@@ -99,9 +99,7 @@ fn render_ai_section(detected: &[ModelUsage], cfg: &AiConfig) -> String {
         s.push_str("Recommended routes (apply in your TokenTrimmer dashboard):\n");
         for r in &cfg.routes {
             match &r.reason {
-                Some(reason) => {
-                    s.push_str(&format!("- `{}` → `{}` — {}\n", r.from, r.to, reason))
-                }
+                Some(reason) => s.push_str(&format!("- `{}` → `{}` — {}\n", r.from, r.to, reason)),
                 None => s.push_str(&format!("- `{}` → `{}`\n", r.from, r.to)),
             }
         }
