@@ -115,6 +115,18 @@ pub(crate) fn fallback_override_from_header(headers: &HeaderMap) -> Option<Vec<S
     }
 }
 
+/// `X-TokenTrimmer-Timeout-Ms` — per-request upstream timeout in ms (1..=600000).
+/// Invalid / non-positive / over-max → None (no per-request timeout; the global
+/// 600s limit still applies).
+pub(crate) fn timeout_ms_from_header(headers: &HeaderMap) -> Option<u64> {
+    const MAX_TIMEOUT_MS: u64 = 600_000;
+    headers
+        .get("x-tokentrimmer-timeout-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0 && *ms <= MAX_TIMEOUT_MS)
+}
+
 /// Apply an `X-TokenTrimmer-Provider` pin. Returns the provider to dispatch and,
 /// when it differs from `current`, the credentials to use. The pin overrides the
 /// routed/inferred provider (the routed model is kept). Cross-provider pins
@@ -2103,6 +2115,19 @@ mod cache_header_tests {
 mod provider_override_tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn timeout_ms_header_parsing() {
+        let mut h = HeaderMap::new();
+        assert_eq!(timeout_ms_from_header(&h), None);
+        h.insert("x-tokentrimmer-timeout-ms", " 30000 ".parse().unwrap());
+        assert_eq!(timeout_ms_from_header(&h), Some(30_000));
+        for bad in ["0", "700000", "abc", "-5"] {
+            let mut b = HeaderMap::new();
+            b.insert("x-tokentrimmer-timeout-ms", bad.parse().unwrap());
+            assert_eq!(timeout_ms_from_header(&b), None, "{bad} must be rejected");
+        }
+    }
 
     #[test]
     fn fallback_override_header_parsing() {
