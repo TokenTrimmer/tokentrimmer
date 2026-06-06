@@ -406,7 +406,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Cost-Limit-Usd` | Reject (402) if estimated cost > limit | Honored | `0.05` |
 | `X-TokenTrimmer-Cache` | Override cache behavior for this request | Planned (not yet honored) | `bypass` / `force-write` / `read-only` / `disabled` |
 | `X-TokenTrimmer-Route` | Force a specific named route | Planned (not yet honored) | `cheap-for-short` |
-| `X-TokenTrimmer-Provider` | Override provider selection | Planned (not yet honored) | `anthropic` |
+| `X-TokenTrimmer-Provider` | Pin the upstream provider for this request (routing still sets the model). Requires that provider's stored credential for cross-provider pins (else `400`); disables route fallbacks. Unknown provider → `400`. | Honored | `anthropic` |
 | `X-TokenTrimmer-Fallback` | Comma-separated fallback chain override | Planned (not yet honored) | `openai/gpt-4o,anthropic/claude-3-5-sonnet` |
 | `X-TokenTrimmer-Timeout-Ms` | Per-request timeout override (max 600000) | Planned (not yet honored) | `30000` |
 | `X-TokenTrimmer-Trace-Parent` | W3C traceparent for distributed tracing | Planned (not yet honored) | (standard format) |
