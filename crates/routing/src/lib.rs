@@ -184,6 +184,12 @@ impl RoutingEngine {
             .iter()
             .find(|r| r.enabled && matches(r, req, ctx, input_tokens_estimate, estimated_cost_usd))
     }
+
+    /// Find an enabled route by exact name (case-sensitive), bypassing condition
+    /// evaluation — used to honor a forced-route request header.
+    pub fn find_by_name(&self, name: &str) -> Option<&Route> {
+        self.routes.iter().find(|r| r.enabled && r.name == name)
+    }
 }
 
 fn matches(
@@ -313,6 +319,18 @@ mod tests {
                 format: "wav".into(),
             },
         }
+    }
+
+    #[test]
+    fn find_by_name_matches_enabled_route_by_exact_name() {
+        let enabled = make_route("alpha", 10, vec!["gpt-4o"], "gpt-4o-mini");
+        let mut disabled = make_route("beta", 10, vec!["gpt-4o"], "gpt-4o-mini");
+        disabled.enabled = false;
+        let eng = RoutingEngine::with_routes(vec![enabled, disabled]);
+        assert!(eng.find_by_name("alpha").is_some());
+        assert_eq!(eng.find_by_name("alpha").unwrap().name, "alpha");
+        assert!(eng.find_by_name("beta").is_none(), "disabled route not found");
+        assert!(eng.find_by_name("missing").is_none());
     }
 
     #[test]
