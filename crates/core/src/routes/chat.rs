@@ -78,6 +78,16 @@ pub(crate) fn cost_limit_from_header(headers: &HeaderMap) -> Option<f64> {
         .filter(|v| *v > 0.0)
 }
 
+/// `X-TokenTrimmer-Provider` — an exact provider id to pin for this request
+/// (lowercased; provider ids are lowercase). `None` when absent or blank.
+pub(crate) fn provider_override_from_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-tokentrimmer-provider")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+}
+
 /// Reject with 402 when the estimated request cost exceeds the header limit.
 /// Permissive when pricing is unknown (can't prove an exceedance) — same
 /// semantics as the route `max_cost_usd` ceiling.
@@ -1844,6 +1854,26 @@ pub(crate) async fn apply_routing(
         max_cost_usd,
         input_tokens_estimate: input_tokens,
     })
+}
+
+#[cfg(test)]
+mod provider_override_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn provider_override_header_parsing() {
+        let mut h = HeaderMap::new();
+        assert_eq!(provider_override_from_header(&h), None);
+        h.insert("x-tokentrimmer-provider", "  Anthropic ".parse().unwrap());
+        assert_eq!(
+            provider_override_from_header(&h).as_deref(),
+            Some("anthropic")
+        );
+        let mut empty = HeaderMap::new();
+        empty.insert("x-tokentrimmer-provider", "   ".parse().unwrap());
+        assert_eq!(provider_override_from_header(&empty), None);
+    }
 }
 
 #[cfg(test)]
