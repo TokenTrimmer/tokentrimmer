@@ -764,6 +764,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_yields_tool_calls() {
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Let me check\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "event: tokentrimmer.usage\n",
+            "data: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":10,\"output_tokens\":2,\"cached_tokens\":0}\n\n",
+            "data: [DONE]\n\n",
+        );
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"stream\":true");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse);
+        });
+
+        let client = Client::new(server.base_url(), "k");
+        let mut stream = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("weather in SF?"))
+            .stream()
+            .await
+            .unwrap();
+
+        let mut text = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut usage: Option<StreamUsage> = None;
+        while let Some(ev) = stream.next().await.unwrap() {
+            match ev {
+                StreamEvent::Delta(t) => text.push_str(&t),
+                StreamEvent::ToolCalls(t) => tool_calls = t,
+                StreamEvent::Usage(u) => usage = Some(u),
+            }
+        }
+        assert_eq!(text, "Let me check");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[0].function.arguments, "{\"city\":\"SF\"}");
+        assert!(usage.is_some());
+    }
+
+    #[tokio::test]
     async fn stream_surfaces_status_error() {
         let server = MockServer::start_async().await;
         server.mock(|when, then| {
