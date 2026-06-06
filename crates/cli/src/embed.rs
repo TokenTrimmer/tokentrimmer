@@ -33,7 +33,11 @@ fn assemble_input(args: &[String], stdin_text: Option<&str>) -> Option<Embedding
 fn format_embed_summary(out: &EmbedOutcome, requested_model: &str) -> String {
     let model = out.cost.model_used.as_deref().unwrap_or(requested_model);
     let count = out.response.data.len();
-    let noun = if count == 1 { "embedding" } else { "embeddings" };
+    let noun = if count == 1 {
+        "embedding"
+    } else {
+        "embeddings"
+    };
 
     let mut parts = vec![model.to_string(), format!("{count} {noun}")];
     if let Some(dims) = out.response.data.first().map(|d| d.embedding.len()) {
