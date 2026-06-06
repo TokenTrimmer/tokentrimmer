@@ -476,7 +476,9 @@ impl ChatBuilder<'_> {
     }
 }
 
-/// A live chat stream. Iterate with [`ChatStream::next`].
+/// A live chat stream. Iterate with [`ChatStream::next`], or use
+/// `futures::StreamExt` combinators via the [`futures::Stream`] impl
+/// (`Item = Result<StreamEvent>`); it is also a [`futures::stream::FusedStream`].
 pub struct ChatStream {
     inner: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
     buf: Vec<u8>,
@@ -550,6 +552,51 @@ impl ChatStream {
                 }
             }
         }
+    }
+}
+
+impl futures::Stream for ChatStream {
+    type Item = Result<StreamEvent>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        // `ChatStream: Unpin` (every field is Unpin), so we can take `&mut Self`.
+        let this = self.get_mut();
+        loop {
+            if let Some(ev) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(ev)));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.buf.extend_from_slice(&chunk);
+                    this.drain_into_pending();
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(Error::Request(e)))),
+                Poll::Ready(None) => {
+                    // Mirror next(): SSE may end without a trailing blank line, so
+                    // flush the residual frame before terminating.
+                    if !this.buf.is_empty() {
+                        this.buf.extend_from_slice(b"\n\n");
+                        this.drain_into_pending();
+                    }
+                    this.done = true;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl futures::stream::FusedStream for ChatStream {
+    fn is_terminated(&self) -> bool {
+        // Once `done` is set and the queue drains, poll_next only returns None.
+        self.done && self.pending.is_empty()
     }
 }
 
@@ -976,6 +1023,92 @@ mod tests {
             }
         }
         assert_eq!(text, "Hi");
+    }
+
+    #[tokio::test]
+    async fn stream_impl_collects_deltas_via_combinators() {
+        use futures::StreamExt;
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse);
+        });
+        let client = Client::new(server.base_url(), "k");
+        let stream = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .stream()
+            .await
+            .unwrap();
+        // Exercises Stream::poll_next via filter_map + collect (no inherent next()).
+        let text = stream
+            .filter_map(|ev| async move {
+                match ev {
+                    Ok(StreamEvent::Delta(t)) => Some(t),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(text, "Hello");
+    }
+
+    #[tokio::test]
+    async fn stream_is_terminated_after_exhaustion() {
+        use futures::stream::FusedStream;
+        let server = MockServer::start_async().await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse);
+        });
+        let client = Client::new(server.base_url(), "k");
+        let mut stream = client.chat().model("m").message(user("hi")).stream().await.unwrap();
+        assert!(!stream.is_terminated(), "fresh stream is not terminated");
+        // Drain via the inherent next() until end.
+        while stream.next().await.unwrap().is_some() {}
+        assert!(stream.is_terminated(), "stream is terminated after None");
+    }
+
+    #[tokio::test]
+    async fn stream_impl_flushes_terminal_frame_on_eof() {
+        use futures::StreamExt;
+        let server = MockServer::start_async().await;
+        // No trailing blank line, no [DONE] — EOF must flush the last frame.
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"end\"}}]}";
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse);
+        });
+        let client = Client::new(server.base_url(), "k");
+        let stream = client.chat().model("m").message(user("hi")).stream().await.unwrap();
+        let text = stream
+            .filter_map(|ev| async move {
+                match ev {
+                    Ok(StreamEvent::Delta(t)) => Some(t),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(text, "end");
     }
 
     #[tokio::test]
