@@ -107,6 +107,10 @@ impl Provider for OpenAiProvider {
         translate::dropped_params(req)
     }
 
+    fn supports_response_schema(&self) -> bool {
+        true
+    }
+
     /// Non-streaming chat completion via `POST /chat/completions`.
     ///
     /// Strips `tt_extras`, applies reasoning-model parameter fixups, sends the

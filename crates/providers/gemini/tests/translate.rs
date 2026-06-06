@@ -39,6 +39,13 @@ fn make_request(model: &str, messages: Vec<Message>) -> ChatCompletionRequest {
     }
 }
 
+#[test]
+fn gemini_supports_response_schema() {
+    use tt_provider_gemini::{ClientConfig, GeminiProvider};
+    use tt_shared::Provider;
+    assert!(GeminiProvider::new(ClientConfig::default()).supports_response_schema());
+}
+
 fn user_text(text: &str) -> Message {
     Message::User {
         content: MessageContent::Text(text.to_string()),

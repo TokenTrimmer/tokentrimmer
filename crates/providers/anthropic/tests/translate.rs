@@ -47,6 +47,13 @@ fn user_text(text: &str) -> Message {
 }
 
 #[test]
+fn anthropic_does_not_support_response_schema() {
+    use tt_provider_anthropic::{AnthropicProvider, ClientConfig};
+    use tt_shared::Provider;
+    assert!(!AnthropicProvider::new(ClientConfig::default()).supports_response_schema());
+}
+
+#[test]
 fn dropped_params_reports_present_openai_only_fields() {
     use tt_provider_anthropic::{AnthropicProvider, ClientConfig};
     use tt_shared::{messages::ResponseFormat, Provider};
