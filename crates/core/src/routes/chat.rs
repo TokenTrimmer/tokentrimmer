@@ -1916,16 +1916,6 @@ pub(crate) struct RouteMatch {
     pub(crate) input_tokens_estimate: u32,
 }
 
-/// Look up the org's routing engine (cached ~60s) and evaluate it against
-/// the incoming request. On a match, rewrites `req.model` in place and
-/// returns the matched route (id + fallbacks) so callers can stamp the id on
-/// the request_logs row and fail over across the fallback chain. Returns
-/// `None` (and does not modify `req`) when:
-///
-/// - no routing store is configured (dev / free tier),
-/// - the request has no resolvable org (synthetic context),
-/// - the backend errors (we log + fall through — never fail user traffic),
-/// - or no enabled route matches.
 /// A forced route that can't be honored is a `400`; absence of routing is fine
 /// for an unforced request.
 fn forced_miss(forced: Option<&str>) -> ApiResult<Option<RouteMatch>> {
@@ -1935,6 +1925,17 @@ fn forced_miss(forced: Option<&str>) -> ApiResult<Option<RouteMatch>> {
     }
 }
 
+/// Look up the org's routing engine (cached ~60s) and evaluate it against
+/// the incoming request. On a match, rewrites `req.model` in place and
+/// returns the matched route (id + fallbacks) so callers can stamp the id on
+/// the request_logs row and fail over across the fallback chain. A forced route
+/// (`X-TokenTrimmer-Route`) bypasses condition evaluation; an unknown forced
+/// route name is a `400`. Returns `None` (and does not modify `req`) when:
+///
+/// - no routing store is configured (dev / free tier),
+/// - the request has no resolvable org (synthetic context),
+/// - the backend errors (we log + fall through — never fail user traffic),
+/// - or no enabled route matches.
 pub(crate) async fn apply_routing(
     state: &AppState,
     ctx: &RequestContext,
