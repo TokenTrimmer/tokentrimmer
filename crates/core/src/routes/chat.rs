@@ -401,6 +401,33 @@ impl CacheBehavior {
     }
 }
 
+/// `X-TokenTrimmer-Cache` → `(do_lookup, do_insert)` per the documented modes.
+/// Absent/blank → `None`. Unknown value → `400` (the four values are documented).
+fn cache_override_from_header(headers: &HeaderMap) -> ApiResult<Option<(bool, bool)>> {
+    let Some(raw) = headers
+        .get("x-tokentrimmer-cache")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    let pair = match v.as_str() {
+        "disabled" => (false, false),
+        "read-only" => (true, false),
+        "bypass" => (false, true),
+        "force-write" => (true, true),
+        other => {
+            return Err(ApiError::InvalidRequest(format!(
+                "invalid X-TokenTrimmer-Cache value: {other} (expected disabled, read-only, bypass, or force-write)"
+            )))
+        }
+    };
+    Ok(Some(pair))
+}
+
 /// Handler for `POST /v1/chat/completions`.
 ///
 /// Resolves the provider for `req.model`, builds a [`RequestContext`] from the
@@ -1929,6 +1956,41 @@ pub(crate) async fn apply_routing(
         max_cost_usd,
         input_tokens_estimate: input_tokens,
     })
+}
+
+#[cfg(test)]
+mod cache_header_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn hv(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-tokentrimmer-cache", v.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn cache_override_parsing() {
+        assert_eq!(cache_override_from_header(&HeaderMap::new()).unwrap(), None);
+        assert_eq!(
+            cache_override_from_header(&hv("disabled")).unwrap(),
+            Some((false, false))
+        );
+        assert_eq!(
+            cache_override_from_header(&hv("read-only")).unwrap(),
+            Some((true, false))
+        );
+        assert_eq!(
+            cache_override_from_header(&hv("bypass")).unwrap(),
+            Some((false, true))
+        );
+        assert_eq!(
+            cache_override_from_header(&hv(" Force-Write ")).unwrap(),
+            Some((true, true))
+        );
+        assert_eq!(cache_override_from_header(&hv("   ")).unwrap(), None);
+        assert!(cache_override_from_header(&hv("nope")).is_err());
+    }
 }
 
 #[cfg(test)]
