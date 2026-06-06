@@ -16,7 +16,7 @@ pub use tt_shared::messages::{
 pub use tt_shared::Usage;
 
 mod embeddings;
-pub use embeddings::EmbedOutcome;
+pub use embeddings::{EmbedBuilder, EmbedOutcome};
 
 mod tools;
 /// Re-exported so downstream `impl ToolExecutor` blocks can annotate with
@@ -227,6 +227,9 @@ pub enum Error {
     /// No model was set on the builder — call `.model(...)`.
     #[error("model is required — call `.model(...)`")]
     MissingModel,
+    /// No input was set on the embeddings builder — call `.input(...)`.
+    #[error("input is required — call `.input(...)`")]
+    MissingInput,
     #[error("request to the gateway failed: {0}")]
     Request(#[source] reqwest::Error),
     /// A non-2xx response. `cost` carries the `x-tokentrimmer-*` telemetry

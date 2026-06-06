@@ -1,25 +1,83 @@
-//! Embeddings: `Client::embed` posts to `/v1/embeddings` and returns the typed
-//! response plus the gateway's cost/savings headers.
+# tt-client EmbedBuilder Implementation Plan
 
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add a fluent `EmbedBuilder` to `tt-client` exposing `dimensions`, `encoding_format`, and `cost_limit` on the embeddings call, mirroring `ChatBuilder`.
+
+**Architecture:** New `Client::embeddings() -> EmbedBuilder` with setters + `send()`, in `crates/client/src/embeddings.rs`; the existing `embed(model, input)` becomes a thin delegate; a new `Error::MissingInput` variant in `lib.rs`. `send()` serializes the typed `EmbeddingsRequest` (so unset options are omitted) and injects the cost-limit header.
+
+**Tech Stack:** Rust, reqwest, serde, httpmock (tests).
+
+Spec: `docs/superpowers/specs/2026-06-05-tt-client-embed-builder-design.md`. Branch `tt-client-embed-builder` (off `main`, spec committed).
+
+**Verified anchors (`crates/client`):**
+- `Error` enum (`#[non_exhaustive]`) — lib.rs:225-242; `MissingModel` at :227-229.
+- `embeddings.rs`: top import `use crate::{parse_cost, Client, CostInfo, EmbeddingInput, EmbeddingsResponse, Error, Result};` (line 6) + `use serde_json::json;` (line 4); `EmbedOutcome` (8-20); `impl Client { embed }` (22-63); `#[cfg(test)] mod tests` (66+) uses `json!` via `use super::*`.
+- `EmbeddingsRequest { model, input, dimensions: Option<u32>, encoding_format: Option<String> }` — re-exported at the crate root (`crate::EmbeddingsRequest`); `dimensions`/`encoding_format` carry `#[serde(skip_serializing_if = "Option::is_none")]`.
+
+---
+
+### Task 1: Add `Error::MissingInput`
+
+**Files:**
+- Modify: `crates/client/src/lib.rs` (Error enum, ~227-229)
+
+- [ ] **Step 1: Add the variant**
+
+In `crates/client/src/lib.rs`, after the `MissingModel` variant (lib.rs:227-229), add:
+
+```rust
+    /// No model was set on the builder — call `.model(...)`.
+    #[error("model is required — call `.model(...)`")]
+    MissingModel,
+    /// No input was set on the embeddings builder — call `.input(...)`.
+    #[error("input is required — call `.input(...)`")]
+    MissingInput,
+```
+
+- [ ] **Step 2: Verify it compiles**
+
+Run: `cargo build -p tt-client`
+Expected: builds (a new unused enum variant on a `#[non_exhaustive]` enum is fine — no warning).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/client/src/lib.rs
+git commit -m "feat(tt-client): add Error::MissingInput"
+```
+
+---
+
+### Task 2: `EmbedBuilder` + `embeddings()` + `embed()` delegate
+
+**Files:**
+- Modify: `crates/client/src/embeddings.rs` (imports, `impl Client`, new builder, tests)
+
+- [ ] **Step 1: Update the imports**
+
+In `crates/client/src/embeddings.rs`, replace the top two `use` lines (lines 4 + 6):
+
+```rust
+use serde_json::json;
+
+use crate::{parse_cost, Client, CostInfo, EmbeddingInput, EmbeddingsResponse, Error, Result};
+```
+
+with (drop `serde_json::json` — non-test code no longer builds JSON by hand — and add `EmbeddingsRequest`):
+
+```rust
 use crate::{
     parse_cost, Client, CostInfo, EmbeddingInput, EmbeddingsRequest, EmbeddingsResponse, Error,
     Result,
 };
+```
 
-/// A completed embeddings call: the typed response plus parsed cost/savings.
-#[derive(Debug, Clone)]
-pub struct EmbedOutcome {
-    pub response: EmbeddingsResponse,
-    pub cost: CostInfo,
-}
+- [ ] **Step 2: Replace the `impl Client { embed }` block with the builder**
 
-impl EmbedOutcome {
-    /// The embedding rows, in returned order.
-    pub fn vectors(&self) -> impl Iterator<Item = &[f32]> {
-        self.response.data.iter().map(|d| d.embedding.as_slice())
-    }
-}
+In `crates/client/src/embeddings.rs`, replace the entire `impl Client { … pub async fn embed … }` block (lines 22-63) with:
 
+```rust
 impl Client {
     /// Start building an embeddings request:
     /// `client.embeddings().model(m).input(i).dimensions(256).send()`.
@@ -136,59 +194,22 @@ impl EmbedBuilder<'_> {
         Ok(EmbedOutcome { response, cost })
     }
 }
+```
 
-#[cfg(test)]
-mod tests {
+- [ ] **Step 3: Add the test-module `json!` import + the new tests**
+
+In the `#[cfg(test)] mod tests` block, add `use serde_json::json;` to the imports (after `use httpmock::prelude::*;`), since the top-level import was removed:
+
+```rust
     use super::*;
     use crate::Client;
     use httpmock::prelude::*;
     use serde_json::json;
+```
 
-    fn embeddings_body() -> serde_json::Value {
-        json!({
-            "object": "list",
-            "data": [
-                { "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] },
-                { "object": "embedding", "index": 1, "embedding": [0.4, 0.5, 0.6] }
-            ],
-            "model": "text-embedding-3-small",
-            "usage": { "prompt_tokens": 8, "completion_tokens": 0, "total_tokens": 8 }
-        })
-    }
+Then add these tests inside `mod tests`:
 
-    #[tokio::test]
-    async fn embed_returns_vectors_and_cost() {
-        let server = MockServer::start_async().await;
-        server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/embeddings")
-                .body_contains("text-embedding-3-small");
-            then.status(200)
-                .header("content-type", "application/json")
-                .header("x-tokentrimmer-cost-usd", "0.0002")
-                .header("x-tokentrimmer-model-used", "text-embedding-3-small")
-                .json_body(embeddings_body());
-        });
-
-        let client = Client::new(server.base_url(), "k");
-        let out = client
-            .embed(
-                "text-embedding-3-small",
-                EmbeddingInput::Batch(vec!["a".into(), "b".into()]),
-            )
-            .await
-            .unwrap();
-
-        let rows: Vec<&[f32]> = out.vectors().collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], &[0.1, 0.2, 0.3]);
-        assert_eq!(out.cost.cost_usd, Some(0.0002));
-        assert_eq!(
-            out.cost.model_used.as_deref(),
-            Some("text-embedding-3-small")
-        );
-    }
-
+```rust
     #[tokio::test]
     async fn embeddings_builder_sends_dimensions_and_encoding_format() {
         let server = MockServer::start_async().await;
@@ -256,26 +277,54 @@ mod tests {
             .await;
         assert!(matches!(result, Err(Error::MissingModel)));
     }
+```
 
-    #[tokio::test]
-    async fn embed_surfaces_status_error() {
-        let server = MockServer::start_async().await;
-        server.mock(|when, then| {
-            when.method(POST).path("/v1/embeddings");
-            then.status(501).body("not implemented");
-        });
-        let client = Client::new(server.base_url(), "k");
-        let result = client.embed("m", EmbeddingInput::Single("hi".into())).await;
-        assert!(matches!(result, Err(Error::Status { status: 501, .. })));
-    }
+- [ ] **Step 4: Run the SDK tests**
 
-    #[tokio::test]
-    async fn embed_without_model_errors_before_any_request() {
-        // dead base — no network is touched because the model is empty.
-        let client = Client::new("http://127.0.0.1:1", "k");
-        let result = client
-            .embed("  ", EmbeddingInput::Single("hi".into()))
-            .await;
-        assert!(matches!(result, Err(Error::MissingModel)));
-    }
-}
+Run: `cargo test -p tt-client`
+Expected: the four new tests pass alongside `embed_returns_vectors_and_cost` (the convenience delegate) and the full suite. (`embed_builder_sends_cost_limit_header`'s mock requires the header, so it only matches if the builder sends it; the `dimensions`/`encoding_format` test's mock requires both body substrings.)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/client/src/embeddings.rs
+git commit -m "feat(tt-client): EmbedBuilder with dimensions/encoding_format/cost_limit"
+```
+
+---
+
+### Task 3: Gates + finish the branch
+
+**Files:** none (verification + PR)
+
+- [ ] **Step 1: Format + clippy**
+
+Run: `cargo fmt --all`
+Then: `git diff --quiet || git commit -am "style: cargo fmt"`
+Run: `cargo clippy --workspace --all-targets -- -D warnings`
+Expected: exit 0. (Confirms the dropped `serde_json::json` top-level import left no unused-import error, and the new builder is lint-clean.)
+
+- [ ] **Step 2: Tests + advisories + docs**
+
+Run: `cargo test -p tt-client`
+Expected: all pass.
+Run: `cargo deny check advisories`
+Expected: ok.
+Run: `RUSTDOCFLAGS="-D warnings" cargo doc -p tt-client --no-deps`
+Expected: exit 0.
+
+- [ ] **Step 3: Finish the branch**
+
+Use the **superpowers:finishing-a-development-branch** skill: verify tests, push `tt-client-embed-builder`, create the PR (option 2). PR body: the fluent `EmbedBuilder` (dimensions/encoding_format/cost_limit), the `embed()` convenience delegate, and `Error::MissingInput`.
+
+- [ ] **Step 4: Adversarial review + CI**
+
+After the PR is open, run a Workflow-based adversarial review (lenses: request serialization parity with the gateway `EmbeddingsRequest` + cost-limit header; builder/API hygiene + the new error variant). Watch CI; fix confirmed findings before merge. Update roadmap memory (F3 done) when green.
+
+---
+
+## Notes for the implementer
+
+- **Typed request serialization:** building `EmbeddingsRequest` and `.json(&req)` is why unset `dimensions`/`encoding_format` are omitted (their `skip_serializing_if`); don't reintroduce manual `json!` in `send`.
+- **`json!` moved to tests:** the top-level `use serde_json::json;` is removed (non-test code no longer needs it); the test module gains its own `use serde_json::json;` for `embeddings_body()`.
+- **Same-crate field access:** `EmbedBuilder::send` reaches `self.client.http/base/key` (private `Client` fields) because `embeddings.rs` is a child module of the crate root — same as `ChatBuilder`.
