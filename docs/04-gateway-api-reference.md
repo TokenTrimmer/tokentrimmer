@@ -148,7 +148,7 @@ Follows the OpenAI Chat Completions schema. Full reference:
 **Provider-specific parameter handling:**
 
 - Parameters not supported by the routed provider are silently dropped, with a `X-TokenTrimmer-Warnings` response header noting the drop.
-- Parameters with different ranges across providers (e.g., temperature) are clamped to the provider's valid range, with a warning.
+- _(Planned)_ Parameters with different ranges across providers (e.g., temperature) are clamped to the provider's valid range, with a `temperature_clamped` warning.
 - For Anthropic-routed requests, `max_tokens` is required by Anthropic but optional here; Gateway defaults to 4096 if omitted.
 
 ### 3.3 Response (non-streaming)
@@ -297,7 +297,7 @@ Or with schema:
 }
 ```
 
-If routed to a provider that doesn't support schema mode, Gateway returns `X-TokenTrimmer-Warnings: response_format_downgrade` and falls back to `json_object`.
+_(Planned)_ If routed to a provider that doesn't support schema mode, Gateway will return `X-TokenTrimmer-Warnings: response_format_downgrade` and fall back to `json_object`. (Today, providers that reject `response_format` outright — e.g. Anthropic — drop it and emit `param_dropped:response_format`.)
 
 ---
 
@@ -424,12 +424,21 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Baseline-Cost-Usd` | on dispatched/cached responses | `0.0218` |
 | `X-TokenTrimmer-Saved-Usd` | on dispatched/cached responses | `0.0184` |
 | `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
-| `X-TokenTrimmer-Warnings` | Planned (not yet emitted) | `param_dropped:frequency_penalty,response_format_downgrade` |
+| `X-TokenTrimmer-Warnings` | on dispatched responses, when the gateway altered the request | `param_dropped:frequency_penalty,param_dropped:n` |
 
 `X-TokenTrimmer-Trace-Id` and `X-TokenTrimmer-Latency-Ms` are present on every
 response (success or error). The cost/provider/model/cache headers are attached on
 responses that reach dispatch, cache, or the sandbox path; they are not emitted on
 early validation errors (4xx returned before dispatch).
+
+`X-TokenTrimmer-Warnings` is a comma-separated list of tokens, emitted only when
+the gateway altered the request before dispatch. Currently the gateway emits one
+`param_dropped:<name>` token per request parameter the routed provider rejects and
+the gateway drops during translation — e.g. Anthropic drops `n`, `seed`,
+`response_format`, `presence_penalty`, and `frequency_penalty`; Gemini drops `n`,
+`seed`, `presence_penalty`, `frequency_penalty`, and `user`; reasoning models
+(`o3`, `o4-mini`) drop `temperature`. The `response_format_downgrade` and
+`temperature_clamped` tokens are planned follow-ups.
 
 ### 6.3 Cache control semantics
 
