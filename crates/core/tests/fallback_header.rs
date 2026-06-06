@@ -160,7 +160,11 @@ async fn fallback_header_enables_failover_without_route() {
         Some("backup")
     );
     assert!(primary_calls.load(Ordering::Relaxed) >= 1, "primary tried");
-    assert_eq!(backup_calls.load(Ordering::Relaxed), 1, "backup served once");
+    assert_eq!(
+        backup_calls.load(Ordering::Relaxed),
+        1,
+        "backup served once"
+    );
 }
 
 #[tokio::test]
