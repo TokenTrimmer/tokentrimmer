@@ -478,12 +478,11 @@ All errors follow OpenAI's error response shape:
 | 200 | Success |
 | 400 | Invalid request (bad params, malformed JSON) |
 | 401 | Invalid or missing TokenTrimmer key |
-| 402 | Subscription required (free tier exhausted) |
+| 402 | Subscription required (free tier exhausted), **or** cost limit exceeded when `X-TokenTrimmer-Cost-Limit-Usd` triggers — distinguish via the error body's `code` |
 | 403 | Operation not permitted (e.g., model not enabled) |
 | 404 | Model or route not found |
 | 408 | Timeout exceeded |
 | 413 | Request too large |
-| 422 | Cost limit exceeded (when `X-TokenTrimmer-Cost-Limit-Usd` triggers) |
 | 429 | Rate limited (TokenTrimmer key or upstream provider) |
 | 500 | Internal Gateway error |
 | 502 | Upstream provider returned 5xx after retries |
@@ -817,15 +816,14 @@ Self-hosted Gateway has all the above with these differences:
 - Provider credentials from env vars or config file, not from a stored DB
 - No subscription/billing; the binary is free
 
-A separate `/health` and `/metrics` endpoint is exposed for ops:
+A `/health` endpoint is exposed for ops:
 
 ```
 GET /health
 → 200 OK if Gateway is healthy
-
-GET /metrics
-→ Prometheus format
 ```
+
+> **Planned:** `GET /metrics` (Prometheus exposition) is not yet implemented — tracked as `gw-metrics-endpoint` in the backlog. The telemetry crate already maintains the underlying counters.
 
 ---
 

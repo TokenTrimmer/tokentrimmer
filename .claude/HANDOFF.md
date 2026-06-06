@@ -1,8 +1,8 @@
 # Active session handoff
 
-_Written at 2026-05-29T13:52:59Z by session `20260529-86515` on branch `main` (@ a05a4af)._
+_Refreshed 2026-06-06 on branch `main` (@ c555ff7). (Prior: 2026-05-29 @ a05a4af.)_
 
-## Status: Backlog drained — chain ending. Recent burst: trackA-sse-transport shipped (MCP SSE bidirectional via GET /sse + POST /messages?sessionId=…). All public-side actionable items complete: 6-track expansion + 6 follow-ups + 4 bug-fixes + workspace clippy gate. Remaining items all CLOUD-REPO or BLOCKED on external accounts/migrations.
+## Status: NOT drained — active development resumed. Since 2026-05-29: the post-roadmap queue (#38–#41), the F-series (F1–F12, incl. cloud F12a/b), and the G-series (tt-client `Stream` #58 + the `X-TokenTrimmer-Warnings` channel: `param_dropped` #59 / `response_format_downgrade` #60-#61 / `temperature_clamped` #62) all shipped. On 2026-06-06 a multi-agent audit produced **`docs/reviews/2026-06-06-audit-checklist.md`** (82 public + 31 cloud findings) — now the active work queue, being executed in priority waves (see "Audit follow-ups" in BACKLOG.md). Genuinely-open: `gw-traceparent-ingest`, `gw-metrics-endpoint`, `gw-gdpr-delete-export`, `rv-l2-org-cache-optout` (priority-bumped), plus the audit items; the 4 P0 go-live gates remain BLOCKED on external accounts/deploy (consolidated as `beta-go-live-runbook`).
 
 Active task: `(idle — all OSS actionable items shipped)`
 
