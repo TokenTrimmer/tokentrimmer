@@ -23,8 +23,9 @@ use tt_shared::{
 
 use crate::middleware::trace::TraceId;
 use crate::routes::chat::{
-    apply_routing, attach_cost_headers, compute_cost, cost_limit_from_header, enforce_cost_limit,
-    estimate_cost_usd, resolve_credentials, resolve_credentials_for,
+    apply_provider_override, apply_routing, attach_cost_headers, compute_cost,
+    cost_limit_from_header, enforce_cost_limit, estimate_cost_usd, provider_override_from_header,
+    resolve_credentials, resolve_credentials_for,
 };
 use crate::{ApiError, ApiResult, AppState};
 
@@ -187,6 +188,23 @@ pub async fn handler(
                 }
             }
         }
+    }
+
+    // Explicit provider pin (X-TokenTrimmer-Provider) — overrides the
+    // routed/inferred provider; the routed model is kept. See chat.rs.
+    let provider_pin = provider_override_from_header(&headers);
+    let (pinned_provider, pin_creds) = apply_provider_override(
+        &state,
+        provider_pin.as_deref(),
+        org_id,
+        &raw_bearer,
+        &source_provider_id,
+        provider,
+    )
+    .await?;
+    provider = pinned_provider;
+    if let Some(c) = pin_creds {
+        ctx.credentials = c;
     }
 
     // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header,

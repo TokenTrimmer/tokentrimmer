@@ -88,6 +88,51 @@ pub(crate) fn provider_override_from_header(headers: &HeaderMap) -> Option<Strin
         .filter(|s| !s.is_empty())
 }
 
+/// Apply an `X-TokenTrimmer-Provider` pin. Returns the provider to dispatch and,
+/// when it differs from `current`, the credentials to use. The pin overrides the
+/// routed/inferred provider (the routed model is kept). Cross-provider pins
+/// re-resolve the target's stored credentials and fail closed (never forward the
+/// source key); pinning back to the source restores source credentials.
+///
+/// # Errors
+/// - [`ApiError::InvalidRequest`] if `pinned_id` is not a known provider id.
+/// - [`ApiError::MissingProviderCredential`] if a cross-provider pin has no
+///   stored credential.
+pub(crate) async fn apply_provider_override(
+    state: &AppState,
+    pinned_id: Option<&str>,
+    org_id: Uuid,
+    raw_bearer: &str,
+    source_provider_id: &str,
+    current: std::sync::Arc<dyn tt_shared::Provider>,
+) -> ApiResult<(
+    std::sync::Arc<dyn tt_shared::Provider>,
+    Option<ProviderCredentials>,
+)> {
+    let Some(pinned_id) = pinned_id else {
+        return Ok((current, None));
+    };
+    let pinned = state
+        .registry
+        .by_id(pinned_id)
+        .ok_or_else(|| ApiError::InvalidRequest(format!("unknown provider: {pinned_id}")))?;
+    if pinned.id() == current.id() {
+        return Ok((current, None));
+    }
+    let creds = if pinned.id() == source_provider_id {
+        // Pin back to the source provider — source credentials (bearer fallback OK).
+        resolve_credentials(state, org_id, source_provider_id, raw_bearer).await
+    } else {
+        // Cross-provider pin — require the target's stored credential, fail closed.
+        resolve_credentials_for(state, org_id, pinned.id(), raw_bearer, false)
+            .await
+            .ok_or_else(|| ApiError::MissingProviderCredential {
+                provider: pinned.id().to_string(),
+            })?
+    };
+    Ok((pinned, Some(creds)))
+}
+
 /// Reject with 402 when the estimated request cost exceeds the header limit.
 /// Permissive when pricing is unknown (can't prove an exceedance) — same
 /// semantics as the route `max_cost_usd` ceiling.
@@ -394,6 +439,9 @@ pub async fn handler(
         .unwrap_or("")
         .to_string();
 
+    // Explicit provider pin (X-TokenTrimmer-Provider), applied after routing below.
+    let provider_pin = provider_override_from_header(&headers);
+
     // 2a. Sandbox short-circuit: `tt_test_*` keys return a deterministic
     //     synthetic response without contacting any real provider — for
     //     E2E test suites and customer integration testing without spend.
@@ -472,7 +520,7 @@ pub async fn handler(
         .map(|m| m.input_tokens_estimate)
         .unwrap_or(0);
     // Ordered fallback model ids from the matched route (empty = no failover).
-    let route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
+    let mut route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
     if matched_route_id.is_some() {
         // Provider may change when a route crosses providers (V3d-1); the
         // registry is the source of truth.
@@ -510,6 +558,27 @@ pub async fn handler(
                 }
             }
         }
+    }
+
+    // 2d. Explicit provider pin (X-TokenTrimmer-Provider) — overrides the
+    //     routed/inferred provider; the routed model is kept. Fails closed on a
+    //     cross-provider pin with no stored credential.
+    let (pinned_provider, pin_creds) = apply_provider_override(
+        &state,
+        provider_pin.as_deref(),
+        org_id,
+        &raw_bearer,
+        &source_provider_id,
+        provider,
+    )
+    .await?;
+    provider = pinned_provider;
+    if let Some(c) = pin_creds {
+        ctx.credentials = c;
+    }
+    if provider_pin.is_some() {
+        // An explicit provider pin must not fail over to a different provider.
+        route_fallbacks.clear();
     }
 
     // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header.
