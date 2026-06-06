@@ -57,7 +57,11 @@ const DEFAULT_OUTPUT_TOKENS_ESTIMATE: u32 = 1000;
 /// Estimated request cost (USD): input tokens at the input rate + output tokens
 /// (from `max_tokens`, else the default) at the output rate. Shared by the
 /// pre-rewrite cost condition (V3d-2a) and the post-rewrite ceiling (V3d-2b).
-fn estimate_cost_usd(pricing: &ModelPricing, input_tokens: u32, max_tokens: Option<u32>) -> f64 {
+pub(crate) fn estimate_cost_usd(
+    pricing: &ModelPricing,
+    input_tokens: u32,
+    max_tokens: Option<u32>,
+) -> f64 {
     let output_est = max_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS_ESTIMATE);
     (f64::from(input_tokens) * pricing.input_per_million
         + f64::from(output_est) * pricing.output_per_million)
@@ -1450,7 +1454,7 @@ async fn insert_into_l2(
 /// model, callers pass the same pricing for both so the baseline reflects the
 /// served model's pre-discount cost. If `baseline_pricing` is `None`, it
 /// falls back to `pricing` (conservative: reports no routing saving).
-fn compute_cost(
+pub(crate) fn compute_cost(
     usage: &Usage,
     pricing: Option<&ModelPricing>,
     baseline_pricing: Option<&ModelPricing>,
@@ -1509,7 +1513,7 @@ fn compute_cost(
 }
 
 /// Insert all six required `X-TokenTrimmer-*` response headers.
-fn attach_cost_headers(
+pub(crate) fn attach_cost_headers(
     headers: &mut axum::http::HeaderMap,
     trace_id: Uuid,
     provider_id: &str,
@@ -1549,7 +1553,7 @@ fn attach_cost_headers(
 ///
 /// On a store error we log and fall back to the raw Bearer rather than
 /// failing the request: cache and credential lookup are best-effort layers.
-async fn resolve_credentials(
+pub(crate) async fn resolve_credentials(
     state: &AppState,
     org_id: Uuid,
     provider_id: &str,
@@ -1574,7 +1578,7 @@ async fn resolve_credentials(
 /// With **no** store configured (dev / dogfood / BYO-key passthrough) there is
 /// no per-provider credential model to enforce, so the raw Bearer is forwarded
 /// to every provider — never fail-closed.
-async fn resolve_credentials_for(
+pub(crate) async fn resolve_credentials_for(
     state: &AppState,
     org_id: Uuid,
     provider_id: &str,
@@ -1704,12 +1708,12 @@ fn clamp_latency_ms(started: Instant) -> i32 {
 /// route's id (for `request_logs.route_id` attribution) plus its ordered
 /// fallback model ids (for failover dispatch). Empty `fallbacks` = the route
 /// declared no failover targets.
-struct RouteMatch {
-    route_id: Uuid,
-    fallbacks: Vec<String>,
-    disable_cache: bool,
-    max_cost_usd: Option<f64>,
-    input_tokens_estimate: u32,
+pub(crate) struct RouteMatch {
+    pub(crate) route_id: Uuid,
+    pub(crate) fallbacks: Vec<String>,
+    pub(crate) disable_cache: bool,
+    pub(crate) max_cost_usd: Option<f64>,
+    pub(crate) input_tokens_estimate: u32,
 }
 
 /// Look up the org's routing engine (cached ~60s) and evaluate it against
@@ -1722,7 +1726,7 @@ struct RouteMatch {
 /// - the request has no resolvable org (synthetic context),
 /// - the backend errors (we log + fall through — never fail user traffic),
 /// - or no enabled route matches.
-async fn apply_routing(
+pub(crate) async fn apply_routing(
     state: &AppState,
     ctx: &RequestContext,
     req: &mut ChatCompletionRequest,

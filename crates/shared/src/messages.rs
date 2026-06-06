@@ -116,7 +116,7 @@ mod cache_control_tests {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -337,4 +337,19 @@ pub struct EmbeddingData {
     pub object: String,
     pub index: u32,
     pub embedding: Vec<f32>,
+}
+
+#[cfg(test)]
+mod embeddings_default_tests {
+    use super::*;
+
+    #[test]
+    fn chat_request_default_is_empty() {
+        let r = ChatCompletionRequest::default();
+        assert_eq!(r.model, "");
+        assert!(r.messages.is_empty());
+        assert!(!r.stream);
+        assert!(r.tools.is_empty());
+        assert!(r.max_tokens.is_none());
+    }
 }
