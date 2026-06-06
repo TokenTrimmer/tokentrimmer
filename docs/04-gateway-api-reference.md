@@ -400,33 +400,36 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 
 ### 6.1 Request headers
 
-| Header | Purpose | Example |
-|---|---|---|
-| `X-TokenTrimmer-Tag` | Free-form tag for cost attribution | `feature=chat-support,user=u_123` |
-| `X-TokenTrimmer-Cache` | Override cache behavior for this request | `bypass` / `force-write` / `read-only` / `disabled` |
-| `X-TokenTrimmer-Route` | Force a specific named route | `cheap-for-short` |
-| `X-TokenTrimmer-Provider` | Override provider selection | `anthropic` |
-| `X-TokenTrimmer-Fallback` | Comma-separated fallback chain override | `openai/gpt-4o,anthropic/claude-3-5-sonnet` |
-| `X-TokenTrimmer-Timeout-Ms` | Per-request timeout override (max 600000) | `30000` |
-| `X-TokenTrimmer-Cost-Limit-Usd` | Reject if estimated cost > limit | `0.05` |
-| `X-TokenTrimmer-Trace-Parent` | W3C traceparent for distributed tracing | (standard format) |
+| Header | Purpose | Status | Example |
+|---|---|---|---|
+| `X-TokenTrimmer-Tag` | Free-form tag for cost attribution | Honored | `feature=chat-support,user=u_123` |
+| `X-TokenTrimmer-Cost-Limit-Usd` | Reject (402) if estimated cost > limit | Honored | `0.05` |
+| `X-TokenTrimmer-Cache` | Override cache behavior for this request | Planned (not yet honored) | `bypass` / `force-write` / `read-only` / `disabled` |
+| `X-TokenTrimmer-Route` | Force a specific named route | Planned (not yet honored) | `cheap-for-short` |
+| `X-TokenTrimmer-Provider` | Override provider selection | Planned (not yet honored) | `anthropic` |
+| `X-TokenTrimmer-Fallback` | Comma-separated fallback chain override | Planned (not yet honored) | `openai/gpt-4o,anthropic/claude-3-5-sonnet` |
+| `X-TokenTrimmer-Timeout-Ms` | Per-request timeout override (max 600000) | Planned (not yet honored) | `30000` |
+| `X-TokenTrimmer-Trace-Parent` | W3C traceparent for distributed tracing | Planned (not yet honored) | (standard format) |
 
 ### 6.2 Response headers
 
-| Header | Always present | Example |
+| Header | Present | Example |
 |---|---|---|
-| `X-TokenTrimmer-Trace-Id` | yes | `5f3a1c...` |
-| `X-TokenTrimmer-Provider` | yes | `anthropic` |
-| `X-TokenTrimmer-Model-Used` | yes | `claude-3-5-haiku-20241022` |
-| `X-TokenTrimmer-Cache` | yes | `hit-l1` / `hit-l2` / `miss` / `bypass` |
-| `X-TokenTrimmer-Route-Matched` | yes | `cheap-for-short` |
-| `X-TokenTrimmer-Cost-Usd` | yes | `0.0034` |
-| `X-TokenTrimmer-Baseline-Cost-Usd` | yes | `0.0218` |
-| `X-TokenTrimmer-Saved-Usd` | yes | `0.0184` |
-| `X-TokenTrimmer-Latency-Ms` | yes | `412` |
-| `X-TokenTrimmer-Warnings` | when applicable | `param_dropped:frequency_penalty,response_format_downgrade` |
+| `X-TokenTrimmer-Trace-Id` | every response | `5f3a1c...` |
+| `X-TokenTrimmer-Latency-Ms` | every response | `412` |
+| `X-TokenTrimmer-Provider` | on dispatched/cached responses | `anthropic` |
+| `X-TokenTrimmer-Model-Used` | on dispatched/cached responses | `claude-3-5-haiku-20241022` |
+| `X-TokenTrimmer-Cache` | on dispatched/cached responses | `hit-l1` / `hit-l2` / `miss` / `none` |
+| `X-TokenTrimmer-Cost-Usd` | on dispatched/cached responses | `0.0034` |
+| `X-TokenTrimmer-Baseline-Cost-Usd` | on dispatched/cached responses | `0.0218` |
+| `X-TokenTrimmer-Saved-Usd` | on dispatched/cached responses | `0.0184` |
+| `X-TokenTrimmer-Route-Matched` | Planned (not yet emitted) | `cheap-for-short` |
+| `X-TokenTrimmer-Warnings` | Planned (not yet emitted) | `param_dropped:frequency_penalty,response_format_downgrade` |
 
-Customers can rely on these headers being present in every response (success or error) for telemetry purposes.
+`X-TokenTrimmer-Trace-Id` and `X-TokenTrimmer-Latency-Ms` are present on every
+response (success or error). The cost/provider/model/cache headers are attached on
+responses that reach dispatch, cache, or the sandbox path; they are not emitted on
+early validation errors (4xx returned before dispatch).
 
 ### 6.3 Cache control semantics
 

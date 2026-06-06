@@ -7,8 +7,10 @@
 //! * [`auth`] — extracts `Authorization: Bearer tt_live_*`, verifies against
 //!   the configured key store, and attaches an `ApiKeyContext` extension for
 //!   downstream handlers.
+//! * [`latency`] — stamps `X-TokenTrimmer-Latency-Ms` on every response.
 
 pub mod auth;
 pub mod key_cache;
+pub mod latency;
 pub mod retrieval;
 pub mod trace;

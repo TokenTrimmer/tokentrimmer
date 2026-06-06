@@ -82,6 +82,10 @@ pub fn build_router_with_retrieval(
     // large-context chat requests (256k-token windows can exceed it). Sized
     // for the largest supported context; returns 413 on exceed. (§4.15)
     .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+    // Outermost app middleware: stamps `X-TokenTrimmer-Latency-Ms` on EVERY
+    // response — including the timeout 504 and body-limit 413 produced by the
+    // layers it wraps (the later `.layer()` is the outer one in axum/tower).
+    .layer(axum::middleware::from_fn(middleware::latency::middleware))
     .with_state(state)
 }
 
@@ -465,6 +469,112 @@ mod tests {
         assert_eq!(envelope["error"]["code"], "model_not_found");
     }
 
+    fn chat_request_with(model: &str, max_tokens: u32, cost_limit: Option<&str>) -> Request<Body> {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "the quick brown fox" }],
+            "max_tokens": max_tokens,
+            "stream": false,
+        });
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(cl) = cost_limit {
+            b = b.header("x-tokentrimmer-cost-limit-usd", cl);
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn latency_header_present_on_success_and_error() {
+        // Success (dispatch) — header present + parseable.
+        let ok = app_with_mock()
+            .oneshot(chat_request("mock-model-1", false))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let _ms: u64 = ok.headers()["x-tokentrimmer-latency-ms"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("latency-ms parseable");
+
+        // Error (unknown model → 404) — middleware still stamps the header.
+        let err = app_with_mock()
+            .oneshot(chat_request("does-not-exist", false))
+            .await
+            .unwrap();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(
+            err.headers().contains_key("x-tokentrimmer-latency-ms"),
+            "latency header must be present even on error responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_limit_header_rejects_over_limit() {
+        // mock pricing $1/M in, $2/M out; max_tokens 1000 → est ≈ $0.002 > 1e-9.
+        let response = app_with_mock()
+            .oneshot(chat_request_with("mock-model-1", 1000, Some("0.000000001")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], "cost_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn cost_limit_counts_full_prompt_not_just_last_message() {
+        // A large system prompt + a tiny trailing user message. The limit is set
+        // so the 402 trips ONLY when the FULL prompt is counted — estimating from
+        // just the last user message (the prior bug) would undercount and pass.
+        let big_system = "word ".repeat(400); // ~2000 chars → ~500 tokens (mock = chars/4)
+        let body = serde_json::json!({
+            "model": "mock-model-1",
+            "messages": [
+                { "role": "system", "content": big_system },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 1,
+            "stream": false,
+        });
+        let response = app_with_mock()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("x-tokentrimmer-cost-limit-usd", "0.0001")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn cost_limit_header_allows_under_limit() {
+        let response = app_with_mock()
+            .oneshot(chat_request_with("mock-model-1", 1000, Some("100")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cost_limit_header_absent_is_noop() {
+        let response = app_with_mock()
+            .oneshot(chat_request_with("mock-model-1", 1000, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn embeddings_dispatch_returns_200_with_headers() {
         let body = serde_json::json!({ "model": "mock-model-1", "input": "hello" });
@@ -544,6 +654,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["data"][0]["embedding"].is_array());
         assert_eq!(v["model"], "mock-model-1");
+    }
+
+    #[tokio::test]
+    async fn embeddings_cost_limit_rejects_over_limit() {
+        let body = serde_json::json!({
+            "model": "mock-model-1",
+            "input": "the quick brown fox jumps over the lazy dog"
+        });
+        let response = app_with_mock()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .header("x-tokentrimmer-cost-limit-usd", "0.000000001")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     }
 
     // ── Dispatch tests (new — w6-gateway-dispatch) ─────────────────────────────

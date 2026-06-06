@@ -23,8 +23,8 @@ use tt_shared::{
 
 use crate::middleware::trace::TraceId;
 use crate::routes::chat::{
-    apply_routing, attach_cost_headers, compute_cost, estimate_cost_usd, resolve_credentials,
-    resolve_credentials_for,
+    apply_routing, attach_cost_headers, compute_cost, cost_limit_from_header, enforce_cost_limit,
+    estimate_cost_usd, resolve_credentials, resolve_credentials_for,
 };
 use crate::{ApiError, ApiResult, AppState};
 
@@ -187,6 +187,19 @@ pub async fn handler(
                 }
             }
         }
+    }
+
+    // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header,
+    // priced on the final (post-routing) embedding model. Output tokens are 0.
+    {
+        let cl_input_tokens =
+            tt_tokenize::estimate_tokens(provider.id(), &input_as_text(&req.input));
+        enforce_cost_limit(
+            cost_limit_from_header(&headers),
+            provider.pricing(&req.model).as_ref(),
+            cl_input_tokens,
+            None,
+        )?;
     }
 
     // 6. Dispatch. Capture the served model + its pricing before `req` moves.
