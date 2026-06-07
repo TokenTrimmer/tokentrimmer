@@ -52,3 +52,25 @@ async fn render_is_some_after_build_router() {
     let _ = router();
     assert!(tt_core::metrics::render().is_some());
 }
+
+#[tokio::test]
+async fn http_request_metrics_recorded_for_health() {
+    let app = router();
+    // Drive one request through the stack so the latency middleware records it.
+    let (s, _h, _b) = get(app.clone(), "/health").await;
+    assert_eq!(s, StatusCode::OK);
+    // Now scrape.
+    let (_s, _h, body) = get(app, "/metrics").await;
+    assert!(
+        body.contains("http_requests_total"),
+        "http_requests_total missing: {body}"
+    );
+    assert!(
+        body.contains("http_request_duration_seconds"),
+        "duration histogram missing: {body}"
+    );
+    assert!(
+        body.contains("endpoint=\"/health\""),
+        "matched-path label missing: {body}"
+    );
+}
