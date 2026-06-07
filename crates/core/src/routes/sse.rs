@@ -45,6 +45,7 @@ pub struct PartialUsage {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub cached_tokens: i32,
+    pub cache_creation_tokens: i32,
 }
 
 // ─── UsageTrackingStream ──────────────────────────────────────────────────────
@@ -66,8 +67,9 @@ pub(crate) struct UsageTrackingStream {
     cached_tokens: i32,
     /// Provider id for tokenizer selection (e.g. "openai", "anthropic").
     provider_id: String,
-    /// Authoritative usage from the provider's terminal chunk.
-    authoritative: Option<(i32, i32, i32)>,
+    /// Authoritative usage from the provider's terminal chunk:
+    /// (prompt, completion, cached, cache_creation).
+    authoritative: Option<(i32, i32, i32, i32)>,
     /// True once any `finish_reason` chunk has been observed.
     pub(crate) finished: bool,
     /// The `finish_reason` string from the terminal chunk (e.g. `"stop"`).
@@ -99,7 +101,8 @@ impl UsageTrackingStream {
     /// (i.e. stream was truncated / no terminal usage chunk), ensuring only cleanly
     /// completed streams with known token counts are cached.
     pub(crate) fn cache_completion_data(&self) -> Option<(String, String, Usage)> {
-        let (prompt_tokens, completion_tokens, cached_tokens) = self.authoritative?;
+        let (prompt_tokens, completion_tokens, cached_tokens, cache_creation) =
+            self.authoritative?;
         let finish_reason = self.finish_reason.clone().unwrap_or_else(|| "stop".into());
         let text = self.output_text.clone();
         let usage = Usage {
@@ -107,27 +110,30 @@ impl UsageTrackingStream {
             completion_tokens: completion_tokens as u64,
             total_tokens: (prompt_tokens + completion_tokens) as u64,
             cached_tokens: cached_tokens as u64,
-            cache_creation_input_tokens: None,
+            cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation as u64),
         };
         Some((text, finish_reason, usage))
     }
 
     pub(crate) fn snapshot(&self) -> PartialUsage {
-        if let Some((input, output, cached)) = self.authoritative {
+        if let Some((input, output, cached, cache_creation)) = self.authoritative {
             PartialUsage {
                 input_tokens: input,
                 output_tokens: output,
                 cached_tokens: cached,
+                cache_creation_tokens: cache_creation,
             }
         } else {
             // Fallback: estimate output tokens from accumulated text via
-            // tt_tokenize rather than raw byte length (§2.12).
+            // tt_tokenize rather than raw byte length (§2.12). No authoritative
+            // block → no known cache-creation count.
             let output_tokens =
                 tt_tokenize::estimate_tokens(&self.provider_id, &self.output_text) as i32;
             PartialUsage {
                 input_tokens: self.input_tokens,
                 output_tokens,
                 cached_tokens: self.cached_tokens,
+                cache_creation_tokens: 0,
             }
         }
     }
@@ -161,6 +167,7 @@ impl Stream for UsageTrackingStream {
                     usage.prompt_tokens as i32,
                     usage.completion_tokens as i32,
                     usage.cached_tokens as i32,
+                    usage.cache_creation_input_tokens.unwrap_or(0) as i32,
                 ));
             }
         }
@@ -297,10 +304,12 @@ impl TrackedEventStream {
             let guard = self.inner.lock().expect("tracking stream mutex poisoned");
             guard.snapshot()
         };
-        let cost_usd = compute_streaming_cost(&usage, Some(pricing)) * self.fee_multiplier;
-        let baseline_cost_usd =
-            compute_streaming_baseline(&usage, self.baseline_pricing.as_ref().or(Some(pricing)))
-                * self.fee_multiplier;
+        let (cost_usd, baseline_cost_usd) = crate::routes::chat::compute_cost(
+            &partial_to_usage(&usage),
+            Some(pricing),
+            self.baseline_pricing.as_ref(),
+            self.fee_multiplier,
+        );
         let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
         let json = serde_json::json!({
             "cost_usd": cost_usd,
@@ -464,10 +473,14 @@ pub fn stream_response(
                 };
                 drop(inner);
 
-                // Apply provider surcharge to both cost and baseline (§2.13).
-                let cost_usd = compute_streaming_cost(&usage, pricing.as_ref()) * fee_multiplier;
-                let baseline_cost_usd =
-                    compute_streaming_baseline(&usage, baseline_pricing.as_ref()) * fee_multiplier;
+                // Reuse the authoritative non-streaming cost math (3-bucket
+                // input pricing incl. cache-write premium); fee applied inside.
+                let (cost_usd, baseline_cost_usd) = crate::routes::chat::compute_cost(
+                    &partial_to_usage(&usage),
+                    pricing.as_ref(),
+                    baseline_pricing.as_ref(),
+                    fee_multiplier,
+                );
 
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, cost_usd, Utc::now());
@@ -649,28 +662,19 @@ fn attach_sse_headers(mut response: Response, trace_id_str: &str, provider_id: &
     response
 }
 
-/// Compute actual cost from partial usage (applying cached-token discount).
-fn compute_streaming_cost(usage: &PartialUsage, pricing: Option<&ModelPricing>) -> f64 {
-    let Some(pricing) = pricing else {
-        return 0.0;
-    };
-    let cached = usage.cached_tokens.min(usage.input_tokens);
-    let non_cached = usage.input_tokens.saturating_sub(cached);
-    let cached_rate = pricing
-        .cached_input_per_million
-        .unwrap_or(pricing.input_per_million);
-    (non_cached as f64) * pricing.input_per_million / 1_000_000.0
-        + (cached as f64) * cached_rate / 1_000_000.0
-        + (usage.output_tokens as f64) * pricing.output_per_million / 1_000_000.0
-}
-
-/// Compute baseline cost (no cache discount) from partial usage.
-fn compute_streaming_baseline(usage: &PartialUsage, pricing: Option<&ModelPricing>) -> f64 {
-    let Some(pricing) = pricing else {
-        return 0.0;
-    };
-    (usage.input_tokens as f64) * pricing.input_per_million / 1_000_000.0
-        + (usage.output_tokens as f64) * pricing.output_per_million / 1_000_000.0
+/// Build a `Usage` from accumulated streaming counts so the streaming path can
+/// reuse the authoritative non-streaming cost math (`chat::compute_cost`).
+fn partial_to_usage(u: &PartialUsage) -> Usage {
+    let prompt = u.input_tokens.max(0) as u64;
+    let completion = u.output_tokens.max(0) as u64;
+    let cache_creation = u.cache_creation_tokens.max(0) as u64;
+    Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        cached_tokens: u.cached_tokens.max(0) as u64,
+        cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation),
+    }
 }
 
 // ─── stream_insert_into_l2 ────────────────────────────────────────────────────
@@ -986,10 +990,9 @@ mod tests {
         assert_eq!(usage.cached_tokens, 0);
     }
 
-    /// §2.13 — `compute_streaming_cost` and baseline are each multiplied by
-    /// `fee_multiplier` when applied via the `TrackedEventStream`/DropGuard.
-    /// Test the raw compute helpers: 1 000 input + 500 output at $1/$2 per M
-    /// with a 1.05 multiplier should yield the correct scaled values.
+    /// §2.13 — the unified streaming cost (via `compute_cost`) applies the
+    /// fee multiplier to both cost and baseline. 1 000 input + 500 output at
+    /// $1/$2 per M, no cache, ×1.05.
     #[test]
     fn streaming_fee_multiplier_scales_cost_and_baseline() {
         let pricing = ModelPricing {
@@ -1003,21 +1006,21 @@ mod tests {
             input_tokens: 1_000,
             output_tokens: 500,
             cached_tokens: 0,
+            cache_creation_tokens: 0,
         };
-        let base_cost = compute_streaming_cost(&usage, Some(&pricing));
-        let base_baseline = compute_streaming_baseline(&usage, Some(&pricing));
+        let u = partial_to_usage(&usage);
 
-        let fee = 1.05_f64;
-        let scaled_cost = base_cost * fee;
-        let scaled_baseline = base_baseline * fee;
-
-        // base_cost = 1000/1e6 + 500*2/1e6 = 0.001 + 0.001 = 0.002
+        let (base_cost, base_baseline) =
+            crate::routes::chat::compute_cost(&u, Some(&pricing), None, 1.0);
         assert!(
             (base_cost - 0.002_f64).abs() < 1e-9,
             "base_cost={base_cost}"
         );
+
+        let (scaled_cost, scaled_baseline) =
+            crate::routes::chat::compute_cost(&u, Some(&pricing), None, 1.05);
         assert!(
-            (scaled_cost - 0.002_f64 * 1.05).abs() < 1e-9,
+            (scaled_cost - base_cost * 1.05).abs() < 1e-9,
             "scaled_cost={scaled_cost}"
         );
         assert!(
@@ -1046,5 +1049,93 @@ mod tests {
         );
         // Sanity: non-zero.
         assert!(tt_estimate > 0);
+    }
+
+    #[tokio::test]
+    async fn usage_tracking_captures_cache_creation_tokens() {
+        let chunks = vec![Ok(ChatCompletionChunk {
+            id: "x".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::default(),
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(tt_shared::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                cached_tokens: 20,
+                cache_creation_input_tokens: Some(30),
+            }),
+        })];
+        let stream = futures::stream::iter(chunks).boxed();
+        let mut tracker = UsageTrackingStream::new(stream, 100, 20, "anthropic");
+        let _ = tracker.next().await;
+
+        let usage = tracker.snapshot();
+        assert_eq!(usage.cache_creation_tokens, 30);
+
+        let (_text, _fr, reconstructed) = tracker.cache_completion_data().unwrap();
+        assert_eq!(reconstructed.cache_creation_input_tokens, Some(30));
+    }
+
+    /// Regression: an all-fresh-input stream (no cache read/write) is priced
+    /// identically to input×rate + output×rate — the unify refactor did not
+    /// change non-Anthropic streaming costs.
+    #[test]
+    fn streaming_all_fresh_input_parity() {
+        let usage = PartialUsage {
+            input_tokens: 800,
+            output_tokens: 200,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        let pricing = ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 6.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            effective_at: chrono::DateTime::UNIX_EPOCH,
+        };
+        let (cost, _baseline) =
+            crate::routes::chat::compute_cost(&partial_to_usage(&usage), Some(&pricing), None, 1.0);
+        let expected = (800.0 * 3.0 + 200.0 * 6.0) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "cost={cost} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn streaming_prices_cache_write_at_premium() {
+        // 100 prompt tokens: 20 cache_read, 30 cache_write, 50 fresh; 10 output.
+        let usage = PartialUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_tokens: 20,
+            cache_creation_tokens: 30,
+        };
+        let pricing = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: Some(0.1),
+            cache_write_per_million: Some(1.25),
+            effective_at: chrono::DateTime::UNIX_EPOCH,
+        };
+        let (cost, _baseline) =
+            crate::routes::chat::compute_cost(&partial_to_usage(&usage), Some(&pricing), None, 1.0);
+        let expected = (50.0 * 1.0 + 20.0 * 0.1 + 30.0 * 1.25 + 10.0 * 2.0) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "cost={cost} expected={expected}"
+        );
+        let folded = (80.0 * 1.0 + 20.0 * 0.1 + 10.0 * 2.0) / 1_000_000.0;
+        assert!(
+            cost > folded,
+            "premium not applied: cost={cost} folded={folded}"
+        );
     }
 }
