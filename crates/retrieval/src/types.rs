@@ -30,6 +30,7 @@ pub struct Chunk {
     pub chunk_idx: u32,
     pub text: String,
     pub embedding: Vec<f32>, // 1536-dim
+    pub embedding_model: String,
     pub metadata: serde_json::Value,
 }
 

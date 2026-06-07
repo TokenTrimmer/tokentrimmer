@@ -13,6 +13,7 @@ pub trait RetrievalStore: Send + Sync {
         corpus: &str,
         query_embedding: &[f32],
         k: usize,
+        embedding_model: &str,
     ) -> Result<Vec<RetrievalResult>, RetrievalError>;
     async fn delete_corpus(&self, org_id: Uuid, corpus: &str) -> Result<u64, RetrievalError>;
 }
