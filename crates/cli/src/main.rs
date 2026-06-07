@@ -1662,7 +1662,7 @@ fn parse_expected_tip(s: &str) -> anyhow::Result<tt_telemetry::audit::TipAnchor>
         .parse()
         .map_err(|_| anyhow::anyhow!("--expected-tip seq must be a non-negative integer"))?;
     if seq < 0 {
-        anyhow::bail!("--expected-tip seq must be non-negative");
+        anyhow::bail!("--expected-tip seq must be a non-negative integer");
     }
     let hash = hash.trim().to_ascii_lowercase();
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
