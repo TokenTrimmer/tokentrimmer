@@ -13,9 +13,12 @@ pub async fn top_k(
     query_embedding: &[f32],
     k: usize,
     min_similarity: f32,
+    embedding_model: &str,
 ) -> Result<Vec<RetrievalResult>, RetrievalError> {
     let k = k.min(crate::tags::MAX_RETRIEVAL_K as usize);
-    let raw = store.search(org_id, corpus, query_embedding, k).await?;
+    let raw = store
+        .search(org_id, corpus, query_embedding, k, embedding_model)
+        .await?;
     Ok(raw
         .into_iter()
         .filter(|r| r.similarity >= min_similarity)
@@ -38,6 +41,7 @@ mod tests {
             chunk_idx: 0,
             text: text.into(),
             embedding: emb,
+            embedding_model: "m".into(),
             metadata: json!({}),
         }
     }
@@ -48,7 +52,7 @@ mod tests {
         let o = Uuid::new_v4();
         s.insert(c(o, vec![1.0, 0.0], "hi-sim")).await.unwrap();
         s.insert(c(o, vec![0.0, 1.0], "low-sim")).await.unwrap();
-        let r = top_k(&s, o, "x", &[1.0, 0.0], 5, 0.5).await.unwrap();
+        let r = top_k(&s, o, "x", &[1.0, 0.0], 5, 0.5, "m").await.unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].text, "hi-sim");
     }
@@ -64,7 +68,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let r = top_k(&s, o, "x", &[1.0, 0.0], 10_000, 0.0).await.unwrap();
+        let r = top_k(&s, o, "x", &[1.0, 0.0], 10_000, 0.0, "m")
+            .await
+            .unwrap();
         assert!(r.len() <= crate::tags::MAX_RETRIEVAL_K as usize);
     }
 }

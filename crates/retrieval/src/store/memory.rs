@@ -56,11 +56,14 @@ impl RetrievalStore for MemoryStore {
         corpus: &str,
         q: &[f32],
         k: usize,
+        embedding_model: &str,
     ) -> Result<Vec<RetrievalResult>, RetrievalError> {
         let snap: Vec<_> = self.chunks.lock().unwrap().clone();
         let mut scored: Vec<(f32, &Chunk)> = snap
             .iter()
-            .filter(|c| c.org_id == org_id && c.corpus == corpus)
+            .filter(|c| {
+                c.org_id == org_id && c.corpus == corpus && c.embedding_model == embedding_model
+            })
             .map(|c| (cosine(q, &c.embedding), c))
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -91,7 +94,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn chunk(org: Uuid, corpus: &str, emb: Vec<f32>, text: &str) -> Chunk {
+    fn chunk(org: Uuid, corpus: &str, emb: Vec<f32>, text: &str, model: &str) -> Chunk {
         Chunk {
             id: Uuid::new_v4(),
             org_id: org,
@@ -100,6 +103,7 @@ mod tests {
             chunk_idx: 0,
             text: text.into(),
             embedding: emb,
+            embedding_model: model.into(),
             metadata: json!({}),
         }
     }
@@ -108,16 +112,16 @@ mod tests {
     async fn search_returns_highest_similarity_first() {
         let s = MemoryStore::new();
         let org = Uuid::new_v4();
-        s.insert(chunk(org, "x", vec![1.0, 0.0], "first"))
+        s.insert(chunk(org, "x", vec![1.0, 0.0], "first", "m"))
             .await
             .unwrap();
-        s.insert(chunk(org, "x", vec![0.0, 1.0], "second"))
+        s.insert(chunk(org, "x", vec![0.0, 1.0], "second", "m"))
             .await
             .unwrap();
-        s.insert(chunk(org, "x", vec![0.9, 0.1], "third"))
+        s.insert(chunk(org, "x", vec![0.9, 0.1], "third", "m"))
             .await
             .unwrap();
-        let r = s.search(org, "x", &[1.0, 0.0], 2).await.unwrap();
+        let r = s.search(org, "x", &[1.0, 0.0], 2, "m").await.unwrap();
         assert_eq!(r[0].text, "first");
         assert_eq!(r[1].text, "third");
     }
@@ -127,10 +131,16 @@ mod tests {
         let s = MemoryStore::new();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        s.insert(chunk(a, "x", vec![1.0], "a-x")).await.unwrap();
-        s.insert(chunk(b, "x", vec![1.0], "b-x")).await.unwrap();
-        s.insert(chunk(a, "y", vec![1.0], "a-y")).await.unwrap();
-        let r = s.search(a, "x", &[1.0], 10).await.unwrap();
+        s.insert(chunk(a, "x", vec![1.0], "a-x", "m"))
+            .await
+            .unwrap();
+        s.insert(chunk(b, "x", vec![1.0], "b-x", "m"))
+            .await
+            .unwrap();
+        s.insert(chunk(a, "y", vec![1.0], "a-y", "m"))
+            .await
+            .unwrap();
+        let r = s.search(a, "x", &[1.0], 10, "m").await.unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].text, "a-x");
     }
@@ -139,10 +149,25 @@ mod tests {
     async fn delete_corpus_returns_removed_count() {
         let s = MemoryStore::new();
         let o = Uuid::new_v4();
-        s.insert(chunk(o, "x", vec![1.0], "1")).await.unwrap();
-        s.insert(chunk(o, "x", vec![1.0], "2")).await.unwrap();
-        s.insert(chunk(o, "y", vec![1.0], "y")).await.unwrap();
+        s.insert(chunk(o, "x", vec![1.0], "1", "m")).await.unwrap();
+        s.insert(chunk(o, "x", vec![1.0], "2", "m")).await.unwrap();
+        s.insert(chunk(o, "y", vec![1.0], "y", "m")).await.unwrap();
         let removed = s.delete_corpus(o, "x").await.unwrap();
         assert_eq!(removed, 2);
+    }
+
+    #[tokio::test]
+    async fn search_partitions_by_embedding_model() {
+        let s = MemoryStore::new();
+        let o = Uuid::new_v4();
+        s.insert(chunk(o, "x", vec![1.0, 0.0], "from-a", "m-a"))
+            .await
+            .unwrap();
+        s.insert(chunk(o, "x", vec![1.0, 0.0], "from-b", "m-b"))
+            .await
+            .unwrap();
+        let r = s.search(o, "x", &[1.0, 0.0], 10, "m-a").await.unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].text, "from-a");
     }
 }

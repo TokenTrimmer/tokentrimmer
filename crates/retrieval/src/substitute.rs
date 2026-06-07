@@ -106,7 +106,16 @@ pub async fn substitute_in_messages(
             new_text.push_str(&text[cursor..t.span.0]);
 
             let floor = t.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY);
-            let hits = top_k(store, org_id, &t.corpus, &query_emb, t.k as usize, floor).await?;
+            let hits = top_k(
+                store,
+                org_id,
+                &t.corpus,
+                &query_emb,
+                t.k as usize,
+                floor,
+                &embedder.model,
+            )
+            .await?;
 
             if hits.is_empty() {
                 // Nothing cleared the floor — leave original payload intact.
@@ -187,6 +196,7 @@ mod tests {
             chunk_idx: 0,
             text: text.into(),
             embedding: emb,
+            embedding_model: "x".into(),
             metadata: json!({}),
         }
     }
@@ -467,6 +477,7 @@ mod tests {
                 chunk_idx: 0,
                 text: "Retrieved-A".into(),
                 embedding: vec![1.0, 0.0],
+                embedding_model: "x".into(),
                 metadata: json!({}),
             })
             .await
@@ -483,5 +494,45 @@ mod tests {
         let new_content = messages[0]["content"].as_str().unwrap();
         assert!(new_content.contains("Retrieved-A"));
         assert!(!new_content.contains("raw payload"));
+    }
+
+    #[tokio::test]
+    async fn cross_model_chunk_is_not_retrieved() {
+        let server = MockServer::start_async().await;
+        let embedder = mock_embedder(&server, vec![1.0, 0.0]).await; // model "x"
+        let store = MemoryStore::new();
+        let org = uuid::Uuid::new_v4();
+        // Chunk indexed under a DIFFERENT embedding model than the query embedder.
+        store
+            .insert(Chunk {
+                id: uuid::Uuid::new_v4(),
+                org_id: org,
+                corpus: "docs".into(),
+                doc_id: uuid::Uuid::new_v4(),
+                chunk_idx: 0,
+                text: "would-be-retrieved".into(),
+                embedding: vec![1.0, 0.0],
+                embedding_model: "other".into(),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": r#"<retrievable corpus="docs">original-payload</retrievable>"#
+        })];
+        let report = substitute_in_messages(&mut messages, org, &store, &embedder)
+            .await
+            .unwrap();
+
+        // The cross-model chunk is invisible → nothing clears the floor → the
+        // original payload is left intact and counted as a low-confidence skip.
+        assert_eq!(report.substitutions, 0);
+        assert_eq!(report.low_confidence_skips, 1);
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("original-payload"));
     }
 }

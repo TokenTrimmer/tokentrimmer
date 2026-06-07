@@ -48,8 +48,8 @@ impl RetrievalStore for PostgresStore {
         let embedding = pgvector::Vector::from(chunk.embedding);
         sqlx::query(
             r#"INSERT INTO retrieval_chunks
-                 (id, org_id, corpus, doc_id, chunk_idx, text, embedding, metadata)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 (id, org_id, corpus, doc_id, chunk_idx, text, embedding, embedding_model, metadata)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                ON CONFLICT (id) DO NOTHING"#,
         )
         .bind(chunk.id)
@@ -59,6 +59,7 @@ impl RetrievalStore for PostgresStore {
         .bind(i32::try_from(chunk.chunk_idx).unwrap_or(i32::MAX))
         .bind(&chunk.text)
         .bind(embedding)
+        .bind(&chunk.embedding_model)
         .bind(&chunk.metadata)
         .execute(&self.pool)
         .await
@@ -72,6 +73,7 @@ impl RetrievalStore for PostgresStore {
         corpus: &str,
         q: &[f32],
         k: usize,
+        embedding_model: &str,
     ) -> Result<Vec<RetrievalResult>, RetrievalError> {
         let query_vec = pgvector::Vector::from(q.to_vec());
         // Raise ef_search for THIS query only (SET LOCAL is transaction-scoped),
@@ -85,7 +87,7 @@ impl RetrievalStore for PostgresStore {
             r#"SELECT id, doc_id, chunk_idx, text,
                       CAST(1.0 - (embedding <=> $3) AS REAL) AS similarity
                  FROM retrieval_chunks
-                WHERE org_id = $1 AND corpus = $2
+                WHERE org_id = $1 AND corpus = $2 AND embedding_model = $5
                 ORDER BY embedding <=> $3
                 LIMIT $4"#,
         )
@@ -93,6 +95,7 @@ impl RetrievalStore for PostgresStore {
         .bind(corpus)
         .bind(query_vec)
         .bind(i64::try_from(k).unwrap_or(i64::MAX))
+        .bind(embedding_model)
         .fetch_all(&mut *tx)
         .await
         .map_err(store_err)?;
