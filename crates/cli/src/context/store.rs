@@ -55,14 +55,32 @@ pub fn load_credentials(dir: &Path) -> anyhow::Result<Option<String>> {
 }
 
 /// Write the API key to `credentials.toml` (0600). Creates the dir (0700).
+///
+/// Atomic: the secret is written to a 0600 temp file in the same directory and
+/// renamed into place, so it is never briefly readable at umask-default perms
+/// (closes the old write-then-chmod TOCTOU). On non-unix the temp file carries
+/// no perms (`set_mode` is a no-op) — the key is stored unprotected there, as
+/// before.
 pub fn save_credentials(dir: &Path, api_key: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
     ensure_dir(dir)?;
     let p = dir.join("credentials.toml");
     let body = toml::to_string(&CredentialsFile {
         api_key: Some(api_key.to_string()),
     })?;
-    std::fs::write(&p, body).with_context(|| format!("write {}", p.display()))?;
-    set_mode(&p, 0o600).with_context(|| format!("chmod {}", p.display()))?;
+
+    // Temp file in the SAME dir so `persist` is a same-filesystem atomic rename.
+    // tempfile creates it 0600 on unix; the explicit set_mode is a
+    // version-independent guarantee.
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("create temp file in {}", dir.display()))?;
+    set_mode(tmp.path(), 0o600).with_context(|| format!("chmod {}", tmp.path().display()))?;
+    tmp.write_all(body.as_bytes())
+        .with_context(|| format!("write {}", tmp.path().display()))?;
+    tmp.persist(&p)
+        .map_err(|e| e.error)
+        .with_context(|| format!("persist {}", p.display()))?;
     Ok(())
 }
 
@@ -138,6 +156,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("credentials.toml"), "not = [valid").unwrap();
         assert!(load_credentials(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_credentials_tightens_a_preexisting_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("credentials.toml");
+        // Simulate a credentials file left world/group-readable by an older,
+        // pre-fix write (or a hostile pre-creation).
+        std::fs::write(&p, "api_key = \"stale\"\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_credentials(dir.path(), "tt_live_new").unwrap();
+
+        // The new key is stored and the file is now 0600 (the atomic replace
+        // carries the temp file's restrictive perms).
+        assert_eq!(
+            load_credentials(dir.path()).unwrap(),
+            Some("tt_live_new".to_string())
+        );
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credentials.toml must be 0600 after save");
     }
 
     #[test]
