@@ -38,7 +38,7 @@ async fn metrics_endpoint_serves_prometheus_text() {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or(""),
-        "text/plain; version=0.0.4"
+        "text/plain; version=0.0.4; charset=utf-8"
     );
     assert!(body.contains("tt_build_info"), "build_info missing: {body}");
     assert!(

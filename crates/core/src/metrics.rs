@@ -26,7 +26,9 @@ pub fn install() {
             ])
             .expect("static bucket list is valid")
             .install_recorder()
-            .expect("global metrics recorder not already set");
+            .expect(
+                "failed to install Prometheus recorder: a global metrics recorder was already set",
+            );
         metrics::gauge!("tt_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
         handle
     });

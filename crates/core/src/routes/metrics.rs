@@ -10,7 +10,11 @@ use axum::response::IntoResponse;
 pub async fn handler() -> impl IntoResponse {
     metrics::gauge!("process_uptime_seconds").set(crate::metrics::uptime_seconds());
     match crate::metrics::render() {
-        Some(body) => ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response(),
+        Some(body) => (
+            [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            body,
+        )
+            .into_response(),
         None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
