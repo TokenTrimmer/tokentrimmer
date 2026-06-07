@@ -823,7 +823,27 @@ GET /health
 → 200 OK if Gateway is healthy
 ```
 
-> **Planned:** `GET /metrics` (Prometheus exposition) is not yet implemented — tracked as `gw-metrics-endpoint` in the backlog. The telemetry crate already maintains the underlying counters.
+A `/metrics` endpoint is exposed for ops (Prometheus exposition format):
+
+```
+GET /metrics
+→ 200 text/plain; version=0.0.4; charset=utf-8
+```
+
+Exposed metric families:
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `http_requests_total` | counter | `method`, `endpoint`, `status` |
+| `http_request_duration_seconds` | histogram | `method`, `endpoint` |
+| `cache_lookups_total` | counter | `tier` (`l1`/`l2`), `result` (`hit`/`miss`) |
+| `provider_failover_total` | counter | `from` |
+| `provider_request_duration_seconds` | histogram | `provider`, `operation` |
+| `catalog_zero_price_total` | counter | `provider`, `model` |
+| `tt_build_info` | gauge | `version` |
+| `process_uptime_seconds` | gauge | — |
+
+> **Operator note:** `/metrics` is unauthenticated (like `/health`). Restrict it at the network / reverse-proxy layer so internal ops counters are not publicly scrapeable.
 
 ---
 
