@@ -358,6 +358,8 @@ enum AuditAction {
         /// this tip — detects tail-truncation and whole-chain deletion. Source it
         /// from your log pipeline, NOT from the same export (an export from a
         /// truncated DB is self-consistent and cannot reveal truncation).
+        /// Only valid for a single-org chain — the seq/length check spans the
+        /// whole file.
         #[arg(long)]
         expected_tip: Option<String>,
     },
@@ -1575,6 +1577,17 @@ fn run_audit_verify(
     let chain_path_str = path.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
     let chain_path = Path::new(chain_path_str);
     if !chain_path.exists() {
+        // A missing chain cannot satisfy an anchor: if the operator supplied an
+        // expected tip, treat the absent file as a verification FAILURE (this is
+        // the whole-chain-deletion case the anchor exists to catch). Without an
+        // anchor, an absent file is still just an informational no-op.
+        if expected_tip.is_some() {
+            anyhow::bail!(
+                "chain verification FAILED: --expected-tip was supplied but chain file {} \
+                 does not exist (possible whole-chain deletion)",
+                chain_path.display()
+            );
+        }
         tt_cli::ui::note(&format!("no chain to verify ({chain_path_str} not found)"));
         if let Some(o) = org {
             tt_cli::ui::note(&format!(
@@ -1921,7 +1934,7 @@ mod plan_apply_tests {
 
 #[cfg(test)]
 mod expected_tip_tests {
-    use super::parse_expected_tip;
+    use super::{parse_expected_tip, run_audit_verify};
 
     const HASH64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1962,5 +1975,32 @@ mod expected_tip_tests {
     fn non_hex_hash_is_rejected() {
         let bad = "z".repeat(64);
         assert!(parse_expected_tip(&format!("3:{bad}")).is_err());
+    }
+
+    #[test]
+    fn missing_chain_file_with_expected_tip_is_error() {
+        // A missing file + an anchor must FAIL (whole-chain deletion case),
+        // not silently succeed.
+        let res = run_audit_verify(
+            Some("/nonexistent/tt-audit-chain-test/AUDIT-CHAIN.jsonl"),
+            None,
+            None,
+            None,
+            Some("5:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        );
+        assert!(res.is_err(), "missing file + expected_tip must error");
+    }
+
+    #[test]
+    fn missing_chain_file_without_expected_tip_is_ok() {
+        // Back-compat: a missing file with no anchor remains an informational no-op.
+        let res = run_audit_verify(
+            Some("/nonexistent/tt-audit-chain-test/AUDIT-CHAIN.jsonl"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(res.is_ok(), "missing file without expected_tip must stay Ok");
     }
 }
