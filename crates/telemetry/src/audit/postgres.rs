@@ -146,6 +146,20 @@ impl AuditWriter for PostgresAuditWriter {
             .await
             .map_err(|e| AuditError::Storage(e.to_string()))?;
 
+        // Emit the new chain tip on a dedicated target so operators can route it
+        // to an append-only, off-box sink. This out-of-band anchor is what makes
+        // tail-truncation / whole-chain deletion detectable later via
+        // `tt audit verify --expected-tip` (the DB alone cannot reveal it).
+        // Per-write is fine: audit writes happen only on privileged actions.
+        tracing::info!(
+            target: "tt::audit::tip",
+            org_id = %org_id,
+            seq = next_seq,
+            tip_hash = %hash_hex,
+            ts = %timestamp.to_rfc3339(),
+            "audit chain tip advanced"
+        );
+
         Ok(AuditEntry {
             id,
             org_id,

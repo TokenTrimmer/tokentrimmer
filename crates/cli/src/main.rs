@@ -353,6 +353,15 @@ enum AuditAction {
         /// preamble when present.
         #[arg(long)]
         key_hex: Option<String>,
+        /// Expected chain tip as `<seq>:<hash>`, captured out-of-band from the
+        /// `tt::audit::tip` log stream. When set, the chain must end exactly at
+        /// this tip — detects tail-truncation and whole-chain deletion. Source it
+        /// from your log pipeline, NOT from the same export (an export from a
+        /// truncated DB is self-consistent and cannot reveal truncation).
+        /// Only valid for a single-org chain — the seq/length check spans the
+        /// whole file.
+        #[arg(long)]
+        expected_tip: Option<String>,
     },
 }
 
@@ -425,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
                     org,
                     key,
                     key_hex,
+                    expected_tip,
                 },
         } => {
             run_audit_verify(
@@ -432,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
                 org.as_deref(),
                 key.as_deref(),
                 key_hex.as_deref(),
+                expected_tip.as_deref(),
             )?;
         }
         Command::Mcp {
@@ -1561,10 +1572,22 @@ fn run_audit_verify(
     org: Option<&str>,
     key_path: Option<&str>,
     key_hex_inline: Option<&str>,
+    expected_tip: Option<&str>,
 ) -> anyhow::Result<()> {
     let chain_path_str = path.unwrap_or(".claude/AUDIT-CHAIN.jsonl");
     let chain_path = Path::new(chain_path_str);
     if !chain_path.exists() {
+        // A missing chain cannot satisfy an anchor: if the operator supplied an
+        // expected tip, treat the absent file as a verification FAILURE (this is
+        // the whole-chain-deletion case the anchor exists to catch). Without an
+        // anchor, an absent file is still just an informational no-op.
+        if expected_tip.is_some() {
+            anyhow::bail!(
+                "chain verification FAILED: --expected-tip was supplied but chain file {} \
+                 does not exist (possible whole-chain deletion)",
+                chain_path.display()
+            );
+        }
         tt_cli::ui::note(&format!("no chain to verify ({chain_path_str} not found)"));
         if let Some(o) = org {
             tt_cli::ui::note(&format!(
@@ -1612,10 +1635,22 @@ fn run_audit_verify(
         ));
     }
 
-    match tt_telemetry::audit::verify_chain(&parsed.entries, &verifying_key) {
+    let result = match expected_tip {
+        Some(tip_str) => {
+            let anchor = parse_expected_tip(tip_str)?;
+            tt_telemetry::audit::verify_chain_with_anchor(&parsed.entries, &verifying_key, &anchor)
+        }
+        None => tt_telemetry::audit::verify_chain(&parsed.entries, &verifying_key),
+    };
+    match result {
         Ok(()) => {
+            let tip_note = if expected_tip.is_some() {
+                " (tip anchor matched)"
+            } else {
+                ""
+            };
             tt_cli::ui::ok(&format!(
-                "chain OK — all {} entries verified",
+                "chain OK — all {} entries verified{tip_note}",
                 parsed.entries.len()
             ));
         }
@@ -1625,6 +1660,28 @@ fn run_audit_verify(
     }
 
     Ok(())
+}
+
+/// Parse an `--expected-tip` value of the form `<seq>:<hash>` into a TipAnchor.
+/// `seq` must be a non-negative integer; `hash` must be 64 hex chars (a BLAKE3
+/// hash), normalized to lowercase. Returns a clear error before verification so
+/// a malformed anchor doesn't surface as a confusing TruncatedChain.
+fn parse_expected_tip(s: &str) -> anyhow::Result<tt_telemetry::audit::TipAnchor> {
+    let (seq_str, hash) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--expected-tip must be `<seq>:<hash>` (missing ':')"))?;
+    let seq: i64 = seq_str
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--expected-tip seq must be a non-negative integer"))?;
+    if seq < 0 {
+        anyhow::bail!("--expected-tip seq must be a non-negative integer");
+    }
+    let hash = hash.trim().to_ascii_lowercase();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("--expected-tip hash must be 64 hex characters (BLAKE3)");
+    }
+    Ok(tt_telemetry::audit::TipAnchor { seq, hash })
 }
 
 /// Result of parsing a JSONL chain file. The preamble line (if present) is
@@ -1872,5 +1929,81 @@ mod plan_apply_tests {
         let out = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
         run_plan(input.path().to_str(), out.path().to_str(), false, false)
             .expect("projection without --apply should succeed");
+    }
+}
+
+#[cfg(test)]
+mod expected_tip_tests {
+    use super::{parse_expected_tip, run_audit_verify};
+
+    const HASH64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn parses_valid_seq_and_hash() {
+        let anchor = parse_expected_tip(&format!("42:{HASH64}")).expect("valid");
+        assert_eq!(anchor.seq, 42);
+        assert_eq!(anchor.hash, HASH64);
+    }
+
+    #[test]
+    fn uppercase_hash_is_normalized_to_lowercase() {
+        let anchor = parse_expected_tip(&format!("0:{}", HASH64.to_uppercase())).expect("valid");
+        assert_eq!(anchor.hash, HASH64);
+    }
+
+    #[test]
+    fn missing_colon_is_rejected() {
+        assert!(parse_expected_tip(HASH64).is_err());
+    }
+
+    #[test]
+    fn non_numeric_seq_is_rejected() {
+        assert!(parse_expected_tip(&format!("notanum:{HASH64}")).is_err());
+    }
+
+    #[test]
+    fn negative_seq_is_rejected() {
+        assert!(parse_expected_tip(&format!("-1:{HASH64}")).is_err());
+    }
+
+    #[test]
+    fn wrong_length_hash_is_rejected() {
+        assert!(parse_expected_tip("3:abcd").is_err());
+    }
+
+    #[test]
+    fn non_hex_hash_is_rejected() {
+        let bad = "z".repeat(64);
+        assert!(parse_expected_tip(&format!("3:{bad}")).is_err());
+    }
+
+    #[test]
+    fn missing_chain_file_with_expected_tip_is_error() {
+        // A missing file + an anchor must FAIL (whole-chain deletion case),
+        // not silently succeed.
+        let res = run_audit_verify(
+            Some("/nonexistent/tt-audit-chain-test/AUDIT-CHAIN.jsonl"),
+            None,
+            None,
+            None,
+            Some("5:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        );
+        assert!(res.is_err(), "missing file + expected_tip must error");
+    }
+
+    #[test]
+    fn missing_chain_file_without_expected_tip_is_ok() {
+        // Back-compat: a missing file with no anchor remains an informational no-op.
+        let res = run_audit_verify(
+            Some("/nonexistent/tt-audit-chain-test/AUDIT-CHAIN.jsonl"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            res.is_ok(),
+            "missing file without expected_tip must stay Ok"
+        );
     }
 }

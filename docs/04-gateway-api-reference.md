@@ -985,6 +985,29 @@ Change `base_url` and `api_key`. Both OpenRouter and Helicone use OpenAI-compati
 
 ---
 
+## 21. Audit log integrity
+
+The Gateway records every request as a hash-chained, Ed25519-signed audit entry. Operators can export and verify the chain with:
+
+```bash
+tt audit verify [--path .claude/AUDIT-CHAIN.jsonl] [--key-hex <hex>]
+```
+
+The verifying key is embedded in the export preamble automatically; pass `--key-hex` or `--key` to override it.
+
+> **Detecting truncation.** `tt audit verify` confirms each entry links and is
+> signed, and that `seq` is gap-free — so reordering or a mid-chain deletion is
+> caught. It cannot, on its own, detect deletion of the most recent entries or of
+> the entire chain (a truncated prefix still verifies). To detect that, pass
+> `tt audit verify --expected-tip <seq>:<hash>`, where the tip is captured
+> **out-of-band** from the gateway's `tt::audit::tip` log stream (shipped to an
+> append-only sink). Do not source the tip from the same export — an export taken
+> from a truncated database is self-consistent. The anchor is only as trustworthy
+> as that off-box log pipeline; automatic WORM anchoring (S3 Object Lock) is the
+> deferred full solution.
+
+---
+
 **End of API reference.**
 
 Companion docs:
