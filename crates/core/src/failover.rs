@@ -204,10 +204,12 @@ pub async fn dispatch_with_failover(
         cand_ctx.credentials = cand_creds.clone();
         let mut attempt_req = req.clone();
         attempt_req.model = model.clone();
+        let __started = std::time::Instant::now();
         let result = with_retry(retry, || {
             provider.chat_completion(attempt_req.clone(), &cand_ctx)
         })
         .await;
+        crate::metrics::record_provider_latency(provider.id(), "chat", __started.elapsed());
         match result {
             Ok(resp) => {
                 breaker.record_success(provider.id());
@@ -220,6 +222,7 @@ pub async fn dispatch_with_failover(
                 // — record it once more here so the breaker sees the full
                 // exhaustion signal.
                 breaker.record_failure(provider.id(), now);
+                metrics::counter!("provider_failover_total", "from" => provider.id()).increment(1);
                 last_err = Some(e);
             }
             Err(e) if e.is_retriable() => {
@@ -320,10 +323,12 @@ pub async fn dispatch_stream_with_failover(
         cand_ctx.credentials = cand_creds.clone();
         let mut attempt_req = req.clone();
         attempt_req.model = model.clone();
+        let started = std::time::Instant::now();
         let result = with_retry(retry, || {
             provider.chat_completion_stream(attempt_req.clone(), &cand_ctx)
         })
         .await;
+        crate::metrics::record_provider_latency(provider.id(), "chat_stream", started.elapsed());
         match result {
             Ok(stream) => {
                 breaker.record_success(provider.id());
@@ -331,6 +336,7 @@ pub async fn dispatch_stream_with_failover(
             }
             Err(e) if e.is_fallback_eligible() => {
                 breaker.record_failure(provider.id(), now);
+                metrics::counter!("provider_failover_total", "from" => provider.id()).increment(1);
                 last_err = Some(e);
             }
             Err(e) if e.is_retriable() => {

@@ -844,10 +844,17 @@ pub async fn handler(
             if route_fallbacks.is_empty() {
                 // Retry the initial stream establishment on transient errors (before
                 // any chunk is yielded); mid-stream errors are not retried.
-                let stream = with_retry(&RetryPolicy::default(), || {
+                let __started = std::time::Instant::now();
+                let __stream_result = with_retry(&RetryPolicy::default(), || {
                     provider.chat_completion_stream(req.clone(), &ctx)
                 })
-                .await?;
+                .await;
+                crate::metrics::record_provider_latency(
+                    provider.id(),
+                    "chat_stream",
+                    __started.elapsed(),
+                );
+                let stream = __stream_result?;
                 Ok((provider, req.model.clone(), stream))
             } else {
                 // Build the capability check for the streaming failover path.
@@ -1035,6 +1042,7 @@ pub async fn handler(
                 match l1.cache.get(key).await {
                     Ok(Some(bytes)) => match L1Entry::from_bytes(&bytes) {
                         Ok(entry) => {
+                            metrics::counter!("cache_lookups_total", "tier" => "l1", "result" => "hit").increment(1);
                             // Log the L1 hit before returning. The hit baseline is
                             // either the envelope's own value or the synthetic
                             // fallback for pre-envelope cache rows.
@@ -1057,7 +1065,9 @@ pub async fn handler(
                             tracing::warn!(error = %e, key = %key, "l1 cache entry failed to deserialize");
                         }
                     },
-                    Ok(None) => {}
+                    Ok(None) => {
+                        metrics::counter!("cache_lookups_total", "tier" => "l1", "result" => "miss").increment(1);
+                    }
                     Err(e) => tracing::warn!(error = %e, "l1 lookup failed"),
                 }
             }
@@ -1069,7 +1079,7 @@ pub async fn handler(
             if let Some(l2) = state.l2.as_ref() {
                 if let Some(query_text) = l2_context_text(&req) {
                     if let Ok(query_vec) = l2.embedder.embed(&query_text).await {
-                        if let Ok(Some((entry, similarity))) = l2
+                        match l2
                             .cache
                             .lookup(
                                 ctx.org_id,
@@ -1080,22 +1090,29 @@ pub async fn handler(
                             )
                             .await
                         {
-                            // Cache hit — best-effort bump and return.
-                            let _ = l2.cache.bump_hit_count(entry.id).await;
-                            spawn_request_log(
-                                state.request_log_writer.as_ref(),
-                                request_log_for_l2_hit(
-                                    &entry,
-                                    &ctx,
-                                    trace_id,
-                                    request_started,
-                                    matched_route_id,
-                                ),
-                            );
-                            return Ok(with_route_matched(
-                                build_hit_l2_response(entry, similarity, trace_id)?,
-                                route_matched_name.as_deref(),
-                            ));
+                            Ok(Some((entry, similarity))) => {
+                                metrics::counter!("cache_lookups_total", "tier" => "l2", "result" => "hit").increment(1);
+                                // Cache hit — best-effort bump and return.
+                                let _ = l2.cache.bump_hit_count(entry.id).await;
+                                spawn_request_log(
+                                    state.request_log_writer.as_ref(),
+                                    request_log_for_l2_hit(
+                                        &entry,
+                                        &ctx,
+                                        trace_id,
+                                        request_started,
+                                        matched_route_id,
+                                    ),
+                                );
+                                return Ok(with_route_matched(
+                                    build_hit_l2_response(entry, similarity, trace_id)?,
+                                    route_matched_name.as_deref(),
+                                ));
+                            }
+                            Ok(None) => {
+                                metrics::counter!("cache_lookups_total", "tier" => "l2", "result" => "miss").increment(1);
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -1196,12 +1213,15 @@ pub async fn handler(
         //     served the request so cost/headers/telemetry below reflect it.
         let dispatch_result: ApiResult<_> = with_request_timeout(request_timeout, async {
             if route_fallbacks.is_empty() {
-                with_retry(&RetryPolicy::default(), || {
+                let __started = std::time::Instant::now();
+                let __dispatch = with_retry(&RetryPolicy::default(), || {
                     provider.chat_completion(req.clone(), &ctx)
                 })
-                .await
-                .map(|resp| (provider, resp))
-                .map_err(ApiError::from)
+                .await;
+                crate::metrics::record_provider_latency(provider.id(), "chat", __started.elapsed());
+                __dispatch
+                    .map(|resp| (provider, resp))
+                    .map_err(ApiError::from)
             } else {
                 // Build the capability check for the failover path.
                 let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
@@ -1304,6 +1324,12 @@ pub async fn handler(
                 "model absent from pricing catalog — request cost recorded as $0; \
                  update data/pricing.toml to restore accurate cost tracking"
             );
+            metrics::counter!(
+                "catalog_zero_price_total",
+                "provider" => provider.id(),
+                "model" => response.model.clone(),
+            )
+            .increment(1);
         }
 
         // Baseline is priced against the originally-requested model when a route

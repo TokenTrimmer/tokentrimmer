@@ -1156,8 +1156,8 @@ Not pursued in v1. Path defined: use Vanta or Drata starting at ~$50K MRR. Requi
 
 ### 17.2 Metrics
 
-- Prometheus exposition format
-- Key metrics: requests/sec, p50/p95/p99 latency, cache hit rate, error rate by class, provider latency
+- Prometheus exposition format — **implemented**: `GET /metrics` (see gateway API reference §17)
+- Metrics: `http_requests_total` + `http_request_duration_seconds` (rate / error / latency by method+endpoint+status), `cache_lookups_total` (hit rate by tier), `provider_failover_total`, `provider_request_duration_seconds` (per-provider latency), `catalog_zero_price_total`, `tt_build_info`, `process_uptime_seconds`
 - Scraped by Grafana Cloud free tier or self-hosted Prometheus + Grafana
 
 ### 17.3 Logs

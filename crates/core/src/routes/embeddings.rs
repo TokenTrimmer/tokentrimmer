@@ -224,7 +224,10 @@ pub async fn handler(
     let served_model = req.model.clone();
     let routed_pricing = provider.pricing(&served_model);
     let resp = with_request_timeout(ctx.deadline, async {
-        provider.embeddings(req, &ctx).await.map_err(ApiError::from)
+        let __started = std::time::Instant::now();
+        let __emb = provider.embeddings(req, &ctx).await;
+        crate::metrics::record_provider_latency(provider.id(), "embeddings", __started.elapsed());
+        __emb.map_err(ApiError::from)
     })
     .await?;
 
