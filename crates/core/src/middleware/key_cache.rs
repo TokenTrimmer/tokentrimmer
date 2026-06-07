@@ -28,13 +28,22 @@
 //! ## Revocation staleness
 //!
 //! Because we skip argon2 for cached-positive entries, a key that is revoked
-//! in the store remains usable for up to `POSITIVE_TTL_SECS` seconds from its
-//! last cache insertion. This is an explicit, documented tradeoff: we prioritise
-//! p50 latency and DoS resistance over instant revocation propagation.
+//! in the store would otherwise remain usable for up to `POSITIVE_TTL_SECS`
+//! seconds from its last cache insertion.
 //!
-//! **Future work:** a cross-instance invalidation channel (e.g. a Redis pub/sub
-//! `keyrevoked` event) could shrink the staleness window to near-zero without
-//! re-introducing per-request argon2 cost. That is out of scope here.
+//! [`KeyVerifyCache::evict_key_id`] closes that window on the instance that
+//! handles the revoke: the key-revocation path (the cloud admin route) must
+//! call `verify_cache.evict_key_id(key_id)` after a successful `revoke_key`.
+//! Revocation knows the key_id but never the token plaintext, so eviction is
+//! by key_id (matching the cached `ApiKeyContext`), not by `blake3(token)`.
+//! After eviction the next request re-runs the full argon2 verify, which the
+//! revoked store row then rejects.
+//!
+//! **Multi-instance:** an in-process evict only invalidates the instance that
+//! processed the revoke; other gateway instances remain bounded by
+//! `POSITIVE_TTL_SECS` until a cross-instance invalidation channel (e.g. a
+//! Redis pub/sub `keyrevoked` event) is added. That channel is the remaining
+//! future work and is out of scope for this crate.
 //!
 //! ## Clock injection
 //!
@@ -65,6 +74,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tt_auth::ApiKeyContext;
+use uuid::Uuid;
 
 /// TTL for a successfully-verified key (positive cache).
 pub const POSITIVE_TTL_SECS: u64 = 60;
@@ -304,6 +314,20 @@ impl<C: Clock> KeyVerifyCache<C> {
         self.map.remove(hash);
     }
 
+    /// Evict every cached positive entry for `key_id`. Called when a key is
+    /// revoked: revocation knows the key_id (not the token plaintext), so the
+    /// `blake3(token)` cache key cannot be recomputed — we match on the cached
+    /// `ApiKeyContext.key_id` instead. After eviction the next request for that
+    /// key is a cache miss → full argon2 verify → store reports revoked → 401.
+    ///
+    /// Negative entries carry no key_id and are left as-is (they expire in
+    /// `NEGATIVE_TTL_SECS`). O(n) over a bounded cache; revocation is rare.
+    pub fn evict_key_id(&self, key_id: Uuid) {
+        self.map.retain(
+            |_, entry| !matches!(entry, CacheEntry::Hit { ctx, .. } if ctx.key_id == key_id),
+        );
+    }
+
     /// Return the number of entries currently in the map (including expired).
     /// Intended for metrics / tests only.
     pub fn len(&self) -> usize {
@@ -432,6 +456,49 @@ mod tests {
         assert!(matches!(cache.get(&hash), CacheLookup::Hit(_)));
         cache.evict(&hash);
         assert!(matches!(cache.get(&hash), CacheLookup::Miss));
+    }
+
+    #[test]
+    fn evict_key_id_removes_matching_hit() {
+        let (cache, _clock) = cache_with_fake_clock();
+        let c = ctx();
+        let hash = hash_token("tt_live_by_keyid");
+        cache.insert_hit(hash, c.clone());
+        assert!(matches!(cache.get(&hash), CacheLookup::Hit(_)));
+        cache.evict_key_id(c.key_id);
+        assert!(matches!(cache.get(&hash), CacheLookup::Miss));
+    }
+
+    #[test]
+    fn evict_key_id_is_targeted() {
+        let (cache, _clock) = cache_with_fake_clock();
+        let a = ctx();
+        let b = ctx();
+        let ha = hash_token("tt_live_keyA");
+        let hb = hash_token("tt_live_keyB");
+        cache.insert_hit(ha, a.clone());
+        cache.insert_hit(hb, b.clone());
+
+        cache.evict_key_id(a.key_id);
+
+        assert!(
+            matches!(cache.get(&ha), CacheLookup::Miss),
+            "A should be evicted"
+        );
+        assert!(
+            matches!(cache.get(&hb), CacheLookup::Hit(_)),
+            "B should remain"
+        );
+    }
+
+    #[test]
+    fn evict_key_id_leaves_negative_entries() {
+        let (cache, _clock) = cache_with_fake_clock();
+        let hn = hash_token("tt_live_wrong_secret");
+        cache.insert_failure(hn);
+        assert!(matches!(cache.get(&hn), CacheLookup::Failure));
+        cache.evict_key_id(Uuid::new_v4());
+        assert!(matches!(cache.get(&hn), CacheLookup::Failure));
     }
 
     // -----------------------------------------------------------------------
