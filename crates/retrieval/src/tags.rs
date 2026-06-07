@@ -1,10 +1,23 @@
 //! Parse `<retrievable corpus="X" k="N">...</retrievable>` tags from message
 //! text. Returns each tag's corpus, k, and span in the text.
+//!
+//! Two caps bound the work an untrusted message can request: a single tag's `k`
+//! is clamped to [`MAX_RETRIEVAL_K`], and at most [`MAX_RETRIEVABLE_TAGS`] tags
+//! are honored per message (the rest are ignored).
 
 use regex::Regex;
 
 use crate::error::RetrievalError;
 use crate::types::RetrievableTag;
+
+/// Maximum chunks a single `<retrievable>` tag may request. Caps the pgvector
+/// `LIMIT` so an untrusted `k="4000000000"` cannot force an unbounded scan.
+pub const MAX_RETRIEVAL_K: u32 = 50;
+
+/// Maximum number of `<retrievable>` tags honored per message. Bounds the
+/// per-message fan-out (one embedding search per tag). Tags beyond this are
+/// ignored (the first `MAX_RETRIEVABLE_TAGS` in document order are kept).
+pub const MAX_RETRIEVABLE_TAGS: usize = 16;
 
 pub fn parse(text: &str) -> Result<Vec<RetrievableTag>, RetrievalError> {
     // Match opening tag attributes and payload. We capture the full attribute
@@ -36,7 +49,8 @@ pub fn parse(text: &str) -> Result<Vec<RetrievableTag>, RetrievalError> {
             .captures(attrs)
             .and_then(|c| c.get(1))
             .and_then(|s| s.as_str().parse::<u32>().ok())
-            .unwrap_or(5);
+            .unwrap_or(5)
+            .min(MAX_RETRIEVAL_K);
 
         let min_similarity = sim_re
             .captures(attrs)
@@ -50,6 +64,7 @@ pub fn parse(text: &str) -> Result<Vec<RetrievableTag>, RetrievalError> {
             span: (full.start(), full.end()),
         });
     }
+    out.truncate(MAX_RETRIEVABLE_TAGS);
     Ok(out)
 }
 
@@ -97,5 +112,42 @@ mod tests {
     fn no_tags_is_empty() {
         let t = parse("plain text").unwrap();
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn k_is_clamped_to_max() {
+        let t = parse(r#"<retrievable corpus="x" k="4000000000">y</retrievable>"#).unwrap();
+        assert_eq!(t[0].k, MAX_RETRIEVAL_K);
+    }
+
+    #[test]
+    fn k_under_cap_is_unchanged() {
+        let t = parse(r#"<retrievable corpus="x" k="10">y</retrievable>"#).unwrap();
+        assert_eq!(t[0].k, 10);
+    }
+
+    #[test]
+    fn tag_count_is_capped() {
+        let mut body = String::new();
+        for i in 0..(MAX_RETRIEVABLE_TAGS + 1) {
+            body.push_str(&format!(r#"<retrievable corpus="c{i}">p</retrievable>"#));
+        }
+        let t = parse(&body).unwrap();
+        assert_eq!(t.len(), MAX_RETRIEVABLE_TAGS);
+        assert_eq!(t[0].corpus, "c0");
+        assert_eq!(
+            t[MAX_RETRIEVABLE_TAGS - 1].corpus,
+            format!("c{}", MAX_RETRIEVABLE_TAGS - 1)
+        );
+    }
+
+    #[test]
+    fn tag_count_at_cap_all_kept() {
+        let mut body = String::new();
+        for i in 0..MAX_RETRIEVABLE_TAGS {
+            body.push_str(&format!(r#"<retrievable corpus="c{i}">p</retrievable>"#));
+        }
+        let t = parse(&body).unwrap();
+        assert_eq!(t.len(), MAX_RETRIEVABLE_TAGS);
     }
 }
