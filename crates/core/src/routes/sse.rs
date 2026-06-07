@@ -45,6 +45,7 @@ pub struct PartialUsage {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub cached_tokens: i32,
+    pub cache_creation_tokens: i32,
 }
 
 // ─── UsageTrackingStream ──────────────────────────────────────────────────────
@@ -66,8 +67,9 @@ pub(crate) struct UsageTrackingStream {
     cached_tokens: i32,
     /// Provider id for tokenizer selection (e.g. "openai", "anthropic").
     provider_id: String,
-    /// Authoritative usage from the provider's terminal chunk.
-    authoritative: Option<(i32, i32, i32)>,
+    /// Authoritative usage from the provider's terminal chunk:
+    /// (prompt, completion, cached, cache_creation).
+    authoritative: Option<(i32, i32, i32, i32)>,
     /// True once any `finish_reason` chunk has been observed.
     pub(crate) finished: bool,
     /// The `finish_reason` string from the terminal chunk (e.g. `"stop"`).
@@ -99,7 +101,8 @@ impl UsageTrackingStream {
     /// (i.e. stream was truncated / no terminal usage chunk), ensuring only cleanly
     /// completed streams with known token counts are cached.
     pub(crate) fn cache_completion_data(&self) -> Option<(String, String, Usage)> {
-        let (prompt_tokens, completion_tokens, cached_tokens) = self.authoritative?;
+        let (prompt_tokens, completion_tokens, cached_tokens, cache_creation) =
+            self.authoritative?;
         let finish_reason = self.finish_reason.clone().unwrap_or_else(|| "stop".into());
         let text = self.output_text.clone();
         let usage = Usage {
@@ -107,27 +110,30 @@ impl UsageTrackingStream {
             completion_tokens: completion_tokens as u64,
             total_tokens: (prompt_tokens + completion_tokens) as u64,
             cached_tokens: cached_tokens as u64,
-            cache_creation_input_tokens: None,
+            cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation as u64),
         };
         Some((text, finish_reason, usage))
     }
 
     pub(crate) fn snapshot(&self) -> PartialUsage {
-        if let Some((input, output, cached)) = self.authoritative {
+        if let Some((input, output, cached, cache_creation)) = self.authoritative {
             PartialUsage {
                 input_tokens: input,
                 output_tokens: output,
                 cached_tokens: cached,
+                cache_creation_tokens: cache_creation,
             }
         } else {
             // Fallback: estimate output tokens from accumulated text via
-            // tt_tokenize rather than raw byte length (§2.12).
+            // tt_tokenize rather than raw byte length (§2.12). No authoritative
+            // block → no known cache-creation count.
             let output_tokens =
                 tt_tokenize::estimate_tokens(&self.provider_id, &self.output_text) as i32;
             PartialUsage {
                 input_tokens: self.input_tokens,
                 output_tokens,
                 cached_tokens: self.cached_tokens,
+                cache_creation_tokens: 0,
             }
         }
     }
@@ -161,6 +167,7 @@ impl Stream for UsageTrackingStream {
                     usage.prompt_tokens as i32,
                     usage.completion_tokens as i32,
                     usage.cached_tokens as i32,
+                    usage.cache_creation_input_tokens.unwrap_or(0) as i32,
                 ));
             }
         }
@@ -1003,6 +1010,7 @@ mod tests {
             input_tokens: 1_000,
             output_tokens: 500,
             cached_tokens: 0,
+            cache_creation_tokens: 0,
         };
         let base_cost = compute_streaming_cost(&usage, Some(&pricing));
         let base_baseline = compute_streaming_baseline(&usage, Some(&pricing));
@@ -1046,5 +1054,36 @@ mod tests {
         );
         // Sanity: non-zero.
         assert!(tt_estimate > 0);
+    }
+
+    #[tokio::test]
+    async fn usage_tracking_captures_cache_creation_tokens() {
+        let chunks = vec![Ok(ChatCompletionChunk {
+            id: "x".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::default(),
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(tt_shared::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                cached_tokens: 20,
+                cache_creation_input_tokens: Some(30),
+            }),
+        })];
+        let stream = futures::stream::iter(chunks).boxed();
+        let mut tracker = UsageTrackingStream::new(stream, 100, 20, "anthropic");
+        let _ = tracker.next().await;
+
+        let usage = tracker.snapshot();
+        assert_eq!(usage.cache_creation_tokens, 30);
+
+        let (_text, _fr, reconstructed) = tracker.cache_completion_data().unwrap();
+        assert_eq!(reconstructed.cache_creation_input_tokens, Some(30));
     }
 }
