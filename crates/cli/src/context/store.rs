@@ -72,7 +72,9 @@ pub fn save_credentials(dir: &Path, api_key: &str) -> anyhow::Result<()> {
 
     // Temp file in the SAME dir so `persist` is a same-filesystem atomic rename.
     // tempfile creates it 0600 on unix; the explicit set_mode is a
-    // version-independent guarantee.
+    // version-independent guarantee. This chmod is HARD-failed on purpose (not
+    // best-effort like the dir's 0700) — the temp's perms are security-load-
+    // bearing, so don't relax this to `.ok()`.
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("create temp file in {}", dir.display()))?;
     set_mode(tmp.path(), 0o600).with_context(|| format!("chmod {}", tmp.path().display()))?;
