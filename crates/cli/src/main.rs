@@ -2001,6 +2001,9 @@ mod expected_tip_tests {
             None,
             None,
         );
-        assert!(res.is_ok(), "missing file without expected_tip must stay Ok");
+        assert!(
+            res.is_ok(),
+            "missing file without expected_tip must stay Ok"
+        );
     }
 }
