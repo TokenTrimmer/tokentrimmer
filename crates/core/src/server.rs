@@ -34,8 +34,11 @@ pub fn build_router_with_retrieval(
     state: AppState,
     retrieval: Option<middleware::retrieval::RetrievalState>,
 ) -> Router {
+    crate::metrics::install();
+
     let base = Router::new()
         .route("/health", get(routes::health::handler))
+        .route("/metrics", get(routes::metrics::handler))
         .route("/v1/models", get(routes::models::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))

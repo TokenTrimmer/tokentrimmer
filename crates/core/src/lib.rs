@@ -6,6 +6,7 @@ pub mod budget;
 pub mod db;
 pub mod error;
 pub mod failover;
+pub mod metrics;
 pub mod middleware;
 pub mod registry;
 pub mod retry;
