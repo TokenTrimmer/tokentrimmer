@@ -588,4 +588,59 @@ mod tests {
         // find_by_prefix was called a second time.
         assert_eq!(store.find_count.load(Ordering::SeqCst), 2);
     }
+
+    // ------------------------------------------------------------------
+    // (e) Revoking a key and evicting by key_id (the revoke-route path)
+    //     causes the next request to re-verify and return 401.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn revoked_key_rejected_after_evict_by_key_id() {
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_revoke_by_id99";
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        let cache = Arc::new(KeyVerifyCache::new());
+
+        let mut app = AppState::new(crate::registry::ProviderRegistry::new());
+        app.verify_cache = cache.clone();
+        app.key_store = Some(store.clone());
+        let router = build_router(app);
+
+        // First request — cache miss → argon2 → 200; warms the positive entry.
+        let r1 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r1");
+        assert_eq!(r1.status(), StatusCode::OK, "pre-revoke should succeed");
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+
+        // Revoke in the store + evict the cache BY KEY_ID (what the revoke route does).
+        let (key_id, key_org_id) = {
+            let g = store.by_prefix.lock().unwrap();
+            let k = g.get(&plaintext[..12]).unwrap();
+            (k.id, k.org_id)
+        };
+        store
+            .revoke(key_id, key_org_id, Utc::now())
+            .await
+            .expect("revoke");
+        cache.evict_key_id(key_id);
+
+        // Next request — cache miss (evicted) → argon2 re-runs → revoked → 401.
+        let r2 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r2");
+        assert_eq!(
+            r2.status(),
+            StatusCode::UNAUTHORIZED,
+            "after evict_key_id, revoked key must be rejected"
+        );
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 2);
+    }
 }
