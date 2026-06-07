@@ -33,6 +33,7 @@ pub async fn add_doc(corpus: &str, path: &std::path::Path, openai_key: &str) -> 
                 chunk_idx: i as u32,
                 text: c.text.clone(),
                 embedding: emb,
+                embedding_model: embedder.model.clone(),
                 metadata: serde_json::json!({}),
             })
             .await?;
@@ -45,7 +46,7 @@ pub async fn search(corpus: &str, query: &str, k: usize, openai_key: &str) -> Re
     let store = MemoryStore::new();
     let embedder = EmbeddingClient::openai(openai_key);
     let q = embedder.embed(query).await?;
-    let r = top_k(&store, Uuid::nil(), corpus, &q, k, 0.0).await?;
+    let r = top_k(&store, Uuid::nil(), corpus, &q, k, 0.0, &embedder.model).await?;
     for hit in r {
         println!(
             "{:.3}  {}",
