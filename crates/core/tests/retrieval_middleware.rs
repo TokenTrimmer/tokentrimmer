@@ -191,6 +191,7 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
             chunk_idx: 0,
             text: "Retrieved chunk content here.".into(),
             embedding: vec![1.0, 0.0],
+            embedding_model: "text-embedding-3-small".into(),
             metadata: json!({}),
         })
         .await

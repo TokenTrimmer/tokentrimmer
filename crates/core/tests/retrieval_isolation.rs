@@ -189,6 +189,7 @@ async fn different_orgs_do_not_share_retrieval_data() {
             chunk_idx: 0,
             text: "ORG_A_EXCLUSIVE_CONTENT".into(),
             embedding: vec![1.0, 0.0],
+            embedding_model: "text-embedding-3-small".into(),
             metadata: json!({}),
         })
         .await
@@ -204,6 +205,7 @@ async fn different_orgs_do_not_share_retrieval_data() {
             chunk_idx: 0,
             text: "ORG_B_EXCLUSIVE_CONTENT".into(),
             embedding: vec![1.0, 0.0],
+            embedding_model: "text-embedding-3-small".into(),
             metadata: json!({}),
         })
         .await
