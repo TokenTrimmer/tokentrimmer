@@ -5,6 +5,7 @@
 use futures::StreamExt as _;
 use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 // Re-export every tt-shared type reachable through the public API (so embedders
 // don't need a direct `tt-shared` dependency to read `outcome.response`).
@@ -291,6 +292,15 @@ pub(crate) fn apply_tt_headers(
     Ok(req)
 }
 
+/// Fail fast if the gateway host is unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Read-INACTIVITY timeout (not a total cap): aborts a connection that goes
+/// silent for this long — including the wait for the FIRST byte. Set generously
+/// (10 min, matching the OpenAI/Anthropic SDK default) so it bounds a truly hung
+/// gateway without aborting a reasoning model that thinks for a while before its
+/// first token; a healthy stream that keeps emitting resets the window each chunk.
+const READ_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// A typed TokenTrimmer gateway client.
 pub struct Client {
     http: reqwest::Client,
@@ -300,9 +310,25 @@ pub struct Client {
 
 impl Client {
     /// New client for `base` (e.g. `https://api.tokentrimmer.com`) with `key`.
+    ///
+    /// Uses safe defaults: a 10s connect timeout, a 10-minute read-inactivity
+    /// timeout (aborts a gateway that goes silent — incl. before the first byte —
+    /// for 10 min, so a hung connection can't hang the caller forever, while
+    /// still allowing a reasoning model that thinks for minutes before its first
+    /// token), and a `tt-client/<version>` User-Agent. For different timeouts,
+    /// retry, proxies, etc., configure a `reqwest::Client` yourself and use
+    /// [`with_http_client`](Self::with_http_client).
     #[must_use]
     pub fn new(base: impl Into<String>, key: impl Into<String>) -> Self {
-        Self::with_http_client(reqwest::Client::new(), base, key)
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .user_agent(concat!("tt-client/", env!("CARGO_PKG_VERSION")))
+            .build()
+            // Keep `new` infallible; the only failure is a rare TLS-backend init
+            // error, where the plain default client is no worse than today.
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self::with_http_client(http, base, key)
     }
 
     /// New client reusing an existing `reqwest::Client`.
@@ -1265,5 +1291,40 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::InvalidTag(_)), "{err:?}");
         m.assert_hits_async(0).await;
+    }
+
+    #[tokio::test]
+    async fn read_timeout_surfaces_as_timeout_not_hang() {
+        use std::time::Duration;
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .delay(Duration::from_secs(2))
+                .json_body(serde_json::json!({
+                    "id":"x","object":"chat.completion","created":0,"model":"m",
+                    "choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}
+                }));
+        });
+        let http = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let client = Client::with_http_client(http, server.base_url(), "k");
+        let result = client.chat().model("m").message(user("hi")).send().await;
+        match result {
+            Err(Error::Request(e)) => assert!(e.is_timeout(), "expected timeout, got {e:?}"),
+            other => panic!("expected Err(Request(timeout)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_does_not_panic() {
+        // The default builder config (connect/read timeouts + user-agent) is
+        // valid, so `new` builds and never falls through to the panic-free
+        // fallback for a bad reason. (reqwest exposes no getter to assert the
+        // configured timeouts, so this only guards against a build/panic
+        // regression — the read-timeout behaviour is covered by the test above.)
+        let _client = Client::new("http://127.0.0.1:0", "tt_test_k");
     }
 }
