@@ -294,9 +294,12 @@ pub(crate) fn apply_tt_headers(
 
 /// Fail fast if the gateway host is unreachable.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Per-read INACTIVITY timeout (not a total cap): bounds a hung connection but
-/// does not kill a healthy long-lived stream, since each chunk resets it.
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Read-INACTIVITY timeout (not a total cap): aborts a connection that goes
+/// silent for this long — including the wait for the FIRST byte. Set generously
+/// (10 min, matching the OpenAI/Anthropic SDK default) so it bounds a truly hung
+/// gateway without aborting a reasoning model that thinks for a while before its
+/// first token; a healthy stream that keeps emitting resets the window each chunk.
+const READ_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A typed TokenTrimmer gateway client.
 pub struct Client {
@@ -308,10 +311,12 @@ pub struct Client {
 impl Client {
     /// New client for `base` (e.g. `https://api.tokentrimmer.com`) with `key`.
     ///
-    /// Uses safe defaults: a 10s connect timeout, a 60s read-inactivity timeout
-    /// (bounds a hung gateway without capping a healthy long stream), and a
-    /// `tt-client/<version>` User-Agent. For different timeouts, retry, proxies,
-    /// etc., configure a `reqwest::Client` yourself and use
+    /// Uses safe defaults: a 10s connect timeout, a 10-minute read-inactivity
+    /// timeout (aborts a gateway that goes silent — incl. before the first byte —
+    /// for 10 min, so a hung connection can't hang the caller forever, while
+    /// still allowing a reasoning model that thinks for minutes before its first
+    /// token), and a `tt-client/<version>` User-Agent. For different timeouts,
+    /// retry, proxies, etc., configure a `reqwest::Client` yourself and use
     /// [`with_http_client`](Self::with_http_client).
     #[must_use]
     pub fn new(base: impl Into<String>, key: impl Into<String>) -> Self {
@@ -1314,7 +1319,12 @@ mod tests {
     }
 
     #[test]
-    fn new_builds_with_default_timeouts() {
+    fn new_does_not_panic() {
+        // The default builder config (connect/read timeouts + user-agent) is
+        // valid, so `new` builds and never falls through to the panic-free
+        // fallback for a bad reason. (reqwest exposes no getter to assert the
+        // configured timeouts, so this only guards against a build/panic
+        // regression — the read-timeout behaviour is covered by the test above.)
         let _client = Client::new("http://127.0.0.1:0", "tt_test_k");
     }
 }
