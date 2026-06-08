@@ -24,7 +24,7 @@ use std::pin::Pin;
 use tt_shared::{
     filter_extra_headers,
     messages::{ChunkChoice, ChunkDelta, ToolCall, ToolCallFunction},
-    ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext, Usage,
+    ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext,
 };
 use uuid::Uuid;
 
@@ -322,13 +322,10 @@ fn process_sse_event(
         // Emit content/tool_call chunk if there is content.
         if text_content.is_some() || !tool_calls.is_empty() {
             let usage = if has_finish_reason {
-                event.usage_metadata.as_ref().map(|u| Usage {
-                    prompt_tokens: u.prompt_token_count,
-                    completion_tokens: u.candidates_token_count,
-                    total_tokens: u.total_token_count,
-                    cached_tokens: u.cached_content_token_count,
-                    cache_creation_input_tokens: None,
-                })
+                event
+                    .usage_metadata
+                    .as_ref()
+                    .map(|u| translate::translate_usage(u.clone()))
             } else {
                 None
             };
@@ -351,13 +348,10 @@ fn process_sse_event(
             }));
         } else if has_finish_reason {
             // Final chunk with finish_reason but no content.
-            let usage = event.usage_metadata.as_ref().map(|u| Usage {
-                prompt_tokens: u.prompt_token_count,
-                completion_tokens: u.candidates_token_count,
-                total_tokens: u.total_token_count,
-                cached_tokens: u.cached_content_token_count,
-                cache_creation_input_tokens: None,
-            });
+            let usage = event
+                .usage_metadata
+                .as_ref()
+                .map(|u| translate::translate_usage(u.clone()));
 
             outcomes.push(SseOutcome::Chunk(ChatCompletionChunk {
                 id: stream_id.to_string(),
