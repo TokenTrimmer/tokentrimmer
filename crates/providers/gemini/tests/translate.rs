@@ -411,6 +411,21 @@ fn translate_tool_choice_none() {
     insta::assert_json_snapshot!("tool_choice_none", &body);
 }
 
+#[test]
+fn translate_tool_choice_required() {
+    let mut req = make_request("gemini-3.1-pro", vec![user_text("You must use a tool.")]);
+    req.tool_choice = Some(ToolChoice::Auto("required".to_string()));
+
+    let body = translate_request(req).expect("translate ok");
+
+    let tc = body
+        .tool_config
+        .as_ref()
+        .expect("toolConfig should be present");
+    assert_eq!(tc.function_calling_config.mode, "ANY");
+    assert!(tc.function_calling_config.allowed_function_names.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // 8. Assistant tool_call → functionCall in content
 // ---------------------------------------------------------------------------
