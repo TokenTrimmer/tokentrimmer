@@ -161,7 +161,6 @@ fn route(target: &str, fallbacks: Vec<String>) -> Route {
         then: RouteAction {
             target_model: target.into(),
             fallbacks,
-            force_cache_layer: None,
             disable_cache: false,
             max_cost_usd: None,
         },

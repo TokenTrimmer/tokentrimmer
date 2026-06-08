@@ -110,7 +110,6 @@ mod tests {
             when,
             then: RouteAction {
                 target_model: "x".into(),
-                force_cache_layer: None,
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,

@@ -165,13 +165,6 @@ pub struct RouteAction {
     /// `tt_plan_core::RouteAction` without dropping fallbacks on read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,
-    /// Override the projected cache layer (e.g. force `"l1"` projection
-    /// even when the request didn't hit cache in the baseline). The replay
-    /// engine does not yet simulate the effect of this override (follow-up:
-    /// wire force_cache_layer into the cache-projection step); the field is
-    /// present so the Plan result carries it through to apply without loss.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub force_cache_layer: Option<String>,
     /// Mirror of `tt_routing::RouteAction::disable_cache`. The replay engine does
     /// not yet model cache opt-out (follow-up); present for lossless round-trip.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -454,14 +447,12 @@ mod tests {
 
     // --- rv-routeaction-shared-type: field-parity serde tests ---
 
-    /// (c) Serializing a `RouteAction` with empty fallbacks and no
-    /// force_cache_layer must produce the same JSON as before — just
-    /// `{"target_model":"x"}` — confirming skip_serializing_if is wired.
+    /// (c) Serializing a `RouteAction` with empty fallbacks produces the
+    /// minimal JSON `{"target_model":"x"}` — confirming skip_serializing_if.
     #[test]
     fn route_action_minimal_serializes_without_new_fields() {
         let a = RouteAction {
             target_model: "x".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -469,48 +460,37 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
             json, r#"{"target_model":"x"}"#,
-            "None force_cache_layer and empty fallbacks must be omitted from JSON"
+            "empty fallbacks must be omitted from JSON"
         );
     }
 
     /// (b) Old JSON that has only `target_model` still deserializes — serde
-    /// default fills in None force_cache_layer and empty fallbacks.
+    /// default fills in empty fallbacks.
     #[test]
     fn route_action_backward_compat_deserialize() {
         let json = r#"{"target_model":"claude-3-5-haiku"}"#;
         let a: RouteAction = serde_json::from_str(json).unwrap();
         assert_eq!(a.target_model, "claude-3-5-haiku");
-        assert!(
-            a.force_cache_layer.is_none(),
-            "force_cache_layer must default to None"
-        );
         assert!(a.fallbacks.is_empty(), "fallbacks must default to empty");
     }
 
-    /// (a) Full round-trip: a `RouteAction` with both new fields serializes to
-    /// JSON carrying both fields, and deserializes back with all values
-    /// preserved — no field dropped.
+    /// (a) Full round-trip: a `RouteAction` with fallbacks serializes to JSON
+    /// carrying them, and deserializes back with all values preserved.
     #[test]
     fn route_action_full_round_trip() {
         let original = RouteAction {
             target_model: "claude-3-5-haiku".into(),
-            force_cache_layer: Some("l1".into()),
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
             max_cost_usd: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
-            json.contains("\"force_cache_layer\""),
-            "force_cache_layer must appear in JSON: {json}"
-        );
-        assert!(
             json.contains("\"fallbacks\""),
             "fallbacks must appear in JSON: {json}"
         );
         let roundtripped: RouteAction = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtripped.target_model, original.target_model);
-        assert_eq!(roundtripped.force_cache_layer, original.force_cache_layer);
         assert_eq!(roundtripped.fallbacks, original.fallbacks);
     }
 
@@ -521,7 +501,6 @@ mod tests {
         let a = RouteAction {
             target_model: "m".into(),
             fallbacks: Vec::new(),
-            force_cache_layer: None,
             disable_cache: true,
             max_cost_usd: None,
         };
@@ -532,20 +511,33 @@ mod tests {
     }
 
     /// Cross-crate lossless round-trip: JSON produced by
-    /// `tt_routing::RouteAction` (target_model + fallbacks + force_cache_layer)
-    /// is accepted by `tt_plan_core::RouteAction` without dropping any field,
-    /// and vice-versa. The wire shapes are now structurally identical.
+    /// `tt_routing::RouteAction` (target_model + fallbacks) is accepted by
+    /// `tt_plan_core::RouteAction` without dropping any field. The wire shapes
+    /// are structurally identical.
     #[test]
     fn route_action_cross_type_wire_compat() {
-        // Simulate the JSON a tt_routing::RouteAction with all fields would emit.
-        let gateway_json = r#"{"target_model":"gpt-4o-mini","fallbacks":["claude-haiku"],"force_cache_layer":"l2"}"#;
+        let gateway_json = r#"{"target_model":"gpt-4o-mini","fallbacks":["claude-haiku"]}"#;
         let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
         assert_eq!(plan_action.target_model, "gpt-4o-mini");
         assert_eq!(plan_action.fallbacks, vec!["claude-haiku"]);
-        assert_eq!(plan_action.force_cache_layer.as_deref(), Some("l2"));
-        // Re-serialize: must re-produce the same JSON (field order is
-        // declaration order, which is now identical between the two types).
+        // Re-serialize: must re-produce the same JSON (declaration order).
         let reemitted = serde_json::to_string(&plan_action).unwrap();
         assert_eq!(reemitted, gateway_json);
+    }
+
+    /// Back-compat: legacy JSON still carrying the removed `force_cache_layer`
+    /// key deserializes fine (serde ignores the unknown field) and re-serializes
+    /// without it. Guards persisted plans/routes written before the removal.
+    #[test]
+    fn route_action_legacy_force_cache_layer_is_ignored() {
+        let legacy = r#"{"target_model":"gpt-4o-mini","fallbacks":["x"],"force_cache_layer":"l2"}"#;
+        let a: RouteAction = serde_json::from_str(legacy).unwrap();
+        assert_eq!(a.target_model, "gpt-4o-mini");
+        assert_eq!(a.fallbacks, vec!["x"]);
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(
+            !j.contains("force_cache_layer"),
+            "obsolete key must not be re-emitted: {j}"
+        );
     }
 }

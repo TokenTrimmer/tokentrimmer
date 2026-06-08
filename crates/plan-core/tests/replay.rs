@@ -205,7 +205,6 @@ fn single_request_route_match_cheaper_model_produces_savings() {
         },
         then: RouteAction {
             target_model: "claude-3-5-haiku".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -236,7 +235,6 @@ fn conservative_when_pricing_missing() {
         when: RouteConditions::default(),
         then: RouteAction {
             target_model: "nonexistent-model".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -271,7 +269,6 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
         },
         then: RouteAction {
             target_model: "claude-haiku-4-5".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -303,7 +300,6 @@ fn cross_provider_target_absent_is_conservative() {
         },
         then: RouteAction {
             target_model: "claude-haiku-4-5".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -334,7 +330,6 @@ fn route_over_ceiling_is_blocked_not_saved() {
         when: RouteConditions::default(),
         then: RouteAction {
             target_model: "claude-3-5-haiku".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: Some(0.01), // haiku on 1M/1M tokens still far exceeds $0.01
@@ -387,7 +382,6 @@ fn rerouted_latency_projected_from_target_model_history() {
         },
         then: RouteAction {
             target_model: "cheap-model".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -463,7 +457,6 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
         },
         then: RouteAction {
             target_model: "claude-3-5-haiku".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -581,7 +574,6 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
         },
         then: RouteAction {
             target_model: "claude-3-5-haiku".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -598,7 +590,6 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
         },
         then: RouteAction {
             target_model: "claude-3-haiku-pricier".into(),
-            force_cache_layer: None,
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,

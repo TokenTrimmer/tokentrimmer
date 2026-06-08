@@ -110,9 +110,8 @@ Serde tolerance: neither struct uses `#[serde(deny_unknown_fields)]` (verify), s
 
 **Ripple:** removing a `pub` field is an API change — `cargo clippy --workspace --all-targets` + `cargo test --workspace --no-run` are mandatory before push (per the enum-variant-ripple lesson).
 
-### 3b.2 nil-org cache bypass (`core/src/routes/chat.rs`)
-Current: unauthenticated/dev requests use `org_id = Uuid::nil()` (line 552) and share one cache namespace via `format!("{}:{}", org_id, cache_key(req))` (line 1546); budget already no-ops nil-org (line 2168).
-Fix: skip cache **lookup and insert** when `org_id.is_nil()`, mirroring the existing `disable_cache` short-circuit. Unauthenticated/dev traffic then neither reads nor pollutes the shared nil-org cache. (Locate the guard that gates the L1/L2 lookup+insert and add `&& !org_id.is_nil()`, or an early `let cache_enabled = !disable_cache && !org_id.is_nil();`.) Add a test: a nil-org request does not hit a previously-inserted cache entry and does not insert one.
+### 3b.2 nil-org cache — ACCEPTED, not fixed (revised 2026-06-08)
+Original plan was to skip L1/L2 for `org_id.is_nil()`. A prototype confirmed this works but **disables legitimate single-tenant dev-mode caching** and breaks ~6 unauthenticated cache-hit test harnesses (`cache_header`, `l1_cache_hit`, `l2_cache_hit`, `negative_cache`, `single_flight_coalesce`, `streaming_cache_write`). Since nil-org is only reachable by unauthenticated requests and production requires auth (routing already enforces it), the shared namespace is only exposed in an unsupported unauth-multi-tenant deploy with effectively one logical tenant. User decision (2026-06-08): **accept + document** rather than rework well-tested cache infra for a low/theoretical exposure. No code change; checklist entry annotated ACCEPTED.
 
 ### 3b.3 Checklist documentation (no code) — both repos' `docs/reviews/2026-06-06-audit-checklist.md`
 - #7 streaming-spend-on-body-drop → annotate **DEFERRED**: a correct fix is reserve-at-admission + reconcile-on-completion (own slice); the current body-drop recording is the documented best-effort. Leave checkbox open with the deferral note.

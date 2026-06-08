@@ -370,7 +370,6 @@ async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential
             then: RouteAction {
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: vec!["gpt-4o".into()],
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },
