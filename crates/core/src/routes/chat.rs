@@ -840,7 +840,8 @@ pub async fn handler(
         // mid-stream error cannot move to another provider); otherwise retry
         // the single provider. `provider`/`served_model` are rebound to whoever
         // actually served so cost/telemetry attribute correctly.
-        let (provider, served_model, stream) = with_request_timeout(request_timeout, async {
+        let __primary = provider.id();
+        let __stream_outcome = with_request_timeout(request_timeout, async {
             if route_fallbacks.is_empty() {
                 // Retry the initial stream establishment on transient errors (before
                 // any chunk is yielded); mid-stream errors are not retried.
@@ -878,7 +879,14 @@ pub async fn handler(
                 .map_err(ApiError::from)
             }
         })
-        .await?;
+        .await;
+        // Attributed to the primary provider: the request deadline spans any
+        // failover loop, so the in-flight candidate at timeout isn't known here
+        // without threading it out of dispatch_stream_with_failover.
+        if matches!(__stream_outcome, Err(ApiError::RequestTimeout { .. })) {
+            crate::metrics::record_provider_timeout(__primary, "chat_stream");
+        }
+        let (provider, served_model, stream) = __stream_outcome?;
 
         // Build the cache-insert context for the streaming miss path
         // (§rv-l2-streaming-cache-write). On clean completion the DropGuard
@@ -1211,6 +1219,7 @@ pub async fn handler(
         //     circuit breaker is open; otherwise dispatch the single provider
         //     with retry. `provider` is rebound to whichever provider actually
         //     served the request so cost/headers/telemetry below reflect it.
+        let __primary = provider.id();
         let dispatch_result: ApiResult<_> = with_request_timeout(request_timeout, async {
             if route_fallbacks.is_empty() {
                 let __started = std::time::Instant::now();
@@ -1248,6 +1257,13 @@ pub async fn handler(
             }
         })
         .await;
+
+        // Attributed to the primary provider: the request deadline spans any
+        // failover loop, so the in-flight candidate at timeout isn't known here
+        // without threading it out of dispatch_with_failover.
+        if matches!(dispatch_result, Err(ApiError::RequestTimeout { .. })) {
+            crate::metrics::record_provider_timeout(__primary, "chat");
+        }
 
         // 3c-neg. Negative-cache write on deterministic client errors.
         //

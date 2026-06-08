@@ -157,3 +157,36 @@ async fn embeddings_timeout_returns_408() {
     let resp = app(1_000).oneshot(request).await.unwrap();
     assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
 }
+
+#[tokio::test]
+async fn timeout_increments_provider_timeouts_total() {
+    let router = app(1_000); // provider sleeps 1s
+    let resp = router.clone().oneshot(chat(Some("50"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+
+    let m = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(m.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("provider_timeouts_total"),
+        "provider_timeouts_total series missing:\n{text}"
+    );
+    assert!(
+        text.contains("provider=\"sleepy\""),
+        "provider label missing:\n{text}"
+    );
+    assert!(
+        text.contains("operation=\"chat\""),
+        "operation label missing:\n{text}"
+    );
+}

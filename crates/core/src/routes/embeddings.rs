@@ -223,13 +223,18 @@ pub async fn handler(
     // 6. Dispatch. Capture the served model + its pricing before `req` moves.
     let served_model = req.model.clone();
     let routed_pricing = provider.pricing(&served_model);
-    let resp = with_request_timeout(ctx.deadline, async {
+    let __primary = provider.id();
+    let __emb_outcome = with_request_timeout(ctx.deadline, async {
         let __started = std::time::Instant::now();
         let __emb = provider.embeddings(req, &ctx).await;
         crate::metrics::record_provider_latency(provider.id(), "embeddings", __started.elapsed());
         __emb.map_err(ApiError::from)
     })
-    .await?;
+    .await;
+    if matches!(__emb_outcome, Err(ApiError::RequestTimeout { .. })) {
+        crate::metrics::record_provider_timeout(__primary, "embeddings");
+    }
+    let resp = __emb_outcome?;
 
     // 7. Cost + headers + spend. Baseline against the original model when routed.
     let baseline_pricing = if matched {
