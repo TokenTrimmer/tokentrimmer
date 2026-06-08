@@ -254,7 +254,9 @@ pub enum Error {
     },
     #[error("failed to decode the gateway response: {0}")]
     Decode(#[source] reqwest::Error),
-    /// The `tag` is not a valid HTTP header value (control chars, CR/LF, …).
+    /// The `tag` is not a valid HTTP header value. Rejected bytes are the
+    /// control chars (`< 0x20`, incl. CR/LF/NUL) and DEL (`0x7F`); high bytes
+    /// (`0x80..=0xFF`, e.g. non-ASCII UTF-8) pass through as opaque octets.
     #[error("invalid tag (not a valid HTTP header value): {0:?}")]
     InvalidTag(String),
     /// The cost limit is not a finite number (NaN / infinity).
@@ -267,7 +269,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Attach the optional `X-TokenTrimmer-Tag` + `X-TokenTrimmer-Cost-Limit-Usd`
 /// headers, validating both. Rejects a tag that isn't a legal HTTP header value
-/// and a non-finite cost limit — surfaced at send time, before any network I/O.
+/// (control chars/CR/LF/DEL; high bytes pass as opaque octets) and a non-finite
+/// cost limit — surfaced at send time, before any network I/O. A finite negative
+/// cost limit is sent as-is; the gateway rejects it with 402.
 pub(crate) fn apply_tt_headers(
     mut req: reqwest::RequestBuilder,
     tag: Option<&str>,
