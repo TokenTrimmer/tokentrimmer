@@ -1,0 +1,28 @@
+name: shellcheck
+
+# Lints the bash tooling in scripts/ on any change to it. Gated at WARNING
+# severity: the existing scripts are clean at this level, while info/style
+# notes (e.g. intentional single-quoted literals) are not failed on.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/*.sh'
+      - '.github/workflows/shellcheck.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/*.sh'
+      - '.github/workflows/shellcheck.yml'
+
+jobs:
+  shellcheck:
+    name: shellcheck scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Lint scripts (severity=warning)
+        run: shellcheck --severity=warning scripts/*.sh

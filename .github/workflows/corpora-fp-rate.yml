@@ -1,0 +1,42 @@
+name: corpora FP-rate gate
+
+# The FP corpus exists to catch rules that over-fire on idiomatic real-world
+# LLM-SDK code. This wires the previously manual-only gate into CI: any rule
+# flagging > 5% of either corpus tier fails the build. Runs on changes to the
+# Inspect rules/engine or the corpora.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/inspect-rules-tier1/**'
+      - 'crates/inspect-core/**'
+      - 'corpora/**'
+      - 'scripts/measure-fp-rate.sh'
+      - '.github/workflows/corpora-fp-rate.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/inspect-rules-tier1/**'
+      - 'crates/inspect-core/**'
+      - 'corpora/**'
+      - 'scripts/measure-fp-rate.sh'
+      - '.github/workflows/corpora-fp-rate.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fp-rate:
+    name: FP rate <= 5%
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build -p tt-cli --release
+      - name: FP rate on authored samples
+        run: ./scripts/measure-fp-rate.sh --corpus corpora/samples
+      - name: FP rate on vendored slices
+        run: ./scripts/measure-fp-rate.sh --corpus corpora/vendor
