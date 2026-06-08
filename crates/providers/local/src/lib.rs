@@ -161,6 +161,10 @@ impl Provider for LocalProvider {
         })
     }
 
+    fn dropped_params(&self, req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+        self.inner.dropped_params(req)
+    }
+
     async fn chat_completion(
         &self,
         mut req: ChatCompletionRequest,
