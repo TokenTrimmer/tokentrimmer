@@ -56,3 +56,15 @@ pub fn record_provider_latency(provider: &'static str, operation: &'static str, 
     )
     .record(dur.as_secs_f64());
 }
+
+/// Count a provider dispatch that hit the request deadline (timed out). Kept
+/// separate from `provider_request_duration_seconds` so right-censored-at-
+/// deadline values don't skew the latency percentiles.
+pub fn record_provider_timeout(provider: &'static str, operation: &'static str) {
+    metrics::counter!(
+        "provider_timeouts_total",
+        "provider" => provider,
+        "operation" => operation,
+    )
+    .increment(1);
+}
