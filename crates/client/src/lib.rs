@@ -254,10 +254,42 @@ pub enum Error {
     },
     #[error("failed to decode the gateway response: {0}")]
     Decode(#[source] reqwest::Error),
+    /// The `tag` is not a valid HTTP header value. Rejected bytes are the
+    /// control chars (`< 0x20`, incl. CR/LF/NUL) and DEL (`0x7F`); high bytes
+    /// (`0x80..=0xFF`, e.g. non-ASCII UTF-8) pass through as opaque octets.
+    #[error("invalid tag (not a valid HTTP header value): {0:?}")]
+    InvalidTag(String),
+    /// The cost limit is not a finite number (NaN / infinity).
+    #[error("invalid cost limit (must be a finite number): {0}")]
+    InvalidCostLimit(f64),
 }
 
 /// Result alias for `tt-client`.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Attach the optional `X-TokenTrimmer-Tag` + `X-TokenTrimmer-Cost-Limit-Usd`
+/// headers, validating both. Rejects a tag that isn't a legal HTTP header value
+/// (control chars/CR/LF/DEL; high bytes pass as opaque octets) and a non-finite
+/// cost limit — surfaced at send time, before any network I/O. A finite negative
+/// cost limit is sent as-is; the gateway rejects it with 402.
+pub(crate) fn apply_tt_headers(
+    mut req: reqwest::RequestBuilder,
+    tag: Option<&str>,
+    cost_limit: Option<f64>,
+) -> Result<reqwest::RequestBuilder> {
+    if let Some(tag) = tag {
+        let value = reqwest::header::HeaderValue::from_str(tag)
+            .map_err(|_| Error::InvalidTag(tag.to_string()))?;
+        req = req.header("X-TokenTrimmer-Tag", value);
+    }
+    if let Some(limit) = cost_limit {
+        if !limit.is_finite() {
+            return Err(Error::InvalidCostLimit(limit));
+        }
+        req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
+    }
+    Ok(req)
+}
 
 /// A typed TokenTrimmer gateway client.
 pub struct Client {
@@ -397,18 +429,13 @@ impl ChatBuilder<'_> {
             false,
         );
         inject_tools(&mut body, &self.tools, self.tool_choice.as_ref());
-        let mut req = self
+        let req = self
             .client
             .http
             .post(format!("{}/v1/chat/completions", self.client.base))
             .bearer_auth(&self.client.key)
             .json(&body);
-        if let Some(tag) = &self.tag {
-            req = req.header("X-TokenTrimmer-Tag", tag);
-        }
-        if let Some(limit) = self.cost_limit {
-            req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
-        }
+        let req = apply_tt_headers(req, self.tag.as_deref(), self.cost_limit)?;
         let resp = req.send().await.map_err(Error::Request)?;
         let cost = parse_cost(resp.headers());
         let status = resp.status();
@@ -443,18 +470,13 @@ impl ChatBuilder<'_> {
             self.temperature,
             true,
         );
-        let mut req = self
+        let req = self
             .client
             .http
             .post(format!("{}/v1/chat/completions", self.client.base))
             .bearer_auth(&self.client.key)
             .json(&body);
-        if let Some(tag) = &self.tag {
-            req = req.header("X-TokenTrimmer-Tag", tag);
-        }
-        if let Some(limit) = self.cost_limit {
-            req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
-        }
+        let req = apply_tt_headers(req, self.tag.as_deref(), self.cost_limit)?;
         let resp = req.send().await.map_err(Error::Request)?;
         let header_cost = parse_cost(resp.headers());
         let status = resp.status();
@@ -1203,5 +1225,45 @@ mod tests {
         assert_eq!(b2["stream"], true);
         assert_eq!(b2["max_tokens"], 256);
         assert!((b2["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_tt_headers_accepts_valid_and_rejects_invalid() {
+        let http = reqwest::Client::new();
+        let url = "http://127.0.0.1:0/x";
+        assert!(super::apply_tt_headers(http.get(url), Some("team-a"), Some(0.5)).is_ok());
+        assert!(super::apply_tt_headers(http.get(url), None, None).is_ok());
+        let e = super::apply_tt_headers(http.get(url), Some("bad\ntag"), None).unwrap_err();
+        assert!(matches!(e, Error::InvalidTag(_)), "{e:?}");
+        let nan = super::apply_tt_headers(http.get(url), None, Some(f64::NAN)).unwrap_err();
+        assert!(matches!(nan, Error::InvalidCostLimit(_)), "{nan:?}");
+        let inf = super::apply_tt_headers(http.get(url), None, Some(f64::INFINITY)).unwrap_err();
+        assert!(matches!(inf, Error::InvalidCostLimit(_)), "{inf:?}");
+    }
+
+    #[tokio::test]
+    async fn invalid_tag_fails_before_any_request() {
+        let server = httpmock::MockServer::start_async().await;
+        let m = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/chat/completions");
+                then.status(200).json_body(serde_json::json!({
+                    "id":"x","object":"chat.completion","created":0,"model":"gpt-4o-mini",
+                    "choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}
+                }));
+            })
+            .await;
+        let client = Client::new(server.base_url(), "tt_test_k");
+        let err = client
+            .chat()
+            .model("gpt-4o-mini")
+            .messages(vec![])
+            .tag("bad\ntag")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidTag(_)), "{err:?}");
+        m.assert_hits_async(0).await;
     }
 }

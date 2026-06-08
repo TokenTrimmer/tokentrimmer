@@ -124,17 +124,12 @@ async fn send_round(
         tool_choice
     };
     inject_tools(&mut body, tools, effective);
-    let mut req = client
+    let req = client
         .http
         .post(format!("{}/v1/chat/completions", client.base))
         .bearer_auth(&client.key)
         .json(&body);
-    if let Some(t) = tag {
-        req = req.header("X-TokenTrimmer-Tag", t);
-    }
-    if let Some(limit) = cost_limit {
-        req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
-    }
+    let req = crate::apply_tt_headers(req, tag, cost_limit)?;
     let resp = req.send().await.map_err(Error::Request)?;
     let cost = parse_cost(resp.headers());
     let status = resp.status();
