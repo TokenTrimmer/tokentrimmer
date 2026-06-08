@@ -37,7 +37,15 @@ fn is_agents_config_file(path: &str) -> bool {
 /// Secret pattern descriptors: (human label, regex pattern).
 static SECRET_PATTERNS: &[(&str, &str)] = &[
     ("Anthropic API key", r"sk-ant-[A-Za-z0-9_-]{32,}"),
-    ("OpenAI API key", r"sk-[A-Za-z0-9]{20,}"),
+    // OpenAI scoped keys (modern): sk-proj-…, sk-svcacct-…, sk-admin-…
+    (
+        "OpenAI API key (scoped)",
+        r"sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}",
+    ),
+    // Legacy bare OpenAI key: sk- + 32+ base62 chars. Raising the floor from
+    // the old {20,} cuts the broad false-positive class (random sk-+20 strings)
+    // while still catching real legacy keys (sk- + 48 chars).
+    ("OpenAI API key (legacy)", r"sk-[A-Za-z0-9]{32,}"),
     ("Stripe live secret key", r"sk_live_[A-Za-z0-9]{20,}"),
     ("AWS Access Key ID", r"AKIA[0-9A-Z]{16}"),
     ("Google API key", r"AIza[0-9A-Za-z_-]{35}"),
@@ -109,5 +117,60 @@ impl Rule for ConfigAgentsMdContainsSecretsRule {
         }
 
         findings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(line: &str) -> Vec<Finding> {
+        ConfigAgentsMdContainsSecretsRule::new().check(line, Language::Markdown, "CLAUDE.md")
+    }
+
+    #[test]
+    fn detects_modern_scoped_openai_keys() {
+        assert!(
+            !scan("OPENAI_API_KEY=sk-proj-abcdefghijklmno0123456789_-XY").is_empty(),
+            "sk-proj- scoped key should fire"
+        );
+        assert!(
+            !scan("key: sk-svcacct-abcdefghijklmnopqrst0123").is_empty(),
+            "sk-svcacct- scoped key should fire"
+        );
+    }
+
+    #[test]
+    fn detects_legacy_48char_openai_key() {
+        // Legacy bare key: sk- + exactly 48 base62 chars.
+        let key = format!("token = sk-{}", "a".repeat(48));
+        assert!(!scan(&key).is_empty(), "legacy 48-char key should fire");
+    }
+
+    #[test]
+    fn does_not_fire_on_short_sk_dash_junk() {
+        // The old `sk-`+20-alnum pattern over-matched; a bare sk- + 20 chars
+        // that is neither a scoped key nor a 48-char legacy key must not fire
+        // as an OpenAI key.
+        let findings = scan("ref = sk-abcdefghij1234567890");
+        assert!(
+            findings.is_empty(),
+            "sk-+20-alnum junk should no longer match as an OpenAI key, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn still_detects_anthropic_keys() {
+        let key = format!("ANTHROPIC_API_KEY=sk-ant-{}", "a".repeat(40));
+        let findings = scan(&key);
+        assert!(!findings.is_empty(), "anthropic key should still fire");
+    }
+
+    #[test]
+    fn ignores_non_config_files() {
+        let key = format!("sk-proj-{}", "a".repeat(30));
+        let findings =
+            ConfigAgentsMdContainsSecretsRule::new().check(&key, Language::Markdown, "README.md");
+        assert!(findings.is_empty(), "non-config file must not be scanned");
     }
 }

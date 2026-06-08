@@ -258,13 +258,26 @@ impl Stream for CleanupStream {
 
 impl Drop for CleanupStream {
     fn drop(&mut self) {
-        let sessions = self.sessions.clone();
         let session_id = self.session_id;
-        // Spawn a task to remove the session asynchronously (can't await in drop).
-        tokio::spawn(async move {
-            sessions.lock().await.remove(&session_id);
-            tracing::debug!(session_id = %session_id, "SSE session cleaned up");
-        });
+        // Fast path: if the lock is free, remove synchronously — no task, no
+        // leak on runtime shutdown.
+        if let Ok(mut guard) = self.sessions.try_lock() {
+            guard.remove(&session_id);
+            tracing::debug!(session_id = %session_id, "SSE session cleaned up (sync)");
+            return;
+        }
+        // Contended: only spawn if a runtime is actually live, else the task
+        // would silently leak. The session map self-heals (stale senders error
+        // on next POST), so dropping cleanup here is safe.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let sessions = self.sessions.clone();
+            handle.spawn(async move {
+                sessions.lock().await.remove(&session_id);
+                tracing::debug!(session_id = %session_id, "SSE session cleaned up (async)");
+            });
+        } else {
+            tracing::debug!(session_id = %session_id, "SSE session cleanup skipped — no runtime");
+        }
     }
 }
 
@@ -340,5 +353,34 @@ mod tests {
         assert!(!origin_is_local_or_absent(Some(&HeaderValue::from_static(
             "https://evil.com"
         ))));
+    }
+
+    #[test]
+    fn cleanup_stream_removes_session_synchronously_on_drop() {
+        use super::{CleanupStream, SessionMap};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, Mutex};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+        use uuid::Uuid;
+
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let id = Uuid::from_u128(1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        sessions.try_lock().unwrap().insert(id, tx);
+
+        let cleanup = CleanupStream {
+            inner: UnboundedReceiverStream::new(rx),
+            sessions: sessions.clone(),
+            session_id: id,
+        };
+        assert!(sessions.try_lock().unwrap().contains_key(&id));
+
+        // Lock is uncontended → Drop removes synchronously, no spawned task.
+        drop(cleanup);
+        assert!(
+            !sessions.try_lock().unwrap().contains_key(&id),
+            "Drop should remove the session synchronously via try_lock"
+        );
     }
 }

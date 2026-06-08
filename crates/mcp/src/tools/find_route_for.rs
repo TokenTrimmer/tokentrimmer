@@ -52,16 +52,6 @@ pub fn classify_task(lower: &str) -> TaskClass {
         || lower.contains("fill in")
     {
         TaskClass::Extraction
-    } else if lower.contains("code")
-        || lower.contains("function")
-        || lower.contains("refactor")
-        || lower.contains("debug")
-        || lower.contains("implement")
-        || lower.contains("unit test")
-        || lower.contains("diff")
-        || lower.contains("compile")
-    {
-        TaskClass::Code
     } else if lower.contains("reason")
         || lower.contains("analyz")
         || lower.contains("analys")
@@ -73,7 +63,20 @@ pub fn classify_task(lower: &str) -> TaskClass {
         || lower.contains("summarise")
         || lower.contains("complex")
     {
+        // Reasoning is checked before Code so reasoning intent ("analyze this
+        // code", "compare these diffs") wins over incidental code nouns; a
+        // prompt with only code keywords still falls through to Code below.
         TaskClass::Reasoning
+    } else if lower.contains("code")
+        || lower.contains("function")
+        || lower.contains("refactor")
+        || lower.contains("debug")
+        || lower.contains("implement")
+        || lower.contains("unit test")
+        || lower.contains("diff")
+        || lower.contains("compile")
+    {
+        TaskClass::Code
     } else {
         TaskClass::General
     }
@@ -337,6 +340,26 @@ mod tests {
             TaskClass::Reasoning
         );
         assert_eq!(classify_task("tell me a joke"), TaskClass::General);
+    }
+
+    #[test]
+    fn reasoning_intent_wins_over_incidental_code_nouns() {
+        // Reasoning is checked before Code: a reasoning verb plus a code noun
+        // routes to Reasoning, not Code.
+        assert_eq!(
+            classify_task("analyze this code refactor"),
+            TaskClass::Reasoning
+        );
+        assert_eq!(
+            classify_task("compare these two diffs"),
+            TaskClass::Reasoning
+        );
+        assert_eq!(
+            classify_task("reason about the compile error step by step"),
+            TaskClass::Reasoning
+        );
+        // A prompt with only code keywords still classifies as Code.
+        assert_eq!(classify_task("refactor this function"), TaskClass::Code);
     }
 
     // ── async tool call tests ────────────────────────────────────────────────

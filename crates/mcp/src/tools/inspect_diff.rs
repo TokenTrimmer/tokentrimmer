@@ -10,6 +10,18 @@ use crate::tools::Tool;
 
 pub struct InspectDiffTool;
 
+/// Sanitize a caller-supplied file extension into a short alphanumeric token.
+///
+/// The extension only steers language detection for the temp file, so we keep
+/// it to ASCII-alphanumeric and cap its length — a caller can't inject path or
+/// suffix surprises through `file_path`.
+fn sanitize_ext(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(16)
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct Input {
     file_path: String,
@@ -35,11 +47,16 @@ impl Tool for InspectDiffTool {
     async fn call(&self, params: Value) -> Result<Value, McpError> {
         let inp: Input =
             serde_json::from_value(params).map_err(|e| McpError::InvalidParams(e.to_string()))?;
-        let ext = std::path::Path::new(&inp.file_path)
+        let raw_ext = std::path::Path::new(&inp.file_path)
             .extension()
             .and_then(|x| x.to_str())
             .unwrap_or("");
-        let suffix = format!(".{ext}");
+        let ext = sanitize_ext(raw_ext);
+        let suffix = if ext.is_empty() {
+            String::new()
+        } else {
+            format!(".{ext}")
+        };
         let mut tmp = tempfile::Builder::new()
             .suffix(&suffix)
             .tempfile()
@@ -53,5 +70,29 @@ impl Tool for InspectDiffTool {
         }
         let findings = engine.scan(tmp.path());
         Ok(json!({ "findings": findings }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_ext;
+
+    #[test]
+    fn sanitize_ext_keeps_simple_extensions() {
+        assert_eq!(sanitize_ext("rs"), "rs");
+        assert_eq!(sanitize_ext("py"), "py");
+        assert_eq!(sanitize_ext("md"), "md");
+    }
+
+    #[test]
+    fn sanitize_ext_strips_non_alnum_and_caps_length() {
+        // Path/suffix-injection characters are dropped.
+        assert_eq!(sanitize_ext("rs/../../etc"), "rsetc");
+        assert_eq!(sanitize_ext("sh; rm -rf"), "shrmrf");
+        // Capped at 16 chars.
+        assert_eq!(sanitize_ext(&"a".repeat(50)).len(), 16);
+        // Empty / all-junk extensions collapse to empty (no suffix).
+        assert_eq!(sanitize_ext(""), "");
+        assert_eq!(sanitize_ext("!@#$"), "");
     }
 }

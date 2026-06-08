@@ -55,7 +55,9 @@ pub fn parse(text: &str) -> Result<Vec<RetrievableTag>, RetrievalError> {
         let min_similarity = sim_re
             .captures(attrs)
             .and_then(|c| c.get(1))
-            .and_then(|s| s.as_str().parse::<f32>().ok());
+            .and_then(|s| s.as_str().parse::<f32>().ok())
+            // Ignore NaN / out-of-range floors; fall back to the default downstream.
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
 
         out.push(RetrievableTag {
             corpus,
@@ -97,6 +99,27 @@ mod tests {
         assert_eq!(t[0].corpus, "x");
         assert_eq!(t[0].k, 3);
         assert_eq!(t[0].min_similarity, Some(0.75));
+    }
+
+    #[test]
+    fn min_similarity_rejects_nan_and_out_of_range() {
+        for bad in ["nan", "NaN", "1.5", "-0.2", "inf", "-inf"] {
+            let tag =
+                format!(r#"<retrievable corpus="x" k="3" min_similarity="{bad}">p</retrievable>"#);
+            let t = parse(&tag).unwrap();
+            assert_eq!(t.len(), 1);
+            assert_eq!(
+                t[0].min_similarity, None,
+                "min_similarity={bad:?} should be rejected"
+            );
+        }
+        // Boundary values 0.0 and 1.0 are accepted.
+        let t =
+            parse(r#"<retrievable corpus="x" k="3" min_similarity="0">p</retrievable>"#).unwrap();
+        assert_eq!(t[0].min_similarity, Some(0.0));
+        let t =
+            parse(r#"<retrievable corpus="x" k="3" min_similarity="1">p</retrievable>"#).unwrap();
+        assert_eq!(t[0].min_similarity, Some(1.0));
     }
 
     #[test]
