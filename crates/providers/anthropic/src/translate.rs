@@ -145,6 +145,8 @@ pub enum AnthropicToolChoice {
     Auto,
     /// Force any available tool.
     Any,
+    /// Disable all tool use.
+    None,
     /// Force a specific tool by name.
     Tool { name: String },
 }
@@ -402,11 +404,9 @@ fn translate_content_blocks(
 /// Convert a canonical [`ToolChoice`] to an [`AnthropicToolChoice`].
 fn translate_tool_choice(choice: ToolChoice) -> AnthropicToolChoice {
     match choice {
-        ToolChoice::Auto(s) if s == "none" => {
-            // "none" isn't a valid Anthropic tool_choice; treat as auto.
-            AnthropicToolChoice::Auto
-        }
-        ToolChoice::Auto(_) => AnthropicToolChoice::Auto,
+        ToolChoice::Auto(s) if s == "none" => AnthropicToolChoice::None,
+        ToolChoice::Auto(s) if s == "required" => AnthropicToolChoice::Any,
+        ToolChoice::Auto(_) => AnthropicToolChoice::Auto, // "auto" + any unknown string
         ToolChoice::Specific { function, .. } => AnthropicToolChoice::Tool {
             name: function.name,
         },
@@ -679,6 +679,30 @@ mod tests {
             body.tool_choice,
             Some(AnthropicToolChoice::Tool { name }) if name == "my_tool"
         ));
+    }
+
+    #[test]
+    fn tool_choice_required_translates_to_any() {
+        use tt_shared::messages::ToolChoice;
+        let mut req = base_request("claude-sonnet-4-6");
+        req.tool_choice = Some(ToolChoice::Auto("required".to_string()));
+        let body = translate_request(req).expect("translate ok");
+        assert!(matches!(body.tool_choice, Some(AnthropicToolChoice::Any)));
+        // Wire format: required → {"type":"any"}.
+        let v = serde_json::to_value(body.tool_choice.unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({ "type": "any" }));
+    }
+
+    #[test]
+    fn tool_choice_none_translates_to_none() {
+        use tt_shared::messages::ToolChoice;
+        let mut req = base_request("claude-sonnet-4-6");
+        req.tool_choice = Some(ToolChoice::Auto("none".to_string()));
+        let body = translate_request(req).expect("translate ok");
+        assert!(matches!(body.tool_choice, Some(AnthropicToolChoice::None)));
+        // Wire format: none → {"type":"none"} (Anthropic "disable all tool use").
+        let v = serde_json::to_value(body.tool_choice.unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({ "type": "none" }));
     }
 
     #[test]

@@ -633,6 +633,12 @@ fn translate_tool_choice(choice: ToolChoice) -> GeminiToolConfig {
                 allowed_function_names: vec![],
             },
         },
+        ToolChoice::Auto(s) if s == "required" => GeminiToolConfig {
+            function_calling_config: GeminiFunctionCallingConfig {
+                mode: "ANY".to_string(), // ANY + empty allowlist = must call some provided fn
+                allowed_function_names: vec![],
+            },
+        },
         ToolChoice::Auto(_) => GeminiToolConfig {
             function_calling_config: GeminiFunctionCallingConfig {
                 mode: "AUTO".to_string(),
