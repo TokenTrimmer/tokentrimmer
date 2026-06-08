@@ -1,6 +1,6 @@
 name = "vercel-ai"
 url = "https://github.com/vercel/ai"
-ref = "HEAD"
+ref = "ab6d66482d31afe15f4973a51c5f7cfa09c92ea6"
 commit = "ab6d66482d31afe15f4973a51c5f7cfa09c92ea6"
 glob = "examples/*.ts"
 files = 8
