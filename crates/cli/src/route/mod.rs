@@ -113,7 +113,7 @@ pub async fn run(
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .context("failed to build HTTP client")?;
 
     match cmd {
         RouteCmd::List => {

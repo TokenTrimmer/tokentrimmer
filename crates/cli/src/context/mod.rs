@@ -192,9 +192,9 @@ mod tests {
 
     #[test]
     fn mask_key_handles_non_ascii_without_panicking() {
-        // `é` (2 bytes) straddles byte 12, so byte-slicing `&key[..12]` panics.
+        // `é` is the 12th char; its 2nd byte sits at index 12, so the old
+        // `&key[..12]` byte-slice cut mid-codepoint and panicked.
         let masked = mask_key("tt_live_caféxyz_more");
-        assert!(masked.ends_with('…'));
-        assert!(masked.starts_with("tt_live_caf"));
+        assert_eq!(masked, "tt_live_café…");
     }
 }
