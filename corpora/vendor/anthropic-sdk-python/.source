@@ -1,6 +1,6 @@
 name = "anthropic-sdk-python"
 url = "https://github.com/anthropics/anthropic-sdk-python"
-ref = "HEAD"
+ref = "ddd43b7ceb79f433dfafe488d95f48c22801186b"
 commit = "ddd43b7ceb79f433dfafe488d95f48c22801186b"
 glob = "examples/*.py"
 files = 8

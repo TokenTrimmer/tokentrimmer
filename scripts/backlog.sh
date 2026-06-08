@@ -60,6 +60,14 @@ case "${cmd}" in
   done)
     task_id="${1:-}"
     [[ -z "${task_id}" ]] && { echo "usage: backlog.sh done <task-id>"; exit 1; }
+    # Validate before interpolating into the sed ERE below: restricting the
+    # task-id to the canonical [A-Za-z0-9-]+ charset (same as the `sync` branch)
+    # means no regex-special character can reach the pattern — closes the
+    # unescaped-interpolation injection without fragile escaping.
+    if [[ ! "${task_id}" =~ ^[A-Za-z0-9-]+$ ]]; then
+      echo "invalid task-id '${task_id}' (expected [A-Za-z0-9-]+)" >&2
+      exit 1
+    fi
     # Flip [ ] to [x] for the line containing this task-id.
     sed -i.bak -E "s/^(\- )\[ \](.*\[${task_id}\])/\1[x]\2/" "${BACKLOG}"
     rm -f "${BACKLOG}.bak"

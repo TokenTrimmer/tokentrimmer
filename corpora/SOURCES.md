@@ -5,16 +5,31 @@ The FP corpus has two tiers:
 1. **`corpora/samples/`** — authored-in-repo idiomatic samples (always present,
    license-clean, runnable in CI today). See `corpora/README.md`.
 2. **`corpora/vendor/<name>/`** — *real* permissively-licensed OSS slices,
-   fetched reproducibly with `scripts/vendor-corpora.sh`. Empty until vendored
-   (fetching needs network), which is why it isn't committed by default.
+   fetched reproducibly with `scripts/vendor-corpora.sh`. This tier **is
+   populated and committed** — see "Vendored slices (committed)" below.
 
 ## Why generic + pinned
 
 Upstream repos restructure. Rather than hardcode paths that bitrot, the vendor
-script takes the repo, a **pinned commit SHA**, and a glob. SHAs are pinned by
-whoever runs the fetch (with network) — this file does **not** invent SHAs.
-The script records the resolved commit in `corpora/vendor/<name>/.source` and
-copies the upstream `LICENSE` so provenance + licence travel with the code.
+script takes the repo, a **pinned commit SHA**, and a glob. `vendor-corpora.sh`
+**requires a full 40-hex SHA** (it rejects branch names / `HEAD`) and asserts the
+checked-out commit equals it, so the fetch is reproducible. The script records
+the pinned commit in `corpora/vendor/<name>/.source` and copies the upstream
+`LICENSE` so provenance + licence travel with the code.
+
+## Vendored slices (committed)
+
+Each was vendored at the pinned commit below; the upstream `LICENSE` is captured
+alongside in the slice directory.
+
+| name | pinned commit | glob |
+|---|---|---|
+| `openai-python`        | `09ece2ee0aa73077d04ac3669d101120076b52fb` | `examples/*.py` |
+| `openai-cookbook`      | `42bc4ed33a2d1ee308c1f614c073f1b5f760061b` | `examples/*.py` |
+| `anthropic-sdk-python` | `ddd43b7ceb79f433dfafe488d95f48c22801186b` | `examples/*.py` |
+| `vercel-ai`            | `ab6d66482d31afe15f4973a51c5f7cfa09c92ea6` | `examples/*.ts` |
+
+`langchain` (below) is curated but **not yet vendored**.
 
 ## Curated sources
 
