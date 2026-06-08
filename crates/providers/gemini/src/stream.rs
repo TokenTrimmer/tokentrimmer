@@ -24,7 +24,7 @@ use std::pin::Pin;
 use tt_shared::{
     filter_extra_headers,
     messages::{ChunkChoice, ChunkDelta, ToolCall, ToolCallFunction},
-    ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext, Usage,
+    ChatCompletionChunk, ChatCompletionRequest, ProviderError, RequestContext,
 };
 use uuid::Uuid;
 
@@ -248,7 +248,14 @@ fn process_sse_event(
 
     let mut outcomes = Vec::new();
 
-    for candidate in event.candidates {
+    for (idx, candidate) in event.candidates.into_iter().enumerate() {
+        if idx > 0 {
+            tracing::debug!(
+                "gemini stream: ignoring extra candidate #{idx} — this gateway is \
+                 single-candidate (n>1 is dropped for Gemini)"
+            );
+            continue;
+        }
         let has_finish_reason = candidate.finish_reason.is_some();
         let finish_reason = candidate
             .finish_reason
@@ -315,13 +322,10 @@ fn process_sse_event(
         // Emit content/tool_call chunk if there is content.
         if text_content.is_some() || !tool_calls.is_empty() {
             let usage = if has_finish_reason {
-                event.usage_metadata.as_ref().map(|u| Usage {
-                    prompt_tokens: u.prompt_token_count,
-                    completion_tokens: u.candidates_token_count,
-                    total_tokens: u.total_token_count,
-                    cached_tokens: u.cached_content_token_count,
-                    cache_creation_input_tokens: None,
-                })
+                event
+                    .usage_metadata
+                    .as_ref()
+                    .map(|u| translate::translate_usage(u.clone()))
             } else {
                 None
             };
@@ -344,13 +348,10 @@ fn process_sse_event(
             }));
         } else if has_finish_reason {
             // Final chunk with finish_reason but no content.
-            let usage = event.usage_metadata.as_ref().map(|u| Usage {
-                prompt_tokens: u.prompt_token_count,
-                completion_tokens: u.candidates_token_count,
-                total_tokens: u.total_token_count,
-                cached_tokens: u.cached_content_token_count,
-                cache_creation_input_tokens: None,
-            });
+            let usage = event
+                .usage_metadata
+                .as_ref()
+                .map(|u| translate::translate_usage(u.clone()));
 
             outcomes.push(SseOutcome::Chunk(ChatCompletionChunk {
                 id: stream_id.to_string(),
@@ -491,5 +492,19 @@ mod tests {
             2,
             "no-space data: prefix should parse the same as data: with space"
         );
+    }
+
+    #[test]
+    fn process_sse_event_ignores_extra_candidates() {
+        let event = b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"first\"}]},\"index\":0},{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"second\"}]},\"index\":1}]}\n\n";
+        let mut first = false;
+        let outcomes = process_sse_event(event, "id", 0, "gemini-3.1-pro", &mut first);
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            SseOutcome::Chunk(c) => {
+                assert_eq!(c.choices[0].delta.content.as_deref(), Some("first"))
+            }
+            _ => panic!("expected one content chunk"),
+        }
     }
 }

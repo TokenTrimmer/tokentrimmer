@@ -161,6 +161,15 @@ impl Provider for LocalProvider {
         })
     }
 
+    fn dropped_params(&self, req: &tt_shared::ChatCompletionRequest) -> Vec<String> {
+        // Strip the backend prefix first so the inner sees the same model id it
+        // dispatches (chat_completion strips it too) — otherwise a prefixed
+        // reasoning model wouldn't report its dropped params.
+        let mut req = req.clone();
+        req.model = strip_backend_prefix(self.backend, &req.model);
+        self.inner.dropped_params(&req)
+    }
+
     async fn chat_completion(
         &self,
         mut req: ChatCompletionRequest,

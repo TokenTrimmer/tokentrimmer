@@ -301,7 +301,7 @@ pub struct GeminiCandidate {
 }
 
 /// Token usage from the Gemini API.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct GeminiUsageMetadata {
     /// Input tokens consumed.
     #[serde(rename = "promptTokenCount", default)]
@@ -782,13 +782,75 @@ pub fn map_finish_reason(reason: &str) -> &'static str {
 
 /// Convert [`GeminiUsageMetadata`] into canonical [`Usage`].
 pub fn translate_usage(u: GeminiUsageMetadata) -> Usage {
+    let prompt = u.prompt_token_count;
+    let mut completion = u.candidates_token_count;
+    let mut total = u.total_token_count;
+    // Gemini can omit candidatesTokenCount/totalTokenCount on partial responses.
+    // Fill in a zero field when the other two allow deriving it. We TRUST a
+    // provided non-zero `total` (Gemini's totalTokenCount can legitimately exceed
+    // prompt+completion — it includes system/cached tokens) and never recompute
+    // or reduce it; this only closes gaps so a 0 doesn't skew compute_cost.
+    if completion == 0 && total > prompt {
+        completion = total - prompt;
+    }
+    if total == 0 {
+        total = prompt + completion;
+    }
     Usage {
-        prompt_tokens: u.prompt_token_count,
-        completion_tokens: u.candidates_token_count,
-        total_tokens: u.total_token_count,
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
         cached_tokens: u.cached_content_token_count,
         cache_creation_input_tokens: None,
     }
 }
 
 // Unit tests live in tests/translate.rs (snapshot tests cover all translation paths).
+
+#[cfg(test)]
+mod tests {
+    use super::GeminiUsageMetadata;
+
+    #[test]
+    fn translate_usage_reconciles_partial_metadata() {
+        let u = super::translate_usage(GeminiUsageMetadata {
+            prompt_token_count: 10,
+            candidates_token_count: 0,
+            total_token_count: 25,
+            cached_content_token_count: 0,
+        });
+        assert_eq!(u.completion_tokens, 15);
+        assert_eq!(u.total_tokens, 25);
+        let u = super::translate_usage(GeminiUsageMetadata {
+            prompt_token_count: 10,
+            candidates_token_count: 5,
+            total_token_count: 0,
+            cached_content_token_count: 0,
+        });
+        assert_eq!(u.total_tokens, 15);
+        let u = super::translate_usage(GeminiUsageMetadata {
+            prompt_token_count: 10,
+            candidates_token_count: 5,
+            total_token_count: 15,
+            cached_content_token_count: 2,
+        });
+        assert_eq!(
+            (
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.total_tokens,
+                u.cached_tokens
+            ),
+            (10, 5, 15, 2)
+        );
+        // All non-zero but total != prompt+completion: trust the provider's
+        // total (it can include system/cached tokens); do NOT recompute/reduce.
+        let u = super::translate_usage(GeminiUsageMetadata {
+            prompt_token_count: 10,
+            candidates_token_count: 5,
+            total_token_count: 100,
+            cached_content_token_count: 0,
+        });
+        assert_eq!((u.completion_tokens, u.total_tokens), (5, 100));
+    }
+}

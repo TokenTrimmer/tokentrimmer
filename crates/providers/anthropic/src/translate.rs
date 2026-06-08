@@ -290,7 +290,9 @@ pub fn translate_request(
     // Apply auto cache_control to the last system block if it is long enough.
     // Heuristic: 1 token ≈ 4 characters.
     if let Some(last) = system_blocks.last_mut() {
-        let estimated_tokens = last.text.len() / 4;
+        // char count, not byte len: multibyte (CJK) over-counts bytes and could
+        // push a sub-1024-token block over the gate, which Anthropic 400s.
+        let estimated_tokens = last.text.chars().count() / 4;
         if estimated_tokens >= 1024 {
             last.cache_control = Some(AnthropicCacheControl {
                 ctype: "ephemeral".to_string(),
@@ -729,5 +731,27 @@ mod tests {
         assert_eq!(usage.total_tokens, 250);
         assert_eq!(usage.cached_tokens, 80);
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
+    }
+
+    #[test]
+    fn cache_control_uses_char_count_not_bytes() {
+        use tt_shared::messages::{Message, MessageContent};
+        let mut req = base_request("claude-sonnet-4-6");
+        req.messages = vec![Message::System {
+            content: MessageContent::Text("中".repeat(1400)),
+        }];
+        let body = translate_request(req).expect("translate ok");
+        let sys = body.system.expect("system blocks present");
+        assert!(
+            sys.last().unwrap().cache_control.is_none(),
+            "must not cache a sub-1024-token block"
+        );
+
+        let mut req = base_request("claude-sonnet-4-6");
+        req.messages = vec![Message::System {
+            content: MessageContent::Text("a".repeat(4096)),
+        }];
+        let body = translate_request(req).expect("translate ok");
+        assert!(body.system.unwrap().last().unwrap().cache_control.is_some());
     }
 }
