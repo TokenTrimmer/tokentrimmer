@@ -33,11 +33,11 @@ Fix: replace the single entry with patterns that match the real key shapes and a
 ("Anthropic API key", r"sk-ant-[A-Za-z0-9_-]{32,}"),
 // OpenAI project/service-account keys (modern): sk-proj-…, sk-svcacct-…, sk-admin-…
 ("OpenAI API key (scoped)", r"sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}"),
-// Legacy bare OpenAI key: sk- + 48 base62 chars (the historical T3BlbkFJ form is 48).
-("OpenAI API key (legacy)", r"sk-[A-Za-z0-9]{48}"),
+// Legacy bare OpenAI key: sk- + 32+ base62 chars (real legacy keys are 48).
+("OpenAI API key (legacy)", r"sk-[A-Za-z0-9]{32,}"),
 ("Stripe live secret key", r"sk_live_[A-Za-z0-9]{20,}"),
 ```
-Rationale: legacy bare keys are exactly 48 chars after `sk-`; requiring `{48}` (not `{20,}`) removes the broad false-positive class while still catching real legacy keys. Scoped keys get their own anchored prefixes. (`sk-ant-` stays first so Anthropic keys aren't mislabeled — but the scoped/legacy OpenAI patterns won't match `sk-ant-…` anyway since `ant` isn't in the alternation and the legacy `{48}` is exact-length.)
+Rationale: raising the legacy floor from `{20,}` to `{32,}` cuts the broad false-positive class (random `sk-`+20 strings) while still catching real legacy keys (48 chars) and the existing should-detect fixture (39 chars — an exact `{48}` was too strict and broke it). Scoped keys get their own anchored prefixes. (`sk-ant-` stays first so Anthropic keys aren't mislabeled — but the scoped/legacy OpenAI patterns won't match `sk-ant-…` anyway since `ant` isn't in the alternation and the legacy `{48}` is exact-length.)
 
 ### 3a.3 `inspect_diff` temp-file extension + swallowed errors (`mcp/src/tools/inspect_diff.rs:38-55`)
 Current: caller-controlled `file_path` extension flows raw into the temp-file suffix (`format!(".{ext}")`); engine scan result returned with no error surfacing.
