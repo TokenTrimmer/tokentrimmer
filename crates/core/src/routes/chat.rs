@@ -880,6 +880,9 @@ pub async fn handler(
             }
         })
         .await;
+        // Attributed to the primary provider: the request deadline spans any
+        // failover loop, so the in-flight candidate at timeout isn't known here
+        // without threading it out of dispatch_stream_with_failover.
         if matches!(__stream_outcome, Err(ApiError::RequestTimeout { .. })) {
             crate::metrics::record_provider_timeout(__primary, "chat_stream");
         }
@@ -1255,6 +1258,9 @@ pub async fn handler(
         })
         .await;
 
+        // Attributed to the primary provider: the request deadline spans any
+        // failover loop, so the in-flight candidate at timeout isn't known here
+        // without threading it out of dispatch_with_failover.
         if matches!(dispatch_result, Err(ApiError::RequestTimeout { .. })) {
             crate::metrics::record_provider_timeout(__primary, "chat");
         }
