@@ -106,6 +106,15 @@ In self-hosted mode, provider credentials come from environment variables by def
 
 Local providers (Ollama, vLLM, LM Studio) don't require keys.
 
+### 2.4 Security: custom provider URLs & headers
+
+When a caller supplies a custom provider `base_url` and/or `extra_headers` (pass-through / BYOK setups), the gateway validates them before dispatching any request, to prevent SSRF and header injection:
+
+- **URL guard** — the `base_url` must be `https` (or `http` only when local providers are explicitly allowed). The gateway rejects hosts that resolve to loopback, private (`10/8`, `172.16/12`, `192.168/16`), link-local (`169.254/16`), unique-local IPv6 (`fc00::/7`), CGNAT (`100.64/10`), the `0.0.0.0/8` block, and cloud-metadata addresses (`169.254.169.254`, `100.100.100.200`), as well as `localhost`, `*.local`, and `metadata.google.internal`. IPv4-mapped IPv6 is unwrapped and re-checked. A best-effort DNS resolution rejects the URL if **any** resolved address is private.
+- **Header filter** — `extra_headers` are stripped of any name that could override gateway-set auth/routing or inject hop-by-hop headers: `authorization`, `x-api-key`, `anthropic-version`, `content-type`, `host`, and the hop-by-hop set (`connection`, `proxy-authorization`, `transfer-encoding`, `upgrade`, `te`, `trailer`, `keep-alive`, `proxy-connection`).
+
+**Limitation (operators):** the DNS check is defense-in-depth and is subject to a TOCTOU/DNS-rebinding race — a malicious resolver can return a safe address at validation time and a private one at connect time. Connect-time enforcement is out of scope for the gateway. Operators handling untrusted `base_url` values should additionally run the gateway behind a network policy that blocks outbound connections to RFC-1918 / metadata ranges.
+
 ---
 
 ## 3. Chat completions
@@ -501,7 +510,7 @@ X-TokenTrimmer-RateLimit-Reset: 1716598234
 
 ### 7.3 Upstream provider errors
 
-When the upstream provider returns an error, Gateway preserves the upstream message in the `error.message` field and adds metadata:
+When the upstream provider returns an error, Gateway preserves the upstream message in `error.message`. The error envelope is the flat OpenAI-compatible shape — `message`, `type`, `code`, and optional `param`:
 
 ```json
 {
@@ -509,16 +518,14 @@ When the upstream provider returns an error, Gateway preserves the upstream mess
     "message": "Anthropic API: max_tokens cannot exceed 8192 for this model",
     "type": "upstream_invalid_request",
     "code": "anthropic_max_tokens_exceeded",
-    "param": "max_tokens",
-    "tokentrimmer": {
-      "provider": "anthropic",
-      "upstream_status": 400,
-      "fallback_attempted": false,
-      "trace_id": "5f3a1c..."
-    }
+    "param": "max_tokens"
   }
 }
 ```
+
+The request's trace id is returned on the **`X-TokenTrimmer-Trace-Id`** response header (not in the body).
+
+> **Planned (not yet honored):** an enriched `error.tokentrimmer` object carrying `provider`, `upstream_status`, `fallback_attempted`, and `trace_id` is on the roadmap but is **not emitted today** — do not depend on it. The body currently contains only the four fields above.
 
 ---
 
@@ -536,6 +543,8 @@ Useful for CI, integration tests, and SDK development.
 ---
 
 ## 9. Webhooks (hosted only)
+
+> **Planned (not yet honored):** customer event-webhook delivery is **not yet implemented** in the gateway. The event types, payload shape, and signing scheme below describe the intended design — do not build against them yet. (The only webhooks the gateway processes today are internal Stripe tier-change events, which are unrelated to this customer-facing delivery system.)
 
 Gateway can deliver event webhooks to a customer URL. Configured per org.
 
@@ -583,18 +592,25 @@ HMAC signature uses webhook secret configured per endpoint. Retries: exponential
 
 ---
 
-## 10. Configuration API (hosted only)
+## 10. Configuration API
 
-For programmatic management of routes, cache settings, and other configuration.
+There are **two distinct surfaces**, depending on deployment:
 
-### 10.1 List routes
+| Surface | Base path | Methods | Where |
+|---------|-----------|---------|-------|
+| **Hosted (cloud) admin API** | `/v1/admin/*` | GET/POST/PATCH/DELETE + plans/inspect/usage/invoices | TokenTrimmer Cloud only |
+| **Self-hosted gateway routes API** | `/v1/routes` | GET, POST, DELETE (no PATCH) | the open-source gateway binary |
+
+Sections 10.1–10.6 document the **hosted admin API**. Self-hosted operators use the routes API in §10.7.
+
+### 10.1 List routes (hosted)
 
 ```
 GET /v1/admin/routes
 Authorization: Bearer tt_live_*
 ```
 
-### 10.2 Create route
+### 10.2 Create route (hosted)
 
 ```
 POST /v1/admin/routes
@@ -665,7 +681,7 @@ GET /v1/admin/inspect/runs/:id
 → Status + findings
 ```
 
-### 10.6 Usage and billing
+### 10.6 Usage and billing (hosted)
 
 ```
 GET /v1/admin/usage?from=2026-05-01&to=2026-05-31
@@ -674,6 +690,19 @@ GET /v1/admin/usage?from=2026-05-01&to=2026-05-31
 GET /v1/admin/invoices
 → List of Stripe invoices
 ```
+
+### 10.7 Self-hosted gateway routes API
+
+The open-source gateway binary serves a routes API at `/v1/routes` (note: **no `/admin/` prefix**). It supports list, create, get, and delete — there is **no PATCH/update** handler; to change a route, delete and re-create it.
+
+```
+GET    /v1/routes          → list all routes
+POST   /v1/routes          → create a route (body identical to §10.2)
+GET    /v1/routes/:id      → fetch one route
+DELETE /v1/routes/:id      → delete a route
+```
+
+> **Planned (not yet honored):** in-place `PATCH /v1/routes/:id` update, and the hosted-only `/v1/admin/plans|inspect|usage|invoices` surfaces, are not served by the self-hosted binary.
 
 ---
 
@@ -765,7 +794,9 @@ Cache hits "fake-streamed" to maintain client-side streaming UX.
 
 ## 15. Versioning
 
-Gateway versions follow semver. Customers can pin to a specific version via:
+Gateway versions follow semver.
+
+> **Planned (not yet honored):** per-request version pinning via an `X-TokenTrimmer-Version` header is **not yet implemented** — the gateway does not read this header today. The form below describes the intended design.
 
 ```
 POST /v1/chat/completions
@@ -809,8 +840,8 @@ Major version bumps (v2) imply breaking changes and run on a separate base URL (
 
 Self-hosted Gateway has all the above with these differences:
 
-- No `/v1/admin/*` API surface (config managed via YAML files only in v1; admin API in v2)
-- No webhooks (v2)
+- No `/v1/admin/*` admin API (that surface is hosted/cloud only). The self-hosted binary **does** serve a routes API at `/v1/routes` (GET/POST/DELETE — see §10.7); routes can also be seeded from YAML config.
+- No customer event webhooks (Planned — see §9)
 - No usage tracking beyond local Postgres
 - Test keys (`tt_test_*`) work the same way
 - Provider credentials from env vars or config file, not from a stored DB
@@ -954,7 +985,7 @@ Just the base URL and API key. Existing OpenAI SDK code works as-is. TokenTrimme
 If your route has a fallback chain configured, Gateway tries each fallback in order. If no fallback or all fallbacks fail, Gateway returns a 502 with the upstream error preserved.
 
 **Q: How is cost calculated?**
-Tokens used × per-model pricing from our daily-refreshed pricing table. Reported in `X-TokenTrimmer-Cost-Usd` and reconciled against actual provider invoices monthly.
+Tokens used × per-model pricing from our curated pricing table (a snapshot embedded at build time and refreshed on each release, not auto-refreshed). Reported in `X-TokenTrimmer-Cost-Usd` and reconciled against actual provider invoices monthly.
 
 **Q: Does Gateway log my prompts?**
 No, not by default. Only request metadata (token counts, model, route, latency). Opt-in per API key if you want raw body logging for Plan quality analysis.

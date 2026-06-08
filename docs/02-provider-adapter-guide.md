@@ -61,21 +61,60 @@ pub trait Provider: Send + Sync {
         ctx: &RequestContext,
     ) -> Result<EmbeddingsResponse, ProviderError>;
 
-    /// Per-model pricing lookup.
-    /// Used for cost computation. Cached, refreshed daily.
+    /// Per-model pricing lookup. Drawn from the manually-curated
+    /// `data/pricing.toml` snapshot embedded at build time — rates are updated
+    /// by hand, not automatically. Returns `None` only when the model is absent.
     fn pricing(&self, model: &str) -> Option<ModelPricing>;
 
     /// List of model identifiers this provider serves.
     /// Used for routing validation and pricing table generation.
     fn models(&self) -> Vec<ModelInfo>;
 
-    /// Provider health check.
-    /// Default implementation hits the provider's models endpoint.
+    // --- default-method hooks (override only when the provider needs it) ---
+
+    /// Cost multiplier for a provider surcharge on top of the model cost (e.g.
+    /// OpenRouter's 5% BYOK fee). Default `1.0` (no surcharge).
+    fn fee_multiplier(&self) -> f64 {
+        1.0
+    }
+
+    /// Names of request params this adapter **silently drops** for `req`
+    /// because the upstream rejects them. The gateway surfaces each as
+    /// `X-TokenTrimmer-Warnings: param_dropped:<name>`. Default: nothing dropped.
+    fn dropped_params(&self, _req: &ChatCompletionRequest) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Whether this provider honors `response_format: json_schema`. Default
+    /// `true` (forward verbatim). Override `false` for a `json_object`-only
+    /// provider — the gateway then downgrades with a `response_format_downgrade`
+    /// warning.
+    fn supports_response_schema(&self) -> bool {
+        true
+    }
+
+    /// Accepted `temperature` range `(min, max)`. The gateway clamps an
+    /// out-of-range value to this and emits `temperature_clamped`. Default
+    /// `(0.0, 2.0)` (the widest common range). Override only with a narrower
+    /// range you are confident is correct.
+    fn temperature_range(&self) -> (f32, f32) {
+        (0.0, 2.0)
+    }
+
+    /// Provider liveness check. The default is a no-op `Ok(())` — it should NOT
+    /// call the provider's pricey endpoints. Override for a real ping.
     async fn health_check(&self) -> Result<(), ProviderError> {
         Ok(())
     }
 }
 ```
+
+The four default-method hooks above (`fee_multiplier`, `dropped_params`,
+`supports_response_schema`, `temperature_range`) drive behaviors described
+elsewhere in this guide — the `param_dropped` warnings, `response_format`
+downgrade, temperature clamping, and the BYOK fee surcharge. A new adapter that
+forgets to override them inherits the defaults silently, so review them when
+adding a provider (see §6).
 
 ### Supporting types (shared)
 
@@ -158,6 +197,8 @@ pub struct ModelPricing {
 }
 ```
 
+> **Security — customer-supplied `base_url` / `extra_headers`:** these are untrusted in pass-through/BYOK mode and are validated by `crates/shared/src/url_guard.rs` before any request is dispatched. `validate_provider_url` rejects loopback/private/link-local/ULA/CGNAT/cloud-metadata hosts (https-only unless local providers are allowed, plus a best-effort DNS check), and `filter_extra_headers` strips headers that could override gateway auth/routing or inject hop-by-hop headers (`authorization`, `x-api-key`, `host`, `content-type`, `anthropic-version`, and the hop-by-hop set). The DNS check is defense-in-depth only (DNS-rebind/TOCTOU is out of scope — operators should add a network policy). See API reference §2.4. New adapters get this for free via the shared OpenAI-compatible base; do not bypass it.
+
 ### Error type
 
 ```rust
@@ -199,13 +240,16 @@ pub enum ProviderError {
 impl ProviderError {
     /// Whether the request should be retried (with backoff) on this error.
     pub fn is_retriable(&self) -> bool {
-        matches!(
-            self,
-            ProviderError::RateLimited { .. }
-                | ProviderError::Timeout { .. }
-                | ProviderError::Network(_)
-                | ProviderError::ProviderUpstream { status, .. } if *status >= 500
-        )
+        // Use `match` (not `matches!`): the `status >= 500` guard binds only in
+        // the arm where `status` is in scope — a guard in `matches!` cannot span
+        // multiple `|` alternatives.
+        match self {
+            ProviderError::RateLimited { .. } => true,
+            ProviderError::Timeout { .. } => true,
+            ProviderError::Network(_) => true,
+            ProviderError::ProviderUpstream { status, .. } => *status >= 500,
+            _ => false,
+        }
     }
 }
 ```
@@ -646,7 +690,7 @@ pub fn pricing_for(model: &str) -> Option<ModelPricing> {
 }
 ```
 
-Pricing tables should be regenerable from a config URL refreshed daily, so price updates don't require a binary release.
+Pricing is a manually-curated snapshot in `data/pricing.toml`, embedded at build time and refreshed on release cadence (not auto-refreshed). Each entry carries an `effective_at` timestamp so historical telemetry replays against the rate that was in effect. Auto-refresh from a config URL is a possible future improvement, but today a price update means editing `data/pricing.toml` and cutting a release.
 
 ---
 
@@ -705,6 +749,7 @@ When you're adding a new provider, work through this list:
 - [ ] Create `crates/providers/<name>/` with `Cargo.toml` and `src/lib.rs`
 - [ ] Add to workspace `Cargo.toml`
 - [ ] Implement `Provider` trait
+- [ ] Review the default-method hooks and override any the provider needs: `dropped_params` (params the upstream rejects → `param_dropped` warnings), `supports_response_schema` (set `false` for `json_object`-only providers), `temperature_range` (narrower than `(0.0, 2.0)` only if certain), `fee_multiplier` (BYOK/surcharge)
 - [ ] Implement `translate_request` (OpenAI → provider format)
 - [ ] Implement `translate_response` (provider → OpenAI format)
 - [ ] Implement streaming translation
