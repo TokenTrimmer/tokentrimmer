@@ -33,6 +33,7 @@ tt-tokenize.workspace = true
 tt-client.workspace = true
 reqwest.workspace = true
 regex.workspace = true
+percent-encoding.workspace = true
 
 axum.workspace = true
 clap.workspace = true

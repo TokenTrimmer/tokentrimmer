@@ -99,6 +99,8 @@ rstest = "0.23"
 tempfile = "3"
 criterion = { version = "0.5", default-features = false }
 
+percent-encoding = "2"
+
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 

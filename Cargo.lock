@@ -5134,6 +5134,7 @@ dependencies = [
  "include_dir",
  "indicatif",
  "insta",
+ "percent-encoding",
  "regex",
  "reqwest",
  "rustyline",
