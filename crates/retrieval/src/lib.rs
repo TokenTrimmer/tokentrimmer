@@ -17,3 +17,14 @@ pub use error::RetrievalError;
 pub use store::RetrievalStore;
 pub use substitute::{substitute_in_messages, SubstitutionReport, DEFAULT_MIN_SIMILARITY};
 pub use types::{Chunk, Corpus, Document, RetrievableTag, RetrievalResult};
+
+/// True if every component is finite (no NaN/Inf). A non-finite embedding makes
+/// cosine distance NaN and corrupts top-k ranking, so it is rejected at the
+/// embed chokepoint and at store insert (mirrors the L2 cache guard).
+///
+/// Note: an empty slice is vacuously finite (`true`). Emptiness is a separate
+/// concern — the pgvector `vector(1536)` column rejects a zero-dim insert with a
+/// `Store` error; this guard only screens NaN/Inf.
+pub(crate) fn embedding_is_finite(v: &[f32]) -> bool {
+    v.iter().all(|x| x.is_finite())
+}

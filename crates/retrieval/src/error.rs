@@ -10,4 +10,6 @@ pub enum RetrievalError {
     Tag(String),
     #[error("malformed: {0}")]
     Malformed(String),
+    #[error("non-finite embedding (NaN/Inf)")]
+    InvalidEmbedding,
 }

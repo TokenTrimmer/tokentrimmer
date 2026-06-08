@@ -311,6 +311,7 @@ pub async fn maybe_substitute(
                 tt_retrieval::RetrievalError::Store(_) => "store-error",
                 tt_retrieval::RetrievalError::Tag(_) => "tag-parse-error",
                 tt_retrieval::RetrievalError::Malformed(_) => "malformed",
+                tt_retrieval::RetrievalError::InvalidEmbedding => "invalid-embedding",
             };
             if let Ok(v) = HeaderValue::from_str(kind) {
                 resp.headers_mut().insert("x-tt-retrieval-error", v);
