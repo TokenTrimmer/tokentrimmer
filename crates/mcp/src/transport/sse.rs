@@ -44,8 +44,12 @@ struct AppState {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Boot the SSE MCP server on `addr`. Runs until shutdown signal (SIGINT/SIGTERM).
-pub async fn run(server: Server, addr: SocketAddr) -> Result<(), McpError> {
+/// 1 MiB cap on POST /messages bodies (GET /sse has none).
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Boot the SSE MCP server on `addr`. Requires `Authorization: Bearer <auth_token>`
+/// and a loopback Host/Origin on every request. Runs until SIGINT/SIGTERM.
+pub async fn run(server: Server, addr: SocketAddr, auth_token: String) -> Result<(), McpError> {
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         server: Arc::new(server),
@@ -54,13 +58,18 @@ pub async fn run(server: Server, addr: SocketAddr) -> Result<(), McpError> {
     let app = axum::Router::new()
         .route("/sse", get(sse_handler))
         .route("/messages", post(messages_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::<str>::from(auth_token.as_str()),
+            guard,
+        ));
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| McpError::Internal(format!("bind {addr}: {e}")))?;
 
-    tracing::info!(addr = %addr, "MCP SSE server listening");
+    tracing::info!(addr = %addr, "MCP SSE server listening (bearer-auth, loopback-only)");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -68,6 +77,77 @@ pub async fn run(server: Server, addr: SocketAddr) -> Result<(), McpError> {
         .map_err(|e| McpError::Internal(format!("SSE server: {e}")))?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Auth + DNS-rebind guard middleware
+// ---------------------------------------------------------------------------
+
+/// Reject any request lacking a valid bearer token or arriving with a non-loopback
+/// Host/Origin (DNS-rebind defense). Runs before body read + dispatch.
+async fn guard(
+    axum::extract::State(token): axum::extract::State<std::sync::Arc<str>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    let headers = req.headers();
+
+    if !host_is_local(headers.get(header::HOST)) {
+        return (StatusCode::FORBIDDEN, "non-local Host").into_response();
+    }
+    if !origin_is_local_or_absent(headers.get(header::ORIGIN)) {
+        return (StatusCode::FORBIDDEN, "cross-origin").into_response();
+    }
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    if !presented.is_some_and(|p| ct_eq(p.as_bytes(), token.as_bytes())) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    next.run(req).await
+}
+
+/// Constant-time byte compare (length mismatch returns early — token length is
+/// not sensitive). Mirrors the cloud `constant_time_eq`.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Host header host-part is loopback (ignoring port). Missing Host → false.
+fn host_is_local(h: Option<&axum::http::HeaderValue>) -> bool {
+    h.and_then(|v| v.to_str().ok())
+        .is_some_and(is_local_authority)
+}
+
+/// Origin absent (non-browser MCP clients) or its host is loopback.
+fn origin_is_local_or_absent(h: Option<&axum::http::HeaderValue>) -> bool {
+    match h.and_then(|v| v.to_str().ok()) {
+        None => true,
+        Some("null") => true,
+        Some(s) => s
+            .strip_prefix("http://")
+            .or_else(|| s.strip_prefix("https://"))
+            .is_some_and(is_local_authority),
+    }
+}
+
+/// Host-part (strip a trailing `:port`) is 127.0.0.1 / localhost / ::1.
+fn is_local_authority(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("") // IPv6 "[::1]:port" → "::1"
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 // ---------------------------------------------------------------------------

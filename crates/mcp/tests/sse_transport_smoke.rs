@@ -11,6 +11,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tt_mcp::Server;
 
+const TOKEN: &str = "tt_test_smoke_token";
+
 // ---------------------------------------------------------------------------
 // Helper: spawn the SSE server in a background task on an ephemeral port.
 // Returns (bound_addr, task_handle).  Cancel by aborting the handle.
@@ -30,7 +32,7 @@ async fn spawn_sse_server() -> (SocketAddr, JoinHandle<()>) {
 
     let handle = tokio::spawn(async move {
         server
-            .run_sse(addr)
+            .run_sse(addr, TOKEN.to_string())
             .await
             .expect("SSE server exited with error");
     });
@@ -95,6 +97,7 @@ async fn sse_transport_tools_list_round_trip() {
     let mut sse_stream = client
         .get(format!("{base}/sse"))
         .header("Accept", "text/event-stream")
+        .header("Authorization", format!("Bearer {TOKEN}"))
         .send()
         .await
         .expect("GET /sse failed")
@@ -164,6 +167,7 @@ async fn sse_transport_tools_list_round_trip() {
 
     let post_resp = client
         .post(&post_url)
+        .header("Authorization", format!("Bearer {TOKEN}"))
         .json(&rpc_body)
         .send()
         .await
@@ -249,6 +253,7 @@ async fn post_unknown_session_returns_404() {
 
     let resp = client
         .post(&url)
+        .header("Authorization", format!("Bearer {TOKEN}"))
         .json(&rpc_body)
         .send()
         .await
@@ -256,6 +261,87 @@ async fn post_unknown_session_returns_404() {
 
     assert_eq!(resp.status(), 404, "unknown sessionId must return 404");
 
+    server_handle.abort();
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn sse_without_bearer_is_401() {
+    let (addr, server_handle) = spawn_sse_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("http://{addr}/sse"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .expect("GET /sse");
+    assert_eq!(resp.status(), 401, "no bearer → 401");
+    server_handle.abort();
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn messages_with_wrong_bearer_is_401() {
+    let (addr, server_handle) = spawn_sse_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/messages?sessionId={}", uuid::Uuid::new_v4());
+    let resp = client
+        .post(&url)
+        .header("Authorization", "Bearer wrong")
+        .json(&serde_json::json!({"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}))
+        .send()
+        .await
+        .expect("POST /messages");
+    assert_eq!(resp.status(), 401, "wrong bearer → 401");
+    server_handle.abort();
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn non_local_host_is_403() {
+    let (addr, server_handle) = spawn_sse_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("http://{addr}/sse"))
+        .header("Accept", "text/event-stream")
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("host", "evil.example.com")
+        .send()
+        .await
+        .expect("GET /sse");
+    assert_eq!(resp.status(), 403, "non-local Host → 403");
+    server_handle.abort();
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn oversized_body_is_413() {
+    let (addr, server_handle) = spawn_sse_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/messages?sessionId={}", uuid::Uuid::new_v4());
+    let big = "A".repeat(2 * 1024 * 1024);
+    let body =
+        serde_json::json!({"jsonrpc":"2.0","method":"tools/list","params":{"pad": big},"id":1});
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /messages");
+    assert_eq!(resp.status(), 413, "oversized body → 413");
     server_handle.abort();
     let _ = server_handle.await;
 }
