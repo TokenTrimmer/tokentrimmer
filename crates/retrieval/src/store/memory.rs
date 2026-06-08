@@ -46,6 +46,9 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[async_trait::async_trait]
 impl RetrievalStore for MemoryStore {
     async fn insert(&self, chunk: Chunk) -> Result<(), RetrievalError> {
+        if !crate::embedding_is_finite(&chunk.embedding) {
+            return Err(RetrievalError::InvalidEmbedding);
+        }
         self.chunks.lock().unwrap().push(chunk);
         Ok(())
     }
@@ -169,5 +172,18 @@ mod tests {
         let r = s.search(o, "x", &[1.0, 0.0], 10, "m-a").await.unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].text, "from-a");
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_non_finite_embedding() {
+        let s = MemoryStore::new();
+        let o = Uuid::new_v4();
+        let err = s
+            .insert(chunk(o, "x", vec![f32::NAN], "bad", "m"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RetrievalError::InvalidEmbedding));
+        // A finite embedding still inserts.
+        s.insert(chunk(o, "x", vec![1.0], "ok", "m")).await.unwrap();
     }
 }

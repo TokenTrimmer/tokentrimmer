@@ -57,12 +57,16 @@ impl EmbeddingClient {
             .json()
             .await
             .map_err(|e| RetrievalError::Embedding(e.to_string()))?;
-        parsed
+        let embedding = parsed
             .data
             .into_iter()
             .next()
             .map(|e| e.embedding)
-            .ok_or_else(|| RetrievalError::Embedding("empty data".into()))
+            .ok_or_else(|| RetrievalError::Embedding("empty data".into()))?;
+        if !crate::embedding_is_finite(&embedding) {
+            return Err(RetrievalError::InvalidEmbedding);
+        }
+        Ok(embedding)
     }
 }
 
@@ -109,5 +113,29 @@ mod tests {
         };
         let err = c.embed("hi").await.unwrap_err();
         assert!(matches!(err, RetrievalError::Embedding(_)));
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_non_finite() {
+        // 1e308 is a valid JSON number (within f64 range) but exceeds f32::MAX
+        // (~3.4e38), so serde deserializes it to f32::INFINITY. This exercises
+        // the non-finite guard without using any out-of-range Rust literal.
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/embeddings");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"data":[{"embedding":[0.1,1e308,0.2]}]}"#);
+            })
+            .await;
+        let c = EmbeddingClient {
+            api_key: "k".into(),
+            base_url: server.base_url(),
+            model: "text-embedding-3-small".into(),
+            http: reqwest::Client::new(),
+        };
+        let err = c.embed("hi").await.unwrap_err();
+        assert!(matches!(err, RetrievalError::InvalidEmbedding));
     }
 }

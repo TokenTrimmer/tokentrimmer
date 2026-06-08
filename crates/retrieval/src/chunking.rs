@@ -1,7 +1,17 @@
 //! 512-token chunks with 64-token overlap. Tokenizer: tiktoken cl100k_base.
 
+use std::sync::OnceLock;
+use tiktoken_rs::CoreBPE;
+
 const CHUNK_SIZE: usize = 512;
 const OVERLAP: usize = 64;
+
+/// Process-wide cached cl100k BPE. `None` if it failed to load (then `chunk`
+/// falls back to a single whole-text chunk). Mirrors `tt-tokenize`.
+fn cl100k() -> Option<&'static CoreBPE> {
+    static BPE: OnceLock<Option<CoreBPE>> = OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok()).as_ref()
+}
 
 pub struct Chunk {
     pub text: String,
@@ -10,15 +20,12 @@ pub struct Chunk {
 }
 
 pub fn chunk(text: &str) -> Vec<Chunk> {
-    let bpe = match tiktoken_rs::cl100k_base() {
-        Ok(b) => b,
-        Err(_) => {
-            return vec![Chunk {
-                text: text.into(),
-                start_token: 0,
-                end_token: 0,
-            }]
-        }
+    let Some(bpe) = cl100k() else {
+        return vec![Chunk {
+            text: text.into(),
+            start_token: 0,
+            end_token: 0,
+        }];
     };
     let tokens = bpe.encode_with_special_tokens(text);
     if tokens.is_empty() {

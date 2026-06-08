@@ -45,6 +45,9 @@ fn store_err(e: impl std::fmt::Display) -> RetrievalError {
 #[async_trait::async_trait]
 impl RetrievalStore for PostgresStore {
     async fn insert(&self, chunk: Chunk) -> Result<(), RetrievalError> {
+        if !crate::embedding_is_finite(&chunk.embedding) {
+            return Err(RetrievalError::InvalidEmbedding);
+        }
         let embedding = pgvector::Vector::from(chunk.embedding);
         sqlx::query(
             r#"INSERT INTO retrieval_chunks
