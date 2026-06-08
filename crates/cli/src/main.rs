@@ -511,7 +511,7 @@ async fn main() -> anyhow::Result<()> {
                     tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
                         .build()?
-                        .block_on(server.run_sse(addr))?;
+                        .block_on(server.run_sse(addr, api_key))?;
                 }
                 other => {
                     anyhow::bail!("unsupported MCP transport `{other}` (supported: stdio, sse)")

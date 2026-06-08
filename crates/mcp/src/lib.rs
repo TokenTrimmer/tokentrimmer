@@ -23,7 +23,11 @@ impl Server {
     ///
     /// Binds to `addr` and serves `GET /sse` + `POST /messages?sessionId=…`
     /// until a shutdown signal is received.
-    pub async fn run_sse(self, addr: std::net::SocketAddr) -> Result<(), McpError> {
-        crate::transport::sse::run(self, addr).await
+    pub async fn run_sse(
+        self,
+        addr: std::net::SocketAddr,
+        auth_token: String,
+    ) -> Result<(), McpError> {
+        crate::transport::sse::run(self, addr, auth_token).await
     }
 }
