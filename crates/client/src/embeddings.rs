@@ -109,15 +109,13 @@ impl EmbedBuilder<'_> {
             dimensions: self.dimensions,
             encoding_format: self.encoding_format,
         };
-        let mut http_req = self
+        let http_req = self
             .client
             .http
             .post(format!("{}/v1/embeddings", self.client.base))
             .bearer_auth(&self.client.key)
             .json(&req);
-        if let Some(limit) = self.cost_limit {
-            http_req = http_req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
-        }
+        let http_req = crate::apply_tt_headers(http_req, None, self.cost_limit)?;
         let resp = http_req.send().await.map_err(Error::Request)?;
         let cost = parse_cost(resp.headers());
         let status = resp.status();
