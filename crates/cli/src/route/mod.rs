@@ -110,7 +110,10 @@ pub async fn run(
         .api_key_string()
         .context("no API key — run `tt login --token <KEY>` or set TT_API_KEY")?;
     let base = ctx.base_url.trim_end_matches('/').to_string();
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("failed to build HTTP client")?;
 
     match cmd {
         RouteCmd::List => {
@@ -122,8 +125,11 @@ pub async fn run(
         }
         RouteCmd::Show(id) => {
             let sp = ui::spinner("Loading route…");
-            let route: Value =
-                send(http.get(format!("{base}/v1/routes/{id}")).bearer_auth(&key)).await?;
+            let route: Value = send(
+                http.get(format!("{base}/v1/routes/{}", enc_segment(&id)))
+                    .bearer_auth(&key),
+            )
+            .await?;
             drop(sp);
             ui::heading(route["name"].as_str().unwrap_or(&id));
             println!("{}", serde_json::to_string_pretty(&route)?);
@@ -131,7 +137,7 @@ pub async fn run(
         RouteCmd::Rm(id) => {
             let sp = ui::spinner("Removing route…");
             let _: Value = send(
-                http.delete(format!("{base}/v1/routes/{id}"))
+                http.delete(format!("{base}/v1/routes/{}", enc_segment(&id)))
                     .bearer_auth(&key),
             )
             .await?;
@@ -156,6 +162,13 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Percent-encode a user-supplied path segment (route id) so `/ ? # %`, spaces,
+/// etc. can't break or traverse the URL path. Over-encodes harmless chars (e.g.
+/// a UUID's `-`); the gateway percent-decodes the path param.
+fn enc_segment(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 /// Send a request; map non-2xx to an error carrying the response body.
@@ -470,5 +483,23 @@ mod tests {
         console::set_colors_enabled(false);
         let out = routes_table(&json!([]));
         assert!(out.contains("No routes"));
+    }
+
+    #[test]
+    fn enc_segment_encodes_path_breakers() {
+        let e = super::enc_segment("a/b?c#d e");
+        assert!(!e.contains('/') && !e.contains('?') && !e.contains('#') && !e.contains(' '));
+        assert!(e.contains("%2F") && e.contains("%3F") && e.contains("%23") && e.contains("%20"));
+    }
+
+    #[test]
+    fn enc_segment_uuid_round_trips() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let e = super::enc_segment(id);
+        assert!(!e.contains('/'));
+        let decoded = percent_encoding::percent_decode_str(&e)
+            .decode_utf8()
+            .unwrap();
+        assert_eq!(decoded, id);
     }
 }

@@ -100,8 +100,8 @@ pub fn resolve_base(
 
 /// Mask a key for display: keep the `tt_live_`/`tt_test_` prefix + a few chars.
 pub fn mask_key(key: &str) -> String {
-    let n = key.len().min(12);
-    format!("{}…", &key[..n])
+    let shown: String = key.chars().take(12).collect();
+    format!("{shown}…")
 }
 
 impl ResolvedContext {
@@ -188,5 +188,13 @@ mod tests {
         let masked = mask_key("tt_live_abcd1234efgh");
         assert_eq!(masked, "tt_live_abcd…");
         assert!(!masked.contains("1234efgh"));
+    }
+
+    #[test]
+    fn mask_key_handles_non_ascii_without_panicking() {
+        // `é` is the 12th char; its 2nd byte sits at index 12, so the old
+        // `&key[..12]` byte-slice cut mid-codepoint and panicked.
+        let masked = mask_key("tt_live_caféxyz_more");
+        assert_eq!(masked, "tt_live_café…");
     }
 }
