@@ -47,7 +47,9 @@ class TestLatestEntries(unittest.TestCase):
         )
         f.write(body)
         f.close()
-        return Path(f.name)
+        path = Path(f.name)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
 
     def test_returns_only_newest_entry_per_model(self):
         path = self._catalog(
