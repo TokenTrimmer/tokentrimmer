@@ -356,7 +356,6 @@ async fn privacy_route_disable_cache_beats_force_write() {
             then: RouteAction {
                 target_model: "counting-1".into(),
                 fallbacks: vec![],
-                force_cache_layer: None,
                 disable_cache: true,
                 max_cost_usd: None,
             },

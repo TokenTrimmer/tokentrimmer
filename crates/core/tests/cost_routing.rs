@@ -166,7 +166,6 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
             then: RouteAction {
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },
@@ -231,7 +230,6 @@ async fn reroute_then_block_on_ceiling() {
             then: RouteAction {
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: Some(0.0008),
             },

@@ -142,7 +142,6 @@ fn route(name: &str, priority: u32, tag: Option<&str>, target: &str) -> Route {
         then: RouteAction {
             target_model: target.into(),
             fallbacks: vec![],
-            force_cache_layer: None,
             disable_cache: false,
             max_cost_usd: None,
         },

@@ -354,7 +354,6 @@ mod tests {
             then: RouteAction {
                 target_model: target.into(),
                 fallbacks: Vec::new(),
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },
@@ -389,7 +388,6 @@ mod tests {
             then: RouteAction {
                 target_model: "m1".into(),
                 fallbacks: vec![],
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },
@@ -424,7 +422,6 @@ mod tests {
                     then: RouteAction {
                         target_model: "m".into(),
                         fallbacks: vec![],
-                        force_cache_layer: None,
                         disable_cache: false,
                         max_cost_usd: None,
                     },

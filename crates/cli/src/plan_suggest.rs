@@ -54,7 +54,6 @@ pub fn suggestions_to_proposed_routes(
             then: RouteAction {
                 target_model: s.model.clone(),
                 fallbacks: Vec::new(),
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },
@@ -320,7 +319,6 @@ mod tests {
         let routes = suggestions_to_proposed_routes("gpt-4o", &suggestions);
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].priority, 100);
-        assert!(routes[0].then.force_cache_layer.is_none());
         assert!(routes[0].when.input_tokens_lt.is_none());
         assert!(routes[0].when.tag_equals.is_none());
     }

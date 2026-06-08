@@ -150,7 +150,6 @@ fn dogfood_routing_store() -> Arc<CachingRoutingStore> {
             then: RouteAction {
                 target_model: "llama-3.1-8b-instant".into(),
                 fallbacks: Vec::new(),
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },

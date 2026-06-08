@@ -153,7 +153,6 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
             then: RouteAction {
                 target_model: "text-embedding-3-small".into(),
                 fallbacks: Vec::new(),
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },

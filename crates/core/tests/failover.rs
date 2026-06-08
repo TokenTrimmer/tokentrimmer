@@ -138,7 +138,6 @@ fn failover_routing_store() -> Arc<CachingRoutingStore> {
             then: RouteAction {
                 target_model: "primary-model".into(),
                 fallbacks: vec!["fallback-model".into()],
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },

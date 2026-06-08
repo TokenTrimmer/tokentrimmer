@@ -267,7 +267,6 @@ async fn fallback_header_overrides_route_chain() {
             then: RouteAction {
                 target_model: "primary-model".into(),
                 fallbacks: vec!["route-fb".into()],
-                force_cache_layer: None,
                 disable_cache: false,
                 max_cost_usd: None,
             },

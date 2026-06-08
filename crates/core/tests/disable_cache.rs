@@ -160,7 +160,6 @@ async fn setup(disable_cache: bool) -> (axum::Router, String, Arc<AtomicUsize>) 
             then: RouteAction {
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: vec![],
-                force_cache_layer: None,
                 disable_cache,
                 max_cost_usd: None,
             },
