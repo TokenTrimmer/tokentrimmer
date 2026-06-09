@@ -790,50 +790,10 @@ pub async fn handler(
         // (tiktoken for openai/anthropic, chars/4 for others) so that the
         // streaming input estimate is consistent with routing and /v1/preview
         // rather than a raw byte-length heuristic (§2.15).
-        let estimated_input_tokens = {
-            let provider_id_for_est = provider.id();
-            let combined_text: String = req
-                .messages
-                .iter()
-                .map(|m| match m {
-                    Message::User { content, .. } | Message::System { content } => match content {
-                        MessageContent::Text(s) => s.as_str().to_owned(),
-                        MessageContent::Parts(parts) => parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                    },
-                    Message::Assistant { content, .. } => match content {
-                        Some(MessageContent::Text(s)) => s.clone(),
-                        Some(MessageContent::Parts(parts)) => parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                        None => String::new(),
-                    },
-                    Message::Tool { content, .. } => match content {
-                        MessageContent::Text(s) => s.clone(),
-                        MessageContent::Parts(parts) => parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                    },
-                })
-                .collect();
-            tt_tokenize::estimate_tokens(provider_id_for_est, &combined_text) as i32
-        };
+        let estimated_input_tokens = tt_tokenize::estimate_tokens(
+            provider.id(),
+            &tt_shared::message_text_for_estimation(&req),
+        ) as i32;
 
         // Establish the stream. When the matched route declares fallbacks, fail
         // over across the candidate chain (initial establishment only — a
