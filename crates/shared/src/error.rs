@@ -50,16 +50,22 @@ impl ProviderError {
 
     /// True if the error means we should try a fallback provider.
     ///
-    /// Only upstream *server* errors (5xx) are fallback-eligible. A
-    /// deterministic client error (400 invalid request, 403 forbidden, 422
-    /// unprocessable) will fail identically on every provider, so failing
-    /// over just burns extra upstream calls + spend. Matches the `>= 500`
-    /// guard in [`Self::is_retriable`]. (429 maps to [`Self::RateLimited`]
-    /// and timeouts to [`Self::Timeout`], which are handled separately.)
+    /// Transient/load and server-side conditions are fallback-eligible:
+    /// upstream *server* errors (5xx), timeouts, model-not-found, and rate
+    /// limiting (429). A 429 is also [`Self::is_retriable`], so the dispatch
+    /// loop first exhausts the same-provider retry budget (honoring
+    /// `retry_after_ms`); only then does failover advance to a candidate that
+    /// may have spare quota — a common real-world recovery during a primary
+    /// provider's capacity crunch.
+    ///
+    /// A *deterministic* client error (400 invalid request, 403 forbidden, 422
+    /// unprocessable) is NOT eligible: it would fail identically on every
+    /// provider, so failing over just burns extra upstream calls + spend.
     pub fn is_fallback_eligible(&self) -> bool {
         match self {
             ProviderError::ModelNotFound { .. } => true,
             ProviderError::Timeout { .. } => true,
+            ProviderError::RateLimited { .. } => true,
             ProviderError::ProviderUpstream { status, .. } => *status >= 500,
             _ => false,
         }
@@ -102,6 +108,16 @@ mod tests {
     fn model_not_found_and_timeout_still_fallback_eligible() {
         assert!(ProviderError::ModelNotFound { model: "x".into() }.is_fallback_eligible());
         assert!(ProviderError::Timeout { ms: 1000 }.is_fallback_eligible());
+    }
+
+    #[test]
+    fn rate_limited_is_fallback_eligible() {
+        // A sustained 429 on the primary should fail over to a provider with
+        // spare quota (after same-provider retries exhaust). 429 is also
+        // retriable, so the dispatch loop retries it in place first.
+        let e = ProviderError::RateLimited { retry_after_ms: 0 };
+        assert!(e.is_fallback_eligible());
+        assert!(e.is_retriable());
     }
 
     #[test]
