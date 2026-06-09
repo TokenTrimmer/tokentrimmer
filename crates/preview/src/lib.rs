@@ -26,7 +26,18 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
     let mut warnings = Vec::new();
 
     let hit = pricing::lookup(&req.model)?;
-    let est = token_estimator::estimate(hit.provider, &req.messages, req.max_tokens);
+    // Clamp the projected output to the model's real catalog max-output when the
+    // model is catalogued (keeps an over-large or absent `max_tokens` honest);
+    // unknown models pass through uncapped.
+    let model_max_output = tt_shared::model_catalog()
+        .model_info(hit.provider, &req.model)
+        .map(|mi| u32::try_from(mi.max_output_tokens).unwrap_or(u32::MAX));
+    let est = token_estimator::estimate(
+        hit.provider,
+        &req.messages,
+        req.max_tokens,
+        model_max_output,
+    );
     let cost = pricing::cost_usd(est.input_tokens, est.output_tokens, &hit);
 
     let task_class = classifier::classify(&req.messages);
@@ -66,4 +77,46 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
         warnings,
         trace_id: Uuid::new_v4().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Message;
+    use serde_json::json;
+
+    fn req_with_max(model: &str, max_tokens: Option<u32>) -> PreviewRequest {
+        PreviewRequest {
+            model: model.to_string(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: json!("hello"),
+            }],
+            max_tokens,
+            tools: None,
+            stream: None,
+        }
+    }
+
+    /// End-to-end: a catalogued model with an over-large `max_tokens` has its
+    /// projected output clamped to the model's real catalog max-output, rather
+    /// than the caller's inflated ceiling or the old hardcoded 4096 cap.
+    /// `gpt-4o` is catalogued (openai, max_output_tokens = 16000).
+    #[test]
+    fn over_large_max_tokens_clamped_to_catalog_max_output() {
+        let model = "gpt-4o";
+        let catalog_max = tt_shared::model_catalog()
+            .model_info("openai", model)
+            .expect("gpt-4o must be catalogued")
+            .max_output_tokens;
+        let resp = preview(&req_with_max(model, Some(catalog_max as u32 + 50_000))).unwrap();
+        assert_eq!(resp.current.output_tokens_estimated as u64, catalog_max);
+    }
+
+    /// A modest explicit `max_tokens` below the model max is honored as-is.
+    #[test]
+    fn modest_max_tokens_is_honored() {
+        let resp = preview(&req_with_max("gpt-4o", Some(1000))).unwrap();
+        assert_eq!(resp.current.output_tokens_estimated, 1000);
+    }
 }

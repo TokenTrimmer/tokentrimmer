@@ -428,7 +428,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Latency-Ms` | every response | `412` |
 | `X-TokenTrimmer-Provider` | on dispatched/cached responses | `anthropic` |
 | `X-TokenTrimmer-Model-Used` | on dispatched/cached responses | `claude-3-5-haiku-20241022` |
-| `X-TokenTrimmer-Cache` | on dispatched/cached responses | `hit-l1` / `hit-l2` / `miss` / `none` |
+| `X-TokenTrimmer-Cache` | on dispatched/cached responses | `hit-l1` / `hit-l2` / `neg-hit` / `miss` / `none` / `sandbox` |
 | `X-TokenTrimmer-Cost-Usd` | on dispatched/cached responses | `0.0034` |
 | `X-TokenTrimmer-Baseline-Cost-Usd` | on dispatched/cached responses | `0.0218` |
 | `X-TokenTrimmer-Saved-Usd` | on dispatched/cached responses | `0.0184` |
