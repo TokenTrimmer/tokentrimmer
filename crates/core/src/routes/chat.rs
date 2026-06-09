@@ -1,19 +1,19 @@
 //! `POST /v1/chat/completions` — OpenAI-compatible chat completion.
 //!
-//! Dispatch pipeline:
-//!   1. Resolve provider from `request.model` via the registry.
-//!   2. Build a synthetic [`RequestContext`] (real auth lands in Week 7).
-//!   3. For `stream: false` (Week 12 +): try L2 semantic cache lookup; on hit
-//!      return the cached response with `X-TokenTrimmer-Cache: hit-l2`.
-//!   4. Otherwise dispatch to provider, then best-effort insert into L2 cache.
-//!   5. For `stream: true`: dispatch streaming directly (fake-stream from
-//!      cache is `w7-fake-stream-cache`, blocked).
+//! Request pipeline (see the numbered steps in `handler`):
+//!   1. Resolve the provider from `request.model`; 404 on an unknown model.
+//!   2. Authenticate (bearer key → `ApiKeyContext`), resolve the org's upstream
+//!      credentials, apply the routing engine (may rewrite `req.model`), honor
+//!      an explicit provider pin, and compute the per-request cache behavior.
+//!   3. Non-streaming: try the negative cache, then L1 exact-match, then the L2
+//!      semantic cache; on a miss, single-flight-coalesce and dispatch to the
+//!      provider (with cross-provider failover), then best-effort insert into
+//!      L1 + L2 and write a `request_logs` row.
+//!      Streaming: dispatch directly (failover only on initial establishment).
+//!   4. Stamp the `X-TokenTrimmer-*` response headers (cost, cache state,
+//!      provider, model, route-matched, warnings).
 //!
-//! Deferred:
-//!   - Real auth middleware populating `RequestContext` org_id (W7).
-//!   - Routing rule engine (W4).
-//!   - L1 exact-match lookup (W7 cache middleware).
-//!   - Telemetry / audit row write (W7 telemetry pipeline).
+//! `tt_test_*` keys short-circuit to a deterministic sandbox response (step 2a).
 
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ use crate::{
     retry::{with_retry, RetryPolicy},
     routes::sse::{self, CacheInsertContext, StreamLogContext},
     single_flight::wait_for_leader,
-    state::L2Config,
+    state::{L1Config, L2Config},
     ApiError, ApiResult, AppState,
 };
 
@@ -469,6 +469,168 @@ fn cache_override_from_header(headers: &HeaderMap) -> ApiResult<Option<(bool, bo
     Ok(Some(pair))
 }
 
+/// Negative-cache lookup (step 3a-neg). If a prior identical request received a
+/// deterministic 4xx that was stored under `neg:{l1_key}`, serve the cached
+/// error immediately. `None` falls through to the positive lookups. Best-effort:
+/// any cache/deserialize error is logged and treated as a miss.
+async fn try_negative_cache_hit(
+    l1: &L1Config,
+    l1_key: &str,
+    route_matched_name: Option<&str>,
+) -> Option<Response> {
+    let neg_key = negative_l1_key(l1_key);
+    match l1.cache.get(&neg_key).await {
+        Ok(Some(bytes)) => {
+            match serde_json::from_slice::<NegativeCacheEntry>(&bytes) {
+                Ok(neg) => {
+                    tracing::debug!(
+                        key = %neg_key,
+                        status = neg.status,
+                        "negative cache hit — short-circuiting provider call"
+                    );
+                    // Reconstruct and return the cached error response.
+                    let err_body = serde_json::json!({
+                        "error": {
+                            "message": neg.message,
+                            "type": "invalid_request_error",
+                            "code": "cached_client_error",
+                            "param": null
+                        }
+                    });
+                    let status = axum::http::StatusCode::from_u16(neg.status)
+                        .unwrap_or(axum::http::StatusCode::BAD_REQUEST);
+                    let mut resp = (status, Json(err_body)).into_response();
+                    if let Ok(v) = "neg-hit".parse() {
+                        resp.headers_mut().insert("x-tokentrimmer-cache", v);
+                    }
+                    Some(with_route_matched(resp, route_matched_name))
+                }
+                Err(e) => {
+                    // Deserialization failure is non-fatal; fall through.
+                    tracing::warn!(
+                        error = %e,
+                        key = %neg_key,
+                        "negative cache entry deserialization failed — ignoring"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(error = %e, "negative cache lookup error — ignoring");
+            None
+        }
+    }
+}
+
+/// L1 exact-match lookup (step 3a, positive — runs after the negative cache).
+/// `None` falls through to L2.
+#[allow(clippy::too_many_arguments)]
+async fn try_l1_hit(
+    l1: &L1Config,
+    l1_key: &str,
+    ctx: &RequestContext,
+    request_log_writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
+    trace_id: Uuid,
+    request_started: Instant,
+    matched_route_id: Option<Uuid>,
+    route_matched_name: Option<&str>,
+) -> Option<Response> {
+    match l1.cache.get(l1_key).await {
+        Ok(Some(bytes)) => match L1Entry::from_bytes(&bytes) {
+            Ok(entry) => {
+                metrics::counter!("cache_lookups_total", "tier" => "l1", "result" => "hit")
+                    .increment(1);
+                // Log the L1 hit before returning. The hit baseline is
+                // either the envelope's own value or the synthetic
+                // fallback for pre-envelope cache rows.
+                spawn_request_log(
+                    request_log_writer,
+                    request_log_for_l1_hit(
+                        &entry,
+                        ctx,
+                        trace_id,
+                        request_started,
+                        matched_route_id,
+                    ),
+                );
+                Some(with_route_matched(
+                    build_hit_l1_response(entry, trace_id),
+                    route_matched_name,
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, key = %l1_key, "l1 cache entry failed to deserialize");
+                None
+            }
+        },
+        Ok(None) => {
+            metrics::counter!("cache_lookups_total", "tier" => "l1", "result" => "miss")
+                .increment(1);
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "l1 lookup failed");
+            None
+        }
+    }
+}
+
+/// L2 semantic-cache lookup (step 3b). `None` falls through to dispatch.
+/// `Some(Err(_))` preserves the original `build_hit_l2_response(...)?` error
+/// propagation (a hit whose body fails to deserialize). Best-effort on the
+/// embed/lookup side: those errors are treated as a miss.
+#[allow(clippy::too_many_arguments)]
+async fn try_l2_hit(
+    l2: &L2Config,
+    ctx: &RequestContext,
+    req: &ChatCompletionRequest,
+    request_log_writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
+    trace_id: Uuid,
+    request_started: Instant,
+    matched_route_id: Option<Uuid>,
+    route_matched_name: Option<&str>,
+) -> Option<ApiResult<Response>> {
+    let query_text = l2_context_text(req)?;
+    let query_vec = match l2.embedder.embed(&query_text).await {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    match l2
+        .cache
+        .lookup(
+            ctx.org_id,
+            &query_vec,
+            l2.threshold,
+            &req.model,
+            l2.embedder.model(),
+        )
+        .await
+    {
+        Ok(Some((entry, similarity))) => {
+            metrics::counter!("cache_lookups_total", "tier" => "l2", "result" => "hit")
+                .increment(1);
+            // Cache hit — best-effort bump and return.
+            let _ = l2.cache.bump_hit_count(entry.id).await;
+            spawn_request_log(
+                request_log_writer,
+                request_log_for_l2_hit(&entry, ctx, trace_id, request_started, matched_route_id),
+            );
+            Some(
+                build_hit_l2_response(entry, similarity, trace_id)
+                    .map(|resp| with_route_matched(resp, route_matched_name)),
+            )
+        }
+        Ok(None) => {
+            metrics::counter!("cache_lookups_total", "tier" => "l2", "result" => "miss")
+                .increment(1);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 /// Handler for `POST /v1/chat/completions`.
 ///
 /// Resolves the provider for `req.model`, builds a [`RequestContext`] from the
@@ -790,50 +952,10 @@ pub async fn handler(
         // (tiktoken for openai/anthropic, chars/4 for others) so that the
         // streaming input estimate is consistent with routing and /v1/preview
         // rather than a raw byte-length heuristic (§2.15).
-        let estimated_input_tokens = {
-            let provider_id_for_est = provider.id();
-            let combined_text: String = req
-                .messages
-                .iter()
-                .map(|m| match m {
-                    Message::User { content, .. } | Message::System { content } => match content {
-                        MessageContent::Text(s) => s.as_str().to_owned(),
-                        MessageContent::Parts(parts) => parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                    },
-                    Message::Assistant { content, .. } => match content {
-                        Some(MessageContent::Text(s)) => s.clone(),
-                        Some(MessageContent::Parts(parts)) => parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                        None => String::new(),
-                    },
-                    Message::Tool { content, .. } => match content {
-                        MessageContent::Text(s) => s.clone(),
-                        MessageContent::Parts(parts) => parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                tt_shared::ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                    },
-                })
-                .collect();
-            tt_tokenize::estimate_tokens(provider_id_for_est, &combined_text) as i32
-        };
+        let estimated_input_tokens = tt_tokenize::estimate_tokens(
+            provider.id(),
+            &tt_shared::message_text_for_estimation(&req),
+        ) as i32;
 
         // Establish the stream. When the matched route declares fallbacks, fail
         // over across the candidate chain (initial establishment only — a
@@ -988,141 +1110,48 @@ pub async fn handler(
             .as_ref()
             .map(|_| namespaced_l1_key(ctx.org_id, &req));
 
-        // 3a-neg. Negative-cache lookup — check before positive L1/L2.
-        //
-        // If a previous identical request received a deterministic 4xx from the
-        // provider, the error is stored in L1 under "neg:{l1_key}" with a short
-        // TTL (NEGATIVE_CACHE_TTL_SECS).  Serve the cached error immediately to
-        // avoid re-hitting the provider with a request that will fail again.
-        //
-        // Gated on the same cache_behavior.do_lookup flag so bypass/read-only
-        // semantics are respected.  Only wired for the non-streaming path
-        // (streaming errors are not deterministic in the same way).
+        // 3a/3a-neg. Negative cache, then L1 exact-match. Gated on cache
+        // eligibility + tt_extras.cache mode; best-effort (errors fall through).
         if cache_behavior.do_lookup {
             if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
-                let neg_key = negative_l1_key(key);
-                match l1.cache.get(&neg_key).await {
-                    Ok(Some(bytes)) => {
-                        match serde_json::from_slice::<NegativeCacheEntry>(&bytes) {
-                            Ok(neg) => {
-                                tracing::debug!(
-                                    key = %neg_key,
-                                    status = neg.status,
-                                    "negative cache hit — short-circuiting provider call"
-                                );
-                                // Reconstruct and return the cached error response.
-                                let err_body = serde_json::json!({
-                                    "error": {
-                                        "message": neg.message,
-                                        "type": "invalid_request_error",
-                                        "code": "cached_client_error",
-                                        "param": null
-                                    }
-                                });
-                                let status = axum::http::StatusCode::from_u16(neg.status)
-                                    .unwrap_or(axum::http::StatusCode::BAD_REQUEST);
-                                let mut resp = (status, Json(err_body)).into_response();
-                                if let Ok(v) = "neg-hit".parse() {
-                                    resp.headers_mut().insert("x-tokentrimmer-cache", v);
-                                }
-                                return Ok(with_route_matched(resp, route_matched_name.as_deref()));
-                            }
-                            Err(e) => {
-                                // Deserialization failure is non-fatal; fall through.
-                                tracing::warn!(
-                                    error = %e,
-                                    key = %neg_key,
-                                    "negative cache entry deserialization failed — ignoring"
-                                );
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::debug!(error = %e, "negative cache lookup error — ignoring");
-                    }
+                if let Some(resp) =
+                    try_negative_cache_hit(l1, key, route_matched_name.as_deref()).await
+                {
+                    return Ok(resp);
+                }
+                if let Some(resp) = try_l1_hit(
+                    l1,
+                    key,
+                    &ctx,
+                    state.request_log_writer.as_ref(),
+                    trace_id,
+                    request_started,
+                    matched_route_id,
+                    route_matched_name.as_deref(),
+                )
+                .await
+                {
+                    return Ok(resp);
                 }
             }
         }
 
-        if cache_behavior.do_lookup {
-            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
-                match l1.cache.get(key).await {
-                    Ok(Some(bytes)) => match L1Entry::from_bytes(&bytes) {
-                        Ok(entry) => {
-                            metrics::counter!("cache_lookups_total", "tier" => "l1", "result" => "hit").increment(1);
-                            // Log the L1 hit before returning. The hit baseline is
-                            // either the envelope's own value or the synthetic
-                            // fallback for pre-envelope cache rows.
-                            spawn_request_log(
-                                state.request_log_writer.as_ref(),
-                                request_log_for_l1_hit(
-                                    &entry,
-                                    &ctx,
-                                    trace_id,
-                                    request_started,
-                                    matched_route_id,
-                                ),
-                            );
-                            return Ok(with_route_matched(
-                                build_hit_l1_response(entry, trace_id),
-                                route_matched_name.as_deref(),
-                            ));
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, key = %key, "l1 cache entry failed to deserialize");
-                        }
-                    },
-                    Ok(None) => {
-                        metrics::counter!("cache_lookups_total", "tier" => "l1", "result" => "miss").increment(1);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "l1 lookup failed"),
-                }
-            }
-        }
-
-        // 3b. Try L2 semantic cache lookup before dispatching to the provider.
-        //     Gated on cache eligibility + tt_extras.cache mode.
+        // 3b. L2 semantic cache. Gated additionally on l2_allowed.
         if cache_behavior.do_lookup && l2_allowed {
             if let Some(l2) = state.l2.as_ref() {
-                if let Some(query_text) = l2_context_text(&req) {
-                    if let Ok(query_vec) = l2.embedder.embed(&query_text).await {
-                        match l2
-                            .cache
-                            .lookup(
-                                ctx.org_id,
-                                &query_vec,
-                                l2.threshold,
-                                &req.model,
-                                l2.embedder.model(),
-                            )
-                            .await
-                        {
-                            Ok(Some((entry, similarity))) => {
-                                metrics::counter!("cache_lookups_total", "tier" => "l2", "result" => "hit").increment(1);
-                                // Cache hit — best-effort bump and return.
-                                let _ = l2.cache.bump_hit_count(entry.id).await;
-                                spawn_request_log(
-                                    state.request_log_writer.as_ref(),
-                                    request_log_for_l2_hit(
-                                        &entry,
-                                        &ctx,
-                                        trace_id,
-                                        request_started,
-                                        matched_route_id,
-                                    ),
-                                );
-                                return Ok(with_route_matched(
-                                    build_hit_l2_response(entry, similarity, trace_id)?,
-                                    route_matched_name.as_deref(),
-                                ));
-                            }
-                            Ok(None) => {
-                                metrics::counter!("cache_lookups_total", "tier" => "l2", "result" => "miss").increment(1);
-                            }
-                            Err(_) => {}
-                        }
-                    }
+                if let Some(result) = try_l2_hit(
+                    l2,
+                    &ctx,
+                    &req,
+                    state.request_log_writer.as_ref(),
+                    trace_id,
+                    request_started,
+                    matched_route_id,
+                    route_matched_name.as_deref(),
+                )
+                .await
+                {
+                    return result;
                 }
             }
         }
