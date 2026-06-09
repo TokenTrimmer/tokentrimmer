@@ -55,7 +55,8 @@ pub fn suggest(
             savings_usd: current_cost_usd - cost,
             quality_risk_band: QualityRiskBand::Unknown,
             rationale: format!(
-                "{candidate} historically handles {task_class:?} tasks at lower cost. Quality \
+                "{candidate} is a lower-cost model for {task_class:?}-style tasks by a static \
+                 pricing + capability heuristic — not based on your telemetry. Quality \
                  band not yet computed for your org (UNKNOWN); enable Plan engine \
                  quality scoring to upgrade to LOW/MEDIUM/HIGH.",
             ),
@@ -94,5 +95,27 @@ mod tests {
     fn caps_at_3_suggestions() {
         let v = suggest("claude-opus", 1.0, 1000, 1000, TaskClass::Extraction);
         assert!(v.len() <= 3);
+    }
+
+    /// Rationale must not claim telemetry-backed history it doesn't have — the
+    /// suggestion is a static pricing/capability heuristic (mirrors the honesty
+    /// guard on `find_route_for`).
+    #[test]
+    fn rationale_makes_no_unsubstantiated_history_claim() {
+        let v = suggest("claude-opus-4-7", 1.0, 1000, 1000, TaskClass::Extraction);
+        assert!(!v.is_empty(), "expected at least one cheaper suggestion");
+        for s in &v {
+            let lower = s.rationale.to_lowercase();
+            assert!(
+                !lower.contains("historically"),
+                "rationale must not claim historical/telemetry data: {}",
+                s.rationale
+            );
+            assert!(
+                lower.contains("not based on your telemetry"),
+                "rationale must disclose it is a heuristic, not telemetry: {}",
+                s.rationale
+            );
+        }
     }
 }
