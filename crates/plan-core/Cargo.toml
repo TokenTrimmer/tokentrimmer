@@ -23,6 +23,10 @@ rand_chacha = "0.3"
 [dev-dependencies]
 insta.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+# Dev-only: the RouteConditions/RouteAction cross-type wire-compat guards
+# round-trip the real gateway types. No cycle — tt-routing does not depend on
+# tt-plan-core.
+tt-routing.workspace = true
 
 [lints]
 workspace = true

@@ -525,6 +525,54 @@ mod tests {
         assert_eq!(reemitted, gateway_json);
     }
 
+    /// Cross-crate lockstep guard for `RouteConditions`, the companion to
+    /// `route_action_cross_type_wire_compat`. The two structs are field-identical
+    /// by hand; this test fails if they ever drift.
+    ///
+    /// The `tt_routing::RouteConditions { .. }` literal below sets EVERY field
+    /// with NO `..Default::default()` on purpose: adding a condition predicate to
+    /// `tt_routing::RouteConditions` makes this test fail to compile (missing
+    /// field), forcing whoever adds it to extend the round-trip here and notice
+    /// if `tt_plan_core::RouteConditions` would silently drop it. The runtime
+    /// assertions then prove the wire shapes (declaration order +
+    /// `skip_serializing_if` gating) are byte-for-byte identical on both sides.
+    #[test]
+    fn route_conditions_cross_type_wire_compat() {
+        let gateway = tt_routing::RouteConditions {
+            model_in: vec!["gpt-4o".to_string()],
+            input_tokens_lt: Some(1000),
+            input_tokens_gt: Some(10),
+            tag_equals: Some("batch".to_string()),
+            has_images: Some(true),
+            has_audio: Some(false),
+            prompt_contains_any_of: vec!["summarize".to_string()],
+            estimated_cost_gt: Some(0.01),
+            estimated_cost_lt: Some(5.0),
+        };
+        let gateway_json = serde_json::to_string(&gateway).unwrap();
+
+        // The gateway JSON deserializes into the plan-core type without dropping
+        // a field.
+        let plan_conditions: RouteConditions = serde_json::from_str(&gateway_json).unwrap();
+        assert_eq!(plan_conditions.model_in, vec!["gpt-4o".to_string()]);
+        assert_eq!(plan_conditions.input_tokens_lt, Some(1000));
+        assert_eq!(plan_conditions.input_tokens_gt, Some(10));
+        assert_eq!(plan_conditions.tag_equals, Some("batch".to_string()));
+        assert_eq!(plan_conditions.has_images, Some(true));
+        assert_eq!(plan_conditions.has_audio, Some(false));
+        assert_eq!(
+            plan_conditions.prompt_contains_any_of,
+            vec!["summarize".to_string()]
+        );
+        assert_eq!(plan_conditions.estimated_cost_gt, Some(0.01));
+        assert_eq!(plan_conditions.estimated_cost_lt, Some(5.0));
+
+        // Re-serialize the plan-core value: must reproduce the gateway JSON
+        // byte-for-byte (same field order + same skip_serializing_if gating).
+        let reemitted = serde_json::to_string(&plan_conditions).unwrap();
+        assert_eq!(reemitted, gateway_json);
+    }
+
     /// Back-compat: legacy JSON still carrying the removed `force_cache_layer`
     /// key deserializes fine (serde ignores the unknown field) and re-serializes
     /// without it. Guards persisted plans/routes written before the removal.

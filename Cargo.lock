@@ -5312,6 +5312,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tt-routing",
  "tt-shared",
  "tt-telemetry",
  "uuid",
