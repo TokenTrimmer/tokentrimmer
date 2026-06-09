@@ -204,6 +204,15 @@ impl EnvProviderCredentialStore {
         Self
     }
 
+    /// Trim surrounding whitespace/newlines from an env-sourced key and treat a
+    /// blank value as absent. A trailing newline (common from
+    /// `echo secret | fly secrets set`) would otherwise be forwarded verbatim and
+    /// produce a confusing upstream 401.
+    fn normalize_key(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
     fn env_var_for(provider_id: &str) -> Option<&'static str> {
         Some(match provider_id {
             "openai" => "OPENAI_API_KEY",
@@ -229,12 +238,12 @@ impl ProviderCredentialStore for EnvProviderCredentialStore {
             return Ok(None);
         };
         match std::env::var(var) {
-            Ok(v) if !v.is_empty() => Ok(Some(ProviderCredentials {
-                api_key: SecretString::new(v),
+            Ok(v) => Ok(Self::normalize_key(&v).map(|key| ProviderCredentials {
+                api_key: SecretString::new(key),
                 base_url: None,
                 extra_headers: Vec::new(),
             })),
-            _ => Ok(None),
+            Err(_) => Ok(None),
         }
     }
 }
@@ -420,6 +429,20 @@ mod tests {
         std::env::set_var("MISTRAL_API_KEY", "");
         assert!(store.get(Uuid::nil(), "mistral").await.unwrap().is_none());
         std::env::remove_var("MISTRAL_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn env_store_trims_surrounding_whitespace_and_newlines() {
+        // `echo secret | fly secrets set` appends a trailing newline; forwarded
+        // verbatim it produces a confusing upstream 401. The store must trim it.
+        std::env::set_var("GROQ_API_KEY", "  gsk-padded\n");
+        let store = EnvProviderCredentialStore::new();
+        let got = store.get(Uuid::nil(), "groq").await.unwrap().unwrap();
+        assert_eq!(got.api_key.expose(), "gsk-padded");
+        // A whitespace-only value is treated as absent, not a blank key.
+        std::env::set_var("GROQ_API_KEY", "  \n\t ");
+        assert!(store.get(Uuid::nil(), "groq").await.unwrap().is_none());
+        std::env::remove_var("GROQ_API_KEY");
     }
 
     #[tokio::test]
