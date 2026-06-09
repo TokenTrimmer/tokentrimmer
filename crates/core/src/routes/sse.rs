@@ -304,17 +304,20 @@ impl TrackedEventStream {
             let guard = self.inner.lock().expect("tracking stream mutex poisoned");
             guard.snapshot()
         };
-        let (cost_usd, baseline_cost_usd) = crate::routes::chat::compute_cost(
+        let breakdown = crate::routes::chat::compute_cost(
             &partial_to_usage(&usage),
             Some(pricing),
             self.baseline_pricing.as_ref(),
             self.fee_multiplier,
         );
-        let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
+        // `saved_usd` is strictly TT-attributed; the provider's automatic
+        // cache discount rides in its own field (mirrors the response-header
+        // split on the non-streaming path).
         let json = serde_json::json!({
-            "cost_usd": cost_usd,
-            "baseline_cost_usd": baseline_cost_usd,
-            "saved_usd": saved_usd,
+            "cost_usd": breakdown.cost_usd,
+            "baseline_cost_usd": breakdown.baseline_cost_usd,
+            "saved_usd": breakdown.tt_saved_usd(),
+            "provider_cache_saved_usd": breakdown.provider_cache_saved_usd,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_tokens": usage.cached_tokens,
@@ -475,12 +478,14 @@ pub fn stream_response(
 
                 // Reuse the authoritative non-streaming cost math (3-bucket
                 // input pricing incl. cache-write premium); fee applied inside.
-                let (cost_usd, baseline_cost_usd) = crate::routes::chat::compute_cost(
+                let breakdown = crate::routes::chat::compute_cost(
                     &partial_to_usage(&usage),
                     pricing.as_ref(),
                     baseline_pricing.as_ref(),
                     fee_multiplier,
                 );
+                let cost_usd = breakdown.cost_usd;
+                let baseline_cost_usd = breakdown.baseline_cost_usd;
 
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, cost_usd, Utc::now());
@@ -497,6 +502,7 @@ pub fn stream_response(
                     cached_tokens: usage.cached_tokens,
                     cost_usd,
                     baseline_cost_usd,
+                    provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
                     cached: false,
                     cache_layer: None,
                     route_id,
@@ -1024,15 +1030,17 @@ mod tests {
         };
         let u = partial_to_usage(&usage);
 
-        let (base_cost, base_baseline) =
-            crate::routes::chat::compute_cost(&u, Some(&pricing), None, 1.0);
+        let base = crate::routes::chat::compute_cost(&u, Some(&pricing), None, 1.0);
+        let base_cost = base.cost_usd;
+        let base_baseline = base.baseline_cost_usd;
         assert!(
             (base_cost - 0.002_f64).abs() < 1e-9,
             "base_cost={base_cost}"
         );
 
-        let (scaled_cost, scaled_baseline) =
-            crate::routes::chat::compute_cost(&u, Some(&pricing), None, 1.05);
+        let scaled = crate::routes::chat::compute_cost(&u, Some(&pricing), None, 1.05);
+        let scaled_cost = scaled.cost_usd;
+        let scaled_baseline = scaled.baseline_cost_usd;
         assert!(
             (scaled_cost - base_cost * 1.05).abs() < 1e-9,
             "scaled_cost={scaled_cost}"
@@ -1114,8 +1122,9 @@ mod tests {
             cache_write_per_million: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
         };
-        let (cost, _baseline) =
-            crate::routes::chat::compute_cost(&partial_to_usage(&usage), Some(&pricing), None, 1.0);
+        let cost =
+            crate::routes::chat::compute_cost(&partial_to_usage(&usage), Some(&pricing), None, 1.0)
+                .cost_usd;
         let expected = (800.0 * 3.0 + 200.0 * 6.0) / 1_000_000.0;
         assert!(
             (cost - expected).abs() < 1e-12,
@@ -1139,8 +1148,9 @@ mod tests {
             cache_write_per_million: Some(1.25),
             effective_at: chrono::DateTime::UNIX_EPOCH,
         };
-        let (cost, _baseline) =
-            crate::routes::chat::compute_cost(&partial_to_usage(&usage), Some(&pricing), None, 1.0);
+        let cost =
+            crate::routes::chat::compute_cost(&partial_to_usage(&usage), Some(&pricing), None, 1.0)
+                .cost_usd;
         let expected = (50.0 * 1.0 + 20.0 * 0.1 + 30.0 * 1.25 + 10.0 * 2.0) / 1_000_000.0;
         assert!(
             (cost - expected).abs() < 1e-12,

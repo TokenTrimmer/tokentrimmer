@@ -480,17 +480,20 @@ impl Provider for CachedDiscountProvider {
 
 /// A single (non-L1-hit) request where the *provider* itself reports
 /// `cached_tokens > 0` (i.e. its own KV-cache read discount, distinct from the
-/// TokenTrimmer L1/L2 cache). The gateway must surface this as a positive
-/// `saved_usd = baseline - cost`.
+/// TokenTrimmer L1/L2 cache) and NO TokenTrimmer optimization was applied (no
+/// routing, no TT cache hit). The provider's automatic discount must NOT be
+/// claimed as TokenTrimmer savings: `saved_usd == 0`, with the discount
+/// surfaced separately as `x-tokentrimmer-provider-cache-saved-usd`.
 ///
-/// Pricing (compute_cost, chat.rs ~line 1356):
+/// Pricing (compute_cost, crates/core/src/routes/chat.rs):
 ///   cache_read   = 50 (cached_tokens), cache_write = 0, fresh_input = 50
 ///   cost_usd     = 50 × $3/M + 50 × $0.3/M + 50 × $6/M
 ///                = 0.000150 + 0.000015 + 0.000300 = 0.000465
 ///   baseline_usd = 100 × $3/M + 50 × $6/M = 0.000300 + 0.000300 = 0.000600
-///   saved_usd    = 0.000600 − 0.000465 = 0.000135
+///   provider_cache_saved_usd = 0.000600 − 0.000465 = 0.000135
+///   saved_usd    = 0 (nothing TokenTrimmer-attributed)
 #[tokio::test]
-async fn cached_token_discount_shows_up_as_positive_saved() {
+async fn provider_cache_discount_excluded_from_tt_saved() {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(CachedDiscountProvider));
     // No L1 cache — we want a live provider dispatch, not a cache hit.
@@ -533,6 +536,7 @@ async fn cached_token_discount_shows_up_as_positive_saved() {
     let cost = header_f64("x-tokentrimmer-cost-usd");
     let baseline = header_f64("x-tokentrimmer-baseline-cost-usd");
     let saved = header_f64("x-tokentrimmer-saved-usd");
+    let provider_cache_saved = header_f64("x-tokentrimmer-provider-cache-saved-usd");
 
     // Pricing derivation (see docstring above):
     //   fresh_input=50, cache_read=50, output=50
@@ -541,7 +545,7 @@ async fn cached_token_discount_shows_up_as_positive_saved() {
     // Baseline: all 100 prompt tokens at the plain input rate, no cache
     // discount.
     let expected_baseline = (100.0 * 3.0 + 50.0 * 6.0) / 1_000_000.0;
-    let expected_saved = expected_baseline - expected_cost;
+    let expected_provider_saved = expected_baseline - expected_cost;
 
     assert!(
         (cost - expected_cost).abs() < 1e-9,
@@ -555,8 +559,14 @@ async fn cached_token_discount_shows_up_as_positive_saved() {
         baseline > cost,
         "baseline ({baseline}) should exceed discounted cost ({cost})"
     );
+    // No TT optimization happened — TT must not claim the provider's discount.
     assert!(
-        (saved - expected_saved).abs() < 1e-9,
-        "saved should equal baseline − cost = {expected_saved}; got {saved}"
+        saved.abs() < 1e-9,
+        "saved must be 0 with no TT optimization (provider discount is not ours); got {saved}"
+    );
+    assert!(
+        (provider_cache_saved - expected_provider_saved).abs() < 1e-9,
+        "provider-cache-saved should equal baseline − cost = {expected_provider_saved}; \
+         got {provider_cache_saved}"
     );
 }

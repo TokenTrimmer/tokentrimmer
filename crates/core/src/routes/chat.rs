@@ -1405,13 +1405,18 @@ pub async fn handler(
         } else {
             pricing.clone()
         };
-        let (cost_usd, baseline_cost_usd) = compute_cost(
+        let cost_breakdown = compute_cost(
             &response.usage,
             pricing.as_ref(),
             baseline_pricing.as_ref(),
             provider.fee_multiplier(),
         );
-        let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
+        let cost_usd = cost_breakdown.cost_usd;
+        let baseline_cost_usd = cost_breakdown.baseline_cost_usd;
+        // headline saved_usd (header) is TT-attributed only — the provider's
+        // automatic cache discount is excluded by `CostBreakdown::tt_saved_usd`
+        // and surfaced via its own header/ledger field.
+        let provider_cache_saved_usd = cost_breakdown.provider_cache_saved_usd;
 
         // Record realized spend into the same enforcer the pre-flight check uses
         // (dynamic_budget on the tier-aware path) so the monthly_cap_usd hard stop trips.
@@ -1542,6 +1547,7 @@ pub async fn handler(
                 cached_tokens: response.usage.cached_tokens as i32,
                 cost_usd,
                 baseline_cost_usd,
+                provider_cache_saved_usd,
                 cached: false,
                 cache_layer: None,
                 route_id: matched_route_id,
@@ -1562,9 +1568,7 @@ pub async fn handler(
             trace_id,
             &provider_id,
             &model_used,
-            cost_usd,
-            baseline_cost_usd,
-            saved_usd,
+            &cost_breakdown,
         );
         // Cache state: miss when ANY cache layer is configured but didn't hit;
         // none when both are disabled.
@@ -1712,14 +1716,19 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
     let model_used = entry.response.model.clone();
 
     let mut http_response = Json(entry.response).into_response();
+    // A TT cache hit never reaches the provider — the full baseline is
+    // TT-attributed (saved == baseline) and there is no provider-side
+    // cache discount.
     attach_cost_headers(
         http_response.headers_mut(),
         trace_id,
         "cache",
         &model_used,
-        0.0,
-        baseline_cost_usd,
-        baseline_cost_usd,
+        &CostBreakdown {
+            cost_usd: 0.0,
+            baseline_cost_usd,
+            provider_cache_saved_usd: 0.0,
+        },
     );
     if let Ok(v) = "hit-l1".parse() {
         http_response
@@ -1752,9 +1761,8 @@ fn build_hit_l2_response(
         .map_err(|e| ApiError::Internal(format!("l2 cache deserialize: {e}")))?;
 
     // Cost is zero on cache hit (no provider call). Baseline reflects what the
-    // request would have cost without our cache.
-    let saved_usd = baseline_cost_usd; // 100% savings on a clean hit
-
+    // request would have cost without our cache; saved == baseline (100%
+    // savings, all TT-attributed) with no provider-side cache discount.
     let provider_id = "cache".to_string();
     let model_used = entry.model.clone();
     let mut http_response = Json(response).into_response();
@@ -1763,9 +1771,11 @@ fn build_hit_l2_response(
         trace_id,
         &provider_id,
         &model_used,
-        0.0,
-        baseline_cost_usd,
-        saved_usd,
+        &CostBreakdown {
+            cost_usd: 0.0,
+            baseline_cost_usd,
+            provider_cache_saved_usd: 0.0,
+        },
     );
     if let Ok(v) = "hit-l2".parse() {
         http_response
@@ -1815,9 +1825,7 @@ fn sandbox_response(req: &ChatCompletionRequest, trace_id_str: &str) -> Response
         trace_id,
         "sandbox",
         &req.model,
-        0.0,
-        0.0,
-        0.0,
+        &CostBreakdown::default(),
     );
     if let Ok(v) = "sandbox".parse() {
         http_response
@@ -1932,9 +1940,44 @@ async fn insert_into_l2(
     }
 }
 
-/// Compute `(actual_cost_usd, baseline_cost_usd)` from token usage and pricing.
+/// Result of [`compute_cost`]: the canonical cost/savings split.
 ///
-/// `pricing` is the served model's rate; `actual_cost_usd` applies the
+/// Attribution rule (P0 #12 — invoice-reconciliation honesty): the headline
+/// `saved_usd` may only contain savings *caused by TokenTrimmer* (routing to a
+/// cheaper model, TT L1/L2 cache hits, failover choices). Discounts the
+/// provider applies automatically to its own bill — prompt-cache read
+/// discounts net of cache-write premiums — are surfaced separately as
+/// `provider_cache_saved_usd` so the TT headline survives reconciliation
+/// against the provider invoice.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CostBreakdown {
+    /// What the provider actually bills (cache discounts included, fee applied).
+    pub cost_usd: f64,
+    /// What the request would have cost with no TokenTrimmer optimisation:
+    /// the originally-requested model at full input price, no cache discount.
+    pub baseline_cost_usd: f64,
+    /// Provider-side automatic cache discount: served-model cost with no
+    /// caching minus actual cost, clamped at 0 (a cache-write premium can make
+    /// the cached request *more* expensive; we never report negative savings).
+    pub provider_cache_saved_usd: f64,
+}
+
+impl CostBreakdown {
+    /// TokenTrimmer-attributed savings: baseline minus actual cost, minus the
+    /// provider-side cache discount (which TokenTrimmer did not cause).
+    ///
+    /// With no routing/caching by TT this is exactly 0 even when the provider
+    /// reports cached tokens. When a cache-write premium exceeds the read
+    /// discount (`provider_cache_saved_usd` clamped to 0), the premium reduces
+    /// the TT claim instead — conservative in TT's disfavor.
+    pub fn tt_saved_usd(&self) -> f64 {
+        (self.baseline_cost_usd - self.cost_usd - self.provider_cache_saved_usd).max(0.0)
+    }
+}
+
+/// Compute the [`CostBreakdown`] from token usage and pricing.
+///
+/// `pricing` is the served model's rate; `cost_usd` applies the
 /// cached-token discount when `usage.cached_tokens > 0`.
 ///
 /// `baseline_pricing` is the rate the request WOULD have paid without any
@@ -1943,14 +1986,23 @@ async fn insert_into_l2(
 /// model, callers pass the same pricing for both so the baseline reflects the
 /// served model's pre-discount cost. If `baseline_pricing` is `None`, it
 /// falls back to `pricing` (conservative: reports no routing saving).
+///
+/// Attribution note: provider-reported cache reads/writes are attributed to
+/// the *provider* side in full. For OpenAI/Gemini they are automatic. For
+/// Anthropic the gateway's adapter may have injected the `cache_control`
+/// breakpoint itself (long-system heuristic in
+/// `tt-provider-anthropic::translate`), but the usage that flows back carries
+/// no signal distinguishing TT-injected breakpoints from caller-driven reuse,
+/// so the whole class is conservatively credited to the provider rather than
+/// inflating the TT headline.
 pub(crate) fn compute_cost(
     usage: &Usage,
     pricing: Option<&ModelPricing>,
     baseline_pricing: Option<&ModelPricing>,
     fee_multiplier: f64,
-) -> (f64, f64) {
+) -> CostBreakdown {
     let Some(pricing) = pricing else {
-        return (0.0, 0.0);
+        return CostBreakdown::default();
     };
 
     // Token breakdown (no double-counting):
@@ -1986,6 +2038,14 @@ pub(crate) fn compute_cost(
         + (cache_write as f64) * write_rate / 1_000_000.0
         + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
 
+    // Served-model cost as if no provider caching had occurred: all prompt
+    // tokens at the full input rate. The delta against `cost_usd` is the
+    // provider's automatic cache discount (read discount net of any
+    // cache-write premium) — savings the provider grants with or without
+    // TokenTrimmer, so they are excluded from the TT-attributed figure.
+    let no_cache_cost_usd = (usage.prompt_tokens as f64) * pricing.input_per_million / 1_000_000.0
+        + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
+
     // Baseline: full input × input rate + output × output rate (no cache
     // discount), priced against the originally-requested model.
     let baseline_pricing = baseline_pricing.unwrap_or(pricing);
@@ -1993,15 +2053,15 @@ pub(crate) fn compute_cost(
         / 1_000_000.0
         + (usage.completion_tokens as f64) * baseline_pricing.output_per_million / 1_000_000.0;
 
-    // Apply the provider surcharge (e.g. OpenRouter's 5% BYOK fee) to both cost
-    // and baseline so saved_usd stays consistent (it scales by the same factor).
-    (
-        cost_usd * fee_multiplier,
-        baseline_cost_usd * fee_multiplier,
-    )
+    // Apply the provider surcharge (e.g. OpenRouter's 5% BYOK fee) to all
+    // figures so the saved splits stay consistent (same scale factor).
+    CostBreakdown {
+        cost_usd: cost_usd * fee_multiplier,
+        baseline_cost_usd: baseline_cost_usd * fee_multiplier,
+        provider_cache_saved_usd: ((no_cache_cost_usd - cost_usd) * fee_multiplier).max(0.0),
+    }
 }
 
-/// Insert all six required `X-TokenTrimmer-*` response headers.
 /// Run `fut` under an optional per-request deadline; on expiry return 408.
 pub(crate) async fn with_request_timeout<T>(
     timeout: Option<std::time::Duration>,
@@ -2029,25 +2089,35 @@ fn with_route_matched(mut resp: Response, name: Option<&str>) -> Response {
     resp
 }
 
+/// Insert all seven required `X-TokenTrimmer-*` response headers.
 pub(crate) fn attach_cost_headers(
     headers: &mut axum::http::HeaderMap,
     trace_id: Uuid,
     provider_id: &str,
     model_used: &str,
-    cost_usd: f64,
-    baseline_cost_usd: f64,
-    saved_usd: f64,
+    cost: &CostBreakdown,
 ) {
     let pairs: &[(&str, String)] = &[
         ("x-tokentrimmer-trace-id", trace_id.to_string()),
         ("x-tokentrimmer-provider", provider_id.to_string()),
         ("x-tokentrimmer-model-used", model_used.to_string()),
-        ("x-tokentrimmer-cost-usd", format!("{cost_usd:.6}")),
+        ("x-tokentrimmer-cost-usd", format!("{:.6}", cost.cost_usd)),
         (
             "x-tokentrimmer-baseline-cost-usd",
-            format!("{baseline_cost_usd:.6}"),
+            format!("{:.6}", cost.baseline_cost_usd),
         ),
-        ("x-tokentrimmer-saved-usd", format!("{saved_usd:.6}")),
+        // Strictly TokenTrimmer-attributed (routing / TT cache / failover) —
+        // excludes the provider's automatic prompt-cache discount, which is
+        // reported separately below so the headline survives invoice
+        // reconciliation.
+        (
+            "x-tokentrimmer-saved-usd",
+            format!("{:.6}", cost.tt_saved_usd()),
+        ),
+        (
+            "x-tokentrimmer-provider-cache-saved-usd",
+            format!("{:.6}", cost.provider_cache_saved_usd),
+        ),
     ];
 
     for (name, value) in pairs {
@@ -2169,6 +2239,8 @@ fn request_log_for_l1_hit(
         cached_tokens: entry.response.usage.cached_tokens as i32,
         cost_usd: 0.0,
         baseline_cost_usd: baseline,
+        // TT cache hit — no provider call, no provider-side discount.
+        provider_cache_saved_usd: 0.0,
         cached: true,
         cache_layer: Some("l1".into()),
         route_id,
@@ -2204,6 +2276,8 @@ fn request_log_for_l2_hit(
         cached_tokens: 0,
         cost_usd: 0.0,
         baseline_cost_usd,
+        // TT cache hit — no provider call, no provider-side discount.
+        provider_cache_saved_usd: 0.0,
         cached: true,
         cache_layer: Some("l2".into()),
         route_id,
@@ -2782,15 +2856,20 @@ mod fee_tests {
             cache_creation_input_tokens: None,
         };
         let p = flat_pricing();
-        let (cost, base) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
-        let (cost_fee, base_fee) = compute_cost(&usage, Some(&p), Some(&p), 1.05);
+        let bd = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        let bd_fee = compute_cost(&usage, Some(&p), Some(&p), 1.05);
         // 1M input @ $1/M = $1.00 with no fee.
-        assert!((cost - 1.0).abs() < 1e-9, "cost = {cost}");
+        assert!((bd.cost_usd - 1.0).abs() < 1e-9, "cost = {}", bd.cost_usd);
         // OpenRouter's 5% BYOK fee scales cost and baseline by 1.05.
-        assert!((cost_fee - 1.05).abs() < 1e-9, "cost_fee = {cost_fee}");
         assert!(
-            (base_fee - base * 1.05).abs() < 1e-12,
-            "base_fee = {base_fee}"
+            (bd_fee.cost_usd - 1.05).abs() < 1e-9,
+            "cost_fee = {}",
+            bd_fee.cost_usd
+        );
+        assert!(
+            (bd_fee.baseline_cost_usd - bd.baseline_cost_usd * 1.05).abs() < 1e-12,
+            "base_fee = {}",
+            bd_fee.baseline_cost_usd
         );
     }
 }
@@ -2856,8 +2935,8 @@ mod cache_write_rate_tests {
             cached_tokens: 0,
             cache_creation_input_tokens: None, // same tokens, no write bucket
         };
-        let (cost_write, _) = compute_cost(&usage_write, Some(&p), Some(&p), 1.0);
-        let (cost_base, _) = compute_cost(&usage_base, Some(&p), Some(&p), 1.0);
+        let cost_write = compute_cost(&usage_write, Some(&p), Some(&p), 1.0).cost_usd;
+        let cost_base = compute_cost(&usage_base, Some(&p), Some(&p), 1.0).cost_usd;
         assert!(
             cost_write > cost_base,
             "write-premium cost ({cost_write}) must exceed base-input cost ({cost_base})"
@@ -2880,7 +2959,7 @@ mod cache_write_rate_tests {
             cached_tokens: 0,
             cache_creation_input_tokens: Some(1_000_000),
         };
-        let (cost, _) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
         assert!(
             (cost - 3.0).abs() < 1e-9,
             "1M cache_write with no write-rate @ $3.00/M = $3.00, got {cost}"
@@ -2899,7 +2978,7 @@ mod cache_write_rate_tests {
             cached_tokens: 1_000_000,
             cache_creation_input_tokens: None,
         };
-        let (cost, _) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
         assert!(
             (cost - 0.30).abs() < 1e-9,
             "1M cache_read @ $0.30/M = $0.30, got {cost}"
@@ -2920,11 +2999,153 @@ mod cache_write_rate_tests {
             cached_tokens: 300_000,
             cache_creation_input_tokens: Some(300_000),
         };
-        let (cost, _) = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
         let expected = (400_000.0 * 3.0 + 300_000.0 * 0.30 + 300_000.0 * 3.75) / 1_000_000.0;
         assert!(
             (cost - expected).abs() < 1e-9,
             "expected {expected}, got {cost}"
+        );
+    }
+}
+
+/// Tests for the provider-cache / TT-savings attribution split (P0 #12).
+///
+/// Rule: `saved_usd` (the headline) contains ONLY TokenTrimmer-caused savings;
+/// the provider's automatic prompt-cache discount is reported separately as
+/// `provider_cache_saved_usd` so the headline survives invoice reconciliation.
+#[cfg(test)]
+mod provider_cache_attribution_tests {
+    use super::*;
+
+    /// $3/$15 with a $0.30 cache-read discount and $3.75 write premium.
+    fn pricing() -> ModelPricing {
+        ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+            cached_input_per_million: Some(0.30),
+            cache_write_per_million: Some(3.75),
+            effective_at: Utc::now(),
+        }
+    }
+
+    /// Provider-reported cached tokens with NO TT optimization (same pricing
+    /// for served and baseline — no routing, no TT cache): saved_usd == 0 and
+    /// the provider-side discount is positive.
+    #[test]
+    fn provider_cached_tokens_without_tt_optimization_yield_zero_tt_saved() {
+        let p = pricing();
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 500_000,
+            cache_creation_input_tokens: None,
+        };
+        let bd = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        // Actual bill: 500K fresh @ $3/M + 500K read @ $0.30/M = $1.65.
+        assert!((bd.cost_usd - 1.65).abs() < 1e-9, "cost = {}", bd.cost_usd);
+        // No-cache cost == baseline: 1M @ $3/M = $3.00.
+        assert!(
+            (bd.baseline_cost_usd - 3.0).abs() < 1e-9,
+            "baseline = {}",
+            bd.baseline_cost_usd
+        );
+        // The whole discount belongs to the provider…
+        assert!(
+            (bd.provider_cache_saved_usd - 1.35).abs() < 1e-9,
+            "provider_cache_saved = {}",
+            bd.provider_cache_saved_usd
+        );
+        // …and TT claims nothing.
+        assert!(
+            bd.tt_saved_usd().abs() < 1e-12,
+            "tt_saved must be 0 with no TT optimization; got {}",
+            bd.tt_saved_usd()
+        );
+    }
+
+    /// Routing savings (cheaper served model) remain TT-attributed and exclude
+    /// the provider's cache discount: tt_saved == baseline − served-model
+    /// no-cache cost.
+    #[test]
+    fn routing_saving_excludes_provider_cache_discount() {
+        let served = pricing(); // $3/$15
+        let requested = ModelPricing {
+            input_per_million: 10.0,
+            output_per_million: 30.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            effective_at: Utc::now(),
+        };
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 500_000,
+            cache_creation_input_tokens: None,
+        };
+        let bd = compute_cost(&usage, Some(&served), Some(&requested), 1.0);
+        // Baseline (requested model, no discount): $10.00.
+        // Served no-cache cost: $3.00 → TT routing saving = $7.00.
+        // Provider discount on the served model: $3.00 − $1.65 = $1.35.
+        assert!(
+            (bd.tt_saved_usd() - 7.0).abs() < 1e-9,
+            "tt_saved = {}",
+            bd.tt_saved_usd()
+        );
+        assert!(
+            (bd.provider_cache_saved_usd - 1.35).abs() < 1e-9,
+            "provider_cache_saved = {}",
+            bd.provider_cache_saved_usd
+        );
+        // The two splits add up to the full apparent saving.
+        let apparent = bd.baseline_cost_usd - bd.cost_usd;
+        assert!(
+            (bd.tt_saved_usd() + bd.provider_cache_saved_usd - apparent).abs() < 1e-9,
+            "splits must sum to baseline − cost"
+        );
+    }
+
+    /// A cache-write premium that exceeds the read discount must not produce a
+    /// negative provider figure, and the excess must not inflate the TT claim.
+    #[test]
+    fn write_premium_dominating_clamps_provider_saved_at_zero() {
+        let p = pricing();
+        // All 1M prompt tokens are cache writes @ $3.75/M = $3.75 — more
+        // expensive than the $3.00 no-cache cost.
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 0,
+            cache_creation_input_tokens: Some(1_000_000),
+        };
+        let bd = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        assert_eq!(
+            bd.provider_cache_saved_usd, 0.0,
+            "never report a negative provider-side saving"
+        );
+        // cost ($3.75) > baseline ($3.00) → TT saving clamps at 0 too.
+        assert_eq!(bd.tt_saved_usd(), 0.0);
+    }
+
+    /// The fee multiplier scales the provider-side figure consistently with
+    /// cost and baseline.
+    #[test]
+    fn fee_multiplier_scales_provider_cache_saved() {
+        let p = pricing();
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 500_000,
+            cache_creation_input_tokens: None,
+        };
+        let base = compute_cost(&usage, Some(&p), Some(&p), 1.0);
+        let scaled = compute_cost(&usage, Some(&p), Some(&p), 1.05);
+        assert!(
+            (scaled.provider_cache_saved_usd - base.provider_cache_saved_usd * 1.05).abs() < 1e-9,
+            "provider_cache_saved must scale by the fee multiplier"
         );
     }
 }

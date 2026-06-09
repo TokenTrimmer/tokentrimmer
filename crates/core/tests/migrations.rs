@@ -81,6 +81,21 @@ fn migrator_includes_cache_baseline_cost_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_provider_cache_saved_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let eleventh = migrations
+        .iter()
+        .find(|m| m.version == 11)
+        .expect("migration version 11 not found");
+    let desc = eleventh.description.to_lowercase();
+    assert!(
+        desc.contains("provider") || desc.contains("cache"),
+        "migration 0011 description is '{}', expected to mention provider/cache",
+        eleventh.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
