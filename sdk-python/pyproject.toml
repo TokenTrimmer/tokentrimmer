@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Thin wrapper around the OpenAI Python SDK that routes through TokenTrimmer Gateway."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Apache-2.0" }
+license = { file = "LICENSE" }
 authors = [{ name = "TokenTrimmer Contributors" }]
 keywords = ["llm", "openai", "anthropic", "gateway", "cost-optimization"]
 classifiers = [
@@ -40,4 +40,4 @@ Documentation = "https://docs.tokentrimmer.com"
 packages = ["tokentrimmer"]
 
 [tool.hatch.build.targets.sdist]
-include = ["tokentrimmer/", "README.md", "pyproject.toml"]
+include = ["tokentrimmer/", "README.md", "LICENSE", "pyproject.toml"]
