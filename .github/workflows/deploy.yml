@@ -103,10 +103,12 @@ jobs:
 
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
 
+      # TT_GIT_SHA is baked into the image (Dockerfile ARG) and surfaced as
+      # "git_sha" in /health, so deployed-sha-drift.yml can compare it to main.
       - name: Deploy gateway → tokentrimmer-staging
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.staging.toml
+        run: flyctl deploy --remote-only --config fly.staging.toml --build-arg TT_GIT_SHA=${{ github.sha }}
 
       - name: Post-deploy staging smoke (wake scale-to-zero, check /health)
         run: |
@@ -143,7 +145,7 @@ jobs:
       - name: Deploy gateway → tokentrimmer
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.toml
+        run: flyctl deploy --remote-only --config fly.toml --build-arg TT_GIT_SHA=${{ github.sha }}
 
       - name: Post-deploy prod smoke
         run: |
