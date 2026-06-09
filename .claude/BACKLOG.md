@@ -15,6 +15,25 @@ Single source of truth for actionable work. Entries are checkboxes; flip to `[x]
 
 ---
 
+## 🚦 GO-LIVE GATE (2026-06-09) — read before picking up ANY feature item
+
+**All new feature work is sequenced BEHIND the P0 launch blockers + the `beta-go-live-runbook` item below.** Per the 2026-06-09 comprehensive review (`/Users/iansimon/Developer/TokenTrimmer/COMPREHENSIVE_REVIEW_2026-06-09.md`, Section 12 "P0 — Launch blockers", 28 items): do not start, spec, or brainstorm new features until (a) every P0 launch blocker is merged/closed and (b) `beta-go-live-runbook` (P0, Audit follow-ups section below) is complete. That runbook item **is the gate**.
+
+Gated work — everything not on the P0 list, explicitly including:
+
+- Remaining G-series items in this file (e.g. `gw-traceparent-ingest`) and all other open P1–P3 backlog entries that aren't P0-tagged.
+- The review's Section 10.1–10.3 strategic ideas: Savings Recipes, be-the-node-in-other-builders (n8n node / MCP write-tools), Hosted Endpoints, Batch Lane, cache maximizer, sample-and-judge quality loop, batch/flex arbitrage, continuous advisor, L2 cache intelligence, learned router, OpenAI-compat fidelity v2, MCP Streamable HTTP migration, `/v1/responses` bridge, etc. These enter the backlog only after the gate clears.
+
+P0 sprint branches carrying the launch blockers (merge these first):
+
+- public: `p0/meta-release`, `p0/cli-fixes`, `p0/gateway-trust`
+- cloud: `p0/api-money-paths`, `p0/ci-supply-chain`, `p0/dashboard-trust-legal`
+- web: `p0/launch-copy`
+
+When the gate clears: delete this section, then resume normal priority order starting from the review's P1 list.
+
+---
+
 ## Post-F-series follow-ups (2026-06-06)
 
 Verified-open items remaining after the F1–F12 series + post-roadmap queue (#38–#41) closed out most of the prior "deferred" list. Each runs the full brainstorm→spec→plan→TDD→adversarial-review→green-CI→PR flow.
