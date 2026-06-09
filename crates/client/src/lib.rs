@@ -744,11 +744,7 @@ mod tests {
     fn inject_tools_adds_fields() {
         let mut body = json!({ "model": "m", "messages": [] });
         let tools = vec![tool("f", "desc", json!({"type":"object"}))];
-        inject_tools(
-            &mut body,
-            &tools,
-            Some(&ToolChoice::Auto("none".to_string())),
-        );
+        inject_tools(&mut body, &tools, Some(&ToolChoice::none()));
         assert_eq!(body["tools"][0]["function"]["name"], "f");
         assert_eq!(body["tool_choice"], "none");
 

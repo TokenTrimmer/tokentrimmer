@@ -233,6 +233,35 @@ pub enum ToolChoice {
     },
 }
 
+impl ToolChoice {
+    /// Let the model decide whether to call a tool (`"auto"`).
+    #[must_use]
+    pub fn auto() -> Self {
+        ToolChoice::Auto("auto".to_string())
+    }
+
+    /// Forbid tool calls — force a plain text answer (`"none"`).
+    #[must_use]
+    pub fn none() -> Self {
+        ToolChoice::Auto("none".to_string())
+    }
+
+    /// Require the model to call some tool (`"required"`).
+    #[must_use]
+    pub fn required() -> Self {
+        ToolChoice::Auto("required".to_string())
+    }
+
+    /// Require the model to call a specific named function.
+    #[must_use]
+    pub fn function(name: impl Into<String>) -> Self {
+        ToolChoice::Specific {
+            r#type: "function".to_string(),
+            function: ToolChoiceFunction { name: name.into() },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolChoiceFunction {
     pub name: String,
@@ -389,6 +418,28 @@ mod embeddings_default_tests {
         assert_eq!(
             parse_data_url("data:image/png;charset=utf-8;base64,iVBORw0KGgo="),
             Some(("image/png".to_string(), "iVBORw0KGgo=".to_string()))
+        );
+    }
+
+    #[test]
+    fn tool_choice_constructors_serialize_to_the_wire_form() {
+        // The string variants stay an untagged bare string …
+        assert_eq!(
+            serde_json::to_value(ToolChoice::auto()).unwrap(),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolChoice::none()).unwrap(),
+            serde_json::json!("none")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolChoice::required()).unwrap(),
+            serde_json::json!("required")
+        );
+        // … and `function(name)` produces the object form.
+        assert_eq!(
+            serde_json::to_value(ToolChoice::function("get_weather")).unwrap(),
+            serde_json::json!({ "type": "function", "function": { "name": "get_weather" } })
         );
     }
 }
