@@ -58,8 +58,14 @@ const MAX_TOKENS_PATTERNS: &[&str] = &[
 ];
 
 /// Return `true` when the file path indicates a test fixture.
+///
+/// Both the `tests/` (Rust/Python convention) and `test/` (common JS/TS
+/// convention, e.g. vitest/jest suites) directory names are recognized — test
+/// code legitimately omits `max_tokens` (e.g. to assert an SDK injects a
+/// default), and is not a production call site.
 fn is_test_fixture(path: &str) -> bool {
     path.contains("/tests/")
+        || path.contains("/test/")
         || path.contains("/should-detect/")
         || path.contains("/should-not-detect/")
 }
@@ -117,5 +123,41 @@ impl Rule for OutputNoMaxTokensRule {
         }
 
         findings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fixture_recognizes_tests_and_test_dirs() {
+        assert!(is_test_fixture("sdk-python/tests/test_client.py"));
+        assert!(is_test_fixture("sdk-typescript/test/client.test.ts"));
+        assert!(is_test_fixture("crates/x/tests/y.rs"));
+        // Production call sites are NOT fixtures.
+        assert!(!is_test_fixture("examples/python/cost_attribution.py"));
+        assert!(!is_test_fixture("src/index.ts"));
+    }
+
+    #[test]
+    fn rule_skips_calls_in_a_test_dir() {
+        // A bare `.create({...})` with no max_tokens would normally fire, but a
+        // `/test/` path is treated as a fixture and skipped.
+        let src = "client.chat.completions.create({ model: 'm', messages: [] });\n";
+        let r = OutputNoMaxTokensRule::new();
+        assert!(r
+            .check(
+                src,
+                Language::Typescript,
+                "sdk-typescript/test/client.test.ts"
+            )
+            .is_empty());
+        // The same call in a non-test path DOES fire.
+        assert_eq!(
+            r.check(src, Language::Typescript, "examples/typescript/x.ts")
+                .len(),
+            1
+        );
     }
 }

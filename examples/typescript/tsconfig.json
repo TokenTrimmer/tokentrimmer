@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@tokentrimmer/client": ["../../sdk-typescript/src/index.ts"],
+      "openai": ["../../sdk-typescript/node_modules/openai/index.d.ts"],
+      "openai/*": ["../../sdk-typescript/node_modules/openai/*.d.ts"]
+    },
+    "typeRoots": ["../../sdk-typescript/node_modules/@types"]
+  },
+  "include": ["*.ts"]
+}
