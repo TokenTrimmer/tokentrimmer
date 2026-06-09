@@ -48,6 +48,13 @@ pub struct AggregateCost {
     pub cost_usd: f64,
     pub saved_usd: f64,
     pub baseline_cost_usd: f64,
+    /// True when at least one round did NOT report a gateway baseline
+    /// (`x-tokentrimmer-baseline-cost-usd`) and its baseline was synthesized as
+    /// `cost + saved`. When set, [`savings_pct`](Self::savings_pct) blends real
+    /// and estimated baselines and should be treated as approximate — mirroring
+    /// how the single-shot [`ChatOutcome::savings_pct`] returns `None` on a
+    /// missing baseline rather than over-reporting precision.
+    pub baseline_estimated: bool,
 }
 
 impl AggregateCost {
@@ -56,10 +63,20 @@ impl AggregateCost {
         let saved = c.saved_usd.unwrap_or(0.0);
         self.cost_usd += cost;
         self.saved_usd += saved;
-        self.baseline_cost_usd += c.baseline_cost_usd.unwrap_or(cost + saved);
+        match c.baseline_cost_usd {
+            Some(b) => self.baseline_cost_usd += b,
+            None => {
+                self.baseline_cost_usd += cost + saved;
+                self.baseline_estimated = true;
+            }
+        }
     }
 
     /// `saved / baseline * 100`, or `None` when baseline is 0.
+    ///
+    /// Note: when [`baseline_estimated`](Self::baseline_estimated) is `true`, at
+    /// least one round's baseline was synthesized, so this percentage is
+    /// approximate (it blends real + estimated baselines).
     #[must_use]
     pub fn savings_pct(&self) -> Option<f64> {
         if self.baseline_cost_usd > 0.0 {
@@ -117,7 +134,7 @@ async fn send_round(
     cost_limit: Option<f64>,
 ) -> Result<(ChatCompletionResponse, CostInfo)> {
     let mut body = build_body(model, messages, max_tokens, temperature, false);
-    let none = ToolChoice::Auto("none".to_string());
+    let none = ToolChoice::none();
     let effective = if force_no_tools {
         Some(&none)
     } else {
@@ -258,9 +275,42 @@ impl ChatBuilder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{tool, user, Client};
+    use crate::{tool, user, Client, CostInfo};
     use httpmock::prelude::*;
     use serde_json::json;
+
+    fn cost(cost_usd: f64, saved_usd: f64, baseline: Option<f64>) -> CostInfo {
+        CostInfo {
+            cost_usd: Some(cost_usd),
+            saved_usd: Some(saved_usd),
+            baseline_cost_usd: baseline,
+            model_used: None,
+            provider: None,
+            trace_id: None,
+            cache: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_cost_flags_estimated_baseline_only_when_a_round_lacks_the_header() {
+        // All rounds report a real gateway baseline → exact.
+        let mut exact = AggregateCost::default();
+        exact.add(&cost(1.0, 1.0, Some(2.0)));
+        exact.add(&cost(1.0, 1.0, Some(2.0)));
+        assert!(!exact.baseline_estimated);
+        assert_eq!(exact.baseline_cost_usd, 4.0);
+
+        // One round lacks the baseline header → synthesized (cost+saved) + flagged.
+        let mut mixed = AggregateCost::default();
+        mixed.add(&cost(1.0, 1.0, Some(2.0))); // real 2.0
+        mixed.add(&cost(1.0, 0.5, None)); // synthesized 1.5
+        assert!(
+            mixed.baseline_estimated,
+            "missing header marks the aggregate estimated"
+        );
+        assert_eq!(mixed.baseline_cost_usd, 3.5);
+        assert!(mixed.savings_pct().is_some()); // still returns the approximate value
+    }
 
     struct Canned(&'static str);
     #[async_trait]
