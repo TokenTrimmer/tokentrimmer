@@ -10,6 +10,7 @@ client = TokenTrimmer(api_key=os.environ["TOKENTRIMMER_API_KEY"])
 stream = client.chat.completions.create(
     model="claude-haiku-4-5",
     messages=[{"role": "user", "content": "Count to five."}],
+    max_tokens=256,
     stream=True,
     stream_options={"include_usage": True},
 )

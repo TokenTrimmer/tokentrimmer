@@ -7,8 +7,8 @@ use tt_client::{user, Client};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = std::env::var("TOKENTRIMMER_API_KEY").unwrap_or_else(|_| "tt_test_local".into());
-    let base =
-        std::env::var("TOKENTRIMMER_BASE_URL").unwrap_or_else(|_| "https://api.tokentrimmer.com".into());
+    let base = std::env::var("TOKENTRIMMER_BASE_URL")
+        .unwrap_or_else(|_| "https://api.tokentrimmer.com".into());
     let client = Client::new(base, key);
 
     let outcome = client

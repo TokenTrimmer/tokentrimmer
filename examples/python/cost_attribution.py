@@ -9,6 +9,7 @@ client = TokenTrimmer(api_key=os.environ["TOKENTRIMMER_API_KEY"])
 resp = client.chat.completions.create(
     model="claude-haiku-4-5",
     messages=[{"role": "user", "content": "Say hello in five words."}],
+    max_tokens=256,
     tt_tag="example=cost-attribution",
     tt_cost_limit=0.05,
 )

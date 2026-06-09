@@ -12,6 +12,7 @@ client = TokenTrimmer(
 resp = client.chat.completions.create(
     model="claude-haiku-4-5",
     messages=[{"role": "user", "content": "Ping"}],
+    max_tokens=256,
     tt_cache="bypass",  # skip the cache for this request
 )
 print(resp.choices[0].message.content)

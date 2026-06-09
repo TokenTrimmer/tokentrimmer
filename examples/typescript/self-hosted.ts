@@ -9,6 +9,7 @@ const client = new TokenTrimmer({
 const res = (await client.chat.completions.create({
   model: 'claude-haiku-4-5',
   messages: [{ role: 'user', content: 'Ping' }],
+  max_tokens: 256,
   ttCache: 'bypass',
 } as never)) as WithTokenTrimmerMeta<ChatCompletion>;
 
