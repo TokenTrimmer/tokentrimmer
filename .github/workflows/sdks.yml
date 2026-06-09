@@ -1,0 +1,57 @@
+name: sdks
+
+on:
+  pull_request:
+    paths:
+      - 'sdk-python/**'
+      - 'sdk-typescript/**'
+      - 'examples/**'
+      - 'crates/client/**'
+      - '.github/workflows/sdks.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'sdk-python/**'
+      - 'sdk-typescript/**'
+      - 'examples/**'
+      - 'crates/client/**'
+      - '.github/workflows/sdks.yml'
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install -e "sdk-python[test]"
+      - name: Compile examples
+        run: python -m py_compile examples/python/*.py
+      - name: Test
+        run: cd sdk-python && python -m pytest tests/ -q
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install
+        run: cd sdk-typescript && npm install
+      - name: Typecheck SDK
+        run: cd sdk-typescript && npx tsc -p tsconfig.json --noEmit
+      - name: Test
+        run: cd sdk-typescript && npx vitest run
+      - name: Typecheck examples
+        run: cd examples/typescript && ../../sdk-typescript/node_modules/.bin/tsc -p tsconfig.json
+
+  rust-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build example
+        run: cargo build -p tt-client --example cost_attribution
