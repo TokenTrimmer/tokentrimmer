@@ -28,6 +28,11 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 # Now copy the source and build only what's not in the dep cache.
 COPY . .
+# Git SHA reported by `GET /health` (compile-time `option_env!("TT_GIT_SHA")`).
+# Inject with: docker build --build-arg TT_GIT_SHA=$(git rev-parse HEAD) ...
+# Declared after `cargo chef cook` so changing the SHA never busts the dep cache.
+ARG TT_GIT_SHA
+ENV TT_GIT_SHA=${TT_GIT_SHA}
 RUN cargo build --release -p tt-cli
 RUN strip /app/target/release/tt
 
