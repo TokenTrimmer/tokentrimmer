@@ -2,8 +2,10 @@
 
 Thin Python SDK over the official OpenAI client — routes through the TokenTrimmer Gateway, surfaces cost + cache metadata.
 
+> **Not yet on PyPI** — published packages land at launch. Until then, install from git:
+
 ```bash
-pip install tokentrimmer
+pip install "git+https://github.com/tokentrimmer/tokentrimmer.git#subdirectory=sdk-python"
 ```
 
 ```python

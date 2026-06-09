@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Model Context Protocol server exposing TokenTrimmer intelligence to MCP-compatible clients."
 
 [dependencies]
@@ -11,7 +12,7 @@ tt-shared.workspace = true
 tt-inspect-core.workspace = true
 tt-inspect-rules-tier1.workspace = true
 tt-plan-core.workspace = true
-tt-preview = { path = "../preview", optional = true }
+tt-preview = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

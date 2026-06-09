@@ -45,7 +45,8 @@ docker run -p 8080:8080 \
   ghcr.io/tokentrimmer/tt-cli:latest
 
 # Inspect a codebase
-cargo install tt-cli
+# (not yet on crates.io — published packages land at launch; install from git)
+cargo install --locked --git https://github.com/tokentrimmer/tokentrimmer tt-cli
 tt inspect ./my-project --fail-on=high
 ```
 

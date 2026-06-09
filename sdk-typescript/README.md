@@ -2,8 +2,13 @@
 
 Thin Node SDK over the official OpenAI client — routes through the TokenTrimmer Gateway, surfaces cost + cache metadata.
 
+> **Not yet on npm** — published packages land at launch. Until then (npm cannot
+> install a git subdirectory directly), build from a clone and install the local path:
+
 ```bash
-npm install @tokentrimmer/client
+git clone https://github.com/tokentrimmer/tokentrimmer.git
+(cd tokentrimmer/sdk-typescript && npm install && npm run build)
+npm install ./tokentrimmer/sdk-typescript
 ```
 
 ```ts

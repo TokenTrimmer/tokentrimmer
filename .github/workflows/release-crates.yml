@@ -1,0 +1,78 @@
+# Publishes `tt-cli` and its entire internal dependency chain to crates.io.
+#
+# Trigger: push a tag like `cli-v0.1.0` (tag version must match the workspace
+# crate versions — all crates currently version in lockstep at 0.1.0).
+#
+# Auth: requires the `CARGO_REGISTRY_TOKEN` repository secret — a crates.io
+# API token with publish-new + publish-update scope for the tt-* crates.
+#
+# Publish order: topological (dependencies first), derived from
+# `cargo metadata` over normal+build deps. `cargo publish` (>=1.66) blocks
+# until each crate is live in the sparse index, so the next publish in the
+# sequence can resolve it. Crates already published at the current version
+# are skipped so a failed run can be re-triggered and resume.
+#
+# tt-ts-types is `publish = false` (internal bindings emitter) and is the only
+# workspace crate excluded from this list.
+name: release-crates
+
+on:
+  push:
+    tags:
+      - 'cli-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Publish in topological order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Dependencies before dependents (see header comment).
+          crates=(
+            tt-shared
+            tt-telemetry
+            tt-auth
+            tt-cache
+            tt-client
+            tt-config
+            tt-tokenize
+            tt-provider-compat
+            tt-provider-openai
+            tt-provider-anthropic
+            tt-provider-gemini
+            tt-provider-groq
+            tt-provider-mistral
+            tt-provider-together
+            tt-provider-openrouter
+            tt-provider-local
+            tt-preview
+            tt-retrieval
+            tt-routing
+            tt-core
+            tt-inspect-core
+            tt-inspect-rules-tier1
+            tt-plan-core
+            tt-mcp
+            tt-cli
+          )
+          for crate in "${crates[@]}"; do
+            version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')"
+            if curl -fsSL "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null 2>&1; then
+              echo "--- ${crate}@${version} already on crates.io, skipping"
+              continue
+            fi
+            echo "--- publishing ${crate}@${version}"
+            cargo publish -p "$crate"
+          done

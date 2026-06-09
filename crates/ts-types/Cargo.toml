@@ -4,7 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Emits TypeScript bindings for shared wire types. Consumed by the cloud repo dashboard."
+# Internal tooling for the cloud-repo dashboard — never publish to crates.io.
+publish = false
 
 [dependencies]
 tt-shared.workspace = true

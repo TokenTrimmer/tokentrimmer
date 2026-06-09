@@ -122,31 +122,33 @@ include_dir = { version = "0.7", features = ["glob"] }
 dialoguer = "0.11"
 toml = "0.8"
 
-# Internal crate refs
+# Internal crate refs.
+# Every entry carries `version` alongside `path` so `cargo publish` can rewrite
+# the path deps into registry deps (required for the release-crates workflow).
 tt-shared = { path = "crates/shared", version = "0.1" }
-tt-tokenize = { path = "crates/tokenize" }
-tt-client = { path = "crates/client" }
-tt-core = { path = "crates/core" }
+tt-tokenize = { path = "crates/tokenize", version = "0.1" }
+tt-client = { path = "crates/client", version = "0.1" }
+tt-core = { path = "crates/core", version = "0.1" }
 tt-cache = { path = "crates/cache", version = "0.1" }
-tt-routing = { path = "crates/routing" }
+tt-routing = { path = "crates/routing", version = "0.1" }
 tt-auth = { path = "crates/auth", version = "0.1" }
 tt-telemetry = { path = "crates/telemetry", version = "0.1" }
-tt-config = { path = "crates/config" }
+tt-config = { path = "crates/config", version = "0.1" }
 tt-inspect-core = { path = "crates/inspect-core", version = "0.1" }
 tt-inspect-rules-tier1 = { path = "crates/inspect-rules-tier1", version = "0.1" }
 tt-plan-core = { path = "crates/plan-core", version = "0.1" }
-tt-provider-compat = { path = "crates/providers/compat" }
-tt-provider-openai = { path = "crates/providers/openai" }
-tt-provider-anthropic = { path = "crates/providers/anthropic" }
-tt-provider-gemini = { path = "crates/providers/gemini" }
-tt-provider-mistral = { path = "crates/providers/mistral" }
-tt-provider-groq = { path = "crates/providers/groq" }
-tt-provider-together = { path = "crates/providers/together" }
-tt-provider-openrouter = { path = "crates/providers/openrouter" }
-tt-provider-local = { path = "crates/providers/local" }
-tt-preview = { path = "crates/preview" }
-tt-mcp = { path = "crates/mcp" }
-tt-retrieval = { path = "crates/retrieval" }
+tt-provider-compat = { path = "crates/providers/compat", version = "0.1" }
+tt-provider-openai = { path = "crates/providers/openai", version = "0.1" }
+tt-provider-anthropic = { path = "crates/providers/anthropic", version = "0.1" }
+tt-provider-gemini = { path = "crates/providers/gemini", version = "0.1" }
+tt-provider-mistral = { path = "crates/providers/mistral", version = "0.1" }
+tt-provider-groq = { path = "crates/providers/groq", version = "0.1" }
+tt-provider-together = { path = "crates/providers/together", version = "0.1" }
+tt-provider-openrouter = { path = "crates/providers/openrouter", version = "0.1" }
+tt-provider-local = { path = "crates/providers/local", version = "0.1" }
+tt-preview = { path = "crates/preview", version = "0.1" }
+tt-mcp = { path = "crates/mcp", version = "0.1" }
+tt-retrieval = { path = "crates/retrieval", version = "0.1" }
 
 [profile.release]
 lto = "thin"
