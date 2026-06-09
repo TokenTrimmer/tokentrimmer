@@ -67,6 +67,10 @@ function parseMeta(headers: Headers): TokenTrimmerMeta {
   };
 }
 
+// Valid X-TokenTrimmer-Cache REQUEST-override values (API reference §6.1).
+// Distinct from the response cache-status values (hit-l1/hit-l2/neg-hit/...).
+const VALID_CACHE_OVERRIDES = new Set(['bypass', 'force-write', 'read-only', 'disabled']);
+
 export class TokenTrimmer extends OpenAI {
   constructor(options: ClientOptions = {}) {
     super({
@@ -74,13 +78,15 @@ export class TokenTrimmer extends OpenAI {
       baseURL: options.baseURL ?? DEFAULT_BASE_URL,
     });
 
-    // Wrap chat.completions.create to lift `ttTag` into the request header
-    // and attach `.tt` metadata to the parsed response.
     const originalCreate = this.chat.completions.create.bind(this.chat.completions);
-    // The OpenAI SDK uses overload-heavy signatures; we type-erase locally.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    this.chat.completions.create = (async (body: any, opts: any = {}) => {
-      const { ttTag, ...rest } = body ?? {};
+
+    // The OpenAI SDK's `create` is a heavily-overloaded method; assigning a
+    // replacement requires a localized cast at this boundary. Inside the
+    // wrapper we keep types explicit and only treat the request body as a
+    // loose record so we can read/move the `tt*` convenience fields.
+    const wrapped = async (body: Record<string, unknown>, opts: Record<string, unknown> = {}) => {
+      const { ttTag, ttCostLimit, ttCache, ...rest } = body ?? {};
+
       // Sensible default to prevent unbounded output. User-provided
       // max_tokens / max_completion_tokens / max_output_tokens win.
       if (
@@ -90,23 +96,39 @@ export class TokenTrimmer extends OpenAI {
       ) {
         rest.max_tokens = 4096;
       }
-      const headers = { ...(opts?.headers ?? {}) } as Record<string, string>;
-      if (typeof ttTag === 'string') {
-        headers['X-TokenTrimmer-Tag'] = ttTag;
+
+      const headers = { ...((opts.headers as Record<string, string>) ?? {}) };
+      if (typeof ttTag === 'string') headers['X-TokenTrimmer-Tag'] = ttTag;
+      if (ttCostLimit !== undefined && ttCostLimit !== null) {
+        headers['X-TokenTrimmer-Cost-Limit-Usd'] = String(Number(ttCostLimit));
       }
-      // Ask the OpenAI SDK to return raw response too, so we can read headers.
-      const { data, response } = await originalCreate(rest, {
-        ...opts,
-        headers,
-      }).withResponse();
-      const meta = parseMeta(response.headers);
-      // Attach .tt to the parsed body. Pydantic-equivalent strictness isn't a
-      // concern in JS — plain assignment works.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (data as any).tt = meta;
+      if (ttCache !== undefined && ttCache !== null) {
+        if (typeof ttCache !== 'string' || !VALID_CACHE_OVERRIDES.has(ttCache)) {
+          throw new Error(
+            `ttCache must be one of ${[...VALID_CACHE_OVERRIDES].join(', ')}; got ${String(ttCache)}`,
+          );
+        }
+        headers['X-TokenTrimmer-Cache'] = ttCache;
+      }
+      const callOpts = { ...opts, headers };
+
+      // Streaming: the cost headers describe the whole response, which isn't
+      // complete until the stream is drained. Return the SDK Stream untouched;
+      // do not call withResponse() or attach .tt.
+      if (rest.stream === true) {
+        // Cast originalCreate to a loose callable to avoid fighting overload
+        // resolution with loose Record args; this is the only non-boundary cast.
+        return (originalCreate as (b: unknown, o: unknown) => Promise<unknown>)(rest, callOpts);
+      }
+
+      const { data, response } = await (originalCreate as (b: unknown, o: unknown) => { withResponse(): Promise<{ data: unknown; response: Response }> })(rest, callOpts).withResponse();
+      (data as { tt?: TokenTrimmerMeta }).tt = parseMeta(response.headers);
       return data;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    }) as any;
+    };
+
+    // Localized cast: see comment above. This is the only `any` in the wrap.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.chat.completions.create = wrapped as any;
   }
 }
 
