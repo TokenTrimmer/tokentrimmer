@@ -10,7 +10,11 @@
 # `cargo metadata` over normal+build deps. `cargo publish` (>=1.66) blocks
 # until each crate is live in the sparse index, so the next publish in the
 # sequence can resolve it. Crates already published at the current version
-# are skipped so a failed run can be re-triggered and resume.
+# are skipped so a failed run can be re-triggered and resume. The skip check
+# queries the crates.io API with a descriptive User-Agent (the default curl UA
+# is rejected with 403 per crates.io's data-access policy) and branches on the
+# HTTP status: 200 = already published (skip), 404 = not published (publish),
+# anything else = hard error rather than risking a doomed publish attempt.
 #
 # tt-ts-types is `publish = false` (internal bindings emitter) and is the only
 # workspace crate excluded from this list.
@@ -77,13 +81,27 @@ jobs:
             tt-mcp
             tt-cli
           )
+          # crates.io rejects curl's default User-Agent with 403, so send a
+          # descriptive one (https://crates.io/data-access).
+          user_agent="tokentrimmer-release (github.com/TokenTrimmer/tokentrimmer)"
           for crate in "${crates[@]}"; do
             version="$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version')"
-            if curl -fsSL "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null 2>&1; then
-              echo "--- ${crate}@${version} already on crates.io, skipping"
-              continue
-            fi
+            http_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              --user-agent "$user_agent" \
+              "https://crates.io/api/v1/crates/${crate}/${version}")" || http_status="curl-failed"
+            case "$http_status" in
+              200)
+                echo "--- ${crate}@${version} already on crates.io, skipping"
+                continue
+                ;;
+              404)
+                ;;
+              *)
+                echo "::error::crates.io returned ${http_status} for ${crate}@${version}; cannot determine publish state, aborting"
+                exit 1
+                ;;
+            esac
             echo "--- publishing ${crate}@${version}"
             cargo publish -p "$crate"
           done
