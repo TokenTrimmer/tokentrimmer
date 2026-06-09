@@ -1,6 +1,6 @@
 name: inspect-self (dogfood)
 
-# Required check as of Week 14 — 10 P0 rules ship and the repo self-scans clean.
+# Required check — the 19 Tier-1 rules ship and the repo self-scans clean.
 # Any new HIGH or CRITICAL finding blocks merge to main.
 
 on:
