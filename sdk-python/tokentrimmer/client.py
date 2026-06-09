@@ -40,7 +40,7 @@ class TokenTrimmerMeta:
     cost_usd: Optional[float]
     baseline_cost_usd: Optional[float]
     saved_usd: Optional[float]
-    cache: Optional[str]  # "hit-l1" | "hit-l2" | "miss" | "none" | "sandbox" | "bypass"
+    cache: Optional[str]  # "hit-l1" | "hit-l2" | "neg-hit" | "miss" | "none" | "sandbox"
 
 
 def _parse_meta(headers: httpx.Headers) -> TokenTrimmerMeta:

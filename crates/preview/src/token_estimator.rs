@@ -11,6 +11,10 @@
 
 use crate::types::{EstimationConfidence, Message};
 
+/// Assumed output length when the caller gives no `max_tokens` — a typical
+/// short completion. Clamped to the model's real catalog max-output when known.
+const DEFAULT_OUTPUT_TOKENS: u32 = 512;
+
 pub struct EstimateResult {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -21,14 +25,34 @@ pub fn estimate(
     provider: &str,
     messages: &[Message],
     max_tokens_hint: Option<u32>,
+    model_max_output: Option<u32>,
 ) -> EstimateResult {
     let text = concat_message_text(messages);
     let est = tt_tokenize::estimate_input_tokens(provider, &text);
-    let output = max_tokens_hint.unwrap_or(512).min(4096);
+    let output = output_tokens(max_tokens_hint, model_max_output);
     EstimateResult {
         input_tokens: est.tokens,
         output_tokens: output,
         confidence: map_confidence(est.confidence),
+    }
+}
+
+/// Project the output-token count used for cost.
+///
+/// - An explicit `max_tokens` hint is the caller's stated ceiling and is
+///   honored. (It was previously capped at a hardcoded 4096, silently halving
+///   the projected output cost — the more expensive side, ~5× input — for any
+///   larger generation, which biased the headline preview number low.)
+/// - With no hint, assume [`DEFAULT_OUTPUT_TOKENS`].
+/// - Either way, clamp to the model's catalog `max_output_tokens` when known so
+///   the estimate never projects beyond what the model can actually emit. When
+///   the model is not in the catalog, the hint/default passes through uncapped
+///   (more honest than a fictitious fixed cap).
+fn output_tokens(max_tokens_hint: Option<u32>, model_max_output: Option<u32>) -> u32 {
+    let assumed = max_tokens_hint.unwrap_or(DEFAULT_OUTPUT_TOKENS);
+    match model_max_output {
+        Some(max) => assumed.min(max),
+        None => assumed,
     }
 }
 
@@ -72,7 +96,7 @@ mod tests {
 
     #[test]
     fn openai_uses_tiktoken_high_confidence() {
-        let est = estimate("openai", &[user("Hello, world.")], Some(100));
+        let est = estimate("openai", &[user("Hello, world.")], Some(100), None);
         assert!(est.input_tokens >= 1);
         assert!(matches!(est.confidence, EstimationConfidence::High));
         assert_eq!(est.output_tokens, 100);
@@ -80,7 +104,7 @@ mod tests {
 
     #[test]
     fn anthropic_uses_tiktoken() {
-        let est = estimate("anthropic", &[user("Hello, world.")], None);
+        let est = estimate("anthropic", &[user("Hello, world.")], None, None);
         assert!(est.input_tokens >= 1);
         assert!(matches!(est.confidence, EstimationConfidence::High));
         assert_eq!(est.output_tokens, 512); // default
@@ -88,16 +112,32 @@ mod tests {
 
     #[test]
     fn unknown_provider_uses_heuristic_medium() {
-        let est = estimate("gemini", &[user("abcdefgh")], None);
+        let est = estimate("gemini", &[user("abcdefgh")], None, None);
         // "abcdefgh\n" = 9 chars, ceil(9/4) = 3 tokens // fixup: \n appended per message
         assert_eq!(est.input_tokens, 3);
         assert!(matches!(est.confidence, EstimationConfidence::Medium));
     }
 
     #[test]
-    fn max_tokens_caps_output_at_4096() {
-        let est = estimate("openai", &[user("hi")], Some(99999));
-        assert_eq!(est.output_tokens, 4096);
+    fn explicit_hint_is_honored_when_model_max_unknown() {
+        // No catalog entry → the caller's stated ceiling passes through; the
+        // old hardcoded 4096 cap that silently halved this is gone.
+        let est = estimate("openai", &[user("hi")], Some(99999), None);
+        assert_eq!(est.output_tokens, 99999);
+    }
+
+    #[test]
+    fn output_is_clamped_to_model_max_when_known() {
+        // An over-large hint is clamped to what the model can actually emit.
+        let est = estimate("openai", &[user("hi")], Some(99999), Some(8192));
+        assert_eq!(est.output_tokens, 8192);
+    }
+
+    #[test]
+    fn default_output_is_clamped_to_small_model_max() {
+        // The 512 default is clamped down for a model whose max-output is below it.
+        let est = estimate("openai", &[user("hi")], None, Some(256));
+        assert_eq!(est.output_tokens, 256);
     }
 
     #[test]
@@ -106,7 +146,7 @@ mod tests {
             role: "user".into(),
             content: json!([{"type": "text", "text": "Hello"}, {"type": "text", "text": " world"}]),
         };
-        let est = estimate("gemini", &[m], None);
+        let est = estimate("gemini", &[m], None, None);
         assert!(est.input_tokens >= 2);
     }
 }

@@ -45,7 +45,7 @@ export interface TokenTrimmerMeta {
   costUsd: number | null;
   baselineCostUsd: number | null;
   savedUsd: number | null;
-  /** `'hit-l1' | 'hit-l2' | 'miss' | 'none' | 'sandbox' | 'bypass'` */
+  /** `'hit-l1' | 'hit-l2' | 'neg-hit' | 'miss' | 'none' | 'sandbox'` */
   cache: string | null;
 }
 
