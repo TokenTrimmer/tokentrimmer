@@ -2586,7 +2586,21 @@ mod cache_eligibility_tests {
 
 #[cfg(test)]
 mod credential_resolution_tests {
+    // The test below holds `ENV_LOCK` (a std Mutex serializing env-var
+    // access) across the awaited resolutions, so the env var stays stable
+    // for the duration of the calls. Only other test threads ever contend
+    // the lock, so there is no deadlock risk — the await-holding-lock lint
+    // does not apply. (Same pattern as the `middleware::retrieval` tests.)
+    #![allow(clippy::await_holding_lock)]
+
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// Process-wide lock that serializes tests which read/write
+    /// `OPENAI_API_KEY` so they cannot race each other in the multi-threaded
+    /// test runner.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// P0 #21 (fail-closed gateway): a gateway running WITHOUT a key store
     /// wires NO credential store at all, so an unverified caller (`org_id` is
@@ -2596,22 +2610,25 @@ mod credential_resolution_tests {
     /// guards the handler half: no store → bearer passthrough only.
     #[tokio::test]
     async fn unverified_caller_without_store_gets_bearer_passthrough_only() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         // Operator env key present in the process — must NOT be served.
         std::env::set_var("OPENAI_API_KEY", "sk-operator-do-not-serve");
         let state = AppState::with_default_providers();
-        assert!(state.credential_store.is_none(), "no store wired");
 
         let got = resolve_credentials(&state, Uuid::nil(), "openai", "sk-caller-own-key").await;
-        assert_eq!(got.api_key.expose(), "sk-caller-own-key");
-
         // Cross-provider resolution (routing rewrite) without a store also
         // never reaches env keys — bearer or nothing.
-        let got = resolve_credentials_for(&state, Uuid::nil(), "openai", "sk-caller-own-key", true)
-            .await
-            .expect("bearer fallback");
-        assert_eq!(got.api_key.expose(), "sk-caller-own-key");
+        let got_for =
+            resolve_credentials_for(&state, Uuid::nil(), "openai", "sk-caller-own-key", true).await;
 
+        // Clean up BEFORE asserting so a failed assert cannot leak the env
+        // var into the rest of this test binary.
         std::env::remove_var("OPENAI_API_KEY");
+
+        assert!(state.credential_store.is_none(), "no store wired");
+        assert_eq!(got.api_key.expose(), "sk-caller-own-key");
+        let got_for = got_for.expect("bearer fallback");
+        assert_eq!(got_for.api_key.expose(), "sk-caller-own-key");
     }
 }
 
