@@ -50,6 +50,7 @@ runs:
         tt --version
 
     - name: Run tt inspect
+      id: run
       shell: bash
       env:
         SCAN_PATH: ${{ inputs.path }}

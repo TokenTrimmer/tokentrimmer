@@ -33,7 +33,7 @@ That's it. The action runs `tt inspect` over your repo, writes a markdown report
 | `path` | `.` | Path to scan, relative to repo root. |
 | `fail-on` | `high` | Severity that fails the action. One of `low`, `medium`, `high`, `critical`. |
 | `output` | `(temp file)` | Write findings here. Use `.json` suffix for JSON. |
-| `token` | `''` | Optional TokenTrimmer hosted API key. When set, results upload to the hosted dashboard for trend tracking. Not required — Inspect runs fully local without one. |
+| `token` | `''` | Optional TokenTrimmer hosted API key. Reserved for hosted-dashboard upload (trend tracking) — **not yet wired; coming soon** once the hosted Inspect backend ships; supplying a token today is a no-op. Not required — Inspect runs fully local without one. |
 | `tt-version` | `latest` | `tt-cli` version to use. |
 
 ## Outputs

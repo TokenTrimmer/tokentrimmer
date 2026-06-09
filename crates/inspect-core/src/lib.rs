@@ -57,6 +57,24 @@ pub enum Language {
     Markdown,
 }
 
+impl Language {
+    /// Infer the source language from a file extension (no leading dot), or
+    /// `None` for an extension the engine does not scan.
+    ///
+    /// This is the single source of truth for the extension→language mapping,
+    /// shared by the directory [`walk`](crate::walk) and the single-file
+    /// `inspect_diff` MCP tool so the two cannot silently drift.
+    pub fn from_extension(ext: &str) -> Option<Language> {
+        match ext {
+            "py" => Some(Language::Python),
+            "ts" | "tsx" => Some(Language::Typescript),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Language::Javascript),
+            "md" => Some(Language::Markdown),
+            _ => None,
+        }
+    }
+}
+
 /// A single diagnostic emitted by a rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
@@ -90,4 +108,32 @@ pub trait Rule: Send + Sync {
     fn supported_languages(&self) -> &'static [Language];
     /// Analyse `source` (and optionally an AST) and return any findings.
     fn check(&self, source: &str, language: Language, path: &str) -> Vec<Finding>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_extension_maps_known_and_rejects_unknown() {
+        assert_eq!(Language::from_extension("py"), Some(Language::Python));
+        assert_eq!(Language::from_extension("ts"), Some(Language::Typescript));
+        assert_eq!(Language::from_extension("tsx"), Some(Language::Typescript));
+        assert_eq!(Language::from_extension("js"), Some(Language::Javascript));
+        assert_eq!(Language::from_extension("cjs"), Some(Language::Javascript));
+        assert_eq!(Language::from_extension("md"), Some(Language::Markdown));
+        // Unknown / extension-less → not scanned.
+        assert_eq!(Language::from_extension("txt"), None);
+        assert_eq!(Language::from_extension(""), None);
+        assert_eq!(Language::from_extension("rs"), None);
+    }
+
+    #[test]
+    fn language_serializes_lowercase() {
+        // inspect_diff echoes this back as `detected_language`.
+        assert_eq!(
+            serde_json::to_value(Language::Python).unwrap(),
+            serde_json::json!("python")
+        );
+    }
 }
