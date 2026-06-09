@@ -3,11 +3,15 @@
  *
  * Thin wrapper around the official `openai` Node SDK that:
  *   1. Defaults `baseURL` to the hosted Gateway.
- *   2. Lifts a convenience `ttTag` field on chat-completion calls into the
- *      `X-TokenTrimmer-Tag` header for per-feature cost attribution.
- *   3. Attaches a `.tt` accessor to each response carrying parsed
+ *   2. Lifts convenience fields on chat-completion calls into request headers:
+ *      `ttTag` → `X-TokenTrimmer-Tag` (per-feature cost attribution),
+ *      `ttCostLimit` → `X-TokenTrimmer-Cost-Limit-Usd` (gateway rejects with 402
+ *      if the estimated cost exceeds it), and `ttCache` → `X-TokenTrimmer-Cache`
+ *      (one of `bypass` / `force-write` / `read-only` / `disabled`).
+ *   3. Attaches a `.tt` accessor to each non-streaming response carrying parsed
  *      `X-TokenTrimmer-*` headers (cost, baseline, saved, cache, provider,
- *      model_used, trace_id).
+ *      model_used, trace_id). Streaming calls return the raw stream unchanged
+ *      (no `.tt`); read terminal `usage` off the final chunk.
  *
  * @example
  *
