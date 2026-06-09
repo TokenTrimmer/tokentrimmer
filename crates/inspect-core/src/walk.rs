@@ -98,13 +98,9 @@ pub fn walk(root: &Path) -> impl Iterator<Item = (PathBuf, Language)> {
             }
             let path = e.path().to_path_buf();
             let ext = path.extension()?.to_str()?;
-            let lang = match ext {
-                "py" => Language::Python,
-                "ts" | "tsx" => Language::Typescript,
-                "js" | "jsx" | "mjs" | "cjs" => Language::Javascript,
-                "md" => Language::Markdown,
-                _ => return None,
-            };
+            // Single source of truth for the extension→language mapping, shared
+            // with the inspect_diff single-file path (see Language::from_extension).
+            let lang = Language::from_extension(ext)?;
             Some((path, lang))
         })
 }

@@ -52,11 +52,26 @@ impl Tool for InspectDiffTool {
             .and_then(|x| x.to_str())
             .unwrap_or("");
         let ext = sanitize_ext(raw_ext);
-        let suffix = if ext.is_empty() {
-            String::new()
-        } else {
-            format!(".{ext}")
+
+        // Resolve the language the engine would assign this file up front. If
+        // it's one inspect doesn't scan, return an explicit reason rather than a
+        // bare empty findings list — otherwise the caller can't tell "clean"
+        // from "silently skipped because .txt isn't a scanned language". Uses
+        // the same source-of-truth mapping the directory walker uses.
+        let Some(lang) = tt_inspect_core::Language::from_extension(&ext) else {
+            return Ok(json!({
+                "findings": [],
+                "scanned": false,
+                "detected_language": Value::Null,
+                "reason": format!(
+                    "inspect does not scan '{}' — supported extensions: \
+                     .py, .ts/.tsx, .js/.jsx/.mjs/.cjs, .md",
+                    inp.file_path
+                ),
+            }));
         };
+
+        let suffix = format!(".{ext}");
         let mut tmp = tempfile::Builder::new()
             .suffix(&suffix)
             .tempfile()
@@ -69,13 +84,60 @@ impl Tool for InspectDiffTool {
             engine.add_rule(rule);
         }
         let findings = engine.scan(tmp.path());
-        Ok(json!({ "findings": findings }))
+        Ok(json!({
+            "findings": findings,
+            "scanned": true,
+            "detected_language": lang,
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_ext;
+    use super::{sanitize_ext, InspectDiffTool};
+    use crate::tools::Tool;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn unsupported_language_returns_reason_not_silent_empty() {
+        let out = InspectDiffTool
+            .call(json!({
+                "file_path": "notes.txt",
+                "proposed_content": "just some prose, not a scanned language"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["scanned"], json!(false));
+        assert_eq!(out["detected_language"], serde_json::Value::Null);
+        assert_eq!(out["findings"], json!([]));
+        assert!(
+            out["reason"].as_str().unwrap().contains("does not scan"),
+            "expected an explicit reason, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extensionless_path_is_reported_as_unsupported() {
+        let out = InspectDiffTool
+            .call(json!({ "file_path": "Makefile", "proposed_content": "all:\n\techo hi" }))
+            .await
+            .unwrap();
+        assert_eq!(out["scanned"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn supported_language_scans_and_echoes_detected_language() {
+        let out = InspectDiffTool
+            .call(json!({
+                "file_path": "mod.py",
+                "proposed_content": "x = 1\n"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["scanned"], json!(true));
+        assert_eq!(out["detected_language"], json!("python"));
+        assert!(out["findings"].is_array());
+    }
 
     #[test]
     fn sanitize_ext_keeps_simple_extensions() {
