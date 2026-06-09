@@ -2585,6 +2585,37 @@ mod cache_eligibility_tests {
 }
 
 #[cfg(test)]
+mod credential_resolution_tests {
+    use super::*;
+
+    /// P0 #21 (fail-closed gateway): a gateway running WITHOUT a key store
+    /// wires NO credential store at all, so an unverified caller (`org_id` is
+    /// nil — no `ApiKeyContext` was attached) must resolve to their own raw
+    /// Bearer key, never the operator's env-sourced provider keys. The env
+    /// store being unreachable is wiring (tested in the `tt` binary); this
+    /// guards the handler half: no store → bearer passthrough only.
+    #[tokio::test]
+    async fn unverified_caller_without_store_gets_bearer_passthrough_only() {
+        // Operator env key present in the process — must NOT be served.
+        std::env::set_var("OPENAI_API_KEY", "sk-operator-do-not-serve");
+        let state = AppState::with_default_providers();
+        assert!(state.credential_store.is_none(), "no store wired");
+
+        let got = resolve_credentials(&state, Uuid::nil(), "openai", "sk-caller-own-key").await;
+        assert_eq!(got.api_key.expose(), "sk-caller-own-key");
+
+        // Cross-provider resolution (routing rewrite) without a store also
+        // never reaches env keys — bearer or nothing.
+        let got = resolve_credentials_for(&state, Uuid::nil(), "openai", "sk-caller-own-key", true)
+            .await
+            .expect("bearer fallback");
+        assert_eq!(got.api_key.expose(), "sk-caller-own-key");
+
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+}
+
+#[cfg(test)]
 mod fee_tests {
     use super::*;
 

@@ -64,6 +64,11 @@ pub async fn middleware(
         if token.starts_with("tt_live_") {
             // No key store wired — dev mode, defer the "no auth configured"
             // decision to the route handler instead of 401-ing the request.
+            // SAFE because the gateway fails closed without a key store: boot
+            // refuses non-loopback binds (unless explicitly opted in) and
+            // wires no credential store, so this unverified pass-through can
+            // only forward the caller's own Bearer key upstream — never the
+            // operator's env provider keys (P0 #21, `tt gateway` boot).
             let Some(key_store) = state.key_store.as_ref() else {
                 return Ok(next.run(req).await);
             };

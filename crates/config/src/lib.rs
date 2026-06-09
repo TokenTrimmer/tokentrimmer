@@ -54,6 +54,10 @@ impl ConfigError {
 pub struct Config {
     /// TCP port the gateway binds. Defaults to 8080.
     pub port: u16,
+    /// IP address the gateway binds (`TT_BIND_ADDR`). `None` when unset —
+    /// the gateway then picks a default based on whether a key store is
+    /// configured (0.0.0.0 with one, loopback without).
+    pub bind_addr: Option<std::net::IpAddr>,
     /// Postgres connection string. `None` disables persistence at boot.
     pub database_url: Option<String>,
     /// Redis URL for the L1 exact-match cache. `None` disables L1.
@@ -80,8 +84,20 @@ impl Config {
             Err(_) => 8080,
         };
 
+        let bind_addr = match opt("TT_BIND_ADDR") {
+            Some(v) => Some(
+                v.parse::<std::net::IpAddr>()
+                    .map_err(|e| ConfigError::Parse {
+                        var: "TT_BIND_ADDR",
+                        reason: e.to_string(),
+                    })?,
+            ),
+            None => None,
+        };
+
         Ok(Self {
             port,
+            bind_addr,
             database_url: opt("DATABASE_URL"),
             redis_url: opt("REDIS_URL"),
             sentry_dsn: opt("SENTRY_DSN"),
@@ -133,5 +149,43 @@ mod tests {
             other => panic!("expected Parse, got {other:?}"),
         }
         std::env::remove_var("PORT");
+    }
+
+    #[test]
+    fn bind_addr_unset_is_none() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("TT_BIND_ADDR");
+        let cfg = Config::from_env().expect("defaults must load");
+        assert!(cfg.bind_addr.is_none());
+    }
+
+    #[test]
+    fn bind_addr_parses_v4_and_v6() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TT_BIND_ADDR", "127.0.0.1");
+        let cfg = Config::from_env().expect("valid v4 must load");
+        assert_eq!(
+            cfg.bind_addr,
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        std::env::set_var("TT_BIND_ADDR", "::1");
+        let cfg = Config::from_env().expect("valid v6 must load");
+        assert_eq!(
+            cfg.bind_addr,
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+        std::env::remove_var("TT_BIND_ADDR");
+    }
+
+    #[test]
+    fn invalid_bind_addr_returns_parse_error() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TT_BIND_ADDR", "not-an-ip");
+        let err = Config::from_env().expect_err("invalid bind addr must fail");
+        match err {
+            ConfigError::Parse { var, .. } => assert_eq!(var, "TT_BIND_ADDR"),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+        std::env::remove_var("TT_BIND_ADDR");
     }
 }
