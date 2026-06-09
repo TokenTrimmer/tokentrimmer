@@ -14,7 +14,7 @@
 All in `crates/cli/src/account/mod.rs` (the store/validate seam already exists from V0). The current `login_with_token` (which bails "browser login arrives in V2") becomes `login(token, base_url, no_browser)`.
 
 ### `crates/cli/src/account/mod.rs`
-- `const DASHBOARD_KEYS_URL: &str = "https://app.tokentrimmer.com/keys";` — the dashboard page that mints keys (the code's existing "get a key at app.tokentrimmer.com" message). One-line constant if the route differs.
+- `const DASHBOARD_KEYS_URL: &str = "https://dashboard.tokentrimmer.com/keys";` — the dashboard page that mints keys (the code's existing "get a key at dashboard.tokentrimmer.com" message). One-line constant if the route differs.
 - **`browser_command_for(os: &str, url: &str) -> Option<(&'static str, Vec<String>)>`** (pure, tested): `macos → ("open", [url])`, `linux → ("xdg-open", [url])`, `windows → ("cmd", ["/C", "start", "", url])` (the empty title arg keeps `start` happy with a URL), else `None`.
 - **`fn open_browser(url) -> bool`**: `browser_command_for(std::env::consts::OS, url)` → spawn (`Command::status`/`spawn`); `true` iff it launched. Integration.
 - **`fn store_key(raw: &str, base_url: Option<String>) -> Result<()>`** (extracted from the current body): `tt_mcp::auth::validate_api_key` → `store::save_credentials` → optional `store::save_config` → the `ui::success("Logged in. Stored …")` line. Shared by both login paths.
