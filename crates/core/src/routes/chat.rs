@@ -1,19 +1,19 @@
 //! `POST /v1/chat/completions` — OpenAI-compatible chat completion.
 //!
-//! Dispatch pipeline:
-//!   1. Resolve provider from `request.model` via the registry.
-//!   2. Build a synthetic [`RequestContext`] (real auth lands in Week 7).
-//!   3. For `stream: false` (Week 12 +): try L2 semantic cache lookup; on hit
-//!      return the cached response with `X-TokenTrimmer-Cache: hit-l2`.
-//!   4. Otherwise dispatch to provider, then best-effort insert into L2 cache.
-//!   5. For `stream: true`: dispatch streaming directly (fake-stream from
-//!      cache is `w7-fake-stream-cache`, blocked).
+//! Request pipeline (see the numbered steps in `handler`):
+//!   1. Resolve the provider from `request.model`; 404 on an unknown model.
+//!   2. Authenticate (bearer key → `ApiKeyContext`), resolve the org's upstream
+//!      credentials, apply the routing engine (may rewrite `req.model`), honor
+//!      an explicit provider pin, and compute the per-request cache behavior.
+//!   3. Non-streaming: try the negative cache, then L1 exact-match, then the L2
+//!      semantic cache; on a miss, single-flight-coalesce and dispatch to the
+//!      provider (with cross-provider failover), then best-effort insert into
+//!      L1 + L2 and write a `request_logs` row.
+//!      Streaming: dispatch directly (failover only on initial establishment).
+//!   4. Stamp the `X-TokenTrimmer-*` response headers (cost, cache state,
+//!      provider, model, route-matched, warnings).
 //!
-//! Deferred:
-//!   - Real auth middleware populating `RequestContext` org_id (W7).
-//!   - Routing rule engine (W4).
-//!   - L1 exact-match lookup (W7 cache middleware).
-//!   - Telemetry / audit row write (W7 telemetry pipeline).
+//! `tt_test_*` keys short-circuit to a deterministic sandbox response (step 2a).
 
 use std::time::{Duration, Instant};
 
