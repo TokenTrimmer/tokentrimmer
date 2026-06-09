@@ -581,11 +581,16 @@ async fn try_l1_hit(
 /// `Some(Err(_))` preserves the original `build_hit_l2_response(...)?` error
 /// propagation (a hit whose body fails to deserialize). Best-effort on the
 /// embed/lookup side: those errors are treated as a miss.
+///
+/// `current_pricing` is the catalog rate for `req.model` (== the entry's
+/// model — lookup filters on it), used only as the [`l2_entry_baseline`]
+/// fallback for rows that predate migration 0010.
 #[allow(clippy::too_many_arguments)]
 async fn try_l2_hit(
     l2: &L2Config,
     ctx: &RequestContext,
     req: &ChatCompletionRequest,
+    current_pricing: Option<&ModelPricing>,
     request_log_writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
     trace_id: Uuid,
     request_started: Instant,
@@ -613,12 +618,22 @@ async fn try_l2_hit(
                 .increment(1);
             // Cache hit — best-effort bump and return.
             let _ = l2.cache.bump_hit_count(entry.id).await;
+            // Resolve the baseline ONCE so the response headers and the
+            // request_logs row report the same figure.
+            let baseline_cost_usd = l2_entry_baseline(&entry, current_pricing);
             spawn_request_log(
                 request_log_writer,
-                request_log_for_l2_hit(&entry, ctx, trace_id, request_started, matched_route_id),
+                request_log_for_l2_hit(
+                    &entry,
+                    ctx,
+                    trace_id,
+                    request_started,
+                    matched_route_id,
+                    baseline_cost_usd,
+                ),
             );
             Some(
-                build_hit_l2_response(entry, similarity, trace_id)
+                build_hit_l2_response(entry, similarity, trace_id, baseline_cost_usd)
                     .map(|resp| with_route_matched(resp, route_matched_name)),
             )
         }
@@ -1139,10 +1154,15 @@ pub async fn handler(
         // 3b. L2 semantic cache. Gated additionally on l2_allowed.
         if cache_behavior.do_lookup && l2_allowed {
             if let Some(l2) = state.l2.as_ref() {
+                // Current catalog rate for the (post-routing) request model —
+                // the legacy-row fallback in `l2_entry_baseline`. The entry's
+                // model always equals `req.model` here (lookup filters on it).
+                let current_pricing = provider.pricing(&req.model);
                 if let Some(result) = try_l2_hit(
                     l2,
                     &ctx,
                     &req,
+                    current_pricing.as_ref(),
                     state.request_log_writer.as_ref(),
                     trace_id,
                     request_started,
@@ -1482,6 +1502,12 @@ pub async fn handler(
                         caller_tier,
                         L2_DEFAULT_TTL.as_secs(),
                     );
+                    // Store the catalog-derived baseline on the row so later
+                    // hits report honest savings. None (→ NULL) when the model
+                    // is absent from the catalog: the hit path then re-prices
+                    // against the catalog current at hit time instead of
+                    // freezing a meaningless $0.
+                    let l2_baseline = pricing.as_ref().map(|_| baseline_cost_usd);
                     tokio::spawn(async move {
                         insert_into_l2(
                             l2_clone,
@@ -1491,6 +1517,7 @@ pub async fn handler(
                             l2_provider_id,
                             l2_model_used,
                             l2_ttl_secs,
+                            l2_baseline,
                         )
                         .await;
                     });
@@ -1713,19 +1740,19 @@ fn synthetic_baseline_from_usage(usage: &Usage) -> f64 {
 
 /// Build the response for an L2 cache hit. Re-deserializes the cached body
 /// and stamps the standard X-TokenTrimmer-* headers, with `Cache: hit-l2`.
+/// `baseline_cost_usd` is the catalog-derived baseline resolved by
+/// [`l2_entry_baseline`].
 fn build_hit_l2_response(
     entry: CacheEntry,
     _similarity: f32,
     trace_id: Uuid,
+    baseline_cost_usd: f64,
 ) -> ApiResult<Response> {
     let response: ChatCompletionResponse = serde_json::from_slice(&entry.response)
         .map_err(|e| ApiError::Internal(format!("l2 cache deserialize: {e}")))?;
 
     // Cost is zero on cache hit (no provider call). Baseline reflects what the
     // request would have cost without our cache.
-    // Use the cached response's own pricing-derivable usage to fill baseline —
-    // the model field on the entry is the provider model that originally served it.
-    let baseline_cost_usd = synthetic_baseline_from_entry(&entry);
     let saved_usd = baseline_cost_usd; // 100% savings on a clean hit
 
     let provider_id = "cache".to_string();
@@ -1800,18 +1827,39 @@ fn sandbox_response(req: &ChatCompletionRequest, trace_id_str: &str) -> Response
     http_response
 }
 
-/// Reconstruct a rough baseline cost for a cached entry. We don't have the
-/// pricing table for `entry.model` here (no Provider reference), so use a
-/// conservative default that produces non-zero savings without claiming more
-/// than the cached call would have actually cost. This is a placeholder until
-/// the L2 row carries its own original cost in a later schema migration.
-fn synthetic_baseline_from_entry(entry: &CacheEntry) -> f64 {
-    // Default to $1/M input, $2/M output — within an order of magnitude of
-    // most chat models. Conservative; real per-model pricing is wired when
-    // the L2 schema gains a `baseline_cost_usd` column.
-    let input = entry.input_tokens as f64 * 1.0 / 1_000_000.0;
-    let output = entry.output_tokens as f64 * 2.0 / 1_000_000.0;
-    input + output
+/// Baseline cost (USD) an L2 hit avoided — the figure `saved_usd` is computed
+/// from (cost on a hit is zero, so saved == baseline).
+///
+/// Resolution order (truth over flattery — never fabricate a number):
+///
+/// 1. The baseline stored on the row at insert time (migration 0010+),
+///    computed from the versioned pricing catalog by [`compute_cost`] on the
+///    original miss. Authoritative: it reflects the catalog rates in force
+///    when the response was actually produced.
+/// 2. Rows predating the migration carry `None`, but still store the chat
+///    model and exact token counts — so re-price those against the CURRENT
+///    catalog (`current_pricing` is the registry's rate for the entry's
+///    model, which equals the request's post-routing model because
+///    `L2Cache::lookup` filters on it). Same shape as [`compute_cost`]'s
+///    baseline arm: full input at the input rate + output at the output
+///    rate, no cache discount. The provider fee multiplier is deliberately
+///    NOT applied — slightly under-reporting beats overstating savings for
+///    legacy rows.
+/// 3. Model absent from the catalog: report 0 saved rather than invent a
+///    rate (the old hardcoded $1/M·$2/M placeholder overstated savings
+///    ~6.7x for cheap models and understated 15x+ for expensive ones).
+fn l2_entry_baseline(entry: &CacheEntry, current_pricing: Option<&ModelPricing>) -> f64 {
+    if let Some(stored) = entry.baseline_cost_usd {
+        return stored;
+    }
+    match current_pricing {
+        Some(p) => {
+            (entry.input_tokens as f64 * p.input_per_million
+                + entry.output_tokens as f64 * p.output_per_million)
+                / 1_000_000.0
+        }
+        None => 0.0,
+    }
 }
 
 /// Background L2 insert. Swallows errors with a tracing log — never blocks
@@ -1820,6 +1868,13 @@ fn synthetic_baseline_from_entry(entry: &CacheEntry) -> f64 {
 /// `ttl_secs` is the pre-resolved TTL (already factoring in the tt_extras
 /// override and the caller's tier per spec §8.4 / rv-per-tier-ttl).
 /// The caller must call `effective_ttl_secs` before spawning this task.
+///
+/// `baseline_cost_usd` is the catalog-derived baseline the miss path computed
+/// via [`compute_cost`]; it is stored on the row so a later hit reports honest
+/// savings. `None` when the served model was absent from the pricing catalog —
+/// stored as NULL so the hit path re-prices against the catalog of THAT day
+/// (the model may have been added by then) instead of freezing a $0 figure.
+#[allow(clippy::too_many_arguments)]
 async fn insert_into_l2(
     l2: L2Config,
     org_id: Uuid,
@@ -1828,6 +1883,7 @@ async fn insert_into_l2(
     _provider_id: String,
     model_used: String,
     ttl_secs: u64,
+    baseline_cost_usd: Option<f64>,
 ) {
     let embedding_model = l2.embedder.model().to_string();
     let embed = match l2.embedder.embed(query_text).await {
@@ -1866,6 +1922,7 @@ async fn insert_into_l2(
         embedding_model,
         input_tokens: response.usage.prompt_tokens,
         output_tokens: response.usage.completion_tokens,
+        baseline_cost_usd,
         hit_count: 0,
         created_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
@@ -2125,15 +2182,16 @@ fn request_log_for_l1_hit(
     }
 }
 
-/// Build the `request_logs` row for an L2 cache hit.
+/// Build the `request_logs` row for an L2 cache hit. `baseline_cost_usd` is
+/// the catalog-derived baseline resolved by [`l2_entry_baseline`].
 fn request_log_for_l2_hit(
     entry: &CacheEntry,
     ctx: &RequestContext,
     trace_id: Uuid,
     request_started: Instant,
     route_id: Option<Uuid>,
+    baseline_cost_usd: f64,
 ) -> RequestLogRow {
-    let baseline = synthetic_baseline_from_entry(entry);
     RequestLogRow {
         id: Uuid::now_v7(),
         org_id: ctx.org_id,
@@ -2145,7 +2203,7 @@ fn request_log_for_l2_hit(
         output_tokens: entry.output_tokens as i32,
         cached_tokens: 0,
         cost_usd: 0.0,
-        baseline_cost_usd: baseline,
+        baseline_cost_usd,
         cached: true,
         cache_layer: Some("l2".into()),
         route_id,
@@ -2629,6 +2687,74 @@ mod credential_resolution_tests {
         assert_eq!(got.api_key.expose(), "sk-caller-own-key");
         let got_for = got_for.expect("bearer fallback");
         assert_eq!(got_for.api_key.expose(), "sk-caller-own-key");
+    }
+}
+
+#[cfg(test)]
+mod l2_baseline_tests {
+    use super::*;
+
+    fn entry(baseline_cost_usd: Option<f64>) -> CacheEntry {
+        CacheEntry {
+            id: Uuid::now_v7(),
+            org_id: Uuid::nil(),
+            embedding: vec![1.0, 0.0],
+            response: b"{}".to_vec(),
+            model: "gpt-4o-mini".into(),
+            embedding_model: "text-embedding-3-small".into(),
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            baseline_cost_usd,
+            hit_count: 0,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        }
+    }
+
+    fn pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing {
+            input_per_million: input,
+            output_per_million: output,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    /// The row's stored catalog baseline is authoritative — current pricing
+    /// must not override it.
+    #[test]
+    fn stored_baseline_wins_over_current_catalog() {
+        let e = entry(Some(0.0123));
+        let p = pricing(3.0, 6.0);
+        assert_eq!(l2_entry_baseline(&e, Some(&p)), 0.0123);
+        assert_eq!(l2_entry_baseline(&e, None), 0.0123);
+    }
+
+    /// A pre-migration row (NULL baseline) is re-priced against the current
+    /// catalog for its stored model/token counts.
+    #[test]
+    fn null_baseline_falls_back_to_current_catalog() {
+        let e = entry(None);
+        // gpt-4o-mini-class rates: $0.15/M input, $0.60/M output.
+        let p = pricing(0.15, 0.60);
+        let got = l2_entry_baseline(&e, Some(&p));
+        // 1M input × $0.15/M + 0.5M output × $0.60/M = 0.15 + 0.30 = 0.45.
+        assert!((got - 0.45).abs() < 1e-12, "expected 0.45, got {got}");
+        // Sanity: the old hardcoded $1/M·$2/M placeholder would have claimed
+        // $2.00 here — a ~4.4x overstatement for this cheap model.
+        assert!(
+            (got - 2.0).abs() > 1.0,
+            "must not be the placeholder figure"
+        );
+    }
+
+    /// NULL baseline AND no catalog entry for the model: report 0 saved —
+    /// never fabricate a rate.
+    #[test]
+    fn null_baseline_without_catalog_pricing_reports_zero() {
+        let e = entry(None);
+        assert_eq!(l2_entry_baseline(&e, None), 0.0);
     }
 }
 

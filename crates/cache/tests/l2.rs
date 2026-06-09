@@ -45,6 +45,7 @@ fn make_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         embedding_model: "mock-v1".to_string(),
         input_tokens: 10,
         output_tokens: 5,
+        baseline_cost_usd: None,
         hit_count: 0,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
@@ -61,6 +62,7 @@ fn make_expired_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         embedding_model: "mock-v1".to_string(),
         input_tokens: 10,
         output_tokens: 5,
+        baseline_cost_usd: None,
         hit_count: 0,
         created_at: Utc::now() - Duration::seconds(7200),
         expires_at: Utc::now() - Duration::seconds(1),
@@ -402,6 +404,7 @@ async fn l2_different_embedding_model_is_not_returned() {
         embedding_model: "mock-v1".to_string(),
         input_tokens: 1,
         output_tokens: 1,
+        baseline_cost_usd: None,
         hit_count: 0,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
@@ -526,6 +529,7 @@ async fn postgres_l2_round_trip() {
         embedding_model: "text-embedding-3-small".to_string(),
         input_tokens: 100,
         output_tokens: 50,
+        baseline_cost_usd: Some(0.000456),
         hit_count: 0,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
@@ -548,16 +552,65 @@ async fn postgres_l2_round_trip() {
         (sim - 1.0).abs() < 1e-4,
         "identical 1536-dim vectors → sim ≈ 1.0, got {sim}"
     );
+    // The catalog-derived baseline stored at insert must round-trip exactly —
+    // the gateway's hit path reports saved_usd from it (migration 0010).
+    assert_eq!(
+        found.baseline_cost_usd,
+        Some(0.000456),
+        "baseline_cost_usd must round-trip through Postgres"
+    );
 
     cache
         .bump_hit_count(entry_id)
         .await
         .expect("bump_hit_count should succeed");
 
-    // Clean up the test row.
-    sqlx::query("DELETE FROM cache_entries WHERE id = $1")
+    // A row without a baseline (legacy / model missing from catalog at
+    // insert) must round-trip as NULL → None so the hit path can apply its
+    // honest fallback.
+    let org_null = Uuid::new_v4();
+    let null_entry = CacheEntry {
+        id: Uuid::new_v4(),
+        org_id: org_null,
+        embedding: embedding.clone(),
+        response: serde_json::to_vec(&serde_json::json!({"object": "chat.completion"}))
+            .expect("serialize ok"),
+        model: "gpt-4o".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
+        input_tokens: 10,
+        output_tokens: 5,
+        baseline_cost_usd: None,
+        hit_count: 0,
+        created_at: Utc::now(),
+        expires_at: Utc::now() + Duration::seconds(3600),
+    };
+    let null_entry_id = null_entry.id;
+    cache
+        .insert(null_entry)
+        .await
+        .expect("Postgres insert (NULL baseline) should succeed");
+    let (found_null, _) = cache
+        .lookup(
+            org_null,
+            &embedding,
+            0.99,
+            "gpt-4o",
+            "text-embedding-3-small",
+        )
+        .await
+        .expect("Postgres lookup (NULL baseline) should succeed")
+        .expect("should find NULL-baseline entry");
+    assert_eq!(
+        found_null.baseline_cost_usd, None,
+        "NULL baseline_cost_usd must surface as None"
+    );
+
+    // Clean up the test rows.
+    let cleanup_pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    sqlx::query("DELETE FROM cache_entries WHERE id = $1 OR id = $2")
         .bind(entry_id)
-        .execute(&sqlx::PgPool::connect(&db_url).await.unwrap())
+        .bind(null_entry_id)
+        .execute(&cleanup_pool)
         .await
         .ok();
 }

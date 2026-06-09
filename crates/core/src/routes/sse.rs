@@ -599,6 +599,12 @@ pub fn stream_response(
                         let org_id_l2 = ins.org_id;
                         let provider_id_l2 = ins.provider_id.clone();
                         let model_l2 = ins.model.clone();
+                        // Store the catalog-derived baseline on the L2 row so
+                        // later hits report honest savings. None (→ NULL) when
+                        // the model is absent from the catalog: the hit path
+                        // then re-prices against the catalog current at hit
+                        // time instead of freezing a meaningless $0.
+                        let baseline_l2 = pricing.as_ref().map(|_| baseline_cost_usd);
                         tokio::spawn(async move {
                             stream_insert_into_l2(
                                 l2,
@@ -608,6 +614,7 @@ pub fn stream_response(
                                 provider_id_l2,
                                 model_l2,
                                 ttl_secs,
+                                baseline_l2,
                             )
                             .await;
                         });
@@ -682,6 +689,11 @@ fn partial_to_usage(u: &PartialUsage) -> Usage {
 /// Best-effort L2 insert for the streaming cache-write path.
 /// Mirrors `insert_into_l2` in `chat.rs` but lives here so the DropGuard
 /// closure can call it without crossing module boundaries.
+///
+/// `baseline_cost_usd` is the catalog-derived baseline the stream's guard
+/// computed via `compute_cost`; stored on the row so later hits report honest
+/// savings. `None` (→ NULL) when the model was absent from the catalog.
+#[allow(clippy::too_many_arguments)]
 async fn stream_insert_into_l2(
     l2: L2Config,
     org_id: Uuid,
@@ -690,6 +702,7 @@ async fn stream_insert_into_l2(
     _provider_id: String,
     model_used: String,
     ttl_secs: u64,
+    baseline_cost_usd: Option<f64>,
 ) {
     let embedding_model = l2.embedder.model().to_string();
     let embed = match l2.embedder.embed(query_text).await {
@@ -717,6 +730,7 @@ async fn stream_insert_into_l2(
         embedding_model,
         input_tokens: response.usage.prompt_tokens,
         output_tokens: response.usage.completion_tokens,
+        baseline_cost_usd,
         hit_count: 0,
         created_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),

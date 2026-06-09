@@ -66,6 +66,21 @@ fn migrator_includes_plan_runs_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_cache_baseline_cost_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let tenth = migrations
+        .iter()
+        .find(|m| m.version == 10)
+        .expect("migration version 10 not found");
+    let desc = tenth.description.to_lowercase();
+    assert!(
+        desc.contains("baseline") || desc.contains("cost"),
+        "migration 0010 description is '{}', expected to mention baseline/cost",
+        tenth.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
