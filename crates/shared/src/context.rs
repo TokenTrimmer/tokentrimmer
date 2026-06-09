@@ -10,11 +10,11 @@ use uuid::Uuid;
 /// tier-resolution layer.
 ///
 /// The tier drives cache TTL selection per spec §8.4 (24h / 7d / 30d bands).
-/// The `tier` field on [`crate::context::RequestContext`] and on
-/// `tt_auth::ApiKeyContext` is `Option<CallerTier>`: when `None`, the gateway
-/// falls back to the conservative 24h default. The cloud will inject the real
-/// tier once `rv-tier-limits-enforcement` is wired; until then all requests
-/// run as if Free.
+/// The tier is carried as `Option<CallerTier>` on `tt_auth::ApiKeyContext`
+/// (NOT on [`crate::context::RequestContext`], which has no `tier` field): when
+/// `None`, the gateway falls back to the conservative 24h default. The cloud
+/// will inject the real tier once `rv-tier-limits-enforcement` is wired; until
+/// then all requests run as if Free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallerTier {
     /// Free tier — 24h cache TTL (spec §8.4).
