@@ -208,6 +208,14 @@ fn parse_sse_frame(frame: &str) -> Frame {
     };
     if let Some(tcs) = v["choices"][0]["delta"]["tool_calls"].as_array() {
         if !tcs.is_empty() {
+            // We expect COMPLETE `ToolCall`s here: the TokenTrimmer gateway's
+            // provider adapters reassemble fragmented upstream tool-call deltas
+            // into whole tool calls before the SSE wire. A *raw* OpenAI-compatible
+            // endpoint that streams partial deltas (`{index, function:{arguments:
+            // "..."}}`) won't deserialize into a full `ToolCall` and is skipped —
+            // streaming tool calls require routing through the gateway (see
+            // `ChatRequest::stream` docs). Treated as `Ignore` rather than erroring
+            // so a benign keep-alive/partial frame doesn't abort the stream.
             if let Ok(calls) = serde_json::from_value::<Vec<ToolCall>>(Value::Array(tcs.clone())) {
                 if !calls.is_empty() {
                     return Frame::ToolCalls(calls);
@@ -482,6 +490,15 @@ impl ChatBuilder<'_> {
 
     /// Send the request and stream the response. Yields [`StreamEvent::Delta`]
     /// text chunks then the terminal [`StreamEvent::Usage`] cost event.
+    ///
+    /// # Streaming tool calls
+    /// [`StreamEvent::ToolCalls`] are emitted only for *complete* tool calls.
+    /// The TokenTrimmer gateway reassembles fragmented upstream tool-call deltas
+    /// before the wire, so this works end-to-end through the gateway. If you point
+    /// the client at a *raw* OpenAI-compatible endpoint that streams partial
+    /// tool-call deltas, those partial frames are skipped (not surfaced) — route
+    /// streaming tool calls through the gateway, or use the non-streamed
+    /// [`send`](Self::send).
     ///
     /// # Errors
     /// Same as [`send`](Self::send): `MissingModel` / `Request` / `Status`.
