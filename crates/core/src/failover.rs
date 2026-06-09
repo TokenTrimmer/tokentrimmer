@@ -398,6 +398,7 @@ mod tests {
     enum Behavior {
         Ok,
         Fail5xx,
+        Fail429,
         Invalid,
     }
 
@@ -456,6 +457,7 @@ mod tests {
                     status: 503,
                     message: "down".into(),
                 }),
+                Behavior::Fail429 => Err(ProviderError::RateLimited { retry_after_ms: 0 }),
                 Behavior::Invalid => Err(ProviderError::InvalidRequest("bad".into())),
             }
         }
@@ -473,6 +475,7 @@ mod tests {
                     status: 503,
                     message: "down".into(),
                 }),
+                Behavior::Fail429 => Err(ProviderError::RateLimited { retry_after_ms: 0 }),
                 Behavior::Invalid => Err(ProviderError::InvalidRequest("bad".into())),
             }
         }
@@ -574,6 +577,72 @@ mod tests {
         .expect("fallback should serve");
         assert_eq!(provider.id(), "pb");
         assert_eq!(resp.model, "model-b");
+    }
+
+    #[tokio::test]
+    async fn falls_over_to_next_candidate_on_429() {
+        // A sustained 429 on the primary exhausts its same-provider retry
+        // budget, then fails over to a candidate with spare quota.
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(MockProvider {
+            id: "pa",
+            model: "model-a",
+            behavior: Behavior::Fail429,
+        }));
+        reg.register(Arc::new(MockProvider {
+            id: "pb",
+            model: "model-b",
+            behavior: Behavior::Ok,
+        }));
+        let breaker = CircuitBreaker::default();
+        let candidates = vec!["model-a".to_string(), "model-b".to_string()];
+        let (provider, resp) = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+        )
+        .await
+        .expect("a 429 on the primary should fall over to the healthy candidate");
+        assert_eq!(provider.id(), "pb");
+        assert_eq!(resp.model, "model-b");
+    }
+
+    #[tokio::test]
+    async fn stream_falls_over_to_next_candidate_on_429() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(MockProvider {
+            id: "pa",
+            model: "model-a",
+            behavior: Behavior::Fail429,
+        }));
+        reg.register(Arc::new(MockProvider {
+            id: "pb",
+            model: "model-b",
+            behavior: Behavior::Ok,
+        }));
+        let breaker = CircuitBreaker::default();
+        let candidates = vec!["model-a".to_string(), "model-b".to_string()];
+        let (provider, served, _stream) = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &all_creds(),
+            now(),
+            None,
+        )
+        .await
+        .expect("a 429 on the primary should fall over to establish the stream");
+        assert_eq!(provider.id(), "pb");
+        assert_eq!(served, "model-b");
     }
 
     #[tokio::test]
