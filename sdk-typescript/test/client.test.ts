@@ -110,6 +110,20 @@ describe('TokenTrimmer TS SDK', () => {
     expect(calls.length).toBe(0);
   });
 
+  it('throws on a non-finite or negative ttCostLimit before sending', async () => {
+    const { calls, fetchImpl } = stubFetch();
+    for (const bad of [Infinity, NaN, -1]) {
+      await expect(
+        client(fetchImpl).chat.completions.create({
+          model: 'm',
+          messages: [{ role: 'user', content: 'hi' }],
+          ttCostLimit: bad,
+        } as any),
+      ).rejects.toThrow();
+    }
+    expect(calls.length).toBe(0);
+  });
+
   it('returns the stream (not a parsed body) for stream:true', async () => {
     const sse =
       'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m",' +

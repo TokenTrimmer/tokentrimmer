@@ -100,7 +100,13 @@ export class TokenTrimmer extends OpenAI {
       const headers = { ...((opts.headers as Record<string, string>) ?? {}) };
       if (typeof ttTag === 'string') headers['X-TokenTrimmer-Tag'] = ttTag;
       if (ttCostLimit !== undefined && ttCostLimit !== null) {
-        headers['X-TokenTrimmer-Cost-Limit-Usd'] = String(Number(ttCostLimit));
+        const limit = Number(ttCostLimit);
+        if (!Number.isFinite(limit) || limit < 0) {
+          throw new Error(
+            `ttCostLimit must be a non-negative finite number; got ${String(ttCostLimit)}`,
+          );
+        }
+        headers['X-TokenTrimmer-Cost-Limit-Usd'] = String(limit);
       }
       if (ttCache !== undefined && ttCache !== null) {
         if (typeof ttCache !== 'string' || !VALID_CACHE_OVERRIDES.has(ttCache)) {
@@ -116,8 +122,7 @@ export class TokenTrimmer extends OpenAI {
       // complete until the stream is drained. Return the SDK Stream untouched;
       // do not call withResponse() or attach .tt.
       if (rest.stream === true) {
-        // Cast originalCreate to a loose callable to avoid fighting overload
-        // resolution with loose Record args; this is the only non-boundary cast.
+        // Localized cast to avoid fighting overload resolution with loose Record args.
         return (originalCreate as (b: unknown, o: unknown) => Promise<unknown>)(rest, callOpts);
       }
 

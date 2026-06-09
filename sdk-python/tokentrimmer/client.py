@@ -23,6 +23,7 @@ is drained. Read terminal ``usage`` off the final chunk instead.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -115,7 +116,12 @@ class TokenTrimmer(OpenAI):
                 extra_headers["X-TokenTrimmer-Tag"] = str(tt_tag)
             tt_cost_limit = kwargs.pop("tt_cost_limit", None)
             if tt_cost_limit is not None:
-                extra_headers["X-TokenTrimmer-Cost-Limit-Usd"] = str(float(tt_cost_limit))
+                limit = float(tt_cost_limit)
+                if not math.isfinite(limit) or limit < 0:
+                    raise ValueError(
+                        f"tt_cost_limit must be a non-negative finite number; got {tt_cost_limit!r}"
+                    )
+                extra_headers["X-TokenTrimmer-Cost-Limit-Usd"] = str(limit)
             tt_cache = kwargs.pop("tt_cache", None)
             if tt_cache is not None:
                 if tt_cache not in _VALID_CACHE_OVERRIDES:

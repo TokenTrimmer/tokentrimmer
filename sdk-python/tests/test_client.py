@@ -132,6 +132,19 @@ def test_invalid_tt_cache_raises_before_send():
 
 
 @respx.mock
+def test_invalid_tt_cost_limit_raises_before_send():
+    route = _completion_route()
+    for bad in (float("inf"), float("nan"), -1.0):
+        with pytest.raises(ValueError):
+            _client().chat.completions.create(
+                model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                tt_cost_limit=bad,
+            )
+    assert not route.called
+
+
+@respx.mock
 def test_metadata_is_per_call_correct_under_concurrency():
     """Each concurrent caller must observe ITS OWN response's metadata.
 
