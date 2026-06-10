@@ -94,6 +94,8 @@ impl Provider for JudgeAwareProvider {
             batch_input_per_million: None,
             batch_output_per_million: None,
             prompt_cache_min_tokens: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             effective_at: Utc::now(),
         })
     }
@@ -233,6 +235,7 @@ async fn build_harness(
                     fallbacks: Vec::new(),
                     disable_cache: false,
                     max_cost_usd: None,
+                    flex: false,
                 },
             }],
         );

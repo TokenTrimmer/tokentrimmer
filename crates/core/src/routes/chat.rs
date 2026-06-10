@@ -824,6 +824,9 @@ pub async fn handler(
     let route_matched_name = route_match.as_ref().map(|m| m.route_name.clone());
     // A matched privacy route forces the request to skip the cache entirely.
     let route_disable_cache = route_match.as_ref().is_some_and(|m| m.disable_cache);
+    // A matched route requesting OpenAI Flex (`service_tier="flex"`). Applied to
+    // the upstream request below, gated on the served model's flex-eligibility.
+    let route_flex = route_match.as_ref().is_some_and(|m| m.flex);
     // Per-request cost ceiling (V3d-2b) + the token estimate, captured before
     // `route_match` is consumed below.
     let route_max_cost_usd = route_match.as_ref().and_then(|m| m.max_cost_usd);
@@ -921,6 +924,14 @@ pub async fn handler(
     let mut warnings: Vec<String> = Vec::new();
     maybe_downgrade_response_format(&mut req, provider.as_ref(), &mut warnings);
     maybe_clamp_temperature(&mut req, provider.as_ref(), &mut warnings);
+
+    // OpenAI Flex (route action): opt the upstream request into `service_tier:
+    // "flex"` ONLY when the served model is flex-eligible (carries a Flex rate in
+    // the catalog). An ineligible model is left untouched and a
+    // `flex_not_applied:<model>` warning is surfaced. `flex_applied` drives the
+    // cost computation below so savings attribute to the `flex` source. Evaluated
+    // against the FINAL served provider/model (post-routing/pin/failover-primary).
+    let flex_applied = maybe_apply_flex(&mut req, route_flex, provider.as_ref(), &mut warnings);
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
     // provider in the candidate set. The raw-Bearer fallback is allowed only for
@@ -1050,6 +1061,7 @@ pub async fn handler(
                             cost_usd: 0.0,
                             baseline_cost_usd,
                             provider_cache_saved_usd: 0.0,
+                            flex_saved_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -1237,6 +1249,10 @@ pub async fn handler(
                 // Thread provider surcharge through so the streaming path applies
                 // it to both cost and baseline, matching the non-streaming path (§2.13).
                 fee_multiplier: provider.fee_multiplier(),
+                // Thread the Flex opt-in through so the streaming cost math meters
+                // at flex rates and attributes the standard-vs-flex saving to the
+                // `flex` source, matching the non-streaming path (FLEX-REWRITE (2)).
+                flex_applied,
                 cache_insert: stream_cache_insert,
                 // Honor stream_options.include_usage end-to-end: emit an
                 // OpenAI-native final usage chunk when the client asked for it.
@@ -1548,11 +1564,12 @@ pub async fn handler(
         } else {
             pricing.clone()
         };
-        let cost_breakdown = compute_cost(
+        let cost_breakdown = compute_cost_with_flex(
             &response.usage,
             pricing.as_ref(),
             baseline_pricing.as_ref(),
             provider.fee_multiplier(),
+            flex_applied,
         );
         let cost_usd = cost_breakdown.cost_usd;
         let baseline_cost_usd = cost_breakdown.baseline_cost_usd;
@@ -1846,6 +1863,43 @@ fn maybe_clamp_temperature(
     }
 }
 
+/// Apply the Flex route action: when `requested` is true, set
+/// `service_tier="flex"` on the upstream request — but ONLY for a flex-eligible
+/// served model. Eligibility is catalog-driven
+/// ([`ModelPricing::flex_eligible`]): OpenAI lists Flex prices only for
+/// supported models (gpt-5.x); o3/o4-mini and every non-OpenAI model carry no
+/// Flex rate and are ineligible. For an ineligible model the request is left
+/// untouched and a `flex_not_applied:<model>` warning is surfaced via the
+/// existing warnings mechanism.
+///
+/// `service_tier` rides through to the upstream via the request's serde-flatten
+/// `extra` map (it is not a typed field) — see `tt_shared::messages`. Returns
+/// whether flex was actually applied, so the cost path can attribute the
+/// standard-vs-flex saving to the `flex` source.
+fn maybe_apply_flex(
+    req: &mut ChatCompletionRequest,
+    requested: bool,
+    provider: &dyn tt_shared::Provider,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if !requested {
+        return false;
+    }
+    let eligible = provider
+        .pricing(&req.model)
+        .is_some_and(|p| p.flex_eligible());
+    if !eligible {
+        // Do NOT set service_tier on an ineligible model — sending flex to a
+        // model that does not support it risks a provider rejection, and it
+        // would never get the discount. Surface the no-op as a warning.
+        warnings.push(format!("flex_not_applied:{}", req.model));
+        return false;
+    }
+    req.extra
+        .insert("service_tier".to_string(), serde_json::json!("flex"));
+    true
+}
+
 /// Attach `X-TokenTrimmer-Warnings`: the model-dependent `param_dropped:<name>`
 /// tokens (computed here against `served_model`) plus any pre-dispatch `extra`
 /// tokens (e.g. `response_format_downgrade`). Comma-joined; no-op when empty.
@@ -1907,6 +1961,7 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         cost_usd: 0.0,
         baseline_cost_usd,
         provider_cache_saved_usd: 0.0,
+        flex_saved_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -1966,6 +2021,7 @@ fn build_hit_l2_response(
         cost_usd: 0.0,
         baseline_cost_usd,
         provider_cache_saved_usd: 0.0,
+        flex_saved_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -2160,6 +2216,8 @@ async fn insert_into_l2(
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CostBreakdown {
     /// What the provider actually bills (cache discounts included, fee applied).
+    /// When the request was served via OpenAI Flex this is the **flex-rate**
+    /// cost (~50% of standard).
     pub cost_usd: f64,
     /// What the request would have cost with no TokenTrimmer optimisation:
     /// the originally-requested model at full input price, no cache discount.
@@ -2168,6 +2226,13 @@ pub(crate) struct CostBreakdown {
     /// caching minus actual cost, clamped at 0 (a cache-write premium can make
     /// the cached request *more* expensive; we never report negative savings).
     pub provider_cache_saved_usd: f64,
+    /// Savings attributed to the OpenAI **Flex** service tier specifically — the
+    /// difference between the synchronous (standard) baseline cost and the flex
+    /// cost for this token usage, at the served model. A distinct savings source
+    /// from routing/cache so the headline + methodology can name it. Zero when
+    /// the request was not served via flex. Already included in
+    /// [`tt_saved_usd`](Self::tt_saved_usd) (flex lowers `cost_usd`).
+    pub flex_saved_usd: f64,
 }
 
 impl CostBreakdown {
@@ -2177,7 +2242,10 @@ impl CostBreakdown {
     /// With no routing/caching by TT this is exactly 0 even when the provider
     /// reports cached tokens. When a cache-write premium exceeds the read
     /// discount (`provider_cache_saved_usd` clamped to 0), the premium reduces
-    /// the TT claim instead — conservative in TT's disfavor.
+    /// the TT claim instead — conservative in TT's disfavor. Flex savings are
+    /// included here automatically: serving via flex lowers `cost_usd`, so the
+    /// baseline − cost delta picks the flex saving up (and `flex_saved_usd`
+    /// isolates the flex component for the methodology breakdown).
     pub fn tt_saved_usd(&self) -> f64 {
         (self.baseline_cost_usd - self.cost_usd - self.provider_cache_saved_usd).max(0.0)
     }
@@ -2216,6 +2284,34 @@ pub(crate) fn compute_cost(
     pricing: Option<&ModelPricing>,
     baseline_pricing: Option<&ModelPricing>,
     fee_multiplier: f64,
+) -> CostBreakdown {
+    compute_cost_with_flex(usage, pricing, baseline_pricing, fee_multiplier, false)
+}
+
+/// Like [`compute_cost`] but with a `flex_applied` flag for requests served via
+/// OpenAI's Flex service tier (`service_tier="flex"`).
+///
+/// When `flex_applied` is true, `cost_usd` is metered at the served model's
+/// **flex** rates (~50% of standard) and [`CostBreakdown::flex_saved_usd`] is set
+/// to the standard-vs-flex delta on this token usage at the served model — the
+/// synchronous (standard) baseline cost minus the flex cost — a distinct savings
+/// source named `flex`. Flex is only ever applied to a flex-eligible model (the
+/// caller gates on [`ModelPricing::flex_eligible`]); if for some reason the
+/// served model carries no flex rate, the flex path is a no-op and pricing falls
+/// back to standard (no phantom saving).
+///
+/// Cache attribution is unchanged: provider-side cache discounts are still
+/// computed against the served model's *standard* rates and surfaced via
+/// `provider_cache_saved_usd`. For the flex-cost figure we conservatively apply
+/// flex rates to the full prompt + completion (the hermetic flex path carries no
+/// cached tokens; OpenAI's additional flex prompt-cache discount is not modeled
+/// here, keeping the flex saving an exact, reconcilable standard−flex delta).
+pub(crate) fn compute_cost_with_flex(
+    usage: &Usage,
+    pricing: Option<&ModelPricing>,
+    baseline_pricing: Option<&ModelPricing>,
+    fee_multiplier: f64,
+    flex_applied: bool,
 ) -> CostBreakdown {
     let Some(pricing) = pricing else {
         return CostBreakdown::default();
@@ -2264,18 +2360,43 @@ pub(crate) fn compute_cost(
         .cache_write_rate_per_million(CacheWriteTier::FiveMin)
         .unwrap_or(pricing.input_per_million);
 
-    let cost_usd = (fresh_input as f64) * pricing.input_per_million / 1_000_000.0
+    let standard_cost_usd = (fresh_input as f64) * pricing.input_per_million / 1_000_000.0
         + (cache_read as f64) * cached_rate / 1_000_000.0
         + (cache_write as f64) * write_rate / 1_000_000.0
         + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
 
+    // Flex (OpenAI service_tier="flex"): when applied AND the served model
+    // carries a flex rate, the actual bill is the flex-rate cost (~50% of
+    // standard). The flex saving is the standard−flex delta on this usage at the
+    // served model, priced on the full prompt + completion so the figure is an
+    // exact, invoice-reconcilable difference. Falls back to standard if a flex
+    // opt-in ever reaches a model with no flex rate (no phantom saving).
+    let (cost_usd, flex_cost_basis) = match (flex_applied, pricing.flex_rates_per_million()) {
+        (true, Some((flex_in, flex_out))) => {
+            let flex_cost = (usage.prompt_tokens as f64) * flex_in / 1_000_000.0
+                + (usage.completion_tokens as f64) * flex_out / 1_000_000.0;
+            (flex_cost, Some(flex_cost))
+        }
+        _ => (standard_cost_usd, None),
+    };
+    // Standard cost at the served model on the SAME basis the flex cost uses
+    // (full prompt + completion, no cache discount) — the comparison point for
+    // the flex saving so the delta is exactly standard − flex.
+    let standard_full_cost_usd = (usage.prompt_tokens as f64) * pricing.input_per_million
+        / 1_000_000.0
+        + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
+    let flex_saved_usd = match flex_cost_basis {
+        Some(flex_cost) => (standard_full_cost_usd - flex_cost).max(0.0),
+        None => 0.0,
+    };
+
     // Served-model cost as if no provider caching had occurred: all prompt
-    // tokens at the full input rate. The delta against `cost_usd` is the
+    // tokens at the full input rate. The delta against the (standard) cost is the
     // provider's automatic cache discount (read discount net of any
     // cache-write premium) — savings the provider grants with or without
-    // TokenTrimmer, so they are excluded from the TT-attributed figure.
-    let no_cache_cost_usd = (usage.prompt_tokens as f64) * pricing.input_per_million / 1_000_000.0
-        + (usage.completion_tokens as f64) * pricing.output_per_million / 1_000_000.0;
+    // TokenTrimmer, so they are excluded from the TT-attributed figure. Computed
+    // on standard rates (flex never widens the cache-attributed figure).
+    let no_cache_cost_usd = standard_full_cost_usd;
 
     // Baseline: full input × input rate + output × output rate (no cache
     // discount), priced against the originally-requested model.
@@ -2285,11 +2406,16 @@ pub(crate) fn compute_cost(
         + (usage.completion_tokens as f64) * baseline_pricing.output_per_million / 1_000_000.0;
 
     // Apply the provider surcharge (e.g. OpenRouter's 5% BYOK fee) to all
-    // figures so the saved splits stay consistent (same scale factor).
+    // figures so the saved splits stay consistent (same scale factor). The
+    // provider-cache discount is metered against the STANDARD cost (not the
+    // flex cost) so flex and cache savings stay independent and don't
+    // double-count.
     CostBreakdown {
         cost_usd: cost_usd * fee_multiplier,
         baseline_cost_usd: baseline_cost_usd * fee_multiplier,
-        provider_cache_saved_usd: ((no_cache_cost_usd - cost_usd) * fee_multiplier).max(0.0),
+        provider_cache_saved_usd: ((no_cache_cost_usd - standard_cost_usd) * fee_multiplier)
+            .max(0.0),
+        flex_saved_usd: flex_saved_usd * fee_multiplier,
     }
 }
 
@@ -2348,6 +2474,13 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-provider-cache-saved-usd",
             format!("{:.6}", cost.provider_cache_saved_usd),
+        ),
+        // Flex-tier-attributed savings (standard baseline − flex cost) — a
+        // distinct source from routing/cache, included in `saved_usd`. Zero
+        // when the request was not served via OpenAI Flex.
+        (
+            "x-tokentrimmer-flex-saved-usd",
+            format!("{:.6}", cost.flex_saved_usd),
         ),
     ];
 
@@ -2724,6 +2857,10 @@ pub(crate) struct RouteMatch {
     pub(crate) disable_cache: bool,
     pub(crate) max_cost_usd: Option<f64>,
     pub(crate) input_tokens_estimate: u32,
+    /// The matched route requested OpenAI Flex (`service_tier="flex"`). The
+    /// actual opt-in is gated on the served model's flex-eligibility at the
+    /// request-build step (an ineligible model is left untouched + warned).
+    pub(crate) flex: bool,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -2808,6 +2945,7 @@ pub(crate) async fn apply_routing(
     let fallbacks = m.then.fallbacks.clone();
     let disable_cache = m.then.disable_cache;
     let max_cost_usd = m.then.max_cost_usd;
+    let flex = m.then.flex;
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -2847,6 +2985,7 @@ pub(crate) async fn apply_routing(
         disable_cache,
         max_cost_usd,
         input_tokens_estimate: input_tokens,
+        flex,
     }))
 }
 
@@ -3317,6 +3456,8 @@ mod l2_baseline_tests {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
@@ -3371,6 +3512,8 @@ mod fee_tests {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
@@ -3402,6 +3545,109 @@ mod fee_tests {
             bd_fee.baseline_cost_usd
         );
     }
+
+    fn flex_pricing() -> ModelPricing {
+        ModelPricing {
+            // Standard $10/$30, flex $5/$15 (exactly 50% — verified flex==batch).
+            input_per_million: 10.0,
+            output_per_million: 30.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: Some(5.0),
+            flex_output_per_million: Some(15.0),
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    /// Flex served: cost is metered at flex rates and the flex saving equals
+    /// the standard baseline minus the flex cost for the usage (the `flex`
+    /// source). Headline `tt_saved_usd` equals that saving (no routing/cache).
+    #[test]
+    fn flex_attributes_standard_minus_flex_saving() {
+        let usage = Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+            total_tokens: 1_500,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        };
+        let p = flex_pricing();
+        let bd = compute_cost_with_flex(&usage, Some(&p), Some(&p), 1.0, true);
+
+        // standard = 1000×$10/M + 500×$30/M = 0.01 + 0.015 = 0.025
+        // flex     = 1000×$5/M  + 500×$15/M = 0.005 + 0.0075 = 0.0125
+        let standard = 1000.0 * 10.0 / 1e6 + 500.0 * 30.0 / 1e6;
+        let flex = 1000.0 * 5.0 / 1e6 + 500.0 * 15.0 / 1e6;
+        assert!((bd.cost_usd - flex).abs() < 1e-12, "cost = {}", bd.cost_usd);
+        assert!(
+            (bd.flex_saved_usd - (standard - flex)).abs() < 1e-12,
+            "flex_saved = {}",
+            bd.flex_saved_usd
+        );
+        // baseline == standard served cost (no routing) → tt_saved == flex_saved.
+        assert!((bd.baseline_cost_usd - standard).abs() < 1e-12);
+        assert!(
+            (bd.tt_saved_usd() - (standard - flex)).abs() < 1e-12,
+            "tt_saved = {}",
+            bd.tt_saved_usd()
+        );
+    }
+
+    /// `flex_applied=false` on a flex-eligible model leaves cost at standard and
+    /// claims zero flex saving (the flag, not the rate, gates the discount).
+    #[test]
+    fn flex_not_applied_keeps_standard_cost_and_zero_flex_saving() {
+        let usage = Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+            total_tokens: 1_500,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        };
+        let p = flex_pricing();
+        let bd = compute_cost_with_flex(&usage, Some(&p), Some(&p), 1.0, false);
+        let standard = 1000.0 * 10.0 / 1e6 + 500.0 * 30.0 / 1e6;
+        assert!(
+            (bd.cost_usd - standard).abs() < 1e-12,
+            "cost = {}",
+            bd.cost_usd
+        );
+        assert_eq!(bd.flex_saved_usd, 0.0);
+    }
+
+    /// Flex composes with a downgrade route: baseline is the (expensive)
+    /// originally-requested model, cost is the flex-rate served model, and the
+    /// flex saving isolates only the standard→flex delta at the served model.
+    #[test]
+    fn flex_composes_with_routing_baseline() {
+        let usage = Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+            total_tokens: 1_500,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        };
+        let served = flex_pricing(); // $10/$30 std, $5/$15 flex
+        let requested = ModelPricing {
+            input_per_million: 40.0,
+            output_per_million: 120.0,
+            ..flex_pricing()
+        };
+        let bd = compute_cost_with_flex(&usage, Some(&served), Some(&requested), 1.0, true);
+
+        let flex = 1000.0 * 5.0 / 1e6 + 500.0 * 15.0 / 1e6; // 0.0125
+        let served_standard = 1000.0 * 10.0 / 1e6 + 500.0 * 30.0 / 1e6; // 0.025
+        let requested_baseline = 1000.0 * 40.0 / 1e6 + 500.0 * 120.0 / 1e6; // 0.10
+        assert!((bd.cost_usd - flex).abs() < 1e-12);
+        assert!((bd.baseline_cost_usd - requested_baseline).abs() < 1e-12);
+        // flex_saved isolates ONLY the served standard→flex delta.
+        assert!((bd.flex_saved_usd - (served_standard - flex)).abs() < 1e-12);
+        // headline = routing + flex combined = baseline − flex cost.
+        assert!((bd.tt_saved_usd() - (requested_baseline - flex)).abs() < 1e-12);
+    }
 }
 
 /// Tests for the Anthropic cache-write-rate fix (rv-anthropic-cache-write-rate).
@@ -3431,6 +3677,8 @@ mod cache_write_rate_tests {
             cache_write_per_million: Some(3.75),
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
@@ -3445,6 +3693,8 @@ mod cache_write_rate_tests {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
@@ -3645,6 +3895,8 @@ mod provider_cache_attribution_tests {
             cache_write_per_million: Some(3.75),
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
@@ -3699,6 +3951,8 @@ mod provider_cache_attribution_tests {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         };

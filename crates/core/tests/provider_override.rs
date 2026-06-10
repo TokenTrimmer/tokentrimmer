@@ -63,6 +63,8 @@ impl Provider for FakeProvider {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
         })
@@ -436,6 +438,7 @@ async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential
                 fallbacks: vec!["gpt-4o".into()],
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );

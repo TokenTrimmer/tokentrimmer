@@ -67,6 +67,8 @@ impl Provider for MockProvider {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
@@ -143,6 +145,7 @@ fn failover_routing_store() -> Arc<CachingRoutingStore> {
                 fallbacks: vec!["fallback-model".into()],
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );

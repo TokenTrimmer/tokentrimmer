@@ -109,6 +109,16 @@ pub struct RouteAction {
     /// the request (402) instead of dispatching. `None` = no ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+    /// Opt the matched request into OpenAI's **Flex** service tier
+    /// (`service_tier: "flex"`) — a synchronous-but-slower processing tier
+    /// billed at ~50% of standard. The gateway sets `service_tier="flex"` on the
+    /// upstream request only when the served model is flex-eligible (carries a
+    /// Flex rate in the catalog); an ineligible model is left untouched and a
+    /// `flex_not_applied:<model>` warning is surfaced. Savings are attributed as
+    /// a distinct `flex` source (standard baseline − flex cost). Default false;
+    /// omitted from JSON when false (back-compat with existing rows).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flex: bool,
 }
 
 /// Rule engine. Hold routes sorted by descending priority; iterate to find
@@ -269,6 +279,7 @@ mod tests {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }
     }
@@ -571,6 +582,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -598,6 +610,7 @@ mod tests {
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -617,6 +630,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -732,6 +746,25 @@ mod tests {
         assert!(eng
             .evaluate(&make_req_text("gpt-4o", "hello"), &make_ctx(None), 100)
             .is_none());
+    }
+
+    #[test]
+    fn route_action_flex_defaults_false_omits_and_round_trips() {
+        // Omitted from JSON when false (back-compat: existing rows unchanged).
+        let mut a = make_route("x", 10, vec![], "gpt-5.4").then;
+        assert!(
+            !serde_json::to_string(&a).unwrap().contains("flex"),
+            "flex must be omitted when false"
+        );
+        // Defaults false when absent from legacy JSON.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.flex);
+        // Present + round-trips when true.
+        a.flex = true;
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(j.contains("\"flex\":true"), "flex=true must serialize: {j}");
+        let back: RouteAction = serde_json::from_str(&j).unwrap();
+        assert!(back.flex);
     }
 
     #[test]

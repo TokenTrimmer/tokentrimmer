@@ -65,6 +65,8 @@ impl Provider for RecordingEmbedder {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
@@ -158,6 +160,7 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );

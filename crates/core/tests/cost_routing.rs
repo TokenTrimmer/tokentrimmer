@@ -66,6 +66,8 @@ impl Provider for RecordingProvider {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
@@ -171,6 +173,7 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );
@@ -235,6 +238,7 @@ async fn reroute_then_block_on_ceiling() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: Some(0.0008),
+                flex: false,
             },
         }],
     );
