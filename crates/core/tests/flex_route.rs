@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
@@ -34,7 +34,7 @@ use tt_routing::{
     CachingRoutingStore, InMemoryRoutingStore, Route, RouteAction, RouteConditions, RoutingStore,
 };
 use tt_shared::{
-    messages::{Choice, Message, MessageContent},
+    messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
     pricing::Capability,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
@@ -130,10 +130,78 @@ impl Provider for FlexRecordingProvider {
     }
     async fn chat_completion_stream(
         &self,
-        _req: ChatCompletionRequest,
+        req: ChatCompletionRequest,
         _ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
-        Ok(futures::stream::iter(vec![]).boxed())
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        // Record service_tier exactly as the non-streaming path does, so the
+        // streaming test can assert the same flex rewrite reached the upstream.
+        let tier = req
+            .extra
+            .get("service_tier")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        self.service_tiers.lock().unwrap().push(tier);
+        // Emit a clean stream (role, content, finish+usage) carrying the same
+        // PROMPT/COMPLETION token usage the non-streaming path returns, so the
+        // terminal `tokentrimmer.usage` event prices a real (non-zero) cost.
+        let chunks = vec![
+            Ok(ChatCompletionChunk {
+                id: "chatcmpl-flex-stream".into(),
+                object: "chat.completion.chunk".into(),
+                created: 0,
+                model: req.model.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: Some("assistant".into()),
+                        ..Default::default()
+                    },
+                    finish_reason: None,
+                    extra: Default::default(),
+                }],
+                usage: None,
+                extra: Default::default(),
+            }),
+            Ok(ChatCompletionChunk {
+                id: "chatcmpl-flex-stream".into(),
+                object: "chat.completion.chunk".into(),
+                created: 0,
+                model: req.model.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        content: Some("ok".into()),
+                        ..Default::default()
+                    },
+                    finish_reason: None,
+                    extra: Default::default(),
+                }],
+                usage: None,
+                extra: Default::default(),
+            }),
+            Ok(ChatCompletionChunk {
+                id: "chatcmpl-flex-stream".into(),
+                object: "chat.completion.chunk".into(),
+                created: 0,
+                model: req.model,
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta::default(),
+                    finish_reason: Some("stop".into()),
+                    extra: Default::default(),
+                }],
+                usage: Some(Usage {
+                    prompt_tokens: PROMPT_TOKENS,
+                    completion_tokens: COMPLETION_TOKENS,
+                    total_tokens: PROMPT_TOKENS + COMPLETION_TOKENS,
+                    cached_tokens: 0,
+                    cache_creation_input_tokens: None,
+                }),
+                extra: Default::default(),
+            }),
+        ];
+        Ok(futures::stream::iter(chunks).boxed())
     }
     async fn embeddings(
         &self,
@@ -145,10 +213,16 @@ impl Provider for FlexRecordingProvider {
 }
 
 fn chat_request(model: &str, bearer: &str) -> Request<Body> {
+    chat_request_streaming(model, bearer, false)
+}
+
+/// Like [`chat_request`] but lets the caller pick the `stream` flag so the same
+/// flex route can be exercised over the streaming surface.
+fn chat_request_streaming(model: &str, bearer: &str, stream: bool) -> Request<Body> {
     let body = json!({
         "model": model,
         "messages": [{ "role": "user", "content": "hello world" }],
-        "stream": false,
+        "stream": stream,
     });
     Request::builder()
         .method("POST")
@@ -342,5 +416,82 @@ async fn flex_saving_equals_standard_minus_flex_to_the_cent() {
     assert!(
         (saved - expected_saved).abs() < 1e-9,
         "headline saved ({saved}) should equal the flex saving ({expected_saved})"
+    );
+}
+
+/// Extract the JSON payload of the terminal `tokentrimmer.usage` SSE event from
+/// a drained event-stream body (`event: tokentrimmer.usage\ndata: {json}`).
+fn parse_tokentrimmer_usage(body: &str) -> serde_json::Value {
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "event: tokentrimmer.usage" {
+            let data_line = lines
+                .find(|l| l.starts_with("data:"))
+                .expect("tokentrimmer.usage event missing data line");
+            let json = data_line.trim_start_matches("data:").trim();
+            return serde_json::from_str(json).expect("tokentrimmer.usage data is valid JSON");
+        }
+    }
+    panic!("no tokentrimmer.usage event found in stream body:\n{body}");
+}
+
+/// (a+c, streaming surface) A STREAMING request matched by the same flex route
+/// on an eligible model must (1) carry `service_tier=flex` on the upstream
+/// streaming dispatch and (2) attribute the standard−flex saving on the
+/// terminal `tokentrimmer.usage` event — cost at flex rates, `saved_usd` ==
+/// standard − flex. Without threading `flex_applied` into `StreamLogContext`
+/// the streaming cost path prices at STANDARD rates (≈2× over-report) and drops
+/// the entire flex saving, so this guards FLEX-REWRITE requirement (2) for
+/// streaming.
+#[tokio::test]
+async fn flex_streaming_attributes_savings_on_usage_event() {
+    let (app, key, tiers, calls) = app_with_flex_route("flex-eligible").await;
+
+    let resp = app
+        .oneshot(chat_request_streaming("flex-eligible", &key, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    // (1) The streaming dispatch carried service_tier=flex upstream — the same
+    // rewrite the non-streaming path applies.
+    assert_eq!(
+        tiers.lock().unwrap().as_slice(),
+        [Some("flex".to_string())],
+        "streaming eligible model must dispatch with service_tier=flex"
+    );
+
+    // Drain the SSE body and pull the terminal tokentrimmer.usage event.
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).to_string();
+    let usage = parse_tokentrimmer_usage(&body);
+
+    // Expected figures for usage prompt=1000, completion=500 (same as the
+    // non-streaming (c) test):
+    //   standard = 1000×$10/M + 500×$30/M = 0.025
+    //   flex     = 1000×$5/M  + 500×$15/M = 0.0125
+    //   flex_saved = standard − flex = 0.0125
+    let standard = (PROMPT_TOKENS as f64) * 10.0 / 1e6 + (COMPLETION_TOKENS as f64) * 30.0 / 1e6;
+    let flex = (PROMPT_TOKENS as f64) * 5.0 / 1e6 + (COMPLETION_TOKENS as f64) * 15.0 / 1e6;
+    let expected_saved = standard - flex;
+
+    let cost = usage["cost_usd"].as_f64().expect("cost_usd is a number");
+    let saved = usage["saved_usd"].as_f64().expect("saved_usd is a number");
+
+    // (2) Cost is billed at flex rates (NOT standard — would be ≈2× here).
+    assert!(
+        (cost - flex).abs() < 1e-9,
+        "streaming cost ({cost}) should be the flex cost ({flex}), not standard ({standard})"
+    );
+    // The headline streaming saving IS the flex saving (no routing rewrite).
+    assert!(
+        (saved - expected_saved).abs() < 1e-9,
+        "streaming saved ({saved}) should equal the flex saving ({expected_saved})"
+    );
+    // Sanity: the bug being guarded would report cost==standard and saved==0.
+    assert!(
+        (cost - standard).abs() > 1e-9,
+        "regression guard: streaming cost must not be the standard cost ({standard})"
     );
 }

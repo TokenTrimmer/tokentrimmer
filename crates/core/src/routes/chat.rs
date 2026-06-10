@@ -1235,6 +1235,10 @@ pub async fn handler(
                 // Thread provider surcharge through so the streaming path applies
                 // it to both cost and baseline, matching the non-streaming path (§2.13).
                 fee_multiplier: provider.fee_multiplier(),
+                // Thread the Flex opt-in through so the streaming cost math meters
+                // at flex rates and attributes the standard-vs-flex saving to the
+                // `flex` source, matching the non-streaming path (FLEX-REWRITE (2)).
+                flex_applied,
                 cache_insert: stream_cache_insert,
                 // Honor stream_options.include_usage end-to-end: emit an
                 // OpenAI-native final usage chunk when the client asked for it.

@@ -357,6 +357,12 @@ pub struct StreamLogContext {
     /// Applied to both cost and baseline on the streaming path, matching the
     /// non-streaming path (§2.13).
     pub fee_multiplier: f64,
+    /// Whether this request was opted into OpenAI Flex (`service_tier="flex"`).
+    /// Set by the same `maybe_apply_flex` rewrite the non-streaming path uses,
+    /// so the streaming cost math meters at flex rates and attributes the
+    /// standard-vs-flex saving to the `flex` source (FLEX-REWRITE requirement
+    /// (2)). When `false`, cost math is unchanged (standard rates).
+    pub flex_applied: bool,
     /// Optional cache insertion context. When `Some`, a cleanly-completed
     /// stream writes its reconstructed response into L1 (and L2 if configured)
     /// after the final chunk is sent.
@@ -402,6 +408,9 @@ struct TrackedEventStream {
     baseline_pricing: Option<ModelPricing>,
     /// Provider surcharge multiplier — applied to cost and baseline (§2.13).
     fee_multiplier: f64,
+    /// Whether the request was served via OpenAI Flex — meters the terminal
+    /// `tokentrimmer.usage` cost at flex rates and attributes the flex saving.
+    flex_applied: bool,
     /// Honor `stream_options.include_usage`: emit an OpenAI-native final usage
     /// chunk before the `tokentrimmer.usage` frame when the client asked for it.
     include_usage: bool,
@@ -437,11 +446,12 @@ impl TrackedEventStream {
             let guard = self.inner.lock().expect("tracking stream mutex poisoned");
             guard.snapshot()
         };
-        let breakdown = crate::routes::chat::compute_cost(
+        let breakdown = crate::routes::chat::compute_cost_with_flex(
             &partial_to_usage(&usage),
             Some(pricing),
             self.baseline_pricing.as_ref(),
             self.fee_multiplier,
+            self.flex_applied,
         );
         // `saved_usd` is strictly TT-attributed; the provider's automatic
         // cache discount rides in its own field (mirrors the response-header
@@ -588,6 +598,9 @@ pub fn stream_response(
             let baseline_pricing = ctx.baseline_pricing.clone().or_else(|| pricing.clone());
             // Provider surcharge (§2.13) — applied to both cost and baseline.
             let fee_multiplier = ctx.fee_multiplier;
+            // Whether the request was served via OpenAI Flex — drives both the
+            // terminal usage event and the request_logs row cost math.
+            let flex_applied = ctx.flex_applied;
             // Honor stream_options.include_usage on the egress.
             let include_usage = ctx.include_usage;
 
@@ -596,6 +609,7 @@ pub fn stream_response(
                 pricing: pricing.clone(),
                 baseline_pricing: baseline_pricing.clone(),
                 fee_multiplier,
+                flex_applied,
                 include_usage,
                 phase: Phase::Streaming,
             };
@@ -630,11 +644,14 @@ pub fn stream_response(
 
                 // Reuse the authoritative non-streaming cost math (3-bucket
                 // input pricing incl. cache-write premium); fee applied inside.
-                let breakdown = crate::routes::chat::compute_cost(
+                // `flex_applied` meters at flex rates and attributes the flex
+                // saving, matching the non-streaming `compute_cost_with_flex`.
+                let breakdown = crate::routes::chat::compute_cost_with_flex(
                     &partial_to_usage(&usage),
                     pricing.as_ref(),
                     baseline_pricing.as_ref(),
                     fee_multiplier,
+                    flex_applied,
                 );
                 let cost_usd = breakdown.cost_usd;
                 let baseline_cost_usd = breakdown.baseline_cost_usd;
