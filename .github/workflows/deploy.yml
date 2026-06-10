@@ -54,9 +54,9 @@ jobs:
   # ── Preflight: are the deploy secrets configured? ────────────────────────────
   # GitHub forbids `secrets` in job-level `if:`, so a tiny job reads them into an
   # output and `staging` gates on it; `prod` cascade-skips via `needs`. When the
-  # secrets are absent every deploy job is SKIPPED (neutral/green) rather than
-  # failing — the pipeline activates automatically once an operator sets
-  # FLY_API_TOKEN + STAGING_DATABASE_URL_DIRECT (and, for prod,
+  # secrets are absent this job FAILS LOUDLY — an unconfigured deploy pipeline
+  # must never read as a green run (it hid a never-deployed prod for weeks).
+  # Set FLY_API_TOKEN + STAGING_DATABASE_URL_DIRECT (and, for prod,
   # PROD_DATABASE_URL_DIRECT + the `production` Environment gate — see header).
   preflight:
     name: deploy configured?
@@ -73,7 +73,8 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Gateway deploy skipped — set FLY_API_TOKEN + STAGING_DATABASE_URL_DIRECT (and PROD_DATABASE_URL_DIRECT + the production Environment) to enable (see header)."
+            echo "::error::Gateway deploy NOT configured — set FLY_API_TOKEN + STAGING_DATABASE_URL_DIRECT (and PROD_DATABASE_URL_DIRECT + the production Environment) to enable (see header). Failing loudly so a dead pipeline can't look green."
+            exit 1
           fi
 
   # ── STAGING ────────────────────────────────────────────────────────────────
