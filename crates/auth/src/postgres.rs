@@ -649,6 +649,152 @@ mod key_store_tests {
             .connect_lazy("postgres://nobody@127.0.0.1:1/none")
             .expect("lazy connect")
     }
+
+    /// Live Postgres round-trip for [`PostgresKeyStore`]: issue → validate →
+    /// revoke → cross-org isolation. Gated behind `TEST_DATABASE_URL`; run with
+    /// `cargo test -p tt-auth --features postgres -- --include-ignored`.
+    ///
+    /// The `api_keys` schema ships from the cloud repo's migrations, not this
+    /// OSS migrator, so the test creates the minimal table shape the store
+    /// queries (mirrors the CLI's `byo_only` ignored test, which creates its
+    /// own `provider_credentials` table for the same reason).
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL (Postgres; the test creates its own api_keys table) — run with --include-ignored"]
+    async fn postgres_key_store_issue_validate_revoke_cross_org() {
+        use crate::keys::{issue, verify};
+        use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
+
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+
+        // Minimal `orgs` + `api_keys` shapes the store reads/writes (matching
+        // the cloud migration 0001_cloud_schema). `IF NOT EXISTS` keeps the
+        // test idempotent across re-runs. `orgs` exists so the cloud schema's
+        // `api_keys.org_id -> orgs.id` FK (present when the test runs against a
+        // cloud-schema DB rather than this OSS migrator's bare DB) is satisfied.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS orgs (
+                 id   uuid PRIMARY KEY,
+                 name text NOT NULL DEFAULT 'test-org'
+               )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create orgs");
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS api_keys (
+                 id            uuid PRIMARY KEY,
+                 org_id        uuid NOT NULL,
+                 label         text NOT NULL,
+                 prefix        text NOT NULL UNIQUE,
+                 secret_hash   text NOT NULL,
+                 environment   text NOT NULL,
+                 created_at    timestamptz NOT NULL DEFAULT now(),
+                 last_used_at  timestamptz,
+                 revoked_at    timestamptz,
+                 CHECK (environment IN ('live', 'test'))
+               )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create api_keys");
+
+        let store = PostgresKeyStore::new(pool.clone());
+        let audit = InMemoryAuditWriter::new();
+        let org_a = Uuid::now_v7();
+        let org_b = Uuid::now_v7();
+
+        // Parent rows so the cloud-schema FK on api_keys.org_id is satisfied.
+        for org in [org_a, org_b] {
+            sqlx::query(
+                "INSERT INTO orgs (id, name) VALUES ($1, 'test-org') ON CONFLICT DO NOTHING",
+            )
+            .bind(org)
+            .execute(&pool)
+            .await
+            .expect("seed org");
+        }
+
+        // ── issue ──────────────────────────────────────────────────────────
+        // Real issuance path: writes a row via PostgresKeyStore::insert.
+        let issued = issue(
+            &store,
+            &audit,
+            org_a,
+            "pg-roundtrip",
+            Environment::Live,
+            Actor::System,
+        )
+        .await
+        .expect("issue should persist through PostgresKeyStore");
+
+        // ── validate ───────────────────────────────────────────────────────
+        // verify() looks the row up by prefix and argon2-checks the plaintext.
+        let ctx = verify(&store, &issued.plaintext)
+            .await
+            .expect("verify should succeed for a freshly issued key");
+        assert_eq!(ctx.key_id, issued.record.id);
+        assert_eq!(ctx.org_id, org_a);
+
+        // The issued key is listed as active for its owning org…
+        let active_a = store.list_active(org_a).await.expect("list_active org_a");
+        assert!(
+            active_a.iter().any(|k| k.id == issued.record.id),
+            "issued key must appear in org_a's active list"
+        );
+        // …and is invisible to a different org (cross-org list isolation).
+        let active_b = store.list_active(org_b).await.expect("list_active org_b");
+        assert!(
+            !active_b.iter().any(|k| k.id == issued.record.id),
+            "org_b must not see org_a's key in its active list"
+        );
+
+        // ── cross-org revoke is a no-op ────────────────────────────────────
+        // org_b cannot revoke org_a's key (tenant isolation); the key stays
+        // valid afterwards.
+        let cross = store
+            .revoke(issued.record.id, org_b, Utc::now())
+            .await
+            .expect("revoke call should not error");
+        assert!(!cross, "cross-org revoke must report no row affected");
+        verify(&store, &issued.plaintext)
+            .await
+            .expect("key must still validate after a cross-org revoke attempt");
+
+        // ── revoke (correct org) ───────────────────────────────────────────
+        let revoked = store
+            .revoke(issued.record.id, org_a, Utc::now())
+            .await
+            .expect("revoke should succeed");
+        assert!(revoked, "owning-org revoke must report exactly one row");
+
+        // A revoked key no longer validates.
+        let err = verify(&store, &issued.plaintext)
+            .await
+            .expect_err("revoked key must not validate");
+        assert!(
+            matches!(err, KeyError::Revoked),
+            "revoked key should surface KeyError::Revoked, got: {err:?}"
+        );
+
+        // Revoking again is idempotent — no second row to flip.
+        let again = store
+            .revoke(issued.record.id, org_a, Utc::now())
+            .await
+            .expect("second revoke should not error");
+        assert!(!again, "re-revoking an already-revoked key returns false");
+
+        // Clean up the row so re-runs against a shared DB stay independent.
+        sqlx::query("DELETE FROM api_keys WHERE id = $1")
+            .bind(issued.record.id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
 }
 
 #[cfg(test)]

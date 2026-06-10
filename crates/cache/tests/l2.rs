@@ -614,3 +614,86 @@ async fn postgres_l2_round_trip() {
         .await
         .ok();
 }
+
+// ---------------------------------------------------------------------------
+// Test 10 — PostgresL2Cache tenant isolation: org-A insert, org-B miss
+//           (requires DATABASE_URL; ignored by default)
+// ---------------------------------------------------------------------------
+
+/// On the real pgvector path, an entry inserted under org A must NOT be visible
+/// to org B even when org B queries with the *identical* embedding. The L2
+/// lookup SQL scopes every row by `org_id`, so the HNSW nearest-neighbour walk
+/// can surface org A's vector as a candidate but the org filter discards it —
+/// org B gets a clean miss. Org A, querying the same vector, gets a hit. This
+/// is the Postgres-backed twin of the in-memory `l2_org_isolation` unit test.
+#[tokio::test]
+#[ignore = "requires a live Postgres instance with pgvector (set DATABASE_URL env var)"]
+async fn postgres_l2_org_isolation_org_b_miss() {
+    let db_url = match env::var("DATABASE_URL") {
+        Ok(u) => u,
+        Err(_) => return, // skip cleanly when env unset
+    };
+
+    let pool = sqlx::PgPool::connect(&db_url)
+        .await
+        .expect("should connect to Postgres");
+
+    let cache = PostgresL2Cache::new(pool);
+    let org_a = Uuid::new_v4();
+    let org_b = Uuid::new_v4();
+
+    // 1536-dim unit vector (matches text-embedding-3-small dimensionality).
+    let mut embedding = vec![0.0_f32; 1536];
+    embedding[0] = 1.0;
+
+    let entry = CacheEntry {
+        id: Uuid::new_v4(),
+        org_id: org_a,
+        embedding: embedding.clone(),
+        response: serde_json::to_vec(&serde_json::json!({"object": "chat.completion"}))
+            .expect("serialize ok"),
+        model: "gpt-4o".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
+        input_tokens: 10,
+        output_tokens: 5,
+        baseline_cost_usd: None,
+        hit_count: 0,
+        created_at: Utc::now(),
+        expires_at: Utc::now() + Duration::seconds(3600),
+    };
+    let entry_id = entry.id;
+
+    cache
+        .insert(entry)
+        .await
+        .expect("org A insert should succeed");
+
+    // org B queries the identical vector — must miss (no cross-tenant leak).
+    let leaked = cache
+        .lookup(org_b, &embedding, 0.99, "gpt-4o", "text-embedding-3-small")
+        .await
+        .expect("org B lookup should succeed");
+    assert!(
+        leaked.is_none(),
+        "org B must NOT see org A's cache entry — got {leaked:?}"
+    );
+
+    // org A queries the same vector — must hit its own entry.
+    let (found, _) = cache
+        .lookup(org_a, &embedding, 0.99, "gpt-4o", "text-embedding-3-small")
+        .await
+        .expect("org A lookup should succeed")
+        .expect("org A should recall its own entry");
+    assert_eq!(
+        found.id, entry_id,
+        "org A must recall its own planted entry"
+    );
+
+    // Clean up the test row.
+    let cleanup_pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    sqlx::query("DELETE FROM cache_entries WHERE id = $1")
+        .bind(entry_id)
+        .execute(&cleanup_pool)
+        .await
+        .ok();
+}
