@@ -15,10 +15,20 @@
 //!    tenant; on any failure (absent/unknown/wrong-secret/revoked/malformed) it
 //!    returns [`McpError::Unauthorized`] (JSON-RPC `-32001`).
 //!
+//! [`Authenticator`] is the seam that puts (2) on the **live request path**: the
+//! [`crate::server::Server`] holds one (when a key store is wired) and calls it
+//! before dispatching `tools/call` / `resources/read`. It implements the design
+//! §8 flow — *validate on first tool/resource call, cache the `org_id` for the
+//! process lifetime* — so the verified tenant is bound once and reused, and an
+//! invalid/absent key fails the call closed with `-32001`.
+//!
 //! We deliberately do **not** reimplement any crypto here — all hashing and the
 //! constant-time compare are owned by `tt_auth`, so the MCP server inherits the
 //! same verify path (and the same no-timing-oracle guarantees) as the Gateway.
 
+use std::sync::Arc;
+
+use tokio::sync::OnceCell;
 use tt_auth::{ApiKeyContext, KeyError, KeyStore};
 
 use crate::error::McpError;
@@ -49,7 +59,8 @@ pub fn validate_api_key(env_var: Option<String>) -> Result<String, McpError> {
 /// oracle).
 ///
 /// An absent key (`None`) is treated as unauthorized: the MCP server fails
-/// closed when a key store is wired.
+/// closed. This is the verify primitive [`Authenticator`] drives on the first
+/// tool/resource call.
 pub async fn verify_api_key<S: KeyStore + ?Sized>(
     store: &S,
     presented: Option<&str>,
@@ -58,6 +69,57 @@ pub async fn verify_api_key<S: KeyStore + ?Sized>(
     tt_auth::verify(store, presented)
         .await
         .map_err(map_key_error)
+}
+
+/// Process-lifetime authenticator wired into the [`crate::server::Server`].
+///
+/// Realises the MCP design (§8): *"Server validates on first tool/resource
+/// call; caches the `org_id` for the process lifetime."* The operator's own
+/// presented key (the same key the loopback transport requires as its bearer
+/// token) is verified against a [`KeyStore`] **on the first tool/resource
+/// dispatch**, and the resulting [`ApiKeyContext`] is cached so every later
+/// call binds the same verified tenant without re-running argon2.
+///
+/// This is the seam through which [`verify_api_key`] enters the live request
+/// path: the server holds an `Authenticator` and calls
+/// [`Authenticator::context`] before dispatching `tools/call` / `resources/read`
+/// so tools act on the right tenant. When no store is wired (the local dev
+/// boot, where the transport bearer guard is the gate and there is no key store
+/// to verify against), the server simply holds no `Authenticator` and dispatch
+/// proceeds unchanged.
+pub struct Authenticator {
+    store: Arc<dyn KeyStore>,
+    presented: String,
+    /// First-call verification result, cached for the process lifetime. Holds
+    /// the bound [`ApiKeyContext`] on success so the org is resolved exactly
+    /// once; the verify failure is *not* cached (a transient store fault must
+    /// not permanently wedge the server).
+    cached: OnceCell<ApiKeyContext>,
+}
+
+impl Authenticator {
+    /// Build an authenticator that will verify `presented` against `store` on
+    /// first use. No verification happens here — it is deferred to the first
+    /// tool/resource call, per §8.
+    pub fn new(store: Arc<dyn KeyStore>, presented: impl Into<String>) -> Self {
+        Self {
+            store,
+            presented: presented.into(),
+            cached: OnceCell::new(),
+        }
+    }
+
+    /// Return the verified [`ApiKeyContext`] for the operator key, verifying
+    /// against the key store on the first call and returning the cached result
+    /// thereafter. Fails closed with [`McpError::Unauthorized`] (`-32001`) on an
+    /// invalid/absent/revoked key — exactly the same verify path and error
+    /// mapping as [`verify_api_key`], so no timing oracle is introduced and the
+    /// rejection never reveals *why* a key failed.
+    pub async fn context(&self) -> Result<&ApiKeyContext, McpError> {
+        self.cached
+            .get_or_try_init(|| verify_api_key(self.store.as_ref(), Some(&self.presented)))
+            .await
+    }
 }
 
 /// Collapse a [`KeyError`] into the MCP `unauthorized` error. Every variant maps

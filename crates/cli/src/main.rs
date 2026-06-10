@@ -502,6 +502,35 @@ async fn main() -> anyhow::Result<()> {
                     http: reqwest::Client::new(),
                 },
             ));
+
+            // Real, store-backed key verification (design §8): when a database is
+            // configured, wire a Postgres key store and have the server verify the
+            // operator's own key against it on the first tool/resource call,
+            // caching the bound org for the process lifetime so tools act on the
+            // right tenant. Invalid/absent/revoked → the call fails closed with
+            // `unauthorized` (-32001) via `tt_auth::verify` (no reimplemented
+            // crypto, no timing oracle). Without a DB there is no key store to
+            // verify against, so we fall back to the transport's loopback bearer
+            // guard alone — mirroring the gateway's documented dev-mode posture.
+            if let Some(db_url) = config.database_url.as_deref() {
+                match tt_core::connect(db_url, 5).await {
+                    Ok(pool) => {
+                        let store: std::sync::Arc<dyn tt_auth::KeyStore> =
+                            std::sync::Arc::new(tt_auth::postgres::PostgresKeyStore::new(pool));
+                        server = server
+                            .with_authenticator(auth::Authenticator::new(store, api_key.clone()));
+                        tracing::info!(
+                            "MCP key store: Postgres-backed (operator key verified on first call)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "MCP db connect failed; serving with loopback bearer guard only (no store-backed verification)");
+                    }
+                }
+            } else {
+                tracing::warn!("DATABASE_URL not set; MCP serving with loopback bearer guard only (no store-backed key verification)");
+            }
+
             match transport.as_str() {
                 "stdio" => {
                     server.run_stdio().await?;
