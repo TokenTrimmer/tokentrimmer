@@ -5,10 +5,23 @@
 //! ## Transport
 //!
 //! The OTLP exporter uses **HTTP/protobuf** (`application/x-protobuf`, the
-//! OTLP spec default) over the existing `reqwest`/`rustls` stack. We
-//! deliberately avoid the gRPC/`tonic` transport to keep the runtime TLS stack
-//! consistent with the rest of the gateway. Spans are exported in the
-//! background via a batch span processor (tokio runtime).
+//! OTLP spec default) over the existing `reqwest`/`rustls` stack, so the export
+//! path reuses the gateway's existing rustls TLS stack rather than standing up
+//! a second TLS stack for a gRPC/`tonic` transport. (`tonic`/`prost` are still
+//! pulled in transitively by `opentelemetry-proto` for the generated wire
+//! types; this is not a tonic-free build.) Spans are exported in the background
+//! via a batch span processor (tokio runtime).
+//!
+//! ## Scope: export only, not cross-service propagation
+//!
+//! This module exports *locally generated* spans over OTLP. It does **not**
+//! install a [`TextMapPropagator`], so W3C `traceparent` headers are neither
+//! emitted on outbound requests nor honoured on inbound ones — the request
+//! middleware mints its own trace-id. Wiring cross-service W3C propagation
+//! (inbound `traceparent` ingest + a `TraceContextPropagator`) is tracked
+//! separately and is intentionally out of scope here.
+//!
+//! [`TextMapPropagator`]: opentelemetry::propagation::TextMapPropagator
 
 use std::env;
 use std::time::Duration;
@@ -166,8 +179,11 @@ pub fn init(service_name: &str) -> Result<TracingGuard, TracingError> {
     let _ = registry.try_init();
 
     if let Some(ref p) = provider {
-        // Register the provider globally so `opentelemetry::global` span/context
-        // APIs (and W3C trace propagation) resolve to it.
+        // Register the provider globally so direct `opentelemetry::global`
+        // tracer lookups resolve to it. NOTE: this does not enable W3C
+        // `traceparent` propagation — that needs a `TextMapPropagator`
+        // (`set_text_map_propagator`), which we deliberately do not install
+        // here (see the module-level "Scope" note).
         opentelemetry::global::set_tracer_provider(p.clone());
         tracing::info!(service = service_name, "OTLP span exporter active");
     }

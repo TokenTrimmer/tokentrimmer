@@ -383,9 +383,12 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Initialize tracing via the telemetry crate so the OTLP span exporter
+    // activates when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (no-op JSON-stdout
+    // otherwise). The guard is bound to `main`'s lifetime; dropping it on
+    // shutdown flushes any buffered spans.
+    let _tracing_guard = tt_telemetry::tracing::init("tokentrimmer")
+        .map_err(|e| anyhow::anyhow!("tracing init: {e}"))?;
 
     let cli = Cli::parse();
     tt_cli::ui::init(cli.no_color);
