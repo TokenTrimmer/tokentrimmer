@@ -5,6 +5,15 @@ Gate your pull requests on **projected LLM cost changes**. The action runs
 per-call cost delta, and (optionally) fails the check when a change would make
 your LLM calls more expensive.
 
+> **Which `uses:` ref?** `tokentrimmer/cost-gate-action` is the intended
+> standalone repo for this action once it's published to the Marketplace — it
+> does **not** exist yet. Until then the action ships inside the monorepo, so
+> consume it via the subpath form:
+> `uses: TokenTrimmer/tokentrimmer/inspect-action@<ref>` (pin `<ref>` to a tag
+> or commit SHA). The `tokentrimmer/cost-gate-action@v1` snippets below are
+> written against the future standalone repo; swap in the subpath ref to run
+> the action today.
+
 It works by reading the model identifiers (`model = "..."`, `"model": "..."`,
 etc.) added and removed in `git diff <base> -- <path>`, pricing each against
 TokenTrimmer's local model catalog, and reporting the net projected per-call
@@ -32,6 +41,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # needed so the base ref is available for the diff
+      # Until the standalone repo is published, use the monorepo subpath:
+      #   uses: TokenTrimmer/tokentrimmer/inspect-action@v1
       - uses: tokentrimmer/cost-gate-action@v1
         with:
           path: .
@@ -78,6 +89,8 @@ PR's base, prices the model changes, posts a comment like:
 Want the comment without blocking merges? Set `fail-on-cost-increase: false`:
 
 ```yaml
+      # Or, from the monorepo today:
+      #   uses: TokenTrimmer/tokentrimmer/inspect-action@v1
       - uses: tokentrimmer/cost-gate-action@v1
         with:
           fail-on-cost-increase: false
