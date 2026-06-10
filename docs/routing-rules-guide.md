@@ -98,7 +98,7 @@ default of `100` is applied when you don't set one.
 ## Managing routes with `tt route`
 
 `tt route` talks to the gateway's `/v1/routes` API using your resolved API key
-(see [`tt login`](#authentication)). All four subcommands require a key.
+(see [`tt login`](tt-cli-commands.md#authentication)). All four subcommands require a key.
 
 ```bash
 tt route list                 # table of NAME, ROUTE, PRIO, STATUS
