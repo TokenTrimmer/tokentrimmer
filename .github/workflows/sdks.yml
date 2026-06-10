@@ -41,8 +41,8 @@ jobs:
           node-version: '20'
       - name: Install
         run: cd sdk-typescript && npm install
-      - name: Typecheck SDK
-        run: cd sdk-typescript && npx tsc -p tsconfig.json --noEmit
+      - name: Typecheck SDK (src + tests)
+        run: cd sdk-typescript && npm run typecheck
       - name: Test
         run: cd sdk-typescript && npx vitest run
       - name: Typecheck examples
