@@ -1019,6 +1019,36 @@ pub async fn handler(
                                 matched_route_id,
                             ),
                         );
+                        // Record OTel GenAI semconv + cost span attributes for the
+                        // fake-stream L1 hit. The cost is already known here (a hit
+                        // never reaches a provider → cost 0, full baseline saved),
+                        // and `Span::current()` is still the `http_request` span,
+                        // so we stamp synchronously — mirroring the non-streaming
+                        // `build_hit_l1_response`. The `None` log_ctx below means
+                        // the SSE drop guard records nothing, so without this the
+                        // streaming L1 hit would be invisible to the dashboards.
+                        let baseline_cost_usd = if entry.is_legacy_format() {
+                            synthetic_baseline_from_usage(&entry.response.usage)
+                        } else {
+                            entry.baseline_cost_usd
+                        };
+                        let hit_cost = CostBreakdown {
+                            cost_usd: 0.0,
+                            baseline_cost_usd,
+                            provider_cache_saved_usd: 0.0,
+                        };
+                        record_request_span_attributes(
+                            &entry.response.model,
+                            &entry.response.model,
+                            "cache",
+                            span_cost(
+                                &hit_cost,
+                                entry.response.usage.prompt_tokens,
+                                entry.response.usage.completion_tokens,
+                            ),
+                            "hit-l1",
+                            None,
+                        );
                         let fake = sse::fake_stream_from_response(entry.response);
                         // L1 hit already logged above; no need for a second row.
                         return Ok(with_route_matched(

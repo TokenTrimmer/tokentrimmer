@@ -227,13 +227,17 @@ mod tests {
     }
 
     /// A malformed endpoint surfaces as a `TracingError::Otlp`, not a panic.
+    /// The exporter builder validates the endpoint URL eagerly, so a string with
+    /// embedded spaces (`"ht tp://bad endpoint"`) deterministically fails to
+    /// parse — we assert the error rather than swallowing it, so a regression
+    /// that started silently accepting bad endpoints would be caught.
     #[tokio::test]
     async fn build_otlp_provider_rejects_malformed_endpoint() {
         let result = build_otlp_provider("ht tp://bad endpoint", "tt-test");
-        // Either the exporter build rejects it (Otlp error) or it is accepted
-        // and only fails at export time. Both are acceptable as long as we do
-        // not panic; assert the no-panic contract by reaching this line.
-        let _ = result;
+        assert!(
+            matches!(result, Err(TracingError::Otlp(_))),
+            "a malformed endpoint URL must surface as TracingError::Otlp, got {result:?}"
+        );
     }
 
     /// `init` no-ops the exporter cleanly when the OTLP endpoint env is unset

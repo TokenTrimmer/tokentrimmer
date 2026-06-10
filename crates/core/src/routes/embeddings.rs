@@ -153,6 +153,8 @@ pub async fn handler(
     };
 
     // 4. Baseline pricing on the ORIGINAL model, before routing rewrites it.
+    // Capture the requested model too, for `gen_ai.request.model` on the span.
+    let requested_model = req.model.clone();
     let requested_pricing = provider.pricing(&req.model);
 
     // 5. Routing via a synthetic chat request (model + input text; no modality).
@@ -279,6 +281,36 @@ pub async fn handler(
     state
         .spend_sink()
         .record(org_id, breakdown.cost_usd, Utc::now());
+
+    // OTel GenAI semconv + TokenTrimmer cost span attributes, mirroring the
+    // chat path so embeddings traffic shows up in the same spend/savings/tokens
+    // dashboards. `operation = embeddings`; output tokens are 0 for embeddings.
+    // Pulls from the same `breakdown` + `resp.usage` already computed above —
+    // nothing recomputed. Captured before `resp` moves into the JSON body.
+    let span_input_tokens = resp.usage.prompt_tokens;
+    let span_output_tokens = resp.usage.completion_tokens;
+    let route_matched_name = route_match.as_ref().map(|m| m.route_name.clone());
+    tt_telemetry::gen_ai::record_request_attributes(
+        &tracing::Span::current(),
+        &tt_telemetry::gen_ai::RequestSpanAttributes {
+            provider_id: provider.id(),
+            request_model: &requested_model,
+            response_model: &served_model,
+            operation: "embeddings",
+            cost: tt_telemetry::gen_ai::RequestSpanCost {
+                input_tokens: span_input_tokens,
+                output_tokens: span_output_tokens,
+                cost_usd: breakdown.cost_usd,
+                baseline_cost_usd: breakdown.baseline_cost_usd,
+                saved_usd: breakdown.tt_saved_usd(),
+                provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+            },
+            // Embeddings are never cache-served today; mark the outcome `none`
+            // so the cache-hit-rate denominator can include them consistently.
+            cache_outcome: Some("none"),
+            route: route_matched_name.as_deref(),
+        },
+    );
 
     let mut http = (StatusCode::OK, Json(resp)).into_response();
     attach_cost_headers(

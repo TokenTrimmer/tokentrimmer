@@ -222,6 +222,25 @@
           "tableType": "spans",
           "query": "{ name = \"http_request\" && span.tokentrimmer.cache != \"\" } | count_over_time()"
         }
+      ],
+      "transformations": [
+        {
+          "id": "reduce",
+          "options": {
+            "reducers": ["lastNotNull"],
+            "includeTimeField": false,
+            "mode": "reduceFields"
+          }
+        },
+        {
+          "id": "calculateField",
+          "options": {
+            "mode": "binary",
+            "binary": { "left": "HITS", "operator": "/", "right": "TOTAL" },
+            "alias": "Cache-hit rate",
+            "replaceFields": true
+          }
+        }
       ]
     },
     {

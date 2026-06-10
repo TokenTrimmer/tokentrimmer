@@ -49,7 +49,10 @@ use tt_auth::ApiKeyContext;
 use tt_cache::{memory::InMemoryL1Cache, CacheEntry, EmbeddingProvider, InMemoryL2Cache, L2Cache};
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
-    messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
+    messages::{
+        Choice, ChunkChoice, ChunkDelta, EmbeddingData, EmbeddingsRequest, EmbeddingsResponse,
+        Message, MessageContent,
+    },
     pricing::Capability,
     CallerTier, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ModelInfo,
     ModelPricing, Provider, ProviderError, RequestContext, Usage,
@@ -508,10 +511,17 @@ impl EmbeddingProvider for FixedEmbedder {
 }
 
 fn cache_chat_request(tier: Option<CallerTier>) -> Request<Body> {
+    cache_chat_request_stream(tier, false)
+}
+
+/// Like [`cache_chat_request`] but lets the caller request a streaming response,
+/// so the fake-stream L1-hit path (a `stream: true` request that hits L1) can be
+/// exercised.
+fn cache_chat_request_stream(tier: Option<CallerTier>, stream: bool) -> Request<Body> {
     let body = json!({
         "model": "counting-1",
         "messages": [{ "role": "user", "content": "hello there" }],
-        "stream": false,
+        "stream": stream,
     });
     let mut req = Request::builder()
         .method("POST")
@@ -679,6 +689,79 @@ fn l1_hit_span_carries_gen_ai_and_cost_attributes() {
     assert_cache_hit_attrs(&attrs, "hit-l1", expected_baseline);
 }
 
+/// A *streaming* L1 cache HIT (`stream: true` request served from the
+/// fake-stream path) must also leave the gen_ai.* + cost attributes on the
+/// `http_request` span with `tokentrimmer.cache = "hit-l1"`. This path passes
+/// `log_ctx = None` to `stream_response` (the hit is logged separately), so the
+/// SSE drop guard records nothing — the attributes are stamped synchronously at
+/// the fake-stream call site. Without that, every streaming cache hit would be
+/// invisible to the dashboards (the gap this test guards). The first
+/// (non-streaming) miss primes L1; the streaming hit shares the cache key and is
+/// the span under test.
+#[test]
+fn streaming_l1_hit_span_carries_gen_ai_and_cost_attributes() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = TracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let tracer = provider.tracer("streaming-l1-hit-span-test");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::with_default(subscriber, || {
+        rt.block_on(async {
+            let mut registry = ProviderRegistry::new();
+            registry.register(Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+            }));
+            let l1 = Arc::new(InMemoryL1Cache::new());
+            let state = AppState::new(registry).with_l1(l1, None);
+            let app = build_router(state);
+
+            // First request — non-streaming miss, primes L1 with deterministic
+            // 100/50 usage and a known catalog baseline. Streaming and
+            // non-streaming variants of the same prompt share the L1 key.
+            let r1 = app.clone().oneshot(cache_chat_request(None)).await.unwrap();
+            assert_eq!(r1.status(), StatusCode::OK);
+            let _ = to_bytes(r1.into_body(), 8 * 1024).await.unwrap();
+
+            // Allow the spawned L1 insert to land.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Second request — STREAMING L1 hit via the fake-stream path. Note
+            // the fake-stream path does not stamp the `x-tokentrimmer-cache`
+            // response header (unlike the non-streaming hit builders); the hit is
+            // confirmed below by the provider NOT being re-dispatched (calls == 1)
+            // and the recorded `tokentrimmer.cache = hit-l1` span attribute.
+            let r2 = app
+                .oneshot(cache_chat_request_stream(None, true))
+                .await
+                .unwrap();
+            assert_eq!(r2.status(), StatusCode::OK);
+            // Drain the SSE body so the response (and any guard) is fully
+            // consumed, matching how a real client reads the stream.
+            let _ = to_bytes(r2.into_body(), 8 * 1024).await.unwrap();
+        });
+    });
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "provider must NOT be re-dispatched on the streaming L1 hit"
+    );
+
+    provider.force_flush();
+    let attrs = cache_hit_span_attrs(&exporter, "hit-l1");
+    // Same envelope baseline as the non-streaming L1-hit test.
+    let expected_baseline = (100.0 * 3.0 + 50.0 * 6.0) / 1_000_000.0;
+    assert_cache_hit_attrs(&attrs, "hit-l1", expected_baseline);
+}
+
 /// An L2 cache HIT must leave the gen_ai.* + cost attributes on the
 /// `http_request` span with `tokentrimmer.cache = "hit-l2"`, and the baseline
 /// must be the ROW's stored catalog baseline (distinct from the $1/M·$2/M
@@ -785,4 +868,179 @@ fn l2_hit_span_carries_gen_ai_and_cost_attributes() {
         ),
         other => panic!("tokentrimmer.baseline_cost_usd should be f64, got {other:?}"),
     }
+}
+
+// ─── Embeddings ────────────────────────────────────────────────────────────────
+//
+// `POST /v1/embeddings` records the same span attributes as the chat path but
+// with `gen_ai.operation.name = embeddings` and zero output tokens. This keeps
+// embeddings traffic visible in the spend/savings/tokens dashboards. The
+// attribute is stamped at the embeddings success path (`embeddings.rs`).
+
+const EMB_PROMPT_TOKENS: u64 = 1_000;
+
+/// Embedding provider with a fixed token usage so cost is deterministic:
+/// $0.13/1M input, no output → cost = 1000 * 0.13e-6 USD.
+struct EmbeddingMock;
+
+#[async_trait]
+impl Provider for EmbeddingMock {
+    fn id(&self) -> &'static str {
+        "openai"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: "text-embedding-3-small".into(),
+            provider: "openai".into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 8192,
+            max_output_tokens: 0,
+        }]
+    }
+    fn pricing(&self, _m: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 0.13,
+            output_per_million: 0.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Err(ProviderError::Unsupported("chat not used".into()))
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Ok(EmbeddingsResponse {
+            object: "list".into(),
+            data: vec![EmbeddingData {
+                object: "embedding".into(),
+                index: 0,
+                embedding: vec![0.1, 0.2],
+            }],
+            model: req.model,
+            usage: Usage {
+                prompt_tokens: EMB_PROMPT_TOKENS,
+                completion_tokens: 0,
+                total_tokens: EMB_PROMPT_TOKENS,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+            },
+        })
+    }
+}
+
+fn embeddings_request() -> Request<Body> {
+    let body = json!({
+        "model": "text-embedding-3-small",
+        "input": "hello there",
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// A `POST /v1/embeddings` request must record the gen_ai.* + cost attributes on
+/// the `http_request` span with `gen_ai.operation.name = embeddings`, zero output
+/// tokens, and the deterministic embedding cost — so embeddings traffic is not
+/// dropped from the spend/tokens dashboards.
+#[test]
+fn embeddings_request_span_carries_gen_ai_and_cost_attributes() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = TracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let tracer = provider.tracer("embeddings-span-test");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let attrs = tracing::subscriber::with_default(subscriber, || {
+        rt.block_on(async {
+            let mut registry = ProviderRegistry::new();
+            registry.register(Arc::new(EmbeddingMock));
+            let app = build_router(AppState::new(registry));
+            let resp = app.oneshot(embeddings_request()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let _ = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
+        });
+
+        provider.force_flush();
+        exporter
+            .get_finished_spans()
+            .expect("finished spans")
+            .into_iter()
+            .find(|s| s.name == "http_request")
+            .expect("the gateway request span 'http_request' should be recorded")
+            .attributes
+            .into_iter()
+            .map(|kv| (kv.key.to_string(), kv.value))
+            .collect::<HashMap<_, _>>()
+    });
+
+    assert_eq!(
+        attrs.get("gen_ai.operation.name"),
+        Some(&Value::String("embeddings".into())),
+        "the embeddings route must stamp operation = embeddings"
+    );
+    assert_eq!(
+        attrs.get("gen_ai.system"),
+        Some(&Value::String("openai".into()))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.request.model"),
+        Some(&Value::String("text-embedding-3-small".into()))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.response.model"),
+        Some(&Value::String("text-embedding-3-small".into())),
+        "no routing → response model equals the requested model"
+    );
+    assert_eq!(
+        attrs.get("gen_ai.usage.input_tokens"),
+        Some(&Value::I64(EMB_PROMPT_TOKENS as i64))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.usage.output_tokens"),
+        Some(&Value::I64(0)),
+        "embeddings produce no output tokens"
+    );
+
+    let expected_cost = EMB_PROMPT_TOKENS as f64 * 0.13 / 1_000_000.0;
+    match attrs.get("tokentrimmer.cost_usd") {
+        Some(Value::F64(c)) => assert!(
+            (c - expected_cost).abs() < 1e-12,
+            "embeddings tokentrimmer.cost_usd = {c}, expected {expected_cost}"
+        ),
+        other => panic!("tokentrimmer.cost_usd should be f64, got {other:?}"),
+    }
+    assert_eq!(
+        attrs.get("tokentrimmer.cache"),
+        Some(&Value::String("none".into())),
+        "embeddings are never cache-served → cache outcome 'none'"
+    );
 }

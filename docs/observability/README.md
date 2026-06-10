@@ -3,10 +3,13 @@
 The gateway emits an OpenTelemetry span per request (`http_request`, created at
 the request-entry middleware — `crates/core/src/middleware/trace.rs`). When the
 cost is known (end of request, alongside the `x-tokentrimmer-*` response
-headers) the chat handler records the OpenTelemetry **GenAI semantic-convention**
-attributes plus TokenTrimmer **cost** attributes onto that span
-(`crates/telemetry/src/gen_ai.rs`, called from
-`crates/core/src/routes/chat.rs`). Spans export over OTLP when
+headers) the chat and embeddings handlers record the OpenTelemetry **GenAI
+semantic-convention** attributes plus TokenTrimmer **cost** attributes onto that
+span (`crates/telemetry/src/gen_ai.rs`, called from
+`crates/core/src/routes/chat.rs` and `crates/core/src/routes/embeddings.rs`).
+The chat path stamps the attributes on every served outcome — non-streaming
+miss, streaming miss, L1/L2 cache hit, and the streaming/fake-stream L1 hit — so
+streaming and cache-hit traffic are not undercounted. Spans export over OTLP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 ## Attributes emitted on the `http_request` span
@@ -17,7 +20,7 @@ GenAI semconv (`gen_ai.*`):
 | --- | --- |
 | `gen_ai.system` | Provider (`openai`, `anthropic`, `gcp.gemini`, `groq`, `mistral_ai`, …). |
 | `gen_ai.provider.name` | Newer semconv spelling of `gen_ai.system`; emitted with the same value for forward-compat. |
-| `gen_ai.operation.name` | `chat` (and `embeddings` / `text_completion` on those routes). |
+| `gen_ai.operation.name` | `chat` on `/v1/chat/completions`, `embeddings` on `/v1/embeddings`. |
 | `gen_ai.request.model` | Model the caller asked for (pre-routing). |
 | `gen_ai.response.model` | Model that actually served the request (post-routing / failover). |
 | `gen_ai.usage.input_tokens` | Prompt tokens. |
