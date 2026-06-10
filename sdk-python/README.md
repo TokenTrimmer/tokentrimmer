@@ -5,8 +5,13 @@ Thin Python SDK over the official OpenAI client — routes through the TokenTrim
 > **Not yet on PyPI** — published packages land at launch. Until then, install from git:
 
 ```bash
-pip install "git+https://github.com/tokentrimmer/tokentrimmer.git#subdirectory=sdk-python"
+pip install "git+https://github.com/TokenTrimmer/tokentrimmer.git#subdirectory=sdk-python"
 ```
+
+> **Hosted gateway launching soon** *(as of 2026-06-10)* — `TokenTrimmer(api_key=...)`
+> defaults to `https://api.tokentrimmer.com`, which is not live yet. Self-host with
+> Docker today and pass `base_url="http://localhost:8080/v1"` (see "Self-hosted
+> Gateway" below).
 
 ```python
 from tokentrimmer import TokenTrimmer

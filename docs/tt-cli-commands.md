@@ -10,6 +10,11 @@ For `tt gateway` (running the gateway itself), `tt inspect`, `tt plan`,
 `GETTING_STARTED.md`, and the other `docs/tt-*-usage.md` guides. The routing
 rule model is its own guide: `docs/routing-rules-guide.md`.
 
+> **Hosted gateway launching soon** *(as of 2026-06-10)* — the default base
+> `https://api.tokentrimmer.com` is not live yet. Self-host with Docker today
+> (`tt gateway`, or the Docker image — see `GETTING_STARTED.md`) and point these
+> commands at it with `--tt-api-base http://localhost:8080` or `TT_API_BASE`.
+
 ## Authentication
 
 Every command on this page (except `tt models`, which can run logged-out)

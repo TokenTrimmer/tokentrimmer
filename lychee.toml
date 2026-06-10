@@ -1,0 +1,53 @@
+# Configuration for the `lychee` link checker (CI: .github/workflows/link-check.yml).
+#
+# Scope: Markdown docs + READMEs. The goal is to catch genuinely broken links
+# while staying green for hosted endpoints that are not live yet (these are in
+# `exclude` below) and for local/placeholder URLs that appear in code snippets.
+
+# Treat these HTTP status codes as success in addition to 2xx.
+# 429 = rate-limited (provider doc sites throttle CI runners); 403 = some hosts
+# block headless/CI user agents but the URL is valid.
+accept = ["200..=299", "403", "429"]
+
+# Per-request timeout (seconds) and retry budget for flaky external hosts.
+timeout = 20
+max_retries = 2
+retry_wait_time = 2
+
+# Follow redirects (canonical-casing and trailing-slash redirects are fine).
+max_redirects = 5
+
+# Only check real network links; skip mail/tel and obviously-fake schemes.
+scheme = ["https", "http"]
+include_mail = false
+
+# Scope: integration-facing docs + READMEs only. The dated planning/audit
+# archives under docs/superpowers/ and docs/reviews/ are point-in-time
+# engineering artifacts (cited links there are not live reference for users),
+# so they are excluded — both here and via the workflow's input globs.
+exclude_path = [
+  "docs/superpowers/",
+  "docs/reviews/",
+]
+
+# Exclude URLs that are not-yet-live hosted endpoints or local/placeholder
+# values embedded in documentation code snippets. Patterns are regexes matched
+# against the full URL.
+exclude = [
+  # --- Hosted TokenTrimmer endpoints — NOT live yet (launching soon) ---
+  # api.tokentrimmer.com (gateway), dashboard.tokentrimmer.com (dashboard),
+  # the bare marketing site, and the staging fly.dev preview.
+  '^https?://([a-z-]+\.)?tokentrimmer\.com',
+  '^https?://tokentrimmer\.fly\.dev',
+
+  # --- Local / loopback / private hosts in self-host code snippets ---
+  '^https?://localhost',
+  '^https?://127\.0\.0\.1',
+  '^https?://0\.0\.0\.0',
+  '^https?://gpu-box',
+  '^https?://gw\.test',
+
+  # --- Placeholder / illustrative URLs in code examples ---
+  '^https?://example\.com',
+  '^https?://github\.com/customer/repo',
+]

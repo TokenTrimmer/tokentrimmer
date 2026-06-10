@@ -1,0 +1,62 @@
+name: link-check
+
+# Checks the Markdown docs and READMEs for broken links with lychee. The
+# ignore-list in lychee.toml allows the not-yet-live hosted endpoints
+# (api/dashboard.tokentrimmer.com) and local/placeholder URLs in code snippets,
+# so this job is green today while still catching genuinely broken links.
+
+on:
+  pull_request:
+    paths:
+      - '*.md'
+      - 'docs/*.md'
+      - 'sdk-python/README.md'
+      - 'sdk-typescript/README.md'
+      - 'examples/README.md'
+      - 'lychee.toml'
+      - '.github/workflows/link-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - '*.md'
+      - 'docs/*.md'
+      - 'sdk-python/README.md'
+      - 'sdk-typescript/README.md'
+      - 'examples/README.md'
+      - 'lychee.toml'
+      - '.github/workflows/link-check.yml'
+  # Weekly run catches links that rot after merge (external sites going away).
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  link-check:
+    name: lychee (docs + READMEs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Check links
+        uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
+        with:
+          # Config (timeouts, accepted codes, exclude-list) lives in lychee.toml.
+          # Scope: integration-facing docs + READMEs. The dated planning/audit
+          # archives under docs/superpowers/ and docs/reviews/ are point-in-time
+          # artifacts, not live reference, so they are out of scope here.
+          args: >-
+            --config lychee.toml
+            --no-progress
+            './*.md'
+            './docs/*.md'
+            './sdk-python/README.md'
+            './sdk-typescript/README.md'
+            './examples/README.md'
+          # Gate the job on broken links (this is the action default; set
+          # explicitly so the intent is obvious).
+          fail: true
+        env:
+          # Authenticates GitHub link checks for a higher rate limit.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

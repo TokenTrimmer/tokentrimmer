@@ -6,10 +6,15 @@ Thin Node SDK over the official OpenAI client — routes through the TokenTrimme
 > install a git subdirectory directly), build from a clone and install the local path:
 
 ```bash
-git clone https://github.com/tokentrimmer/tokentrimmer.git
+git clone https://github.com/TokenTrimmer/tokentrimmer.git
 (cd tokentrimmer/sdk-typescript && npm install && npm run build)
 npm install ./tokentrimmer/sdk-typescript
 ```
+
+> **Hosted gateway launching soon** *(as of 2026-06-10)* — `new TokenTrimmer({ apiKey })`
+> defaults to `https://api.tokentrimmer.com`, which is not live yet. Self-host with
+> Docker today and pass `baseURL: 'http://localhost:8080/v1'` (see "Self-hosted
+> Gateway" below).
 
 ```ts
 import { TokenTrimmer } from '@tokentrimmer/client';

@@ -9,7 +9,7 @@ to exercise the wire path without real provider calls.
 
 ## Python
 ```bash
-pip install "git+https://github.com/tokentrimmer/tokentrimmer.git#subdirectory=sdk-python"
+pip install "git+https://github.com/TokenTrimmer/tokentrimmer.git#subdirectory=sdk-python"
 export TOKENTRIMMER_API_KEY=tt_...
 python examples/python/cost_attribution.py
 ```
@@ -17,7 +17,7 @@ python examples/python/cost_attribution.py
 ## TypeScript
 ```bash
 # npm cannot install a git subdirectory directly — build the SDK from a clone:
-git clone https://github.com/tokentrimmer/tokentrimmer.git
+git clone https://github.com/TokenTrimmer/tokentrimmer.git
 (cd tokentrimmer/sdk-typescript && npm install && npm run build)
 npm install ./tokentrimmer/sdk-typescript
 export TOKENTRIMMER_API_KEY=tt_...
