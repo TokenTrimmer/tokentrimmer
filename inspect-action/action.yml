@@ -111,6 +111,13 @@ runs:
       run: |
         # Sticky comment: an HTML marker lets us find & update our own comment
         # instead of stacking a new one on every push.
+        #
+        # The PR comment is a nice-to-have, NOT the gate. Posting requires a
+        # write-capable token, which is unavailable on fork-contributor PRs
+        # (GITHUB_TOKEN is read-only under `on: pull_request` from a fork). A
+        # denied/failed write here must never red-X the job — the cost pass/fail
+        # verdict is decided independently in the "Fail the check" step below. So
+        # we warn-and-continue on any failure instead of letting it propagate.
         marker="<!-- tokentrimmer-cost-gate -->"
         body="$(mktemp)"
         {
@@ -121,16 +128,22 @@ runs:
         existing="$(gh api \
           "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
           --paginate --jq \
-          ".[] | select(.body | contains(\"$marker\")) | .id" | head -n1)"
+          ".[] | select(.body | contains(\"$marker\")) | .id" 2>/dev/null | head -n1 || true)"
 
         if [ -n "$existing" ]; then
+          posted=0
           gh api --method PATCH \
             "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
-            -F body=@"$body" >/dev/null
+            -F body=@"$body" >/dev/null 2>&1 || posted=1
         else
+          posted=0
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            -F body=@"$body" >/dev/null
+            -F body=@"$body" >/dev/null 2>&1 || posted=1
+        fi
+
+        if [ "$posted" -ne 0 ]; then
+          echo "::warning::TokenTrimmer cost gate could not post the PR comment (the token is likely read-only, e.g. a fork-contributor PR). The cost report is still in the job step summary and the gate verdict is unaffected."
         fi
 
     - name: Fail the check on projected cost increase

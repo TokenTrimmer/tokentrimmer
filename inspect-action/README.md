@@ -86,6 +86,19 @@ Want the comment without blocking merges? Set `fail-on-cost-increase: false`:
 The action still posts the cost delta comment and writes the report to the job
 step summary, but never fails the check.
 
+## Fork-PR / read-only token note
+
+On pull requests opened from a **fork**, GitHub gives the workflow a read-only
+`GITHUB_TOKEN`, so the action cannot post or update the PR comment. This is by
+design and is **not** a failure: the comment step warns and continues, the
+cost-diff report is still written to the **job step summary**, and the
+pass/fail gate (`fail-on-cost-increase`) is decided independently — so the gate
+keeps working even when commenting is denied. Set `comment: false` to skip the
+comment step entirely. To get comments on fork PRs, run the gate from a
+`pull_request_target` workflow (note the
+[security implications](https://securitylab.github.com/research/github-actions-preventing-pwn-requests/))
+or post via a separate workflow with a write-scoped token.
+
 ## How costs are projected
 
 Real prompt sizes aren't recoverable from source, so each model change is priced
