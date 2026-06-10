@@ -1,7 +1,8 @@
 # Publishes `tt-cli` and its entire internal dependency chain to crates.io.
 #
-# Trigger: push a tag like `cli-v0.1.0` (tag version must match the workspace
-# crate versions — all crates currently version in lockstep at 0.1.0).
+# Trigger: push a tag like `cli-v0.1.0` (tag version must match the `tt-cli`
+# manifest version; other workspace crates may version independently — e.g.
+# crates republished after the stale 2026-06-03 upload sit at 0.1.1).
 #
 # Auth: requires the `CARGO_REGISTRY_TOKEN` repository secret — a crates.io
 # API token with publish-new + publish-update scope for the tt-* crates.
@@ -59,7 +60,7 @@ jobs:
             tt-telemetry
             tt-auth
             tt-cache
-            tt-client
+            tokentrimmer-client
             tt-config
             tt-tokenize
             tt-provider-compat

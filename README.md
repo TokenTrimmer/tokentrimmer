@@ -20,9 +20,9 @@ This repo is the **open-source core** (Apache 2.0): the Gateway, the `tt` CLI, t
 
 Alpha. The open-source core is implemented and tested: the Gateway (routing, L1/L2 caching, failover), all 19 Tier-1 Inspect rules, the Plan replay engine, the full `tt` CLI, the MCP server, retrieval, and the three SDKs all ship from this repo, gated by CI (fmt, clippy `-D warnings`, tests, and a self-inspect run).
 
-Two things are **not** true yet, so you don't find out the hard way:
+Two things to know up front, so you don't find out the hard way:
 
-- **No published packages.** Nothing is on crates.io, PyPI, or npm yet — published packages land at launch. Until then, every install path below (and throughout the docs) is a working git install.
+- **Rust crates are on crates.io; Python/npm packages are not yet.** `cargo install tt-cli` works, and the Rust SDK is published as [`tokentrimmer-client`](https://crates.io/crates/tokentrimmer-client) (the code still imports as `tt_client`; the crates.io name `tt-client` belongs to an unrelated project). The Python and TypeScript SDKs are not on PyPI/npm yet — install those from git.
 - **The hosted gateway is not live.** Self-hosting is the supported path today.
 
 ## Quick start (self-host)
@@ -41,8 +41,7 @@ docker run -p 8080:8080 \
 Or install the `tt` binary directly:
 
 ```bash
-# (not yet on crates.io — published packages land at launch; install from git)
-cargo install --locked --git https://github.com/tokentrimmer/tokentrimmer tt-cli
+cargo install --locked tt-cli
 
 # Scan a codebase for token waste
 tt inspect ./my-project --fail-on=high
@@ -98,7 +97,7 @@ crates/
 ├── plan-core/                 Replay engine + bootstrap CIs
 ├── retrieval/                 RAG / context-compression engine
 ├── mcp/                       MCP server
-├── client/                    Rust SDK (typed gateway client)
+├── client/                    Rust SDK (typed gateway client; on crates.io as `tokentrimmer-client`, imports as `tt_client`)
 ├── cli/                       `tt` binary
 ├── ts-types/                  Rust → TS bindings codegen (placeholder, not yet implemented)
 └── providers/

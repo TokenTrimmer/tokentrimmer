@@ -56,4 +56,4 @@ jobs:
         with:
           toolchain: stable
       - name: Build example
-        run: cargo build -p tt-client --example cost_attribution
+        run: cargo build -p tokentrimmer-client --example cost_attribution

@@ -1,11 +1,18 @@
 [package]
-name = "tt-client"
+# Published as `tokentrimmer-client` — the crates.io name `tt-client` is owned
+# by an unrelated third party. The library target stays `tt_client`, so code
+# still does `use tt_client::...` and workspace members still depend on it via
+# the `tt-client` alias (see `[workspace.dependencies]`).
+name = "tokentrimmer-client"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Typed Rust client for the TokenTrimmer gateway (OpenAI-compatible chat + cost/savings surfacing)."
+
+[lib]
+name = "tt_client"
 
 [dependencies]
 tt-shared.workspace = true
