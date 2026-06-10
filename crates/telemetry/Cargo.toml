@@ -14,6 +14,7 @@ tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
 blake3.workspace = true
