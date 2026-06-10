@@ -142,6 +142,7 @@ mod tests {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }
     }
@@ -240,6 +241,7 @@ mod tests {
                         fallbacks: vec![],
                         disable_cache: false,
                         max_cost_usd: None,
+                        flex: false,
                     },
                 },
             )

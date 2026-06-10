@@ -37,6 +37,16 @@ pub struct ModelPricing {
     /// USD per 1M batch (async) output tokens (~50% of standard output).
     /// `None` for providers with no batch tier.
     pub batch_output_per_million: Option<f64>,
+    /// USD per 1M input tokens under OpenAI's **Flex** service tier
+    /// (`service_tier: "flex"`) — a synchronous-but-slower tier billed at Batch
+    /// API rates (~50% of standard). `None` for models/providers with no Flex
+    /// tier; **presence is the eligibility gate** (only models that carry a Flex
+    /// rate may be opted into `service_tier=flex`). See
+    /// developers.openai.com/api/docs/guides/flex-processing.
+    pub flex_input_per_million: Option<f64>,
+    /// USD per 1M output tokens under the Flex service tier (~50% of standard
+    /// output). `None` when the model has no Flex tier.
+    pub flex_output_per_million: Option<f64>,
     /// Provider minimum prefix length, in tokens, before a `cache_control`
     /// breakpoint actually caches (shorter prefixes silently don't cache).
     /// Anthropic varies this by model (2048–4096); `None` when not documented.
@@ -92,6 +102,29 @@ impl ModelPricing {
                 .map(|_| self.input_per_million * CACHE_WRITE_1H_MULTIPLIER),
         }
     }
+
+    /// Whether this model is eligible for OpenAI's Flex service tier
+    /// (`service_tier: "flex"`). Eligibility is **catalog-driven**: a model is
+    /// flex-eligible iff it carries a Flex input rate. OpenAI lists Flex prices
+    /// only for supported models (gpt-5.x family); o3 / o4-mini are batch-only
+    /// "specialized models" and therefore carry no Flex rate.
+    #[must_use]
+    pub fn flex_eligible(&self) -> bool {
+        self.flex_input_per_million.is_some()
+    }
+
+    /// The Flex `(input, output)` per-million rates when this model is
+    /// flex-eligible, else `None`. Both are present together for an eligible
+    /// row (the catalog carries the pair); a missing output rate falls back to
+    /// the standard output rate so a partially-populated row stays priceable.
+    #[must_use]
+    pub fn flex_rates_per_million(&self) -> Option<(f64, f64)> {
+        let input = self.flex_input_per_million?;
+        let output = self
+            .flex_output_per_million
+            .unwrap_or(self.output_per_million);
+        Some((input, output))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,6 +169,10 @@ struct RawEntry {
     #[serde(default)]
     batch_output_per_million: Option<f64>,
     #[serde(default)]
+    flex_input_per_million: Option<f64>,
+    #[serde(default)]
+    flex_output_per_million: Option<f64>,
+    #[serde(default)]
     prompt_cache_min_tokens: Option<u32>,
     effective_at: DateTime<Utc>,
 }
@@ -170,6 +207,8 @@ impl PricingCatalog {
                     cache_write_per_million: e.cache_write_per_million,
                     batch_input_per_million: e.batch_input_per_million,
                     batch_output_per_million: e.batch_output_per_million,
+                    flex_input_per_million: e.flex_input_per_million,
+                    flex_output_per_million: e.flex_output_per_million,
                     prompt_cache_min_tokens: e.prompt_cache_min_tokens,
                     effective_at: e.effective_at,
                 });
@@ -498,6 +537,41 @@ mod catalog_tests {
     #[test]
     fn cache_write_tier_defaults_to_five_min() {
         assert_eq!(CacheWriteTier::default(), CacheWriteTier::FiveMin);
+    }
+
+    /// Flex eligibility is catalog-driven: the supported gpt-5.x models carry a
+    /// Flex rate (== batch, 50% of standard) and report eligible; o3 / o4-mini
+    /// are batch-only "specialized models" and carry no Flex rate, so they are
+    /// NOT flex-eligible. Verified vs developers.openai.com Flex docs/pricing.
+    #[test]
+    fn flex_rates_and_eligibility_match_openai_docs() {
+        let c = catalog();
+
+        // gpt-5.5: standard $5/$30 → flex $2.50/$15 (== batch, 50% off).
+        let gpt55 = c.latest("openai", "gpt-5.5").expect("present");
+        assert!(gpt55.flex_eligible(), "gpt-5.5 is flex-eligible");
+        assert_eq!(gpt55.flex_rates_per_million(), Some((2.50, 15.00)));
+        assert_eq!(gpt55.flex_input_per_million, gpt55.batch_input_per_million);
+        assert_eq!(
+            gpt55.flex_output_per_million,
+            gpt55.batch_output_per_million
+        );
+
+        // gpt-5.4: standard $2.50/$15 → flex $1.25/$7.50.
+        let gpt54 = c.latest("openai", "gpt-5.4").expect("present");
+        assert!(gpt54.flex_eligible());
+        assert_eq!(gpt54.flex_rates_per_million(), Some((1.25, 7.50)));
+
+        // o3 / o4-mini are batch-only → no flex rate → ineligible.
+        let o3 = c.latest("openai", "o3").expect("present");
+        assert!(!o3.flex_eligible(), "o3 is batch-only, not flex-eligible");
+        assert_eq!(o3.flex_rates_per_million(), None);
+        let o4 = c.latest("openai", "o4-mini").expect("present");
+        assert!(!o4.flex_eligible());
+
+        // A non-OpenAI model never carries a flex rate.
+        let haiku = c.latest("anthropic", "claude-haiku-4-5").expect("present");
+        assert!(!haiku.flex_eligible());
     }
 
     #[test]

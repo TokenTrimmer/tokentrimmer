@@ -65,6 +65,8 @@ impl Provider for RecordingProvider {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
@@ -193,6 +195,7 @@ async fn cost_condition_counts_full_prompt() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );

@@ -51,6 +51,7 @@ mod tests {
             fallbacks: vec![],
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
         }
     }
     fn vision_model(id: &str) -> ModelInfo {

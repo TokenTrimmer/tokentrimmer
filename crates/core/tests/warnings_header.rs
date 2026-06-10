@@ -44,6 +44,8 @@ impl Provider for WarnMock {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
@@ -140,6 +142,8 @@ impl Provider for ReasoningMock {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
