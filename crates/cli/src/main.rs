@@ -1320,6 +1320,14 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         tracing::warn!("no DB pool; routing disabled (chat requests pass through unrouted)");
     }
 
+    // Start background catalogue refreshers (OpenRouter's dynamic `GET /models`
+    // fetch). Best-effort + non-blocking: it refreshes once shortly after boot
+    // and hourly thereafter, so the live 300+ model catalogue + per-model
+    // pricing feed dispatch/cost. A failed fetch is logged and the provider
+    // keeps serving its static baseline — this never delays startup or 5xxs a
+    // request. No-op when OpenRouter is disabled (`TT_PROVIDERS`).
+    state.spawn_background_refreshers();
+
     let app = tt_core::build_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
