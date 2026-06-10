@@ -507,7 +507,7 @@ Plan reads telemetry; quality sampling reads (sometimes) raw request bodies.
 | Operation | Data required | Privacy posture |
 |---|---|---|
 | Cost projection | Token counts, model, route, timestamp | No raw content |
-| Cache projection | Embedding hashes only | No raw content |
+| Cache projection | Stored embeddings only | No raw content |
 | Latency projection | Timestamps, model, provider | No raw content |
 | Quality sampling | Raw request body, raw response body | Requires opt-in per API key |
 

@@ -89,7 +89,28 @@ pub async fn middleware(
                     return Err(ApiError::Unauthorized);
                 }
                 CacheLookup::Miss => {
-                    // Cold path: run the real argon2 verify.
+                    // Cold path: about to run the CPU-expensive argon2 verify.
+                    //
+                    // PRE-AUTH RATE CAP — consult the per-IP cap BEFORE the
+                    // hash. A flood of distinct bogus suffixes for a known live
+                    // prefix would otherwise miss the cache every time and force
+                    // argon2 on each request (a CPU-DoS amplifier). Past the
+                    // per-IP threshold we shed with 429 + Retry-After and never
+                    // call `tt_auth::verify`, so the expensive work is skipped.
+                    // Cache hits (handled above) and non-`tt_live_*` traffic do
+                    // not reach here, so authenticated traffic is never capped.
+                    let client_ip = crate::middleware::argon2_cap::client_ip(req.headers());
+                    if let crate::middleware::argon2_cap::CapDecision::Reject { retry_after_secs } =
+                        state.argon2_cap.check(client_ip)
+                    {
+                        tracing::debug!(
+                            ip = %client_ip,
+                            "auth: per-IP argon2 verify cap exceeded, shedding pre-hash"
+                        );
+                        return Ok(verify_cap_response(retry_after_secs));
+                    }
+
+                    // Under the cap: run the real argon2 verify.
                     match tt_auth::verify(key_store.as_ref(), &token).await {
                         Ok(ctx) => {
                             cache.insert_hit(token_hash, ctx.clone());
@@ -226,6 +247,24 @@ fn budget_denied_response(
         if let Ok(v) = secs.to_string().parse() {
             headers.insert(axum::http::header::RETRY_AFTER, v);
         }
+    }
+    resp
+}
+
+/// Build the `429 Too Many Requests` response returned when an IP exceeds the
+/// pre-auth per-IP argon2-verify cap. Carries `Retry-After` and an opaque JSON
+/// error body. Returned BEFORE any argon2 work so a flood is cheap to reject.
+fn verify_cap_response(retry_after_secs: u64) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": "Too many key-verification attempts from this source. Slow down.",
+            "type": "rate_limit_exceeded"
+        }
+    });
+    let mut resp = (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    if let Ok(v) = retry_after_secs.max(1).to_string().parse() {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, v);
     }
     resp
 }
@@ -406,6 +445,27 @@ mod tests {
             .header("Authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .expect("request")
+    }
+
+    /// Like [`live_bearer`] but stamps an `x-forwarded-for` so the per-IP
+    /// argon2-verify cap can be exercised with distinct source IPs in-process.
+    fn live_bearer_from_ip(token: &str, ip: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .uri("/")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("x-forwarded-for", ip)
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    /// `AppState` with a counting store, fresh verify cache, and a per-IP
+    /// argon2 cap set to `verify_per_min` (deterministic: burst == per_min, so
+    /// the `(verify_per_min + 1)`-th cold-path verify from one IP is shed).
+    fn state_with_cap(store: Arc<CountingKeyStore>, verify_per_min: u32) -> AppState {
+        use crate::middleware::argon2_cap::{Argon2CapConfig, Argon2VerifyCap};
+        let mut app = state_with_store(store);
+        app.argon2_cap = Argon2VerifyCap::new(Argon2CapConfig { verify_per_min });
+        app
     }
 
     // ------------------------------------------------------------------
@@ -647,5 +707,155 @@ mod tests {
             "after evict_key_id, revoked key must be rejected"
         );
         assert_eq!(store.find_count.load(Ordering::SeqCst), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // (f) PRE-AUTH per-IP argon2 cap.
+    //
+    // A flood of DISTINCT bogus suffixes (each a cache miss → would cost one
+    // argon2 hash) from a single IP is capped: past the per-IP threshold the
+    // request is shed with 429 + Retry-After and `find_by_prefix` (== argon2
+    // run) is NOT invoked on the shed request. We assert the cheap-rejection
+    // property via the store's find_count seam.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn argon2_cap_sheds_flood_before_invoking_argon2() {
+        let org = Uuid::new_v4();
+        // One valid key in the store (not used by the flood — the flood uses
+        // distinct never-seeded tokens so every attempt is a real cache miss).
+        seed_key(&CountingKeyStore::new(), org, "tt_live_unused0000000").await;
+
+        let store = CountingKeyStore::new();
+        // Cap = 2 cold-path verifies per IP (burst == per_min).
+        let state = state_with_cap(store.clone(), 2);
+        let router = build_router(state);
+
+        let flood_ip = "203.0.113.10";
+
+        // First 2 distinct bogus tokens from this IP are UNDER the cap: each is a
+        // cache miss → argon2 runs → key not found → 401.
+        for n in 0..2 {
+            let token = format!("tt_live_floodaaa{n:04}");
+            let r = router
+                .clone()
+                .oneshot(live_bearer_from_ip(&token, flood_ip))
+                .await
+                .expect("under-cap resp");
+            assert_eq!(
+                r.status(),
+                StatusCode::UNAUTHORIZED,
+                "under-cap bogus token should reach argon2 and 401"
+            );
+        }
+        // argon2 ran exactly twice so far (once per under-cap attempt).
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            2,
+            "the two under-cap attempts each invoke argon2"
+        );
+
+        // Third distinct bogus token from the SAME IP is OVER the cap: shed with
+        // 429 + Retry-After, and argon2 must NOT be invoked (find_count stays 2).
+        let r3 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_live_floodaaa9999", flood_ip))
+            .await
+            .expect("over-cap resp");
+        assert_eq!(
+            r3.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "over-cap attempt must be shed with 429"
+        );
+        assert!(
+            r3.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "429 must carry Retry-After"
+        );
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            2,
+            "over-cap attempt must NOT invoke argon2 (cheap rejection before hash)"
+        );
+    }
+
+    #[tokio::test]
+    async fn argon2_cap_is_per_ip_other_ip_unaffected() {
+        let store = CountingKeyStore::new();
+        // Cap = 1 cold-path verify per IP.
+        let state = state_with_cap(store.clone(), 1);
+        let router = build_router(state);
+
+        // IP A burns its single cell on a bogus token (401, argon2 runs once).
+        let a1 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_live_aaaa00000000", "198.51.100.1"))
+            .await
+            .expect("a1");
+        assert_eq!(a1.status(), StatusCode::UNAUTHORIZED);
+        // IP A's next attempt is over its cap → 429, no argon2.
+        let a2 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_live_aaaa11111111", "198.51.100.1"))
+            .await
+            .expect("a2");
+        assert_eq!(a2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A DIFFERENT IP is independent: its first attempt still reaches argon2
+        // (401 for the bogus token), proving normal traffic is unaffected.
+        let b1 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_live_bbbb00000000", "198.51.100.2"))
+            .await
+            .expect("b1");
+        assert_eq!(
+            b1.status(),
+            StatusCode::UNAUTHORIZED,
+            "a different IP within its own limit is not throttled"
+        );
+
+        // argon2 ran twice total: once for IP A's first attempt, once for IP B's.
+        // IP A's over-cap attempt did NOT run argon2.
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn argon2_cap_does_not_throttle_cache_hits() {
+        // A legitimate caller re-presenting the SAME valid token hits the verify
+        // cache on every request after the first, so it never consumes from the
+        // per-IP cap — even a cap of 1 must not throttle authenticated traffic.
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_cachehit12345";
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        let state = state_with_cap(store.clone(), 1);
+        let router = build_router(state);
+
+        let ip = "192.0.2.50";
+        // First request: cold path → consumes the single cap cell, argon2 runs, 200.
+        let r1 = router
+            .clone()
+            .oneshot(live_bearer_from_ip(plaintext, ip))
+            .await
+            .expect("r1");
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        // Many more requests with the same token from the same IP: all cache
+        // hits → bypass the cap entirely → all 200, argon2 never runs again.
+        for _ in 0..5 {
+            let r = router
+                .clone()
+                .oneshot(live_bearer_from_ip(plaintext, ip))
+                .await
+                .expect("cache-hit resp");
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "cache-hit (authenticated) traffic must not be capped"
+            );
+        }
+        // argon2 ran exactly once (cold path); the cap was consulted only once.
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
     }
 }
