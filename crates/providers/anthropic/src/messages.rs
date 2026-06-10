@@ -750,6 +750,37 @@ fn sse_frame(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+/// Build an Anthropic `event: error` SSE frame from an OpenAI-shaped in-band error
+/// payload (`{"error":{"message":..,"type":..}}`).
+///
+/// The OpenAI-compatible streaming path emits a mid-stream upstream failure as an
+/// in-band `data: {"error":{...}}` chunk rather than a typed event. Anthropic's
+/// wire instead carries failures as a typed `error` event
+/// (`{"type":"error","error":{"type":..,"message":..}}`), which Anthropic-wire
+/// clients (Claude Code) surface as an error. This translates the former into the
+/// latter so a mid-stream failure is not silently dropped and presented as a clean
+/// (but truncated) success.
+pub fn anthropic_error_frame(err: &Value) -> String {
+    let inner = err.get("error").unwrap_or(err);
+    let message = inner
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("upstream error");
+    // Map the OpenAI in-band `upstream_error` type to Anthropic's `api_error`;
+    // pass through any other concrete type verbatim.
+    let err_type = match inner.get("type").and_then(Value::as_str) {
+        Some("upstream_error") | None => "api_error",
+        Some(other) => other,
+    };
+    sse_frame(
+        "error",
+        &json!({
+            "type": "error",
+            "error": {"type": err_type, "message": message},
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,6 +1208,33 @@ mod tests {
         assert!(tail.contains("\"input_tokens\":10"));
         assert!(tail.contains("\"cache_read_input_tokens\":80"));
         assert!(tail.contains("\"cache_creation_input_tokens\":20"));
+    }
+
+    #[test]
+    fn anthropic_error_frame_maps_openai_upstream_error() {
+        let openai = json!({"error": {"message": "boom", "type": "upstream_error"}});
+        let frame = anthropic_error_frame(&openai);
+        assert!(frame.starts_with("event: error\n"), "frame: {frame}");
+        assert!(frame.contains("\"type\":\"error\""));
+        // upstream_error maps to Anthropic's api_error.
+        assert!(frame.contains("\"type\":\"api_error\""));
+        assert!(frame.contains("\"message\":\"boom\""));
+        assert!(frame.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn anthropic_error_frame_passes_through_concrete_type() {
+        let openai = json!({"error": {"message": "slow down", "type": "overloaded_error"}});
+        let frame = anthropic_error_frame(&openai);
+        assert!(frame.contains("\"type\":\"overloaded_error\""));
+        assert!(frame.contains("\"message\":\"slow down\""));
+    }
+
+    #[test]
+    fn anthropic_error_frame_defaults_missing_fields() {
+        let frame = anthropic_error_frame(&json!({"error": {}}));
+        assert!(frame.contains("\"type\":\"api_error\""));
+        assert!(frame.contains("\"message\":\"upstream error\""));
     }
 
     #[test]

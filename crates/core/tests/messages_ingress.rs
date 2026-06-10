@@ -8,6 +8,7 @@
 //! headers, the Anthropic SSE event frames, and the #119 BYO-only credential
 //! guard (verified org without an anthropic credential → missing_provider_credential).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ use tt_auth::{
     keys::{issue, Environment},
     InMemoryKeyStore, InMemoryProviderCredentialStore, KeyStore, ProviderCredentialStore,
 };
+use tt_cache::memory::InMemoryL1Cache;
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
@@ -569,4 +571,285 @@ async fn messages_sandbox_streaming_transcodes_json_body() {
         .as_str()
         .unwrap()
         .starts_with("[sandbox]"));
+}
+
+/// An "anthropic" provider that always returns a deterministic 400-like error,
+/// so a repeat request is served from the negative cache as
+/// `Ok((400, Json({"error":..})))` (NOT via `?`). Records its call count.
+struct AnthropicInvalidMock {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for AnthropicInvalidMock {
+    fn id(&self) -> &'static str {
+        "anthropic"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: "claude-sonnet-4-6".into(),
+            provider: "anthropic".into(),
+            capabilities: vec![Capability::Text, Capability::Streaming],
+            max_input_tokens: 200_000,
+            max_output_tokens: 8192,
+        }]
+    }
+    fn pricing(&self, _m: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+            cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
+            effective_at: chrono::Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(ProviderError::InvalidRequest(
+            "prompt violates content policy".into(),
+        ))
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(ProviderError::InvalidRequest("stream not supported".into()))
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+/// A deterministic (temperature=0) non-streaming Messages request, so negative
+/// caching engages on the first 4xx.
+fn det_messages_request() -> serde_json::Value {
+    json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "repeat me"}],
+        "temperature": 0,
+        "stream": false,
+    })
+}
+
+/// A negative-cache 4xx hit (an `Ok((400, Json({"error":..})))` from the chat
+/// handler) must pass through `/v1/messages` verbatim — same 400 status and the
+/// real error body — NOT be mis-transcoded into a misleading 500. The first
+/// request populates the negative cache; the second is served from it.
+#[tokio::test]
+async fn messages_negative_cache_4xx_passes_through_not_500() {
+    let org = Uuid::now_v7();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(AnthropicInvalidMock {
+        calls: Arc::clone(&calls),
+    }));
+
+    let key_store = InMemoryKeyStore::new();
+    let cred_store = InMemoryProviderCredentialStore::new();
+    cred_store.insert(org, "anthropic", creds("ANT_KEY"));
+    let key = issue_key_for(&key_store, org).await;
+
+    let l1 = Arc::new(InMemoryL1Cache::new());
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(Arc::new(key_store) as Arc<dyn KeyStore>)
+            .with_credential_store(Arc::new(cred_store) as Arc<dyn ProviderCredentialStore>)
+            .with_l1(l1, None),
+    );
+
+    let make_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::from(det_messages_request().to_string()))
+            .unwrap()
+    };
+
+    // First request — provider returns InvalidRequest → 4xx; neg-cache populated.
+    let r1 = app.clone().oneshot(make_req()).await.unwrap();
+    assert!(
+        r1.status().is_client_error(),
+        "first request should be a 4xx; got {}",
+        r1.status()
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "provider called once");
+
+    // Let the spawned negative-cache insert land.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Second request — served from the negative cache as Ok((4xx, Json(error))).
+    // The ingress MUST pass it through verbatim, not mis-map it to a 500.
+    let r2 = app.oneshot(make_req()).await.unwrap();
+    assert_eq!(
+        r2.status(),
+        StatusCode::BAD_REQUEST,
+        "neg-cache hit must pass through the 4xx, not become a 500; got {}",
+        r2.status()
+    );
+    assert_eq!(
+        r2.headers()
+            .get("x-tokentrimmer-cache")
+            .and_then(|v| v.to_str().ok()),
+        Some("neg-hit"),
+        "second request should be a negative-cache hit"
+    );
+    // Provider NOT called again — short-circuited by the negative cache.
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "provider not re-called");
+
+    // The real cached error shape is preserved (not a 'failed to parse' 500 body).
+    let bytes = axum::body::to_bytes(r2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        v.get("error").is_some(),
+        "cached error body must be preserved; got {v}"
+    );
+    assert_eq!(v["error"]["code"], "cached_client_error");
+}
+
+/// An "anthropic" provider whose stream yields one good content chunk and THEN
+/// fails mid-stream — exercising the in-band `upstream_error` SSE frame.
+struct AnthropicMidStreamErrorMock;
+
+#[async_trait]
+impl Provider for AnthropicMidStreamErrorMock {
+    fn id(&self) -> &'static str {
+        "anthropic"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: "claude-sonnet-4-6".into(),
+            provider: "anthropic".into(),
+            capabilities: vec![Capability::Text, Capability::Streaming],
+            max_input_tokens: 200_000,
+            max_output_tokens: 8192,
+        }]
+    }
+    fn pricing(&self, _m: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+            cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
+            effective_at: chrono::Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Err(ProviderError::Unsupported("non-streaming not used".into()))
+    }
+    async fn chat_completion_stream(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        let good = ChatCompletionChunk {
+            id: "msg_err_1".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: Some("assistant".into()),
+                    content: Some("Partial".into()),
+                    tool_calls: vec![],
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let items: Vec<Result<ChatCompletionChunk, ProviderError>> = vec![
+            Ok(good),
+            Err(ProviderError::ProviderUpstream {
+                status: 503,
+                message: "upstream exploded mid-stream".into(),
+            }),
+        ];
+        Ok(futures::stream::iter(items).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+/// A mid-stream upstream failure on a streaming `/v1/messages` request MUST surface
+/// as an Anthropic `event: error` frame — NOT be silently dropped and presented as
+/// a clean (but truncated) successful termination.
+#[tokio::test]
+async fn messages_streaming_mid_stream_error_emits_anthropic_error_event() {
+    let org = Uuid::now_v7();
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(AnthropicMidStreamErrorMock));
+
+    let key_store = InMemoryKeyStore::new();
+    let cred_store = InMemoryProviderCredentialStore::new();
+    cred_store.insert(org, "anthropic", creds("ANT_KEY"));
+    let key = issue_key_for(&key_store, org).await;
+
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(Arc::new(key_store) as Arc<dyn KeyStore>)
+            .with_credential_store(Arc::new(cred_store) as Arc<dyn ProviderCredentialStore>),
+    );
+
+    let r = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::from(messages_request(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Initial establishment succeeded (the failure is mid-stream), so 200 + SSE.
+    assert_eq!(r.status(), StatusCode::OK);
+    let ct = r.headers()["content-type"].to_str().unwrap();
+    assert!(ct.contains("text/event-stream"), "expected SSE, got {ct}");
+
+    let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+
+    // The good prefix is still delivered…
+    assert!(body.contains("Partial"), "good prefix missing in:\n{body}");
+    // …then the mid-stream failure surfaces as an Anthropic error event.
+    assert!(
+        body.contains("event: error"),
+        "mid-stream error not surfaced as an Anthropic error event in:\n{body}"
+    );
+    assert!(
+        body.contains("upstream exploded mid-stream"),
+        "error message missing in:\n{body}"
+    );
+    // It must NOT masquerade as a clean OpenAI terminator.
+    assert!(!body.contains("data: [DONE]"));
 }

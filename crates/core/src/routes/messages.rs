@@ -24,7 +24,7 @@ use axum::{
 use futures::stream::StreamExt;
 use tt_auth::ApiKeyContext;
 use tt_provider_anthropic::messages::{
-    chat_response_to_messages, AnthropicSseEncoder, MessagesRequest,
+    anthropic_error_frame, chat_response_to_messages, AnthropicSseEncoder, MessagesRequest,
 };
 use tt_shared::ChatCompletionChunk;
 
@@ -82,11 +82,25 @@ fn is_event_stream(resp: &Response) -> bool {
 /// Buffer a non-streaming chat response, translate its `ChatCompletionResponse`
 /// body into an Anthropic Messages JSON body, and re-attach the original status
 /// and headers.
+///
+/// Not every `Ok` chat response is success-shaped: the chat handler returns some
+/// client errors (e.g. a negative-cache 4xx hit, or the BYO-only credential guard)
+/// as `Ok((status_4xx, Json({"error":{...}})))` rather than via `?`. Those bodies
+/// are NOT `ChatCompletionResponse`s, so a non-2xx status or an error-shaped body
+/// is passed through verbatim — keeping the real status and error payload — instead
+/// of attempting the (failing) transcode and mis-mapping it to a 500.
 async fn transcode_json_response(resp: Response) -> ApiResult<Response> {
     let (parts, body) = resp.into_parts();
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to read chat response body: {e}")))?;
+
+    // Pass non-success / error-shaped bodies through unchanged. The chat handler's
+    // error bodies are already an `{"error":{...}}` shape an Anthropic-wire client
+    // can consume, and the original 4xx/5xx status must be preserved.
+    if !parts.status.is_success() || is_error_body(&bytes) {
+        return Ok(Response::from_parts(parts, Body::from(bytes)));
+    }
 
     let chat: tt_shared::ChatCompletionResponse = serde_json::from_slice(&bytes)
         .map_err(|e| ApiError::Internal(format!("failed to parse chat response body: {e}")))?;
@@ -103,6 +117,15 @@ async fn transcode_json_response(resp: Response) -> ApiResult<Response> {
             .insert(axum::http::header::CONTENT_TYPE, ct);
     }
     Ok(out)
+}
+
+/// Whether `bytes` is a JSON object carrying a top-level `error` field (the chat
+/// handler's error-response shape).
+fn is_error_body(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("error").cloned())
+        .is_some()
 }
 
 /// Wrap a streaming chat (OpenAI SSE) response in a transform that re-emits
@@ -160,6 +183,13 @@ fn transcode_sse_response(resp: Response) -> Response {
 /// encoder, returning the concatenated Anthropic frames it produced (if any).
 /// `data: [DONE]` and non-`data:` lines are ignored — the Anthropic terminator
 /// is emitted by [`AnthropicSseEncoder::finish`].
+///
+/// The OpenAI-compatible streaming path emits a mid-stream upstream failure as an
+/// in-band `data: {"error":{...,"type":"upstream_error"}}` chunk (see
+/// `routes::sse`). Such a frame does NOT deserialize as a `ChatCompletionChunk`;
+/// rather than silently dropping it (which would present a truncated response as a
+/// clean success), it is translated into an Anthropic `event: error` frame so the
+/// client sees the failure.
 fn process_openai_frame(frame: &[u8], encoder: &mut AnthropicSseEncoder) -> Option<String> {
     let text = std::str::from_utf8(frame).ok()?;
     for line in text.lines() {
@@ -179,9 +209,20 @@ fn process_openai_frame(frame: &[u8], encoder: &mut AnthropicSseEncoder) -> Opti
             if !frames.is_empty() {
                 return Some(frames.concat());
             }
+        } else if let Some(err) = parse_inband_error(data) {
+            // Mid-stream provider failure — surface it as an Anthropic error event
+            // instead of dropping the frame.
+            return Some(anthropic_error_frame(&err));
         }
     }
     None
+}
+
+/// If `data` is an OpenAI-shaped in-band error payload (`{"error":{...}}`), return
+/// the parsed JSON; otherwise `None`.
+fn parse_inband_error(data: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    value.get("error").is_some().then_some(value)
 }
 
 /// Find the first `\n\n` boundary in `buf`, returning the index of the first `\n`.
@@ -204,6 +245,18 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new();
         assert!(process_openai_frame(b"data: [DONE]\n\n", &mut enc).is_none());
         assert!(process_openai_frame(b": keep-alive\n\n", &mut enc).is_none());
+    }
+
+    #[test]
+    fn inband_error_frame_becomes_anthropic_error_event() {
+        let mut enc = AnthropicSseEncoder::new();
+        // The OpenAI-compat streaming path emits mid-stream failures like this.
+        let frame =
+            b"data: {\"error\":{\"message\":\"upstream blew up\",\"type\":\"upstream_error\"}}\n\n";
+        let out = process_openai_frame(frame, &mut enc).expect("error frame surfaced");
+        assert!(out.starts_with("event: error\n"), "out: {out}");
+        assert!(out.contains("\"type\":\"api_error\""));
+        assert!(out.contains("upstream blew up"));
     }
 
     #[test]
