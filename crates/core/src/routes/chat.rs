@@ -2057,7 +2057,7 @@ impl CostBreakdown {
 /// Attribution note: provider-reported cache reads/writes are attributed to
 /// the *provider* side in full. For OpenAI/Gemini they are automatic. For
 /// Anthropic the gateway's adapter may have injected the `cache_control`
-/// breakpoint itself (long-system heuristic in
+/// breakpoint itself (model-aware prompt-cache-minimum gate in
 /// `tt-provider-anthropic::translate`), but the usage that flows back carries
 /// no signal distinguishing TT-injected breakpoints from caller-driven reuse,
 /// so the whole class is conservatively credited to the provider rather than

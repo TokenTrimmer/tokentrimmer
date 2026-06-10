@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Anthropic provider adapter — the worked reference example. Auto-applies cache_control on system blocks >=1024 tokens."
+description = "Anthropic provider adapter — the worked reference example. Auto-applies cache_control on system blocks once the prefix meets the model's per-model prompt-cache minimum."
 
 [dependencies]
 tt-shared.workspace = true
+tt-tokenize.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true
