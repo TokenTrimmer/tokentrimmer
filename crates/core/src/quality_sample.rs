@@ -283,6 +283,31 @@ pub fn risk_band_for_verdict(verdict: JudgeVerdict) -> RiskBand {
     }
 }
 
+/// Lowercase wire string for a verdict (`acceptable` / `degraded` / `unclear`),
+/// matching the `tt_plan_core::JudgeVerdict` serde representation. Used on the
+/// `tokentrimmer.quality.verdict` telemetry attribute.
+#[must_use]
+pub fn verdict_str(verdict: JudgeVerdict) -> &'static str {
+    match verdict {
+        JudgeVerdict::Acceptable => "acceptable",
+        JudgeVerdict::Degraded => "degraded",
+        JudgeVerdict::Unclear => "unclear",
+    }
+}
+
+/// Lowercase wire string for a risk band (`low` / `medium` / `high`), matching
+/// the `tt_plan_core::RiskBand` serde representation. Used on the
+/// `tokentrimmer.quality.band` telemetry attribute / `x-tokentrimmer-quality-band`
+/// header.
+#[must_use]
+pub fn band_str(band: RiskBand) -> &'static str {
+    match band {
+        RiskBand::Low => "low",
+        RiskBand::Medium => "medium",
+        RiskBand::High => "high",
+    }
+}
+
 /// Deterministic-but-uniform sampling decision for a request, keyed on its trace
 /// id. Returns `true` for a `rate` fraction of trace ids, uniformly.
 ///
@@ -547,6 +572,22 @@ async fn run_job(job: QualityJudgeJob) -> Result<(), QualityError> {
         .judge(&job.input_text, &reference, &job.served_answer)
         .await?;
     let risk_band = risk_band_for_verdict(verdict);
+
+    // Surface the per-request verdict on the telemetry path — but ONLY here,
+    // where a judge actually ran and produced a verdict. An unjudged request
+    // never reaches `run_job`, so the quality attributes are never fabricated
+    // for one. This records onto the detached judge task's span (off the user
+    // response path → zero user latency); the hosted side ingests + aggregates
+    // these into "Quality preserved: …% (n=…)" via
+    // `tt_plan_core::quality_preserved_summary`.
+    record_quality_verdict_telemetry(
+        job.request_id,
+        &job.requested_model,
+        &job.served_model,
+        verdict,
+        risk_band,
+    );
+
     let score = SampleScore {
         request_id: job.request_id,
         verdict,
@@ -565,6 +606,31 @@ async fn run_job(job: QualityJudgeJob) -> Result<(), QualityError> {
     Ok(())
 }
 
+/// Stamp the per-request quality verdict onto the current (judge-task) span via
+/// the telemetry crate, using the same per-request values recorded into the
+/// sink. The score is the classified verdict's `[0, 1]` value; an `Unclear`
+/// verdict has no valence, so it surfaces as the band/verdict only (the score
+/// falls back to the "preserved" default rather than fabricating a degradation).
+fn record_quality_verdict_telemetry(
+    request_id: Uuid,
+    requested_model: &str,
+    served_model: &str,
+    verdict: JudgeVerdict,
+    risk_band: RiskBand,
+) {
+    tt_telemetry::gen_ai::record_quality_verdict(
+        &tracing::Span::current(),
+        &tt_telemetry::gen_ai::QualityVerdictAttributes {
+            request_id: &request_id.to_string(),
+            requested_model,
+            served_model,
+            score: tt_plan_core::quality_score_for_verdict(verdict),
+            band: band_str(risk_band),
+            verdict: verdict_str(verdict),
+        },
+    );
+}
+
 /// Spawn the judge job on the tokio runtime and return immediately.
 ///
 /// **This is the only public way to run the judge from the request path, and it
@@ -572,11 +638,21 @@ async fn run_job(job: QualityJudgeJob) -> Result<(), QualityError> {
 /// detached task and returns. The HTTP response is built and returned by the
 /// caller before (and independently of) this task making any progress.
 pub fn spawn_quality_judge(job: QualityJudgeJob) {
-    tokio::spawn(async move {
-        if let Err(e) = run_job(job).await {
-            tracing::warn!(error = %e, "quality judge sample failed");
+    use tracing::Instrument as _;
+    // Instrument the detached task with its own `quality_judge` span so the
+    // per-request quality verdict recorded inside `run_job` has a stable home
+    // span (the cloud ingests these), and the judge's own dispatch is traceable
+    // separately from the user request span it never touches.
+    let request_id = job.request_id;
+    let span = tracing::info_span!("quality_judge", request_id = %request_id);
+    tokio::spawn(
+        async move {
+            if let Err(e) = run_job(job).await {
+                tracing::warn!(error = %e, "quality judge sample failed");
+            }
         }
-    });
+        .instrument(span),
+    );
 }
 
 #[cfg(test)]
@@ -708,6 +784,16 @@ mod tests {
     }
 
     #[test]
+    fn verdict_and_band_wire_strings() {
+        assert_eq!(verdict_str(JudgeVerdict::Acceptable), "acceptable");
+        assert_eq!(verdict_str(JudgeVerdict::Degraded), "degraded");
+        assert_eq!(verdict_str(JudgeVerdict::Unclear), "unclear");
+        assert_eq!(band_str(RiskBand::Low), "low");
+        assert_eq!(band_str(RiskBand::Medium), "medium");
+        assert_eq!(band_str(RiskBand::High), "high");
+    }
+
+    #[test]
     fn task_class_only_chat_completions_sampled() {
         assert!(JudgeTaskClass::ChatCompletions.is_sampled());
     }
@@ -828,6 +914,174 @@ mod tests {
         assert_eq!(
             suggestions[1].quality_risk_band,
             tt_preview::QualityRiskBand::Unknown
+        );
+    }
+
+    // ── Telemetry surfacing of the per-request verdict (JUDGE-SURFACE) ──────
+    //
+    // The judge runs detached, AFTER the user response, so the per-request
+    // verdict is surfaced on the JUDGE TASK's own span (zero user latency). The
+    // hosted side ingests these `tokentrimmer.quality.*` attributes and
+    // aggregates them into "Quality preserved: …% (n=…)". A request the judge
+    // never scored carries no quality attributes at all (no fabricated verdict).
+
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry::Value;
+    use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
+    use opentelemetry_sdk::trace::TracerProvider;
+    use std::collections::HashMap;
+    use tracing_subscriber::prelude::*;
+
+    /// Sink that swallows outcomes — the telemetry tests assert on the span, not
+    /// the sink.
+    struct NullSink;
+    #[async_trait]
+    impl JudgeSink for NullSink {
+        async fn record(&self, _outcome: JudgeOutcome) {}
+    }
+
+    /// Drive `f` under a scoped OTel subscriber on a current-thread runtime and
+    /// return the attributes recorded on the single `quality_judge` span as a
+    /// name→Value map. `run_job` is async; a current-thread runtime keeps the
+    /// future on the subscriber's thread so the span reaches the exporter.
+    fn capture_judge_span_attributes<F, Fut>(f: F) -> HashMap<String, Value>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let exporter = InMemorySpanExporter::default();
+        let provider = TracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("judge-test");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            rt.block_on(async {
+                use tracing::Instrument as _;
+                let span = tracing::info_span!("quality_judge");
+                f().instrument(span).await;
+            });
+        });
+
+        provider.force_flush();
+        let spans = exporter.get_finished_spans().expect("finished spans");
+        spans
+            .into_iter()
+            .find(|s| s.name == "quality_judge")
+            .map(|s| {
+                s.attributes
+                    .into_iter()
+                    .map(|kv| (kv.key.to_string(), kv.value))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn job_with(reference: ReferenceSource, verdict_word: &'static str) -> QualityJudgeJob {
+        QualityJudgeJob {
+            judge: Arc::new(tt_plan_core::MockJudge {
+                verdict: match verdict_word {
+                    "degraded" => JudgeVerdict::Degraded,
+                    "unclear" => JudgeVerdict::Unclear,
+                    _ => JudgeVerdict::Acceptable,
+                },
+                reason: "because".to_string(),
+            }),
+            sink: Arc::new(NullSink),
+            org_id: Uuid::now_v7(),
+            route_id: Some(Uuid::now_v7()),
+            request_id: Uuid::now_v7(),
+            requested_model: "gpt-4o".to_string(),
+            served_model: "gpt-4o-mini".to_string(),
+            input_text: "in".to_string(),
+            served_answer: "served".to_string(),
+            reference,
+        }
+    }
+
+    /// A judged (Acceptable) request stamps `quality.score = 1.0`, `band = low`,
+    /// `verdict = acceptable`, plus the request id + the swapped models.
+    #[test]
+    fn judged_request_records_quality_verdict_on_span() {
+        let job = job_with(
+            ReferenceSource::Ready("reference".to_string()),
+            "acceptable",
+        );
+        let request_id = job.request_id.to_string();
+        let attrs = capture_judge_span_attributes(|| async move {
+            run_job(job).await.expect("run_job ok");
+        });
+
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.score"),
+            Some(&Value::F64(1.0)),
+            "acceptable verdict → preserved score 1.0"
+        );
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.band"),
+            Some(&Value::String("low".into()))
+        );
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.verdict"),
+            Some(&Value::String("acceptable".into()))
+        );
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.request_id"),
+            Some(&Value::String(request_id.into()))
+        );
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.requested_model"),
+            Some(&Value::String("gpt-4o".into()))
+        );
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.served_model"),
+            Some(&Value::String("gpt-4o-mini".into()))
+        );
+    }
+
+    /// A Degraded verdict surfaces `score = 0.0` / `band = high`.
+    #[test]
+    fn degraded_request_records_zero_score_high_band() {
+        let job = job_with(ReferenceSource::Ready("reference".to_string()), "degraded");
+        let attrs = capture_judge_span_attributes(|| async move {
+            run_job(job).await.expect("run_job ok");
+        });
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.score"),
+            Some(&Value::F64(0.0))
+        );
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.band"),
+            Some(&Value::String("high".into()))
+        );
+    }
+
+    /// An UNJUDGED request (empty reference → `run_job` records nothing) carries
+    /// NO quality attributes — the verdict is never fabricated.
+    #[test]
+    fn unjudged_request_records_no_quality_attributes() {
+        // Empty reference short-circuits run_job before any judge/verdict.
+        let job = job_with(ReferenceSource::Ready("   ".to_string()), "acceptable");
+        let attrs = capture_judge_span_attributes(|| async move {
+            run_job(job).await.expect("run_job ok");
+        });
+        assert!(
+            !attrs.contains_key("tokentrimmer.quality.score"),
+            "unjudged request must not carry a quality score"
+        );
+        assert!(
+            !attrs.contains_key("tokentrimmer.quality.band"),
+            "unjudged request must not carry a quality band"
+        );
+        assert!(
+            !attrs.contains_key("tokentrimmer.quality.verdict"),
+            "unjudged request must not carry a quality verdict"
         );
     }
 }

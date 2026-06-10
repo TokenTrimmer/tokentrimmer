@@ -71,6 +71,31 @@ pub const TT_CACHE: &str = "tokentrimmer.cache";
 /// `tokentrimmer.route` — the matched route name (when routing applied).
 pub const TT_ROUTE: &str = "tokentrimmer.route";
 
+/// `tokentrimmer.quality.request_id` — trace/request id of the judged request.
+pub const TT_QUALITY_REQUEST_ID: &str = "tokentrimmer.quality.request_id";
+/// `tokentrimmer.quality.requested_model` — originally-requested (expensive) model.
+pub const TT_QUALITY_REQUESTED_MODEL: &str = "tokentrimmer.quality.requested_model";
+/// `tokentrimmer.quality.served_model` — served (cheaper) model whose quality was judged.
+pub const TT_QUALITY_SERVED_MODEL: &str = "tokentrimmer.quality.served_model";
+/// `tokentrimmer.quality.score` — per-request quality score in `[0, 1]`
+/// (`1.0` = preserved, `0.0` = degraded). Mirrors [`HEADER_QUALITY_SCORE`].
+pub const TT_QUALITY_SCORE: &str = "tokentrimmer.quality.score";
+/// `tokentrimmer.quality.band` — `low` / `medium` / `high` risk band for the
+/// judged sample. Mirrors [`HEADER_QUALITY_BAND`].
+pub const TT_QUALITY_BAND: &str = "tokentrimmer.quality.band";
+/// `tokentrimmer.quality.verdict` — raw judge verdict (`acceptable` / `degraded`
+/// / `unclear`).
+pub const TT_QUALITY_VERDICT: &str = "tokentrimmer.quality.verdict";
+
+/// Response/telemetry header carrying the per-request quality score in `[0, 1]`.
+/// Emitted only when a judge actually ran (sampled); follows the existing
+/// `x-tokentrimmer-*` header convention so the hosted side ingests + aggregates
+/// it the same way it ingests the cost headers.
+pub const HEADER_QUALITY_SCORE: &str = "x-tokentrimmer-quality-score";
+/// Response/telemetry header carrying the per-request quality band
+/// (`low` / `medium` / `high`). Companion to [`HEADER_QUALITY_SCORE`].
+pub const HEADER_QUALITY_BAND: &str = "x-tokentrimmer-quality-band";
+
 /// Map a TokenTrimmer provider id to the OpenTelemetry `gen_ai.system` /
 /// `gen_ai.provider.name` well-known value.
 ///
@@ -187,6 +212,54 @@ pub fn record_request_attributes(span: &Span, attrs: &RequestSpanAttributes<'_>)
     }
 }
 
+/// One judged request's quality verdict, ready to record onto a span.
+///
+/// This is the telemetry shape of the sampled quality judge's per-request
+/// outcome. `score` is the per-request quality in `[0, 1]` (`1.0` preserved /
+/// `0.0` degraded), `band` is `low`/`medium`/`high`, and `verdict` is the raw
+/// judge verdict (`acceptable`/`degraded`/`unclear`). The gateway maps its
+/// `tt_plan_core` verdict into this struct, mirroring how [`RequestSpanCost`]
+/// is mapped from the gateway's `CostBreakdown`.
+#[derive(Debug, Clone, Copy)]
+pub struct QualityVerdictAttributes<'a> {
+    /// Trace/request id of the judged request → `tokentrimmer.quality.request_id`.
+    pub request_id: &'a str,
+    /// Originally-requested (expensive) model → `tokentrimmer.quality.requested_model`.
+    pub requested_model: &'a str,
+    /// Served (cheaper) model whose quality was judged → `tokentrimmer.quality.served_model`.
+    pub served_model: &'a str,
+    /// Per-request quality score in `[0, 1]` → `tokentrimmer.quality.score`.
+    pub score: f64,
+    /// Risk band (`low`/`medium`/`high`) → `tokentrimmer.quality.band`.
+    pub band: &'a str,
+    /// Raw judge verdict (`acceptable`/`degraded`/`unclear`) → `tokentrimmer.quality.verdict`.
+    pub verdict: &'a str,
+}
+
+/// Record the per-request quality verdict onto `span`.
+///
+/// **Call this only when a judge actually ran** for the request (the sampled
+/// ~2% of rerouted-down traffic). Surfacing code must never call it for an
+/// unjudged request — there is deliberately no "default" verdict, so an
+/// unjudged request carries no quality attributes at all and the hosted
+/// aggregation never counts a fabricated score.
+///
+/// The judge is detached from the user response path, so this records onto the
+/// judge task's own span, not the user request span — it adds zero user
+/// latency. Setting attributes on a span not bridged to an OpenTelemetry layer
+/// is a cheap no-op, as with [`record_request_attributes`].
+pub fn record_quality_verdict(span: &Span, attrs: &QualityVerdictAttributes<'_>) {
+    span.set_attribute(TT_QUALITY_REQUEST_ID, attrs.request_id.to_string());
+    span.set_attribute(
+        TT_QUALITY_REQUESTED_MODEL,
+        attrs.requested_model.to_string(),
+    );
+    span.set_attribute(TT_QUALITY_SERVED_MODEL, attrs.served_model.to_string());
+    span.set_attribute(TT_QUALITY_SCORE, attrs.score);
+    span.set_attribute(TT_QUALITY_BAND, attrs.band.to_string());
+    span.set_attribute(TT_QUALITY_VERDICT, attrs.verdict.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +369,55 @@ mod tests {
             attrs.get(TT_ROUTE),
             Some(&Value::String("cheap-route".into()))
         );
+    }
+
+    #[test]
+    fn records_quality_verdict_attributes_on_span() {
+        let attrs = capture_attributes(|span| {
+            record_quality_verdict(
+                span,
+                &QualityVerdictAttributes {
+                    request_id: "11111111-1111-1111-1111-111111111111",
+                    requested_model: "gpt-4o",
+                    served_model: "gpt-4o-mini",
+                    score: 1.0,
+                    band: "low",
+                    verdict: "acceptable",
+                },
+            );
+        });
+
+        assert_eq!(
+            attrs.get(TT_QUALITY_REQUEST_ID),
+            Some(&Value::String(
+                "11111111-1111-1111-1111-111111111111".into()
+            ))
+        );
+        assert_eq!(
+            attrs.get(TT_QUALITY_REQUESTED_MODEL),
+            Some(&Value::String("gpt-4o".into()))
+        );
+        assert_eq!(
+            attrs.get(TT_QUALITY_SERVED_MODEL),
+            Some(&Value::String("gpt-4o-mini".into()))
+        );
+        assert_eq!(attrs.get(TT_QUALITY_SCORE), Some(&Value::F64(1.0)));
+        assert_eq!(
+            attrs.get(TT_QUALITY_BAND),
+            Some(&Value::String("low".into()))
+        );
+        assert_eq!(
+            attrs.get(TT_QUALITY_VERDICT),
+            Some(&Value::String("acceptable".into()))
+        );
+    }
+
+    /// The header-name constants stay aligned with the spec'd wire format the
+    /// cloud ingests.
+    #[test]
+    fn quality_header_names_match_convention() {
+        assert_eq!(HEADER_QUALITY_SCORE, "x-tokentrimmer-quality-score");
+        assert_eq!(HEADER_QUALITY_BAND, "x-tokentrimmer-quality-band");
     }
 
     #[test]
