@@ -25,6 +25,7 @@ Gateway implements the following OpenAI API endpoints, with the OpenAI request/r
 | `/v1/embeddings` | POST | ✓ v1 |
 | `/v1/models` | GET | ✓ v1 |
 | `/v1/completions` (legacy) | POST | ✗ not supported |
+| `/v1/responses` (OpenAI Responses API) | POST | ✗ not yet supported — use `/v1/chat/completions` |
 | `/v1/images/generations` | POST | ✗ not supported (v2 candidate) |
 | `/v1/audio/transcriptions` | POST | ✗ not supported (v2 candidate) |
 | `/v1/audio/speech` | POST | ✗ not supported (v2 candidate) |

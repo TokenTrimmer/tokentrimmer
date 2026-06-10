@@ -18,6 +18,12 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
 
+# Bluegreen avoids a brown-out on single-machine deploys: a rolling deploy on
+# one machine takes it down mid-deploy. Bluegreen boots a fresh machine, health-
+# checks it, then cuts over (Fly spins a temporary one when min_machines == 1).
+[deploy]
+  strategy = "bluegreen"
+
 [http_service]
   internal_port      = 8080
   force_https        = true
