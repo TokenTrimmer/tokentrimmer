@@ -432,6 +432,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Cost-Usd` | on dispatched/cached responses | `0.0034` |
 | `X-TokenTrimmer-Baseline-Cost-Usd` | on dispatched/cached responses | `0.0218` |
 | `X-TokenTrimmer-Saved-Usd` | on dispatched/cached responses | `0.0184` |
+| `X-TokenTrimmer-Provider-Cache-Saved-Usd` | on dispatched/cached responses | `0.0009` |
 | `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
 | `X-TokenTrimmer-Warnings` | on dispatched responses, when the gateway altered the request | `param_dropped:frequency_penalty,param_dropped:n` |
 
@@ -439,6 +440,16 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 response (success or error). The cost/provider/model/cache headers are attached on
 responses that reach dispatch, cache, or the sandbox path; they are not emitted on
 early validation errors (4xx returned before dispatch).
+
+Savings attribution: `X-TokenTrimmer-Saved-Usd` contains only savings *caused by
+TokenTrimmer* (routing to a cheaper model, TokenTrimmer L1/L2 cache hits,
+failover choices). Discounts the provider applies automatically to its own bill
+— prompt-cache read discounts (e.g. OpenAI cached input tokens, Anthropic
+`cache_read_input_tokens`), net of any cache-write premium — are reported
+separately on `X-TokenTrimmer-Provider-Cache-Saved-Usd` and never inflate the
+TokenTrimmer figure, so `Saved-Usd` reconciles against the provider invoice.
+`X-TokenTrimmer-Cost-Usd` always reflects what the provider actually bills
+(cache discounts included).
 
 `X-TokenTrimmer-Warnings` is a comma-separated list of tokens, emitted only when
 the gateway altered the request before dispatch. Currently the gateway emits one

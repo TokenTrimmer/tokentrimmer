@@ -838,7 +838,7 @@ A nightly job purges expired records.
 
 - **Marketing site** (`tokentrimmer.com`) — landing page, pricing, blog
 - **Docs** (`docs.tokentrimmer.com`) — Starlight (Astro)
-- **App** (`app.tokentrimmer.com`) — dashboard, settings, billing
+- **App** (`dashboard.tokentrimmer.com`) — dashboard, settings, billing
 
 Three Astro projects under one monorepo, deployed separately.
 

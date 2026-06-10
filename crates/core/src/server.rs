@@ -693,7 +693,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // All six required headers must be present.
+        // All seven required headers must be present.
         for header in &[
             "x-tokentrimmer-trace-id",
             "x-tokentrimmer-provider",
@@ -701,6 +701,7 @@ mod tests {
             "x-tokentrimmer-cost-usd",
             "x-tokentrimmer-baseline-cost-usd",
             "x-tokentrimmer-saved-usd",
+            "x-tokentrimmer-provider-cache-saved-usd",
         ] {
             assert!(
                 response.headers().contains_key(*header),
@@ -735,17 +736,30 @@ mod tests {
             .parse()
             .expect("x-tokentrimmer-saved-usd should be parseable as f64");
 
+        let provider_cache_saved: f64 = response.headers()
+            ["x-tokentrimmer-provider-cache-saved-usd"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("x-tokentrimmer-provider-cache-saved-usd should be parseable as f64");
+
         // baseline >= cost (no routing savings in this iteration, but cached discount applies).
         assert!(
             baseline >= cost,
             "baseline ({baseline}) should be >= actual cost ({cost})"
         );
 
-        // saved = baseline - cost (within floating-point rounding).
-        let expected_saved = (baseline - cost).max(0.0);
+        // No TT optimization (no routing, no TT cache): the provider's
+        // automatic cached-token discount must NOT be claimed as TT savings.
         assert!(
-            (saved - expected_saved).abs() < 1e-9,
-            "saved ({saved}) should equal baseline - cost ({expected_saved})"
+            saved.abs() < 1e-9,
+            "saved ({saved}) should be 0 — the cached-token discount is provider-side"
+        );
+        let expected_provider_saved = (baseline - cost).max(0.0);
+        assert!(
+            (provider_cache_saved - expected_provider_saved).abs() < 1e-9,
+            "provider-cache-saved ({provider_cache_saved}) should equal \
+             baseline - cost ({expected_provider_saved})"
         );
 
         // Response body should be valid JSON with `id` and `choices`.

@@ -35,6 +35,13 @@ pub struct RequestLogRow {
     pub cached_tokens: i32,
     pub cost_usd: f64,
     pub baseline_cost_usd: f64,
+    /// Provider-side automatic prompt-cache discount (USD) — savings the
+    /// provider grants with or without TokenTrimmer. Kept separate so the
+    /// TT-attributed saving (`baseline_cost_usd - cost_usd -
+    /// provider_cache_saved_usd`) survives invoice reconciliation. `0.0` for
+    /// TT cache hits (no provider call) and rows from before migration 0011.
+    #[serde(default)]
+    pub provider_cache_saved_usd: f64,
     /// `true` when ANY cache layer served the response (L1 or L2).
     pub cached: bool,
     /// `Some("l1")` / `Some("l2")` / `None`. Matches the SQL CHECK constraint.
@@ -134,21 +141,23 @@ pub mod postgres {
     pub const INSERT_SQL: &str = r#"INSERT INTO request_logs
                      (id, org_id, api_key_id, ts, provider, model,
                       input_tokens, output_tokens, cached_tokens,
-                      cost_usd, baseline_cost_usd, cached, cache_layer,
+                      cost_usd, baseline_cost_usd, provider_cache_saved_usd,
+                      cached, cache_layer,
                       route_id, latency_ms, upstream_latency_ms, status,
                       tag, error_class, trace_id,
                       truncated)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
-                      $10, $11, $12, $13,
-                      $14, $15, $16, $17,
-                      $18, $19, $20,
-                      $21)"#;
+                      $10, $11, $12,
+                      $13, $14,
+                      $15, $16, $17, $18,
+                      $19, $20, $21,
+                      $22)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 21;
+    pub const INSERT_BIND_COUNT: usize = 22;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -165,16 +174,17 @@ pub mod postgres {
                 .bind(row.cached_tokens) // $9
                 .bind(row.cost_usd) // $10
                 .bind(row.baseline_cost_usd) // $11
-                .bind(row.cached) // $12
-                .bind(row.cache_layer.as_deref()) // $13
-                .bind(row.route_id) // $14
-                .bind(row.latency_ms) // $15
-                .bind(row.upstream_latency_ms) // $16
-                .bind(row.status) // $17
-                .bind(row.tag.as_deref()) // $18
-                .bind(row.error_class.as_deref()) // $19
-                .bind(row.trace_id.as_deref()) // $20
-                .bind(row.truncated) // $21
+                .bind(row.provider_cache_saved_usd) // $12
+                .bind(row.cached) // $13
+                .bind(row.cache_layer.as_deref()) // $14
+                .bind(row.route_id) // $15
+                .bind(row.latency_ms) // $16
+                .bind(row.upstream_latency_ms) // $17
+                .bind(row.status) // $18
+                .bind(row.tag.as_deref()) // $19
+                .bind(row.error_class.as_deref()) // $20
+                .bind(row.trace_id.as_deref()) // $21
+                .bind(row.truncated) // $22
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -200,6 +210,7 @@ mod tests {
             cached_tokens: 0,
             cost_usd: 0.0045,
             baseline_cost_usd: 0.0045,
+            provider_cache_saved_usd: 0.0,
             cached: false,
             cache_layer: None,
             route_id: None,

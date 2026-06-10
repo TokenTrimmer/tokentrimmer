@@ -8,7 +8,7 @@ use crate::ui;
 
 /// The dashboard page where a user mints an API key (the cloud dashboard; the
 /// public gateway only verifies keys). One-line change if the route differs.
-const DASHBOARD_KEYS_URL: &str = "https://app.tokentrimmer.com/keys";
+const DASHBOARD_KEYS_URL: &str = "https://dashboard.tokentrimmer.com/keys";
 
 /// Pure decision: resolve the token text from the `--token` arg and (when the
 /// arg is `-`) the stdin contents. Errors on a missing / blank token.

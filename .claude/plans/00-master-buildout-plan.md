@@ -113,7 +113,7 @@ The spec's 19-week plan assumed 2 engineers + 0.5 founder. Solo execution slips 
 
 ### Week 11 — HARD CHECKPOINT (was Week 8 in spec; slipped by 3 weeks for solo)
 Eleven acceptance items (all must be checked or scope cut):
-- [ ] New user signs up via magic link on `app.tokentrimmer.com`
+- [ ] New user signs up via magic link on `dashboard.tokentrimmer.com`
 - [ ] Pays via Stripe Checkout, lands on dashboard logged in
 - [ ] Adds provider credential (encrypted with XChaCha20-Poly1305)
 - [ ] Issues API key in `tt_live_*` format
@@ -403,7 +403,7 @@ cd tokentrimmer && nix develop --command bash -c "cargo test --workspace && carg
 oha -n 1000 -c 10 https://api.tokentrimmer.com/v1/chat/completions  # p50 miss <30ms, hit <5ms
 
 # 3. End-to-end customer flow
-# Browser: visit app.tokentrimmer.com → magic link → Stripe $1 test → issue key → curl with key
+# Browser: visit dashboard.tokentrimmer.com → magic link → Stripe $1 test → issue key → curl with key
 curl https://api.tokentrimmer.com/v1/chat/completions \
   -H "Authorization: Bearer tt_live_..." \
   -d '{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}'

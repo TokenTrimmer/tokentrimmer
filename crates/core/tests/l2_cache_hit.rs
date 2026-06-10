@@ -268,6 +268,11 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         },
     };
     let entry_vec = vec![1.0; 1536];
+    // Stored catalog-derived baseline (what the original miss computed via
+    // compute_cost). Deliberately distinct from both the CountingProvider
+    // catalog rate and the old hardcoded placeholder, so the assertion proves
+    // the hit reads the ROW's stored value.
+    let stored_baseline = 0.000777_f64;
     let entry = CacheEntry {
         id: Uuid::now_v7(),
         org_id: Uuid::nil(),
@@ -277,6 +282,7 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         embedding_model: "fixed-embed".into(),
         input_tokens: 100,
         output_tokens: 50,
+        baseline_cost_usd: Some(stored_baseline),
         hit_count: 0,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
@@ -320,28 +326,22 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         "provider must NOT be called on a cache hit"
     );
 
-    // ── Savings headers: an L2 hit must report full savings (saved == baseline).
-    //
-    // `build_hit_l2_response` calls `synthetic_baseline_from_entry` which
-    // prices at $1/M input + $2/M output (the conservative default until the
-    // L2 schema carries its own baseline_cost_usd column).
-    //
-    // The primed entry above has input_tokens=100, output_tokens=50 so:
-    //   baseline = (100 × $1 + 50 × $2) / 1_000_000 = 0.0002
-    //   saved    = baseline  (cost is zero — no provider call on a hit)
+    // ── Savings headers: an L2 hit must report full savings (saved == baseline)
+    // and the baseline must be the catalog-derived value STORED ON THE ROW at
+    // insert time (migration 0010) — never the old $1/M·$2/M placeholder.
     let baseline_l2: f64 = response.headers()["x-tokentrimmer-baseline-cost-usd"]
         .to_str()
         .unwrap()
         .parse()
         .unwrap();
-    let expected_baseline = (100.0_f64 * 1.0 + 50.0_f64 * 2.0) / 1_000_000.0;
     assert!(
-        baseline_l2 > 0.0,
-        "L2 hit must report a positive baseline; got {baseline_l2}"
+        (baseline_l2 - stored_baseline).abs() < 1e-9,
+        "L2 hit baseline must be the row's stored baseline_cost_usd ({stored_baseline}); got {baseline_l2}"
     );
+    let placeholder = (100.0_f64 * 1.0 + 50.0_f64 * 2.0) / 1_000_000.0;
     assert!(
-        (baseline_l2 - expected_baseline).abs() < 1e-9,
-        "L2 hit baseline should be synthetic $1/M·$2/M estimate ({expected_baseline}); got {baseline_l2}"
+        (baseline_l2 - placeholder).abs() > 1e-9,
+        "L2 hit baseline must NOT be the hardcoded $1/M·$2/M placeholder ({placeholder})"
     );
     let saved_l2: f64 = response.headers()["x-tokentrimmer-saved-usd"]
         .to_str()
@@ -357,6 +357,170 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
     let bytes = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["id"], "chatcmpl-cached");
+}
+
+/// A legacy L2 row (inserted before migration 0010, `baseline_cost_usd: None`)
+/// must have its savings re-priced against the CURRENT pricing catalog for the
+/// stored model/token counts — NOT the old hardcoded $1/M·$2/M placeholder.
+///
+/// CountingProvider prices counting-1 at $3/M input + $6/M output, so the
+/// honest baseline for 100 input + 50 output tokens is 0.0006 — the
+/// placeholder would have reported 0.0002 (a 3x misstatement).
+#[tokio::test]
+async fn l2_hit_with_null_baseline_uses_current_catalog_not_placeholder() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let cache = Arc::new(InMemoryL2Cache::new());
+
+    let primed = ChatCompletionResponse {
+        id: "chatcmpl-cached-legacy".into(),
+        object: "chat.completion".into(),
+        created: 0,
+        model: "counting-1".into(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message::Assistant {
+                content: Some(MessageContent::Text("from cache".into())),
+                tool_calls: vec![],
+                name: None,
+            },
+            finish_reason: Some("stop".into()),
+        }],
+        usage: Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        },
+    };
+    let entry_vec = vec![1.0; 1536];
+    let entry = CacheEntry {
+        id: Uuid::now_v7(),
+        org_id: Uuid::nil(),
+        embedding: entry_vec.clone(),
+        response: serde_json::to_vec(&primed).unwrap(),
+        model: "counting-1".into(),
+        embedding_model: "fixed-embed".into(),
+        input_tokens: 100,
+        output_tokens: 50,
+        baseline_cost_usd: None, // legacy row — predates migration 0010
+        hit_count: 0,
+        created_at: Utc::now(),
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+    };
+    {
+        use tt_cache::L2Cache;
+        cache.insert(entry).await.unwrap();
+    }
+
+    let embedder = Arc::new(FixedEmbedder { vec: entry_vec });
+    let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.99));
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(chat_request_with_tier(
+            "counting-1",
+            false,
+            Some(CallerTier::Pro),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-tokentrimmer-cache")
+            .and_then(|v| v.to_str().ok()),
+        Some("hit-l2")
+    );
+
+    let baseline_l2: f64 = response.headers()["x-tokentrimmer-baseline-cost-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Current catalog (CountingProvider): $3/M input + $6/M output.
+    let catalog_baseline = (100.0_f64 * 3.0 + 50.0_f64 * 6.0) / 1_000_000.0;
+    let placeholder = (100.0_f64 * 1.0 + 50.0_f64 * 2.0) / 1_000_000.0;
+    assert!(
+        (baseline_l2 - catalog_baseline).abs() < 1e-9,
+        "legacy-row L2 hit baseline must be catalog-derived ({catalog_baseline}); got {baseline_l2}"
+    );
+    assert!(
+        (baseline_l2 - placeholder).abs() > 1e-9,
+        "legacy-row L2 hit baseline must NOT be the hardcoded placeholder ({placeholder})"
+    );
+    let saved_l2: f64 = response.headers()["x-tokentrimmer-saved-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (saved_l2 - catalog_baseline).abs() < 1e-9,
+        "legacy-row L2 hit saved must be catalog-derived ({catalog_baseline}); got {saved_l2}"
+    );
+}
+
+/// A cache-miss dispatch must populate the new L2 row's `baseline_cost_usd`
+/// from the real pricing catalog (the same `compute_cost` math the gateway
+/// prices live requests with) — counting-1 at $3/M input + $6/M output over
+/// the response's 100/50 token usage = 0.0006.
+#[tokio::test]
+async fn l2_insert_stores_catalog_baseline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let cache = Arc::new(InMemoryL2Cache::new());
+    let entry_vec = vec![1.0_f32; 1536];
+    let embedder = Arc::new(FixedEmbedder {
+        vec: entry_vec.clone(),
+    });
+    let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.99));
+    let app = build_router(state);
+
+    // Paid-tier miss → provider dispatch → fire-and-forget L2 insert.
+    let response = app
+        .oneshot(chat_request_with_tier(
+            "counting-1",
+            false,
+            Some(CallerTier::Pro),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "miss must dispatch");
+    let _ = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+
+    // The L2 insert is a spawned task; poll the cache until it lands.
+    let mut found = None;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        if let Some(hit) = cache
+            .lookup(Uuid::nil(), &entry_vec, 0.99, "counting-1", "fixed-embed")
+            .await
+            .unwrap()
+        {
+            found = Some(hit.0);
+            break;
+        }
+    }
+    let entry = found.expect("miss should have inserted an L2 entry");
+
+    // CountingProvider catalog: $3/M input + $6/M output; usage 100/50.
+    let catalog_baseline = (100.0_f64 * 3.0 + 50.0_f64 * 6.0) / 1_000_000.0;
+    let stored = entry
+        .baseline_cost_usd
+        .expect("insert must store a catalog-derived baseline_cost_usd");
+    assert!(
+        (stored - catalog_baseline).abs() < 1e-9,
+        "stored baseline must be catalog-derived ({catalog_baseline}); got {stored}"
+    );
 }
 
 #[tokio::test]
@@ -439,6 +603,7 @@ async fn free_tier_caller_skips_l2_lookup_and_write() {
         embedding_model: "fixed-embed".into(),
         input_tokens: 100,
         output_tokens: 50,
+        baseline_cost_usd: None,
         hit_count: 0,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),

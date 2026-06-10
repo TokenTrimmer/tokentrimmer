@@ -94,7 +94,7 @@ In `crates/cli/src/account/mod.rs`, add the constant near the top (after the `us
 ```rust
 /// The dashboard page where a user mints an API key (the cloud dashboard; the
 /// public gateway only verifies keys). One-line change if the route differs.
-const DASHBOARD_KEYS_URL: &str = "https://app.tokentrimmer.com/keys";
+const DASHBOARD_KEYS_URL: &str = "https://dashboard.tokentrimmer.com/keys";
 ```
 
 Replace the whole `login_with_token` function with `store_key` + `open_browser` + `browser_login` + `login`:

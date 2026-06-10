@@ -105,12 +105,22 @@ The Gateway runs as `tt gateway` and listens on **port 8080**. Configuration is 
 # Build the image (produces the `tt` binary; default CMD is `gateway`)
 docker build -t tokentrimmer/tt-cli:dev .
 
-# Run the Gateway — env-only config
+# Run the Gateway — env-only config. Without DATABASE_URL there is no key
+# store: the gateway binds loopback by default and refuses a non-loopback
+# bind unless you explicitly opt in. A container port mapping needs a
+# non-loopback bind, hence the two extra vars:
 docker run --rm -p 8080:8080 \
-  -e OPENAI_API_KEY=sk-... \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e TT_BIND_ADDR=0.0.0.0 \
+  -e TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND=1 \
   tokentrimmer/tt-cli:dev gateway
 ```
+
+> **Security:** the opt-in runs the gateway as an *unauthenticated BYO-key
+> passthrough* — anyone who can reach the port can use it, but each caller
+> must supply their **own** upstream provider key as the Bearer token. The
+> operator's `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` env vars are **never**
+> served without a key store. For verified `tt_live_*` keys and per-org
+> provider credentials, set `DATABASE_URL` (and `TT_MASTER_KEY`).
 
 Smoke-test it:
 
@@ -125,10 +135,12 @@ Every external dependency is best-effort: if it's missing or unreachable, the Ga
 | Env var | Purpose | If unset |
 |---|---|---|
 | `PORT` | Bind port | Defaults to `8080` |
-| `DATABASE_URL` | Postgres: API-key verification, request logs, routing rules, provider-credential store | Runs without persistence; `tt_live_*` keys pass through **unverified** (dev mode) |
+| `TT_BIND_ADDR` | Bind IP | Defaults to `0.0.0.0` with `DATABASE_URL`, `127.0.0.1` without (fail-closed) |
+| `TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND` | Set to `1` to allow a non-loopback bind **without** a key store (unauthenticated BYO-key passthrough) | A non-loopback `TT_BIND_ADDR` without `DATABASE_URL` refuses to start |
+| `DATABASE_URL` | Postgres: API-key verification, request logs, routing rules, provider-credential store | Runs without persistence; `tt_live_*` keys pass through **unverified** (dev mode), binds loopback by default, and env provider keys are never served |
 | `REDIS_URL` | L1 exact-match cache (use `rediss://` native, **not** an HTTP REST URL) | L1 cache disabled |
 | `TT_MASTER_KEY` | XChaCha20-Poly1305 root key for the Postgres provider-credential store. Generate with `openssl rand -hex 32` | Postgres credential store disabled; provider keys come from env only |
-| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `OPENROUTER_API_KEY` | Upstream provider credentials (single-tenant / dogfood fallback) | That provider can't be reached |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `OPENROUTER_API_KEY` | Upstream provider credentials (single-tenant fallback; only served when `DATABASE_URL` configures a key store) | That provider can't be reached (callers can still pass their own key as the Bearer token) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `SENTRY_DSN` | Observability | Disabled |
 | `RUST_LOG` | Log filter, e.g. `info,tt_core=debug` | Default tracing filter |
 
@@ -178,12 +190,12 @@ Every example below uses real commands and flags from the `tt` CLI.
 Run the OpenAI-compatible proxy.
 
 ```bash
-PORT=8080 OPENAI_API_KEY=sk-... ./target/release/tt gateway
+PORT=8080 ./target/release/tt gateway
 ```
 
 Endpoints exposed: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/preview`, and `POST /v1/embeddings` *(currently returns **501 Not Implemented** — not yet dispatched to a provider)*.
 
-**Requires:** nothing to start (degraded dev mode). For full features: `DATABASE_URL`, `REDIS_URL`, and provider keys. See the self-host table above.
+**Requires:** nothing to start (degraded dev mode: loopback-only, callers pass their own provider key as the Bearer token). For full features: `DATABASE_URL`, `REDIS_URL`, and provider keys. See the self-host table above.
 
 ### 2. Inspect — `tt inspect`
 
@@ -282,7 +294,7 @@ Tools: `preview_cost`, `find_route_for`, `inspect_diff`, `lookup_semantic_cache`
 
 ### 6. `tt proxy` — local listener for coding agents
 
-A local OpenAI/Anthropic-compatible listener (default **port 31415**) that routes through the hosted Gateway and writes per-session cost rollups. Handy for tools like Claude Code, Codex, or anything that reads `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`.
+A local OpenAI/Anthropic-compatible listener (default **port 31415**) that routes OpenAI-wire traffic through the hosted Gateway and writes per-session cost rollups. Handy for tools like Claude Code, Codex, or anything that reads `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`. Note: Anthropic-wire requests (`/v1/messages`) forward directly to the Anthropic upstream in every mode, with your client's own credentials passed through — the Gateway has no Anthropic ingress yet.
 
 ```bash
 tt proxy --mode gateway --tt-api-key tt_live_...
@@ -293,7 +305,7 @@ export ANTHROPIC_BASE_URL=http://localhost:31415
 export OPENAI_BASE_URL=http://localhost:31415
 ```
 
-Modes: `gateway` (default; forward to hosted TT, requires a key), `bypass` (forward straight to the upstream, logging only), `hybrid` (gateway for `/v1/chat/completions`, bypass for everything else). Flags: `--port`, `--bind` (default `127.0.0.1`), `--no-tui`, `--no-preview`, `--session-log <path>`.
+Modes: `gateway` (default; OpenAI-wire endpoints forward to hosted TT with your TokenTrimmer key injected, requires a key), `bypass` (forward straight to the upstream, logging only), `hybrid` (OpenAI-wire endpoints to the gateway, but your client's own credentials pass through). In all three modes `/v1/messages` goes directly to the Anthropic upstream. Flags: `--port`, `--bind` (default `127.0.0.1`), `--no-tui`, `--no-preview`, `--session-log <path>`.
 
 Session log is JSONL at `~/.tokentrimmer/sessions/YYYY-MM-DD.jsonl`; on Ctrl-C the proxy prints a session summary.
 
@@ -379,7 +391,7 @@ tt audit verify path/to/chain.jsonl --key-hex <64-hex-chars>
 These are two different things, easy to confuse:
 
 - **`http://localhost:8080`** — your **self-hosted Gateway** (`tt gateway`). Point your app's `base_url` here when you run TokenTrimmer yourself.
-- **`http://localhost:31415`** — the **`tt proxy`** that forwards to the *hosted* Gateway and tracks per-session cost. Point coding agents (`ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL`) here.
+- **`http://localhost:31415`** — the **`tt proxy`** that forwards OpenAI-wire traffic to the *hosted* Gateway (`/v1/messages` goes directly to the Anthropic upstream — no gateway Anthropic ingress yet) and tracks per-session cost. Point coding agents (`ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL`) here.
 
 ---
 
