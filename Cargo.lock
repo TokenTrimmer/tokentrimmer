@@ -5307,7 +5307,7 @@ dependencies = [
  "chrono",
  "insta",
  "rand 0.8.6",
- "rand_chacha 0.3.1",
+ "rand_chacha 0.9.0",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
