@@ -16,11 +16,12 @@ The promise to customers: **change one line — your `base_url` — and your exi
 
 ## 1. Compatibility statement
 
-Gateway implements the following OpenAI API endpoints, with the OpenAI request/response schema as the source of truth:
+Gateway implements the following OpenAI API endpoints, with the OpenAI request/response schema as the source of truth, plus an Anthropic-native `/v1/messages` ingress for Anthropic-wire clients (Claude Code, the Anthropic SDKs):
 
 | Endpoint | Method | Status |
 |---|---|---|
 | `/v1/chat/completions` | POST | ✓ v1 |
+| `/v1/messages` (Anthropic Messages wire) | POST | ✓ v1 |
 | `/v1/embeddings` | POST | ✓ v1 |
 | `/v1/models` | GET | ✓ v1 |
 | `/v1/completions` (legacy) | POST | ✗ not supported |
@@ -309,6 +310,25 @@ Or with schema:
 ```
 
 If routed to a provider that doesn't support schema mode, Gateway rewrites `response_format` to `json_object` (dropping the schema) before dispatch and emits `X-TokenTrimmer-Warnings: response_format_downgrade`. (Providers that reject `response_format` outright — e.g. Anthropic — instead drop it and emit `param_dropped:response_format`.)
+
+### 3.8 Anthropic Messages ingress (`POST /v1/messages`)
+
+For Anthropic-wire clients (Claude Code, the Anthropic SDKs), Gateway also accepts the native Anthropic Messages API request shape at `POST /v1/messages` and returns the Anthropic Messages response shape — `{ "type": "message", "role": "assistant", "content": [...], "stop_reason": ..., "usage": {...} }`. With `"stream": true` it returns Anthropic typed SSE event frames (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`).
+
+```
+POST /v1/messages
+```
+
+```json
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 1024,
+  "system": "You are a helpful assistant.",
+  "messages": [{ "role": "user", "content": "Hello" }]
+}
+```
+
+The request is translated to the canonical chat shape and runs through the **same** cost, routing, cache, and credential pipeline as `/v1/chat/completions` — including the same `X-TokenTrimmer-*` response headers (§6.2) and the same BYO credential requirement (a verified org without a stored `anthropic` credential gets `400 missing_provider_credential`). Authenticate exactly as for chat (§2): a TokenTrimmer key in `Authorization: Bearer …`.
 
 ---
 

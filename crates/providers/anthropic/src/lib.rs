@@ -14,6 +14,7 @@
 
 pub mod client;
 pub mod errors;
+pub mod messages;
 pub mod pricing;
 pub mod stream;
 pub mod translate;
