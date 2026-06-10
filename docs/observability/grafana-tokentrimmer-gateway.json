@@ -1,0 +1,256 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_TEMPO",
+      "label": "Tempo",
+      "description": "Tempo (or any TraceQL-metrics-capable) data source holding the gateway's http_request spans.",
+      "type": "datasource",
+      "pluginId": "tempo",
+      "pluginName": "Tempo"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "11.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "tempo",
+      "name": "Tempo",
+      "version": "1.0.0"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "TokenTrimmer gateway request spans: GenAI (gen_ai.*) + TokenTrimmer cost (tokentrimmer.*) attributes. Panels query the http_request span attributes emitted by the gateway (crates/core middleware/trace + routes) via TraceQL metrics.",
+  "editable": true,
+  "graphTooltip": 0,
+  "links": [],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["tokentrimmer", "gen_ai", "gateway", "cost"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "label": "Tempo",
+        "name": "tempo",
+        "options": [],
+        "query": "tempo",
+        "refresh": 1,
+        "type": "datasource",
+        "pluginId": "tempo"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "TokenTrimmer Gateway — GenAI cost & traffic",
+  "uid": "tt-gateway-genai",
+  "version": 1,
+  "weekStart": "",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate (req/s)",
+      "description": "Rate of gateway request spans, broken down by gen_ai.system (provider).",
+      "type": "timeseries",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" && span.gen_ai.operation.name != \"\" } | rate() by (span.gen_ai.system)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Latency p50 / p95 (s)",
+      "description": "Request span duration percentiles across all gateway requests.",
+      "type": "timeseries",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "P50",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" } | quantile_over_time(duration, .5)"
+        },
+        {
+          "refId": "P95",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" } | quantile_over_time(duration, .95)"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Spend over time (USD billed)",
+      "description": "Sum of tokentrimmer.cost_usd — what providers actually bill — per interval.",
+      "type": "timeseries",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "custom": { "drawStyle": "bars", "fillOpacity": 60 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" } | sum_over_time(span.tokentrimmer.cost_usd)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Savings over time (USD, TokenTrimmer-attributed)",
+      "description": "Sum of tokentrimmer.saved_usd — savings caused by TokenTrimmer (routing + cache + failover). Excludes provider-side automatic cache discounts (tokentrimmer.provider_cache_saved_usd).",
+      "type": "timeseries",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "custom": { "drawStyle": "bars", "fillOpacity": 60 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" } | sum_over_time(span.tokentrimmer.saved_usd)"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Cache hits/s by layer",
+      "description": "Rate of cache-hit spans by tokentrimmer.cache outcome (hit-l1, hit-l2). Compare against the total request rate panel for the hit ratio.",
+      "type": "timeseries",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" && span.tokentrimmer.cache =~ \"hit-.*\" } | rate() by (span.tokentrimmer.cache)"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Cache-hit rate (hits / served)",
+      "description": "Fraction of served requests answered from the TokenTrimmer cache (hit-l1 or hit-l2) over the dashboard window.",
+      "type": "stat",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.2 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "HITS",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" && span.tokentrimmer.cache =~ \"hit-.*\" } | count_over_time()"
+        },
+        {
+          "refId": "TOTAL",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" && span.tokentrimmer.cache != \"\" } | count_over_time()"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Tokens by model (in / out)",
+      "description": "Sum of gen_ai.usage.input_tokens and gen_ai.usage.output_tokens grouped by the served model (gen_ai.response.model).",
+      "type": "timeseries",
+      "datasource": { "type": "tempo", "uid": "${tempo}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "IN",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" } | sum_over_time(span.gen_ai.usage.input_tokens) by (span.gen_ai.response.model)"
+        },
+        {
+          "refId": "OUT",
+          "datasource": { "type": "tempo", "uid": "${tempo}" },
+          "queryType": "traceqlSearch",
+          "tableType": "spans",
+          "query": "{ name = \"http_request\" } | sum_over_time(span.gen_ai.usage.output_tokens) by (span.gen_ai.response.model)"
+        }
+      ]
+    }
+  ]
+}

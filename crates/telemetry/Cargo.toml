@@ -37,6 +37,9 @@ postgres = ["dep:sqlx"]
 
 [dev-dependencies]
 tokio = { workspace = true }
+# gen_ai span-attribute unit tests: capture the recorded attributes via an
+# in-memory span exporter under a scoped tracing-opentelemetry subscriber.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true
