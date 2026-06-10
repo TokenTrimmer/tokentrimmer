@@ -37,28 +37,22 @@ use tt_shared::{
 use crate::errors::{map_reqwest_error, map_response_error};
 use crate::translate;
 
-/// Extra fields sent alongside the body for streaming requests.
-///
-/// The `stream_options` object asks OpenAI to include usage in the final chunk
-/// so that callers can account for token consumption even when streaming.
-#[derive(Debug, serde::Serialize)]
-struct StreamOptions {
-    include_usage: bool,
-}
-
-/// Extended request body with streaming fields.
-#[derive(Debug, serde::Serialize)]
-struct OpenAiStreamBody {
-    /// All standard fields come from the translated request body.
-    #[serde(flatten)]
-    inner: translate::OpenAiRequestBody,
-    /// Options that control SSE stream behaviour.
-    stream_options: StreamOptions,
-}
-
 /// A `BoxStream` alias used by this module.
 pub type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, ProviderError>> + Send>>;
+
+/// Return a `stream_options` value with `include_usage: true` set, preserving
+/// any other keys a caller already supplied. A non-object caller value is
+/// replaced (the streaming usage option is mandatory for accounting).
+fn merge_include_usage(caller: Option<serde_json::Value>) -> serde_json::Value {
+    match caller {
+        Some(serde_json::Value::Object(mut map)) => {
+            map.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+            serde_json::Value::Object(map)
+        }
+        _ => serde_json::json!({ "include_usage": true }),
+    }
+}
 
 /// Build and execute a streaming chat completion request.
 ///
@@ -80,18 +74,14 @@ pub async fn stream_chat_completion(
     let api_key = ctx.credentials.api_key.expose().to_string();
     let extra_headers: Vec<(String, String)> = filter_extra_headers(&ctx.credentials.extra_headers);
 
-    // Translate to the OpenAI wire shape, then override the stream flag.
+    // Translate to the OpenAI wire shape, then override the stream flag and
+    // force `stream_options.include_usage` so the final chunk carries usage —
+    // merging into any caller-supplied `stream_options` rather than dropping it.
     let mut translated = translate::translate_request(req)?;
     translated.stream = true;
+    translated.stream_options = Some(merge_include_usage(translated.stream_options.take()));
 
-    let body = OpenAiStreamBody {
-        inner: translated,
-        stream_options: StreamOptions {
-            include_usage: true,
-        },
-    };
-
-    let body_bytes = serde_json::to_vec(&body)
+    let body_bytes = serde_json::to_vec(&translated)
         .map_err(|e| ProviderError::Internal(format!("failed to serialize stream body: {e}")))?;
 
     let mut request_builder = client
@@ -609,6 +599,28 @@ mod tests {
     fn find_event_boundary_lf() {
         let buf = b"data: hello\n\ndata: world\n\n";
         assert_eq!(find_event_boundary(buf), Some((11, 2)));
+    }
+
+    #[test]
+    fn merge_include_usage_sets_flag_when_absent() {
+        let v = merge_include_usage(None);
+        assert_eq!(v, serde_json::json!({ "include_usage": true }));
+    }
+
+    #[test]
+    fn merge_include_usage_preserves_caller_keys() {
+        let caller = serde_json::json!({ "continuous_usage_stats": true });
+        let v = merge_include_usage(Some(caller));
+        assert_eq!(v["include_usage"], true);
+        assert_eq!(v["continuous_usage_stats"], true);
+    }
+
+    #[test]
+    fn merge_include_usage_overrides_caller_false() {
+        // Streaming usage accounting is mandatory: a caller's `false` is upgraded.
+        let caller = serde_json::json!({ "include_usage": false });
+        let v = merge_include_usage(Some(caller));
+        assert_eq!(v["include_usage"], true);
     }
 
     #[test]

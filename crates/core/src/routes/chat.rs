@@ -2615,6 +2615,7 @@ mod cache_eligibility_tests {
             seed: None,
             user: None,
             tt_extras: HashMap::new(),
+            ..Default::default()
         }
     }
 

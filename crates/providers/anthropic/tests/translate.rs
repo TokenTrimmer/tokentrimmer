@@ -36,6 +36,7 @@ fn make_request(model: &str, messages: Vec<Message>) -> ChatCompletionRequest {
         seed: None,
         user: None,
         tt_extras: HashMap::new(),
+        ..Default::default()
     }
 }
 
@@ -134,6 +135,47 @@ fn dropped_params_reports_present_openai_only_fields() {
     // Nothing set → nothing dropped.
     let req2 = make_request("claude-sonnet-4-6", vec![]);
     assert!(provider.dropped_params(&req2).is_empty());
+}
+
+#[test]
+fn dropped_params_reports_unsupported_typed_compat_fields() {
+    use tt_provider_anthropic::{AnthropicProvider, ClientConfig};
+    use tt_shared::Provider;
+
+    let provider = AnthropicProvider::new(ClientConfig::default());
+    let mut req = make_request("claude-sonnet-4-6", vec![]);
+    req.parallel_tool_calls = Some(true);
+    req.reasoning_effort = Some("high".into());
+    req.stream_options = Some(serde_json::json!({ "include_usage": true }));
+    let mut got = provider.dropped_params(&req);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "parallel_tool_calls".to_string(),
+            "reasoning_effort".to_string(),
+            "stream_options".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn max_completion_tokens_maps_to_anthropic_max_tokens() {
+    use tt_provider_anthropic::{AnthropicProvider, ClientConfig};
+    use tt_shared::Provider;
+
+    // The spend cap must reach Anthropic's required `max_tokens`, not vanish.
+    let mut req = make_request("claude-sonnet-4-6", vec![]);
+    req.max_tokens = None;
+    req.max_completion_tokens = Some(321);
+    let body = translate_request(req.clone()).expect("translate ok");
+    assert_eq!(body.max_tokens, 321);
+
+    // And it must NOT be reported as dropped.
+    let provider = AnthropicProvider::new(ClientConfig::default());
+    assert!(!provider
+        .dropped_params(&req)
+        .contains(&"max_completion_tokens".to_string()));
 }
 
 fn assistant_text(text: &str) -> Message {

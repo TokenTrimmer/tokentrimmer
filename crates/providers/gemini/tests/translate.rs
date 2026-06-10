@@ -36,6 +36,7 @@ fn make_request(model: &str, messages: Vec<Message>) -> ChatCompletionRequest {
         seed: None,
         user: None,
         tt_extras: HashMap::new(),
+        ..Default::default()
     }
 }
 
@@ -151,6 +152,48 @@ fn dropped_params_reports_present_fields_but_not_response_format() {
             "user".to_string()
         ]
     );
+}
+
+#[test]
+fn dropped_params_reports_unsupported_typed_compat_fields() {
+    use tt_provider_gemini::{ClientConfig, GeminiProvider};
+    use tt_shared::Provider;
+
+    let provider = GeminiProvider::new(ClientConfig::default());
+    let mut req = make_request("gemini-3.1-pro", vec![]);
+    req.parallel_tool_calls = Some(true);
+    req.reasoning_effort = Some("high".into());
+    req.stream_options = Some(serde_json::json!({ "include_usage": true }));
+    let mut got = provider.dropped_params(&req);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "parallel_tool_calls".to_string(),
+            "reasoning_effort".to_string(),
+            "stream_options".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn max_completion_tokens_maps_to_max_output_tokens() {
+    use tt_provider_gemini::{ClientConfig, GeminiProvider};
+    use tt_shared::Provider;
+
+    // The spend cap must reach Gemini's `maxOutputTokens`, not vanish.
+    let mut req = make_request("gemini-3.1-pro", vec![]);
+    req.max_tokens = None;
+    req.max_completion_tokens = Some(777);
+    let body = translate_request(req.clone()).expect("translate ok");
+    let gen_cfg = body.generation_config.as_ref().expect("generationConfig");
+    assert_eq!(gen_cfg.max_output_tokens, Some(777));
+
+    // And it must NOT be reported as dropped.
+    let provider = GeminiProvider::new(ClientConfig::default());
+    assert!(!provider
+        .dropped_params(&req)
+        .contains(&"max_completion_tokens".to_string()));
 }
 
 fn assistant_text(text: &str) -> Message {

@@ -127,8 +127,18 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Newer OpenAI spend cap for reasoning models (`o3`, `o4-mini`, …). When a
+    /// client sets this it MUST be honored end-to-end — dropping it silently
+    /// removes the caller's output ceiling and changes spend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+    /// OpenAI `stream_options` (e.g. `{ "include_usage": true }`). Kept as an
+    /// opaque value so the full object passes through to OpenAI-shaped upstreams
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,11 +157,27 @@ pub struct ChatCompletionRequest {
     pub seed: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Whether the model may emit tool calls in parallel (OpenAI
+    /// `parallel_tool_calls`). Forwarded to OpenAI-shaped upstreams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// Reasoning-effort hint for reasoning models (`"low"`/`"medium"`/`"high"`).
+    /// Materially changes output and cost, so it must reach the upstream when
+    /// supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 
     /// TokenTrimmer-internal extras (cache config, route hints, etc.) that are
     /// stripped before forwarding to the provider.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tt_extras: HashMap<String, serde_json::Value>,
+
+    /// Genuinely-unknown / newer OpenAI fields not modeled above. Captured via
+    /// `#[serde(flatten)]` so they passthrough to OpenAI-shaped upstreams
+    /// instead of being silently dropped on deserialize. Never includes the
+    /// named fields above (serde consumes those first).
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +427,62 @@ mod embeddings_default_tests {
         assert!(!r.stream);
         assert!(r.tools.is_empty());
         assert!(r.max_tokens.is_none());
+    }
+
+    #[test]
+    fn typed_compat_fields_roundtrip() {
+        let json = serde_json::json!({
+            "model": "o3",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 4096,
+            "stream_options": { "include_usage": true },
+            "parallel_tool_calls": false,
+            "reasoning_effort": "high",
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.max_completion_tokens, Some(4096));
+        assert_eq!(req.parallel_tool_calls, Some(false));
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            req.stream_options,
+            Some(serde_json::json!({ "include_usage": true }))
+        );
+        // The flatten map must NOT capture the named fields.
+        assert!(req.extra.is_empty());
+
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["max_completion_tokens"], 4096);
+        assert_eq!(
+            out["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+        assert_eq!(out["parallel_tool_calls"], false);
+        assert_eq!(out["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn unknown_fields_passthrough_via_flatten() {
+        // A genuinely-unknown / newer OpenAI field must survive deserialize and
+        // re-serialize verbatim rather than being silently dropped.
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "logprobs": true,
+            "top_logprobs": 5,
+            "service_tier": "auto",
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(req.extra.get("logprobs"), Some(&serde_json::json!(true)));
+        assert_eq!(req.extra.get("top_logprobs"), Some(&serde_json::json!(5)));
+        assert_eq!(
+            req.extra.get("service_tier"),
+            Some(&serde_json::json!("auto"))
+        );
+
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["logprobs"], true);
+        assert_eq!(out["top_logprobs"], 5);
+        assert_eq!(out["service_tier"], "auto");
     }
 
     #[test]

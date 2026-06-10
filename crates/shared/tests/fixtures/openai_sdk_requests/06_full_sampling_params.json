@@ -1,0 +1,17 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    { "role": "system", "content": "Be concise." },
+    { "role": "user", "content": "List three primes." }
+  ],
+  "temperature": 0.2,
+  "top_p": 0.9,
+  "max_tokens": 128,
+  "n": 1,
+  "stop": ["\n\n"],
+  "presence_penalty": 0.1,
+  "frequency_penalty": 0.2,
+  "seed": 42,
+  "user": "user_abc123",
+  "response_format": { "type": "json_object" }
+}

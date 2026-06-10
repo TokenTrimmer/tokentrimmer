@@ -142,9 +142,13 @@ Follows the OpenAI Chat Completions schema. Full reference:
   "temperature": 0.7,
   "top_p": 1.0,
   "max_tokens": 1024,
+  "max_completion_tokens": 1024,
   "stream": false,
+  "stream_options": { "include_usage": true },
   "tools": [],
   "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning_effort": "high",
   "response_format": { "type": "text" },
   "stop": null,
   "presence_penalty": 0,
@@ -157,11 +161,36 @@ Follows the OpenAI Chat Completions schema. Full reference:
 
 **Required:** `model`, `messages`.
 
+**Compat fidelity (field passthrough):**
+
+Gateway preserves the full OpenAI request shape. In addition to the fields above
+it models these newer OpenAI fields as first-class, forwarding them to the
+routed provider where supported:
+
+- `max_completion_tokens` — the reasoning-model spend cap (`o3`, `o4-mini`, …).
+  Forwarded verbatim to OpenAI; mapped to the native output cap for Anthropic
+  (`max_tokens`) and Gemini (`maxOutputTokens`). Takes precedence over
+  `max_tokens` when both are set.
+- `stream_options` — e.g. `{ "include_usage": true }`. Forwarded to
+  OpenAI-shaped providers (the gateway always enables `include_usage` for its
+  own accounting; any other keys you set are preserved).
+- `parallel_tool_calls` — forwarded to OpenAI-shaped providers.
+- `reasoning_effort` — `"low"`/`"medium"`/`"high"`; forwarded to OpenAI-shaped
+  providers.
+
+Any **genuinely-unknown or newer** OpenAI field not modeled above (e.g.
+`logprobs`, `service_tier`, `prediction`) passes through to OpenAI-shaped
+upstreams unchanged rather than being dropped. (TokenTrimmer-internal
+`tt_extras` is the one field always stripped before forwarding.)
+
 **Provider-specific parameter handling:**
 
-- Parameters not supported by the routed provider are silently dropped, with a `X-TokenTrimmer-Warnings` response header noting the drop.
+- Parameters not supported by the routed provider are dropped, with a
+  `X-TokenTrimmer-Warnings: param_dropped:<name>` response header noting the
+  drop — e.g. `parallel_tool_calls`, `reasoning_effort`, and `stream_options`
+  are reported dropped for Anthropic- and Gemini-routed requests.
 - Parameters with different ranges across providers (e.g., temperature) are clamped to the provider's valid range, with a `temperature_clamped` warning (e.g. Anthropic caps `temperature` at 1.0).
-- For Anthropic-routed requests, `max_tokens` is required by Anthropic but optional here; Gateway defaults to 4096 if omitted.
+- For Anthropic-routed requests, `max_tokens` is required by Anthropic but optional here; Gateway defaults to 4096 if omitted (or to `max_completion_tokens` when that is set).
 
 ### 3.3 Response (non-streaming)
 

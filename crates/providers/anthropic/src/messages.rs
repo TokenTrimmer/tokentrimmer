@@ -231,6 +231,7 @@ impl MessagesRequest {
             seed: None,
             user: self.metadata.and_then(|m| m.user_id),
             tt_extras: Default::default(),
+            ..Default::default()
         })
     }
 }

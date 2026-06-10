@@ -1,0 +1,8 @@
+{
+  "model": "o3",
+  "messages": [
+    { "role": "user", "content": "Prove that sqrt(2) is irrational." }
+  ],
+  "max_completion_tokens": 4096,
+  "reasoning_effort": "high"
+}

@@ -58,6 +58,7 @@ fn minimal_request() -> ChatCompletionRequest {
         seed: None,
         user: None,
         tt_extras: HashMap::new(),
+        ..Default::default()
     }
 }
 
