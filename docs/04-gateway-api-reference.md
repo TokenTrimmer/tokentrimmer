@@ -90,9 +90,9 @@ Two options:
 
 ### 2.3 Provider credentials
 
-In hosted mode, provider credentials (OpenAI key, Anthropic key, etc.) are stored encrypted in the customer's TokenTrimmer org settings and selected based on the routed provider.
+In hosted mode, provider credentials (OpenAI key, Anthropic key, etc.) are stored encrypted in the customer's TokenTrimmer org settings and selected based on the routed provider. The hosted gateway is **BYO-only**: an org that has not added its own credential for the requested provider gets a `400` with code `missing_provider_credential` telling it to add one — it is never served the operator's keys.
 
-In self-hosted mode, provider credentials come from environment variables by default:
+In self-hosted deployments with a Postgres credential store (`DATABASE_URL` + `TT_MASTER_KEY`), the same BYO-only default applies. A **single-tenant** self-host can opt in to serving the operator's process-env keys as a fallback for orgs with no stored credential by setting `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` (do **not** set this on a multi-tenant gateway — every org would spend on, and be exposed to, the shared keys). With the opt-in set, these env vars are recognized:
 
 | Provider | Env var |
 |---|---|
@@ -103,6 +103,8 @@ In self-hosted mode, provider credentials come from environment variables by def
 | Groq | `GROQ_API_KEY` |
 | Together | `TOGETHER_API_KEY` |
 | OpenRouter | `OPENROUTER_API_KEY` |
+
+Without any persistent store at all (no `DATABASE_URL`, dev mode), the gateway never serves env keys either: callers forward their own provider key as the Bearer token (pass-through mode above).
 
 Local providers (Ollama, vLLM, LM Studio) don't require keys.
 

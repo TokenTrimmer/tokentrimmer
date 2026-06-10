@@ -30,8 +30,13 @@ Two things to know up front, so you don't find out the hard way:
 The Docker image is built from [`Dockerfile`](Dockerfile) and pushed to GHCR on every merge to `main`. The image's entrypoint is `tt`, default command `gateway` (binds `:8080`). Configuration is env-only; Postgres and Redis are optional — without them the Gateway runs in a degraded dev mode (no persistence, no caching).
 
 ```bash
+# Without DATABASE_URL this is an unauthenticated BYO-key passthrough: each
+# caller supplies their own provider key as the Bearer token, and the two
+# opt-in vars below acknowledge the public unauthenticated bind. Operator env
+# keys (OPENAI_API_KEY, …) are only served with a DB-backed credential store
+# AND TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1 — see GETTING_STARTED.md.
 docker run -p 8080:8080 \
-  -e OPENAI_API_KEY=sk-... -e ANTHROPIC_API_KEY=sk-ant-... \
+  -e TT_BIND_ADDR=0.0.0.0 -e TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND=1 \
   ghcr.io/tokentrimmer/tt-cli:latest
 
 # Then point your existing OpenAI SDK at it — one line:
