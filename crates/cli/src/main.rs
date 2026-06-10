@@ -93,14 +93,19 @@ enum Command {
         action: AuditAction,
     },
     /// Run the MCP server (stdio transport by default).
+    ///
+    /// `--transport http` serves the current MCP Streamable HTTP transport on a
+    /// single `/mcp` endpoint; `--transport sse` is the deprecated HTTP+SSE
+    /// transport, retained only for older clients.
     Mcp {
+        /// Transport: `stdio` (default), `http` (Streamable HTTP), or `sse` (deprecated).
         #[arg(long, default_value = "stdio")]
         transport: String,
         #[arg(long)]
         tt_api_key: Option<String>,
         #[arg(long)]
         tt_api_base: Option<String>,
-        /// Port to bind when using --transport sse (default 31416).
+        /// Port to bind when using --transport http or sse (default 31416).
         #[arg(long, default_value_t = 31416)]
         sse_port: u16,
     },
@@ -501,14 +506,23 @@ async fn main() -> anyhow::Result<()> {
                 "stdio" => {
                     server.run_stdio().await?;
                 }
+                "http" => {
+                    let addr: std::net::SocketAddr = format!("127.0.0.1:{sse_port}")
+                        .parse()
+                        .context("invalid HTTP bind address")?;
+                    server.run_http(addr, api_key).await?;
+                }
                 "sse" => {
+                    // Deprecated HTTP+SSE transport (MCP 2024-11-05); prefer `http`.
                     let addr: std::net::SocketAddr = format!("127.0.0.1:{sse_port}")
                         .parse()
                         .context("invalid SSE bind address")?;
                     server.run_sse(addr, api_key).await?;
                 }
                 other => {
-                    anyhow::bail!("unsupported MCP transport `{other}` (supported: stdio, sse)")
+                    anyhow::bail!(
+                        "unsupported MCP transport `{other}` (supported: stdio, http, sse[deprecated])"
+                    )
                 }
             }
         }
