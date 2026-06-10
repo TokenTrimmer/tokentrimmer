@@ -490,18 +490,36 @@ fn message_content_text(content: &MessageContent) -> Option<String> {
 /// returned frames; call [`finish`](Self::finish) once the source stream ends to
 /// flush the closing `content_block_stop` / `message_delta` / `message_stop`.
 ///
-/// Only a single text content block is modeled (index 0), which covers the
-/// streaming text responses Claude Code consumes. Tool-call deltas are not split
-/// into separate `tool_use` blocks here.
+/// Both text and tool-call deltas are modeled. A single text content block is
+/// emitted at index 0; each distinct streamed `tool_calls` entry becomes its own
+/// `tool_use` content block (`content_block_start` → `input_json_delta`s →
+/// `content_block_stop`) so Claude Code's agentic loop receives runnable tools.
+/// Canonical tool-call `arguments` are cumulative (the adapters re-emit the
+/// accumulated string), so each delta forwards only the newly-appended suffix.
 #[derive(Default)]
 pub struct AnthropicSseEncoder {
     started: bool,
     text_block_open: bool,
+    /// Next free Anthropic content-block index (text takes 0 when present).
+    next_block_index: usize,
+    /// Per tool-call-id streaming state, in first-seen order.
+    tool_blocks: Vec<ToolBlockState>,
     stop_reason: Option<String>,
     output_tokens: u64,
     input_tokens: u64,
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
+}
+
+/// Streaming state for one open `tool_use` content block.
+struct ToolBlockState {
+    /// Canonical tool-call id (matched across chunks to route deltas).
+    id: String,
+    /// Anthropic content-block index this tool occupies.
+    block_index: usize,
+    /// Length of the `arguments` string already forwarded as `input_json_delta`,
+    /// so the next cumulative snapshot only emits its new suffix.
+    emitted_args_len: usize,
 }
 
 impl AnthropicSseEncoder {
@@ -542,6 +560,9 @@ impl AnthropicSseEncoder {
                 if !text.is_empty() {
                     if !self.text_block_open {
                         self.text_block_open = true;
+                        // Text always claims block index 0 (it is opened before any
+                        // tool block in this model).
+                        self.next_block_index = self.next_block_index.max(1);
                         frames.push(sse_frame(
                             "content_block_start",
                             &json!({
@@ -561,6 +582,9 @@ impl AnthropicSseEncoder {
                     ));
                 }
             }
+            for tc in &choice.delta.tool_calls {
+                frames.extend(self.push_tool_call(tc));
+            }
             if let Some(reason) = &choice.finish_reason {
                 self.stop_reason = Some(map_finish_reason(reason).to_string());
             }
@@ -579,12 +603,80 @@ impl AnthropicSseEncoder {
         frames
     }
 
+    /// Translate one canonical streamed [`tt_shared::messages::ToolCall`] into
+    /// Anthropic `tool_use` frames.
+    ///
+    /// On first sight of a tool-call id, opens a `tool_use` content block
+    /// (`content_block_start`) at the next free block index. Then forwards the
+    /// newly-appended `arguments` suffix as an `input_json_delta`. Canonical
+    /// `arguments` snapshots are cumulative, so the prefix already emitted is
+    /// stripped to avoid duplicating fragments. The block is closed in
+    /// [`finish`](Self::finish).
+    fn push_tool_call(&mut self, tc: &tt_shared::messages::ToolCall) -> Vec<String> {
+        let mut frames: Vec<String> = Vec::new();
+
+        let pos = match self.tool_blocks.iter().position(|b| b.id == tc.id) {
+            Some(pos) => pos,
+            None => {
+                let block_index = self.next_block_index;
+                self.next_block_index += 1;
+                self.tool_blocks.push(ToolBlockState {
+                    id: tc.id.clone(),
+                    block_index,
+                    emitted_args_len: 0,
+                });
+                frames.push(sse_frame(
+                    "content_block_start",
+                    &json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "input": {},
+                        },
+                    }),
+                ));
+                self.tool_blocks.len() - 1
+            }
+        };
+
+        let block = &mut self.tool_blocks[pos];
+        let args = &tc.function.arguments;
+        // Forward only the suffix not yet emitted. Cumulative snapshots grow by
+        // appending, so the already-emitted prefix is a prefix of `args`; if a
+        // provider ever sends a non-cumulative fragment we fall back to emitting
+        // the whole fragment.
+        let new_part = if args.len() >= block.emitted_args_len
+            && args.is_char_boundary(block.emitted_args_len)
+        {
+            &args[block.emitted_args_len..]
+        } else {
+            args.as_str()
+        };
+        if !new_part.is_empty() {
+            frames.push(sse_frame(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": block.block_index,
+                    "delta": {"type": "input_json_delta", "partial_json": new_part},
+                }),
+            ));
+            block.emitted_args_len = args.len();
+        }
+
+        frames
+    }
+
     /// Flush the terminal frames after the source stream ends.
     ///
-    /// Emits `content_block_stop` (when a text block was opened), `message_delta`
-    /// (stop_reason + output tokens) and `message_stop`. A no-op `message_start`
-    /// is emitted first if no chunk was ever seen, so the output is always a
-    /// well-formed Anthropic event sequence.
+    /// Emits `content_block_stop` for the text block (when opened) and for every
+    /// open `tool_use` block, then `message_delta` (stop_reason + output tokens)
+    /// and `message_stop`. A no-op `message_start` is emitted first if no chunk
+    /// was ever seen, so the output is always a well-formed Anthropic event
+    /// sequence.
     pub fn finish(&mut self) -> Vec<String> {
         let mut frames: Vec<String> = Vec::new();
 
@@ -613,6 +705,14 @@ impl AnthropicSseEncoder {
             frames.push(sse_frame(
                 "content_block_stop",
                 &json!({"type": "content_block_stop", "index": 0}),
+            ));
+        }
+
+        // Close every open tool_use block, in the order they were opened.
+        for block in std::mem::take(&mut self.tool_blocks) {
+            frames.push(sse_frame(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": block.block_index}),
             ));
         }
 
@@ -653,7 +753,7 @@ fn sse_frame(event: &str, data: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tt_shared::messages::{Choice, ChunkChoice, ChunkDelta};
+    use tt_shared::messages::{Choice, ChunkChoice, ChunkDelta, ToolCall, ToolCallFunction};
     use tt_shared::usage::Usage;
     use tt_shared::ChatCompletionChunk;
 
@@ -964,6 +1064,100 @@ mod tests {
         assert!(out.contains("\"stop_reason\":\"end_turn\""));
         // Frames are blank-line terminated.
         assert!(out.ends_with("\n\n"));
+    }
+
+    /// A chunk carrying a single streamed tool-call delta with the given
+    /// cumulative `arguments` snapshot.
+    fn tool_chunk(id: &str, name: &str, arguments: &str) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "msg_s".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "claude-sonnet-4-6".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: id.to_string(),
+                        r#type: "function".to_string(),
+                        function: ToolCallFunction {
+                            name: name.to_string(),
+                            arguments: arguments.to_string(),
+                        },
+                    }],
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn sse_encoder_emits_tool_use_block_from_streamed_tool_call() {
+        let mut enc = AnthropicSseEncoder::new();
+        let mut out = String::new();
+        // A leading text token, then a tool call whose arguments arrive as
+        // cumulative snapshots (as the anthropic adapter re-emits them).
+        for frame in enc.push_chunk(&text_chunk(Some("Let me check"), None)) {
+            out.push_str(&frame);
+        }
+        for frame in enc.push_chunk(&tool_chunk("toolu_1", "get_weather", "{\"city\"")) {
+            out.push_str(&frame);
+        }
+        for frame in enc.push_chunk(&tool_chunk("toolu_1", "get_weather", "{\"city\":\"SF\"}")) {
+            out.push_str(&frame);
+        }
+        for frame in enc.push_chunk(&text_chunk(None, Some("tool_calls"))) {
+            out.push_str(&frame);
+        }
+        for frame in enc.finish() {
+            out.push_str(&frame);
+        }
+
+        // A tool_use content block is opened at index 1 (text holds index 0).
+        assert!(
+            out.contains("\"type\":\"tool_use\""),
+            "missing tool_use block in:\n{out}"
+        );
+        assert!(out.contains("\"id\":\"toolu_1\""));
+        assert!(out.contains("\"name\":\"get_weather\""));
+        // serde_json Value maps serialize keys alphabetically, so a content_block_start
+        // frame at index 1 reads `…"index":1,"type":"content_block_start"…`.
+        assert!(
+            out.contains("\"index\":1,\"type\":\"content_block_start\""),
+            "tool block start at index 1 in:\n{out}"
+        );
+        // Cumulative arguments forwarded as input_json_delta suffixes (no dupes).
+        assert!(out.contains("\"input_json_delta\""));
+        assert!(out.contains("\"partial_json\":\"{\\\"city\\\""));
+        assert!(out.contains("\"partial_json\":\":\\\"SF\\\"}"));
+        // Both the text block (0) and the tool block (1) are closed.
+        assert!(out.contains("\"index\":0,\"type\":\"content_block_stop\""));
+        assert!(out.contains("\"index\":1,\"type\":\"content_block_stop\""));
+        // finish_reason tool_calls maps to stop_reason tool_use.
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
+    }
+
+    #[test]
+    fn sse_encoder_tool_call_without_text_uses_block_index_zero() {
+        let mut enc = AnthropicSseEncoder::new();
+        let mut out = String::new();
+        for frame in enc.push_chunk(&tool_chunk("toolu_a", "do_thing", "{}")) {
+            out.push_str(&frame);
+        }
+        for frame in enc.push_chunk(&text_chunk(None, Some("tool_calls"))) {
+            out.push_str(&frame);
+        }
+        for frame in enc.finish() {
+            out.push_str(&frame);
+        }
+        // No text → the tool block claims index 0.
+        assert!(out.contains("\"type\":\"tool_use\""));
+        assert!(out.contains("\"index\":0,\"type\":\"content_block_start\""));
+        assert!(out.contains("\"index\":0,\"type\":\"content_block_stop\""));
+        assert!(out.contains("\"stop_reason\":\"tool_use\""));
     }
 
     #[test]

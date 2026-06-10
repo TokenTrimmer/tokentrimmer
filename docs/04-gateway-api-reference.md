@@ -315,6 +315,8 @@ If routed to a provider that doesn't support schema mode, Gateway rewrites `resp
 
 For Anthropic-wire clients (Claude Code, the Anthropic SDKs), Gateway also accepts the native Anthropic Messages API request shape at `POST /v1/messages` and returns the Anthropic Messages response shape — `{ "type": "message", "role": "assistant", "content": [...], "stop_reason": ..., "usage": {...} }`. With `"stream": true` it returns Anthropic typed SSE event frames (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`).
 
+Tool use is supported in both directions. Non-streaming responses carry `tool_use` content blocks; streaming responses emit a `tool_use` content block per tool call (`content_block_start` → `input_json_delta` deltas → `content_block_stop`) and a `stop_reason: "tool_use"` in the closing `message_delta`, so Claude Code's agentic loop receives runnable tools.
+
 ```
 POST /v1/messages
 ```

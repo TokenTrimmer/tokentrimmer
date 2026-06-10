@@ -24,7 +24,9 @@ use tt_auth::{
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
-    messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
+    messages::{
+        Choice, ChunkChoice, ChunkDelta, Message, MessageContent, ToolCall, ToolCallFunction,
+    },
     pricing::Capability,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
@@ -100,25 +102,66 @@ impl Provider for AnthropicMock {
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
         *self.seen_key.lock().unwrap() = Some(ctx.credentials.api_key.expose().to_string());
         *self.seen_request.lock().unwrap() = Some(req.clone());
-        let chunks = vec![
-            ChatCompletionChunk {
-                id: "msg_stream_1".into(),
-                object: "chat.completion.chunk".into(),
-                created: 0,
-                model: req.model.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: ChunkDelta {
-                        role: Some("assistant".into()),
-                        content: None,
-                        tool_calls: vec![],
-                    },
-                    finish_reason: None,
-                }],
-                usage: None,
-            },
-            ChatCompletionChunk {
-                id: "msg_stream_1".into(),
+        let final_usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            total_tokens: 120,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        };
+        let chunks = if req.tools.is_empty() {
+            vec![
+                ChatCompletionChunk {
+                    id: "msg_stream_1".into(),
+                    object: "chat.completion.chunk".into(),
+                    created: 0,
+                    model: req.model.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: Some("assistant".into()),
+                            content: None,
+                            tool_calls: vec![],
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                },
+                ChatCompletionChunk {
+                    id: "msg_stream_1".into(),
+                    object: "chat.completion.chunk".into(),
+                    created: 0,
+                    model: req.model.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: None,
+                            content: Some("Hello!".into()),
+                            tool_calls: vec![],
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                },
+                ChatCompletionChunk {
+                    id: "msg_stream_1".into(),
+                    object: "chat.completion.chunk".into(),
+                    created: 0,
+                    model: req.model,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta::default(),
+                        finish_reason: Some("stop".into()),
+                    }],
+                    usage: Some(final_usage),
+                },
+            ]
+        } else {
+            // Tools present → stream a tool call (as the anthropic adapter does:
+            // cumulative `arguments` snapshots per chunk, then a `tool_calls`
+            // finish_reason). Exercises the encoder's tool_use block emission.
+            let tool_chunk = |args: &str| ChatCompletionChunk {
+                id: "msg_stream_tc".into(),
                 object: "chat.completion.chunk".into(),
                 created: 0,
                 model: req.model.clone(),
@@ -126,32 +169,37 @@ impl Provider for AnthropicMock {
                     index: 0,
                     delta: ChunkDelta {
                         role: None,
-                        content: Some("Hello!".into()),
-                        tool_calls: vec![],
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "toolu_stream_1".into(),
+                            r#type: "function".into(),
+                            function: ToolCallFunction {
+                                name: "get_weather".into(),
+                                arguments: args.into(),
+                            },
+                        }],
                     },
                     finish_reason: None,
                 }],
                 usage: None,
-            },
-            ChatCompletionChunk {
-                id: "msg_stream_1".into(),
-                object: "chat.completion.chunk".into(),
-                created: 0,
-                model: req.model,
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: ChunkDelta::default(),
-                    finish_reason: Some("stop".into()),
-                }],
-                usage: Some(Usage {
-                    prompt_tokens: 100,
-                    completion_tokens: 20,
-                    total_tokens: 120,
-                    cached_tokens: 0,
-                    cache_creation_input_tokens: None,
-                }),
-            },
-        ];
+            };
+            vec![
+                tool_chunk("{\"city\""),
+                tool_chunk("{\"city\":\"SF\"}"),
+                ChatCompletionChunk {
+                    id: "msg_stream_tc".into(),
+                    object: "chat.completion.chunk".into(),
+                    created: 0,
+                    model: req.model,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta::default(),
+                        finish_reason: Some("tool_calls".into()),
+                    }],
+                    usage: Some(final_usage),
+                },
+            ]
+        };
         Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
     }
     async fn embeddings(
@@ -185,6 +233,26 @@ fn messages_request(stream: bool) -> serde_json::Value {
         "max_tokens": 64,
         "system": "You are a helpful assistant.",
         "messages": [{"role": "user", "content": "Hi"}],
+        "stream": stream,
+    })
+}
+
+/// An Anthropic Messages request that declares a tool, so the mock streams a
+/// tool call (exercises the encoder's `tool_use` content-block emission).
+fn messages_tool_request(stream: bool) -> serde_json::Value {
+    json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "What's the weather in SF?"}],
+        "tools": [{
+            "name": "get_weather",
+            "description": "Get the weather for a city",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }],
         "stream": stream,
     })
 }
@@ -348,6 +416,80 @@ async fn messages_streaming_yields_anthropic_sse_frames() {
         !body.contains("data: [DONE]"),
         "Anthropic SSE must not emit the OpenAI [DONE] sentinel"
     );
+}
+
+#[tokio::test]
+async fn messages_streaming_emits_tool_use_content_block() {
+    let org = Uuid::now_v7();
+    let Harness { app, key, .. } = build(org, /*seed_anthropic_cred=*/ true).await;
+
+    let r = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::from(messages_tool_request(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), StatusCode::OK);
+    let ct = r.headers()["content-type"].to_str().unwrap();
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected SSE content-type, got {ct}"
+    );
+
+    let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+
+    // The streamed tool call MUST surface as an Anthropic tool_use content block
+    // (start → input_json_delta → stop) — without this the response carries a
+    // `tool_use` stop_reason but no runnable tool, breaking Claude Code's loop.
+    assert!(
+        body.contains("event: content_block_start"),
+        "missing content_block_start in:\n{body}"
+    );
+    assert!(
+        body.contains("\"type\":\"tool_use\""),
+        "streamed tool call dropped — no tool_use block in:\n{body}"
+    );
+    assert!(
+        body.contains("\"name\":\"get_weather\""),
+        "tool_use block missing tool name in:\n{body}"
+    );
+    assert!(
+        body.contains("\"id\":\"toolu_stream_1\""),
+        "tool_use block missing tool id in:\n{body}"
+    );
+    // Arguments stream as input_json_delta suffixes (cumulative snapshots de-duped).
+    assert!(
+        body.contains("\"input_json_delta\""),
+        "missing input_json_delta in:\n{body}"
+    );
+    assert!(
+        body.contains("\"partial_json\":\"{\\\"city\\\""),
+        "first arguments fragment missing in:\n{body}"
+    );
+    assert!(
+        body.contains("\"partial_json\":\":\\\"SF\\\"}"),
+        "second arguments fragment missing in:\n{body}"
+    );
+    assert!(
+        body.contains("event: content_block_stop"),
+        "tool_use block not closed in:\n{body}"
+    );
+    // tool_calls finish_reason maps to the Anthropic tool_use stop_reason.
+    assert!(
+        body.contains("\"stop_reason\":\"tool_use\""),
+        "missing tool_use stop_reason in:\n{body}"
+    );
+    assert!(!body.contains("data: [DONE]"));
 }
 
 #[tokio::test]
