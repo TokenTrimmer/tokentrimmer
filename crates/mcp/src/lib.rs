@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod cost;
 pub mod error;
 pub mod protocol;
 pub mod resources;

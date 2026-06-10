@@ -458,8 +458,11 @@ async fn main() -> anyhow::Result<()> {
         } => {
             use tt_mcp::{
                 auth,
+                cost::{CostControlBackend, UnconfiguredBackend},
                 resources::{cost_ledger, inspect_baseline},
-                tools::{find_route_for, inspect_diff, lookup_semantic_cache, preview_cost},
+                tools::{
+                    cost_control, find_route_for, inspect_diff, lookup_semantic_cache, preview_cost,
+                },
                 Server,
             };
             let ctx = tt_cli::context::ResolvedContext::load(tt_api_key, tt_api_base)?;
@@ -517,8 +520,53 @@ async fn main() -> anyhow::Result<()> {
                     Ok(pool) => {
                         let store: std::sync::Arc<dyn tt_auth::KeyStore> =
                             std::sync::Arc::new(tt_auth::postgres::PostgresKeyStore::new(pool));
-                        server = server
-                            .with_authenticator(auth::Authenticator::new(store, api_key.clone()));
+                        let authenticator = auth::Authenticator::new(store, api_key.clone());
+
+                        // Eagerly resolve the bound org so the cost-control tools
+                        // can be scoped to the verified tenant (set_cost_limit
+                        // must only ever touch this org). This runs the same
+                        // store-backed verify path the dispatcher uses; the
+                        // OnceCell caches it so the first dispatch reuses it.
+                        match authenticator.context().await {
+                            Ok(ctx) => {
+                                let org_id = ctx.org_id;
+                                // PUBLIC-repo MVP: no per-org-key cost endpoint
+                                // exists in the hosted API yet, so the cost tools
+                                // run against the documented `UnconfiguredBackend`
+                                // seam (clearly-marked responses, no fabricated
+                                // numbers). A hosted deployment swaps in a real
+                                // `CostControlBackend` here without changing the
+                                // tool surface.
+                                let backend: std::sync::Arc<dyn CostControlBackend> =
+                                    std::sync::Arc::new(UnconfiguredBackend);
+                                server
+                                    .tools
+                                    .register(Box::new(cost_control::GetSpendTodayTool {
+                                        backend: backend.clone(),
+                                        org_id,
+                                    }));
+                                server.tools.register(Box::new(
+                                    cost_control::CheckBudgetRemainingTool {
+                                        backend: backend.clone(),
+                                        org_id,
+                                    },
+                                ));
+                                server
+                                    .tools
+                                    .register(Box::new(cost_control::SetCostLimitTool {
+                                        backend,
+                                        org_id,
+                                    }));
+                                tracing::info!(
+                                    "MCP cost-control tools registered (org-scoped); backend: unconfigured seam"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "MCP operator key verification failed; cost-control tools not registered");
+                            }
+                        }
+
+                        server = server.with_authenticator(authenticator);
                         tracing::info!(
                             "MCP key store: Postgres-backed (operator key verified on first call)"
                         );
@@ -528,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                tracing::warn!("DATABASE_URL not set; MCP serving with loopback bearer guard only (no store-backed key verification)");
+                tracing::warn!("DATABASE_URL not set; MCP serving with loopback bearer guard only (no store-backed key verification); cost-control tools require a verified org and are not registered");
             }
 
             match transport.as_str() {
