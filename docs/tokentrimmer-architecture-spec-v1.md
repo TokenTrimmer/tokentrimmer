@@ -223,13 +223,13 @@ For streaming, steps 6–8 happen concurrently — the response streams through 
 - Eviction: LRU within Upstash limits
 
 **L2 — Semantic match (pgvector):**
-- Embed the *last user message* (not the whole conversation — too noisy)
+- Embed a canonicalized representation of the conversation: the system prompt plus the ordered user/assistant messages (tool messages omitted) — embedding only the last user message caused different conversations sharing a final turn to collide
 - Use `text-embedding-3-small` (cheap, fast, 1536 dims)
 - Insert into `cache_entries` with HNSW index
 - Lookup: cosine similarity, threshold per route (default 0.92)
 - Storage: response JSON, model used, token counts, hit count, expires_at
 - Per-org isolation: every cache entry has `org_id`; queries scope to org
-- Privacy: cache stores the **full response JSON** and the prompt embedding; it does not persist the original prompt text, but generating the embedding sends that prompt (the last user message) to OpenAI for `text-embedding-3-small`
+- Privacy: cache stores the **full response JSON** and the prompt embedding; it does not persist the original prompt text, but generating the embedding sends that prompt text — the system prompt plus the conversation messages (canonicalized) — to OpenAI for `text-embedding-3-small`
 
 **What is never cached:**
 - Requests with `stream: true` and `cache: false` header
