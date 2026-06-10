@@ -42,6 +42,7 @@ impl Default for Registry {
     }
 }
 
+pub mod batch_savings;
 pub mod cost_control;
 pub mod find_route_for;
 pub mod inspect_diff;

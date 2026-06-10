@@ -15,10 +15,13 @@ use crate::ui;
 const ADVISOR_MODEL: &str = "gpt-4o-mini";
 
 const ADVISOR_SYSTEM: &str = "You are a TokenTrimmer cost-optimization advisor. \
-Use the provided tools (preview_cost, find_route_for, inspect_diff) to ground EVERY \
-recommendation in real numbers — never invent prices, call the tools. Be concrete and \
-brief: list specific routing/model changes with their dollar impact, name cheaper \
-equivalents, and flag risky or wasteful prompt patterns. End with the single \
+Use the provided tools (preview_cost, find_route_for, inspect_diff, batch_savings) to \
+ground EVERY recommendation in real numbers — never invent prices, call the tools. Be \
+concrete and brief: list specific routing/model changes with their dollar impact, name \
+cheaper equivalents, and flag risky or wasteful prompt patterns. When you have \
+request-log aggregates grouped by tag, call batch_savings to flag latency-insensitive \
+traffic (tags like background/offline/nightly/bulk) that could move to the provider's \
+Batch API at ~50% off — surface the projected dollar savings. End with the single \
 highest-impact change.";
 
 /// File extensions worth scanning for model usage.
@@ -229,7 +232,7 @@ pub async fn run(
     );
     conv.push_user(build_context_message(&detected, describe.as_deref()));
 
-    let reg = tools::build_registry();
+    let reg = tools::build_advisor_registry();
     let mut ledger = Ledger::default();
     ui::heading("TokenTrimmer advisor");
     tools::run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;

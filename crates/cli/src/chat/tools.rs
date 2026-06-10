@@ -5,6 +5,7 @@
 use anyhow::Context as _;
 use serde_json::{json, Value};
 
+use tt_mcp::tools::batch_savings::BatchSavingsTool;
 use tt_mcp::tools::find_route_for::FindRouteForTool;
 use tt_mcp::tools::inspect_diff::InspectDiffTool;
 use tt_mcp::tools::preview_cost::PreviewCostTool;
@@ -24,6 +25,17 @@ pub fn build_registry() -> Registry {
     r.register(Box::new(FindRouteForTool));
     r.register(Box::new(PreviewCostTool));
     r.register(Box::new(InspectDiffTool));
+    r
+}
+
+/// The advisor's tool surface: the chat tools plus `batch_savings`, which
+/// projects Batch-API savings over request-log aggregates (Batch/Flex phase 1,
+/// advisory only). Kept off the `tt chat` registry — it reasons over telemetry
+/// aggregates the advisor assembles, not something a chat user supplies.
+#[must_use]
+pub fn build_advisor_registry() -> Registry {
+    let mut r = build_registry();
+    r.register(Box::new(BatchSavingsTool));
     r
 }
 
@@ -467,5 +479,25 @@ mod tests {
             .find(|x| x.function.name == "find_route_for")
             .unwrap();
         assert_eq!(fr.function.parameters["required"][0], "task_description");
+        // batch_savings is advisor-only — not on the chat registry.
+        assert!(
+            !names.contains(&"batch_savings"),
+            "batch_savings must not be on the chat registry"
+        );
+    }
+
+    /// The advisor registry is the chat tools plus `batch_savings`, so the
+    /// model can flag batch-eligible request-log traffic and project savings.
+    #[test]
+    fn advisor_registry_adds_batch_savings() {
+        let reg = build_advisor_registry();
+        let t = registry_tools(&reg);
+        let names: Vec<&str> = t.iter().map(|x| x.function.name.as_str()).collect();
+        assert!(names.contains(&"batch_savings"), "{names:?}");
+        // and still carries the chat tools.
+        assert!(names.contains(&"find_route_for"));
+        assert!(names.contains(&"preview_cost"));
+        assert!(names.contains(&"inspect_diff"));
+        assert_eq!(t.len(), 4);
     }
 }
