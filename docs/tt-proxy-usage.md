@@ -6,6 +6,13 @@ Note: Anthropic-wire requests (`/v1/messages`) forward directly to the
 Anthropic upstream in every mode, with your client's own credentials passed
 through — the Gateway has no Anthropic ingress yet.
 
+> **`tt proxy` is not self-hosting.** It is a *local egress shim* — a listener on
+> port 31415 that forwards your app's OpenAI/Anthropic-wire traffic to a remote
+> Gateway. To **self-host the Gateway itself**, run `tt gateway` (the
+> OpenAI-compatible server, port 8080) — see the self-host section in
+> `GETTING_STARTED.md` / `README.md`. Point `tt proxy` at your self-hosted
+> Gateway with `--tt-api-base http://localhost:8080`.
+
 ## Quick start
 
 ```bash
