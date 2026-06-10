@@ -28,9 +28,9 @@ use tt_auth::{
     keys::{issue, Environment},
     InMemoryKeyStore, KeyStore,
 };
-use tt_core::quality_sample::{JudgeConfig, JudgeOutcome, JudgeSink};
+use tt_core::quality_sample::{InMemoryJudgeBandStore, JudgeConfig, JudgeOutcome, JudgeSink};
 use tt_core::{build_router, AppState, ProviderRegistry};
-use tt_plan_core::{JudgeVerdict, RiskBand};
+use tt_plan_core::{JudgeVerdict, RiskBand, SampleScore};
 use tt_routing::{
     CachingRoutingStore, InMemoryRoutingStore, Route, RouteAction, RouteConditions, RoutingStore,
 };
@@ -467,4 +467,100 @@ async fn response_returns_before_judge_completes() {
     .expect("judge records after the gate is released");
     assert_eq!(h.sink.outcomes.lock().unwrap().len(), 1);
     assert!(h.judge_calls.load(Ordering::SeqCst) >= 1);
+}
+
+/// End-to-end production join: a recorded judge outcome flows through the
+/// `InMemoryJudgeBandStore` and the `tt_preview` enrichment seam to populate the
+/// `quality_risk_band` on the live `/v1/preview` response — lifting the judged
+/// swap off the hard-coded `Unknown`, while an unjudged swap stays `UNKNOWN`.
+#[tokio::test]
+async fn preview_enriches_quality_band_from_recorded_judge_outcome() {
+    // A band store with a Degraded outcome recorded for gpt-4o → gpt-4o-mini.
+    let store = Arc::new(InMemoryJudgeBandStore::new());
+    store
+        .record(JudgeOutcome {
+            org_id: Uuid::now_v7(),
+            route_id: Some(Uuid::now_v7()),
+            requested_model: "gpt-4o".into(),
+            served_model: "gpt-4o-mini".into(),
+            score: SampleScore {
+                request_id: Uuid::now_v7(),
+                verdict: JudgeVerdict::Degraded,
+                reason: "lost nuance".into(),
+            },
+            risk_band: RiskBand::High,
+        })
+        .await;
+
+    // Minimal authed app with the SAME store wired as sink + read-side.
+    let registry = ProviderRegistry::new();
+    let raw_store = InMemoryKeyStore::new();
+    let org_id = Uuid::now_v7();
+    let audit = InMemoryAuditWriter::new();
+    let plaintext = issue(
+        &raw_store,
+        &audit,
+        org_id,
+        "k",
+        Environment::Live,
+        Actor::System,
+    )
+    .await
+    .unwrap()
+    .plaintext;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
+
+    let config = JudgeConfig {
+        enabled: true,
+        sample_rate: 1.0,
+        judge_model: JUDGE_MODEL.to_string(),
+    };
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_quality_judge_band_store(store, config),
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/preview")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {plaintext}"))
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hello world"}],
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let suggestions = body["route_suggestions"]
+        .as_array()
+        .expect("route_suggestions array");
+    let mini = suggestions
+        .iter()
+        .find(|s| s["model"] == "gpt-4o-mini")
+        .expect("preview should suggest gpt-4o-mini for a gpt-4o chat request");
+    // Judged swap → lifted off UNKNOWN to the recorded HIGH band.
+    assert_eq!(
+        mini["quality_risk_band"], "HIGH",
+        "judged swap band must be populated from the recorded outcome"
+    );
+    // Any OTHER (unjudged) suggestion stays honestly UNKNOWN.
+    for s in suggestions {
+        if s["model"] != "gpt-4o-mini" {
+            assert_eq!(
+                s["quality_risk_band"], "UNKNOWN",
+                "unjudged swap must stay UNKNOWN"
+            );
+        }
+    }
 }

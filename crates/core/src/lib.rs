@@ -26,8 +26,8 @@ pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use middleware::retrieval::RetrievalState;
 pub use quality_sample::{
-    risk_band_to_preview, spawn_quality_judge, GatewayLlmJudge, JudgeConfig, JudgeOutcome,
-    JudgeSink, JudgeTaskClass, QualityJudgeJob, ReferenceSource,
+    risk_band_to_preview, spawn_quality_judge, GatewayLlmJudge, InMemoryJudgeBandStore,
+    JudgeConfig, JudgeOutcome, JudgeSink, JudgeTaskClass, QualityJudgeJob, ReferenceSource,
 };
 pub use registry::{register_providers, ProviderRegistry, ProvidersConfig};
 pub use retry::{with_retry, RetryPolicy};

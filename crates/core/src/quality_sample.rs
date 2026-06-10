@@ -158,6 +158,107 @@ pub trait JudgeSink: Send + Sync {
     async fn record(&self, outcome: JudgeOutcome);
 }
 
+/// Running verdict tally for one `(requested_model → served_model)` swap.
+/// Aggregation mirrors `tt_plan_core::score_quality`: `degraded_pct` is computed
+/// over *classified* (non-`Unclear`) samples and fed to
+/// [`RiskBand::from_degraded_pct`], so a single `Degraded` in a large acceptable
+/// set is `Low`, not `High`.
+#[derive(Debug, Clone, Copy, Default)]
+struct VerdictTally {
+    acceptable: u64,
+    degraded: u64,
+    unclear: u64,
+}
+
+impl VerdictTally {
+    fn add(&mut self, verdict: JudgeVerdict) {
+        match verdict {
+            JudgeVerdict::Acceptable => self.acceptable += 1,
+            JudgeVerdict::Degraded => self.degraded += 1,
+            JudgeVerdict::Unclear => self.unclear += 1,
+        }
+    }
+
+    /// Aggregate band over the classified samples, or `None` when nothing has
+    /// been classified yet (only `Unclear` verdicts → we genuinely don't know).
+    fn band(self) -> Option<RiskBand> {
+        let classified = self.acceptable + self.degraded;
+        if classified == 0 {
+            return None;
+        }
+        let degraded_pct = self.degraded as f64 / classified as f64 * 100.0;
+        Some(RiskBand::from_degraded_pct(degraded_pct))
+    }
+}
+
+/// An in-process, store-backed [`JudgeSink`] that aggregates judged outcomes per
+/// `(requested_model → served_model)` swap and exposes the aggregate
+/// [`tt_preview::QualityRiskBand`] for suggestion enrichment.
+///
+/// This is the production join the spec asks for: the live judge records into
+/// it (closing the persistence gap), and [`enrich_suggestions`] reads from it
+/// through the `tt_preview` enrichment seam (closing the lookup gap) so a live
+/// judge outcome flows end-to-end into a populated suggestion band — replacing
+/// the hard-coded `Unknown`. It is in-process (per-instance) and bounded by the
+/// distinct swap count; a follow-up can back it with Postgres without changing
+/// the call sites.
+///
+/// **Record only** — it never pauses a route or mutates live routing.
+#[derive(Debug, Default)]
+pub struct InMemoryJudgeBandStore {
+    /// `(requested_model, served_model) → running verdict tally`.
+    tallies: std::sync::Mutex<std::collections::HashMap<(String, String), VerdictTally>>,
+}
+
+impl InMemoryJudgeBandStore {
+    /// Fresh, empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Aggregate [`tt_preview::QualityRiskBand`] for one swap, or `None` when the
+    /// judge has not classified that swap yet (no samples, or only `Unclear`).
+    /// `None` keeps an unjudged swap honestly `Unknown` at the call site.
+    #[must_use]
+    pub fn band_for(
+        &self,
+        requested_model: &str,
+        served_model: &str,
+    ) -> Option<tt_preview::QualityRiskBand> {
+        let key = (requested_model.to_string(), served_model.to_string());
+        let tallies = self.tallies.lock().expect("judge band store poisoned");
+        tallies
+            .get(&key)
+            .copied()
+            .and_then(VerdictTally::band)
+            .map(risk_band_to_preview)
+    }
+
+    /// Enrich `suggestions` (all swaps *from* `requested_model`) in place,
+    /// lifting each from `Unknown` to its judged band where one exists. Joins
+    /// the recorded judge outcomes to the suggestion pill through the
+    /// `tt_preview` enrichment seam.
+    pub fn enrich_suggestions(
+        &self,
+        requested_model: &str,
+        suggestions: &mut [tt_preview::RouteSuggestion],
+    ) {
+        tt_preview::route_suggestions::enrich_with_judged_bands(suggestions, |s| {
+            self.band_for(requested_model, &s.model)
+        });
+    }
+}
+
+#[async_trait]
+impl JudgeSink for InMemoryJudgeBandStore {
+    async fn record(&self, outcome: JudgeOutcome) {
+        let key = (outcome.requested_model, outcome.served_model);
+        let mut tallies = self.tallies.lock().expect("judge band store poisoned");
+        tallies.entry(key).or_default().add(outcome.score.verdict);
+    }
+}
+
 /// Map a plan-core [`RiskBand`] onto the reserved `tt_preview::QualityRiskBand`
 /// hook (currently hard-coded to `Unknown` in `plan_suggest`). This is the
 /// adapter that lets a live judge outcome populate the suggestion pill.
@@ -617,5 +718,116 @@ mod tests {
         assert!(!c.enabled);
         assert!((c.sample_rate - 0.02).abs() < 1e-12);
         assert_eq!(c.judge_model, DEFAULT_JUDGE_MODEL);
+    }
+
+    fn outcome(requested: &str, served: &str, verdict: JudgeVerdict) -> JudgeOutcome {
+        JudgeOutcome {
+            org_id: Uuid::now_v7(),
+            route_id: Some(Uuid::now_v7()),
+            requested_model: requested.to_string(),
+            served_model: served.to_string(),
+            score: SampleScore {
+                request_id: Uuid::now_v7(),
+                verdict,
+                reason: "r".to_string(),
+            },
+            risk_band: risk_band_for_verdict(verdict),
+        }
+    }
+
+    /// Unjudged swap → `None` (caller keeps it `Unknown`).
+    #[tokio::test]
+    async fn band_store_returns_none_for_unjudged_swap() {
+        let store = InMemoryJudgeBandStore::new();
+        assert_eq!(store.band_for("gpt-4o", "gpt-4o-mini"), None);
+    }
+
+    /// A single `Degraded` sample aggregates to `High` for that swap.
+    #[tokio::test]
+    async fn band_store_single_degraded_is_high() {
+        let store = InMemoryJudgeBandStore::new();
+        store
+            .record(outcome("gpt-4o", "gpt-4o-mini", JudgeVerdict::Degraded))
+            .await;
+        assert_eq!(
+            store.band_for("gpt-4o", "gpt-4o-mini"),
+            Some(tt_preview::QualityRiskBand::High)
+        );
+    }
+
+    /// Aggregation matches `score_quality`: one `Degraded` in a large acceptable
+    /// set is `Low` (degraded share ≤ 5%), not `High`.
+    #[tokio::test]
+    async fn band_store_aggregates_degraded_pct_over_classified() {
+        let store = InMemoryJudgeBandStore::new();
+        for _ in 0..30 {
+            store
+                .record(outcome("gpt-4o", "gpt-4o-mini", JudgeVerdict::Acceptable))
+                .await;
+        }
+        store
+            .record(outcome("gpt-4o", "gpt-4o-mini", JudgeVerdict::Degraded))
+            .await;
+        // 1 / 31 ≈ 3.2% degraded → Low.
+        assert_eq!(
+            store.band_for("gpt-4o", "gpt-4o-mini"),
+            Some(tt_preview::QualityRiskBand::Low)
+        );
+    }
+
+    /// Only-`Unclear` samples stay `None` (genuinely unknown), and `Unclear` is
+    /// excluded from the degraded denominator.
+    #[tokio::test]
+    async fn band_store_only_unclear_is_none() {
+        let store = InMemoryJudgeBandStore::new();
+        store
+            .record(outcome("gpt-4o", "gpt-4o-mini", JudgeVerdict::Unclear))
+            .await;
+        assert_eq!(store.band_for("gpt-4o", "gpt-4o-mini"), None);
+    }
+
+    /// End-to-end join: a recorded outcome flows through the enrichment seam to
+    /// populate the suggestion band, replacing the hard-coded `Unknown`. An
+    /// unjudged swap in the same batch stays `Unknown`.
+    #[tokio::test]
+    async fn band_store_enriches_suggestions_through_seam() {
+        let store = InMemoryJudgeBandStore::new();
+        store
+            .record(outcome("gpt-4o", "gpt-4o-mini", JudgeVerdict::Degraded))
+            .await;
+
+        let mut suggestions = vec![
+            tt_preview::RouteSuggestion {
+                route: "swap-to-gpt-4o-mini".into(),
+                model: "gpt-4o-mini".into(),
+                cost_usd: 0.001,
+                savings_usd: 0.01,
+                quality_risk_band: tt_preview::QualityRiskBand::Unknown,
+                rationale: "x".into(),
+                applicable: true,
+            },
+            tt_preview::RouteSuggestion {
+                route: "swap-to-haiku".into(),
+                model: "claude-haiku-4-5".into(),
+                cost_usd: 0.001,
+                savings_usd: 0.01,
+                quality_risk_band: tt_preview::QualityRiskBand::Unknown,
+                rationale: "x".into(),
+                applicable: true,
+            },
+        ];
+
+        store.enrich_suggestions("gpt-4o", &mut suggestions);
+
+        // Judged swap → lifted to High.
+        assert_eq!(
+            suggestions[0].quality_risk_band,
+            tt_preview::QualityRiskBand::High
+        );
+        // Unjudged swap → stays honestly Unknown.
+        assert_eq!(
+            suggestions[1].quality_risk_band,
+            tt_preview::QualityRiskBand::Unknown
+        );
     }
 }
