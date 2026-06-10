@@ -74,6 +74,11 @@ opentelemetry-otlp = { version = "0.26", default-features = false, features = [
     "reqwest-client",
     "reqwest-rustls",
 ] }
+# `HeaderExtractor` adapter so the gateway can extract an inbound W3C
+# `traceparent` from request headers (crates/core/src/middleware/trace.rs).
+# Already in the tree transitively via opentelemetry-otlp; pinned here so the
+# direct use is explicit.
+opentelemetry-http = "0.26"
 
 # Crypto + auth
 argon2 = "0.5"

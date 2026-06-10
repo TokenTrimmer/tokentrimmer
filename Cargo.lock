@@ -2934,6 +2934,7 @@ version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2c627d9f4c9cdc1f21a29ee4bfbd6028fcb8bcf2a857b43f3abdf72c9c862f3"
 dependencies = [
+ "async-std",
  "async-trait",
  "futures-channel",
  "futures-executor",
@@ -5362,6 +5363,9 @@ dependencies = [
  "hyper 1.9.0",
  "metrics",
  "metrics-exporter-prometheus",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry_sdk",
  "rand_core 0.6.4",
  "reqwest",
  "serde",
@@ -5372,6 +5376,8 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "tt-auth",
  "tt-cache",
  "tt-config",

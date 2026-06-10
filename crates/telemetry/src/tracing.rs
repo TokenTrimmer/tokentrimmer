@@ -12,16 +12,21 @@
 //! types; this is not a tonic-free build.) Spans are exported in the background
 //! via a batch span processor (tokio runtime).
 //!
-//! ## Scope: export only, not cross-service propagation
+//! ## Scope: export + inbound ingest (not outbound propagation)
 //!
 //! This module exports *locally generated* spans over OTLP. It does **not**
-//! install a [`TextMapPropagator`], so W3C `traceparent` headers are neither
-//! emitted on outbound requests nor honoured on inbound ones — the request
-//! middleware mints its own trace-id. Wiring cross-service W3C propagation
-//! (inbound `traceparent` ingest + a `TraceContextPropagator`) is tracked
-//! separately and is intentionally out of scope here.
+//! install a global [`TextMapPropagator`], so this module never *emits* a
+//! `traceparent` on outbound requests.
+//!
+//! Inbound W3C `traceparent` **ingest** is wired separately, at the gateway's
+//! request-entry middleware: it extracts the inbound trace context via
+//! [`crate::propagation::extract_remote_parent`] (a [`TraceContextPropagator`])
+//! and parents the request span on the caller's trace, so an existing
+//! distributed trace flows through the gateway. When no `traceparent` is
+//! present the middleware mints a fresh root with its own trace-id, as before.
 //!
 //! [`TextMapPropagator`]: opentelemetry::propagation::TextMapPropagator
+//! [`TraceContextPropagator`]: opentelemetry_sdk::propagation::TraceContextPropagator
 
 use std::env;
 use std::time::Duration;
@@ -180,10 +185,11 @@ pub fn init(service_name: &str) -> Result<TracingGuard, TracingError> {
 
     if let Some(ref p) = provider {
         // Register the provider globally so direct `opentelemetry::global`
-        // tracer lookups resolve to it. NOTE: this does not enable W3C
-        // `traceparent` propagation — that needs a `TextMapPropagator`
-        // (`set_text_map_propagator`), which we deliberately do not install
-        // here (see the module-level "Scope" note).
+        // tracer lookups resolve to it. NOTE: this does not install a *global*
+        // `TextMapPropagator`, so we never emit `traceparent` on outbound
+        // requests. Inbound `traceparent` ingest is handled explicitly at the
+        // gateway request middleware via `crate::propagation` (see the
+        // module-level "Scope" note).
         opentelemetry::global::set_tracer_provider(p.clone());
         tracing::info!(service = service_name, "OTLP span exporter active");
     }
