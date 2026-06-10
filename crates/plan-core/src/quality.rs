@@ -89,9 +89,15 @@ impl JudgeVerdict {
     /// for an unclassified verdict.
     ///
     /// This is the per-request number surfaced on the
-    /// `x-tokentrimmer-quality-score` header / telemetry attribute when a judge
-    /// actually ran; the cloud averages these into the "Quality preserved %"
-    /// headline beside the Saved card.
+    /// `tokentrimmer.quality.score` telemetry attribute when a judge actually
+    /// ran; the attribute is *omitted* for `Unclear` (the `None` case).
+    ///
+    /// The canonical "Quality preserved %" headline is computed by
+    /// [`quality_preserved_summary`] — the single source of truth the cloud
+    /// should call. Because `Unclear` returns `None` here and the attribute is
+    /// omitted, averaging the emitted per-request scores yields the same number;
+    /// even so, prefer [`quality_preserved_summary`] so `n` and the `band` stay
+    /// consistent with the headline.
     #[must_use]
     pub fn quality_score(self) -> Option<f64> {
         match self {

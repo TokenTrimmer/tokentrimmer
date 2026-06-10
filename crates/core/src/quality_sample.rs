@@ -296,9 +296,10 @@ pub fn verdict_str(verdict: JudgeVerdict) -> &'static str {
 }
 
 /// Lowercase wire string for a risk band (`low` / `medium` / `high`), matching
-/// the `tt_plan_core::RiskBand` serde representation. Used on the
-/// `tokentrimmer.quality.band` telemetry attribute / `x-tokentrimmer-quality-band`
-/// header.
+/// the `tt_plan_core::RiskBand` serde representation. Emitted on the
+/// `tokentrimmer.quality.band` telemetry attribute (the live surface; the
+/// `x-tokentrimmer-quality-band` header name is reserved but not emitted because
+/// the verdict is produced asynchronously after the response is built).
 #[must_use]
 pub fn band_str(band: RiskBand) -> &'static str {
     match band {
@@ -609,8 +610,10 @@ async fn run_job(job: QualityJudgeJob) -> Result<(), QualityError> {
 /// Stamp the per-request quality verdict onto the current (judge-task) span via
 /// the telemetry crate, using the same per-request values recorded into the
 /// sink. The score is the classified verdict's `[0, 1]` value; an `Unclear`
-/// verdict has no valence, so it surfaces as the band/verdict only (the score
-/// falls back to the "preserved" default rather than fabricating a degradation).
+/// verdict has no valence, so `quality_score()` is `None` and the score
+/// attribute is omitted (band/verdict still surface) rather than fabricating a
+/// "preserved" score — keeping the emitted per-request scores consistent with
+/// `quality_preserved_summary`, which drops `Unclear` from its denominator.
 fn record_quality_verdict_telemetry(
     request_id: Uuid,
     requested_model: &str,
@@ -624,7 +627,7 @@ fn record_quality_verdict_telemetry(
             request_id: &request_id.to_string(),
             requested_model,
             served_model,
-            score: tt_plan_core::quality_score_for_verdict(verdict),
+            score: verdict.quality_score(),
             band: band_str(risk_band),
             verdict: verdict_str(verdict),
         },
@@ -1059,6 +1062,32 @@ mod tests {
         assert_eq!(
             attrs.get("tokentrimmer.quality.band"),
             Some(&Value::String("high".into()))
+        );
+    }
+
+    /// An Unclear verdict was judged, so it surfaces `band` + `verdict`, but it
+    /// has no valence — the `score` attribute is OMITTED rather than defaulted to
+    /// a "preserved" `1.0`. This keeps the emitted per-request scores consistent
+    /// with `quality_preserved_summary`, which drops `Unclear` from its
+    /// denominator (an emitted `1.0` would inflate an averaged headline).
+    #[test]
+    fn unclear_request_omits_score_but_records_band_and_verdict() {
+        let job = job_with(ReferenceSource::Ready("reference".to_string()), "unclear");
+        let attrs = capture_judge_span_attributes(|| async move {
+            run_job(job).await.expect("run_job ok");
+        });
+        assert!(
+            !attrs.contains_key("tokentrimmer.quality.score"),
+            "unclear verdict has no valence → score attribute must be omitted"
+        );
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.verdict"),
+            Some(&Value::String("unclear".into()))
+        );
+        // Band still surfaces (the judge ran), so the sample is visible.
+        assert!(
+            attrs.contains_key("tokentrimmer.quality.band"),
+            "a judged unclear request still records its band"
         );
     }
 

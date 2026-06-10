@@ -78,22 +78,37 @@ pub const TT_QUALITY_REQUESTED_MODEL: &str = "tokentrimmer.quality.requested_mod
 /// `tokentrimmer.quality.served_model` — served (cheaper) model whose quality was judged.
 pub const TT_QUALITY_SERVED_MODEL: &str = "tokentrimmer.quality.served_model";
 /// `tokentrimmer.quality.score` — per-request quality score in `[0, 1]`
-/// (`1.0` = preserved, `0.0` = degraded). Mirrors [`HEADER_QUALITY_SCORE`].
+/// (`1.0` = preserved, `0.0` = degraded). **Omitted for an `unclear` verdict**
+/// (no valence) so averaging the emitted scores matches
+/// `quality_preserved_summary`. This is the live wire surface for the score;
+/// [`HEADER_QUALITY_SCORE`] is a reserved (not-yet-emitted) header name.
 pub const TT_QUALITY_SCORE: &str = "tokentrimmer.quality.score";
 /// `tokentrimmer.quality.band` — `low` / `medium` / `high` risk band for the
-/// judged sample. Mirrors [`HEADER_QUALITY_BAND`].
+/// judged sample. Live wire surface for the band; [`HEADER_QUALITY_BAND`] is a
+/// reserved (not-yet-emitted) header name.
 pub const TT_QUALITY_BAND: &str = "tokentrimmer.quality.band";
 /// `tokentrimmer.quality.verdict` — raw judge verdict (`acceptable` / `degraded`
 /// / `unclear`).
 pub const TT_QUALITY_VERDICT: &str = "tokentrimmer.quality.verdict";
 
-/// Response/telemetry header carrying the per-request quality score in `[0, 1]`.
-/// Emitted only when a judge actually ran (sampled); follows the existing
-/// `x-tokentrimmer-*` header convention so the hosted side ingests + aggregates
-/// it the same way it ingests the cost headers.
+/// **Reserved** wire name for a per-request quality score header in `[0, 1]`,
+/// following the existing `x-tokentrimmer-*` header convention.
+///
+/// Nothing currently attaches this header to a response. The judge runs
+/// asynchronously *after* the HTTP response is built (see
+/// [`record_quality_verdict`]), so the verdict does not exist at
+/// response-header time — the live surface for the score is the
+/// [`TT_QUALITY_SCORE`] (`tokentrimmer.quality.*`) span attribute on the
+/// detached judge task's span, which the hosted side ingests. This name is held
+/// for a future *synchronous* surface (e.g. a blocking inline judge) that could
+/// stamp the verdict on the response itself; until then, consumers must read the
+/// span attribute, not this header.
 pub const HEADER_QUALITY_SCORE: &str = "x-tokentrimmer-quality-score";
-/// Response/telemetry header carrying the per-request quality band
-/// (`low` / `medium` / `high`). Companion to [`HEADER_QUALITY_SCORE`].
+/// **Reserved** wire name for a per-request quality band header
+/// (`low` / `medium` / `high`). Companion to [`HEADER_QUALITY_SCORE`]; like it,
+/// nothing emits this header today (the verdict is async — see
+/// [`HEADER_QUALITY_SCORE`]). The live surface for the band is the
+/// [`TT_QUALITY_BAND`] span attribute.
 pub const HEADER_QUALITY_BAND: &str = "x-tokentrimmer-quality-band";
 
 /// Map a TokenTrimmer provider id to the OpenTelemetry `gen_ai.system` /
@@ -216,9 +231,11 @@ pub fn record_request_attributes(span: &Span, attrs: &RequestSpanAttributes<'_>)
 ///
 /// This is the telemetry shape of the sampled quality judge's per-request
 /// outcome. `score` is the per-request quality in `[0, 1]` (`1.0` preserved /
-/// `0.0` degraded), `band` is `low`/`medium`/`high`, and `verdict` is the raw
-/// judge verdict (`acceptable`/`degraded`/`unclear`). The gateway maps its
-/// `tt_plan_core` verdict into this struct, mirroring how [`RequestSpanCost`]
+/// `0.0` degraded) for a *classified* verdict, or `None` for `unclear` — an
+/// unclassified verdict has no valence, so the score attribute is omitted rather
+/// than defaulted (see below). `band` is `low`/`medium`/`high`, and `verdict` is
+/// the raw judge verdict (`acceptable`/`degraded`/`unclear`). The gateway maps
+/// its `tt_plan_core` verdict into this struct, mirroring how [`RequestSpanCost`]
 /// is mapped from the gateway's `CostBreakdown`.
 #[derive(Debug, Clone, Copy)]
 pub struct QualityVerdictAttributes<'a> {
@@ -229,7 +246,13 @@ pub struct QualityVerdictAttributes<'a> {
     /// Served (cheaper) model whose quality was judged → `tokentrimmer.quality.served_model`.
     pub served_model: &'a str,
     /// Per-request quality score in `[0, 1]` → `tokentrimmer.quality.score`.
-    pub score: f64,
+    /// `None` for an `unclear` verdict: the attribute is then **omitted** so a
+    /// consumer that averages the emitted per-request scores gets the same
+    /// headline as `tt_plan_core::quality_preserved_summary`, which likewise
+    /// drops `unclear` from the preserved denominator. Never default this to a
+    /// number for `unclear` — that would count an unclassified sample as fully
+    /// preserved and diverge from the canonical aggregation.
+    pub score: Option<f64>,
     /// Risk band (`low`/`medium`/`high`) → `tokentrimmer.quality.band`.
     pub band: &'a str,
     /// Raw judge verdict (`acceptable`/`degraded`/`unclear`) → `tokentrimmer.quality.verdict`.
@@ -255,7 +278,12 @@ pub fn record_quality_verdict(span: &Span, attrs: &QualityVerdictAttributes<'_>)
         attrs.requested_model.to_string(),
     );
     span.set_attribute(TT_QUALITY_SERVED_MODEL, attrs.served_model.to_string());
-    span.set_attribute(TT_QUALITY_SCORE, attrs.score);
+    // Omit the score for an `unclear` verdict (`None`): it has no valence, so
+    // emitting a number would let a consumer average it in as if preserved,
+    // diverging from `quality_preserved_summary` (which drops `unclear`).
+    if let Some(score) = attrs.score {
+        span.set_attribute(TT_QUALITY_SCORE, score);
+    }
     span.set_attribute(TT_QUALITY_BAND, attrs.band.to_string());
     span.set_attribute(TT_QUALITY_VERDICT, attrs.verdict.to_string());
 }
@@ -380,7 +408,7 @@ mod tests {
                     request_id: "11111111-1111-1111-1111-111111111111",
                     requested_model: "gpt-4o",
                     served_model: "gpt-4o-mini",
-                    score: 1.0,
+                    score: Some(1.0),
                     band: "low",
                     verdict: "acceptable",
                 },
@@ -409,6 +437,40 @@ mod tests {
         assert_eq!(
             attrs.get(TT_QUALITY_VERDICT),
             Some(&Value::String("acceptable".into()))
+        );
+    }
+
+    /// An `unclear` verdict carries no `score` (`None`), so the
+    /// `tokentrimmer.quality.score` attribute is omitted — band/verdict still
+    /// surface. This keeps averaging the emitted scores aligned with
+    /// `quality_preserved_summary`, which drops `unclear` from its denominator.
+    #[test]
+    fn unclear_verdict_omits_score_attribute() {
+        let attrs = capture_attributes(|span| {
+            record_quality_verdict(
+                span,
+                &QualityVerdictAttributes {
+                    request_id: "22222222-2222-2222-2222-222222222222",
+                    requested_model: "gpt-4o",
+                    served_model: "gpt-4o-mini",
+                    score: None,
+                    band: "low",
+                    verdict: "unclear",
+                },
+            );
+        });
+
+        assert!(
+            !attrs.contains_key(TT_QUALITY_SCORE),
+            "score attribute must be omitted for an unclear verdict"
+        );
+        assert_eq!(
+            attrs.get(TT_QUALITY_BAND),
+            Some(&Value::String("low".into()))
+        );
+        assert_eq!(
+            attrs.get(TT_QUALITY_VERDICT),
+            Some(&Value::String("unclear".into()))
         );
     }
 
