@@ -878,16 +878,31 @@ fn resolve_gateway_bind(
     }
 }
 
+/// Opt-in env var that re-enables the process-env credential fallback behind
+/// the Postgres store (see [`tt_auth::ALLOW_ENV_CREDENTIAL_FALLBACK_VAR`]).
+const ALLOW_ENV_CREDENTIAL_FALLBACK_VAR: &str = tt_auth::ALLOW_ENV_CREDENTIAL_FALLBACK_VAR;
+
 /// Build the provider credential store for the gateway.
 ///
-/// With a DB pool: Postgres primary (when `TT_MASTER_KEY` is valid) chained
-/// onto the env fallback — unchanged DB-backed behavior. Without a DB pool
-/// there is no key store, so nothing can verify callers, and the operator's
-/// env provider keys (`OPENAI_API_KEY`, …) must never be served: no
-/// credential store is wired at all, which makes the chat handler fall back
-/// to forwarding the caller's own Bearer key upstream.
+/// * No DB pool → there is no key store, nothing can verify callers, and the
+///   operator's env provider keys (`OPENAI_API_KEY`, …) must never be served:
+///   no credential store is wired at all, which makes the chat handler fall
+///   back to forwarding the caller's own Bearer key upstream (dev mode,
+///   loopback-guarded at boot).
+/// * DB pool + valid `TT_MASTER_KEY` → the per-org Postgres store, **BYO-only
+///   by default** (P0 #9): an org with no stored credential for a provider
+///   gets an actionable `missing_provider_credential` error — it never
+///   silently rides the operator's env keys (provider-ToS / resale and
+///   surprise-spend exposure on the hosted gateway). Setting
+///   `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` chains the env store behind
+///   Postgres for single-tenant self-host / dogfood deployments.
+/// * DB pool + missing/bad `TT_MASTER_KEY` → fail closed (no credential
+///   store; verified orgs cannot resolve upstream credentials) unless the env
+///   fallback is explicitly opted in, which restores the env-only dogfood
+///   mode.
 fn build_credential_store(
     db_pool: Option<&sqlx::PgPool>,
+    allow_env_fallback: bool,
 ) -> Option<Arc<dyn tt_auth::ProviderCredentialStore>> {
     let pool = match db_pool {
         Some(pool) => pool,
@@ -900,20 +915,45 @@ fn build_credential_store(
             return None;
         }
     };
-    let env_store = tt_auth::EnvProviderCredentialStore::new();
     match tt_auth::postgres::PostgresProviderCredentialStore::from_env(pool.clone()) {
-        Ok(pg) => {
-            tracing::info!("provider credentials: Postgres primary + env fallback");
+        Ok(pg) if allow_env_fallback => {
+            tracing::warn!(
+                "provider credentials: Postgres primary + process-env fallback \
+                 ({ALLOW_ENV_CREDENTIAL_FALLBACK_VAR}=1). Single-tenant/self-host only — every \
+                 org without a stored credential is served the operator's env provider keys"
+            );
             Some(Arc::new(tt_auth::ChainedProviderCredentialStore::new(
-                pg, env_store,
+                pg,
+                tt_auth::EnvProviderCredentialStore::new(),
             )))
         }
-        Err(e) => {
+        Ok(pg) => {
+            tracing::info!(
+                "provider credentials: Postgres only (BYO-only). Orgs without a stored \
+                 credential get `missing_provider_credential`; set \
+                 {ALLOW_ENV_CREDENTIAL_FALLBACK_VAR}=1 to re-enable the process-env fallback \
+                 for single-tenant/dogfood deployments"
+            );
+            Some(Arc::new(pg))
+        }
+        Err(e) if allow_env_fallback => {
             tracing::warn!(
                 error = %e,
-                "Postgres credential store unavailable (TT_MASTER_KEY missing / bad); env-only"
+                "Postgres credential store unavailable (TT_MASTER_KEY missing / bad); serving \
+                 env-only provider credentials ({ALLOW_ENV_CREDENTIAL_FALLBACK_VAR}=1)"
             );
-            Some(Arc::new(env_store))
+            Some(Arc::new(tt_auth::EnvProviderCredentialStore::new()))
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Postgres credential store unavailable (TT_MASTER_KEY missing / bad) and \
+                 {ALLOW_ENV_CREDENTIAL_FALLBACK_VAR} is not set — wiring NO credential store. \
+                 Operator env provider keys are never served; verified orgs cannot resolve \
+                 upstream credentials until TT_MASTER_KEY is fixed (or, for single-tenant \
+                 deployments, the env fallback is explicitly opted in)"
+            );
+            None
         }
     }
 }
@@ -1041,17 +1081,21 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         }
     }
 
-    // Provider credentials: chained store — Postgres primary (when DB +
-    // `TT_MASTER_KEY` are configured), env-backed fallback (single-tenant
-    // dogfooding from the operator's own `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
-    // / etc. in Fly secrets). The chain means org-specific credentials win,
-    // and orgs that haven't onboarded yet fall back to the operator's keys.
+    // Provider credentials: Postgres per-org store (when DB + `TT_MASTER_KEY`
+    // are configured), BYO-only by default — an org that hasn't onboarded a
+    // provider credential gets `missing_provider_credential`, never the
+    // operator's env keys (P0 #9). Setting TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1
+    // chains the env-backed fallback (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` /
+    // … in Fly secrets) behind Postgres for single-tenant dogfooding.
     //
     // SECURITY: without a DB pool there is no key store either, so callers
     // can't be verified — `build_credential_store` then wires NO store, so the
     // operator's env keys are unreachable and requests fall back to the
     // caller's own Bearer key (P0 #21 fail-closed).
-    if let Some(credential_store) = build_credential_store(db_pool.as_ref()) {
+    if let Some(credential_store) = build_credential_store(
+        db_pool.as_ref(),
+        tt_auth::env_credential_fallback_opted_in(),
+    ) {
         state = state.with_credential_store(credential_store);
     }
 
@@ -1298,13 +1342,128 @@ mod gateway_fail_closed_tests {
 
     // -- credential-store wiring ------------------------------------------------
 
+    /// Process-wide lock serializing the credential-wiring tests that mutate
+    /// `TT_MASTER_KEY` / `OPENAI_API_KEY` so they can't race each other in the
+    /// multi-threaded test runner. (Same pattern as the `routes::chat`
+    /// credential tests in tt-core.)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn no_db_pool_wires_no_credential_store() {
         // Without a key store nothing can verify callers, so the operator's
         // env provider keys (OPENAI_API_KEY, …) must be unreachable: no
         // credential store at all → the chat handler falls back to forwarding
-        // the caller's own Bearer key upstream.
-        assert!(build_credential_store(None).is_none());
+        // the caller's own Bearer key upstream. The env-fallback opt-in makes
+        // no difference without a DB pool — (c) no-DB dev mode is unchanged.
+        assert!(build_credential_store(None, false).is_none());
+        assert!(build_credential_store(None, true).is_none());
+    }
+
+    /// With a DB pool but a missing/bad `TT_MASTER_KEY`, the env-only dogfood
+    /// store exists ONLY behind the explicit opt-in; by default the gateway
+    /// fails closed with no credential store, so the operator's env keys are
+    /// structurally unreachable.
+    // The lock is held across awaits on purpose: only other test threads ever
+    // contend it, so there is no deadlock risk (same pattern as tt-core's
+    // credential tests).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn bad_master_key_env_only_store_requires_opt_in() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("TT_MASTER_KEY"); // Postgres store init fails
+        std::env::set_var("OPENAI_API_KEY", "sk-operator-env");
+
+        // Lazy pool: never connected — the env-only store ignores it and the
+        // fail-closed branch returns before any query.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .expect("lazy pool");
+
+        // Default (no opt-in): NO store — env keys unreachable.
+        let fail_closed = build_credential_store(Some(&pool), false);
+
+        // Explicit opt-in: env-only store serves the operator's env key.
+        let env_only = build_credential_store(Some(&pool), true).expect("env-only store");
+        let got = env_only
+            .get(uuid::Uuid::nil(), "openai")
+            .await
+            .expect("env get");
+
+        // Clean up BEFORE asserting so a failed assert can't leak env state.
+        std::env::remove_var("OPENAI_API_KEY");
+
+        assert!(
+            fail_closed.is_none(),
+            "bad TT_MASTER_KEY without the opt-in must wire NO credential store"
+        );
+        let got = got.expect("opt-in env fallback must serve the env key");
+        assert_eq!(got.api_key.expose(), "sk-operator-env");
+    }
+
+    /// BYO-only against a REAL Postgres: with a valid `TT_MASTER_KEY`,
+    /// (a) the default wiring is Postgres-only — an org with no stored
+    /// credential resolves NOTHING even though `OPENAI_API_KEY` is set in the
+    /// process env (env never consulted); (b) the explicit opt-in chains the
+    /// env fallback behind Postgres and serves it.
+    ///
+    /// Run with e.g.:
+    /// `docker run -d --name tt-byo-pg -e POSTGRES_PASSWORD=tt -p 55432:5432 pgvector/pgvector:pg17`
+    /// `TEST_DATABASE_URL=postgres://postgres:tt@localhost:55432/postgres cargo test -p tt-cli -- --include-ignored byo_only`
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL (Postgres; the test creates its own provider_credentials table) — run with --include-ignored"]
+    async fn byo_only_db_wiring_env_fallback_gated_by_opt_in() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        // The provider_credentials schema ships from the cloud repo's
+        // migrations, not this OSS migrator — create the minimal shape the
+        // store queries here.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS provider_credentials (
+                 id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                 org_id uuid NOT NULL,
+                 provider text NOT NULL,
+                 label text NOT NULL DEFAULT '',
+                 secret_enc bytea NOT NULL,
+                 base_url text,
+                 extra_headers jsonb NOT NULL DEFAULT '[]'::jsonb,
+                 created_at timestamptz NOT NULL DEFAULT now(),
+                 rotated_at timestamptz,
+                 UNIQUE (org_id, provider)
+               )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create provider_credentials");
+
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("TT_MASTER_KEY", hex::encode([7u8; 32]));
+        std::env::set_var("OPENAI_API_KEY", "sk-operator-env");
+        let org = uuid::Uuid::now_v7(); // fresh org: no stored credential
+
+        // (a) Default: Postgres-only. Store miss → None; env NOT consulted.
+        let byo_only = build_credential_store(Some(&pool), false).expect("postgres-only store");
+        let got_default = byo_only.get(org, "openai").await.expect("pg get");
+
+        // (b) Opt-in: env fallback chained behind Postgres serves the env key.
+        let chained = build_credential_store(Some(&pool), true).expect("chained store");
+        let got_opt_in = chained.get(org, "openai").await.expect("chained get");
+
+        std::env::remove_var("TT_MASTER_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        assert!(
+            got_default.is_none(),
+            "BYO-only default must NOT serve the operator's env key, got {:?}",
+            got_default.map(|c| c.api_key.expose().to_string())
+        );
+        let got_opt_in = got_opt_in.expect("opt-in env fallback must serve the env key");
+        assert_eq!(got_opt_in.api_key.expose(), "sk-operator-env");
     }
 }
 

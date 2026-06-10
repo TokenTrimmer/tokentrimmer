@@ -39,7 +39,7 @@ with `fly secrets set KEY=value` and read from the Fly runtime environment.
 | `TT_ADMIN_TOKEN` (cloud) | Full admin API access (`/v1/admin/*`). | Rotate immediately; single bearer value, no migration needed. |
 | `FLY_API_TOKEN` | Deploy/destroy infrastructure. | `fly tokens revoke` + issue a new scoped deploy token. |
 | `STRIPE_SECRET_KEY` / webhook signing secret | Billing actions / forged webhooks. | Roll in the Stripe dashboard; update `fly secrets`; re-point the webhook endpoint secret. |
-| Provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) | Spend on your provider bill. | Roll at each provider; update `fly secrets`. These are normally **per-tenant** in `provider_credentials`; a top-level key only exists for dogfooding. |
+| Provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) | Spend on your provider bill. | Roll at each provider; update `fly secrets`. These are normally **per-tenant** in `provider_credentials`; a top-level key only exists for dogfooding and is only ever served when `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` is set explicitly (the gateway is BYO-only by default). |
 
 ## `TT_MASTER_KEY` rotation (re-encryption)
 

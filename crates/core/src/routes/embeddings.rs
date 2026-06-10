@@ -125,7 +125,21 @@ pub async fn handler(
         None => (Uuid::nil(), Uuid::nil()),
     };
     let source_provider_id = provider.id().to_string();
-    let credentials = resolve_credentials(&state, org_id, provider.id(), &raw_bearer).await;
+    // BYO-only (P0 #9): `None` means a VERIFIED org has no stored credential
+    // for the source provider. Deferred like chat.rs — routing below may
+    // rewrite to a provider the org HAS onboarded (the cross-provider
+    // re-resolve fails closed on its own); the guard after the pin block
+    // errors only when the serving provider still needs the missing source
+    // credential. Until then the raw bearer is an inert placeholder.
+    let resolved_source_creds =
+        resolve_credentials(&state, org_id, provider.id(), &raw_bearer).await;
+    let source_creds_missing = resolved_source_creds.is_none();
+    let credentials =
+        resolved_source_creds.unwrap_or_else(|| tt_shared::context::ProviderCredentials {
+            api_key: tt_shared::context::SecretString::new(raw_bearer.clone()),
+            base_url: None,
+            extra_headers: Vec::new(),
+        });
     let mut ctx = RequestContext {
         trace_id,
         org_id,
@@ -204,6 +218,18 @@ pub async fn handler(
     provider = pinned_provider;
     if let Some(c) = pin_creds {
         ctx.credentials = c;
+    }
+
+    // BYO-only (P0 #9): same dispatch-time guard as chat.rs — the serving
+    // provider is still the source provider and the verified org has no
+    // stored credential for it → actionable 400 instead of forwarding the
+    // org's TokenTrimmer key upstream. Cross-provider rewrites and pins
+    // re-resolve + fail closed above; anonymous / no-store callers never set
+    // `source_creds_missing`.
+    if source_creds_missing && provider_pin.is_none() && provider.id() == source_provider_id {
+        return Err(ApiError::MissingProviderCredential {
+            provider: source_provider_id.clone(),
+        });
     }
 
     // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header,

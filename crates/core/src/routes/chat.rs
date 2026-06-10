@@ -143,7 +143,8 @@ pub(crate) fn timeout_ms_from_header(headers: &HeaderMap) -> Option<u64> {
 /// # Errors
 /// - [`ApiError::InvalidRequest`] if `pinned_id` is not a known provider id.
 /// - [`ApiError::MissingProviderCredential`] if a cross-provider pin has no
-///   stored credential.
+///   stored credential, or (BYO-only, P0 #9) if a pin to the source provider
+///   finds no stored credential for a verified org.
 pub(crate) async fn apply_provider_override(
     state: &AppState,
     pinned_id: Option<&str>,
@@ -167,7 +168,11 @@ pub(crate) async fn apply_provider_override(
     // pins require the target's stored credential and fail closed; a pin to the
     // source provider resolves source credentials (bearer fallback OK).
     let creds = if pinned.id() == source_provider_id {
-        resolve_credentials(state, org_id, source_provider_id, raw_bearer).await
+        resolve_credentials(state, org_id, source_provider_id, raw_bearer)
+            .await
+            .ok_or_else(|| ApiError::MissingProviderCredential {
+                provider: source_provider_id.to_string(),
+            })?
     } else {
         resolve_credentials_for(state, org_id, pinned.id(), raw_bearer, false)
             .await
@@ -738,7 +743,23 @@ pub async fn handler(
         )
     );
     let source_provider_id = provider.id().to_string();
-    let credentials = resolve_credentials(&state, org_id, provider.id(), &raw_bearer).await;
+    // BYO-only (P0 #9): `None` means a VERIFIED org has no stored credential
+    // for the source provider. The error is deferred rather than raised here —
+    // routing below may rewrite the request to a provider the org HAS
+    // onboarded (the cross-provider re-resolve and the per-candidate failover
+    // map fail closed on their own) — so the guard after pin/failover
+    // resolution returns `missing_provider_credential` only when the serving
+    // provider still needs the missing source credential. Until then
+    // `ctx.credentials` holds the raw bearer as an inert placeholder (the old
+    // legacy value); it is never dispatched on the guarded paths.
+    let resolved_source_creds =
+        resolve_credentials(&state, org_id, provider.id(), &raw_bearer).await;
+    let source_creds_missing = resolved_source_creds.is_none();
+    let credentials = resolved_source_creds.unwrap_or_else(|| ProviderCredentials {
+        api_key: SecretString::new(raw_bearer.clone()),
+        base_url: None,
+        extra_headers: Vec::new(),
+    });
 
     let mut ctx = RequestContext {
         trace_id,
@@ -894,6 +915,7 @@ pub async fn handler(
             }
         }
         let mut map = std::collections::HashMap::new();
+        let had_resolvable_candidates = !provider_ids.is_empty();
         for pid in provider_ids {
             let allow_bearer = pid == source_provider_id;
             if let Some(c) =
@@ -902,8 +924,36 @@ pub async fn handler(
                 map.insert(pid, c);
             }
         }
+        // BYO-only (P0 #9): when NO candidate provider has a resolvable
+        // credential the dispatch loop would skip every candidate and return
+        // an opaque 503 — surface the actionable missing-credential error for
+        // the primary candidate's provider instead. (Candidates whose models
+        // are unknown to the registry keep today's 503.)
+        if had_resolvable_candidates && map.is_empty() {
+            return Err(ApiError::MissingProviderCredential {
+                provider: provider.id().to_string(),
+            });
+        }
         (candidates, map)
     };
+
+    // BYO-only (P0 #9): single-provider dispatch where the serving provider is
+    // still the source provider and the verified org has no stored credential
+    // for it → actionable 400 BEFORE cache lookup and dispatch, instead of
+    // forwarding the org's TokenTrimmer key upstream (a confusing upstream
+    // 401). The other dispatch shapes are already covered: cross-provider
+    // rewrites and pins re-resolve + fail closed above, failover chains skip
+    // per-candidate (or error above when nothing resolves), and anonymous /
+    // no-store callers never set `source_creds_missing`.
+    if source_creds_missing
+        && route_fallbacks.is_empty()
+        && provider_pin.is_none()
+        && provider.id() == source_provider_id
+    {
+        return Err(ApiError::MissingProviderCredential {
+            provider: source_provider_id.clone(),
+        });
+    }
 
     // 2d. Determine cache behaviour for this request (Fix A §2.2 + Fix B §2.7).
     //     Resolved once here so all four call-sites (streaming L1 read,
@@ -2133,33 +2183,38 @@ pub(crate) fn attach_cost_headers(
 ///
 /// 1. The credential store (if configured) — production path: per-org
 ///    upstream key, possibly with `base_url` / `extra_headers`.
-/// 2. The raw Bearer token as a fallback — preserves legacy behavior where
-///    customers pointed their OpenAI SDK at our gateway with their own
-///    upstream key in the `Authorization` header.
+/// 2. The raw Bearer token as a fallback — ONLY for anonymous callers (no
+///    verified org) or when no store is configured: preserves the legacy
+///    BYO-key passthrough where customers pointed their OpenAI SDK at the
+///    gateway with their own upstream key in the `Authorization` header.
 ///
-/// On a store error we log and fall back to the raw Bearer rather than
-/// failing the request: cache and credential lookup are best-effort layers.
+/// Returns `None` exactly when a credential store is configured and a
+/// VERIFIED org has no stored credential for `provider_id` (BYO-only,
+/// P0 #9). The caller must surface that as
+/// [`ApiError::MissingProviderCredential`] — never forward the org's
+/// `tt_live_*` bearer upstream and never substitute an operator key.
 pub(crate) async fn resolve_credentials(
     state: &AppState,
     org_id: Uuid,
     provider_id: &str,
     raw_bearer: &str,
-) -> ProviderCredentials {
-    // Source-provider resolution always allows the raw-Bearer fallback (legacy
-    // BYO-key passthrough). `expect` is safe: allow_bearer_fallback=true never
-    // returns None.
-    resolve_credentials_for(state, org_id, provider_id, raw_bearer, true)
-        .await
-        .expect("bearer fallback yields Some")
+) -> Option<ProviderCredentials> {
+    resolve_credentials_for(state, org_id, provider_id, raw_bearer, true).await
 }
 
 /// Resolve upstream credentials for `provider_id`.
 ///
 /// With a credential store configured (the hosted per-org model), a store hit
 /// wins; on a miss the raw-Bearer fallback applies only when
-/// `allow_bearer_fallback` is true (the source provider's key is its own), so a
-/// cross-provider target with no stored key returns `None` (fail closed — we
-/// must not forward the source key to a different provider).
+/// `allow_bearer_fallback` is true (the source provider's key is its own) AND
+/// the caller is anonymous (`org_id` nil — no verified `ApiKeyContext`). A
+/// verified org's bearer is its TokenTrimmer key, never a valid upstream key,
+/// so a store miss returns `None` and the handler answers with an actionable
+/// `missing_provider_credential` error instead of a confusing upstream 401
+/// (BYO-only, P0 #9 — the operator's env keys are not even in the store
+/// composition unless explicitly opted in at boot). A cross-provider target
+/// with no stored key likewise returns `None` (fail closed — we must not
+/// forward the source key to a different provider).
 ///
 /// With **no** store configured (dev / dogfood / BYO-key passthrough) there is
 /// no per-provider credential model to enforce, so the raw Bearer is forwarded
@@ -2182,9 +2237,14 @@ pub(crate) async fn resolve_credentials_for(
     };
     match store.get(org_id, provider_id).await {
         Ok(Some(c)) => Some(c),
-        Ok(None) if allow_bearer_fallback => Some(bearer()),
+        // Anonymous BYO passthrough only — a verified org's store miss fails
+        // closed (see doc comment).
+        Ok(None) if allow_bearer_fallback && org_id.is_nil() => Some(bearer()),
         Ok(None) => None,
         Err(e) => {
+            // Store ERRORS (DB blip) stay best-effort: log and keep the
+            // legacy bearer fallback. This never serves an operator env key —
+            // only the caller's own bearer.
             tracing::warn!(error = %e, "credential store lookup failed");
             allow_bearer_fallback.then(bearer)
         }
@@ -2758,9 +2818,89 @@ mod credential_resolution_tests {
         std::env::remove_var("OPENAI_API_KEY");
 
         assert!(state.credential_store.is_none(), "no store wired");
+        let got = got.expect("no-store dev mode keeps the bearer passthrough");
         assert_eq!(got.api_key.expose(), "sk-caller-own-key");
         let got_for = got_for.expect("bearer fallback");
         assert_eq!(got_for.api_key.expose(), "sk-caller-own-key");
+    }
+
+    /// No-store dev mode is untouched by BYO-only even for a VERIFIED org
+    /// (e.g. the dogfood org id): without a credential store there is no
+    /// per-provider credential model to enforce, so the bearer passthrough
+    /// keeps working (#106's boot guard already keeps that mode loopback /
+    /// explicitly-opted-in only).
+    #[tokio::test]
+    async fn verified_org_without_store_keeps_bearer_passthrough() {
+        let state = AppState::with_default_providers();
+        let got = resolve_credentials(&state, Uuid::now_v7(), "openai", "sk-own-key")
+            .await
+            .expect("dev-mode passthrough");
+        assert_eq!(got.api_key.expose(), "sk-own-key");
+    }
+
+    /// BYO-only (P0 #9): with a credential store CONFIGURED, a VERIFIED org
+    /// (non-nil `org_id`) that has no stored credential for the provider must
+    /// resolve to `None` — never its own raw bearer (the org's TokenTrimmer
+    /// key, useless upstream) and never an operator env key (which is not in
+    /// the store composition unless the operator opted in at boot).
+    #[tokio::test]
+    async fn verified_org_with_store_but_no_credential_fails_closed() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // Operator env key present in the process — must NOT be served.
+        std::env::set_var("OPENAI_API_KEY", "sk-operator-do-not-serve");
+        let store = tt_auth::credentials::InMemoryProviderCredentialStore::new();
+        let state =
+            AppState::with_default_providers().with_credential_store(std::sync::Arc::new(store));
+        let org = Uuid::now_v7();
+
+        let got_for = resolve_credentials_for(&state, org, "openai", "tt_live_abc123", true).await;
+
+        std::env::remove_var("OPENAI_API_KEY");
+
+        assert!(
+            got_for.is_none(),
+            "verified org + store miss must fail closed (BYO-only), got {:?}",
+            got_for.map(|c| c.api_key.expose().to_string())
+        );
+    }
+
+    /// BYO-only leaves the ANONYMOUS legacy passthrough intact: with a store
+    /// configured, a caller with no verified org (nil `org_id`, e.g. an
+    /// `sk-…` bearer) still forwards their own key upstream.
+    #[tokio::test]
+    async fn anonymous_caller_with_store_keeps_bearer_passthrough() {
+        let store = tt_auth::credentials::InMemoryProviderCredentialStore::new();
+        let state =
+            AppState::with_default_providers().with_credential_store(std::sync::Arc::new(store));
+
+        let got = resolve_credentials_for(&state, Uuid::nil(), "openai", "sk-caller-own-key", true)
+            .await
+            .expect("anonymous BYO passthrough must keep working");
+        assert_eq!(got.api_key.expose(), "sk-caller-own-key");
+    }
+
+    /// A verified org WITH a stored credential resolves it — the BYO-only
+    /// guard only fires on a miss.
+    #[tokio::test]
+    async fn verified_org_with_stored_credential_resolves_it() {
+        let store = tt_auth::credentials::InMemoryProviderCredentialStore::new();
+        let org = Uuid::now_v7();
+        store.insert(
+            org,
+            "openai",
+            ProviderCredentials {
+                api_key: SecretString::new("sk-org-own"),
+                base_url: None,
+                extra_headers: Vec::new(),
+            },
+        );
+        let state =
+            AppState::with_default_providers().with_credential_store(std::sync::Arc::new(store));
+
+        let got = resolve_credentials_for(&state, org, "openai", "tt_live_abc123", true)
+            .await
+            .expect("stored credential");
+        assert_eq!(got.api_key.expose(), "sk-org-own");
     }
 }
 

@@ -22,8 +22,9 @@ pub mod keys;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub use credentials::{
-    ChainedProviderCredentialStore, CredentialError, EnvProviderCredentialStore,
-    InMemoryProviderCredentialStore, ProviderCredentialStore,
+    env_credential_fallback_opted_in, ChainedProviderCredentialStore, CredentialError,
+    EnvProviderCredentialStore, InMemoryProviderCredentialStore, ProviderCredentialStore,
+    ALLOW_ENV_CREDENTIAL_FALLBACK_VAR,
 };
 pub use keys::{
     issue, revoke_key, verify, ApiKey, Environment, InMemoryKeyStore, IssuedKey, KeyError, KeyStore,

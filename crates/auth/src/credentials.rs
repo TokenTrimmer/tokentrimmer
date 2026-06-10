@@ -15,11 +15,16 @@
 //! * [`EnvProviderCredentialStore`] — reads `OPENAI_API_KEY`,
 //!   `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, etc. from process environment.
 //!   Returns the same credential to **every** org, which is what you want
-//!   for single-tenant dogfooding (one team, one set of upstream keys)
-//!   until the cloud-repo dashboard lands a credential-entry UI.
+//!   for single-tenant dogfooding (one team, one set of upstream keys) and
+//!   nothing else: on a hosted/multi-tenant gateway a shared env key lets an
+//!   org that never onboarded its own provider key silently ride — and spend
+//!   on — the operator's keys (provider-ToS / resale exposure). The gateway
+//!   is therefore BYO-only by default when a persistent store is configured,
+//!   and only chains this store behind it when the operator explicitly sets
+//!   [`ALLOW_ENV_CREDENTIAL_FALLBACK_VAR`]`=1`.
 //!
 //! The DB-backed store (XChaCha20-Poly1305 encrypted, `TT_MASTER_KEY` derived
-//! per-row) is `w7-auth-credentials-postgres`, blocked on the cloud repo.
+//! per-row) lives in [`crate::postgres`] behind the `postgres` feature.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,6 +40,25 @@ pub enum CredentialError {
     /// Backing store failed (DB error, lock poisoned, etc.).
     #[error("credential store: {0}")]
     Store(String),
+}
+
+/// Opt-in env var that re-enables serving the operator's process-env provider
+/// keys (`OPENAI_API_KEY`, …) as a fallback behind a persistent (Postgres)
+/// credential store.
+///
+/// OFF by default (P0 #9, BYO-only): on a hosted gateway an org that never
+/// onboarded its own provider key must get an actionable
+/// `missing_provider_credential` error — never silently ride, and spend on,
+/// the operator's keys (provider-ToS / resale and surprise-spend exposure).
+/// Single-tenant self-host / dogfood deployments that knowingly want one
+/// shared set of upstream keys set this to `1`.
+pub const ALLOW_ENV_CREDENTIAL_FALLBACK_VAR: &str = "TT_ALLOW_ENV_CREDENTIAL_FALLBACK";
+
+/// True when the operator has explicitly opted in to the env-credential
+/// fallback by setting [`ALLOW_ENV_CREDENTIAL_FALLBACK_VAR`] to exactly `1`
+/// (same strict opt-in shape as `TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND`).
+pub fn env_credential_fallback_opted_in() -> bool {
+    std::env::var(ALLOW_ENV_CREDENTIAL_FALLBACK_VAR).as_deref() == Ok("1")
 }
 
 /// Lookup + persistence of upstream provider credentials.
@@ -270,10 +294,13 @@ impl<A, B> ChainedProviderCredentialStore<A, B> {
     /// dogfooding (e.g. [`EnvProviderCredentialStore`], which ignores `org_id`
     /// and returns one shared process-env key for ALL orgs). In a HOSTED /
     /// multi-tenant deployment do NOT chain a shared env store — use the
-    /// Postgres store alone and fail closed (the gateway then falls back to the
-    /// customer's own raw Bearer) so one org can't be billed against / exposed
-    /// to another org's shared key. When the fallback serves a credential this
-    /// store logs a one-time warning to surface such a misconfiguration. (§5.10)
+    /// Postgres store alone and fail closed (a verified org with no stored
+    /// credential gets `missing_provider_credential`) so one org can't be
+    /// billed against / exposed to another org's shared key. The gateway only
+    /// builds this composition when the operator explicitly sets
+    /// [`ALLOW_ENV_CREDENTIAL_FALLBACK_VAR`]`=1`. When the fallback serves a
+    /// credential this store logs a one-time warning to surface a
+    /// misconfiguration. (§5.10, P0 #9)
     pub fn new(primary: A, fallback: B) -> Self {
         Self {
             primary,
@@ -313,9 +340,10 @@ where
                 %org_id,
                 provider_id,
                 "provider credential served from the SHARED fallback store (e.g. process env) — \
-                 OK for single-tenant/self-host, but a misconfiguration in a multi-tenant \
-                 deployment (an org billed against / exposed to a shared key). Use Postgres-only \
-                 + fail-closed in hosted mode. (warns once per process)"
+                 OK for single-tenant/self-host ({ALLOW_ENV_CREDENTIAL_FALLBACK_VAR}=1), but a \
+                 misconfiguration in a multi-tenant deployment (an org billed against / exposed \
+                 to a shared key). Use Postgres-only + fail-closed in hosted mode: unset \
+                 {ALLOW_ENV_CREDENTIAL_FALLBACK_VAR}. (warns once per process)"
             );
         }
         Ok(fallback)
@@ -443,6 +471,32 @@ mod tests {
         std::env::set_var("GROQ_API_KEY", "  \n\t ");
         assert!(store.get(Uuid::nil(), "groq").await.unwrap().is_none());
         std::env::remove_var("GROQ_API_KEY");
+    }
+
+    /// Cases combined into ONE test because they share the process env var
+    /// (same pattern as `postgres::tests::from_env_validation`): cargo runs
+    /// tests in parallel and this var is touched nowhere else in this binary.
+    #[test]
+    fn env_fallback_opt_in_requires_exactly_one() {
+        // Unset → no opt-in (the safe default).
+        std::env::remove_var(ALLOW_ENV_CREDENTIAL_FALLBACK_VAR);
+        assert!(!env_credential_fallback_opted_in());
+
+        // Exactly "1" → opted in.
+        std::env::set_var(ALLOW_ENV_CREDENTIAL_FALLBACK_VAR, "1");
+        assert!(env_credential_fallback_opted_in());
+
+        // Anything else must NOT opt in — the risk is shared-key resale, so
+        // sloppy truthiness ("true", "yes") is rejected on purpose.
+        for v in ["0", "true", "yes", "on", "", " 1"] {
+            std::env::set_var(ALLOW_ENV_CREDENTIAL_FALLBACK_VAR, v);
+            assert!(
+                !env_credential_fallback_opted_in(),
+                "{v:?} must not enable the env-credential fallback"
+            );
+        }
+
+        std::env::remove_var(ALLOW_ENV_CREDENTIAL_FALLBACK_VAR);
     }
 
     #[tokio::test]

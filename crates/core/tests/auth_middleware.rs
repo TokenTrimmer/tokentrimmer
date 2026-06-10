@@ -228,6 +228,62 @@ async fn tt_live_invalid_returns_401() {
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
+/// BYO-only (P0 #9): a VERIFIED org with a credential store configured but no
+/// stored credential for the serving provider gets an actionable
+/// `missing_provider_credential` 400 — the gateway must neither forward the
+/// org's TokenTrimmer key upstream nor serve any operator key.
+#[tokio::test]
+async fn tt_live_valid_without_stored_credential_is_actionable_400() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_key = Arc::new(Mutex::new(None));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        last_api_key: Arc::clone(&last_key),
+        calls: Arc::clone(&calls),
+    }));
+
+    let raw_store = InMemoryKeyStore::new();
+    let audit = InMemoryAuditWriter::new();
+    let org_id = Uuid::now_v7();
+    let issued = issue(
+        &raw_store,
+        &audit,
+        org_id,
+        "byo-only",
+        Environment::Live,
+        Actor::System,
+    )
+    .await
+    .expect("issue tt_live_ key");
+
+    // Credential store configured but EMPTY for this org.
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
+    let app = build_app_with_state(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_credential_store(Arc::new(InMemoryProviderCredentialStore::new())),
+    );
+
+    let resp = app
+        .oneshot(chat_request("rec-1", Some(&issued.plaintext)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        v["error"]["code"], "missing_provider_credential",
+        "error must tell the org to add its provider credential, got: {v}"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "provider must never be called"
+    );
+}
+
 #[tokio::test]
 async fn tt_live_valid_substitutes_upstream_credential() {
     let calls = Arc::new(AtomicUsize::new(0));

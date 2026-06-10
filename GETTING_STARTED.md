@@ -32,7 +32,7 @@ Pick the path that matches what you want to do.
 | You want to… | You need |
 |---|---|
 | Use the **hosted** Gateway | A TokenTrimmer API key (`tt_live_…`) from your dashboard. Nothing to install except your existing OpenAI SDK (or our thin SDK). |
-| **Self-host** the Gateway via Docker | Docker. Optionally Postgres + Redis for persistence/caching (the gateway runs without them, in degraded "dev mode"). Provider API keys (e.g. `OPENAI_API_KEY`). |
+| **Self-host** the Gateway via Docker | Docker. Optionally Postgres + Redis for persistence/caching (the gateway runs without them, in degraded "dev mode"). Provider API keys: per-org in the credential store, or callers bring their own as the Bearer token (operator env keys like `OPENAI_API_KEY` are only served behind `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1`). |
 | Use **`tt inspect`**, **`tt plan`**, **`tt init`** locally | The `tt` binary. Build from source (Rust 1.88) or use the Docker image. |
 | **Build from source / contribute** | Rust **1.88** (pinned in `rust-toolchain.toml`; `rustup` auto-installs it). For local end-to-end services: Docker (for `make dev`). |
 
@@ -119,8 +119,10 @@ docker run --rm -p 8080:8080 \
 > passthrough* — anyone who can reach the port can use it, but each caller
 > must supply their **own** upstream provider key as the Bearer token. The
 > operator's `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` env vars are **never**
-> served without a key store. For verified `tt_live_*` keys and per-org
-> provider credentials, set `DATABASE_URL` (and `TT_MASTER_KEY`).
+> served without a key store — and even with one, only behind the explicit
+> `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` opt-in (see the table below). For
+> verified `tt_live_*` keys and per-org provider credentials, set
+> `DATABASE_URL` (and `TT_MASTER_KEY`).
 
 Smoke-test it:
 
@@ -139,8 +141,9 @@ Every external dependency is best-effort: if it's missing or unreachable, the Ga
 | `TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND` | Set to `1` to allow a non-loopback bind **without** a key store (unauthenticated BYO-key passthrough) | A non-loopback `TT_BIND_ADDR` without `DATABASE_URL` refuses to start |
 | `DATABASE_URL` | Postgres: API-key verification, request logs, routing rules, provider-credential store | Runs without persistence; `tt_live_*` keys pass through **unverified** (dev mode), binds loopback by default, and env provider keys are never served |
 | `REDIS_URL` | L1 exact-match cache (use `rediss://` native, **not** an HTTP REST URL) | L1 cache disabled |
-| `TT_MASTER_KEY` | XChaCha20-Poly1305 root key for the Postgres provider-credential store. Generate with `openssl rand -hex 32` | Postgres credential store disabled; provider keys come from env only |
-| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `OPENROUTER_API_KEY` | Upstream provider credentials (single-tenant fallback; only served when `DATABASE_URL` configures a key store) | That provider can't be reached (callers can still pass their own key as the Bearer token) |
+| `TT_MASTER_KEY` | XChaCha20-Poly1305 root key for the Postgres provider-credential store. Generate with `openssl rand -hex 32` | Postgres credential store disabled; **no** provider credentials are served unless `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` restores the env-only dogfood mode |
+| `TT_ALLOW_ENV_CREDENTIAL_FALLBACK` | Set to `1` to serve the operator's env provider keys (below) to orgs with no stored credential — **single-tenant self-host / dogfood only**. On a multi-tenant gateway this lets every org spend on the operator's keys (provider-ToS / resale exposure) | **BYO-only (default):** with `DATABASE_URL` + `TT_MASTER_KEY` configured, an org with no stored credential for the requested provider gets an actionable `missing_provider_credential` error — never the operator's env keys |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `OPENROUTER_API_KEY` | Upstream provider credentials (single-tenant fallback; only served when `DATABASE_URL` configures a key store **and** `TT_ALLOW_ENV_CREDENTIAL_FALLBACK=1` is set) | That provider can't be reached (callers can still pass their own key as the Bearer token) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `SENTRY_DSN` | Observability | Disabled |
 | `RUST_LOG` | Log filter, e.g. `info,tt_core=debug` | Default tracing filter |
 

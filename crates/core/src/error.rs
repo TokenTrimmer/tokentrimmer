@@ -113,7 +113,7 @@ impl IntoResponse for ApiError {
                 "invalid_request_error",
                 "missing_provider_credential",
                 format!(
-                    "No upstream credential configured for provider '{provider}'. Add it before routing or pinning requests to this provider."
+                    "No upstream credential configured for provider '{provider}'. Add your org's '{provider}' API key in the TokenTrimmer dashboard (Credentials) before sending, routing, or pinning requests to this provider."
                 ),
             ),
             ApiError::CostLimitExceeded {

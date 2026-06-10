@@ -251,6 +251,67 @@ async fn pin_unknown_provider_is_400() {
     assert_eq!(h.beta_calls.load(Ordering::Relaxed), 0);
 }
 
+/// BYO-only (P0 #9): a VERIFIED org with a credential store configured but no
+/// stored credential for the serving (source) provider gets an actionable 400
+/// — its TokenTrimmer key must never be forwarded upstream as if it were a
+/// provider key.
+#[tokio::test]
+async fn chat_without_stored_credential_fails_closed() {
+    let h = harness(true).await; // empty credential store, verified org
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request(None, &h.key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        h.alpha_calls.load(Ordering::Relaxed),
+        0,
+        "must not dispatch"
+    );
+    assert_eq!(h.beta_calls.load(Ordering::Relaxed), 0, "must not dispatch");
+}
+
+/// Same BYO-only guard for `/v1/embeddings`.
+#[tokio::test]
+async fn embeddings_without_stored_credential_fails_closed() {
+    let h = harness(true).await; // empty credential store, verified org
+    let resp = h
+        .app
+        .clone()
+        .oneshot(embeddings_request(None, &h.key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        h.alpha_calls.load(Ordering::Relaxed),
+        0,
+        "must not dispatch"
+    );
+    assert_eq!(h.beta_calls.load(Ordering::Relaxed), 0, "must not dispatch");
+}
+
+/// BYO-only: pinning the SOURCE provider does not bypass the guard — a
+/// verified org with no stored source credential still gets the actionable
+/// 400 rather than its TokenTrimmer key forwarded upstream.
+#[tokio::test]
+async fn pin_to_source_without_stored_credential_fails_closed() {
+    let h = harness(true).await; // empty credential store, verified org
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request(Some("alpha"), &h.key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        h.alpha_calls.load(Ordering::Relaxed),
+        0,
+        "must not dispatch"
+    );
+}
+
 #[tokio::test]
 async fn cross_provider_pin_without_credential_fails_closed() {
     let h = harness(true).await; // empty credential store
