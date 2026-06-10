@@ -81,6 +81,45 @@ pub enum JudgeVerdict {
     Unclear,
 }
 
+impl JudgeVerdict {
+    /// Per-request quality score in `[0, 1]` for a *classified* verdict:
+    /// `1.0` for [`JudgeVerdict::Acceptable`] (quality preserved), `0.0` for
+    /// [`JudgeVerdict::Degraded`] (quality lost). [`JudgeVerdict::Unclear`]
+    /// has no valence and returns `None` — callers must not fabricate a score
+    /// for an unclassified verdict.
+    ///
+    /// This is the per-request number surfaced on the
+    /// `tokentrimmer.quality.score` telemetry attribute when a judge actually
+    /// ran; the attribute is *omitted* for `Unclear` (the `None` case).
+    ///
+    /// The canonical "Quality preserved %" headline is computed by
+    /// [`quality_preserved_summary`] — the single source of truth the cloud
+    /// should call. Because `Unclear` returns `None` here and the attribute is
+    /// omitted, averaging the emitted per-request scores yields the same number;
+    /// even so, prefer [`quality_preserved_summary`] so `n` and the `band` stay
+    /// consistent with the headline.
+    #[must_use]
+    pub fn quality_score(self) -> Option<f64> {
+        match self {
+            JudgeVerdict::Acceptable => Some(1.0),
+            JudgeVerdict::Degraded => Some(0.0),
+            JudgeVerdict::Unclear => None,
+        }
+    }
+}
+
+/// Per-request quality score for a verdict, defaulting an unclassified
+/// ([`JudgeVerdict::Unclear`]) verdict to `1.0`.
+///
+/// Use this only when a non-`None` score is required (e.g. a header value the
+/// caller has already decided to emit). Prefer [`JudgeVerdict::quality_score`]
+/// when you can represent "no valence" — surfacing code omits the header for an
+/// `Unclear` sample rather than implying preserved quality.
+#[must_use]
+pub fn quality_score_for_verdict(verdict: JudgeVerdict) -> f64 {
+    verdict.quality_score().unwrap_or(1.0)
+}
+
 /// One sampled request's score.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SampleScore {
@@ -114,6 +153,65 @@ pub struct QualityResult {
     pub sampled_examples: Vec<SampleScore>,
     /// Human-readable warnings (small sample, high `Unclear` share, etc.).
     pub caveats: Vec<String>,
+}
+
+/// "Quality preserved" aggregate over a set of [`SampleScore`]s — the
+/// primitive the hosted dashboard calls to render the headline beside the Saved
+/// card ("Quality preserved: 98.7% (n=412)").
+///
+/// `preserved_pct` is the share of *classified* (non-`Unclear`) samples the
+/// judge ruled [`JudgeVerdict::Acceptable`] — the complement of
+/// [`QualityResult::degraded_pct`]. `n` is the total number of scored samples
+/// (including `Unclear`, so the displayed sample count matches what was judged).
+/// `band` is the same red/yellow/green [`RiskBand`] the per-request hook uses,
+/// derived from the degraded share so a single `Degraded` in a large acceptable
+/// set stays `Low`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct QualityPreservedSummary {
+    /// Percentage (0–100) of classified samples judged `Acceptable`. When no
+    /// sample was classified (empty set or only `Unclear`), `100.0` — no
+    /// degradation was observed, so nothing was lost.
+    pub preserved_pct: f64,
+    /// Total scored samples (the `n=…` in the headline), `Unclear` included.
+    pub n: u32,
+    /// Aggregate risk band, from the degraded share of classified samples.
+    pub band: RiskBand,
+}
+
+/// Aggregate a set of [`SampleScore`]s into a [`QualityPreservedSummary`] —
+/// "Quality preserved: `preserved_pct`% (n=`n`)".
+///
+/// This is the cloud-callable aggregation primitive for the dashboard headline.
+/// It mirrors [`score_quality`]'s aggregation (degraded share over *classified*
+/// samples → [`RiskBand`]) but operates on already-scored samples, so it can be
+/// fed verdicts collected across many requests / orgs without re-running judges.
+///
+/// `Unclear` verdicts are counted in `n` but excluded from `preserved_pct`'s
+/// denominator (by definition we don't know their valence). An empty slice — or
+/// one with only `Unclear` verdicts — yields `100.0%` preserved / `Low` band:
+/// no degradation was *observed*, so the headline doesn't fabricate a loss.
+#[must_use]
+pub fn quality_preserved_summary(scores: &[SampleScore]) -> QualityPreservedSummary {
+    let mut acceptable: u32 = 0;
+    let mut degraded: u32 = 0;
+    for s in scores {
+        match s.verdict {
+            JudgeVerdict::Acceptable => acceptable += 1,
+            JudgeVerdict::Degraded => degraded += 1,
+            JudgeVerdict::Unclear => {}
+        }
+    }
+    let classified = f64::from(acceptable + degraded);
+    let degraded_pct = if classified > 0.0 {
+        (f64::from(degraded) / classified) * 100.0
+    } else {
+        0.0
+    };
+    QualityPreservedSummary {
+        preserved_pct: 100.0 - degraded_pct,
+        n: scores.len() as u32,
+        band: RiskBand::from_degraded_pct(degraded_pct),
+    }
 }
 
 /// Configuration for one Tier 3 quality scoring run.
@@ -411,5 +509,95 @@ mod tests {
         assert_eq!(RiskBand::from_degraded_pct(15.0), RiskBand::Medium);
         assert_eq!(RiskBand::from_degraded_pct(15.0001), RiskBand::High);
         assert_eq!(RiskBand::from_degraded_pct(100.0), RiskBand::High);
+    }
+
+    fn score(verdict: JudgeVerdict) -> SampleScore {
+        SampleScore {
+            request_id: Uuid::now_v7(),
+            verdict,
+            reason: "r".to_string(),
+        }
+    }
+
+    #[test]
+    fn preserved_summary_all_acceptable_is_100pct() {
+        let scores: Vec<SampleScore> = (0..10).map(|_| score(JudgeVerdict::Acceptable)).collect();
+        let s = quality_preserved_summary(&scores);
+        assert_eq!(s.n, 10);
+        assert!((s.preserved_pct - 100.0).abs() < 1e-9);
+        assert_eq!(s.band, RiskBand::Low);
+    }
+
+    #[test]
+    fn preserved_summary_matches_dashboard_example() {
+        // "Quality preserved: 98.7% (n=412)": of 412 classified samples, ~1.3%
+        // degraded. 5 degraded / 412 = 1.214% degraded → 98.786% preserved.
+        let mut scores: Vec<SampleScore> = Vec::new();
+        for _ in 0..407 {
+            scores.push(score(JudgeVerdict::Acceptable));
+        }
+        for _ in 0..5 {
+            scores.push(score(JudgeVerdict::Degraded));
+        }
+        let s = quality_preserved_summary(&scores);
+        assert_eq!(s.n, 412);
+        // 5/412 = 1.214% degraded → 98.786% preserved.
+        assert!(
+            (s.preserved_pct - 98.79).abs() < 0.01,
+            "preserved_pct {} should be ~98.79",
+            s.preserved_pct
+        );
+        // 1.21% degraded ≤ 5% → Low.
+        assert_eq!(s.band, RiskBand::Low);
+    }
+
+    #[test]
+    fn preserved_summary_excludes_unclear_from_denominator_but_counts_n() {
+        // 8 acceptable, 2 degraded, 5 unclear. n counts every scored sample (15);
+        // preserved_pct is over the 10 *classified* samples → 80% preserved.
+        let mut scores: Vec<SampleScore> = Vec::new();
+        for _ in 0..8 {
+            scores.push(score(JudgeVerdict::Acceptable));
+        }
+        for _ in 0..2 {
+            scores.push(score(JudgeVerdict::Degraded));
+        }
+        for _ in 0..5 {
+            scores.push(score(JudgeVerdict::Unclear));
+        }
+        let s = quality_preserved_summary(&scores);
+        assert_eq!(s.n, 15, "n counts every scored sample including Unclear");
+        assert!((s.preserved_pct - 80.0).abs() < 1e-9);
+        // 20% degraded > 15% → High.
+        assert_eq!(s.band, RiskBand::High);
+    }
+
+    #[test]
+    fn preserved_summary_empty_is_zero_n_and_full_preserved() {
+        let s = quality_preserved_summary(&[]);
+        assert_eq!(s.n, 0);
+        // No degradation observed → 100% preserved, Low band (vacuously).
+        assert!((s.preserved_pct - 100.0).abs() < 1e-9);
+        assert_eq!(s.band, RiskBand::Low);
+    }
+
+    #[test]
+    fn preserved_summary_only_unclear_is_full_preserved() {
+        // Only Unclear: no classified samples → no observed degradation.
+        let scores: Vec<SampleScore> = (0..3).map(|_| score(JudgeVerdict::Unclear)).collect();
+        let s = quality_preserved_summary(&scores);
+        assert_eq!(s.n, 3);
+        assert!((s.preserved_pct - 100.0).abs() < 1e-9);
+        assert_eq!(s.band, RiskBand::Low);
+    }
+
+    #[test]
+    fn verdict_quality_score_is_one_for_acceptable_zero_for_degraded() {
+        assert!((quality_score_for_verdict(JudgeVerdict::Acceptable) - 1.0).abs() < 1e-9);
+        assert!((quality_score_for_verdict(JudgeVerdict::Degraded) - 0.0).abs() < 1e-9);
+        // Unclear has no valence — None, not a fabricated 0 or 1.
+        assert_eq!(JudgeVerdict::Unclear.quality_score(), None);
+        assert_eq!(JudgeVerdict::Acceptable.quality_score(), Some(1.0));
+        assert_eq!(JudgeVerdict::Degraded.quality_score(), Some(0.0));
     }
 }
