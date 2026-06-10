@@ -5335,6 +5335,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "chrono",
  "futures",
  "httpmock",
  "insta",
@@ -5346,11 +5347,13 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tt-auth",
  "tt-inspect-core",
  "tt-inspect-rules-tier1",
  "tt-plan-core",
  "tt-preview",
  "tt-shared",
+ "tt-telemetry",
  "url",
  "uuid",
 ]
