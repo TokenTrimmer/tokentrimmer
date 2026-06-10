@@ -1306,6 +1306,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     fallbacks: Vec::new(),
                     disable_cache: false,
                     max_cost_usd: None,
+                    flex: false,
                 },
             }],
         );

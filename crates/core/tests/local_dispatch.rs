@@ -49,6 +49,8 @@ impl Provider for MockOllama {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
@@ -123,6 +125,8 @@ impl Provider for MockOpenAi {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
@@ -202,6 +206,7 @@ async fn route_to_local_dispatches_to_ollama_provider() {
                 fallbacks: vec![],
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );

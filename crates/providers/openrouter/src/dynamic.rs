@@ -180,6 +180,9 @@ impl DynamicCatalog {
                             batch_input_per_million: None,
                             batch_output_per_million: None,
                             prompt_cache_min_tokens: None,
+                            // OpenRouter exposes no Flex service tier.
+                            flex_input_per_million: None,
+                            flex_output_per_million: None,
                             effective_at,
                         },
                     );

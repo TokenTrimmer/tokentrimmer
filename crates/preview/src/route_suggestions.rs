@@ -69,6 +69,32 @@ pub fn suggest(
     out
 }
 
+/// Populate the reserved [`QualityRiskBand`] hook on a suggestion from a judged
+/// band, where one is available.
+///
+/// The live gateway runs a sampled quality judge on rerouted-DOWN traffic
+/// (`tt_core::quality_sample`) and records a per-`(requested_model → served_model)`
+/// [`QualityRiskBand`]. This is the enrichment seam that lifts a suggestion from
+/// the default `Unknown` to that judged band: `judged_band_for(&suggestion)`
+/// returns `Some(band)` when the judge has scored that swap, `None` to leave the
+/// suggestion at `Unknown`. Only `LOW`/`MEDIUM`/`HIGH` overwrite; a `None` or
+/// `Unknown` lookup is a no-op so an unjudged swap stays honestly `Unknown`.
+///
+/// Record-only: enrichment never changes `applicable` or pauses a route — the
+/// band is an advisory signal surfaced to the user.
+pub fn enrich_with_judged_bands<F>(suggestions: &mut [RouteSuggestion], judged_band_for: F)
+where
+    F: Fn(&RouteSuggestion) -> Option<QualityRiskBand>,
+{
+    for s in suggestions.iter_mut() {
+        if let Some(band) = judged_band_for(s) {
+            if band != QualityRiskBand::Unknown {
+                s.quality_risk_band = band;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +143,37 @@ mod tests {
                 s.rationale
             );
         }
+    }
+
+    fn suggestion(model: &str) -> RouteSuggestion {
+        RouteSuggestion {
+            route: format!("swap-to-{model}"),
+            model: model.into(),
+            cost_usd: 0.001,
+            savings_usd: 0.01,
+            quality_risk_band: QualityRiskBand::Unknown,
+            rationale: "x".into(),
+            applicable: true,
+        }
+    }
+
+    #[test]
+    fn enrichment_upgrades_unknown_to_judged_band() {
+        let mut v = vec![suggestion("gpt-4o-mini"), suggestion("claude-haiku-4-5")];
+        enrich_with_judged_bands(&mut v, |s| {
+            (s.model == "gpt-4o-mini").then_some(QualityRiskBand::High)
+        });
+        assert_eq!(v[0].quality_risk_band, QualityRiskBand::High);
+        // No judged band for the second swap → stays Unknown.
+        assert_eq!(v[1].quality_risk_band, QualityRiskBand::Unknown);
+    }
+
+    #[test]
+    fn enrichment_none_or_unknown_is_a_noop() {
+        let mut v = vec![suggestion("gpt-4o-mini")];
+        enrich_with_judged_bands(&mut v, |_| None);
+        assert_eq!(v[0].quality_risk_band, QualityRiskBand::Unknown);
+        enrich_with_judged_bands(&mut v, |_| Some(QualityRiskBand::Unknown));
+        assert_eq!(v[0].quality_risk_band, QualityRiskBand::Unknown);
     }
 }

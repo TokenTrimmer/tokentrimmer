@@ -47,6 +47,14 @@
 # batch_{input,output}_per_million is OpenAI's Batch-API rate — a flat 50% of
 # standard. prompt_cache_min_tokens = 1024: OpenAI auto-caches prompts ≥1024
 # tokens (developers.openai.com/api/docs/prompt-caching).
+#
+# flex_{input,output}_per_million is OpenAI's Flex service tier
+# (`service_tier: "flex"`) — a synchronous-but-slower tier billed at Batch-API
+# rates (so flex == batch here). PRESENCE = flex eligibility: OpenAI lists Flex
+# prices only for supported models (the gpt-5.x family); o3 / o4-mini are
+# batch-only "specialized models" and intentionally carry NO flex rate, so a
+# route opting them into flex is gated off + warned. Verified 2026-06 vs
+# developers.openai.com/api/docs/guides/flex-processing + .../pricing.
 [[entry]]
 provider = "openai"
 model = "gpt-5.5"
@@ -55,6 +63,8 @@ output_per_million = 30.00
 cached_input_per_million = 0.50
 batch_input_per_million = 2.50
 batch_output_per_million = 15.00
+flex_input_per_million = 2.50
+flex_output_per_million = 15.00
 prompt_cache_min_tokens = 1024
 effective_at = "2026-05-01T00:00:00Z"
 
@@ -66,6 +76,8 @@ output_per_million = 15.00
 cached_input_per_million = 0.25
 batch_input_per_million = 1.25
 batch_output_per_million = 7.50
+flex_input_per_million = 1.25
+flex_output_per_million = 7.50
 prompt_cache_min_tokens = 1024
 effective_at = "2026-05-01T00:00:00Z"
 

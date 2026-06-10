@@ -78,6 +78,8 @@ impl Provider for RecordingProvider {
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
@@ -193,6 +195,7 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );
@@ -268,6 +271,7 @@ async fn routed_request_reports_savings_against_original_model() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );
@@ -375,6 +379,7 @@ async fn route_for_other_org_does_not_match() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );
@@ -427,6 +432,7 @@ async fn route_skipped_when_no_resolvable_org() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );
@@ -509,6 +515,7 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
             },
         }],
     );

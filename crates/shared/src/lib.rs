@@ -3,6 +3,7 @@
 //! No business logic lives here — only the contracts that other crates implement.
 //! See `docs/02-provider-adapter-guide.md` for the Provider trait.
 
+pub mod batch_advisor;
 pub mod capability_check;
 pub mod context;
 pub mod error;
@@ -14,6 +15,10 @@ pub mod providers;
 pub mod url_guard;
 pub mod usage;
 
+pub use batch_advisor::{
+    project_batch_savings, project_batch_savings_with_tags, BatchFinding, RequestAggregate,
+    DEFAULT_BATCH_ELIGIBLE_TAGS,
+};
 pub use capability_check::{message_text_for_estimation, RequiredCapabilities};
 pub use context::{CallerTier, RequestContext};
 pub use error::ProviderError;

@@ -31,8 +31,9 @@ pub use apply::{apply_plan, ApplyError, InMemoryPlanStore, PlanStore};
 pub use error::PlanError;
 pub use pricing::{catalog_pricing_table, catalog_pricing_table_at};
 pub use quality::{
-    score_quality, stratified_sample, JudgeProvider, JudgeVerdict, MockJudge, QualityConfig,
-    QualityError, QualityResult, RiskBand, SampleScore,
+    quality_preserved_summary, quality_score_for_verdict, score_quality, stratified_sample,
+    JudgeProvider, JudgeVerdict, MockJudge, QualityConfig, QualityError, QualityPreservedSummary,
+    QualityResult, RiskBand, SampleScore,
 };
 pub use replay::{replay, replay_with_quality};
 pub use types::{

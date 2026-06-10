@@ -13,6 +13,9 @@ tt-tokenize.workspace = true
 tt-cache.workspace = true
 tt-retrieval = { workspace = true, features = ["postgres"] }
 tt-preview.workspace = true
+# Reuse the plan-replay quality judge (JudgeProvider/RiskBand/SampleScore) for
+# the live sampled judge on rerouted traffic (quality_sample.rs).
+tt-plan-core.workspace = true
 tt-routing.workspace = true
 tt-auth.workspace = true
 tt-telemetry.workspace = true
