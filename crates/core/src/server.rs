@@ -41,6 +41,7 @@ pub fn build_router_with_retrieval(
         .route("/metrics", get(routes::metrics::handler))
         .route("/v1/models", get(routes::models::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
+        .route("/v1/messages", post(routes::messages::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))
         .route(
             "/v1/preview",
@@ -215,10 +216,13 @@ mod tests {
                             role: Some("assistant".into()),
                             content: None,
                             tool_calls: vec![],
+                            extra: Default::default(),
                         },
                         finish_reason: None,
+                        extra: Default::default(),
                     }],
                     usage: None,
+                    extra: Default::default(),
                 },
                 ChatCompletionChunk {
                     id: "c1".into(),
@@ -231,10 +235,13 @@ mod tests {
                             role: None,
                             content: Some("Hi!".into()),
                             tool_calls: vec![],
+                            extra: Default::default(),
                         },
                         finish_reason: Some("stop".into()),
+                        extra: Default::default(),
                     }],
                     usage: None,
+                    extra: Default::default(),
                 },
             ];
             Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())

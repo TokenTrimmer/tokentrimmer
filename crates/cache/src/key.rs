@@ -180,12 +180,26 @@ fn build_canonical(req: &ChatCompletionRequest) -> serde_json::Value {
 
     // Build the object with keys in sorted (alphabetical) order so the JSON
     // output is deterministic.
+    // Genuinely-unknown / newer passthrough fields (`extra`) may steer model
+    // output, so they contribute to the key. Serialize the whole map (BTreeMap
+    // ordering inside serde_json gives a stable representation) — empty becomes
+    // null so a request without extras is unaffected.
+    let extra: Value = if req.extra.is_empty() {
+        Value::Null
+    } else {
+        serde_json::to_value(&req.extra).expect("extra always serializable")
+    };
+
     json!({
+        "extra": extra,
         "frequency_penalty": req.frequency_penalty.map(round6),
+        "max_completion_tokens": req.max_completion_tokens,
         "max_tokens": req.max_tokens,
         "messages": messages,
         "model": req.model,
+        "parallel_tool_calls": req.parallel_tool_calls,
         "presence_penalty": req.presence_penalty.map(round6),
+        "reasoning_effort": req.reasoning_effort,
         "response_format": response_format,
         "stop": stop,
         "temperature": req.temperature.map(round6),
@@ -231,6 +245,7 @@ mod tests {
             seed: None,
             user: None,
             tt_extras: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -249,6 +264,55 @@ mod tests {
         let mut b = base_request();
         a.user = None;
         b.user = Some("alice".into());
+        assert_eq!(cache_key(&a), cache_key(&b));
+    }
+
+    #[test]
+    fn max_completion_tokens_affects_key() {
+        // The reasoning-model spend cap changes the output ceiling, so it must
+        // not collide with a request that omits it.
+        let a = base_request();
+        let mut b = base_request();
+        b.max_completion_tokens = Some(128);
+        assert_ne!(cache_key(&a), cache_key(&b));
+    }
+
+    #[test]
+    fn reasoning_effort_affects_key() {
+        let mut a = base_request();
+        let mut b = base_request();
+        a.reasoning_effort = Some("low".into());
+        b.reasoning_effort = Some("high".into());
+        assert_ne!(cache_key(&a), cache_key(&b));
+    }
+
+    #[test]
+    fn parallel_tool_calls_affects_key() {
+        let mut a = base_request();
+        let mut b = base_request();
+        a.parallel_tool_calls = Some(true);
+        b.parallel_tool_calls = Some(false);
+        assert_ne!(cache_key(&a), cache_key(&b));
+    }
+
+    #[test]
+    fn passthrough_extra_affects_key() {
+        // Genuinely-unknown fields may steer the model, so a request that sets
+        // one must not collide with one that does not.
+        let a = base_request();
+        let mut b = base_request();
+        b.extra
+            .insert("service_tier".into(), serde_json::json!("flex"));
+        assert_ne!(cache_key(&a), cache_key(&b));
+    }
+
+    #[test]
+    fn stream_options_ignored() {
+        // stream_options only controls SSE framing, not the model output.
+        let mut a = base_request();
+        let mut b = base_request();
+        a.stream_options = None;
+        b.stream_options = Some(serde_json::json!({ "include_usage": true }));
         assert_eq!(cache_key(&a), cache_key(&b));
     }
 

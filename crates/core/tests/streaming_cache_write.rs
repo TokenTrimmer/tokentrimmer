@@ -156,10 +156,13 @@ impl Provider for CleanStreamProvider {
                         role: Some("assistant".into()),
                         content: None,
                         tool_calls: vec![],
+                        extra: Default::default(),
                     },
                     finish_reason: None,
+                    extra: Default::default(),
                 }],
                 usage: None,
+                extra: Default::default(),
             }),
             Ok(ChatCompletionChunk {
                 id: "stream-id".into(),
@@ -172,10 +175,13 @@ impl Provider for CleanStreamProvider {
                         role: None,
                         content: Some("hello from stream".into()),
                         tool_calls: vec![],
+                        extra: Default::default(),
                     },
                     finish_reason: None,
+                    extra: Default::default(),
                 }],
                 usage: None,
+                extra: Default::default(),
             }),
             Ok(ChatCompletionChunk {
                 id: "stream-id".into(),
@@ -186,6 +192,7 @@ impl Provider for CleanStreamProvider {
                     index: 0,
                     delta: ChunkDelta::default(),
                     finish_reason: Some("stop".into()),
+                    extra: Default::default(),
                 }],
                 usage: Some(Usage {
                     prompt_tokens: 10,
@@ -194,6 +201,7 @@ impl Provider for CleanStreamProvider {
                     cached_tokens: 0,
                     cache_creation_input_tokens: None,
                 }),
+                extra: Default::default(),
             }),
         ];
         Ok(futures::stream::iter(chunks).boxed())
@@ -254,10 +262,13 @@ impl Provider for TruncatedStreamProvider {
                     role: None,
                     content: Some("partial".into()),
                     tool_calls: vec![],
+                    extra: Default::default(),
                 },
                 finish_reason: None, // no finish_reason → truncated
+                extra: Default::default(),
             }],
             usage: None, // no authoritative usage
+            extra: Default::default(),
         })];
         Ok(futures::stream::iter(chunks).boxed())
     }

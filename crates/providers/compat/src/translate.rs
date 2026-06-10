@@ -78,6 +78,18 @@ pub struct OpenAiRequestBody {
     pub seed: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// OpenAI `stream_options` object (e.g. `{ "include_usage": true }`),
+    /// forwarded verbatim. The streaming path overrides this to request usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
+    /// Genuinely-unknown / newer OpenAI fields, flattened back to the top level
+    /// so they passthrough instead of being dropped.
+    #[serde(flatten, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra: std::collections::HashMap<String, Value>,
 }
 
 /// Translate a canonical [`tt_shared::ChatCompletionRequest`] into an
@@ -89,6 +101,11 @@ pub fn translate_request(
 ) -> Result<OpenAiRequestBody, ProviderError> {
     let reasoning = is_reasoning_model(&req.model);
 
+    // An explicit caller-supplied `max_completion_tokens` is always authoritative
+    // (it is the spend cap). For reasoning models we also rename the legacy
+    // `max_tokens` → `max_completion_tokens`, but only when the explicit field is
+    // absent. Non-reasoning models keep `max_tokens` and still forward an
+    // explicit `max_completion_tokens` verbatim.
     let (max_tokens, max_completion_tokens, temperature) = if reasoning {
         if req.temperature.is_some() {
             tracing::warn!(
@@ -96,10 +113,10 @@ pub fn translate_request(
                 "reasoning models do not support temperature; dropping the field"
             );
         }
-        // Rename max_tokens → max_completion_tokens for reasoning models.
-        (None, req.max_tokens, None)
+        let mct = req.max_completion_tokens.or(req.max_tokens);
+        (None, mct, None)
     } else {
-        (req.max_tokens, None, req.temperature)
+        (req.max_tokens, req.max_completion_tokens, req.temperature)
     };
 
     Ok(OpenAiRequestBody {
@@ -119,6 +136,10 @@ pub fn translate_request(
         n: req.n,
         seed: req.seed,
         user: req.user,
+        parallel_tool_calls: req.parallel_tool_calls,
+        reasoning_effort: req.reasoning_effort,
+        stream_options: req.stream_options,
+        extra: req.extra,
         // tt_extras is intentionally not forwarded.
     })
 }
@@ -253,6 +274,7 @@ mod tests {
             seed: None,
             user: None,
             tt_extras: std::collections::HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -300,6 +322,62 @@ mod tests {
         let serialized = serde_json::to_string(&body).expect("serialize ok");
         assert!(!serialized.contains("tt_extras"));
         assert!(!serialized.contains("route_hint"));
+    }
+
+    #[test]
+    fn typed_compat_fields_forwarded() {
+        let mut req = base_request("gpt-4o");
+        req.parallel_tool_calls = Some(false);
+        req.reasoning_effort = Some("high".to_string());
+        req.stream_options = Some(serde_json::json!({ "include_usage": true }));
+        let body = translate_request(req).expect("translate ok");
+        let v = serde_json::to_value(&body).expect("serialize ok");
+        assert_eq!(v["parallel_tool_calls"], false);
+        assert_eq!(v["reasoning_effort"], "high");
+        assert_eq!(
+            v["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_honored_for_reasoning_model() {
+        // A client setting max_completion_tokens directly (the spend cap) must
+        // be forwarded, not dropped.
+        let mut req = base_request("o3");
+        req.max_tokens = None;
+        req.max_completion_tokens = Some(2048);
+        let body = translate_request(req).expect("translate ok");
+        assert_eq!(body.max_completion_tokens, Some(2048));
+        assert!(body.max_tokens.is_none());
+    }
+
+    #[test]
+    fn explicit_max_completion_tokens_wins_over_renamed_max_tokens() {
+        // If a reasoning-model request carries BOTH the legacy max_tokens (which
+        // we rename) and an explicit max_completion_tokens, the explicit field
+        // is authoritative.
+        let mut req = base_request("o3");
+        req.max_tokens = Some(512);
+        req.max_completion_tokens = Some(2048);
+        let body = translate_request(req).expect("translate ok");
+        assert_eq!(body.max_completion_tokens, Some(2048));
+        assert!(body.max_tokens.is_none());
+    }
+
+    #[test]
+    fn unknown_fields_passthrough_to_upstream() {
+        let mut req = base_request("gpt-4o");
+        req.extra
+            .insert("service_tier".to_string(), serde_json::json!("flex"));
+        req.extra
+            .insert("logprobs".to_string(), serde_json::json!(true));
+        let body = translate_request(req).expect("translate ok");
+        let v = serde_json::to_value(&body).expect("serialize ok");
+        assert_eq!(v["service_tier"], "flex");
+        assert_eq!(v["logprobs"], true);
+        // tt_extras must never leak.
+        assert!(v.get("tt_extras").is_none());
     }
 
     #[test]

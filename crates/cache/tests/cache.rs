@@ -35,6 +35,7 @@ fn base_request() -> ChatCompletionRequest {
         seed: None,
         user: None,
         tt_extras: Default::default(),
+        ..Default::default()
     }
 }
 

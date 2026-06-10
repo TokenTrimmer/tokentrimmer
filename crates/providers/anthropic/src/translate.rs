@@ -300,11 +300,19 @@ pub fn translate_request(
         }
     }
 
-    // `max_tokens` is required by Anthropic.
-    let max_tokens = req.max_tokens.unwrap_or_else(|| {
-        tracing::debug!("max_tokens omitted — defaulting to 4096 for Anthropic");
-        4096
-    });
+    // `max_tokens` is required by Anthropic and is its output cap. Honor the
+    // caller's spend cap from either `max_tokens` or the newer
+    // `max_completion_tokens` (the latter takes precedence when both are set)
+    // so the ceiling is never silently dropped; default to 4096 when neither.
+    let max_tokens = req
+        .max_completion_tokens
+        .or(req.max_tokens)
+        .unwrap_or_else(|| {
+            tracing::debug!(
+                "max_tokens/max_completion_tokens omitted — defaulting to 4096 for Anthropic"
+            );
+            4096
+        });
 
     // Translate tools.
     let tools: Vec<AnthropicTool> = req
@@ -544,6 +552,7 @@ mod tests {
             seed: None,
             user: None,
             tt_extras: HashMap::new(),
+            ..Default::default()
         }
     }
 

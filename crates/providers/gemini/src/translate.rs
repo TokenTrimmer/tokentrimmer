@@ -439,10 +439,12 @@ pub fn translate_request(
 
     // Translate generation config.
     let (response_mime_type, response_schema) = translate_response_format(req.response_format);
+    // Honor the spend cap from either `max_tokens` or the newer
+    // `max_completion_tokens` (the latter wins) → Gemini `maxOutputTokens`.
     let generation_config = build_generation_config(
         req.temperature,
         req.top_p,
-        req.max_tokens,
+        req.max_completion_tokens.or(req.max_tokens),
         req.stop,
         response_mime_type,
         response_schema,

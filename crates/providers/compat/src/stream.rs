@@ -37,28 +37,22 @@ use tt_shared::{
 use crate::errors::{map_reqwest_error, map_response_error};
 use crate::translate;
 
-/// Extra fields sent alongside the body for streaming requests.
-///
-/// The `stream_options` object asks OpenAI to include usage in the final chunk
-/// so that callers can account for token consumption even when streaming.
-#[derive(Debug, serde::Serialize)]
-struct StreamOptions {
-    include_usage: bool,
-}
-
-/// Extended request body with streaming fields.
-#[derive(Debug, serde::Serialize)]
-struct OpenAiStreamBody {
-    /// All standard fields come from the translated request body.
-    #[serde(flatten)]
-    inner: translate::OpenAiRequestBody,
-    /// Options that control SSE stream behaviour.
-    stream_options: StreamOptions,
-}
-
 /// A `BoxStream` alias used by this module.
 pub type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, ProviderError>> + Send>>;
+
+/// Return a `stream_options` value with `include_usage: true` set, preserving
+/// any other keys a caller already supplied. A non-object caller value is
+/// replaced (the streaming usage option is mandatory for accounting).
+fn merge_include_usage(caller: Option<serde_json::Value>) -> serde_json::Value {
+    match caller {
+        Some(serde_json::Value::Object(mut map)) => {
+            map.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+            serde_json::Value::Object(map)
+        }
+        _ => serde_json::json!({ "include_usage": true }),
+    }
+}
 
 /// Build and execute a streaming chat completion request.
 ///
@@ -80,18 +74,14 @@ pub async fn stream_chat_completion(
     let api_key = ctx.credentials.api_key.expose().to_string();
     let extra_headers: Vec<(String, String)> = filter_extra_headers(&ctx.credentials.extra_headers);
 
-    // Translate to the OpenAI wire shape, then override the stream flag.
+    // Translate to the OpenAI wire shape, then override the stream flag and
+    // force `stream_options.include_usage` so the final chunk carries usage —
+    // merging into any caller-supplied `stream_options` rather than dropping it.
     let mut translated = translate::translate_request(req)?;
     translated.stream = true;
+    translated.stream_options = Some(merge_include_usage(translated.stream_options.take()));
 
-    let body = OpenAiStreamBody {
-        inner: translated,
-        stream_options: StreamOptions {
-            include_usage: true,
-        },
-    };
-
-    let body_bytes = serde_json::to_vec(&body)
+    let body_bytes = serde_json::to_vec(&translated)
         .map_err(|e| ProviderError::Internal(format!("failed to serialize stream body: {e}")))?;
 
     let mut request_builder = client
@@ -230,6 +220,9 @@ struct RawChunk {
     choices: Vec<RawChoice>,
     #[serde(default)]
     usage: Option<Usage>,
+    /// Unknown / newer top-level chunk fields preserved for round-trip passthrough.
+    #[serde(flatten, default)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +233,9 @@ struct RawChoice {
     delta: RawDelta,
     #[serde(default)]
     finish_reason: Option<String>,
+    /// Unknown per-choice fields (e.g. `logprobs`) preserved for passthrough.
+    #[serde(flatten, default)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -250,6 +246,9 @@ struct RawDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<RawToolCallDelta>,
+    /// Unknown per-delta fields (e.g. `refusal`) preserved for passthrough.
+    #[serde(flatten, default)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -290,11 +289,14 @@ impl RawChunk {
                         role: c.delta.role,
                         content: c.delta.content,
                         tool_calls: Vec::new(),
+                        extra: c.delta.extra,
                     },
                     finish_reason: c.finish_reason,
+                    extra: c.extra,
                 })
                 .collect(),
             usage: self.usage,
+            extra: self.extra,
         }
     }
 }
@@ -416,8 +418,10 @@ impl ToolAccum {
                     role: None,
                     content: None,
                     tool_calls,
+                    extra: Default::default(),
                 },
                 finish_reason: finish_reason.clone(),
+                extra: Default::default(),
             })
             .collect();
         Some(ChatCompletionChunk {
@@ -427,6 +431,7 @@ impl ToolAccum {
             model: meta.model,
             choices,
             usage,
+            extra: Default::default(),
         })
     }
 }
@@ -459,11 +464,14 @@ fn content_chunk(raw: &RawChunk) -> Option<ChatCompletionChunk> {
                     role: c.delta.role.clone(),
                     content: c.delta.content.clone(),
                     tool_calls: Vec::new(),
+                    extra: c.delta.extra.clone(),
                 },
                 finish_reason: None,
+                extra: c.extra.clone(),
             })
             .collect(),
         usage: None,
+        extra: raw.extra.clone(),
     })
 }
 
@@ -612,6 +620,28 @@ mod tests {
     }
 
     #[test]
+    fn merge_include_usage_sets_flag_when_absent() {
+        let v = merge_include_usage(None);
+        assert_eq!(v, serde_json::json!({ "include_usage": true }));
+    }
+
+    #[test]
+    fn merge_include_usage_preserves_caller_keys() {
+        let caller = serde_json::json!({ "continuous_usage_stats": true });
+        let v = merge_include_usage(Some(caller));
+        assert_eq!(v["include_usage"], true);
+        assert_eq!(v["continuous_usage_stats"], true);
+    }
+
+    #[test]
+    fn merge_include_usage_overrides_caller_false() {
+        // Streaming usage accounting is mandatory: a caller's `false` is upgraded.
+        let caller = serde_json::json!({ "include_usage": false });
+        let v = merge_include_usage(Some(caller));
+        assert_eq!(v["include_usage"], true);
+    }
+
+    #[test]
     fn find_event_boundary_crlf() {
         let buf = b"data: hello\r\n\r\ndata: world\r\n\r\n";
         assert_eq!(find_event_boundary(buf), Some((11, 4)));
@@ -630,6 +660,32 @@ mod tests {
         let results = parse_sse_event(event.as_bytes());
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0], SseEvent::Chunk(c) if c.id == "c1"));
+    }
+
+    #[test]
+    fn unknown_chunk_fields_round_trip_through_pipeline() {
+        // An upstream SSE chunk carrying newer/unknown fields (top-level, per-
+        // choice, per-delta) must survive parse → handle_raw_chunk → serialize.
+        let chunk_json = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","system_fingerprint":"fp_x","choices":[{"index":0,"delta":{"content":"Hi","refusal":null},"finish_reason":null,"logprobs":{"content":[]}}]}"#;
+        let event = format!("data: {chunk_json}\n\n");
+        let mut acc = ToolAccum::default();
+        let mut canonical = Vec::new();
+        for ev in parse_sse_event(event.as_bytes()) {
+            if let SseEvent::Chunk(raw) = ev {
+                canonical.extend(handle_raw_chunk(&mut acc, raw));
+            }
+        }
+        assert_eq!(canonical.len(), 1);
+        let out = serde_json::to_value(&canonical[0]).unwrap();
+        assert_eq!(out["system_fingerprint"], "fp_x");
+        assert_eq!(
+            out["choices"][0]["logprobs"],
+            serde_json::json!({ "content": [] })
+        );
+        assert_eq!(
+            out["choices"][0]["delta"]["refusal"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -674,10 +730,13 @@ mod tests {
                     role: None,
                     content: None,
                     tool_calls,
+                    extra: Default::default(),
                 },
                 finish_reason: finish_reason.map(String::from),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 
@@ -748,10 +807,13 @@ mod tests {
                     role: None,
                     content: Some("Hi".into()),
                     tool_calls: vec![],
+                    extra: Default::default(),
                 },
                 finish_reason: None,
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         };
         let out = handle_raw_chunk(&mut acc, raw);
         assert_eq!(out.len(), 1);
@@ -775,10 +837,13 @@ mod tests {
                     role: Some("assistant".into()),
                     content: None,
                     tool_calls: vec![frag(0, Some("call_1"), Some("f"), "{}")],
+                    extra: Default::default(),
                 },
                 finish_reason: None,
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         };
         let out = handle_raw_chunk(&mut acc, first);
         // One chunk: the role/content carrier (the tool fragment is swallowed).
@@ -810,8 +875,10 @@ mod tests {
                         role: None,
                         content: None,
                         tool_calls: vec![frag(0, Some("call_0"), Some("f0"), "{}")],
+                        extra: Default::default(),
                     },
                     finish_reason: Some("tool_calls".into()),
+                    extra: Default::default(),
                 },
                 RawChoice {
                     index: 1,
@@ -819,11 +886,14 @@ mod tests {
                         role: None,
                         content: None,
                         tool_calls: vec![frag(0, Some("call_1"), Some("f1"), "{}")],
+                        extra: Default::default(),
                     },
                     finish_reason: Some("tool_calls".into()),
+                    extra: Default::default(),
                 },
             ],
             usage: None,
+            extra: Default::default(),
         };
         let out = handle_raw_chunk(&mut acc, raw);
         assert_eq!(out.len(), 1);

@@ -93,10 +93,13 @@ impl Provider for CountingMock {
                             },
                             content: Some(format!("chunk-{i} ")),
                             tool_calls: vec![],
+                            extra: Default::default(),
                         },
                         finish_reason: if i == 4 { Some("stop".into()) } else { None },
+                        extra: Default::default(),
                     }],
                     usage: None,
+                    extra: Default::default(),
                 })
             })
             .collect();

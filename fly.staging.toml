@@ -12,6 +12,11 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
 
+# Bluegreen avoids a brown-out on single-machine deploys (Fly spins a temporary
+# machine even when min_machines_running is 0).
+[deploy]
+  strategy = "bluegreen"
+
 [http_service]
   internal_port      = 8080
   force_https        = true
