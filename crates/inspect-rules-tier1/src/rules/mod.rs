@@ -1,4 +1,4 @@
-//! All 19 P0 Inspect rules shipped at launch.
+//! The Tier-1 deterministic Inspect rules shipped at launch.
 //!
 //! Each rule lives in its own submodule. The public struct for each rule is
 //! re-exported here for convenience.
@@ -22,6 +22,7 @@ pub mod prompt_bloated_system;
 pub mod prompt_dynamic_prefix_breaks_cache;
 pub mod prompt_no_output_constraint;
 pub mod prompt_verbose_few_shot;
+pub mod prompt_volatile_in_system_prompt;
 
 pub use agent_no_termination_condition::AgentNoTerminationConditionRule;
 pub use cache_anthropic_prompt_cache_missing::CacheAnthropicPromptCacheMissingRule;
@@ -42,3 +43,4 @@ pub use prompt_bloated_system::PromptBloatedSystemRule;
 pub use prompt_dynamic_prefix_breaks_cache::PromptDynamicPrefixBreaksCacheRule;
 pub use prompt_no_output_constraint::PromptNoOutputConstraintRule;
 pub use prompt_verbose_few_shot::PromptVerboseFewShotRule;
+pub use prompt_volatile_in_system_prompt::PromptVolatileInSystemPromptRule;

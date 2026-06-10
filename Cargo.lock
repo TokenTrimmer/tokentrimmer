@@ -5422,6 +5422,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "tt-shared",
+ "tt-tokenize",
  "uuid",
 ]
 

@@ -8,8 +8,11 @@
 //! - **System messages** are extracted to a top-level `system` field; they must
 //!   not appear in `messages`.
 //! - **`max_tokens` is required** — defaults to 4096 if omitted.
-//! - **Auto cache_control**: if the last system block is ≥ 1024 tokens (via
-//!   `len/4` heuristic), `cache_control: { type: "ephemeral" }` is applied.
+//! - **Auto cache_control**: `cache_control: { type: "ephemeral" }` is applied
+//!   to the system prefix only when its estimated token count meets the
+//!   model's per-model prompt-cache minimum (`prompt_cache_min_tokens` from the
+//!   pricing catalog; 1024–4096 tokens). Below that minimum Anthropic silently
+//!   refuses to cache, so injecting a breakpoint would be a no-op.
 //! - **Tool format** differs: OpenAI `{type, function:{name,description,parameters}}`
 //!   → Anthropic `{name, description, input_schema}`.
 //! - **`tool_choice`**: OpenAI `auto` string → `{type:"auto"}`, specific →
@@ -287,18 +290,13 @@ pub fn translate_request(
         }
     }
 
-    // Apply auto cache_control to the last system block if it is long enough.
-    // Heuristic: 1 token ≈ 4 characters.
-    if let Some(last) = system_blocks.last_mut() {
-        // char count, not byte len: multibyte (CJK) over-counts bytes and could
-        // push a sub-1024-token block over the gate, which Anthropic 400s.
-        let estimated_tokens = last.text.chars().count() / 4;
-        if estimated_tokens >= 1024 {
-            last.cache_control = Some(AnthropicCacheControl {
-                ctype: "ephemeral".to_string(),
-            });
-        }
-    }
+    // Auto-inject a `cache_control` breakpoint on the system prefix, but only
+    // when the cacheable prefix is long enough for THIS model. Anthropic only
+    // caches a `cache_control` prefix once it meets a per-model minimum
+    // (1024–4096 tokens); below that the breakpoint silently no-ops and nothing
+    // is cached. The minimum lives in the pricing catalog as
+    // `prompt_cache_min_tokens`; see `maybe_inject_cache_control`.
+    maybe_inject_cache_control(&mut system_blocks, &req.model);
 
     // `max_tokens` is required by Anthropic and is its output cap. Honor the
     // caller's spend cap from either `max_tokens` or the newer
@@ -351,6 +349,95 @@ pub fn translate_request(
         // n, seed, response_format, presence_penalty, frequency_penalty,
         // logit_bias, tt_extras
     })
+}
+
+/// Conservative fallback prompt-cache minimum (in tokens) used when the model
+/// is not in the catalog or has no documented `prompt_cache_min_tokens`.
+///
+/// Anthropic's documented per-model minimums span 1024–4096 tokens. Picking the
+/// largest known minimum means an injected breakpoint is guaranteed to be at or
+/// above the real (unknown) minimum for any current Anthropic model, so we never
+/// inject a breakpoint that would silently no-op. The trade-off is that a
+/// borderline prefix (e.g. 2500 tokens) on an unrecognised model won't be
+/// cached even though it might have qualified — the safe direction.
+const FALLBACK_CACHE_MIN_TOKENS: u32 = 4096;
+
+/// The Anthropic prompt-cache minimum prefix length, in tokens, for `model`.
+///
+/// Reads `prompt_cache_min_tokens` from the pricing catalog for
+/// `("anthropic", model)`. Anthropic model ids sent to the wire may carry a
+/// date suffix (e.g. `claude-sonnet-4-6-20260101`) while the catalog keys on the
+/// bare id, so we fall back to a longest-prefix match before giving up. When the
+/// model is unknown or has no documented minimum, returns
+/// [`FALLBACK_CACHE_MIN_TOKENS`] and logs at debug so the skip is observable.
+fn cache_min_tokens_for_model(model: &str) -> u32 {
+    let catalog = tt_shared::pricing::catalog();
+
+    // Exact match first; then longest catalog id that is a prefix of `model`
+    // (handles dated aliases like `claude-sonnet-4-6-20260101`).
+    let lookup = catalog.latest("anthropic", model).or_else(|| {
+        catalog
+            .pairs()
+            .into_iter()
+            .filter(|(provider, id)| provider == "anthropic" && model.starts_with(id.as_str()))
+            .max_by_key(|(_, id)| id.len())
+            .and_then(|(_, id)| catalog.latest("anthropic", &id))
+    });
+
+    match lookup.and_then(|p| p.prompt_cache_min_tokens) {
+        Some(min) => min,
+        None => {
+            tracing::debug!(
+                model,
+                fallback = FALLBACK_CACHE_MIN_TOKENS,
+                "no prompt_cache_min_tokens in catalog for Anthropic model — \
+                 using conservative fallback minimum"
+            );
+            FALLBACK_CACHE_MIN_TOKENS
+        }
+    }
+}
+
+/// Inject a single `cache_control` breakpoint on the system prefix when, and
+/// only when, the cacheable prefix meets `model`'s prompt-cache minimum.
+///
+/// The cacheable prefix is the concatenation of all system blocks (Anthropic
+/// caches everything up to and including the breakpoint). Because the cumulative
+/// token count is monotonic in block count, the *largest* qualifying prefix
+/// boundary is always the last system block — so we place the breakpoint there
+/// when the total system token count meets the minimum, and nowhere otherwise.
+///
+/// Estimation uses the shared [`tt_tokenize`] estimator (tiktoken `cl100k` as an
+/// Anthropic proxy), which *undercounts* Anthropic tokens by ~15–20%; combined
+/// with the catalog minimum this keeps us on the safe side of the gate — a
+/// breakpoint we inject is comfortably above the real minimum, never below it.
+fn maybe_inject_cache_control(system_blocks: &mut [AnthropicSystemBlock], model: &str) {
+    if system_blocks.is_empty() {
+        return;
+    }
+
+    let min_tokens = cache_min_tokens_for_model(model);
+
+    // Estimated tokens of the full system prefix (all blocks concatenated).
+    let prefix_tokens: u32 = system_blocks
+        .iter()
+        .map(|b| tt_tokenize::estimate_tokens("anthropic", &b.text))
+        .sum();
+
+    if prefix_tokens >= min_tokens {
+        if let Some(last) = system_blocks.last_mut() {
+            last.cache_control = Some(AnthropicCacheControl {
+                ctype: "ephemeral".to_string(),
+            });
+        }
+    } else {
+        tracing::debug!(
+            model,
+            prefix_tokens,
+            min_tokens,
+            "system prefix below model prompt-cache minimum — skipping cache_control injection"
+        );
+    }
 }
 
 /// Extract a plain-text string from a [`MessageContent`].
@@ -595,6 +682,13 @@ mod tests {
         assert_eq!(body.messages[0].role, "user");
     }
 
+    /// `"word "` tokenizes to ~1 token under cl100k, so `word_tokens(n)` is a
+    /// system prompt of ~`n` estimated tokens — handy for landing just below /
+    /// above a model's prompt-cache minimum.
+    fn word_tokens(n: usize) -> String {
+        "word ".repeat(n)
+    }
+
     #[test]
     fn short_system_no_cache_control() {
         let mut req = base_request("claude-sonnet-4-6");
@@ -617,12 +711,11 @@ mod tests {
 
     #[test]
     fn long_system_gets_cache_control() {
-        // ~1500 tokens × 4 chars/token = 6000 chars
-        let long_text = "a".repeat(6000);
+        // Sonnet 4.6's minimum is 2048 tokens; ~2500 estimated tokens clears it.
         let mut req = base_request("claude-sonnet-4-6");
         req.messages = vec![
             Message::System {
-                content: MessageContent::Text(long_text),
+                content: MessageContent::Text(word_tokens(2500)),
             },
             Message::User {
                 content: MessageContent::Text("Hi".to_string()),
@@ -636,6 +729,155 @@ mod tests {
             "long system should have cache_control"
         );
         assert_eq!(system[0].cache_control.as_ref().unwrap().ctype, "ephemeral");
+    }
+
+    /// (a) A prompt below the model's minimum must NOT get a breakpoint, even
+    /// though it would have qualified under the old fixed 1024-token gate.
+    #[test]
+    fn prefix_below_model_minimum_is_not_cached() {
+        // ~1500 tokens: above the old 1024 gate, below Sonnet's 2048 minimum.
+        let mut req = base_request("claude-sonnet-4-6");
+        req.messages = vec![Message::System {
+            content: MessageContent::Text(word_tokens(1500)),
+        }];
+        let body = translate_request(req).expect("translate ok");
+        let system = body.system.expect("system present");
+        assert!(
+            system.last().unwrap().cache_control.is_none(),
+            "1500-token prefix is below Sonnet's 2048 minimum — must not cache"
+        );
+    }
+
+    /// (c) Two models with different minimums: the SAME ~2500-token prefix
+    /// caches on Sonnet (min 2048) but NOT on Opus (min 4096).
+    #[test]
+    fn same_prefix_respects_per_model_minimum() {
+        let make = |model: &str| {
+            let mut req = base_request(model);
+            req.messages = vec![Message::System {
+                content: MessageContent::Text(word_tokens(2500)),
+            }];
+            translate_request(req)
+                .expect("translate ok")
+                .system
+                .expect("system present")
+        };
+
+        // Sonnet 4.6: min 2048 → 2500 qualifies.
+        assert!(
+            make("claude-sonnet-4-6")
+                .last()
+                .unwrap()
+                .cache_control
+                .is_some(),
+            "2500 tokens clears Sonnet's 2048 minimum"
+        );
+        // Opus 4.8: min 4096 → 2500 does not qualify.
+        assert!(
+            make("claude-opus-4-8")
+                .last()
+                .unwrap()
+                .cache_control
+                .is_none(),
+            "2500 tokens is below Opus's 4096 minimum"
+        );
+    }
+
+    /// A prefix above Opus's 4096 minimum is cached.
+    #[test]
+    fn opus_large_prefix_is_cached() {
+        let mut req = base_request("claude-opus-4-8");
+        req.messages = vec![Message::System {
+            content: MessageContent::Text(word_tokens(4500)),
+        }];
+        let body = translate_request(req).expect("translate ok");
+        assert!(
+            body.system.unwrap().last().unwrap().cache_control.is_some(),
+            "4500 tokens clears Opus's 4096 minimum"
+        );
+    }
+
+    /// (b) The breakpoint lands on the LAST (largest) qualifying system prefix
+    /// boundary, and only there — earlier blocks stay un-marked. Total prefix is
+    /// the sum across blocks, so two ~1300-token blocks (2600 total) clear
+    /// Sonnet's 2048 minimum even though neither block alone would.
+    #[test]
+    fn breakpoint_at_largest_prefix_boundary() {
+        let mut req = base_request("claude-sonnet-4-6");
+        req.messages = vec![
+            Message::System {
+                content: MessageContent::Text(word_tokens(1300)),
+            },
+            Message::System {
+                content: MessageContent::Text(word_tokens(1300)),
+            },
+        ];
+        let body = translate_request(req).expect("translate ok");
+        let system = body.system.expect("system present");
+        assert_eq!(system.len(), 2);
+        assert!(
+            system[0].cache_control.is_none(),
+            "only the last (largest-prefix) boundary carries the breakpoint"
+        );
+        assert!(
+            system[1].cache_control.is_some(),
+            "cumulative prefix (2600 tokens) clears Sonnet's 2048 minimum"
+        );
+    }
+
+    /// An unknown model falls back to the conservative 4096-token minimum: a
+    /// ~2500-token prefix (which would cache on Sonnet) is NOT cached.
+    #[test]
+    fn unknown_model_uses_conservative_fallback() {
+        let mut req = base_request("claude-future-model-not-in-catalog");
+        req.messages = vec![Message::System {
+            content: MessageContent::Text(word_tokens(2500)),
+        }];
+        let body = translate_request(req).expect("translate ok");
+        assert!(
+            body.system.unwrap().last().unwrap().cache_control.is_none(),
+            "unknown model falls back to 4096 minimum — 2500 tokens skipped"
+        );
+
+        // But a prefix above the fallback minimum still caches.
+        let mut req = base_request("claude-future-model-not-in-catalog");
+        req.messages = vec![Message::System {
+            content: MessageContent::Text(word_tokens(4500)),
+        }];
+        let body = translate_request(req).expect("translate ok");
+        assert!(
+            body.system.unwrap().last().unwrap().cache_control.is_some(),
+            "4500 tokens clears the 4096 fallback minimum"
+        );
+    }
+
+    /// A dated wire alias (e.g. `claude-sonnet-4-6-20260101`) resolves to the
+    /// bare catalog id's minimum via longest-prefix match.
+    #[test]
+    fn dated_model_alias_resolves_to_catalog_minimum() {
+        let mut req = base_request("claude-sonnet-4-6-20260101");
+        req.messages = vec![Message::System {
+            // ~2500 tokens: clears Sonnet's 2048 min but not the 4096 fallback,
+            // so caching here proves the alias resolved to Sonnet, not fallback.
+            content: MessageContent::Text(word_tokens(2500)),
+        }];
+        let body = translate_request(req).expect("translate ok");
+        assert!(
+            body.system.unwrap().last().unwrap().cache_control.is_some(),
+            "dated alias must resolve to Sonnet's 2048 minimum (not the fallback)"
+        );
+    }
+
+    #[test]
+    fn cache_min_tokens_lookup_matches_catalog() {
+        assert_eq!(cache_min_tokens_for_model("claude-sonnet-4-6"), 2048);
+        assert_eq!(cache_min_tokens_for_model("claude-opus-4-8"), 4096);
+        assert_eq!(cache_min_tokens_for_model("claude-haiku-4-5"), 4096);
+        // Unknown → conservative fallback.
+        assert_eq!(
+            cache_min_tokens_for_model("no-such-model"),
+            FALLBACK_CACHE_MIN_TOKENS
+        );
     }
 
     #[test]
@@ -742,8 +984,13 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
     }
 
+    /// Estimation goes through the shared tiktoken-based estimator, not a raw
+    /// byte length, so multibyte (CJK) text is counted by tokens — a 1400-token
+    /// CJK prefix stays below Sonnet's 2048 minimum and is not cached, where a
+    /// naive byte-length heuristic would have over-counted and wrongly injected
+    /// a breakpoint Anthropic then refuses to cache.
     #[test]
-    fn cache_control_uses_char_count_not_bytes() {
+    fn cache_control_estimates_by_tokens_not_bytes() {
         use tt_shared::messages::{Message, MessageContent};
         let mut req = base_request("claude-sonnet-4-6");
         req.messages = vec![Message::System {
@@ -753,14 +1000,7 @@ mod tests {
         let sys = body.system.expect("system blocks present");
         assert!(
             sys.last().unwrap().cache_control.is_none(),
-            "must not cache a sub-1024-token block"
+            "1400-token CJK prefix is below Sonnet's 2048 minimum — must not cache"
         );
-
-        let mut req = base_request("claude-sonnet-4-6");
-        req.messages = vec![Message::System {
-            content: MessageContent::Text("a".repeat(4096)),
-        }];
-        let body = translate_request(req).expect("translate ok");
-        assert!(body.system.unwrap().last().unwrap().cache_control.is_some());
     }
 }

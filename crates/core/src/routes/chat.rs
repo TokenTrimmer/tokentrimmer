@@ -32,7 +32,7 @@ use tt_auth::ApiKeyContext;
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
     messages::Choice,
-    parse_cache_control, CacheControlConfig, CacheMode, ChatCompletionRequest,
+    parse_cache_control, CacheControlConfig, CacheMode, CacheWriteTier, ChatCompletionRequest,
     ChatCompletionResponse, Message, MessageContent, ModelPricing, RequestContext, Usage,
 };
 
@@ -2044,8 +2044,16 @@ impl CostBreakdown {
 
 /// Compute the [`CostBreakdown`] from token usage and pricing.
 ///
-/// `pricing` is the served model's rate; `cost_usd` applies the
-/// cached-token discount when `usage.cached_tokens > 0`.
+/// `pricing` is the served model's rate; `cost_usd` meters each prompt-token
+/// bucket at its catalog rate — fresh input at `input_per_million`, cache reads
+/// at the discounted `cached_input_per_million`, and cache writes
+/// (`cache_creation_input_tokens`) at the cache-write premium. Writes are priced
+/// at the **5-minute TTL tier** (`cache_write_per_million`, ~1.25× base input):
+/// that is the only tier the gateway writes (the Anthropic adapter emits a bare
+/// `ephemeral` breakpoint, which Anthropic defaults to the 5-minute TTL), and
+/// the provider's flat `cache_creation_input_tokens` carries no per-tier split.
+/// See the inline note in the body and
+/// [`tt_shared::pricing::CacheWriteTier`].
 ///
 /// `baseline_pricing` is the rate the request WOULD have paid without any
 /// TokenTrimmer optimisation — i.e. the originally-requested model's rate at
@@ -2057,7 +2065,7 @@ impl CostBreakdown {
 /// Attribution note: provider-reported cache reads/writes are attributed to
 /// the *provider* side in full. For OpenAI/Gemini they are automatic. For
 /// Anthropic the gateway's adapter may have injected the `cache_control`
-/// breakpoint itself (long-system heuristic in
+/// breakpoint itself (model-aware prompt-cache-minimum gate in
 /// `tt-provider-anthropic::translate`), but the usage that flows back carries
 /// no signal distinguishing TT-injected breakpoints from caller-driven reuse,
 /// so the whole class is conservatively credited to the provider rather than
@@ -2079,7 +2087,7 @@ pub(crate) fn compute_cost(
     //
     // Rates:
     //   cache_read  → cached_input_per_million  (or base if absent)
-    //   cache_write → cache_write_per_million   (or base if absent; non-Anthropic unchanged)
+    //   cache_write → cache_write_per_million   (5-min tier; or base if absent)
     //   fresh_input → input_per_million
     let cache_read = usage.cached_tokens.min(usage.prompt_tokens);
     let cache_write = usage
@@ -2095,9 +2103,24 @@ pub(crate) fn compute_cost(
     let cached_rate = pricing
         .cached_input_per_million
         .unwrap_or(pricing.input_per_million);
-    // Use write-premium rate when available; fall back to base input rate.
+    // Cache-write TTL tier (write-premium selection):
+    //
+    // Anthropic bills cache *writes* at a per-TTL premium — the default 5-minute
+    // ephemeral tier at ~1.25× base input, the opt-in 1-hour tier at ~2×. We
+    // meter at the **5-minute tier** because that is the only tier the gateway
+    // ever writes: the Anthropic adapter injects a bare
+    // `cache_control: {"type": "ephemeral"}` with no `ttl` field (see
+    // `tt-provider-anthropic::translate::maybe_inject_cache_control`), and
+    // Anthropic defaults a bare `ephemeral` breakpoint to the 5-minute TTL.
+    // The flat `cache_creation_input_tokens` the provider returns carries no
+    // per-tier breakdown (the granular `cache_creation` split is an opt-in beta
+    // we do not request), so there is no signal that would let us attribute any
+    // write to the 1-hour tier even if one occurred. The 2× one-hour rate is
+    // available via `ModelPricing::cache_write_rate_per_million(OneHour)` for
+    // when a 1-hour write is introduced. Fall back to the base input rate when
+    // the model documents no write premium (non-Anthropic — cost unchanged).
     let write_rate = pricing
-        .cache_write_per_million
+        .cache_write_rate_per_million(CacheWriteTier::FiveMin)
         .unwrap_or(pricing.input_per_million);
 
     let cost_usd = (fresh_input as f64) * pricing.input_per_million / 1_000_000.0
@@ -3199,6 +3222,89 @@ mod cache_write_rate_tests {
         assert!(
             (cost - expected).abs() < 1e-9,
             "expected {expected}, got {cost}"
+        );
+    }
+
+    // (e) End-to-end against the REAL pricing catalog: given N cache-write +
+    //     M cache-read + K fresh input tokens for a catalogued model, the cost
+    //     matches the catalog rates to the cent — write premium and read
+    //     discount both applied. Guards the wiring from `tt_shared::pricing`
+    //     into `compute_cost`, not just the synthetic-pricing math above.
+    #[test]
+    fn catalog_grounded_breakdown_matches_to_the_cent() {
+        // claude-sonnet-4-6 catalog rates (data/pricing.toml):
+        //   input 3.00, output 15.00, cache-read 0.30, cache-write 3.75 (5-min).
+        let p = tt_shared::pricing::catalog()
+            .latest("anthropic", "claude-sonnet-4-6")
+            .expect("sonnet present in catalog");
+
+        // K=500_000 fresh, M=300_000 cache-read, N=200_000 cache-write,
+        // 100_000 output. prompt_tokens = K+M+N = 1_000_000.
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 100_000,
+            total_tokens: 1_100_000,
+            cached_tokens: 300_000,
+            cache_creation_input_tokens: Some(200_000),
+        };
+        let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
+
+        // 500K×$3.00 + 300K×$0.30 + 200K×$3.75 + 100K×$15.00, all /1M:
+        //   1.50 + 0.09 + 0.75 + 1.50 = $3.84.
+        let expected = (500_000.0 * 3.0 + 300_000.0 * 0.30 + 200_000.0 * 3.75 + 100_000.0 * 15.0)
+            / 1_000_000.0;
+        assert!(
+            (cost - 3.84).abs() < 1e-9,
+            "catalog-grounded cost should be exactly $3.84, got {cost}"
+        );
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "expected {expected}, got {cost}"
+        );
+
+        // The write premium must actually be billed: pricing the same writes at
+        // the base input rate ($3.00) would undercount by 200K×($3.75−$3.00)/1M.
+        let undercounted =
+            (500_000.0 * 3.0 + 300_000.0 * 0.30 + 200_000.0 * 3.0 + 100_000.0 * 15.0) / 1_000_000.0;
+        assert!(
+            cost > undercounted,
+            "write premium must raise cost above the base-input mispricing"
+        );
+        assert!(
+            (cost - undercounted - 0.15).abs() < 1e-9,
+            "premium delta = 200K × ($3.75 − $3.00)/1M = $0.15"
+        );
+    }
+
+    // (f) compute_cost meters writes at the 5-minute tier (1.25×), NOT the
+    //     1-hour tier (2×). The gateway only ever writes the 5-min tier, so the
+    //     headline cost must use it; the 1-hour rate is available on the catalog
+    //     for when a 1-hour write is introduced, but must not be applied here.
+    #[test]
+    fn writes_metered_at_five_min_not_one_hour_tier() {
+        let p = tt_shared::pricing::catalog()
+            .latest("anthropic", "claude-sonnet-4-6")
+            .expect("sonnet present");
+        // 1M cache-write only.
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 0,
+            cache_creation_input_tokens: Some(1_000_000),
+        };
+        let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
+        // 5-min tier = $3.75/M; 1-hour tier would be 2×$3.00 = $6.00/M.
+        assert!(
+            (cost - 3.75).abs() < 1e-9,
+            "1M cache_write must bill at the 5-min tier ($3.75), got {cost}"
+        );
+        let one_hour = p
+            .cache_write_rate_per_million(CacheWriteTier::OneHour)
+            .expect("sonnet has a write premium");
+        assert!(
+            (one_hour - 6.00).abs() < 1e-9,
+            "sanity: 1-hour tier is 2× base input ($6.00), not what compute_cost applied"
         );
     }
 }

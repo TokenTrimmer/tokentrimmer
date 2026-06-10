@@ -263,13 +263,13 @@ fn translate_system_message_extraction() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Auto cache_control on long system (~1500 tokens)
+// 4. Auto cache_control on long system (clears the model's prompt-cache minimum)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn translate_long_system_gets_cache_control() {
-    // 1500 tokens × 4 chars/token ≈ 6000 characters.
-    let long_text = "word ".repeat(1500);
+    // ~2500 estimated tokens — clears Sonnet 4.6's 2048-token cache minimum.
+    let long_text = "word ".repeat(2500);
     let messages = vec![
         Message::System {
             content: MessageContent::Text(long_text),
