@@ -65,7 +65,7 @@ These decisions are locked. Any change to these affects every subsequent section
 2. **OpenAI-compatible API is the contract.** All providers — Anthropic, Gemini, Mistral, Groq, Together, OpenRouter, Ollama, vLLM, LM Studio — are exposed behind one OpenAI-compatible request/response surface. Customers integrate by changing `base_url` only.
 3. **Self-serve everything.** Fixed pricing tiers. Stripe Checkout signup. Cancel button in dashboard. Zero negotiation, zero demos, zero sales calls.
 4. **Async-only support.** Email, Discord, GitHub Issues. No live chat. No phone.
-5. **Privacy-preserving by default.** No prompt or response bodies logged by default. Semantic cache uses embedding hashes, not raw text. Customer can opt into full logging per API key.
+5. **Privacy-preserving by default.** Request logs are metadata-only by default — no prompt or response bodies (only token counts, model, timing, route). Two paid features are the exceptions, and both are off unless enabled: the L2 semantic cache **stores full response bodies** (in Postgres, scoped by `org_id`) so it can replay them on a hit, and any feature that generates embeddings — L2 cache lookups and retrieval — **sends the prompt text to OpenAI** (`text-embedding-3-small`) to produce the embedding vector. Customer can additionally opt into full request/response logging per API key.
 6. **Latency budget.** Target sub-30ms gateway overhead (p50) on cache misses. Sub-5ms (p50) on cache hits. Multi-region deployment is non-negotiable.
 7. **Cost discipline on our side.** TokenTrimmer's own LLM and infra costs must be predictable and bounded. We dogfood our own product.
 8. **Honest measurement.** No inflated savings claims. Confidence intervals everywhere. The "savings" number on the dashboard must reconcile to provider invoices.
@@ -229,7 +229,7 @@ For streaming, steps 6–8 happen concurrently — the response streams through 
 - Lookup: cosine similarity, threshold per route (default 0.92)
 - Storage: response JSON, model used, token counts, hit count, expires_at
 - Per-org isolation: every cache entry has `org_id`; queries scope to org
-- Privacy: cache stores response and embedding, *not* the original prompt text
+- Privacy: cache stores the **full response JSON** and the prompt embedding; it does not persist the original prompt text, but generating the embedding sends that prompt (the last user message) to OpenAI for `text-embedding-3-small`
 
 **What is never cached:**
 - Requests with `stream: true` and `cache: false` header
@@ -1117,7 +1117,7 @@ OSS contributions go to the public repos. Private contributions (commercial feat
 - API key secrets argon2-hashed
 - Prompt and response bodies NOT logged by default (only metadata: token counts, model, timing, route)
 - Customer can opt into full logging per API key
-- Semantic cache stores embeddings + responses, not original prompt text
+- L2 semantic cache (paid, opt-in) stores the prompt embedding **and the full response body** in Postgres (scoped by `org_id`); it does not persist the original prompt text, but generating the embedding sends that prompt text to OpenAI (`text-embedding-3-small`). Retrieval, when enabled, sends prompt text to OpenAI for the same reason
 - All data scoped by `org_id` at every query
 
 ### 16.2 Network
