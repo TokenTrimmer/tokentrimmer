@@ -127,7 +127,10 @@ toml = "0.8"
 # the path deps into registry deps (required for the release-crates workflow).
 tt-shared = { path = "crates/shared", version = "0.1" }
 tt-tokenize = { path = "crates/tokenize", version = "0.1" }
-tt-client = { path = "crates/client", version = "0.1" }
+# Package renamed on crates.io (the name `tt-client` is owned by an unrelated
+# third party); the alias keeps every consumer's `tt-client.workspace = true`
+# and all `use tt_client::` imports unchanged.
+tt-client = { package = "tokentrimmer-client", path = "crates/client", version = "0.1" }
 tt-core = { path = "crates/core", version = "0.1" }
 tt-cache = { path = "crates/cache", version = "0.1" }
 tt-routing = { path = "crates/routing", version = "0.1" }
