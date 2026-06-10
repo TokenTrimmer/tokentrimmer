@@ -26,6 +26,7 @@ use crate::routes::chat::{
     apply_provider_override, apply_routing, attach_cost_headers, compute_cost,
     cost_limit_from_header, enforce_cost_limit, estimate_cost_usd, provider_override_from_header,
     resolve_credentials, resolve_credentials_for, timeout_ms_from_header, with_request_timeout,
+    CostBreakdown,
 };
 use crate::{ApiError, ApiResult, AppState};
 
@@ -72,9 +73,7 @@ fn sandbox_embeddings_response(req: &EmbeddingsRequest, trace_id: Uuid) -> Respo
         trace_id,
         "sandbox",
         &req.model,
-        0.0,
-        0.0,
-        0.0,
+        &CostBreakdown::default(),
     );
     if let Ok(v) = "sandbox".parse() {
         http.headers_mut().insert("x-tokentrimmer-cache", v);
@@ -242,14 +241,18 @@ pub async fn handler(
     } else {
         routed_pricing.clone()
     };
-    let (cost_usd, baseline_cost_usd) = compute_cost(
+    // Header saved_usd is TT-attributed only; the provider's automatic cache
+    // discount (always 0 for embeddings today — no cached tokens) rides in
+    // its own header.
+    let breakdown = compute_cost(
         &resp.usage,
         routed_pricing.as_ref(),
         baseline_pricing.as_ref(),
         provider.fee_multiplier(),
     );
-    let saved_usd = (baseline_cost_usd - cost_usd).max(0.0_f64);
-    state.spend_sink().record(org_id, cost_usd, Utc::now());
+    state
+        .spend_sink()
+        .record(org_id, breakdown.cost_usd, Utc::now());
 
     let mut http = (StatusCode::OK, Json(resp)).into_response();
     attach_cost_headers(
@@ -257,9 +260,7 @@ pub async fn handler(
         trace_id,
         provider.id(),
         &served_model,
-        cost_usd,
-        baseline_cost_usd,
-        saved_usd,
+        &breakdown,
     );
     Ok(http)
 }

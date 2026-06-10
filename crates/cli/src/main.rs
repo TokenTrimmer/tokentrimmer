@@ -836,13 +836,120 @@ fn scrub_sensitive_event(
 // `tt gateway` implementation
 // ---------------------------------------------------------------------------
 
+/// Opt-in env var that allows binding a non-loopback address WITHOUT a key
+/// store. With it set to `1` the gateway serves unauthenticated traffic as a
+/// BYO-key passthrough — callers supply their own upstream provider key as
+/// the Bearer token; the operator's env provider keys are still never served.
+const ALLOW_UNAUTHENTICATED_PUBLIC_BIND_VAR: &str = "TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND";
+
+/// Decide which IP the gateway binds, failing closed when an unauthenticated
+/// deployment would be exposed beyond loopback.
+///
+/// Without a persistent key store the auth middleware cannot verify anyone —
+/// every caller is anonymous — so a non-loopback bind would serve the open
+/// internet (or LAN) as an anonymous proxy. The matrix:
+///
+/// * key store configured → today's behavior: `TT_BIND_ADDR` or 0.0.0.0.
+/// * no key store, no `TT_BIND_ADDR` → loopback (dev mode keeps working).
+/// * no key store, loopback `TT_BIND_ADDR` → honored.
+/// * no key store, non-loopback `TT_BIND_ADDR` → refused unless
+///   `TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND=1`.
+fn resolve_gateway_bind(
+    configured: Option<std::net::IpAddr>,
+    key_store_configured: bool,
+    public_opt_in: bool,
+) -> anyhow::Result<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    if key_store_configured {
+        return Ok(configured.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+    match configured {
+        None => Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        Some(ip) if ip.is_loopback() || public_opt_in => Ok(ip),
+        Some(ip) => anyhow::bail!(
+            "refusing to bind {ip}: no persistent key store is configured (DATABASE_URL \
+             unset), so every caller is anonymous and a non-loopback bind would serve an \
+             unauthenticated proxy. Fix one of: set DATABASE_URL to enable tt_live_* key \
+             verification; bind loopback (unset TT_BIND_ADDR or set TT_BIND_ADDR=127.0.0.1); \
+             or, to knowingly run an unauthenticated BYO-key passthrough, set \
+             {ALLOW_UNAUTHENTICATED_PUBLIC_BIND_VAR}=1"
+        ),
+    }
+}
+
+/// Build the provider credential store for the gateway.
+///
+/// With a DB pool: Postgres primary (when `TT_MASTER_KEY` is valid) chained
+/// onto the env fallback — unchanged DB-backed behavior. Without a DB pool
+/// there is no key store, so nothing can verify callers, and the operator's
+/// env provider keys (`OPENAI_API_KEY`, …) must never be served: no
+/// credential store is wired at all, which makes the chat handler fall back
+/// to forwarding the caller's own Bearer key upstream.
+fn build_credential_store(
+    db_pool: Option<&sqlx::PgPool>,
+) -> Option<Arc<dyn tt_auth::ProviderCredentialStore>> {
+    let pool = match db_pool {
+        Some(pool) => pool,
+        None => {
+            tracing::warn!(
+                "no DB pool → no key store; provider credential store disabled — operator env \
+                 provider keys are never served to unverified callers (requests forward the \
+                 caller's own Bearer key upstream)"
+            );
+            return None;
+        }
+    };
+    let env_store = tt_auth::EnvProviderCredentialStore::new();
+    match tt_auth::postgres::PostgresProviderCredentialStore::from_env(pool.clone()) {
+        Ok(pg) => {
+            tracing::info!("provider credentials: Postgres primary + env fallback");
+            Some(Arc::new(tt_auth::ChainedProviderCredentialStore::new(
+                pg, env_store,
+            )))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Postgres credential store unavailable (TT_MASTER_KEY missing / bad); env-only"
+            );
+            Some(Arc::new(env_store))
+        }
+    }
+}
+
 /// Boot the Gateway HTTP server.
 ///
 /// Reads config from env (see [`tt_config::Config::from_env`]). Every external
 /// dependency (DB, Redis) is best-effort at boot: a failure logs + continues
-/// rather than crash-looping the process. Bind / serve are fatal.
+/// rather than crash-looping the process. Bind / serve are fatal — including
+/// the fail-closed refusal to bind a non-loopback address without a key store
+/// (see [`resolve_gateway_bind`]).
 async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
-    let bind = format!("0.0.0.0:{}", config.port);
+    // Fail-closed bind decision, BEFORE any best-effort dependency connects:
+    // a misconfigured public + unauthenticated gateway must not boot at all.
+    let key_store_configured = config.database_url.is_some();
+    let public_opt_in = std::env::var(ALLOW_UNAUTHENTICATED_PUBLIC_BIND_VAR).as_deref() == Ok("1");
+    let bind_ip = resolve_gateway_bind(config.bind_addr, key_store_configured, public_opt_in)?;
+    if !key_store_configured {
+        if bind_ip.is_loopback() {
+            tracing::info!(
+                %bind_ip,
+                "no key store configured (DATABASE_URL unset); binding loopback. Set \
+                 DATABASE_URL for tt_live_* verification, or TT_BIND_ADDR + \
+                 {ALLOW_UNAUTHENTICATED_PUBLIC_BIND_VAR}=1 to expose an unauthenticated \
+                 BYO-key passthrough anyway"
+            );
+        } else {
+            tracing::warn!(
+                %bind_ip,
+                "{ALLOW_UNAUTHENTICATED_PUBLIC_BIND_VAR}=1: serving UNAUTHENTICATED traffic \
+                 on a non-loopback address. Callers must bring their own upstream provider \
+                 key as the Bearer token; operator env provider keys are never served"
+            );
+        }
+    }
+    let bind = std::net::SocketAddr::new(bind_ip, config.port);
 
     // Every external connect is wrapped in a 5s budget so a misconfigured
     // hostname can't hang the process past Fly's health-check grace window.
@@ -939,29 +1046,14 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // dogfooding from the operator's own `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
     // / etc. in Fly secrets). The chain means org-specific credentials win,
     // and orgs that haven't onboarded yet fall back to the operator's keys.
-    let env_store = tt_auth::EnvProviderCredentialStore::new();
-    let credential_store: Arc<dyn tt_auth::ProviderCredentialStore> = match db_pool.as_ref() {
-        Some(pool) => {
-            match tt_auth::postgres::PostgresProviderCredentialStore::from_env(pool.clone()) {
-                Ok(pg) => {
-                    tracing::info!("provider credentials: Postgres primary + env fallback");
-                    Arc::new(tt_auth::ChainedProviderCredentialStore::new(pg, env_store))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Postgres credential store unavailable (TT_MASTER_KEY missing / bad); env-only"
-                    );
-                    Arc::new(env_store)
-                }
-            }
-        }
-        None => {
-            tracing::warn!("no DB pool; provider credentials are env-only");
-            Arc::new(env_store)
-        }
-    };
-    state = state.with_credential_store(credential_store);
+    //
+    // SECURITY: without a DB pool there is no key store either, so callers
+    // can't be verified — `build_credential_store` then wires NO store, so the
+    // operator's env keys are unreachable and requests fall back to the
+    // caller's own Bearer key (P0 #21 fail-closed).
+    if let Some(credential_store) = build_credential_store(db_pool.as_ref()) {
+        state = state.with_credential_store(credential_store);
+    }
 
     // Key store: Postgres when a DB pool is available. Without a key store
     // the auth middleware passes `tt_live_*` through unchallenged (dev mode);
@@ -1092,7 +1184,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
 
     let app = tt_core::build_router(state);
 
-    let listener = tokio::net::TcpListener::bind(&bind)
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind} failed"))?;
     tracing::info!(addr = %bind, "gateway listening");
@@ -1124,6 +1216,95 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("shutdown: SIGINT"),
         _ = terminate => tracing::info!("shutdown: SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod gateway_fail_closed_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    const ANY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const PUBLIC: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+
+    // -- startup-config matrix ------------------------------------------------
+
+    #[test]
+    fn with_key_store_default_bind_is_unspecified_unchanged() {
+        // DB-backed deployments keep today's 0.0.0.0 default.
+        assert_eq!(resolve_gateway_bind(None, true, false).unwrap(), ANY);
+    }
+
+    #[test]
+    fn with_key_store_explicit_non_loopback_allowed_without_opt_in() {
+        assert_eq!(resolve_gateway_bind(Some(ANY), true, false).unwrap(), ANY);
+        assert_eq!(
+            resolve_gateway_bind(Some(PUBLIC), true, false).unwrap(),
+            PUBLIC
+        );
+    }
+
+    #[test]
+    fn no_store_default_bind_falls_back_to_loopback() {
+        // Dev mode (`tt gateway` with no DATABASE_URL) keeps working — on
+        // loopback, where the unauthenticated gateway can't be reached from
+        // the network.
+        assert_eq!(resolve_gateway_bind(None, false, false).unwrap(), LOOPBACK);
+    }
+
+    #[test]
+    fn no_store_explicit_loopback_allowed() {
+        assert_eq!(
+            resolve_gateway_bind(Some(LOOPBACK), false, false).unwrap(),
+            LOOPBACK
+        );
+        let v6_lo = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(
+            resolve_gateway_bind(Some(v6_lo), false, false).unwrap(),
+            v6_lo
+        );
+    }
+
+    #[test]
+    fn no_store_non_loopback_refused_with_actionable_error() {
+        for ip in [ANY, PUBLIC, IpAddr::V6(Ipv6Addr::UNSPECIFIED)] {
+            let err = resolve_gateway_bind(Some(ip), false, false)
+                .expect_err("non-loopback bind without a key store must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(ALLOW_UNAUTHENTICATED_PUBLIC_BIND_VAR),
+                "error must name the opt-in env var: {msg}"
+            );
+            assert!(
+                msg.contains("DATABASE_URL"),
+                "error must point at the key-store fix: {msg}"
+            );
+            assert!(
+                msg.contains("TT_BIND_ADDR"),
+                "error must point at the loopback fix: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_store_non_loopback_allowed_with_explicit_opt_in() {
+        assert_eq!(resolve_gateway_bind(Some(ANY), false, true).unwrap(), ANY);
+        assert_eq!(
+            resolve_gateway_bind(Some(PUBLIC), false, true).unwrap(),
+            PUBLIC
+        );
+    }
+
+    // -- credential-store wiring ------------------------------------------------
+
+    #[test]
+    fn no_db_pool_wires_no_credential_store() {
+        // Without a key store nothing can verify callers, so the operator's
+        // env provider keys (OPENAI_API_KEY, …) must be unreachable: no
+        // credential store at all → the chat handler falls back to forwarding
+        // the caller's own Bearer key upstream.
+        assert!(build_credential_store(None).is_none());
     }
 }
 

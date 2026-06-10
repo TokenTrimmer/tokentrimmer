@@ -71,6 +71,14 @@ pub struct CacheEntry {
     pub input_tokens: u64,
     /// Number of completion tokens produced.
     pub output_tokens: u64,
+    /// Catalog-derived baseline cost (USD) of producing this response — what
+    /// the original request would have paid with no cache, computed at insert
+    /// time from the versioned pricing catalog (the same math as the gateway's
+    /// `compute_cost`). `None` for rows inserted before migration 0010, or
+    /// when the model was absent from the catalog at insert time; the hit
+    /// path then re-prices the stored model/token counts against the current
+    /// catalog (or reports 0 saved) rather than fabricating a number.
+    pub baseline_cost_usd: Option<f64>,
     /// How many times this entry has been served from cache.
     pub hit_count: u64,
     /// Wall-clock time the entry was created.
@@ -258,6 +266,7 @@ pub fn l2_context_text(req: &ChatCompletionRequest) -> Option<String> {
 ///     embedding_model: "text-embedding-3-small".to_string(),
 ///     input_tokens: 10,
 ///     output_tokens: 5,
+///     baseline_cost_usd: Some(0.000045),
 ///     hit_count: 0,
 ///     created_at: Utc::now(),
 ///     expires_at: Utc::now() + chrono::Duration::seconds(3600),
@@ -417,8 +426,9 @@ impl L2Cache for PostgresL2Cache {
             r#"
             INSERT INTO cache_entries
                 (id, org_id, embedding, response, model, embedding_model,
-                 input_tokens, output_tokens, hit_count, created_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 input_tokens, output_tokens, baseline_cost_usd, hit_count,
+                 created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT DO NOTHING
             "#,
         )
@@ -433,6 +443,7 @@ impl L2Cache for PostgresL2Cache {
         .bind(&entry.embedding_model)
         .bind(entry.input_tokens as i64)
         .bind(entry.output_tokens as i64)
+        .bind(entry.baseline_cost_usd)
         .bind(entry.hit_count as i64)
         .bind(entry.created_at)
         .bind(entry.expires_at)
@@ -478,7 +489,8 @@ impl L2Cache for PostgresL2Cache {
         let row = sqlx::query(
             r#"
             SELECT id, org_id, embedding, response, model, embedding_model,
-                   input_tokens, output_tokens, hit_count, created_at, expires_at,
+                   input_tokens, output_tokens, baseline_cost_usd, hit_count,
+                   created_at, expires_at,
                    CAST(1.0 - (embedding <=> $2) AS REAL) AS similarity
               FROM cache_entries
              WHERE org_id = $1
@@ -513,8 +525,15 @@ impl L2Cache for PostgresL2Cache {
         let model: String = row.try_get("model").map_err(CacheError::Sqlx)?;
         let embedding_model_col: String =
             row.try_get("embedding_model").map_err(CacheError::Sqlx)?;
-        let input_tokens: i64 = row.try_get("input_tokens").map_err(CacheError::Sqlx)?;
-        let output_tokens: i64 = row.try_get("output_tokens").map_err(CacheError::Sqlx)?;
+        // `input_tokens` / `output_tokens` are INT (INT4) in the schema
+        // (migration 0002) — sqlx's strict decoding rejects an i64 read.
+        let input_tokens: i32 = row.try_get("input_tokens").map_err(CacheError::Sqlx)?;
+        let output_tokens: i32 = row.try_get("output_tokens").map_err(CacheError::Sqlx)?;
+        // NULL for rows inserted before migration 0010 (or when the model was
+        // missing from the catalog at insert) — surfaced as `None` so the hit
+        // path can apply its honest fallback instead of a fabricated rate.
+        let baseline_cost_usd: Option<f64> =
+            row.try_get("baseline_cost_usd").map_err(CacheError::Sqlx)?;
         let hit_count: i64 = row.try_get("hit_count").map_err(CacheError::Sqlx)?;
         let created_at: DateTime<Utc> = row.try_get("created_at").map_err(CacheError::Sqlx)?;
         let expires_at: DateTime<Utc> = row.try_get("expires_at").map_err(CacheError::Sqlx)?;
@@ -529,8 +548,9 @@ impl L2Cache for PostgresL2Cache {
             response: response_bytes,
             model,
             embedding_model: embedding_model_col,
-            input_tokens: input_tokens as u64,
-            output_tokens: output_tokens as u64,
+            input_tokens: input_tokens.max(0) as u64,
+            output_tokens: output_tokens.max(0) as u64,
+            baseline_cost_usd,
             hit_count: hit_count as u64,
             created_at,
             expires_at,
@@ -594,6 +614,7 @@ mod tests {
             embedding_model: "mock-v1".into(),
             input_tokens: 1,
             output_tokens: 1,
+            baseline_cost_usd: None,
             hit_count: 0,
             created_at: now,
             expires_at: now + chrono::Duration::seconds(3600),
