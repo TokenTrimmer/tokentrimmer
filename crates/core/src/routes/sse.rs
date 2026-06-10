@@ -11,6 +11,17 @@
 //! completion **or** client-abort), the guard fires a closure that writes a
 //! `request_logs` row with the partial usage.  The row carries
 //! `truncated = true` when no `finish_reason` chunk was observed before drop.
+//!
+//! ## Span attributes
+//!
+//! The same drop guard also records the OpenTelemetry GenAI semconv +
+//! TokenTrimmer cost attributes (`gen_ai.*` / `tokentrimmer.*`) onto the
+//! captured `http_request` span via [`StreamSpanContext`].  Streaming cost is
+//! only known once the stream drains, and the request span has already exited by
+//! the time the SSE body is polled — so the handler captures the span handle and
+//! the guard stamps the attributes onto it from the same `compute_cost`
+//! breakdown it computes for the row.  This keeps streaming traffic in the
+//! spend/savings/tokens/cache dashboards, matching the non-streaming path.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -25,6 +36,8 @@ use axum::response::{
 use chrono::Utc;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use uuid::Uuid;
+
+use tracing::Span;
 
 use tt_cache::{CacheEntry, L1Entry};
 use tt_shared::{
@@ -282,6 +295,36 @@ pub struct CacheInsertContext {
     pub org_id: Uuid,
 }
 
+// ─── StreamSpanContext ──────────────────────────────────────────────────────────
+
+/// Metadata + the captured gateway request span needed to record the OTel
+/// GenAI semconv + TokenTrimmer cost attributes when the SSE stream terminates.
+///
+/// The cost is only known once the stream drains (the [`DropGuard`] computes it
+/// from the accumulated usage), and the stream body is polled *after* the
+/// handler future — and thus the `http_request` span — has already exited. So we
+/// capture the span handle here (cloning a [`Span`] keeps it open) and record
+/// the attributes onto it from inside the guard, mirroring the non-streaming
+/// path's call to `record_request_span_attributes`. The token + cost figures
+/// are pulled from the same `compute_cost` breakdown the guard computes for the
+/// `request_logs` row and the `tokentrimmer.usage` frame — nothing is recomputed.
+pub struct StreamSpanContext {
+    /// The gateway `http_request` span, captured in the handler so the guard can
+    /// stamp attributes onto it after the handler future has exited.
+    pub span: Span,
+    /// TokenTrimmer provider id → `gen_ai.system` / `gen_ai.provider.name`.
+    pub provider_id: String,
+    /// Model the caller asked for → `gen_ai.request.model`.
+    pub request_model: String,
+    /// Model that served the request → `gen_ai.response.model`.
+    pub response_model: String,
+    /// Cache outcome → `tokentrimmer.cache` (`miss` when a cache layer is wired
+    /// on the live streaming path, `none` otherwise).
+    pub cache_outcome: String,
+    /// Matched route name → `tokentrimmer.route` (when routing applied).
+    pub route: Option<String>,
+}
+
 // ─── LogContext ───────────────────────────────────────────────────────────────
 
 /// Caller-supplied metadata needed to construct the `request_logs` row when
@@ -324,6 +367,13 @@ pub struct StreamLogContext {
     /// frame and `[DONE]` — synthesized from accumulated usage only when the
     /// provider did not already forward a standalone usage chunk.
     pub include_usage: bool,
+    /// Optional OTel GenAI semconv + cost span-attribute context. When `Some`,
+    /// the [`DropGuard`] records `gen_ai.*` + `tokentrimmer.*` attributes onto
+    /// the captured `http_request` span once the per-request cost is known —
+    /// mirroring the non-streaming path so streaming traffic is not dropped from
+    /// the spend/savings/tokens/cache dashboards. `None` skips recording (e.g.
+    /// the fake-stream cache-hit path, which logs its own row separately).
+    pub span_ctx: Option<StreamSpanContext>,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -562,6 +612,7 @@ pub fn stream_response(
             let log_trace_id = ctx.trace_id;
             let spend_sink = ctx.spend_sink.clone();
             let cache_insert = ctx.cache_insert;
+            let span_ctx = ctx.span_ctx;
 
             let guard = DropGuard::new(move || {
                 let inner = shared_for_guard
@@ -590,6 +641,35 @@ pub fn stream_response(
 
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, cost_usd, Utc::now());
+
+                // Record OTel GenAI semconv + TokenTrimmer cost attributes onto
+                // the captured `http_request` span, mirroring the non-streaming
+                // path. Done here (not in the handler) because the cost is only
+                // known once the stream drains, and the span handle was captured
+                // so it is still open after the handler future exited. Pulls
+                // from the same `breakdown` + `usage` as the request_logs row —
+                // nothing recomputed. No-op on a span with no OTel layer.
+                if let Some(sc) = span_ctx.as_ref() {
+                    tt_telemetry::gen_ai::record_request_attributes(
+                        &sc.span,
+                        &tt_telemetry::gen_ai::RequestSpanAttributes {
+                            provider_id: &sc.provider_id,
+                            request_model: &sc.request_model,
+                            response_model: &sc.response_model,
+                            operation: "chat",
+                            cost: tt_telemetry::gen_ai::RequestSpanCost {
+                                input_tokens: usage.input_tokens.max(0) as u64,
+                                output_tokens: usage.output_tokens.max(0) as u64,
+                                cost_usd,
+                                baseline_cost_usd,
+                                saved_usd: breakdown.tt_saved_usd(),
+                                provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+                            },
+                            cache_outcome: Some(&sc.cache_outcome),
+                            route: sc.route.as_deref(),
+                        },
+                    );
+                }
 
                 let row = RequestLogRow {
                     id: Uuid::now_v7(),

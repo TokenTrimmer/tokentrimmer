@@ -14,6 +14,7 @@ tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
 blake3.workspace = true
@@ -36,6 +37,9 @@ postgres = ["dep:sqlx"]
 
 [dev-dependencies]
 tokio = { workspace = true }
+# gen_ai span-attribute unit tests: capture the recorded attributes via an
+# in-memory span exporter under a scoped tracing-opentelemetry subscriber.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

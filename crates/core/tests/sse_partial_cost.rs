@@ -159,6 +159,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         fee_multiplier: 1.0,
         cache_insert: None,
         include_usage: false,
+        span_ctx: None,
     }
 }
 

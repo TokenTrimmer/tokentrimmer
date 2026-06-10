@@ -39,7 +39,7 @@ use tt_shared::{
 use crate::{
     middleware::trace::TraceId,
     retry::{with_retry, RetryPolicy},
-    routes::sse::{self, CacheInsertContext, StreamLogContext},
+    routes::sse::{self, CacheInsertContext, StreamLogContext, StreamSpanContext},
     single_flight::wait_for_leader,
     state::{L1Config, L2Config},
     ApiError, ApiResult, AppState,
@@ -798,6 +798,10 @@ pub async fn handler(
     // of collapsing to ~0 (which happens when baseline is priced against the
     // cheap routed-to model).
     let requested_pricing = provider.pricing(&req.model);
+    // The model the caller asked for, captured before routing rewrites
+    // `req.model`. Recorded as `gen_ai.request.model` on the request span (the
+    // served model becomes `gen_ai.response.model`).
+    let requested_model = req.model.clone();
     let route_match = apply_routing(&state, &ctx, &mut req, forced_route.as_deref()).await?;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
     // The applied route's name (forced or condition-matched) for the
@@ -1015,6 +1019,36 @@ pub async fn handler(
                                 matched_route_id,
                             ),
                         );
+                        // Record OTel GenAI semconv + cost span attributes for the
+                        // fake-stream L1 hit. The cost is already known here (a hit
+                        // never reaches a provider → cost 0, full baseline saved),
+                        // and `Span::current()` is still the `http_request` span,
+                        // so we stamp synchronously — mirroring the non-streaming
+                        // `build_hit_l1_response`. The `None` log_ctx below means
+                        // the SSE drop guard records nothing, so without this the
+                        // streaming L1 hit would be invisible to the dashboards.
+                        let baseline_cost_usd = if entry.is_legacy_format() {
+                            synthetic_baseline_from_usage(&entry.response.usage)
+                        } else {
+                            entry.baseline_cost_usd
+                        };
+                        let hit_cost = CostBreakdown {
+                            cost_usd: 0.0,
+                            baseline_cost_usd,
+                            provider_cache_saved_usd: 0.0,
+                        };
+                        record_request_span_attributes(
+                            &entry.response.model,
+                            &entry.response.model,
+                            "cache",
+                            span_cost(
+                                &hit_cost,
+                                entry.response.usage.prompt_tokens,
+                                entry.response.usage.completion_tokens,
+                            ),
+                            "hit-l1",
+                            None,
+                        );
                         let fake = sse::fake_stream_from_response(entry.response);
                         // L1 hit already logged above; no need for a second row.
                         return Ok(with_route_matched(
@@ -1133,10 +1167,37 @@ pub async fn handler(
                 None
             };
 
-        // Build a StreamLogContext whenever either telemetry or cache insertion
-        // is needed. writer=None skips the request_logs row without preventing
-        // cache writes (tests, dev mode without a DB).
-        let needs_tracking = state.request_log_writer.is_some() || stream_cache_insert.is_some();
+        // OTel GenAI semconv + cost span attributes for the streaming path. The
+        // cost is only known once the stream drains, and the `http_request` span
+        // has already exited by the time the SSE body is polled — so capture the
+        // span handle here (cloning keeps it open) and let the DropGuard stamp
+        // the attributes onto it once the cost is computed, mirroring the
+        // non-streaming `record_request_span_attributes` call. Without this,
+        // every streaming request would carry none of the gen_ai.*/tokentrimmer.*
+        // attributes and the dashboards would undercount streaming traffic.
+        //
+        // Cache state: `miss` when a cache layer is wired (the L1 fake-stream
+        // lookup above didn't hit), `none` when neither L1 nor L2 is configured.
+        let stream_cache_state = if state.l1.is_some() || state.l2.is_some() {
+            "miss"
+        } else {
+            "none"
+        };
+        let span_ctx = Some(StreamSpanContext {
+            span: tracing::Span::current(),
+            provider_id: provider.id().to_string(),
+            request_model: requested_model.clone(),
+            response_model: served_model.clone(),
+            cache_outcome: stream_cache_state.to_string(),
+            route: route_matched_name.clone(),
+        });
+
+        // Build a StreamLogContext whenever telemetry, span attributes, or cache
+        // insertion is needed. writer=None skips the request_logs row without
+        // preventing span recording / cache writes (tests, dev mode without a DB).
+        let needs_tracking = state.request_log_writer.is_some()
+            || stream_cache_insert.is_some()
+            || span_ctx.is_some();
         let log_ctx = if needs_tracking {
             Some(StreamLogContext {
                 writer: state.request_log_writer.as_ref().map(|w| w.clone()),
@@ -1166,6 +1227,7 @@ pub async fn handler(
                 // Honor stream_options.include_usage end-to-end: emit an
                 // OpenAI-native final usage chunk when the client asked for it.
                 include_usage: client_requested_include_usage(&req),
+                span_ctx,
             })
         } else {
             None
@@ -1491,6 +1553,10 @@ pub async fn handler(
 
         let provider_id = provider.id().to_string();
         let model_used = response.model.clone();
+        // Token counts for the request-span attributes, captured before
+        // `response` is moved into the HTTP body below.
+        let input_tokens = response.usage.prompt_tokens;
+        let output_tokens = response.usage.completion_tokens;
 
         // 3e. Best-effort L1 insert. Gated on do_insert (Fix A + Fix B) and
         //     the response not containing tool_calls (non-deterministic output).
@@ -1656,6 +1722,19 @@ pub async fn handler(
                     .insert("x-tokentrimmer-route-matched", v);
             }
         }
+
+        // Record OTel GenAI semconv + TokenTrimmer cost attributes on the
+        // request span from the same per-request values the headers carry (no
+        // recompute). The served model may differ from the requested one after
+        // routing / cross-model failover.
+        record_request_span_attributes(
+            &requested_model,
+            &model_used,
+            &provider_id,
+            span_cost(&cost_breakdown, input_tokens, output_tokens),
+            cache_state,
+            route_matched_name.as_deref(),
+        );
         attach_warnings(
             http_response.headers_mut(),
             provider.as_ref(),
@@ -1781,27 +1860,40 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         entry.baseline_cost_usd
     };
     let model_used = entry.response.model.clone();
+    let input_tokens = entry.response.usage.prompt_tokens;
+    let output_tokens = entry.response.usage.completion_tokens;
 
     let mut http_response = Json(entry.response).into_response();
     // A TT cache hit never reaches the provider — the full baseline is
     // TT-attributed (saved == baseline) and there is no provider-side
     // cache discount.
+    let cost = CostBreakdown {
+        cost_usd: 0.0,
+        baseline_cost_usd,
+        provider_cache_saved_usd: 0.0,
+    };
     attach_cost_headers(
         http_response.headers_mut(),
         trace_id,
         "cache",
         &model_used,
-        &CostBreakdown {
-            cost_usd: 0.0,
-            baseline_cost_usd,
-            provider_cache_saved_usd: 0.0,
-        },
+        &cost,
     );
     if let Ok(v) = "hit-l1".parse() {
         http_response
             .headers_mut()
             .insert("x-tokentrimmer-cache", v);
     }
+    // A cache hit never re-runs routing, so the requested model equals the
+    // served (cached) model here.
+    record_request_span_attributes(
+        &model_used,
+        &model_used,
+        "cache",
+        span_cost(&cost, input_tokens, output_tokens),
+        "hit-l1",
+        None,
+    );
     http_response
 }
 
@@ -1832,23 +1924,36 @@ fn build_hit_l2_response(
     // savings, all TT-attributed) with no provider-side cache discount.
     let provider_id = "cache".to_string();
     let model_used = entry.model.clone();
+    let input_tokens = response.usage.prompt_tokens;
+    let output_tokens = response.usage.completion_tokens;
+    let cost = CostBreakdown {
+        cost_usd: 0.0,
+        baseline_cost_usd,
+        provider_cache_saved_usd: 0.0,
+    };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
         http_response.headers_mut(),
         trace_id,
         &provider_id,
         &model_used,
-        &CostBreakdown {
-            cost_usd: 0.0,
-            baseline_cost_usd,
-            provider_cache_saved_usd: 0.0,
-        },
+        &cost,
     );
     if let Ok(v) = "hit-l2".parse() {
         http_response
             .headers_mut()
             .insert("x-tokentrimmer-cache", v);
     }
+    // A cache hit never re-runs routing, so the requested model equals the
+    // served (cached) model here.
+    record_request_span_attributes(
+        &model_used,
+        &model_used,
+        &provider_id,
+        span_cost(&cost, input_tokens, output_tokens),
+        "hit-l2",
+        None,
+    );
     Ok(http_response)
 }
 
@@ -2215,6 +2320,57 @@ pub(crate) fn attach_cost_headers(
             headers.insert(*name, v);
         }
     }
+}
+
+/// Bridge a [`CostBreakdown`] + token counts to the telemetry crate's
+/// [`tt_telemetry::gen_ai::RequestSpanCost`] (pulling `saved_usd` from
+/// [`CostBreakdown::tt_saved_usd`] — the same headline the header carries).
+fn span_cost(
+    cost: &CostBreakdown,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> tt_telemetry::gen_ai::RequestSpanCost {
+    tt_telemetry::gen_ai::RequestSpanCost {
+        input_tokens,
+        output_tokens,
+        cost_usd: cost.cost_usd,
+        baseline_cost_usd: cost.baseline_cost_usd,
+        saved_usd: cost.tt_saved_usd(),
+        provider_cache_saved_usd: cost.provider_cache_saved_usd,
+    }
+}
+
+/// Record the OpenTelemetry GenAI semantic-convention attributes plus the
+/// TokenTrimmer cost attributes onto the current request span (the gateway's
+/// `http_request` span from [`crate::middleware::trace`]).
+///
+/// Pulls from the same per-request values stamped onto the `x-tokentrimmer-*`
+/// response headers (token usage + [`CostBreakdown`]) — nothing is recomputed.
+/// `request_model` is the model the caller asked for; `response_model` is the
+/// model that actually served the request (they differ after routing /
+/// cross-model failover). On a span with no OpenTelemetry layer (dev `fmt`
+/// subscriber) this is a cheap no-op. This module handles only
+/// `POST /v1/chat/completions`, so the operation is always `chat`.
+fn record_request_span_attributes(
+    request_model: &str,
+    response_model: &str,
+    provider_id: &str,
+    cost: tt_telemetry::gen_ai::RequestSpanCost,
+    cache_outcome: &str,
+    route: Option<&str>,
+) {
+    tt_telemetry::gen_ai::record_request_attributes(
+        &tracing::Span::current(),
+        &tt_telemetry::gen_ai::RequestSpanAttributes {
+            provider_id,
+            request_model,
+            response_model,
+            operation: "chat",
+            cost,
+            cache_outcome: Some(cache_outcome),
+            route,
+        },
+    );
 }
 
 /// Decide which credentials to send to the upstream provider.

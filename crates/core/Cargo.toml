@@ -48,6 +48,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+# W3C `traceparent` ingest: extract an inbound trace context from request
+# headers and continue that trace at the request-span layer
+# (middleware/trace.rs).
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry-http.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
@@ -65,6 +71,10 @@ serde_json.workspace = true
 httpmock.workspace = true
 tt-retrieval.workspace = true
 reqwest.workspace = true
+# Traceparent-ingest test: in-memory span exporter + a scoped tracing-opentelemetry
+# subscriber to capture the gateway request span's trace_id/parent_span_id.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "streaming"
