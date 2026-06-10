@@ -29,7 +29,7 @@ classifiers = [
 # silently no-ops and re-exposes the malformed-chunk crash. Built/tested against
 # 1.70.0; keep the floor at the tested version.
 dependencies = [
-    "openai>=1.70.0,<2.0.0",
+    "openai>=1.70.0,<3.0.0",
     "httpx>=0.27.0",
 ]
 
