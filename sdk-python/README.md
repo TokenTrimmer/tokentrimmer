@@ -44,9 +44,11 @@ stream = client.chat.completions.create(
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="")
 
-# Cost is known once the stream is fully consumed:
-print(f"\ncost  ${stream.tt.cost_usd:.4f}")
-print(f"saved ${stream.tt.saved_usd:.4f}")
+# Cost is known once the stream is fully consumed (`stream.tt` stays None if the
+# Gateway emitted no usage frame, e.g. self-hosted without pricing):
+if stream.tt is not None:
+    print(f"\ncost  ${stream.tt.cost_usd:.4f}")
+    print(f"saved ${stream.tt.saved_usd:.4f}")
 ```
 
 ## Self-hosted Gateway

@@ -36,6 +36,11 @@ from typing import Any, Iterator, Optional
 
 import httpx
 from openai import OpenAI
+
+# Internals dependency: the streaming strip below imports `ServerSentEvent` and
+# swaps the stream's injectable `_decoder` (built via `client._make_sse_decoder()`).
+# These require openai>=1.70.0 (the tested floor pinned in pyproject.toml); on
+# older releases the strip silently no-ops and re-exposes the malformed-chunk crash.
 from openai._streaming import ServerSentEvent
 
 DEFAULT_BASE_URL = "https://api.tokentrimmer.com/v1"
