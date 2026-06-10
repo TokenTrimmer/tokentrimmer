@@ -39,7 +39,7 @@ use tt_shared::{
 use crate::{
     middleware::trace::TraceId,
     retry::{with_retry, RetryPolicy},
-    routes::sse::{self, CacheInsertContext, StreamLogContext},
+    routes::sse::{self, CacheInsertContext, StreamLogContext, StreamSpanContext},
     single_flight::wait_for_leader,
     state::{L1Config, L2Config},
     ApiError, ApiResult, AppState,
@@ -1137,10 +1137,37 @@ pub async fn handler(
                 None
             };
 
-        // Build a StreamLogContext whenever either telemetry or cache insertion
-        // is needed. writer=None skips the request_logs row without preventing
-        // cache writes (tests, dev mode without a DB).
-        let needs_tracking = state.request_log_writer.is_some() || stream_cache_insert.is_some();
+        // OTel GenAI semconv + cost span attributes for the streaming path. The
+        // cost is only known once the stream drains, and the `http_request` span
+        // has already exited by the time the SSE body is polled — so capture the
+        // span handle here (cloning keeps it open) and let the DropGuard stamp
+        // the attributes onto it once the cost is computed, mirroring the
+        // non-streaming `record_request_span_attributes` call. Without this,
+        // every streaming request would carry none of the gen_ai.*/tokentrimmer.*
+        // attributes and the dashboards would undercount streaming traffic.
+        //
+        // Cache state: `miss` when a cache layer is wired (the L1 fake-stream
+        // lookup above didn't hit), `none` when neither L1 nor L2 is configured.
+        let stream_cache_state = if state.l1.is_some() || state.l2.is_some() {
+            "miss"
+        } else {
+            "none"
+        };
+        let span_ctx = Some(StreamSpanContext {
+            span: tracing::Span::current(),
+            provider_id: provider.id().to_string(),
+            request_model: requested_model.clone(),
+            response_model: served_model.clone(),
+            cache_outcome: stream_cache_state.to_string(),
+            route: route_matched_name.clone(),
+        });
+
+        // Build a StreamLogContext whenever telemetry, span attributes, or cache
+        // insertion is needed. writer=None skips the request_logs row without
+        // preventing span recording / cache writes (tests, dev mode without a DB).
+        let needs_tracking = state.request_log_writer.is_some()
+            || stream_cache_insert.is_some()
+            || span_ctx.is_some();
         let log_ctx = if needs_tracking {
             Some(StreamLogContext {
                 writer: state.request_log_writer.as_ref().map(|w| w.clone()),
@@ -1170,6 +1197,7 @@ pub async fn handler(
                 // Honor stream_options.include_usage end-to-end: emit an
                 // OpenAI-native final usage chunk when the client asked for it.
                 include_usage: client_requested_include_usage(&req),
+                span_ctx,
             })
         } else {
             None

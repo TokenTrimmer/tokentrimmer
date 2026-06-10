@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
 use tower::util::ServiceExt;
 
@@ -100,10 +100,53 @@ impl Provider for CostMock {
     }
     async fn chat_completion_stream(
         &self,
-        _req: ChatCompletionRequest,
+        req: ChatCompletionRequest,
         _ctx: &RequestContext,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
-        Err(ProviderError::Unsupported("n/a".into()))
+        // Two chunks: a content delta, then a terminal chunk carrying the same
+        // fixed authoritative usage as the non-streaming path so the streamed
+        // cost is deterministic and matches `request_span_carries_*`.
+        use tt_shared::messages::{ChunkChoice, ChunkDelta};
+        let content = ChatCompletionChunk {
+            id: "chatcmpl-cost-stream".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: req.model.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: Some("ok".into()),
+                    tool_calls: vec![],
+                    extra: Default::default(),
+                },
+                finish_reason: None,
+                extra: Default::default(),
+            }],
+            usage: None,
+            extra: Default::default(),
+        };
+        let terminal = ChatCompletionChunk {
+            id: "chatcmpl-cost-stream".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::default(),
+                finish_reason: Some("stop".into()),
+                extra: Default::default(),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: PROMPT_TOKENS,
+                completion_tokens: COMPLETION_TOKENS,
+                total_tokens: PROMPT_TOKENS + COMPLETION_TOKENS,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+            }),
+            extra: Default::default(),
+        };
+        Ok(futures::stream::iter(vec![Ok(content), Ok(terminal)]).boxed())
     }
 }
 
@@ -113,11 +156,11 @@ fn app() -> axum::Router {
     build_router(AppState::new(registry))
 }
 
-fn chat_request() -> Request<Body> {
+fn chat_request(stream: bool) -> Request<Body> {
     let body = json!({
         "model": "gpt-test",
         "messages": [{"role": "user", "content": "hi"}],
-        "stream": false,
+        "stream": stream,
     });
     Request::builder()
         .method("POST")
@@ -129,7 +172,11 @@ fn chat_request() -> Request<Body> {
 
 /// Drive one request through the gateway under a scoped OTel subscriber and
 /// return the captured `http_request` span's attributes as a name→Value map.
-fn run_request_capturing_attrs() -> HashMap<String, Value> {
+///
+/// The response body is fully drained before the span is read: on the streaming
+/// path the gen_ai.*/cost attributes are recorded in the SSE drop guard (once
+/// the per-request cost is known), which only fires when the body is consumed.
+fn run_request_capturing_attrs(stream: bool) -> HashMap<String, Value> {
     let exporter = InMemorySpanExporter::default();
     let provider = TracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -144,8 +191,13 @@ fn run_request_capturing_attrs() -> HashMap<String, Value> {
         .unwrap();
 
     tracing::subscriber::with_default(subscriber, || {
-        let resp = rt.block_on(async { app().oneshot(chat_request()).await.unwrap() });
-        assert_eq!(resp.status(), StatusCode::OK, "route should return 200");
+        rt.block_on(async {
+            let resp = app().oneshot(chat_request(stream)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "route should return 200");
+            // Drain the body so the SSE GuardedStream (and its DropGuard) drops,
+            // recording the streaming span attributes. Harmless for non-stream.
+            let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+        });
     });
 
     provider.force_flush();
@@ -162,7 +214,7 @@ fn run_request_capturing_attrs() -> HashMap<String, Value> {
 
 #[test]
 fn request_span_carries_gen_ai_and_cost_attributes() {
-    let attrs = run_request_capturing_attrs();
+    let attrs = run_request_capturing_attrs(false);
 
     // GenAI semantic-convention attributes.
     assert_eq!(
@@ -220,6 +272,68 @@ fn request_span_carries_gen_ai_and_cost_attributes() {
         "no cache layer configured in this test → cache outcome 'none'"
     );
     // Present even when zero so spend/savings panels can sum across spans.
+    assert!(attrs.contains_key("tokentrimmer.baseline_cost_usd"));
+    assert!(attrs.contains_key("tokentrimmer.provider_cache_saved_usd"));
+}
+
+/// A streaming `POST /v1/chat/completions` (`stream: true`) must leave the same
+/// gen_ai.* + cost attributes on the `http_request` span as the non-streaming
+/// path. Cost is computed asynchronously in the SSE drop guard, so this guards
+/// against streaming traffic being silently dropped from the spend/savings/
+/// tokens/cache dashboards.
+#[test]
+fn streaming_request_span_carries_gen_ai_and_cost_attributes() {
+    let attrs = run_request_capturing_attrs(true);
+
+    // GenAI semantic-convention attributes — identical mapping to non-stream.
+    assert_eq!(
+        attrs.get("gen_ai.system"),
+        Some(&Value::String("openai".into())),
+        "streaming: gen_ai.system must map the provider id"
+    );
+    assert_eq!(
+        attrs.get("gen_ai.operation.name"),
+        Some(&Value::String("chat".into()))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.request.model"),
+        Some(&Value::String("gpt-test".into()))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.response.model"),
+        Some(&Value::String("gpt-test".into()))
+    );
+    assert_eq!(
+        attrs.get("gen_ai.usage.input_tokens"),
+        Some(&Value::I64(PROMPT_TOKENS as i64)),
+        "streaming: input tokens come from the terminal usage chunk"
+    );
+    assert_eq!(
+        attrs.get("gen_ai.usage.output_tokens"),
+        Some(&Value::I64(COMPLETION_TOKENS as i64)),
+        "streaming: output tokens come from the terminal usage chunk"
+    );
+
+    // TokenTrimmer cost attributes — same deterministic cost as non-stream.
+    let expected_cost =
+        (PROMPT_TOKENS as f64) * 1.0 / 1_000_000.0 + (COMPLETION_TOKENS as f64) * 2.0 / 1_000_000.0;
+    match attrs.get("tokentrimmer.cost_usd") {
+        Some(Value::F64(c)) => assert!(
+            (c - expected_cost).abs() < 1e-12,
+            "streaming tokentrimmer.cost_usd = {c}, expected {expected_cost}"
+        ),
+        other => panic!("streaming tokentrimmer.cost_usd should be an f64, got {other:?}"),
+    }
+    assert_eq!(
+        attrs.get("tokentrimmer.saved_usd"),
+        Some(&Value::F64(0.0)),
+        "streaming: saved_usd is 0 with no routing/cache saving"
+    );
+    assert_eq!(
+        attrs.get("tokentrimmer.cache"),
+        Some(&Value::String("none".into())),
+        "streaming: no cache layer configured → cache outcome 'none'"
+    );
     assert!(attrs.contains_key("tokentrimmer.baseline_cost_usd"));
     assert!(attrs.contains_key("tokentrimmer.provider_cache_saved_usd"));
 }
