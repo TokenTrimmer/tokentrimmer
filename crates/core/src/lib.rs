@@ -24,7 +24,9 @@ pub use db::{connect, migrate, migrate_only, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use middleware::retrieval::RetrievalState;
-pub use registry::{register_providers, ProviderRegistry, ProvidersConfig};
+pub use registry::{
+    register_providers, spawn_openrouter_catalog_refresh, ProviderRegistry, ProvidersConfig,
+};
 pub use retry::{with_retry, RetryPolicy};
 pub use server::{build_router, build_router_with_retrieval};
 pub use state::AppState;
