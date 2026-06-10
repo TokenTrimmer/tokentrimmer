@@ -36,10 +36,13 @@ fn content_chunk(text: &str) -> ChatCompletionChunk {
                 role: None,
                 content: Some(text.into()),
                 tool_calls: vec![],
+                extra: Default::default(),
             },
             finish_reason: None,
+            extra: Default::default(),
         }],
         usage: None,
+        extra: Default::default(),
     }
 }
 
@@ -53,6 +56,7 @@ fn finish_chunk(completion_tokens: u64) -> ChatCompletionChunk {
             index: 0,
             delta: ChunkDelta::default(),
             finish_reason: Some("stop".into()),
+            extra: Default::default(),
         }],
         usage: Some(Usage {
             prompt_tokens: 20,
@@ -61,6 +65,7 @@ fn finish_chunk(completion_tokens: u64) -> ChatCompletionChunk {
             cached_tokens: 0,
             cache_creation_input_tokens: None,
         }),
+        extra: Default::default(),
     }
 }
 
@@ -144,6 +149,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         spend_sink: tt_core::budget::SpendSink::None,
         fee_multiplier: 1.0,
         cache_insert: None,
+        include_usage: false,
     }
 }
 
@@ -350,6 +356,180 @@ async fn sse_emits_terminal_usage_event_before_done() {
     assert!(
         usage_pos < done_pos,
         "usage event must precede [DONE]; body:\n{text}"
+    );
+}
+
+// ─── GW-STREAM: include_usage end-to-end ─────────────────────────────────────
+
+/// (a) When the client set `stream_options.include_usage = true`, the gateway
+/// must emit an OpenAI-native final usage chunk (`choices: []`, populated
+/// `usage`) before `[DONE]`, even when the provider folded usage into its
+/// finish_reason chunk (as Anthropic/Gemini do) rather than emitting a
+/// standalone usage chunk.
+#[tokio::test]
+async fn include_usage_emits_openai_native_usage_chunk() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+    // Provider folds usage into the finish chunk (no standalone usage chunk).
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("Hi")), Ok(finish_chunk(5))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let mut ctx = make_log_ctx(Arc::clone(&writer));
+    ctx.include_usage = true;
+
+    let response = stream_response(stream, &provider, Uuid::nil(), Some(ctx));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+
+    // A standalone OpenAI-native usage chunk: empty choices + a usage block,
+    // emitted as a normal `data:` SSE chunk (not the tokentrimmer.usage frame).
+    let usage_chunk_line = text
+        .lines()
+        .find(|l| l.contains("\"choices\":[]") && l.contains("\"usage\""))
+        .unwrap_or_else(|| panic!("expected OpenAI-native usage chunk; body:\n{text}"));
+    let v: serde_json::Value =
+        serde_json::from_str(usage_chunk_line.trim_start_matches("data:").trim()).unwrap();
+    assert_eq!(v["object"], "chat.completion.chunk");
+    assert!(v["choices"].as_array().unwrap().is_empty());
+    assert_eq!(v["usage"]["completion_tokens"], 5);
+    assert_eq!(v["usage"]["prompt_tokens"], 20);
+
+    // The usage chunk must precede the tokentrimmer.usage frame and [DONE].
+    let chunk_pos = text.find("\"choices\":[]").unwrap();
+    let tt_pos = text.find("tokentrimmer.usage").unwrap();
+    let done_pos = text.find("[DONE]").unwrap();
+    assert!(chunk_pos < tt_pos, "usage chunk must precede tt frame");
+    assert!(tt_pos < done_pos, "tt frame must precede [DONE]");
+}
+
+/// (a-neg) When the client did NOT request include_usage, the gateway must not
+/// inject a standalone OpenAI-native usage chunk (a chunk with empty choices).
+/// The provider's own folded-usage finish chunk is untouched.
+#[tokio::test]
+async fn no_include_usage_does_not_inject_standalone_usage_chunk() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("Hi")), Ok(finish_chunk(5))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    // include_usage defaults to false in make_log_ctx.
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(make_log_ctx(Arc::clone(&writer))),
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+
+    assert!(
+        !text.contains("\"choices\":[]"),
+        "should not inject a standalone empty-choices usage chunk; body:\n{text}"
+    );
+}
+
+/// (b) The `tokentrimmer.usage` frame keeps its documented shape exactly — the
+/// parallel SDK lane parses it. Adding the include_usage chunk must not change
+/// these fields.
+#[tokio::test]
+async fn tokentrimmer_usage_frame_shape_unchanged_with_include_usage() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("Hi")), Ok(finish_chunk(5))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let mut ctx = make_log_ctx(Arc::clone(&writer));
+    ctx.include_usage = true;
+
+    let response = stream_response(stream, &provider, Uuid::nil(), Some(ctx));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+
+    // Find the `event: tokentrimmer.usage` frame's data line.
+    let mut lines = text.lines().peekable();
+    let mut data_json: Option<serde_json::Value> = None;
+    while let Some(line) = lines.next() {
+        if line.trim() == "event: tokentrimmer.usage" {
+            // The data line follows the event line.
+            let data_line = lines
+                .find(|l| l.starts_with("data:"))
+                .expect("tokentrimmer.usage frame must have a data line");
+            data_json =
+                Some(serde_json::from_str(data_line.trim_start_matches("data:").trim()).unwrap());
+            break;
+        }
+    }
+    let v = data_json.expect("tokentrimmer.usage frame present");
+    // Documented golden keys — the parallel SDK depends on these EXACTLY.
+    for key in [
+        "cost_usd",
+        "baseline_cost_usd",
+        "saved_usd",
+        "provider_cache_saved_usd",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+    ] {
+        assert!(
+            v.get(key).is_some(),
+            "tokentrimmer.usage frame missing documented key `{key}`; frame:\n{v}"
+        );
+    }
+    let obj = v.as_object().unwrap();
+    assert_eq!(
+        obj.len(),
+        7,
+        "tokentrimmer.usage frame must carry exactly the 7 documented keys; got {obj:?}"
+    );
+    assert_eq!(v["input_tokens"], 20);
+    assert_eq!(v["output_tokens"], 5);
+}
+
+/// (c) An injected unknown field on a provider chunk survives the gateway's
+/// serialize round-trip rather than being silently dropped.
+#[tokio::test]
+async fn unknown_provider_chunk_field_survives_passthrough() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+
+    let mut content = content_chunk("Hi");
+    content
+        .extra
+        .insert("system_fingerprint".into(), serde_json::json!("fp_zzz"));
+    content.choices[0]
+        .extra
+        .insert("logprobs".into(), serde_json::json!({ "content": [] }));
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content), Ok(finish_chunk(5))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(make_log_ctx(Arc::clone(&writer))),
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+
+    assert!(
+        text.contains("\"system_fingerprint\":\"fp_zzz\""),
+        "unknown top-level chunk field must survive; body:\n{text}"
+    );
+    assert!(
+        text.contains("\"logprobs\""),
+        "unknown per-choice chunk field must survive; body:\n{text}"
     );
 }
 

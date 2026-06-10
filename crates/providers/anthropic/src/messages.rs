@@ -1054,10 +1054,13 @@ mod tests {
                     role: None,
                     content: content.map(str::to_string),
                     tool_calls: vec![],
+                    extra: Default::default(),
                 },
                 finish_reason: finish.map(str::to_string),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 
@@ -1119,10 +1122,13 @@ mod tests {
                             arguments: arguments.to_string(),
                         },
                     }],
+                    extra: Default::default(),
                 },
                 finish_reason: None,
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 

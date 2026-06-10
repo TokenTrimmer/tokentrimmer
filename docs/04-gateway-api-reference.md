@@ -236,10 +236,37 @@ data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1716598234
 
 data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1716598234,"model":"claude-3-5-sonnet-20241022","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":23,"completion_tokens":8,"total_tokens":31,"cached_tokens":0}}
 
+event: tokentrimmer.usage
+data: {"cost_usd":0.000123,"baseline_cost_usd":0.000456,"saved_usd":0.000333,"provider_cache_saved_usd":0.0,"input_tokens":23,"output_tokens":8,"cached_tokens":0}
+
 data: [DONE]
 ```
 
-Usage is included on the final chunk (this differs from OpenAI's default; can be toggled with `stream_options: {"include_usage": false}` to suppress).
+Usage is included on the final content chunk (this differs from OpenAI's default; can be toggled with `stream_options: {"include_usage": false}` to suppress the folded usage block).
+
+**`stream_options.include_usage: true` (OpenAI-native usage chunk).** When the
+client explicitly sets `include_usage: true`, Gateway additionally emits an
+OpenAI-native final usage chunk — a chunk with an **empty `choices` array** and a
+populated `usage` block — immediately before the trailing frames, matching how
+OpenAI streams usage. This is guaranteed end-to-end regardless of which provider
+served the request (for OpenAI-shaped upstreams the provider's own usage chunk is
+forwarded; for Anthropic/Gemini one is synthesized from the accumulated counts):
+
+```
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1716598234,"model":"claude-3-5-sonnet-20241022","choices":[],"usage":{"prompt_tokens":23,"completion_tokens":8,"total_tokens":31,"cached_tokens":0}}
+```
+
+**`event: tokentrimmer.usage` (cost frame).** On clean completion Gateway always
+emits a non-OpenAI `tokentrimmer.usage` SSE frame carrying per-request cost,
+baseline, and savings — so streaming clients can surface savings that response
+headers cannot. Its shape is **stable** (TokenTrimmer SDKs parse it): exactly the
+keys `cost_usd`, `baseline_cost_usd`, `saved_usd`, `provider_cache_saved_usd`,
+`input_tokens`, `output_tokens`, `cached_tokens`. The `include_usage` chunk (when
+requested) is emitted *before* this frame; this frame does not replace it.
+
+**Unknown / newer provider chunk fields** (e.g. `system_fingerprint`,
+per-choice `logprobs`, per-delta `refusal`) are preserved on streaming chunks and
+round-tripped to the client unchanged rather than being dropped.
 
 **Cached responses + streaming:** if a request hits the cache and the client requested streaming, Gateway "fake-streams" the cached response back in chunks. This preserves UX consistency.
 

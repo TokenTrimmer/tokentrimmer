@@ -220,6 +220,9 @@ struct RawChunk {
     choices: Vec<RawChoice>,
     #[serde(default)]
     usage: Option<Usage>,
+    /// Unknown / newer top-level chunk fields preserved for round-trip passthrough.
+    #[serde(flatten, default)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +233,9 @@ struct RawChoice {
     delta: RawDelta,
     #[serde(default)]
     finish_reason: Option<String>,
+    /// Unknown per-choice fields (e.g. `logprobs`) preserved for passthrough.
+    #[serde(flatten, default)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -240,6 +246,9 @@ struct RawDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<RawToolCallDelta>,
+    /// Unknown per-delta fields (e.g. `refusal`) preserved for passthrough.
+    #[serde(flatten, default)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -280,11 +289,14 @@ impl RawChunk {
                         role: c.delta.role,
                         content: c.delta.content,
                         tool_calls: Vec::new(),
+                        extra: c.delta.extra,
                     },
                     finish_reason: c.finish_reason,
+                    extra: c.extra,
                 })
                 .collect(),
             usage: self.usage,
+            extra: self.extra,
         }
     }
 }
@@ -406,8 +418,10 @@ impl ToolAccum {
                     role: None,
                     content: None,
                     tool_calls,
+                    extra: Default::default(),
                 },
                 finish_reason: finish_reason.clone(),
+                extra: Default::default(),
             })
             .collect();
         Some(ChatCompletionChunk {
@@ -417,6 +431,7 @@ impl ToolAccum {
             model: meta.model,
             choices,
             usage,
+            extra: Default::default(),
         })
     }
 }
@@ -449,11 +464,14 @@ fn content_chunk(raw: &RawChunk) -> Option<ChatCompletionChunk> {
                     role: c.delta.role.clone(),
                     content: c.delta.content.clone(),
                     tool_calls: Vec::new(),
+                    extra: c.delta.extra.clone(),
                 },
                 finish_reason: None,
+                extra: c.extra.clone(),
             })
             .collect(),
         usage: None,
+        extra: raw.extra.clone(),
     })
 }
 
@@ -645,6 +663,32 @@ mod tests {
     }
 
     #[test]
+    fn unknown_chunk_fields_round_trip_through_pipeline() {
+        // An upstream SSE chunk carrying newer/unknown fields (top-level, per-
+        // choice, per-delta) must survive parse → handle_raw_chunk → serialize.
+        let chunk_json = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","system_fingerprint":"fp_x","choices":[{"index":0,"delta":{"content":"Hi","refusal":null},"finish_reason":null,"logprobs":{"content":[]}}]}"#;
+        let event = format!("data: {chunk_json}\n\n");
+        let mut acc = ToolAccum::default();
+        let mut canonical = Vec::new();
+        for ev in parse_sse_event(event.as_bytes()) {
+            if let SseEvent::Chunk(raw) = ev {
+                canonical.extend(handle_raw_chunk(&mut acc, raw));
+            }
+        }
+        assert_eq!(canonical.len(), 1);
+        let out = serde_json::to_value(&canonical[0]).unwrap();
+        assert_eq!(out["system_fingerprint"], "fp_x");
+        assert_eq!(
+            out["choices"][0]["logprobs"],
+            serde_json::json!({ "content": [] })
+        );
+        assert_eq!(
+            out["choices"][0]["delta"]["refusal"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn parse_sse_event_done() {
         let results = parse_sse_event(b"data: [DONE]\n\n");
         assert_eq!(results.len(), 1);
@@ -686,10 +730,13 @@ mod tests {
                     role: None,
                     content: None,
                     tool_calls,
+                    extra: Default::default(),
                 },
                 finish_reason: finish_reason.map(String::from),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         }
     }
 
@@ -760,10 +807,13 @@ mod tests {
                     role: None,
                     content: Some("Hi".into()),
                     tool_calls: vec![],
+                    extra: Default::default(),
                 },
                 finish_reason: None,
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         };
         let out = handle_raw_chunk(&mut acc, raw);
         assert_eq!(out.len(), 1);
@@ -787,10 +837,13 @@ mod tests {
                     role: Some("assistant".into()),
                     content: None,
                     tool_calls: vec![frag(0, Some("call_1"), Some("f"), "{}")],
+                    extra: Default::default(),
                 },
                 finish_reason: None,
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         };
         let out = handle_raw_chunk(&mut acc, first);
         // One chunk: the role/content carrier (the tool fragment is swallowed).
@@ -822,8 +875,10 @@ mod tests {
                         role: None,
                         content: None,
                         tool_calls: vec![frag(0, Some("call_0"), Some("f0"), "{}")],
+                        extra: Default::default(),
                     },
                     finish_reason: Some("tool_calls".into()),
+                    extra: Default::default(),
                 },
                 RawChoice {
                     index: 1,
@@ -831,11 +886,14 @@ mod tests {
                         role: None,
                         content: None,
                         tool_calls: vec![frag(0, Some("call_1"), Some("f1"), "{}")],
+                        extra: Default::default(),
                     },
                     finish_reason: Some("tool_calls".into()),
+                    extra: Default::default(),
                 },
             ],
             usage: None,
+            extra: Default::default(),
         };
         let out = handle_raw_chunk(&mut acc, raw);
         assert_eq!(out.len(), 1);

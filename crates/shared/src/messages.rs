@@ -343,6 +343,12 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Genuinely-unknown / newer provider chunk fields (e.g.
+    /// `system_fingerprint`, `service_tier`). Captured via `#[serde(flatten)]`
+    /// so upstream SSE chunks round-trip through the gateway unchanged rather
+    /// than being silently dropped.
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +356,9 @@ pub struct ChunkChoice {
     pub index: u32,
     pub delta: ChunkDelta,
     pub finish_reason: Option<String>,
+    /// Unknown per-choice fields (e.g. `logprobs`) preserved verbatim.
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -360,6 +369,9 @@ pub struct ChunkDelta {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Unknown per-delta fields (e.g. `refusal`) preserved verbatim.
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -483,6 +495,50 @@ mod embeddings_default_tests {
         assert_eq!(out["logprobs"], true);
         assert_eq!(out["top_logprobs"], 5);
         assert_eq!(out["service_tier"], "auto");
+    }
+
+    #[test]
+    fn streaming_chunk_unknown_fields_passthrough() {
+        // Unknown / newer provider fields on a streaming chunk (and on its nested
+        // choice/delta) must survive deserialize and re-serialize verbatim rather
+        // than being silently dropped on the round-trip passthrough.
+        let json = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1716598234,
+            "model": "gpt-4o",
+            "system_fingerprint": "fp_abc123",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "hi", "refusal": null },
+                "finish_reason": null,
+                "logprobs": { "content": [] }
+            }]
+        });
+        let chunk: ChatCompletionChunk = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            chunk.extra.get("system_fingerprint"),
+            Some(&serde_json::json!("fp_abc123"))
+        );
+        assert_eq!(
+            chunk.choices[0].extra.get("logprobs"),
+            Some(&serde_json::json!({ "content": [] }))
+        );
+        assert_eq!(
+            chunk.choices[0].delta.extra.get("refusal"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let out = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(out["system_fingerprint"], "fp_abc123");
+        assert_eq!(
+            out["choices"][0]["logprobs"],
+            serde_json::json!({ "content": [] })
+        );
+        assert_eq!(
+            out["choices"][0]["delta"]["refusal"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

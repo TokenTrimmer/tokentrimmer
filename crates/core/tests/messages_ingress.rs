@@ -124,10 +124,13 @@ impl Provider for AnthropicMock {
                             role: Some("assistant".into()),
                             content: None,
                             tool_calls: vec![],
+                            extra: Default::default(),
                         },
                         finish_reason: None,
+                        extra: Default::default(),
                     }],
                     usage: None,
+                    extra: Default::default(),
                 },
                 ChatCompletionChunk {
                     id: "msg_stream_1".into(),
@@ -140,10 +143,13 @@ impl Provider for AnthropicMock {
                             role: None,
                             content: Some("Hello!".into()),
                             tool_calls: vec![],
+                            extra: Default::default(),
                         },
                         finish_reason: None,
+                        extra: Default::default(),
                     }],
                     usage: None,
+                    extra: Default::default(),
                 },
                 ChatCompletionChunk {
                     id: "msg_stream_1".into(),
@@ -154,8 +160,10 @@ impl Provider for AnthropicMock {
                         index: 0,
                         delta: ChunkDelta::default(),
                         finish_reason: Some("stop".into()),
+                        extra: Default::default(),
                     }],
                     usage: Some(final_usage),
+                    extra: Default::default(),
                 },
             ]
         } else {
@@ -180,10 +188,13 @@ impl Provider for AnthropicMock {
                                 arguments: args.into(),
                             },
                         }],
+                        extra: Default::default(),
                     },
                     finish_reason: None,
+                    extra: Default::default(),
                 }],
                 usage: None,
+                extra: Default::default(),
             };
             vec![
                 tool_chunk("{\"city\""),
@@ -197,8 +208,10 @@ impl Provider for AnthropicMock {
                         index: 0,
                         delta: ChunkDelta::default(),
                         finish_reason: Some("tool_calls".into()),
+                        extra: Default::default(),
                     }],
                     usage: Some(final_usage),
+                    extra: Default::default(),
                 },
             ]
         };
@@ -772,10 +785,13 @@ impl Provider for AnthropicMidStreamErrorMock {
                     role: Some("assistant".into()),
                     content: Some("Partial".into()),
                     tool_calls: vec![],
+                    extra: Default::default(),
                 },
                 finish_reason: None,
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         };
         let items: Vec<Result<ChatCompletionChunk, ProviderError>> = vec![
             Ok(good),
