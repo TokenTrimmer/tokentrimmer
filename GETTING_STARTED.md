@@ -292,7 +292,7 @@ Tools: `preview_cost`, `find_route_for`, `inspect_diff`, `lookup_semantic_cache`
 
 ### 6. `tt proxy` — local listener for coding agents
 
-A local OpenAI/Anthropic-compatible listener (default **port 31415**) that routes through the hosted Gateway and writes per-session cost rollups. Handy for tools like Claude Code, Codex, or anything that reads `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`.
+A local OpenAI/Anthropic-compatible listener (default **port 31415**) that routes OpenAI-wire traffic through the hosted Gateway and writes per-session cost rollups. Handy for tools like Claude Code, Codex, or anything that reads `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`. Note: Anthropic-wire requests (`/v1/messages`) forward directly to the Anthropic upstream in every mode, with your client's own credentials passed through — the Gateway has no Anthropic ingress yet.
 
 ```bash
 tt proxy --mode gateway --tt-api-key tt_live_...
@@ -303,7 +303,7 @@ export ANTHROPIC_BASE_URL=http://localhost:31415
 export OPENAI_BASE_URL=http://localhost:31415
 ```
 
-Modes: `gateway` (default; forward to hosted TT, requires a key), `bypass` (forward straight to the upstream, logging only), `hybrid` (gateway for `/v1/chat/completions`, bypass for everything else). Flags: `--port`, `--bind` (default `127.0.0.1`), `--no-tui`, `--no-preview`, `--session-log <path>`.
+Modes: `gateway` (default; OpenAI-wire endpoints forward to hosted TT with your TokenTrimmer key injected, requires a key), `bypass` (forward straight to the upstream, logging only), `hybrid` (OpenAI-wire endpoints to the gateway, but your client's own credentials pass through). In all three modes `/v1/messages` goes directly to the Anthropic upstream. Flags: `--port`, `--bind` (default `127.0.0.1`), `--no-tui`, `--no-preview`, `--session-log <path>`.
 
 Session log is JSONL at `~/.tokentrimmer/sessions/YYYY-MM-DD.jsonl`; on Ctrl-C the proxy prints a session summary.
 
@@ -383,7 +383,7 @@ tt audit verify path/to/chain.jsonl --key-hex <64-hex-chars>
 These are two different things, easy to confuse:
 
 - **`http://localhost:8080`** — your **self-hosted Gateway** (`tt gateway`). Point your app's `base_url` here when you run TokenTrimmer yourself.
-- **`http://localhost:31415`** — the **`tt proxy`** that forwards to the *hosted* Gateway and tracks per-session cost. Point coding agents (`ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL`) here.
+- **`http://localhost:31415`** — the **`tt proxy`** that forwards OpenAI-wire traffic to the *hosted* Gateway (`/v1/messages` goes directly to the Anthropic upstream — no gateway Anthropic ingress yet) and tracks per-session cost. Point coding agents (`ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL`) here.
 
 ---
 

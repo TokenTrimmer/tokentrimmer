@@ -499,19 +499,13 @@ async fn main() -> anyhow::Result<()> {
             ));
             match transport.as_str() {
                 "stdio" => {
-                    tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(server.run_stdio())?;
+                    server.run_stdio().await?;
                 }
                 "sse" => {
                     let addr: std::net::SocketAddr = format!("127.0.0.1:{sse_port}")
                         .parse()
                         .context("invalid SSE bind address")?;
-                    tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(server.run_sse(addr, api_key))?;
+                    server.run_sse(addr, api_key).await?;
                 }
                 other => {
                     anyhow::bail!("unsupported MCP transport `{other}` (supported: stdio, sse)")
@@ -634,31 +628,24 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Retrieval { action } => {
             use tt_cli::retrieval as cli_retrieval;
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
-                .block_on(async {
-                    match action {
-                        RetrievalAction::DocAdd {
-                            corpus,
-                            path,
-                            openai_key,
-                        } => {
-                            cli_retrieval::add_doc(
-                                &corpus,
-                                std::path::Path::new(&path),
-                                &openai_key,
-                            )
-                            .await
-                        }
-                        RetrievalAction::Search {
-                            corpus,
-                            query,
-                            k,
-                            openai_key,
-                        } => cli_retrieval::search(&corpus, &query, k, &openai_key).await,
-                    }
-                })?;
+            match action {
+                RetrievalAction::DocAdd {
+                    corpus,
+                    path,
+                    openai_key,
+                } => {
+                    cli_retrieval::add_doc(&corpus, std::path::Path::new(&path), &openai_key)
+                        .await?;
+                }
+                RetrievalAction::Search {
+                    corpus,
+                    query,
+                    k,
+                    openai_key,
+                } => {
+                    cli_retrieval::search(&corpus, &query, k, &openai_key).await?;
+                }
+            }
         }
         Command::Route {
             action,
@@ -743,12 +730,7 @@ async fn main() -> anyhow::Result<()> {
                 session_log.map(std::path::PathBuf::from),
             );
             cfg.gateway_base_url = ctx.base_url;
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("tokio runtime")?
-                .block_on(run_listener(cfg))
-                .context("tt proxy listener")?;
+            run_listener(cfg).await.context("tt proxy listener")?;
         }
     }
     Ok(())
