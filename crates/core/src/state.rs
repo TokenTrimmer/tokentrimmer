@@ -130,6 +130,15 @@ pub struct AppState {
     /// Always present. Disabled by setting `l1` to `None` in `AppState`
     /// (single-flight is gated on cache_behavior.do_lookup, which requires L1).
     pub single_flight: Arc<SingleFlight>,
+    /// Sampled async quality-judge config (sample rate, judge model, enable
+    /// flag). Read from `TT_JUDGE_*` env; defaults keep the judge OFF. The chat
+    /// handler consults this on the non-streaming path to decide whether to
+    /// sample a rerouted-DOWN request for an off-path quality judge.
+    pub judge_config: crate::quality_sample::JudgeConfig,
+    /// Optional sink the sampled judge records its [`crate::JudgeOutcome`] into.
+    /// `None` (default) disables the judge entirely regardless of `judge_config`
+    /// — there's nowhere to record. Record-only: the sink never pauses routes.
+    pub judge_sink: Option<Arc<dyn crate::quality_sample::JudgeSink>>,
 }
 
 impl AppState {
@@ -153,6 +162,8 @@ impl AppState {
             dynamic_budget: Arc::new(DynamicBudgetEnforcer::new()),
             breaker: Arc::new(CircuitBreaker::default()),
             single_flight: Arc::new(SingleFlight::new()),
+            judge_config: crate::quality_sample::JudgeConfig::from_env(),
+            judge_sink: None,
         }
     }
 
@@ -211,6 +222,23 @@ impl AppState {
     /// Builder-style attach: enable per-org routing.
     pub fn with_routing_store(mut self, store: Arc<CachingRoutingStore>) -> Self {
         self.routing_store = Some(store);
+        self
+    }
+
+    /// Builder-style attach: enable the sampled async quality judge with the
+    /// given recording sink and config. The judge scores a deterministic ~2%
+    /// sample of rerouted-DOWN chat-completion requests AFTER the user response
+    /// is returned (zero added latency) and records the outcome into `sink`.
+    ///
+    /// Pass [`crate::quality_sample::JudgeConfig::from_env`] to honor `TT_JUDGE_*`,
+    /// or a hand-built config (tests). Record-only — the sink never pauses routes.
+    pub fn with_quality_judge(
+        mut self,
+        sink: Arc<dyn crate::quality_sample::JudgeSink>,
+        config: crate::quality_sample::JudgeConfig,
+    ) -> Self {
+        self.judge_sink = Some(sink);
+        self.judge_config = config;
         self
     }
 

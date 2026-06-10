@@ -8,6 +8,7 @@ pub mod error;
 pub mod failover;
 pub mod metrics;
 pub mod middleware;
+pub mod quality_sample;
 pub mod registry;
 pub mod retry;
 pub mod routes;
@@ -24,6 +25,10 @@ pub use db::{connect, migrate, migrate_only, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use middleware::retrieval::RetrievalState;
+pub use quality_sample::{
+    risk_band_to_preview, spawn_quality_judge, GatewayLlmJudge, JudgeConfig, JudgeOutcome,
+    JudgeSink, JudgeTaskClass, QualityJudgeJob, ReferenceSource,
+};
 pub use registry::{register_providers, ProviderRegistry, ProvidersConfig};
 pub use retry::{with_retry, RetryPolicy};
 pub use server::{build_router, build_router_with_retrieval};
