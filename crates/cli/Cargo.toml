@@ -60,7 +60,7 @@ console = "0.15"
 comfy-table = { version = "7", features = ["custom_styling"] }
 indicatif = "0.17"
 rustyline = "14"
-dirs = "5.0"
+dirs = "6.0"
 base64 = "0.22"
 tempfile.workspace = true
 bytes.workspace = true
