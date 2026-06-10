@@ -66,6 +66,66 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --workspace --no-fail-fast
 
+  db-tests:
+    name: cargo test (DB-gated, --include-ignored)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Postgres + pgvector (the L2 semantic cache needs the `vector` extension)
+    # and Redis (the L1 cache round-trip). These back the #[ignore]d,
+    # TEST_DATABASE_URL/DATABASE_URL/REDIS_URL-gated tests that the other jobs
+    # never run: PostgresKeyStore, the pgvector L2 cache + tenant isolation,
+    # the migrate-only path, and the BYO credential-store wiring.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # tt-core migrations, tt-auth PostgresKeyStore, and the CLI BYO test read
+      # TEST_DATABASE_URL; the tt-cache L2 tests read DATABASE_URL. Point both at
+      # the same pgvector service. tt-cache L1 reads REDIS_URL.
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Apply the public schema (creates cache_entries with pgvector) before the
+      # L2 tests, which assume the table already exists. The migrate-only test
+      # is itself one of the ignored tests we want covered, and it's idempotent.
+      - name: Apply migrations (tt-core migrate_only)
+        run: cargo test -p tt-core --test migrations -- --include-ignored migrate_only_applies_schema
+      # Postgres key store: issue -> validate -> revoke -> cross-org isolation.
+      # PostgresKeyStore is gated behind tt-auth's `postgres` feature, which the
+      # default workspace build does not enable — so scope + feature it here.
+      - name: tt-auth Postgres key store (ignored)
+        run: cargo test -p tt-auth --features postgres -- --include-ignored
+      # L2 pgvector cache: round-trip + org-A-insert / org-B-miss isolation.
+      - name: tt-cache L2 + L1 (ignored)
+        run: cargo test -p tt-cache -- --include-ignored
+      # BYO credential-store wiring (creates its own provider_credentials table).
+      - name: tt-cli BYO credential wiring (ignored)
+        run: cargo test -p tt-cli -- --include-ignored byo_only
+
   secret-scan:
     name: secret scan
     runs-on: ubuntu-latest

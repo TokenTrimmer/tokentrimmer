@@ -8,8 +8,14 @@
 //! and routing in lockstep.
 //!
 //! Strategy (mirrors what `/v1/preview` historically did):
-//! - `openai` / `anthropic` → tiktoken `cl100k_base` (high confidence). The
-//!   BPE is built once and cached, so this is cheap on the hot path.
+//! - `openai` → tiktoken `cl100k_base` (high confidence — `cl100k` is OpenAI's
+//!   own tokenizer). The BPE is built once and cached, so this is cheap.
+//! - `anthropic` → tiktoken `cl100k_base` as a *proxy* (medium confidence).
+//!   `cl100k` is not Anthropic's tokenizer; it undercounts Anthropic input by
+//!   ~15–20% on typical text (more on code / non-English), so the estimate is
+//!   directional-only, not for billing. Demoting it from High keeps callers
+//!   (and `/v1/preview`) from over-trusting an Anthropic number that is
+//!   systematically low. The provider's reported usage remains authoritative.
 //! - everything else (Gemini, Groq, Together, local, …) → `chars / 4` heuristic
 //!   (medium confidence). tiktoken is not accurate for these tokenizers, and
 //!   the final bill always uses the provider's reported usage anyway.
@@ -23,9 +29,11 @@ use tiktoken_rs::CoreBPE;
 /// weight it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
-    /// Exact tokenizer for the provider family (tiktoken `cl100k`).
+    /// The provider's own exact tokenizer (tiktoken `cl100k` for OpenAI).
     High,
-    /// Heuristic (`chars / 4`) — close enough for routing, not for billing.
+    /// A proxy tokenizer or heuristic — close enough for routing, not for
+    /// billing. Covers both the `chars / 4` heuristic and `cl100k` used as a
+    /// stand-in for Anthropic (which it undercounts by ~15–20%).
     Medium,
     /// Heuristic used only because the exact tokenizer failed to load.
     Low,
@@ -51,9 +59,21 @@ pub fn char_count_estimate(text: &str) -> u32 {
     ((text.chars().count() as f64) / 4.0).ceil() as u32
 }
 
-/// Whether this provider id is tokenized accurately by tiktoken `cl100k`.
+/// Whether `cl100k` produces an estimate for this provider — exactly for
+/// OpenAI (its own tokenizer), or as an undercounting proxy for Anthropic.
 fn uses_tiktoken(provider: &str) -> bool {
     matches!(provider, "openai" | "anthropic")
+}
+
+/// The confidence to report when `cl100k` succeeds for `provider`: `High` only
+/// for OpenAI (its native tokenizer); `Medium` for Anthropic, where `cl100k` is
+/// a proxy that undercounts input by ~15–20% (see module docs).
+fn tiktoken_confidence(provider: &str) -> Confidence {
+    if provider == "openai" {
+        Confidence::High
+    } else {
+        Confidence::Medium
+    }
 }
 
 /// Estimate input tokens for `text` as served by `provider`, with a confidence
@@ -64,7 +84,7 @@ pub fn estimate_input_tokens(provider: &str, text: &str) -> Estimate {
         if let Some(bpe) = cl100k() {
             return Estimate {
                 tokens: bpe.encode_with_special_tokens(text).len() as u32,
-                confidence: Confidence::High,
+                confidence: tiktoken_confidence(provider),
             };
         }
         // tiktoken unavailable — degrade to the heuristic, flagged Low.
@@ -91,12 +111,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_and_anthropic_use_tiktoken_high() {
-        for p in ["openai", "anthropic"] {
-            let e = estimate_input_tokens(p, "Hello, world.");
-            assert!(e.tokens >= 1);
-            assert_eq!(e.confidence, Confidence::High, "provider {p}");
-        }
+    fn openai_uses_tiktoken_high() {
+        // cl100k is OpenAI's own tokenizer → High confidence.
+        let e = estimate_input_tokens("openai", "Hello, world.");
+        assert!(e.tokens >= 1);
+        assert_eq!(e.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn anthropic_uses_tiktoken_proxy_medium() {
+        // cl100k is a proxy for Anthropic (undercounts ~15–20%), so the
+        // estimate is produced by tiktoken but flagged Medium, not High.
+        let e = estimate_input_tokens("anthropic", "Hello, world.");
+        assert!(e.tokens >= 1);
+        assert_eq!(e.confidence, Confidence::Medium);
+        // It still uses the real BPE, so it should match OpenAI's count on the
+        // same text (same tokenizer) — confirming it's not the chars/4 path.
+        assert_eq!(
+            e.tokens,
+            estimate_input_tokens("openai", "Hello, world.").tokens
+        );
     }
 
     #[test]

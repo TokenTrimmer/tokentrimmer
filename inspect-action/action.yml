@@ -1,32 +1,43 @@
-name: TokenTrimmer Inspect
-description: Scan a codebase for LLM token-waste patterns. Outputs markdown to the PR check.
+name: TokenTrimmer Cost Gate
+description: >-
+  Gate pull requests on projected LLM cost changes. Runs
+  `tt inspect --cost-diff` over the PR diff and (optionally) fails the check on a
+  projected per-call cost increase, posting the cost delta as a sticky PR comment.
 author: TokenTrimmer Contributors
 branding:
-  icon: search
-  color: blue
+  icon: dollar-sign
+  color: green
 
 inputs:
   path:
-    description: Path to scan (relative to repo root).
+    description: Path to scope the cost diff to (relative to repo root).
     required: false
     default: .
-  fail-on:
-    description: Severity that fails the action. One of low, medium, high, critical.
-    required: false
-    default: high
-  output:
-    description: Output file path. Default writes markdown to a step summary; pass a .json suffix for JSON.
-    required: false
-    default: ''
-  token:
-    description: |
-      Optional TokenTrimmer hosted API key (`tt_live_*`). When set, the action uploads
-      results to the hosted dashboard for trend tracking. Leave blank to run fully local
-      and free — Inspect itself does not require a hosted account.
+  base-ref:
+    description: >-
+      Base git ref to diff the working tree against. Defaults to the pull
+      request's base SHA on `pull_request` events, otherwise `HEAD`. The ref
+      must be fetched — use `actions/checkout` with `fetch-depth: 0`.
     required: false
     default: ''
+  fail-on-cost-increase:
+    description: >-
+      When `true`, the check fails (non-zero exit) if a net projected per-call
+      cost increase is detected. Set to `false` to report only.
+    required: false
+    default: 'true'
+  comment:
+    description: >-
+      When `true` (and the event is a pull request), post or update a sticky PR
+      comment with the cost-diff report.
+    required: false
+    default: 'true'
+  github-token:
+    description: Token used to post the PR comment. Defaults to the workflow token.
+    required: false
+    default: ${{ github.token }}
   tt-version:
-    description: tt-cli version to use, e.g. "0.1.0" or "latest". Default pins to a known-good release.
+    description: tt-cli version to use, e.g. "0.1.0" or "latest".
     required: false
     default: latest
 
@@ -39,7 +50,7 @@ runs:
         TT_VERSION: ${{ inputs.tt-version }}
       run: |
         # Install the tt binary. For now we build from source — once we publish
-        # to crates.io / GHCR release artifacts, swap to a direct download.
+        # release artifacts, swap to a direct download.
         if ! command -v tt >/dev/null 2>&1; then
           if [ "$TT_VERSION" = "latest" ]; then
             cargo install --locked --git https://github.com/tokentrimmer/tokentrimmer --branch main tt-cli
@@ -49,45 +60,103 @@ runs:
         fi
         tt --version
 
-    - name: Run tt inspect
+    - name: Run tt inspect --cost-diff
       id: run
       shell: bash
       env:
         SCAN_PATH: ${{ inputs.path }}
-        FAIL_ON: ${{ inputs.fail-on }}
-        OUTPUT: ${{ inputs.output }}
+        BASE_REF_INPUT: ${{ inputs.base-ref }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        FAIL_ON_INCREASE: ${{ inputs.fail-on-cost-increase }}
       run: |
-        outfile="$OUTPUT"
-        if [ -z "$outfile" ]; then
-          outfile="$(mktemp -t tt-inspect.XXXXXX.md)"
-        fi
-        # Capture exit status without aborting (we want to append to summary even on failures).
-        if tt inspect "$SCAN_PATH" --fail-on "$FAIL_ON" --output "$outfile"; then
-          echo "tt-inspect-status=passed" >> "$GITHUB_OUTPUT"
-        else
-          echo "tt-inspect-status=failed" >> "$GITHUB_OUTPUT"
-          INSPECT_FAILED=1
-        fi
-        if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "$outfile" ]; then
-          {
-            echo "## TokenTrimmer Inspect"
-            echo ""
-            cat "$outfile"
-          } >> "$GITHUB_STEP_SUMMARY"
-        fi
-        if [ -n "${INSPECT_FAILED:-}" ]; then exit 1; fi
+        set -euo pipefail
 
-    - name: Upload to hosted dashboard
-      if: inputs.token != ''
+        # Resolve the base ref: explicit input wins; else the PR base SHA on
+        # pull_request events; else HEAD (no-op diff).
+        base="$BASE_REF_INPUT"
+        if [ -z "$base" ]; then
+          base="${PR_BASE_SHA:-HEAD}"
+        fi
+        echo "base-ref=$base" >> "$GITHUB_OUTPUT"
+
+        report="$(mktemp -t tt-cost-diff.XXXXXX.md)"
+        echo "report-file=$report" >> "$GITHUB_OUTPUT"
+
+        # Always generate the report WITHOUT --fail-on-cost-increase so that a
+        # genuine setup error (e.g. base ref not fetched, git missing) fails
+        # this step loudly and unambiguously — rather than being mistaken for a
+        # cost increase. Markdown goes to stdout; human notices go to stderr.
+        tt inspect "$SCAN_PATH" --cost-diff --base "$base" --no-color > "$report"
+
+        # Derive the gate from the report content. The markdown verdict line
+        # contains "Projected cost increase" iff the net per-call cost rose.
+        if [ "$FAIL_ON_INCREASE" = "true" ] && grep -q "Projected cost increase" "$report"; then
+          echo "cost-gate=failed" >> "$GITHUB_OUTPUT"
+        else
+          echo "cost-gate=passed" >> "$GITHUB_OUTPUT"
+        fi
+
+        # Mirror the report into the job step summary.
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Post cost-diff PR comment
+      if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' }}
       shell: bash
       env:
-        TT_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPORT_FILE: ${{ steps.run.outputs.report-file }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
-        # Hosted upload is implemented when the cloud repo's hosted Inspect
-        # backend ships. For now we just note that a token was supplied.
-        echo "tt-cli hosted upload: not yet wired (cloud backend pending)"
+        # Sticky comment: an HTML marker lets us find & update our own comment
+        # instead of stacking a new one on every push.
+        #
+        # The PR comment is a nice-to-have, NOT the gate. Posting requires a
+        # write-capable token, which is unavailable on fork-contributor PRs
+        # (GITHUB_TOKEN is read-only under `on: pull_request` from a fork). A
+        # denied/failed write here must never red-X the job — the cost pass/fail
+        # verdict is decided independently in the "Fail the check" step below. So
+        # we warn-and-continue on any failure instead of letting it propagate.
+        marker="<!-- tokentrimmer-cost-gate -->"
+        body="$(mktemp)"
+        {
+          echo "$marker"
+          cat "$REPORT_FILE"
+        } > "$body"
+
+        existing="$(gh api \
+          "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+          --paginate --jq \
+          ".[] | select(.body | contains(\"$marker\")) | .id" 2>/dev/null | head -n1 || true)"
+
+        if [ -n "$existing" ]; then
+          posted=0
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
+            -F body=@"$body" >/dev/null 2>&1 || posted=1
+        else
+          posted=0
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -F body=@"$body" >/dev/null 2>&1 || posted=1
+        fi
+
+        if [ "$posted" -ne 0 ]; then
+          echo "::warning::TokenTrimmer cost gate could not post the PR comment (the token is likely read-only, e.g. a fork-contributor PR). The cost report is still in the job step summary and the gate verdict is unaffected."
+        fi
+
+    - name: Fail the check on projected cost increase
+      if: ${{ steps.run.outputs.cost-gate == 'failed' }}
+      shell: bash
+      run: |
+        echo "::error::TokenTrimmer cost gate: a projected per-call cost increase was detected."
+        exit 1
 
 outputs:
-  status:
-    description: passed or failed based on findings vs fail-on threshold
-    value: ${{ steps.run.outputs.tt-inspect-status }}
+  cost-gate:
+    description: passed or failed based on the projected per-call cost change.
+    value: ${{ steps.run.outputs.cost-gate }}
+  base-ref:
+    description: The base git ref the working tree was diffed against.
+    value: ${{ steps.run.outputs.base-ref }}

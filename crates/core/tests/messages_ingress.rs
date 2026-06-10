@@ -64,6 +64,9 @@ impl Provider for AnthropicMock {
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
         })
     }
@@ -613,6 +616,9 @@ impl Provider for AnthropicInvalidMock {
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
         })
     }
@@ -759,6 +765,9 @@ impl Provider for AnthropicMidStreamErrorMock {
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
         })
     }

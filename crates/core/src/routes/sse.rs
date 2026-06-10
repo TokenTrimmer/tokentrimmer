@@ -1137,6 +1137,9 @@ mod tests {
             output_per_million: 2.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
         };
         let usage = PartialUsage {
@@ -1239,6 +1242,9 @@ mod tests {
             output_per_million: 6.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
         };
         let cost =
@@ -1265,6 +1271,9 @@ mod tests {
             output_per_million: 2.0,
             cached_input_per_million: Some(0.1),
             cache_write_per_million: Some(1.25),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::DateTime::UNIX_EPOCH,
         };
         let cost =

@@ -103,10 +103,12 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_uses_tiktoken() {
+    fn anthropic_uses_tiktoken_proxy_medium() {
+        // cl100k tokenizes Anthropic input but only as a proxy that undercounts
+        // ~15–20%, so the surfaced confidence is Medium, not High.
         let est = estimate("anthropic", &[user("Hello, world.")], None, None);
         assert!(est.input_tokens >= 1);
-        assert!(matches!(est.confidence, EstimationConfidence::High));
+        assert!(matches!(est.confidence, EstimationConfidence::Medium));
         assert_eq!(est.output_tokens, 512); // default
     }
 

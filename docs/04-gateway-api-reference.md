@@ -4,6 +4,8 @@
 **Base URL (hosted):** `https://api.tokentrimmer.com/v1`
 **Base URL (self-hosted, default):** `http://localhost:8080/v1`
 
+> **Hosted gateway launching soon** *(as of 2026-06-10)* — the hosted base URL `https://api.tokentrimmer.com/v1` is not live yet. Self-host with Docker today and integrate against `http://localhost:8080/v1`; every example below works unchanged once you swap the base URL. See `GETTING_STARTED.md` for the one-`docker run` quickstart.
+
 ---
 
 ## Purpose

@@ -42,6 +42,8 @@ Pick the path that matches what you want to do.
 
 ## 5-minute hosted quickstart (one-line base_url swap)
 
+> **Hosted gateway launching soon** *(as of 2026-06-10)* — `https://api.tokentrimmer.com` is not live yet. Self-host with Docker today (see the [Self-host path (Docker)](#self-host-path-docker) section below) and point your SDK at `http://localhost:8080/v1`. This section is the integration you will use once the hosted endpoint goes live.
+
 You already have OpenAI-style code. Change the base URL and the key. That's it.
 
 ### Option A — your existing OpenAI SDK (no new dependency)
@@ -70,7 +72,7 @@ The SDK is a drop-in `openai.OpenAI` subclass; the default base URL is already t
 > **Not yet on PyPI** — published packages land at launch. Until then, install from git:
 
 ```bash
-pip install "git+https://github.com/tokentrimmer/tokentrimmer.git#subdirectory=sdk-python"
+pip install "git+https://github.com/TokenTrimmer/tokentrimmer.git#subdirectory=sdk-python"
 ```
 
 ```python
@@ -167,7 +169,7 @@ You need `tt` locally for `inspect`, `plan`, and `init`.
 
 ```bash
 # rustup auto-installs the pinned toolchain (1.88) from rust-toolchain.toml
-git clone https://github.com/tokentrimmer/public.git tokentrimmer
+git clone https://github.com/TokenTrimmer/tokentrimmer.git
 cd tokentrimmer
 
 # Build just the CLI (binary is named `tt`)
@@ -196,7 +198,7 @@ Run the OpenAI-compatible proxy.
 PORT=8080 ./target/release/tt gateway
 ```
 
-Endpoints exposed: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/preview`, and `POST /v1/embeddings` *(currently returns **501 Not Implemented** — not yet dispatched to a provider)*.
+Endpoints exposed: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/preview`, and `POST /v1/embeddings` *(fully implemented — routed, billing-correct provider dispatch; sandbox `tt_test_*` keys return deterministic vectors with zero cost)*.
 
 **Requires:** nothing to start (degraded dev mode: loopback-only, callers pass their own provider key as the Bearer token). For full features: `DATABASE_URL`, `REDIS_URL`, and provider keys. See the self-host table above.
 
@@ -340,7 +342,7 @@ TT_RETRIEVAL_STORE=memory TT_OPENAI_EMBED_KEY=sk-... tt gateway
 Thin OpenAI subclasses that route through the Gateway and surface cost/cache metadata on `.tt`.
 
 > **Not yet on PyPI/npm** — published packages land at launch. Until then, install from git:
-> `pip install "git+https://github.com/tokentrimmer/tokentrimmer.git#subdirectory=sdk-python"`.
+> `pip install "git+https://github.com/TokenTrimmer/tokentrimmer.git#subdirectory=sdk-python"`.
 > For TypeScript (npm cannot install a git subdirectory directly): clone the repo, run
 > `npm install && npm run build` in `sdk-typescript/`, then `npm install <path-to-clone>/sdk-typescript`
 > from your project.
@@ -371,7 +373,7 @@ const response = await client.chat.completions.create({
 console.log(response.tt.costUsd, response.tt.cache, response.tt.traceId);
 ```
 
-Both default to the hosted Gateway. For self-host, pass `base_url` / `baseURL` = `http://localhost:8080/v1` and your provider key. Every other OpenAI method (streaming, tools, vision, async) works unchanged. (`embeddings` is the one exception — the Gateway's `/v1/embeddings` is a 501 stub today.)
+Both default to the hosted Gateway. For self-host, pass `base_url` / `baseURL` = `http://localhost:8080/v1` and your provider key. Every other OpenAI method (streaming, tools, vision, async, `embeddings`) works unchanged — the Gateway's `/v1/embeddings` is a routed, billing-correct endpoint.
 
 ---
 

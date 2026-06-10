@@ -10,7 +10,11 @@
 #   model                     = exact model id the provider matches on
 #   input_per_million         = USD per 1M input tokens
 #   output_per_million        = USD per 1M output tokens
-#   cached_input_per_million  = USD per 1M cached-read input tokens (omit if N/A)
+#   cached_input_per_million  = USD per 1M cached-READ input tokens (omit if N/A)
+#   cache_write_per_million   = USD per 1M cache-WRITE input tokens (omit if N/A)
+#   batch_input_per_million   = USD per 1M batch (async) input tokens (omit if N/A)
+#   batch_output_per_million  = USD per 1M batch (async) output tokens (omit if N/A)
+#   prompt_cache_min_tokens   = min prefix tokens before cache_control caches (omit if N/A)
 #   effective_at              = RFC3339 UTC instant the rate took effect
 #
 # Price HISTORY: multiple entries for the same (provider, model) form a
@@ -40,12 +44,18 @@
 #   (carried from the May snapshot — verify in the next refresh).
 
 # ── OpenAI ──────────────────────────────────────────────────────────────────
+# batch_{input,output}_per_million is OpenAI's Batch-API rate — a flat 50% of
+# standard. prompt_cache_min_tokens = 1024: OpenAI auto-caches prompts ≥1024
+# tokens (developers.openai.com/api/docs/prompt-caching).
 [[entry]]
 provider = "openai"
 model = "gpt-5.5"
 input_per_million = 5.00
 output_per_million = 30.00
 cached_input_per_million = 0.50
+batch_input_per_million = 2.50
+batch_output_per_million = 15.00
+prompt_cache_min_tokens = 1024
 effective_at = "2026-05-01T00:00:00Z"
 
 [[entry]]
@@ -54,6 +64,9 @@ model = "gpt-5.4"
 input_per_million = 2.50
 output_per_million = 15.00
 cached_input_per_million = 0.25
+batch_input_per_million = 1.25
+batch_output_per_million = 7.50
+prompt_cache_min_tokens = 1024
 effective_at = "2026-05-01T00:00:00Z"
 
 # Added 2026-05-31 — verified vs developers.openai.com/api/docs/pricing.
@@ -148,6 +161,11 @@ effective_at = "2026-05-01T00:00:00Z"
 # cache_write_per_million is the cache-WRITE (creation) rate (~1.25× standard
 # input). Anthropic charges a write premium for tokens written to the prompt
 # cache; this is distinct from the lower read rate on cache hits.
+# batch_{input,output}_per_million are the async Batches-API rates — a flat 50%
+# of the standard input/output rate (platform.claude.com/docs/.../batch-processing).
+# prompt_cache_min_tokens is the minimum prefix length before a cache_control
+# breakpoint actually caches: 4096 tokens on Opus 4.x / Haiku 4.5, 2048 on
+# Sonnet 4.6 (platform.claude.com/docs/.../prompt-caching).
 [[entry]]
 provider = "anthropic"
 model = "claude-haiku-4-5"
@@ -155,6 +173,9 @@ input_per_million = 1.00
 output_per_million = 5.00
 cached_input_per_million = 0.10
 cache_write_per_million = 1.25
+batch_input_per_million = 0.50
+batch_output_per_million = 2.50
+prompt_cache_min_tokens = 4096
 effective_at = "2026-05-01T00:00:00Z"
 
 [[entry]]
@@ -164,6 +185,9 @@ input_per_million = 3.00
 output_per_million = 15.00
 cached_input_per_million = 0.30
 cache_write_per_million = 3.75
+batch_input_per_million = 1.50
+batch_output_per_million = 7.50
+prompt_cache_min_tokens = 2048
 effective_at = "2026-05-01T00:00:00Z"
 
 [[entry]]
@@ -173,11 +197,15 @@ input_per_million = 5.00
 output_per_million = 25.00
 cached_input_per_million = 0.50
 cache_write_per_million = 6.25
+batch_input_per_million = 2.50
+batch_output_per_million = 12.50
+prompt_cache_min_tokens = 4096
 effective_at = "2026-05-01T00:00:00Z"
 
 # Added 2026-05-31 — Claude Opus 4.8 is now Anthropic's current Opus flagship
 # (anthropic.com/claude/opus), $5/$25. Cache read/write follow Anthropic's
-# documented 0.1× / 1.25× input formula (cached 0.50, write 6.25).
+# documented 0.1× / 1.25× input formula (cached 0.50, write 6.25); batch is the
+# flat 50% (2.50/12.50); 4096-token cache minimum like the other Opus models.
 [[entry]]
 provider = "anthropic"
 model = "claude-opus-4-8"
@@ -185,16 +213,25 @@ input_per_million = 5.00
 output_per_million = 25.00
 cached_input_per_million = 0.50
 cache_write_per_million = 6.25
+batch_input_per_million = 2.50
+batch_output_per_million = 12.50
+prompt_cache_min_tokens = 4096
 effective_at = "2026-05-31T00:00:00Z"
 
 # ── Google Gemini ─────────────────────────────────────────────────────────────
 # Headline rate is the ≤200K-token bracket; >200K bracket pricing is a v2 item.
+# batch_{input,output}_per_million is the Batch-mode rate — a flat 50% of
+# standard (ai.google.dev/gemini-api/docs/pricing). prompt_cache_min_tokens is
+# left unset: Gemini implicit caching minimums vary by model and aren't pinned
+# here yet (the provider's reported usage remains authoritative for billing).
 [[entry]]
 provider = "gemini"
 model = "gemini-3.1-flash-lite"
 input_per_million = 0.25
 output_per_million = 1.50
 cached_input_per_million = 0.025
+batch_input_per_million = 0.125
+batch_output_per_million = 0.75
 effective_at = "2026-05-01T00:00:00Z"
 
 [[entry]]
@@ -203,6 +240,8 @@ model = "gemini-3.5-flash"
 input_per_million = 1.50
 output_per_million = 9.00
 cached_input_per_million = 0.15
+batch_input_per_million = 0.75
+batch_output_per_million = 4.50
 effective_at = "2026-05-01T00:00:00Z"
 
 [[entry]]
@@ -211,6 +250,8 @@ model = "gemini-3.1-pro"
 input_per_million = 2.00
 output_per_million = 12.00
 cached_input_per_million = 0.20
+batch_input_per_million = 1.00
+batch_output_per_million = 6.00
 effective_at = "2026-05-01T00:00:00Z"
 
 # ── Groq ──────────────────────────────────────────────────────────────────────

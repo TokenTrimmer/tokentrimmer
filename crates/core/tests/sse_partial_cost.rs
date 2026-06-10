@@ -93,6 +93,9 @@ impl Provider for MockProvider {
             output_per_million: 6.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
         })
     }
@@ -134,6 +137,9 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
             output_per_million: 6.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
         }),
         baseline_pricing: Some(ModelPricing {
@@ -141,6 +147,9 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
             output_per_million: 6.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: chrono::Utc::now(),
         }),
         route_id: None,
@@ -283,6 +292,9 @@ async fn sse_routed_stream_logs_baseline_against_original_model() {
         output_per_million: 0.6,
         cached_input_per_million: None,
         cache_write_per_million: None,
+        batch_input_per_million: None,
+        batch_output_per_million: None,
+        prompt_cache_min_tokens: None,
         effective_at: chrono::Utc::now(),
     };
     let expensive = ModelPricing {
@@ -290,6 +302,9 @@ async fn sse_routed_stream_logs_baseline_against_original_model() {
         output_per_million: 15.0,
         cached_input_per_million: None,
         cache_write_per_million: None,
+        batch_input_per_million: None,
+        batch_output_per_million: None,
+        prompt_cache_min_tokens: None,
         effective_at: chrono::Utc::now(),
     };
     let mut ctx = make_log_ctx(Arc::clone(&writer));

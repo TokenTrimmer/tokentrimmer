@@ -145,6 +145,11 @@ pub fn format_markdown(report: &CostDiffReport) -> String {
         return out;
     }
 
+    // CONTRACT: the cost-gate GitHub Action (`inspect-action/action.yml`)
+    // decides pass/fail by grepping the rendered report for the literal
+    // substring "Projected cost increase". Do not reword the increase verdict
+    // below without updating that action and the `verdict_string_is_gate_contract`
+    // test, or the gate will silently stop failing.
     let verdict = if report.net_projected_usd > 0.0 {
         format!(
             "⚠️ **Projected cost increase: +${:.6}/call** (standard profile: {STD_INPUT_TOKENS} in / {STD_OUTPUT_TOKENS} out)",
@@ -267,5 +272,43 @@ mod tests {
     fn empty_diff_reports_no_changes() {
         let md = format_markdown(&analyze(" no model here\n+just text\n"));
         assert!(md.contains("No LLM model changes detected"));
+    }
+
+    #[test]
+    fn verdict_string_is_gate_contract() {
+        // The cost-gate GitHub Action (`inspect-action/action.yml`) decides
+        // pass/fail by grepping the rendered report for this exact substring.
+        // If this assertion fails because the verdict copy changed, update the
+        // action's grep AND the cross-reference comment above the verdict.
+        const GATE_SUBSTRING: &str = "Projected cost increase";
+
+        // An increase MUST render the gate substring.
+        let increase = "+resp = client.chat(model = 'o3', messages=msgs)\n";
+        let inc_md = format_markdown(&analyze(increase));
+        assert!(
+            analyze(increase).is_increase(),
+            "fixture must project an increase"
+        );
+        assert!(
+            inc_md.contains(GATE_SUBSTRING),
+            "increase verdict must contain the gate substring {GATE_SUBSTRING:?}; \
+             got:\n{inc_md}"
+        );
+
+        // A saving MUST NOT render the gate substring (else false-positive gate).
+        let saving = "-client.chat(model=\"gpt-4o\")\n+client.chat(model=\"gpt-4o-mini\")\n";
+        let sav_md = format_markdown(&analyze(saving));
+        assert!(
+            !analyze(saving).is_increase(),
+            "fixture must project a saving"
+        );
+        assert!(
+            !sav_md.contains(GATE_SUBSTRING),
+            "saving verdict must not contain the gate substring; got:\n{sav_md}"
+        );
+
+        // No change MUST NOT render the gate substring either.
+        let no_change = format_markdown(&analyze("+just text\n"));
+        assert!(!no_change.contains(GATE_SUBSTRING));
     }
 }

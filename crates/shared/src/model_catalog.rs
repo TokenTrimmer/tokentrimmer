@@ -110,9 +110,9 @@ mod tests {
     #[test]
     fn embedded_catalog_parses_all_providers() {
         let c = model_catalog();
-        assert_eq!(c.len(), 32, "native (14) + compat (18)");
+        assert_eq!(c.len(), 33, "native (15) + compat (18)");
         assert_eq!(c.for_provider("openai").len(), 8);
-        assert_eq!(c.for_provider("anthropic").len(), 3);
+        assert_eq!(c.for_provider("anthropic").len(), 4); // + claude-opus-4-8
         assert_eq!(c.for_provider("gemini").len(), 3);
         assert_eq!(c.for_provider("mistral").len(), 5);
         assert_eq!(c.for_provider("groq").len(), 4);
@@ -166,7 +166,7 @@ mod tests {
         let c = model_catalog();
         let haiku = c.model_info("anthropic", "claude-haiku-4-5").unwrap();
         assert_eq!(haiku.max_input_tokens, 200_000);
-        assert_eq!(haiku.max_output_tokens, 8192);
+        assert_eq!(haiku.max_output_tokens, 65_536); // 64K, not the stale 8192
         assert_eq!(
             haiku.capabilities,
             vec![
@@ -185,5 +185,39 @@ mod tests {
         let pro = c.model_info("gemini", "gemini-3.1-pro").unwrap();
         assert_eq!(pro.max_input_tokens, 2_000_000);
         assert!(c.model_info("openai", "nope").is_none());
+    }
+
+    /// The corrected Anthropic flagships: Sonnet 4.6 is 1M context / 64K output
+    /// (was stale at 200K/8192) and Opus 4.8 is present at 1M / 128K.
+    #[test]
+    fn anthropic_flagships_have_current_windows() {
+        let c = model_catalog();
+
+        let sonnet = c.model_info("anthropic", "claude-sonnet-4-6").unwrap();
+        assert_eq!(
+            sonnet.max_input_tokens, 1_000_000,
+            "sonnet-4-6 is 1M context"
+        );
+        assert_eq!(
+            sonnet.max_output_tokens, 65_536,
+            "sonnet-4-6 is 64K max output"
+        );
+
+        let opus47 = c.model_info("anthropic", "claude-opus-4-7").unwrap();
+        assert_eq!(opus47.max_input_tokens, 1_000_000);
+        assert_eq!(opus47.max_output_tokens, 131_072);
+
+        // Opus 4.8 must exist (was missing from the catalog).
+        let opus48 = c.model_info("anthropic", "claude-opus-4-8").unwrap();
+        assert_eq!(opus48.max_input_tokens, 1_000_000);
+        assert_eq!(opus48.max_output_tokens, 131_072);
+        assert!(opus48.capabilities.contains(&Capability::PromptCaching));
+
+        // The OpenRouter mirror of Sonnet 4.6 tracks the same window.
+        let or_sonnet = c
+            .model_info("openrouter", "anthropic/claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(or_sonnet.max_input_tokens, 1_000_000);
+        assert_eq!(or_sonnet.max_output_tokens, 65_536);
     }
 }
