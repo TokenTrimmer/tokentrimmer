@@ -45,6 +45,55 @@ pub struct ModelPricing {
     pub effective_at: DateTime<Utc>,
 }
 
+/// Which cache-write TTL tier a prompt-cache write was billed at.
+///
+/// Anthropic bills cache *writes* at a per-TTL premium over the base input rate:
+/// the default 5-minute ephemeral tier is ~1.25× base input, and the opt-in
+/// 1-hour tier (`cache_control: {"type": "ephemeral", "ttl": "1h"}`) is ~2×
+/// (platform.claude.com/docs/en/build-with-claude/prompt-caching § Economics).
+/// [`ModelPricing::cache_write_per_million`] is the 5-minute rate;
+/// [`ModelPricing::cache_write_rate_per_million`] resolves either tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheWriteTier {
+    /// The default ephemeral TTL — `cache_control` with no `ttl` field. ~1.25×.
+    #[default]
+    FiveMin,
+    /// The opt-in 1-hour TTL — `cache_control` with `"ttl": "1h"`. ~2×.
+    OneHour,
+}
+
+/// Ratio of the 1-hour cache-write rate to the base input rate (Anthropic's
+/// documented 2× one-hour-TTL premium). The 5-minute rate is carried directly
+/// in the catalog as `cache_write_per_million` (~1.25× base); the 1-hour rate
+/// follows the same documented base-input relationship, so we derive it rather
+/// than carrying a second column.
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
+
+impl ModelPricing {
+    /// USD per 1M cache-write (creation) tokens for the given TTL `tier`.
+    ///
+    /// - `FiveMin` → the catalog's [`cache_write_per_million`](Self::cache_write_per_million)
+    ///   (the 5-minute/1.25× rate Anthropic applies to bare `ephemeral` writes).
+    /// - `OneHour` → the documented 2× base-input rate, but **only when a 5-min
+    ///   write premium is documented** (i.e. the provider tiers cache writes at
+    ///   all). Providers with no write premium return `None` for both tiers so
+    ///   the caller falls back to the plain input rate, unchanged.
+    ///
+    /// Returns `None` when no write premium applies, so callers price the
+    /// remaining tokens at `input_per_million`.
+    #[must_use]
+    pub fn cache_write_rate_per_million(&self, tier: CacheWriteTier) -> Option<f64> {
+        match tier {
+            CacheWriteTier::FiveMin => self.cache_write_per_million,
+            // Only tier up when the provider documents a 5-min write premium;
+            // otherwise there is no premium to scale and we leave it absent.
+            CacheWriteTier::OneHour => self
+                .cache_write_per_million
+                .map(|_| self.input_per_million * CACHE_WRITE_1H_MULTIPLIER),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelInfo {
     pub id: String,
@@ -394,6 +443,61 @@ mod catalog_tests {
         assert_eq!(groq.batch_input_per_million, None);
         assert_eq!(groq.batch_output_per_million, None);
         assert_eq!(groq.prompt_cache_min_tokens, None);
+    }
+
+    /// `cache_write_rate_per_million` resolves the documented per-TTL premium:
+    /// 5-min from the catalog column, 1-hour as 2× base input — but only when a
+    /// 5-min write premium is documented (providers without one stay at None so
+    /// the caller falls back to the plain input rate).
+    #[test]
+    fn cache_write_rate_resolves_per_ttl_tier() {
+        let c = catalog();
+
+        // Anthropic Sonnet 4.6: base input 3.00, 5-min write 3.75 (=1.25×).
+        let sonnet = c.latest("anthropic", "claude-sonnet-4-6").expect("present");
+        assert_eq!(
+            sonnet.cache_write_rate_per_million(CacheWriteTier::FiveMin),
+            Some(3.75),
+            "5-min tier = catalog cache_write_per_million (1.25× input)"
+        );
+        assert_eq!(
+            sonnet.cache_write_rate_per_million(CacheWriteTier::OneHour),
+            Some(6.00),
+            "1-hour tier = 2× base input (3.00)"
+        );
+
+        // Opus 4.8: base input 5.00 → 1-hour write 10.00.
+        let opus = c.latest("anthropic", "claude-opus-4-8").expect("present");
+        assert_eq!(
+            opus.cache_write_rate_per_million(CacheWriteTier::FiveMin),
+            Some(6.25)
+        );
+        assert_eq!(
+            opus.cache_write_rate_per_million(CacheWriteTier::OneHour),
+            Some(10.00),
+            "1-hour tier = 2× base input (5.00)"
+        );
+
+        // A provider with no documented write premium: both tiers are None so
+        // the caller prices these tokens at the plain input rate (unchanged).
+        let groq = c.latest("groq", "llama-3.1-8b-instant").expect("present");
+        assert_eq!(
+            groq.cache_write_rate_per_million(CacheWriteTier::FiveMin),
+            None
+        );
+        assert_eq!(
+            groq.cache_write_rate_per_million(CacheWriteTier::OneHour),
+            None,
+            "no 5-min premium → no 1-hour premium either"
+        );
+    }
+
+    /// Default tier is the 5-minute tier — Anthropic's default for a bare
+    /// `cache_control: {"type": "ephemeral"}` (no `ttl`), which is the only
+    /// breakpoint the gateway's Anthropic adapter emits.
+    #[test]
+    fn cache_write_tier_defaults_to_five_min() {
+        assert_eq!(CacheWriteTier::default(), CacheWriteTier::FiveMin);
     }
 
     #[test]
