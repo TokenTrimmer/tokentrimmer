@@ -33,7 +33,28 @@ print(f"cache {response.tt.cache}        # hit-l1 | hit-l2 | miss | none")
 print(f"trace {response.tt.trace_id}")
 ```
 
-The class is a `openai.OpenAI` subclass — every other method (`embeddings`, `models`, streaming, async, tools, vision) works unchanged.
+The class is a `openai.OpenAI` subclass — every other method (`embeddings`, `models`, tools, vision) works unchanged.
+
+## Streaming
+
+Streaming works as usual; per-request cost is on the stream's `.tt` once it's drained (the Gateway's terminal usage frame is stripped, so chunk iteration is clean):
+
+```python
+stream = client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "Hello"}],
+    stream=True,
+)
+
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="")
+
+# Cost is known once the stream is fully consumed (`stream.tt` stays None if the
+# Gateway emitted no usage frame, e.g. self-hosted without pricing):
+if stream.tt is not None:
+    print(f"\ncost  ${stream.tt.cost_usd:.4f}")
+    print(f"saved ${stream.tt.saved_usd:.4f}")
+```
 
 ## Self-hosted Gateway
 

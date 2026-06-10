@@ -478,6 +478,7 @@ fn l2_context_text_differs_for_different_system_prompts() {
             tool_choice: None,
             response_format: None,
             tt_extras: HashMap::new(),
+            ..Default::default()
         }
     }
 

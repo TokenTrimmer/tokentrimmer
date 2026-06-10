@@ -34,6 +34,7 @@ fn make_request(model: &str, messages: Vec<Message>) -> ChatCompletionRequest {
         seed: None,
         user: None,
         tt_extras: HashMap::new(),
+        ..Default::default()
     }
 }
 

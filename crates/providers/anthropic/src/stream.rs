@@ -401,10 +401,13 @@ fn handle_message_start(data: &str, state: &mut Option<StreamState>) -> SseOutco
                 role: Some("assistant".to_string()),
                 content: None,
                 tool_calls: vec![],
+                extra: Default::default(),
             },
             finish_reason: None,
+            extra: Default::default(),
         }],
         usage: None,
+        extra: Default::default(),
     };
 
     *state = Some(new_state);
@@ -471,10 +474,13 @@ fn handle_content_block_delta(data: &str, state: &mut Option<StreamState>) -> Ss
                         role: None,
                         content: Some(text),
                         tool_calls: vec![],
+                        extra: Default::default(),
                     },
                     finish_reason: None,
+                    extra: Default::default(),
                 }],
                 usage: None,
+                extra: Default::default(),
             };
             SseOutcome::Chunk(chunk)
         }
@@ -500,10 +506,13 @@ fn handle_content_block_delta(data: &str, state: &mut Option<StreamState>) -> Ss
                             role: None,
                             content: None,
                             tool_calls: vec![tool_call],
+                            extra: Default::default(),
                         },
                         finish_reason: None,
+                        extra: Default::default(),
                     }],
                     usage: None,
+                    extra: Default::default(),
                 };
                 SseOutcome::Chunk(chunk)
             } else {
@@ -574,8 +583,10 @@ fn handle_message_delta(data: &str, state: &mut Option<StreamState>) -> SseOutco
             index: 0,
             delta: ChunkDelta::default(),
             finish_reason,
+            extra: Default::default(),
         }],
         usage: Some(usage),
+        extra: Default::default(),
     };
 
     SseOutcome::Chunk(chunk)

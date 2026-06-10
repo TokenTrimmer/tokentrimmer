@@ -104,10 +104,13 @@ impl Provider for CountingProvider {
                     role: Some("assistant".into()),
                     content: Some("hi".into()),
                     tool_calls: vec![],
+                    extra: Default::default(),
                 },
                 finish_reason: Some("stop".into()),
+                extra: Default::default(),
             }],
             usage: None,
+            extra: Default::default(),
         })];
         Ok(futures::stream::iter(chunks).boxed())
     }

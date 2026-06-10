@@ -128,6 +128,18 @@ impl Provider for GeminiProvider {
         if req.user.is_some() {
             out.push("user".to_string());
         }
+        // Newer OpenAI-only fields Gemini's wire format has no equivalent for.
+        // (`max_completion_tokens` IS honored — mapped to `maxOutputTokens` in
+        // translate.rs — so it is deliberately absent here.)
+        if req.parallel_tool_calls.is_some() {
+            out.push("parallel_tool_calls".to_string());
+        }
+        if req.reasoning_effort.is_some() {
+            out.push("reasoning_effort".to_string());
+        }
+        if req.stream_options.is_some() {
+            out.push("stream_options".to_string());
+        }
         out
     }
 

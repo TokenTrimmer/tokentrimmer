@@ -48,6 +48,8 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
+# Re-encodes the chat SSE stream into Anthropic SSE frames on /v1/messages (routes/messages.rs).
+async-stream.workspace = true
 # Zeroizing wrapper for the plaintext retrieval-prompt clone (middleware/retrieval.rs).
 zeroize.workspace = true
 

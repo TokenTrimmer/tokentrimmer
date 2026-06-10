@@ -18,14 +18,16 @@ The promise to customers: **change one line — your `base_url` — and your exi
 
 ## 1. Compatibility statement
 
-Gateway implements the following OpenAI API endpoints, with the OpenAI request/response schema as the source of truth:
+Gateway implements the following OpenAI API endpoints, with the OpenAI request/response schema as the source of truth, plus an Anthropic-native `/v1/messages` ingress for Anthropic-wire clients (Claude Code, the Anthropic SDKs):
 
 | Endpoint | Method | Status |
 |---|---|---|
 | `/v1/chat/completions` | POST | ✓ v1 |
+| `/v1/messages` (Anthropic Messages wire) | POST | ✓ v1 |
 | `/v1/embeddings` | POST | ✓ v1 |
 | `/v1/models` | GET | ✓ v1 |
 | `/v1/completions` (legacy) | POST | ✗ not supported |
+| `/v1/responses` (OpenAI Responses API) | POST | ✗ not yet supported — use `/v1/chat/completions` |
 | `/v1/images/generations` | POST | ✗ not supported (v2 candidate) |
 | `/v1/audio/transcriptions` | POST | ✗ not supported (v2 candidate) |
 | `/v1/audio/speech` | POST | ✗ not supported (v2 candidate) |
@@ -143,9 +145,13 @@ Follows the OpenAI Chat Completions schema. Full reference:
   "temperature": 0.7,
   "top_p": 1.0,
   "max_tokens": 1024,
+  "max_completion_tokens": 1024,
   "stream": false,
+  "stream_options": { "include_usage": true },
   "tools": [],
   "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning_effort": "high",
   "response_format": { "type": "text" },
   "stop": null,
   "presence_penalty": 0,
@@ -158,11 +164,36 @@ Follows the OpenAI Chat Completions schema. Full reference:
 
 **Required:** `model`, `messages`.
 
+**Compat fidelity (field passthrough):**
+
+Gateway preserves the full OpenAI request shape. In addition to the fields above
+it models these newer OpenAI fields as first-class, forwarding them to the
+routed provider where supported:
+
+- `max_completion_tokens` — the reasoning-model spend cap (`o3`, `o4-mini`, …).
+  Forwarded verbatim to OpenAI; mapped to the native output cap for Anthropic
+  (`max_tokens`) and Gemini (`maxOutputTokens`). Takes precedence over
+  `max_tokens` when both are set.
+- `stream_options` — e.g. `{ "include_usage": true }`. Forwarded to
+  OpenAI-shaped providers (the gateway always enables `include_usage` for its
+  own accounting; any other keys you set are preserved).
+- `parallel_tool_calls` — forwarded to OpenAI-shaped providers.
+- `reasoning_effort` — `"low"`/`"medium"`/`"high"`; forwarded to OpenAI-shaped
+  providers.
+
+Any **genuinely-unknown or newer** OpenAI field not modeled above (e.g.
+`logprobs`, `service_tier`, `prediction`) passes through to OpenAI-shaped
+upstreams unchanged rather than being dropped. (TokenTrimmer-internal
+`tt_extras` is the one field always stripped before forwarding.)
+
 **Provider-specific parameter handling:**
 
-- Parameters not supported by the routed provider are silently dropped, with a `X-TokenTrimmer-Warnings` response header noting the drop.
+- Parameters not supported by the routed provider are dropped, with a
+  `X-TokenTrimmer-Warnings: param_dropped:<name>` response header noting the
+  drop — e.g. `parallel_tool_calls`, `reasoning_effort`, and `stream_options`
+  are reported dropped for Anthropic- and Gemini-routed requests.
 - Parameters with different ranges across providers (e.g., temperature) are clamped to the provider's valid range, with a `temperature_clamped` warning (e.g. Anthropic caps `temperature` at 1.0).
-- For Anthropic-routed requests, `max_tokens` is required by Anthropic but optional here; Gateway defaults to 4096 if omitted.
+- For Anthropic-routed requests, `max_tokens` is required by Anthropic but optional here; Gateway defaults to 4096 if omitted (or to `max_completion_tokens` when that is set).
 
 ### 3.3 Response (non-streaming)
 
@@ -208,10 +239,37 @@ data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1716598234
 
 data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1716598234,"model":"claude-3-5-sonnet-20241022","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":23,"completion_tokens":8,"total_tokens":31,"cached_tokens":0}}
 
+event: tokentrimmer.usage
+data: {"cost_usd":0.000123,"baseline_cost_usd":0.000456,"saved_usd":0.000333,"provider_cache_saved_usd":0.0,"input_tokens":23,"output_tokens":8,"cached_tokens":0}
+
 data: [DONE]
 ```
 
-Usage is included on the final chunk (this differs from OpenAI's default; can be toggled with `stream_options: {"include_usage": false}` to suppress).
+Usage is included on the final content chunk (this differs from OpenAI's default; can be toggled with `stream_options: {"include_usage": false}` to suppress the folded usage block).
+
+**`stream_options.include_usage: true` (OpenAI-native usage chunk).** When the
+client explicitly sets `include_usage: true`, Gateway additionally emits an
+OpenAI-native final usage chunk — a chunk with an **empty `choices` array** and a
+populated `usage` block — immediately before the trailing frames, matching how
+OpenAI streams usage. This is guaranteed end-to-end regardless of which provider
+served the request (for OpenAI-shaped upstreams the provider's own usage chunk is
+forwarded; for Anthropic/Gemini one is synthesized from the accumulated counts):
+
+```
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1716598234,"model":"claude-3-5-sonnet-20241022","choices":[],"usage":{"prompt_tokens":23,"completion_tokens":8,"total_tokens":31,"cached_tokens":0}}
+```
+
+**`event: tokentrimmer.usage` (cost frame).** On clean completion Gateway always
+emits a non-OpenAI `tokentrimmer.usage` SSE frame carrying per-request cost,
+baseline, and savings — so streaming clients can surface savings that response
+headers cannot. Its shape is **stable** (TokenTrimmer SDKs parse it): exactly the
+keys `cost_usd`, `baseline_cost_usd`, `saved_usd`, `provider_cache_saved_usd`,
+`input_tokens`, `output_tokens`, `cached_tokens`. The `include_usage` chunk (when
+requested) is emitted *before* this frame; this frame does not replace it.
+
+**Unknown / newer provider chunk fields** (e.g. `system_fingerprint`,
+per-choice `logprobs`, per-delta `refusal`) are preserved on streaming chunks and
+round-tripped to the client unchanged rather than being dropped.
 
 **Cached responses + streaming:** if a request hits the cache and the client requested streaming, Gateway "fake-streams" the cached response back in chunks. This preserves UX consistency.
 
@@ -311,6 +369,27 @@ Or with schema:
 ```
 
 If routed to a provider that doesn't support schema mode, Gateway rewrites `response_format` to `json_object` (dropping the schema) before dispatch and emits `X-TokenTrimmer-Warnings: response_format_downgrade`. (Providers that reject `response_format` outright — e.g. Anthropic — instead drop it and emit `param_dropped:response_format`.)
+
+### 3.8 Anthropic Messages ingress (`POST /v1/messages`)
+
+For Anthropic-wire clients (Claude Code, the Anthropic SDKs), Gateway also accepts the native Anthropic Messages API request shape at `POST /v1/messages` and returns the Anthropic Messages response shape — `{ "type": "message", "role": "assistant", "content": [...], "stop_reason": ..., "usage": {...} }`. With `"stream": true` it returns Anthropic typed SSE event frames (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`).
+
+Tool use is supported in both directions. Non-streaming responses carry `tool_use` content blocks; streaming responses emit a `tool_use` content block per tool call (`content_block_start` → `input_json_delta` deltas → `content_block_stop`) and a `stop_reason: "tool_use"` in the closing `message_delta`, so Claude Code's agentic loop receives runnable tools.
+
+```
+POST /v1/messages
+```
+
+```json
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 1024,
+  "system": "You are a helpful assistant.",
+  "messages": [{ "role": "user", "content": "Hello" }]
+}
+```
+
+The request is translated to the canonical chat shape and runs through the **same** cost, routing, cache, and credential pipeline as `/v1/chat/completions` — including the same `X-TokenTrimmer-*` response headers (§6.2) and the same BYO credential requirement (a verified org without a stored `anthropic` credential gets `400 missing_provider_credential`). Authenticate exactly as for chat (§2): a TokenTrimmer key in `Authorization: Bearer …`.
 
 ---
 

@@ -382,6 +382,20 @@ fn is_cache_eligible(req: &ChatCompletionRequest) -> bool {
     true
 }
 
+/// Whether the client explicitly set `stream_options.include_usage = true`.
+///
+/// The gateway always forces `include_usage` upstream for its own accounting,
+/// but only *forwards* an OpenAI-native final usage chunk to the client when the
+/// client actually asked for one. `stream_options` is kept as an opaque JSON
+/// value, so probe the `include_usage` boolean directly.
+fn client_requested_include_usage(req: &ChatCompletionRequest) -> bool {
+    req.stream_options
+        .as_ref()
+        .and_then(|o| o.get("include_usage"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Returns `true` when any choice in the response contains tool calls.
 /// Responses with tool calls are non-deterministic in call order/arguments and
 /// must not be replayed from cache.
@@ -1149,6 +1163,9 @@ pub async fn handler(
                 // it to both cost and baseline, matching the non-streaming path (§2.13).
                 fee_multiplier: provider.fee_multiplier(),
                 cache_insert: stream_cache_insert,
+                // Honor stream_options.include_usage end-to-end: emit an
+                // OpenAI-native final usage chunk when the client asked for it.
+                include_usage: client_requested_include_usage(&req),
             })
         } else {
             None
@@ -2615,6 +2632,7 @@ mod cache_eligibility_tests {
             seed: None,
             user: None,
             tt_extras: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -2648,6 +2666,31 @@ mod cache_eligibility_tests {
     #[test]
     fn deterministic_request_is_eligible() {
         assert!(is_cache_eligible(&base_req()));
+    }
+
+    #[test]
+    fn include_usage_true_is_honored() {
+        let mut req = base_req();
+        req.stream_options = Some(serde_json::json!({ "include_usage": true }));
+        assert!(client_requested_include_usage(&req));
+    }
+
+    #[test]
+    fn include_usage_absent_or_false_is_not_honored() {
+        // No stream_options at all.
+        assert!(!client_requested_include_usage(&base_req()));
+        // stream_options present but include_usage false.
+        let mut req = base_req();
+        req.stream_options = Some(serde_json::json!({ "include_usage": false }));
+        assert!(!client_requested_include_usage(&req));
+        // stream_options present but include_usage absent.
+        let mut req = base_req();
+        req.stream_options = Some(serde_json::json!({ "other": 1 }));
+        assert!(!client_requested_include_usage(&req));
+        // Non-bool include_usage degrades to false rather than panicking.
+        let mut req = base_req();
+        req.stream_options = Some(serde_json::json!({ "include_usage": "yes" }));
+        assert!(!client_requested_include_usage(&req));
     }
 
     #[test]

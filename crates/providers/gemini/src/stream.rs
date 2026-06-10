@@ -312,10 +312,13 @@ fn process_sse_event(
                         role: Some("assistant".to_string()),
                         content: None,
                         tool_calls: vec![],
+                        extra: Default::default(),
                     },
                     finish_reason: None,
+                    extra: Default::default(),
                 }],
                 usage: None,
+                extra: Default::default(),
             }));
         }
 
@@ -341,10 +344,13 @@ fn process_sse_event(
                         role: None,
                         content: text_content,
                         tool_calls,
+                        extra: Default::default(),
                     },
                     finish_reason: effective_finish_reason.clone(),
+                    extra: Default::default(),
                 }],
                 usage,
+                extra: Default::default(),
             }));
         } else if has_finish_reason {
             // Final chunk with finish_reason but no content.
@@ -362,8 +368,10 @@ fn process_sse_event(
                     index: 0,
                     delta: ChunkDelta::default(),
                     finish_reason: effective_finish_reason,
+                    extra: Default::default(),
                 }],
                 usage,
+                extra: Default::default(),
             }));
         }
     }

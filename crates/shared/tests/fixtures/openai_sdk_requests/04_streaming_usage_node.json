@@ -1,0 +1,9 @@
+{
+  "model": "gpt-4o-mini",
+  "messages": [
+    { "role": "user", "content": "Stream me a haiku." }
+  ],
+  "stream": true,
+  "stream_options": { "include_usage": true },
+  "temperature": 1.0
+}

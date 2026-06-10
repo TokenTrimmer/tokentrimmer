@@ -82,14 +82,17 @@ impl Provider for FastMock {
                             },
                             content: Some("x".into()),
                             tool_calls: vec![],
+                            extra: Default::default(),
                         },
                         finish_reason: if i == n - 1 {
                             Some("stop".into())
                         } else {
                             None
                         },
+                        extra: Default::default(),
                     }],
                     usage: None,
+                    extra: Default::default(),
                 })
             })
             .collect();

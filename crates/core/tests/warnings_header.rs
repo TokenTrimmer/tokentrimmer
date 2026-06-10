@@ -56,6 +56,14 @@ impl Provider for WarnMock {
         if req.seed.is_some() {
             v.push("seed".to_string());
         }
+        // Mimic a non-OpenAI provider that cannot honor the newer typed compat
+        // fields (e.g. Anthropic/Gemini for reasoning_effort).
+        if req.reasoning_effort.is_some() {
+            v.push("reasoning_effort".to_string());
+        }
+        if req.parallel_tool_calls.is_some() {
+            v.push("parallel_tool_calls".to_string());
+        }
         v
     }
     async fn chat_completion(
@@ -264,6 +272,39 @@ async fn warnings_header_lists_dropped_params() {
         .unwrap_or("");
     assert!(warn.contains("param_dropped:n"), "got: {warn}");
     assert!(warn.contains("param_dropped:seed"), "got: {warn}");
+}
+
+#[tokio::test]
+async fn warnings_header_reports_unsupported_typed_compat_field() {
+    // A newer typed field (`reasoning_effort`) the routed provider can't honor
+    // must surface on the warnings header rather than vanishing silently.
+    let body = json!({
+        "model": "wm-1",
+        "messages": [{"role":"user","content":"hi"}],
+        "reasoning_effort": "high"
+    })
+    .to_string();
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let warn = resp
+        .headers()
+        .get("x-tokentrimmer-warnings")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        warn.contains("param_dropped:reasoning_effort"),
+        "got: {warn}"
+    );
 }
 
 #[tokio::test]

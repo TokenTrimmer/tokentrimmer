@@ -75,6 +75,13 @@ pub(crate) struct UsageTrackingStream {
     /// The `finish_reason` string from the terminal chunk (e.g. `"stop"`).
     /// Used to reconstruct a `ChatCompletionResponse` for cache insertion.
     pub(crate) finish_reason: Option<String>,
+    /// True once a standalone OpenAI-native usage chunk (empty `choices`,
+    /// populated `usage`) has flowed through. Lets the egress avoid emitting a
+    /// duplicate synthesized usage chunk when `include_usage` is honored.
+    saw_standalone_usage_chunk: bool,
+    /// `(id, model, created)` of the most recent chunk, used to stamp the
+    /// synthesized OpenAI-native usage chunk so it matches the stream.
+    last_chunk_meta: Option<(String, String, i64)>,
 }
 
 impl UsageTrackingStream {
@@ -93,7 +100,43 @@ impl UsageTrackingStream {
             authoritative: None,
             finished: false,
             finish_reason: None,
+            saw_standalone_usage_chunk: false,
+            last_chunk_meta: None,
         }
+    }
+
+    /// Whether the upstream already forwarded a standalone OpenAI-native usage
+    /// chunk (empty `choices`, populated `usage`). When `true`, the egress need
+    /// not synthesize one to honor `include_usage`.
+    pub(crate) fn saw_standalone_usage_chunk(&self) -> bool {
+        self.saw_standalone_usage_chunk
+    }
+
+    /// Build the OpenAI-native final usage chunk (empty `choices`, populated
+    /// `usage`) from the accumulated authoritative usage, stamped with the
+    /// stream's id/model/created. Returns `None` when no authoritative usage
+    /// arrived (a truncated stream — nothing trustworthy to report).
+    fn synthesized_usage_chunk(&self) -> Option<ChatCompletionChunk> {
+        let (prompt, completion, cached, cache_creation) = self.authoritative?;
+        let (id, model, created) = self
+            .last_chunk_meta
+            .clone()
+            .unwrap_or_else(|| (String::new(), String::new(), 0));
+        Some(ChatCompletionChunk {
+            id,
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model,
+            choices: Vec::new(),
+            usage: Some(Usage {
+                prompt_tokens: prompt as u64,
+                completion_tokens: completion as u64,
+                total_tokens: (prompt + completion) as u64,
+                cached_tokens: cached as u64,
+                cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation as u64),
+            }),
+            extra: Default::default(),
+        })
     }
 
     /// Returns the accumulated data needed to reconstruct a `ChatCompletionResponse`
@@ -145,6 +188,9 @@ impl Stream for UsageTrackingStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = Pin::new(&mut self.inner).poll_next(cx);
         if let Poll::Ready(Some(Ok(ref chunk))) = poll {
+            // Remember the latest chunk's identity so a synthesized usage chunk
+            // (when `include_usage` is honored) matches the stream.
+            self.last_chunk_meta = Some((chunk.id.clone(), chunk.model.clone(), chunk.created));
             // Track finish_reason (first observed value wins).
             for choice in &chunk.choices {
                 if let Some(ref fr) = choice.finish_reason {
@@ -169,6 +215,12 @@ impl Stream for UsageTrackingStream {
                     usage.cached_tokens as i32,
                     usage.cache_creation_input_tokens.unwrap_or(0) as i32,
                 ));
+                // A standalone usage chunk (no choices) is the OpenAI-native
+                // include_usage shape — record it so we don't synthesize a
+                // duplicate at the egress.
+                if chunk.choices.is_empty() {
+                    self.saw_standalone_usage_chunk = true;
+                }
             }
         }
         poll
@@ -266,6 +318,12 @@ pub struct StreamLogContext {
     /// stream writes its reconstructed response into L1 (and L2 if configured)
     /// after the final chunk is sent.
     pub cache_insert: Option<CacheInsertContext>,
+    /// Whether the client requested `stream_options.include_usage = true`. When
+    /// set, the stream guarantees an OpenAI-native final usage chunk (empty
+    /// `choices`, populated `usage`) is emitted before the `tokentrimmer.usage`
+    /// frame and `[DONE]` — synthesized from accumulated usage only when the
+    /// provider did not already forward a standalone usage chunk.
+    pub include_usage: bool,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -274,8 +332,10 @@ pub struct StreamLogContext {
 enum Phase {
     /// Forwarding provider chunks.
     Streaming,
-    /// Inner stream exhausted; next poll emits the `[DONE]` sentinel.
-    EmitDone,
+    /// Inner stream exhausted; emitting the queued terminal events
+    /// (OpenAI-native usage chunk → `tokentrimmer.usage` → `[DONE]`) one per
+    /// poll, in order.
+    EmitTerminal(std::collections::VecDeque<Event>),
     /// All terminal events emitted.
     Finished,
 }
@@ -292,10 +352,33 @@ struct TrackedEventStream {
     baseline_pricing: Option<ModelPricing>,
     /// Provider surcharge multiplier — applied to cost and baseline (§2.13).
     fee_multiplier: f64,
+    /// Honor `stream_options.include_usage`: emit an OpenAI-native final usage
+    /// chunk before the `tokentrimmer.usage` frame when the client asked for it.
+    include_usage: bool,
     phase: Phase,
 }
 
 impl TrackedEventStream {
+    /// Build the OpenAI-native final usage chunk SSE event (a normal `data:`
+    /// chunk with empty `choices` + populated `usage`) when `include_usage` is
+    /// honored and the provider did not already forward a standalone usage
+    /// chunk. Returns `None` when not requested, already satisfied upstream, or
+    /// no authoritative usage is available (truncated stream).
+    fn include_usage_chunk_event(&self) -> Option<Event> {
+        if !self.include_usage {
+            return None;
+        }
+        let guard = self.inner.lock().expect("tracking stream mutex poisoned");
+        if guard.saw_standalone_usage_chunk() {
+            return None;
+        }
+        let chunk = guard.synthesized_usage_chunk()?;
+        drop(guard);
+        let json = serde_json::to_string(&chunk)
+            .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}"));
+        Some(Event::default().data(json))
+    }
+
     /// Build the terminal `tokentrimmer.usage` SSE event from the accumulated
     /// usage. Returns `None` when there is no pricing to compute cost from.
     fn usage_event(&self) -> Option<Event> {
@@ -331,11 +414,16 @@ impl Stream for TrackedEventStream {
     type Item = Result<Event, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.phase {
+        match &mut self.phase {
             Phase::Finished => return Poll::Ready(None),
-            Phase::EmitDone => {
-                self.phase = Phase::Finished;
-                return Poll::Ready(Some(Ok(Event::default().data("[DONE]"))));
+            Phase::EmitTerminal(queue) => {
+                let next = queue.pop_front();
+                if queue.is_empty() {
+                    self.phase = Phase::Finished;
+                }
+                // The queue always ends with `[DONE]`, so `next` is always Some
+                // while in this phase; fall through to Finished otherwise.
+                return Poll::Ready(next.map(Ok));
             }
             Phase::Streaming => {}
         }
@@ -346,16 +434,26 @@ impl Stream for TrackedEventStream {
         match poll {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                // Clean completion: emit the terminal usage event (when we can
-                // price it), then `[DONE]` on the next poll.
-                self.phase = Phase::EmitDone;
-                match self.usage_event() {
-                    Some(ev) => Poll::Ready(Some(Ok(ev))),
-                    None => {
-                        self.phase = Phase::Finished;
-                        Poll::Ready(Some(Ok(Event::default().data("[DONE]"))))
-                    }
+                // Clean completion: queue the terminal events in order —
+                //   1. OpenAI-native usage chunk (only when include_usage honored),
+                //   2. the `tokentrimmer.usage` cost frame (always, when priceable),
+                //   3. `[DONE]`.
+                let mut queue: std::collections::VecDeque<Event> =
+                    std::collections::VecDeque::new();
+                if let Some(ev) = self.include_usage_chunk_event() {
+                    queue.push_back(ev);
                 }
+                if let Some(ev) = self.usage_event() {
+                    queue.push_back(ev);
+                }
+                queue.push_back(Event::default().data("[DONE]"));
+                let first = queue.pop_front();
+                self.phase = if queue.is_empty() {
+                    Phase::Finished
+                } else {
+                    Phase::EmitTerminal(queue)
+                };
+                Poll::Ready(first.map(Ok))
             }
             Poll::Ready(Some(result)) => {
                 let json = match result {
@@ -440,12 +538,15 @@ pub fn stream_response(
             let baseline_pricing = ctx.baseline_pricing.clone().or_else(|| pricing.clone());
             // Provider surcharge (§2.13) — applied to both cost and baseline.
             let fee_multiplier = ctx.fee_multiplier;
+            // Honor stream_options.include_usage on the egress.
+            let include_usage = ctx.include_usage;
 
             let event_stream = TrackedEventStream {
                 inner: Arc::clone(&shared),
                 pricing: pricing.clone(),
                 baseline_pricing: baseline_pricing.clone(),
                 fee_multiplier,
+                include_usage,
                 phase: Phase::Streaming,
             };
 
@@ -804,10 +905,13 @@ pub fn fake_stream_from_response(
                 role: Some("assistant".into()),
                 content: None,
                 tool_calls: Vec::new(),
+                extra: Default::default(),
             },
             finish_reason: None,
+            extra: Default::default(),
         }],
         usage: None,
+        extra: Default::default(),
     };
 
     let content_chunk = ChatCompletionChunk {
@@ -821,10 +925,13 @@ pub fn fake_stream_from_response(
                 role: None,
                 content: Some(assistant_text),
                 tool_calls: Vec::new(),
+                extra: Default::default(),
             },
             finish_reason: None,
+            extra: Default::default(),
         }],
         usage: None,
+        extra: Default::default(),
     };
 
     let finish_chunk = ChatCompletionChunk {
@@ -836,8 +943,10 @@ pub fn fake_stream_from_response(
             index: 0,
             delta: ChunkDelta::default(),
             finish_reason: Some(finish_reason),
+            extra: Default::default(),
         }],
         usage: Some(usage),
+        extra: Default::default(),
     };
 
     futures::stream::iter(vec![Ok(role_chunk), Ok(content_chunk), Ok(finish_chunk)]).boxed()
@@ -926,10 +1035,13 @@ mod tests {
                         role: None,
                         content: Some("hello ".into()),
                         tool_calls: vec![],
+                        extra: Default::default(),
                     },
                     finish_reason: None,
+                    extra: Default::default(),
                 }],
                 usage: None,
+                extra: Default::default(),
             }),
             Ok(ChatCompletionChunk {
                 id: "x".into(),
@@ -940,6 +1052,7 @@ mod tests {
                     index: 0,
                     delta: ChunkDelta::default(),
                     finish_reason: Some("stop".into()),
+                    extra: Default::default(),
                 }],
                 usage: Some(tt_shared::Usage {
                     prompt_tokens: 10,
@@ -948,6 +1061,7 @@ mod tests {
                     cached_tokens: 2,
                     cache_creation_input_tokens: None,
                 }),
+                extra: Default::default(),
             }),
         ];
         let stream = futures::stream::iter(chunks).boxed();
@@ -986,10 +1100,13 @@ mod tests {
                     role: None,
                     content: Some(long_text.clone()),
                     tool_calls: vec![],
+                    extra: Default::default(),
                 },
                 finish_reason: None,
+                extra: Default::default(),
             }],
             usage: None, // no authoritative usage → triggers fallback
+            extra: Default::default(),
         })];
         let stream = futures::stream::iter(chunks).boxed();
         let mut tracker = UsageTrackingStream::new(stream, 5, 0, "openai");
@@ -1087,6 +1204,7 @@ mod tests {
                 index: 0,
                 delta: ChunkDelta::default(),
                 finish_reason: Some("stop".into()),
+                extra: Default::default(),
             }],
             usage: Some(tt_shared::Usage {
                 prompt_tokens: 100,
@@ -1095,6 +1213,7 @@ mod tests {
                 cached_tokens: 20,
                 cache_creation_input_tokens: Some(30),
             }),
+            extra: Default::default(),
         })];
         let stream = futures::stream::iter(chunks).boxed();
         let mut tracker = UsageTrackingStream::new(stream, 100, 20, "anthropic");
