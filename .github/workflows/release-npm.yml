@@ -1,0 +1,56 @@
+# Publishes the `@tokentrimmer/client` TypeScript SDK (sdk-typescript/) to npm.
+#
+# Trigger: push a tag like `ts-v0.1.0` (tag version must match
+# sdk-typescript/package.json `version`).
+#
+# Auth: requires the `NPM_TOKEN` repository secret — an npm automation
+# (granular access) token with publish rights to the @tokentrimmer scope.
+# Provenance attestation (`--provenance`) additionally needs `id-token: write`
+# and a public repository, both satisfied here.
+name: release-npm
+
+on:
+  push:
+    tags:
+      - 'ts-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm provenance attestation (OIDC).
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Verify tag matches package.json version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#ts-v}"
+          manifest_version="$(node -p "require('./sdk-typescript/package.json').version")"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} (version ${tag_version}) does not match sdk-typescript/package.json version ${manifest_version}"
+            exit 1
+          fi
+          echo "ok: tag ${GITHUB_REF_NAME} matches package.json version ${manifest_version}"
+      - name: Install
+        run: npm install
+        working-directory: sdk-typescript
+      - name: Build
+        run: npm run build
+        working-directory: sdk-typescript
+      - name: Test
+        run: npm test
+        working-directory: sdk-typescript
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        working-directory: sdk-typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

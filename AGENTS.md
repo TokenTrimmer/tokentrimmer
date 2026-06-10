@@ -100,7 +100,7 @@ Use `onboarding-context-loader` first when the task crosses files or you lack co
 
 ## Autonomous loop
 
-The autonomous build runs via `scripts/ralph-iteration.sh`, triggered by cron or `/loop`. Each iteration: one backlog item (`.claude/BACKLOG.md` or GitHub issue labeled `autopilot`), one branch, one subagent dispatch, mandatory gates (test green + inspect-self clean + cost under $1), opens a PR. Never auto-merges. See plan at `/Users/iansimon/.claude/plans/please-review-all-files-linked-tulip.md`.
+The autonomous build runs via `scripts/ralph-iteration.sh`, triggered by cron or `/loop`. Each iteration: one backlog item (`.claude/BACKLOG.md` or GitHub issue labeled `autopilot`), one branch, one subagent dispatch, mandatory gates (test green + inspect-self clean + cost under $1), opens a PR. Never auto-merges. See the in-repo plan at `.claude/plans/00-master-buildout-plan.md`.
 
 ## Session lifecycle
 

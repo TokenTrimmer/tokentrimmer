@@ -54,9 +54,9 @@ jobs:
   # ── Preflight: are the deploy secrets configured? ────────────────────────────
   # GitHub forbids `secrets` in job-level `if:`, so a tiny job reads them into an
   # output and `staging` gates on it; `prod` cascade-skips via `needs`. When the
-  # secrets are absent every deploy job is SKIPPED (neutral/green) rather than
-  # failing — the pipeline activates automatically once an operator sets
-  # FLY_API_TOKEN + STAGING_DATABASE_URL_DIRECT (and, for prod,
+  # secrets are absent this job FAILS LOUDLY — an unconfigured deploy pipeline
+  # must never read as a green run (it hid a never-deployed prod for weeks).
+  # Set FLY_API_TOKEN + STAGING_DATABASE_URL_DIRECT (and, for prod,
   # PROD_DATABASE_URL_DIRECT + the `production` Environment gate — see header).
   preflight:
     name: deploy configured?
@@ -73,7 +73,8 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Gateway deploy skipped — set FLY_API_TOKEN + STAGING_DATABASE_URL_DIRECT (and PROD_DATABASE_URL_DIRECT + the production Environment) to enable (see header)."
+            echo "::error::Gateway deploy NOT configured — set FLY_API_TOKEN + STAGING_DATABASE_URL_DIRECT (and PROD_DATABASE_URL_DIRECT + the production Environment) to enable (see header). Failing loudly so a dead pipeline can't look green."
+            exit 1
           fi
 
   # ── STAGING ────────────────────────────────────────────────────────────────
@@ -84,10 +85,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # Build `tt` from THIS commit so the embedded migrator (migrate! embeds SQL
       # at compile time) reflects the migrations being deployed. The bin is `tt`.
@@ -99,12 +102,14 @@ jobs:
           DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL_DIRECT }}
         run: ./target/release/tt gateway --migrate-only
 
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
 
+      # TT_GIT_SHA is baked into the image (Dockerfile ARG) and surfaced as
+      # "git_sha" in /health, so deployed-sha-drift.yml can compare it to main.
       - name: Deploy gateway → tokentrimmer-staging
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.staging.toml
+        run: flyctl deploy --remote-only --config fly.staging.toml --build-arg TT_GIT_SHA=${{ github.sha }}
 
       - name: Post-deploy staging smoke (wake scale-to-zero, check /health)
         run: |
@@ -121,10 +126,12 @@ jobs:
     timeout-minutes: 30
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Build tt CLI (embeds current migrations)
         run: cargo build -p tt-cli --bin tt --locked --release
@@ -134,12 +141,12 @@ jobs:
           DATABASE_URL: ${{ secrets.PROD_DATABASE_URL_DIRECT }}
         run: ./target/release/tt gateway --migrate-only
 
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
 
       - name: Deploy gateway → tokentrimmer
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.toml
+        run: flyctl deploy --remote-only --config fly.toml --build-arg TT_GIT_SHA=${{ github.sha }}
 
       - name: Post-deploy prod smoke
         run: |

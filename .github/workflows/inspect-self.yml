@@ -1,6 +1,6 @@
 name: inspect-self (dogfood)
 
-# Required check as of Week 14 — 10 P0 rules ship and the repo self-scans clean.
+# Required check — the 19 Tier-1 rules ship and the repo self-scans clean.
 # Any new HIGH or CRITICAL finding blocks merge to main.
 
 on:
@@ -17,9 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build CLI
         run: cargo build -p tt-cli --release
       - name: Run Inspect on self (gate at HIGH severity)

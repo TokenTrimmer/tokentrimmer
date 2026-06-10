@@ -67,8 +67,10 @@ The Gateway authenticates via `Authorization: Bearer tt_live_…` and returns co
 
 The SDK is a drop-in `openai.OpenAI` subclass; the default base URL is already the hosted Gateway, and it parses the cost headers onto a `.tt` attribute.
 
+> **Not yet on PyPI** — published packages land at launch. Until then, install from git:
+
 ```bash
-pip install tokentrimmer
+pip install "git+https://github.com/tokentrimmer/tokentrimmer.git#subdirectory=sdk-python"
 ```
 
 ```python
@@ -334,7 +336,13 @@ TT_RETRIEVAL_STORE=memory TT_OPENAI_EMBED_KEY=sk-... tt gateway
 
 Thin OpenAI subclasses that route through the Gateway and surface cost/cache metadata on `.tt`.
 
-**Python** (`pip install tokentrimmer`, requires Python ≥ 3.9, `openai>=1.0,<2`):
+> **Not yet on PyPI/npm** — published packages land at launch. Until then, install from git:
+> `pip install "git+https://github.com/tokentrimmer/tokentrimmer.git#subdirectory=sdk-python"`.
+> For TypeScript (npm cannot install a git subdirectory directly): clone the repo, run
+> `npm install && npm run build` in `sdk-typescript/`, then `npm install <path-to-clone>/sdk-typescript`
+> from your project.
+
+**Python** (package `tokentrimmer`, requires Python ≥ 3.9, `openai>=1.0,<2`):
 
 ```python
 from tokentrimmer import TokenTrimmer
@@ -347,7 +355,7 @@ resp = client.chat.completions.create(
 print(resp.tt.cost_usd, resp.tt.cache, resp.tt.trace_id)
 ```
 
-**TypeScript** (`npm install @tokentrimmer/client`, peer dep `openai ^4 || ^5`):
+**TypeScript** (package `@tokentrimmer/client`, peer dep `openai ^4 || ^5`):
 
 ```ts
 import { TokenTrimmer } from '@tokentrimmer/client';

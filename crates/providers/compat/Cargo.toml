@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "OpenAI-wire-compatible provider machinery — shared by the OpenAI adapter and the Groq/Mistral/Together/OpenRouter adapters."
 
 [dependencies]

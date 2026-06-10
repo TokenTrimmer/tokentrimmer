@@ -1,0 +1,89 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Deployed-SHA drift check: prod gateway /health "git_sha" vs origin/main HEAD.
+#
+# The deploy workflow bakes the commit into the image via
+# `flyctl deploy --build-arg TT_GIT_SHA=…` (deploy.yml) and the gateway surfaces
+# it as `git_sha` in /health. This daily job fails — and opens-or-updates a
+# single pinned issue (stable title, comment on repeat) — when prod is
+# unreachable, reports `git_sha: "unknown"` (image built without TT_GIT_SHA),
+# or is running a commit other than main HEAD (e.g. an unapproved prod deploy
+# sitting behind the `production` Environment gate).
+# ─────────────────────────────────────────────────────────────────────────────
+name: Deployed SHA drift
+
+on:
+  schedule:
+    - cron: '23 6 * * *' # daily 06:23 UTC
+  workflow_dispatch:
+
+jobs:
+  drift:
+    name: prod /health git_sha vs main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      # Prod gateway URL — matches the post-deploy prod smoke in deploy.yml
+      # (fly.toml app "tokentrimmer"; the api.tokentrimmer.com alias fronts it).
+      HEALTH_URL: https://tokentrimmer.fly.dev/health
+    steps:
+      - name: Compare deployed git_sha to main HEAD
+        id: check
+        run: |
+          main_sha="$(gh api "repos/${GH_REPO}/commits/heads/main" --jq .sha)"
+          status=ok
+          detail="deployed git_sha matches main HEAD (${main_sha})"
+          if ! health="$(curl -sf --retry 5 --retry-all-errors --retry-delay 5 "$HEALTH_URL")"; then
+            status=unreachable
+            detail="GET ${HEALTH_URL} failed after retries"
+          else
+            deployed_sha="$(printf '%s' "$health" | jq -r '.git_sha // empty' 2>/dev/null || true)"
+            if [ -z "$deployed_sha" ] || [ "$deployed_sha" = "unknown" ]; then
+              status=unknown
+              detail="/health reported git_sha \"${deployed_sha:-<missing>}\" — image was built without TT_GIT_SHA"
+            elif [ "$deployed_sha" != "$main_sha" ]; then
+              status=mismatch
+              detail="deployed ${deployed_sha} != main HEAD ${main_sha}"
+            fi
+          fi
+          echo "${status}: ${detail}"
+          {
+            echo "status=${status}"
+            echo "detail=${detail}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Stable title → one pinned issue that gets a comment per failing run
+      # instead of a new issue each day (cf. provider-contract-tests.yml).
+      - name: Open or update drift issue
+        if: steps.check.outputs.status != 'ok'
+        env:
+          TITLE: 'Deployed gateway SHA drift (prod /health vs main)'
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="Scheduled deployed-SHA drift check failed: **${STATUS}** — ${DETAIL}
+
+          Run: ${RUN_URL}
+
+          Repeat failures comment on this issue instead of opening a new one; close it once prod matches main HEAD."
+          num="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == env.TITLE)][0].number // empty')"
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi
+
+      - name: Fail on drift
+        if: steps.check.outputs.status != 'ok'
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail }}
+        run: |
+          echo "::error::deployed-SHA drift check failed (${STATUS}): ${DETAIL}"
+          exit 1

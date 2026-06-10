@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Anthropic provider adapter — the worked reference example. Auto-applies cache_control on system blocks >=1024 tokens."
 
 [dependencies]

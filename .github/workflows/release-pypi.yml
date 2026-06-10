@@ -1,0 +1,59 @@
+# Publishes the `tokentrimmer` Python SDK (sdk-python/) to PyPI.
+#
+# Trigger: push a tag like `py-v0.1.0` (tag version must match
+# sdk-python/pyproject.toml `version`).
+#
+# Auth: PyPI Trusted Publishing (OIDC) — no API token secret needed.
+# One-time setup on pypi.org for the `tokentrimmer` project:
+#   owner: TokenTrimmer, repo: tokentrimmer,
+#   workflow: release-pypi.yml, environment: pypi
+name: release-pypi
+
+on:
+  push:
+    tags:
+      - 'py-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      # Required for PyPI Trusted Publishing (OIDC token exchange).
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Verify tag matches pyproject.toml version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#py-v}"
+          manifest_version="$(python -c 'import tomllib; print(tomllib.load(open("sdk-python/pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} (version ${tag_version}) does not match sdk-python/pyproject.toml version ${manifest_version}"
+            exit 1
+          fi
+          echo "ok: tag ${GITHUB_REF_NAME} matches pyproject.toml version ${manifest_version}"
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install build
+          python -m build --outdir dist sdk-python
+      - name: Check py.typed shipped
+        run: |
+          python - <<'EOF'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          assert "tokentrimmer/py.typed" in names, f"py.typed missing from {wheel}: {names}"
+          print(f"ok: tokentrimmer/py.typed present in {wheel}")
+          EOF
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist
