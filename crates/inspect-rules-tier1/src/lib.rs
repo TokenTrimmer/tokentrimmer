@@ -1,4 +1,5 @@
-//! The 19 P0 rules that ship at launch. See `docs/01-inspect-rule-catalog.md`.
+//! The Tier-1 deterministic rules that ship at launch. See
+//! `docs/01-inspect-rule-catalog.md`.
 
 pub mod rules;
 
@@ -21,6 +22,7 @@ pub use rules::PromptBloatedSystemRule;
 pub use rules::PromptDynamicPrefixBreaksCacheRule;
 pub use rules::PromptNoOutputConstraintRule;
 pub use rules::PromptVerboseFewShotRule;
+pub use rules::PromptVolatileInSystemPromptRule;
 
 use tt_inspect_core::{Finding, Language, Rule, Severity};
 
@@ -50,6 +52,8 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(OutputNGreaterThanOneRule::new()),
         Box::new(ModelReasoningEffortDefaultHighRule::new()),
         Box::new(PromptDynamicPrefixBreaksCacheRule::new()),
+        // Cache-maximizer: volatile token embedded anywhere in a system prompt.
+        Box::new(PromptVolatileInSystemPromptRule::new()),
     ]
 }
 
