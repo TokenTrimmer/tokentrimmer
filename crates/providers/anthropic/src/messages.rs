@@ -751,6 +751,82 @@ fn sse_frame(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+/// The set of Anthropic error `type` values per the Messages API spec:
+/// `invalid_request_error`, `authentication_error`, `permission_error`,
+/// `not_found_error`, `request_too_large`, `rate_limit_error`, `api_error`,
+/// `overloaded_error`. Anything outside this set is collapsed to `api_error`.
+fn is_anthropic_error_type(t: &str) -> bool {
+    matches!(
+        t,
+        "invalid_request_error"
+            | "authentication_error"
+            | "permission_error"
+            | "not_found_error"
+            | "request_too_large"
+            | "rate_limit_error"
+            | "api_error"
+            | "overloaded_error"
+    )
+}
+
+/// Map an OpenAI-shaped error `type` (the gateway's internal envelope:
+/// `invalid_request_error`, `authentication_error`, `billing_error`,
+/// `permission_error`, `rate_limit_error`, `timeout_error`, `upstream_error`,
+/// `server_error`, …) to an Anthropic error `type`. Values that are already valid
+/// Anthropic types pass through; everything else (gateway-only types like
+/// `upstream_error`/`server_error`/`timeout_error`/`billing_error`, or a missing
+/// type) collapses to `api_error`.
+fn anthropic_error_type_from_openai(openai_type: Option<&str>) -> &str {
+    match openai_type {
+        Some(t) if is_anthropic_error_type(t) => t,
+        _ => "api_error",
+    }
+}
+
+/// Map an HTTP status code to an Anthropic error `type` per the Messages API spec
+/// table (400→invalid_request_error, 401→authentication_error, 403→permission_error,
+/// 404→not_found_error, 413→request_too_large, 429→rate_limit_error,
+/// 529→overloaded_error, any other 5xx→api_error). Unmapped statuses fall back to
+/// `api_error`. This is the authoritative mapping for error *bodies*, where the HTTP
+/// status is always present (unlike a mid-stream SSE frame).
+pub fn anthropic_error_type_for_status(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
+/// Build an Anthropic-shaped error *body* (`{"type":"error","error":{"type","message"}}`)
+/// from the gateway's internal OpenAI-style error envelope
+/// (`{"error":{"message":..,"type":..,"code":..}}`) and the HTTP status the response
+/// carries.
+///
+/// The error `type` is derived from the HTTP `status` (the spec's authoritative
+/// status→type table — see [`anthropic_error_type_for_status`]); the `message` is
+/// taken verbatim from the OpenAI `error.message`. `err` may be the full envelope
+/// (`{"error":{...}}`) or the bare inner object.
+///
+/// Strict Anthropic SDK clients (Claude Code) parse error bodies as the native
+/// Anthropic shape; the OpenAI envelope would mis-parse. This keeps the HTTP status
+/// and message but re-shapes the body so those clients consume it correctly.
+pub fn anthropic_error_body(err: &Value, status: u16) -> Value {
+    let inner = err.get("error").unwrap_or(err);
+    let message = inner
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    json!({
+        "type": "error",
+        "error": {"type": anthropic_error_type_for_status(status), "message": message},
+    })
+}
+
 /// Build an Anthropic `event: error` SSE frame from an OpenAI-shaped in-band error
 /// payload (`{"error":{"message":..,"type":..}}`).
 ///
@@ -761,18 +837,16 @@ fn sse_frame(event: &str, data: &Value) -> String {
 /// clients (Claude Code) surface as an error. This translates the former into the
 /// latter so a mid-stream failure is not silently dropped and presented as a clean
 /// (but truncated) success.
+///
+/// Unlike an error *body*, a mid-stream frame carries no HTTP status, so the type is
+/// derived from the in-band OpenAI `type` via [`anthropic_error_type_from_openai`].
 pub fn anthropic_error_frame(err: &Value) -> String {
     let inner = err.get("error").unwrap_or(err);
     let message = inner
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("upstream error");
-    // Map the OpenAI in-band `upstream_error` type to Anthropic's `api_error`;
-    // pass through any other concrete type verbatim.
-    let err_type = match inner.get("type").and_then(Value::as_str) {
-        Some("upstream_error") | None => "api_error",
-        Some(other) => other,
-    };
+    let err_type = anthropic_error_type_from_openai(inner.get("type").and_then(Value::as_str));
     sse_frame(
         "error",
         &json!({
@@ -1242,6 +1316,56 @@ mod tests {
         let frame = anthropic_error_frame(&json!({"error": {}}));
         assert!(frame.contains("\"type\":\"api_error\""));
         assert!(frame.contains("\"message\":\"upstream error\""));
+    }
+
+    #[test]
+    fn anthropic_error_body_maps_status_to_type_and_keeps_message() {
+        // The credential-guard 400 carries an OpenAI envelope with a gateway-only
+        // `code`; the Anthropic body must use the status-derived `type` + the
+        // message verbatim, wrapped in `{"type":"error","error":{...}}`.
+        let openai = json!({
+            "error": {
+                "message": "No upstream credential configured for provider 'anthropic'.",
+                "type": "invalid_request_error",
+                "code": "missing_provider_credential",
+                "param": null,
+            }
+        });
+        let body = anthropic_error_body(&openai, 400);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["message"],
+            "No upstream credential configured for provider 'anthropic'."
+        );
+        // The gateway-only `code`/`param` keys are dropped from the Anthropic shape.
+        assert!(body["error"].get("code").is_none());
+    }
+
+    #[test]
+    fn anthropic_error_body_maps_each_status() {
+        let cases = [
+            (401u16, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (413, "request_too_large"),
+            (429, "rate_limit_error"),
+            (529, "overloaded_error"),
+            (500, "api_error"),
+            (502, "api_error"),
+            (504, "api_error"),
+        ];
+        for (status, expected) in cases {
+            let body = anthropic_error_body(&json!({"error": {"message": "x"}}), status);
+            assert_eq!(body["error"]["type"], expected, "status {status}");
+        }
+    }
+
+    #[test]
+    fn anthropic_error_body_defaults_missing_message() {
+        let body = anthropic_error_body(&json!({"error": {}}), 500);
+        assert_eq!(body["error"]["message"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
     }
 
     #[test]

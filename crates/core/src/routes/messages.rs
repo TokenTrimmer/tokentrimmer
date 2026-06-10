@@ -18,13 +18,14 @@ use axum::{
     body::{Body, Bytes},
     extract::{Extension, State},
     http::HeaderMap,
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use futures::stream::StreamExt;
 use tt_auth::ApiKeyContext;
 use tt_provider_anthropic::messages::{
-    anthropic_error_frame, chat_response_to_messages, AnthropicSseEncoder, MessagesRequest,
+    anthropic_error_body, anthropic_error_frame, chat_response_to_messages, AnthropicSseEncoder,
+    MessagesRequest,
 };
 use tt_shared::ChatCompletionChunk;
 
@@ -36,6 +37,30 @@ use crate::{middleware::trace::TraceId, routes::chat, ApiError, ApiResult, AppSt
 /// runs it through [`chat::handler`], and translates the response (JSON or SSE)
 /// back to the Anthropic Messages shape, preserving cost headers and status.
 pub async fn handler(
+    State(state): State<AppState>,
+    Extension(trace): Extension<TraceId>,
+    auth_ctx: Option<Extension<ApiKeyContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Errors must NOT escape via `?` to axum's default `IntoResponse for ApiError`,
+    // which renders the gateway's OpenAI-style error envelope. This endpoint is
+    // Anthropic-native, so every error body — parse/translate failures, the
+    // credential-guard 400, and any upstream error propagated from `chat::handler`
+    // — is re-shaped into the Anthropic error envelope before it leaves the handler.
+    match handle(State(state), Extension(trace), auth_ctx, headers, body).await {
+        Ok(resp) => resp,
+        // Render the ApiError to its (status, OpenAI body), then transcode that body
+        // to the Anthropic shape so strict Anthropic SDK clients (Claude Code) parse it.
+        Err(err) => transcode_error_response(err.into_response()).await,
+    }
+}
+
+/// Inner handler: parses + translates the request, runs the shared chat pipeline,
+/// and transcodes the response. Returns `Err(ApiError)` for the error paths; the
+/// outer [`handler`] is responsible for re-shaping those into the Anthropic error
+/// envelope (so they never reach axum's OpenAI-style renderer).
+async fn handle(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
     auth_ctx: Option<Extension<ApiKeyContext>>,
@@ -86,20 +111,21 @@ fn is_event_stream(resp: &Response) -> bool {
 /// Not every `Ok` chat response is success-shaped: the chat handler returns some
 /// client errors (e.g. a negative-cache 4xx hit, or the BYO-only credential guard)
 /// as `Ok((status_4xx, Json({"error":{...}})))` rather than via `?`. Those bodies
-/// are NOT `ChatCompletionResponse`s, so a non-2xx status or an error-shaped body
-/// is passed through verbatim — keeping the real status and error payload — instead
-/// of attempting the (failing) transcode and mis-mapping it to a 500.
+/// are the gateway's OpenAI-style error envelope, NOT a `ChatCompletionResponse`,
+/// so a non-2xx status or an error-shaped body is re-shaped into the Anthropic error
+/// envelope (preserving the real status + headers) rather than mis-transcoded as a
+/// success body.
 async fn transcode_json_response(resp: Response) -> ApiResult<Response> {
     let (parts, body) = resp.into_parts();
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to read chat response body: {e}")))?;
 
-    // Pass non-success / error-shaped bodies through unchanged. The chat handler's
-    // error bodies are already an `{"error":{...}}` shape an Anthropic-wire client
-    // can consume, and the original 4xx/5xx status must be preserved.
+    // Non-success / error-shaped bodies carry the gateway's OpenAI error envelope.
+    // Re-shape them to the Anthropic error envelope so strict Anthropic-wire clients
+    // (Claude Code) parse them; the original 4xx/5xx status + headers are preserved.
     if !parts.status.is_success() || is_error_body(&bytes) {
-        return Ok(Response::from_parts(parts, Body::from(bytes)));
+        return Ok(rebuild_as_anthropic_error(parts, &bytes));
     }
 
     let chat: tt_shared::ChatCompletionResponse = serde_json::from_slice(&bytes)
@@ -117,6 +143,44 @@ async fn transcode_json_response(resp: Response) -> ApiResult<Response> {
             .insert(axum::http::header::CONTENT_TYPE, ct);
     }
     Ok(out)
+}
+
+/// Re-shape an error response (an `ApiError` rendered to its OpenAI envelope) into
+/// the Anthropic error envelope, preserving status + headers. Used for the
+/// `Err(ApiError)` paths — parse/translate failures, the credential-guard 400, and
+/// upstream errors propagated from `chat::handler`.
+async fn transcode_error_response(resp: Response) -> Response {
+    let (parts, body) = resp.into_parts();
+    match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => rebuild_as_anthropic_error(parts, &bytes),
+        // Reading the (in-memory) error body should never fail; if it somehow does,
+        // surface a minimal Anthropic-shaped error rather than the OpenAI one.
+        Err(_) => {
+            let value =
+                anthropic_error_body(&serde_json::json!({"error": {}}), parts.status.as_u16());
+            (parts.status, Json(value)).into_response()
+        }
+    }
+}
+
+/// Build an Anthropic-error-shaped response from response `parts` (status + headers)
+/// and an OpenAI-style error body. The status code is preserved verbatim and drives
+/// the Anthropic error `type`; the message is taken from the OpenAI `error.message`.
+fn rebuild_as_anthropic_error(parts: axum::http::response::Parts, bytes: &[u8]) -> Response {
+    let status = parts.status;
+    let openai: serde_json::Value =
+        serde_json::from_slice(bytes).unwrap_or_else(|_| serde_json::json!({"error": {}}));
+    let anthropic = anthropic_error_body(&openai, status.as_u16());
+    let new_body = serde_json::to_vec(&anthropic).unwrap_or_default();
+
+    let mut out = Response::from_parts(parts, Body::from(new_body));
+    // Body length changed; drop any stale content-length so axum recomputes it.
+    out.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
+    if let Ok(ct) = "application/json".parse() {
+        out.headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, ct);
+    }
+    out
 }
 
 /// Whether `bytes` is a JSON object carrying a top-level `error` field (the chat
