@@ -542,7 +542,22 @@ async fn messages_credential_guard_fires_for_verified_org_without_anthropic_cred
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["error"]["code"], "missing_provider_credential");
+    // GW-MSG-ERRSHAPE: the body MUST be the Anthropic error envelope
+    // ({"type":"error","error":{"type","message"}}), NOT the gateway's OpenAI-style
+    // envelope — strict Anthropic SDK clients (Claude Code) parse error bodies.
+    assert_eq!(v["type"], "error", "body must be Anthropic-shaped: {v}");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    // The credential-guard message is preserved (mentions the provider + dashboard).
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("anthropic") && msg.contains("credential"),
+        "credential-guard message not preserved: {msg}"
+    );
+    // The gateway-only OpenAI `code` field must not leak into the Anthropic shape.
+    assert!(
+        v["error"].get("code").is_none(),
+        "Anthropic error body must not carry the OpenAI `code` field: {v}"
+    );
 }
 
 /// A `tt_test_*` sandbox key streaming request: the chat handler short-circuits
@@ -662,9 +677,10 @@ fn det_messages_request() -> serde_json::Value {
 }
 
 /// A negative-cache 4xx hit (an `Ok((400, Json({"error":..})))` from the chat
-/// handler) must pass through `/v1/messages` verbatim — same 400 status and the
-/// real error body — NOT be mis-transcoded into a misleading 500. The first
-/// request populates the negative cache; the second is served from it.
+/// handler) must surface on `/v1/messages` with the same 400 status and the real
+/// error message — NOT be mis-transcoded into a misleading 500 — but re-shaped into
+/// the Anthropic error envelope (GW-MSG-ERRSHAPE). The first request populates the
+/// negative cache; the second is served from it.
 #[tokio::test]
 async fn messages_negative_cache_4xx_passes_through_not_500() {
     let org = Uuid::now_v7();
@@ -729,16 +745,23 @@ async fn messages_negative_cache_4xx_passes_through_not_500() {
     // Provider NOT called again — short-circuited by the negative cache.
     assert_eq!(calls.load(Ordering::Relaxed), 1, "provider not re-called");
 
-    // The real cached error shape is preserved (not a 'failed to parse' 500 body).
+    // The error is preserved (not a 'failed to parse' 500 body) and Anthropic-shaped.
     let bytes = axum::body::to_bytes(r2.into_body(), usize::MAX)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error", "body must be Anthropic-shaped: {v}");
+    // 400 → Anthropic `invalid_request_error` per the status→type mapping.
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    // The original error message is preserved; the OpenAI-only `code` is dropped.
     assert!(
-        v.get("error").is_some(),
-        "cached error body must be preserved; got {v}"
+        v["error"]["message"].is_string(),
+        "cached error message must be preserved; got {v}"
     );
-    assert_eq!(v["error"]["code"], "cached_client_error");
+    assert!(
+        v["error"].get("code").is_none(),
+        "Anthropic error body must not carry the OpenAI `code` field: {v}"
+    );
 }
 
 /// An "anthropic" provider whose stream yields one good content chunk and THEN
@@ -871,10 +894,163 @@ async fn messages_streaming_mid_stream_error_emits_anthropic_error_event() {
         body.contains("event: error"),
         "mid-stream error not surfaced as an Anthropic error event in:\n{body}"
     );
+    // GW-MSG-ERRSHAPE: the error frame payload MUST be the Anthropic error envelope
+    // ({"type":"error","error":{"type","message"}}), not the OpenAI in-band shape.
+    let err_data = body
+        .split("event: error\n")
+        .nth(1)
+        .and_then(|tail| tail.lines().find_map(|l| l.strip_prefix("data: ")))
+        .expect("error event must carry a data line");
+    let v: serde_json::Value =
+        serde_json::from_str(err_data).expect("error frame must be valid JSON");
+    assert_eq!(v["type"], "error", "error frame not Anthropic-shaped: {v}");
+    // The gateway's in-band `upstream_error` type maps to Anthropic's `api_error`.
+    assert_eq!(v["error"]["type"], "api_error");
+    let frame_msg = v["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        body.contains("upstream exploded mid-stream"),
-        "error message missing in:\n{body}"
+        frame_msg.contains("upstream exploded mid-stream"),
+        "error message not preserved in frame: {frame_msg}"
     );
     // It must NOT masquerade as a clean OpenAI terminator.
     assert!(!body.contains("data: [DONE]"));
+}
+
+/// An "anthropic" provider that fails a non-streaming request with an upstream 401.
+/// This drives the `Err(ApiError::Provider(..))` path that propagates out of
+/// `chat::handler` via `?` — distinct from both the credential-guard
+/// (`ApiError::InvalidRequest`) and the negative-cache (`Ok((4xx, error body))`).
+struct AnthropicUnauthorizedMock;
+
+#[async_trait]
+impl Provider for AnthropicUnauthorizedMock {
+    fn id(&self) -> &'static str {
+        "anthropic"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: "claude-sonnet-4-6".into(),
+            provider: "anthropic".into(),
+            capabilities: vec![Capability::Text, Capability::Streaming],
+            max_input_tokens: 200_000,
+            max_output_tokens: 8192,
+        }]
+    }
+    fn pricing(&self, _m: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+            cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: chrono::Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Err(ProviderError::Unauthorized(
+            "invalid upstream api key".into(),
+        ))
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Err(ProviderError::Unauthorized("no".into()))
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+/// An upstream error propagated from `chat::handler` (here a 401) must surface on
+/// `/v1/messages` as the Anthropic error envelope with the mapped status — NOT the
+/// gateway's OpenAI-style envelope (GW-MSG-ERRSHAPE).
+#[tokio::test]
+async fn messages_non_streaming_upstream_error_is_anthropic_shaped() {
+    let org = Uuid::now_v7();
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(AnthropicUnauthorizedMock));
+
+    let key_store = InMemoryKeyStore::new();
+    let cred_store = InMemoryProviderCredentialStore::new();
+    cred_store.insert(org, "anthropic", creds("ANT_KEY"));
+    let key = issue_key_for(&key_store, org).await;
+
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(Arc::new(key_store) as Arc<dyn KeyStore>)
+            .with_credential_store(Arc::new(cred_store) as Arc<dyn ProviderCredentialStore>),
+    );
+
+    let r = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::from(messages_request(false).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Upstream 401 → gateway 401.
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error", "body must be Anthropic-shaped: {v}");
+    // 401 → Anthropic `authentication_error` per the status→type mapping.
+    assert_eq!(v["error"]["type"], "authentication_error");
+    assert!(
+        v["error"]["message"].is_string(),
+        "upstream error message must be present: {v}"
+    );
+    // No OpenAI-only `code` field in the Anthropic shape.
+    assert!(v["error"].get("code").is_none(), "got {v}");
+}
+
+/// A malformed request body (not valid Anthropic JSON) fails at parse time with
+/// `ApiError::InvalidRequest`. That 400 must also emit the Anthropic error envelope,
+/// never reaching axum's OpenAI-style renderer (GW-MSG-ERRSHAPE).
+#[tokio::test]
+async fn messages_malformed_request_is_anthropic_shaped_400() {
+    let org = Uuid::now_v7();
+    let Harness { app, key, .. } = build(org, /*seed_anthropic_cred=*/ true).await;
+
+    let r = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                // Missing required fields / not a valid MessagesRequest.
+                .body(Body::from("{\"not\":\"a messages request\"}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["type"], "error", "body must be Anthropic-shaped: {v}");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
 }

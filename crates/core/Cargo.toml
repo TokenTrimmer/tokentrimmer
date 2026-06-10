@@ -30,6 +30,9 @@ sqlx.workspace = true
 blake3.workspace = true
 dashmap.workspace = true
 rand_core.workspace = true
+# Pre-auth per-IP rate cap in front of the argon2 key-verify path
+# (middleware/argon2_cap.rs). GCRA keyed limiter.
+governor.workspace = true
 
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true

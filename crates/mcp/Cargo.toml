@@ -9,6 +9,7 @@ description = "Model Context Protocol server exposing TokenTrimmer intelligence 
 
 [dependencies]
 tt-shared.workspace = true
+tt-auth.workspace = true
 tt-inspect-core.workspace = true
 tt-inspect-rules-tier1.workspace = true
 tt-plan-core.workspace = true
@@ -37,6 +38,12 @@ insta = { workspace = true, features = ["json"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
+# Used only by auth tests to mint a real argon2-hashed key into the in-memory
+# key store (via `tt_auth::issue`), so verification exercises the real crypto
+# path rather than a reimplemented hash.
+tt-telemetry.workspace = true
+uuid.workspace = true
+chrono.workspace = true
 
 [lints]
 workspace = true

@@ -93,14 +93,19 @@ enum Command {
         action: AuditAction,
     },
     /// Run the MCP server (stdio transport by default).
+    ///
+    /// `--transport http` serves the current MCP Streamable HTTP transport on a
+    /// single `/mcp` endpoint; `--transport sse` is the deprecated HTTP+SSE
+    /// transport, retained only for older clients.
     Mcp {
+        /// Transport: `stdio` (default), `http` (Streamable HTTP), or `sse` (deprecated).
         #[arg(long, default_value = "stdio")]
         transport: String,
         #[arg(long)]
         tt_api_key: Option<String>,
         #[arg(long)]
         tt_api_base: Option<String>,
-        /// Port to bind when using --transport sse (default 31416).
+        /// Port to bind when using --transport http or sse (default 31416).
         #[arg(long, default_value_t = 31416)]
         sse_port: u16,
     },
@@ -456,8 +461,11 @@ async fn main() -> anyhow::Result<()> {
         } => {
             use tt_mcp::{
                 auth,
+                cost::{CostControlBackend, UnconfiguredBackend},
                 resources::{cost_ledger, inspect_baseline},
-                tools::{find_route_for, inspect_diff, lookup_semantic_cache, preview_cost},
+                tools::{
+                    cost_control, find_route_for, inspect_diff, lookup_semantic_cache, preview_cost,
+                },
                 Server,
             };
             let ctx = tt_cli::context::ResolvedContext::load(tt_api_key, tt_api_base)?;
@@ -500,18 +508,101 @@ async fn main() -> anyhow::Result<()> {
                     http: reqwest::Client::new(),
                 },
             ));
+
+            // Real, store-backed key verification (design §8): when a database is
+            // configured, wire a Postgres key store and have the server verify the
+            // operator's own key against it on the first tool/resource call,
+            // caching the bound org for the process lifetime so tools act on the
+            // right tenant. Invalid/absent/revoked → the call fails closed with
+            // `unauthorized` (-32001) via `tt_auth::verify` (no reimplemented
+            // crypto, no timing oracle). Without a DB there is no key store to
+            // verify against, so we fall back to the transport's loopback bearer
+            // guard alone — mirroring the gateway's documented dev-mode posture.
+            if let Some(db_url) = config.database_url.as_deref() {
+                match tt_core::connect(db_url, 5).await {
+                    Ok(pool) => {
+                        let store: std::sync::Arc<dyn tt_auth::KeyStore> =
+                            std::sync::Arc::new(tt_auth::postgres::PostgresKeyStore::new(pool));
+                        let authenticator = auth::Authenticator::new(store, api_key.clone());
+
+                        // Eagerly resolve the bound org so the cost-control tools
+                        // can be scoped to the verified tenant (set_cost_limit
+                        // must only ever touch this org). This runs the same
+                        // store-backed verify path the dispatcher uses; the
+                        // OnceCell caches it so the first dispatch reuses it.
+                        match authenticator.context().await {
+                            Ok(ctx) => {
+                                let org_id = ctx.org_id;
+                                // PUBLIC-repo MVP: no per-org-key cost endpoint
+                                // exists in the hosted API yet, so the cost tools
+                                // run against the documented `UnconfiguredBackend`
+                                // seam (clearly-marked responses, no fabricated
+                                // numbers). A hosted deployment swaps in a real
+                                // `CostControlBackend` here without changing the
+                                // tool surface.
+                                let backend: std::sync::Arc<dyn CostControlBackend> =
+                                    std::sync::Arc::new(UnconfiguredBackend);
+                                server
+                                    .tools
+                                    .register(Box::new(cost_control::GetSpendTodayTool {
+                                        backend: backend.clone(),
+                                        org_id,
+                                    }));
+                                server.tools.register(Box::new(
+                                    cost_control::CheckBudgetRemainingTool {
+                                        backend: backend.clone(),
+                                        org_id,
+                                    },
+                                ));
+                                server
+                                    .tools
+                                    .register(Box::new(cost_control::SetCostLimitTool {
+                                        backend,
+                                        org_id,
+                                    }));
+                                tracing::info!(
+                                    "MCP cost-control tools registered (org-scoped); backend: unconfigured seam"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "MCP operator key verification failed; cost-control tools not registered");
+                            }
+                        }
+
+                        server = server.with_authenticator(authenticator);
+                        tracing::info!(
+                            "MCP key store: Postgres-backed (operator key verified on first call)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "MCP db connect failed; serving with loopback bearer guard only (no store-backed verification)");
+                    }
+                }
+            } else {
+                tracing::warn!("DATABASE_URL not set; MCP serving with loopback bearer guard only (no store-backed key verification); cost-control tools require a verified org and are not registered");
+            }
+
             match transport.as_str() {
                 "stdio" => {
                     server.run_stdio().await?;
                 }
+                "http" => {
+                    let addr: std::net::SocketAddr = format!("127.0.0.1:{sse_port}")
+                        .parse()
+                        .context("invalid HTTP bind address")?;
+                    server.run_http(addr, api_key).await?;
+                }
                 "sse" => {
+                    // Deprecated HTTP+SSE transport (MCP 2024-11-05); prefer `http`.
                     let addr: std::net::SocketAddr = format!("127.0.0.1:{sse_port}")
                         .parse()
                         .context("invalid SSE bind address")?;
                     server.run_sse(addr, api_key).await?;
                 }
                 other => {
-                    anyhow::bail!("unsupported MCP transport `{other}` (supported: stdio, sse)")
+                    anyhow::bail!(
+                        "unsupported MCP transport `{other}` (supported: stdio, http, sse[deprecated])"
+                    )
                 }
             }
         }

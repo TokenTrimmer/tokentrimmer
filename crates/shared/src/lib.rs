@@ -23,7 +23,7 @@ pub use messages::{
     MessageContent, Tool, ToolCall, ToolChoice,
 };
 pub use model_catalog::{model_catalog, ModelCatalog};
-pub use pricing::{ModelInfo, ModelPricing};
+pub use pricing::{CacheWriteTier, ModelInfo, ModelPricing};
 pub use provider::Provider;
 pub use url_guard::{
     filter_extra_headers, find_denied_header, validate_provider_url, UrlGuardError,

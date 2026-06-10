@@ -13,6 +13,7 @@ use tt_telemetry::request_logs::RequestLogWriter;
 
 use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
 use crate::failover::CircuitBreaker;
+use crate::middleware::argon2_cap::{Argon2Cap, Argon2CapConfig, Argon2VerifyCap};
 use crate::middleware::key_cache::{KeyVerifyCache, VerifyCache};
 use crate::registry::{register_default_providers, ProviderRegistry};
 use crate::single_flight::SingleFlight;
@@ -79,6 +80,18 @@ pub struct AppState {
     /// See [`crate::middleware::key_cache`] for TTL constants and the
     /// revocation-staleness tradeoff documentation.
     pub verify_cache: VerifyCache,
+    /// Pre-auth per-IP rate cap consulted by the auth middleware **immediately
+    /// before** the (CPU-expensive) argon2 verify on the cold path — i.e. only
+    /// when a `tt_live_*` token misses the verify cache. Past the per-IP
+    /// threshold the request is shed with 429 + `Retry-After` and argon2 is
+    /// never invoked, so a flood of bogus keys cannot amplify a trickle of HTTP
+    /// requests into pinned CPU. Cache hits (already-verified tokens) and
+    /// non-`tt_live_*` traffic bypass it, so authenticated traffic is unaffected.
+    ///
+    /// Always present (in-memory, per-instance — see
+    /// [`crate::middleware::argon2_cap`] for the "move to Redis before scaling"
+    /// caveat). Limit defaults come from `TT_ARGON2_CAP_*` env (sane defaults).
+    pub argon2_cap: Argon2Cap,
     /// When `true`, the auth middleware injects a dogfood [`ApiKeyContext`]
     /// for unauthenticated requests so the dogfood routing route fires.
     /// Enabled by setting `TT_DOGFOOD_GROQ_ROUTING=1` at startup.
@@ -133,6 +146,7 @@ impl AppState {
             request_log_writer: None,
             routing_store: None,
             verify_cache: Arc::new(KeyVerifyCache::new()),
+            argon2_cap: Argon2VerifyCap::new(Argon2CapConfig::from_env()),
             dogfood_enabled: false,
             budget: None,
             tier_resolver: None,

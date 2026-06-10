@@ -245,14 +245,14 @@ fn every_rule_has_min_fixtures_and_detects_correctly() {
     check_config_no_agents_md();
 }
 
-/// Verify `all_rules()` returns exactly 19 rules.
+/// Verify `all_rules()` returns exactly 20 rules.
 #[test]
-fn all_rules_count_is_19() {
+fn all_rules_count_is_20() {
     let rules = all_rules();
     assert_eq!(
         rules.len(),
-        19,
-        "all_rules() should return 19 rules, got {}",
+        20,
+        "all_rules() should return 20 rules, got {}",
         rules.len()
     );
 }
@@ -280,6 +280,7 @@ fn rule_ids_are_stable() {
         "output-n-greater-than-one",
         "model-reasoning-effort-default-high",
         "prompt-dynamic-prefix-breaks-cache",
+        "prompt-volatile-in-system-prompt",
     ];
     let rule_ids: Vec<&str> = all_rules().iter().map(|r| r.id()).collect();
     // Check all expected IDs are present.
