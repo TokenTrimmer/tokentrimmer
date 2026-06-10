@@ -30,6 +30,17 @@ pub struct ModelPricing {
     /// ~1.25× the base input rate for tokens written to the prompt cache.
     /// `None` for providers with no documented write premium (cost path unchanged).
     pub cache_write_per_million: Option<f64>,
+    /// USD per 1M batch (async) input tokens. Providers with a batch tier
+    /// (OpenAI / Anthropic / Gemini) bill async requests at ~50% of standard
+    /// input. `None` for providers with no batch tier.
+    pub batch_input_per_million: Option<f64>,
+    /// USD per 1M batch (async) output tokens (~50% of standard output).
+    /// `None` for providers with no batch tier.
+    pub batch_output_per_million: Option<f64>,
+    /// Provider minimum prefix length, in tokens, before a `cache_control`
+    /// breakpoint actually caches (shorter prefixes silently don't cache).
+    /// Anthropic varies this by model (2048–4096); `None` when not documented.
+    pub prompt_cache_min_tokens: Option<u32>,
     /// When this pricing took effect (for historical replay).
     pub effective_at: DateTime<Utc>,
 }
@@ -71,6 +82,12 @@ struct RawEntry {
     cached_input_per_million: Option<f64>,
     #[serde(default)]
     cache_write_per_million: Option<f64>,
+    #[serde(default)]
+    batch_input_per_million: Option<f64>,
+    #[serde(default)]
+    batch_output_per_million: Option<f64>,
+    #[serde(default)]
+    prompt_cache_min_tokens: Option<u32>,
     effective_at: DateTime<Utc>,
 }
 
@@ -102,6 +119,9 @@ impl PricingCatalog {
                     output_per_million: e.output_per_million,
                     cached_input_per_million: e.cached_input_per_million,
                     cache_write_per_million: e.cache_write_per_million,
+                    batch_input_per_million: e.batch_input_per_million,
+                    batch_output_per_million: e.batch_output_per_million,
+                    prompt_cache_min_tokens: e.prompt_cache_min_tokens,
                     effective_at: e.effective_at,
                 });
         }
@@ -335,6 +355,45 @@ mod catalog_tests {
             groq_llama.cache_write_per_million, None,
             "Groq has no cache-write premium"
         );
+    }
+
+    /// The new schema fields (batch rates + prompt-cache minimum) parse and
+    /// carry the documented values on the current Anthropic flagships, and are
+    /// `None` for providers without a batch tier / documented cache minimum.
+    #[test]
+    fn batch_and_cache_min_fields_parse() {
+        let c = catalog();
+
+        // Anthropic batch = flat 50% of standard; cache minimum is model-specific.
+        let opus = c.latest("anthropic", "claude-opus-4-8").expect("present");
+        assert_eq!(opus.batch_input_per_million, Some(2.50), "50% of 5.00");
+        assert_eq!(opus.batch_output_per_million, Some(12.50), "50% of 25.00");
+        assert_eq!(opus.prompt_cache_min_tokens, Some(4096), "Opus 4.x: 4096");
+
+        let sonnet = c.latest("anthropic", "claude-sonnet-4-6").expect("present");
+        assert_eq!(sonnet.batch_input_per_million, Some(1.50));
+        assert_eq!(sonnet.batch_output_per_million, Some(7.50));
+        assert_eq!(
+            sonnet.prompt_cache_min_tokens,
+            Some(2048),
+            "Sonnet 4.6: 2048"
+        );
+
+        // OpenAI flagship: batch tier present, 1024-token auto-cache minimum.
+        let gpt = c.latest("openai", "gpt-5.5").expect("present");
+        assert_eq!(gpt.batch_input_per_million, Some(2.50));
+        assert_eq!(gpt.prompt_cache_min_tokens, Some(1024));
+
+        // Gemini: batch present, cache minimum intentionally unset (None).
+        let gem = c.latest("gemini", "gemini-3.1-pro").expect("present");
+        assert_eq!(gem.batch_input_per_million, Some(1.00));
+        assert_eq!(gem.prompt_cache_min_tokens, None);
+
+        // A provider with no batch tier → both batch fields None.
+        let groq = c.latest("groq", "llama-3.1-8b-instant").expect("present");
+        assert_eq!(groq.batch_input_per_million, None);
+        assert_eq!(groq.batch_output_per_million, None);
+        assert_eq!(groq.prompt_cache_min_tokens, None);
     }
 
     #[test]

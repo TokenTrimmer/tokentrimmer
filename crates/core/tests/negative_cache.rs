@@ -61,6 +61,9 @@ impl Provider for InvalidRequestProvider {
             output_per_million: 2.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
     }
@@ -116,6 +119,9 @@ impl Provider for RateLimitedProvider {
             output_per_million: 2.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
     }
@@ -173,6 +179,9 @@ impl Provider for ServerErrorProvider {
             output_per_million: 2.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
     }
@@ -521,6 +530,9 @@ async fn positive_cache_unaffected_by_negative_cache_logic() {
                 output_per_million: 2.0,
                 cached_input_per_million: None,
                 cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                prompt_cache_min_tokens: None,
                 effective_at: Utc::now(),
             })
         }

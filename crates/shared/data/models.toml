@@ -72,25 +72,36 @@ max_output_tokens = 0
 capabilities = ["text"]
 
 # ── Anthropic ───────────────────────────────────────────────────────────────
+# Context windows + max-output verified against platform.claude.com model docs.
+# claude-haiku-4-5: 200K context, 64K max output. Sonnet 4.6 and the Opus 4.x
+# flagships carry a 1M-token context window at standard pricing and 128K max
+# output (Sonnet 4.6 caps at 64K). The prior 200K/8192 entries were stale.
 [[model]]
 provider = "anthropic"
 model = "claude-haiku-4-5"
 max_input_tokens = 200000
-max_output_tokens = 8192
+max_output_tokens = 65536
 capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "anthropic"
 model = "claude-sonnet-4-6"
-max_input_tokens = 200000
-max_output_tokens = 8192
+max_input_tokens = 1000000
+max_output_tokens = 65536
 capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
 
 [[model]]
 provider = "anthropic"
 model = "claude-opus-4-7"
-max_input_tokens = 200000
-max_output_tokens = 8192
+max_input_tokens = 1000000
+max_output_tokens = 131072
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "anthropic"
+model = "claude-opus-4-8"
+max_input_tokens = 1000000
+max_output_tokens = 131072
 capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
 
 # ── Gemini ──────────────────────────────────────────────────────────────────
@@ -213,8 +224,8 @@ capabilities = ["text", "tools", "json_mode", "streaming"]
 [[model]]
 provider = "openrouter"
 model = "anthropic/claude-sonnet-4-6"
-max_input_tokens = 200000
-max_output_tokens = 8192
+max_input_tokens = 1000000
+max_output_tokens = 65536
 capabilities = ["text", "tools", "json_mode", "streaming"]
 
 [[model]]

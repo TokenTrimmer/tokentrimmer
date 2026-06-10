@@ -77,6 +77,9 @@ impl Provider for VisionProvider {
             output_per_million: o,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         })
     }

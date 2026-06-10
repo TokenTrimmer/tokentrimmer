@@ -2931,6 +2931,9 @@ mod l2_baseline_tests {
             output_per_million: output,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
     }
@@ -2982,6 +2985,9 @@ mod fee_tests {
             output_per_million: 2.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
     }
@@ -3039,6 +3045,9 @@ mod cache_write_rate_tests {
             output_per_million: 15.0,
             cached_input_per_million: Some(0.30),
             cache_write_per_million: Some(3.75),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
     }
@@ -3050,6 +3059,9 @@ mod cache_write_rate_tests {
             output_per_million: 15.0,
             cached_input_per_million: Some(0.30),
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
     }
@@ -3164,6 +3176,9 @@ mod provider_cache_attribution_tests {
             output_per_million: 15.0,
             cached_input_per_million: Some(0.30),
             cache_write_per_million: Some(3.75),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
     }
@@ -3215,6 +3230,9 @@ mod provider_cache_attribution_tests {
             output_per_million: 30.0,
             cached_input_per_million: None,
             cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         };
         let usage = Usage {
