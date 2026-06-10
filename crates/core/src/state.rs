@@ -130,6 +130,25 @@ pub struct AppState {
     /// Always present. Disabled by setting `l1` to `None` in `AppState`
     /// (single-flight is gated on cache_behavior.do_lookup, which requires L1).
     pub single_flight: Arc<SingleFlight>,
+    /// Sampled async quality-judge config (sample rate, judge model, enable
+    /// flag). Read from `TT_JUDGE_*` env; defaults keep the judge OFF. The chat
+    /// handler consults this on the non-streaming path to decide whether to
+    /// sample a rerouted-DOWN request for an off-path quality judge.
+    pub judge_config: crate::quality_sample::JudgeConfig,
+    /// Optional sink the sampled judge records its [`crate::JudgeOutcome`] into.
+    /// `None` (default) disables the judge entirely regardless of `judge_config`
+    /// — there's nowhere to record. Record-only: the sink never pauses routes.
+    pub judge_sink: Option<Arc<dyn crate::quality_sample::JudgeSink>>,
+    /// Optional typed judge-band store read by the `/v1/preview` handler to
+    /// enrich route suggestions with the live judge's aggregate
+    /// [`tt_preview::QualityRiskBand`] per `(requested → served)` swap — the
+    /// production join that lifts a suggestion off the hard-coded `Unknown`.
+    ///
+    /// `None` (default) leaves suggestions at `Unknown`. When the judge is wired
+    /// via [`AppState::with_quality_judge_band_store`], the SAME store is both the
+    /// recording `judge_sink` and this read-side, so a recorded outcome flows
+    /// end-to-end into a populated band. Record-only: enrichment is advisory.
+    pub judge_band_store: Option<Arc<crate::quality_sample::InMemoryJudgeBandStore>>,
 }
 
 impl AppState {
@@ -153,6 +172,9 @@ impl AppState {
             dynamic_budget: Arc::new(DynamicBudgetEnforcer::new()),
             breaker: Arc::new(CircuitBreaker::default()),
             single_flight: Arc::new(SingleFlight::new()),
+            judge_config: crate::quality_sample::JudgeConfig::from_env(),
+            judge_sink: None,
+            judge_band_store: None,
         }
     }
 
@@ -211,6 +233,44 @@ impl AppState {
     /// Builder-style attach: enable per-org routing.
     pub fn with_routing_store(mut self, store: Arc<CachingRoutingStore>) -> Self {
         self.routing_store = Some(store);
+        self
+    }
+
+    /// Builder-style attach: enable the sampled async quality judge with the
+    /// given recording sink and config. The judge scores a deterministic ~2%
+    /// sample of rerouted-DOWN chat-completion requests AFTER the user response
+    /// is returned (zero added latency) and records the outcome into `sink`.
+    ///
+    /// Pass [`crate::quality_sample::JudgeConfig::from_env`] to honor `TT_JUDGE_*`,
+    /// or a hand-built config (tests). Record-only — the sink never pauses routes.
+    pub fn with_quality_judge(
+        mut self,
+        sink: Arc<dyn crate::quality_sample::JudgeSink>,
+        config: crate::quality_sample::JudgeConfig,
+    ) -> Self {
+        self.judge_sink = Some(sink);
+        self.judge_config = config;
+        self
+    }
+
+    /// Builder-style attach: wire the sampled judge to an in-process
+    /// [`crate::quality_sample::InMemoryJudgeBandStore`] used as BOTH the
+    /// recording sink AND the read-side the `/v1/preview` handler enriches
+    /// suggestions from. This is the production join that lifts a route
+    /// suggestion off the hard-coded `Unknown` once the live judge has scored
+    /// that `(requested → served)` swap.
+    ///
+    /// The judge still only fires for the deterministic ~2% sample of
+    /// rerouted-DOWN chat completions, AFTER the user response is returned
+    /// (zero added latency). Record-only — the store never pauses routes.
+    pub fn with_quality_judge_band_store(
+        mut self,
+        store: Arc<crate::quality_sample::InMemoryJudgeBandStore>,
+        config: crate::quality_sample::JudgeConfig,
+    ) -> Self {
+        self.judge_sink = Some(store.clone() as Arc<dyn crate::quality_sample::JudgeSink>);
+        self.judge_band_store = Some(store);
+        self.judge_config = config;
         self
     }
 

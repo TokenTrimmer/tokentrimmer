@@ -802,6 +802,20 @@ pub async fn handler(
     // `req.model`. Recorded as `gen_ai.request.model` on the request span (the
     // served model becomes `gen_ai.response.model`).
     let requested_model = req.model.clone();
+    // Sampled-quality-judge inputs, captured BEFORE routing rewrites the model
+    // or rebinds the provider/credentials. The async judge (spawned only for a
+    // ~2% sample of rerouted-DOWN requests, after the user response is returned)
+    // re-dispatches the ORIGINAL model on the SOURCE provider to produce a
+    // reference answer, then scores the served (cheaper) answer against it.
+    // Cheap clones (a few Arc bumps + a request clone); they cost nothing on the
+    // hot path when the judge is disabled because we only build the job later
+    // when sampling actually fires.
+    let judge_enabled = state.judge_config.enabled && state.judge_sink.is_some();
+    let (judge_source_provider, judge_source_ctx, judge_original_req) = if judge_enabled {
+        (Some(provider.clone()), Some(ctx.clone()), Some(req.clone()))
+    } else {
+        (None, None, None)
+    };
     let route_match = apply_routing(&state, &ctx, &mut req, forced_route.as_deref()).await?;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
     // The applied route's name (forced or condition-matched) for the
@@ -1711,6 +1725,28 @@ pub async fn handler(
             },
         );
 
+        // 3h. Sampled async quality judge on rerouted-DOWN traffic. Spawns a
+        //     detached task ONLY when: the judge is enabled + a sink is wired,
+        //     a route rewrote the model, the served model is cheaper than the
+        //     originally-requested one (a true downgrade priced on realized
+        //     usage), this task class (chat-completions) is in scope, and the
+        //     trace falls in the deterministic ~2% sample. The judge runs AFTER
+        //     this point and never touches `http_response`, so it adds ZERO
+        //     latency to the user request (see `quality_sample::spawn_quality_judge`).
+        maybe_spawn_quality_judge(
+            &state,
+            matched_route_id,
+            &requested_model,
+            &response,
+            requested_pricing.as_ref(),
+            pricing.as_ref(),
+            trace_id,
+            ctx.org_id,
+            judge_source_provider,
+            judge_source_ctx,
+            judge_original_req,
+        );
+
         // 5. Serialize body and attach TokenTrimmer extension headers.
         let mut http_response = Json(response).into_response();
         attach_cost_headers(
@@ -2590,6 +2626,132 @@ fn spawn_request_log(writer: Option<&std::sync::Arc<dyn RequestLogWriter>>, row:
         if let Err(e) = writer.write(row).await {
             tracing::warn!(error = %e, "request_logs write failed");
         }
+    });
+}
+
+/// Extract the assistant text of a non-streaming response — the served
+/// (cheaper-model) answer the quality judge scores. Empty when the response
+/// carries only tool calls.
+fn response_assistant_text(resp: &ChatCompletionResponse) -> String {
+    resp.choices
+        .iter()
+        .filter_map(|c| match &c.message {
+            Message::Assistant {
+                content: Some(content),
+                ..
+            } => Some(match content {
+                MessageContent::Text(s) => s.clone(),
+                MessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        tt_shared::messages::ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Gate + spawn the sampled async quality judge for a rerouted-DOWN chat
+/// completion. Returns immediately in all cases; when it does fire, the actual
+/// judging (including the original-model reference re-dispatch) runs in a
+/// detached task via [`crate::quality_sample::spawn_quality_judge`], AFTER the
+/// caller has returned the user response — so it adds zero user latency.
+///
+/// Spawns only when ALL hold:
+/// - the judge is enabled and a sink is wired (`judge_source_*` are `Some`),
+/// - a route rewrote the model (`matched_route_id.is_some()`),
+/// - the served model is cheaper than the originally-requested one (a true
+///   downgrade priced on realized usage — [`crate::quality_sample::is_downgrade`]),
+/// - the served answer is non-empty (tool-call-only responses are skipped),
+/// - the trace falls in the deterministic ~2% sample
+///   ([`crate::quality_sample::should_sample`]),
+/// - the judge model resolves to a provider.
+#[allow(clippy::too_many_arguments)]
+fn maybe_spawn_quality_judge(
+    state: &AppState,
+    matched_route_id: Option<Uuid>,
+    requested_model: &str,
+    response: &ChatCompletionResponse,
+    requested_pricing: Option<&ModelPricing>,
+    served_pricing: Option<&ModelPricing>,
+    trace_id: Uuid,
+    org_id: Uuid,
+    judge_source_provider: Option<std::sync::Arc<dyn tt_shared::Provider>>,
+    judge_source_ctx: Option<RequestContext>,
+    judge_original_req: Option<ChatCompletionRequest>,
+) {
+    use crate::quality_sample as qs;
+
+    // Enable gate + the pre-routing captures (all-or-nothing).
+    let (Some(sink), Some(source_provider), Some(source_ctx), Some(original_req)) = (
+        state.judge_sink.as_ref(),
+        judge_source_provider,
+        judge_source_ctx,
+        judge_original_req,
+    ) else {
+        return;
+    };
+    if !state.judge_config.enabled {
+        return;
+    }
+    // MVP task-class filter: chat-completions only (explicit + extensible).
+    if !qs::JudgeTaskClass::ChatCompletions.is_sampled() {
+        return;
+    }
+    // Reroute-DOWN only: a route fired AND the served model is cheaper.
+    if matched_route_id.is_none() {
+        return;
+    }
+    if !qs::is_downgrade(requested_pricing, served_pricing, &response.usage) {
+        return;
+    }
+    // Deterministic ~2% sample keyed on the trace id.
+    if !qs::should_sample(trace_id, state.judge_config.sample_rate) {
+        return;
+    }
+    let served_answer = response_assistant_text(response);
+    if served_answer.trim().is_empty() {
+        return; // tool-call-only response — nothing textual to judge.
+    }
+    // Resolve a provider that serves the (cheap) judge model.
+    let Some(judge_provider) = state.registry.resolve(&state.judge_config.judge_model) else {
+        tracing::warn!(
+            judge_model = %state.judge_config.judge_model,
+            "quality judge model not resolvable — skipping sample"
+        );
+        return;
+    };
+
+    // The judge reuses the org's source-provider context for credentials.
+    let judge = std::sync::Arc::new(qs::GatewayLlmJudge::new(
+        judge_provider,
+        state.judge_config.judge_model.clone(),
+        source_ctx.clone(),
+    ));
+    let input_text = tt_shared::message_text_for_estimation(&original_req);
+    let served_model = response.model.clone();
+
+    qs::spawn_quality_judge(qs::QualityJudgeJob {
+        judge,
+        sink: sink.clone(),
+        org_id,
+        route_id: matched_route_id,
+        request_id: trace_id,
+        requested_model: requested_model.to_string(),
+        served_model,
+        input_text,
+        served_answer,
+        // Reference = the ORIGINAL model re-dispatched off-path inside the task.
+        reference: qs::ReferenceSource::Dispatch {
+            provider: source_provider,
+            request: Box::new(original_req),
+            ctx: Box::new(source_ctx),
+        },
     });
 }
 
