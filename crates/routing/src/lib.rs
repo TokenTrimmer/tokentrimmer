@@ -119,6 +119,18 @@ pub struct RouteAction {
     /// omitted from JSON when false (back-compat with existing rows).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flex: bool,
+    /// Opt the matched request into the **conservative compression pass**
+    /// (request-pass pipeline, compression pass #1): a content-lossless trim of
+    /// *non-prose* blocks (collapse redundant whitespace/blank lines in
+    /// system/tool-result payloads, de-duplicate exactly-repeated adjacent
+    /// tool-result blocks, canonicalize `tool_calls` arguments JSON). User prose
+    /// and the actual instruction content are never altered. The pass runs only
+    /// when this is true; the removed input tokens lower the prompt-token bill
+    /// and are attributed as a distinct `compression` savings source (standard
+    /// baseline − compressed cost). **Off by default** — no behavior change
+    /// unless a route enables it; omitted from JSON when false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compress: bool,
 }
 
 /// Rule engine. Hold routes sorted by descending priority; iterate to find
@@ -280,6 +292,7 @@ mod tests {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         }
     }
@@ -583,6 +596,7 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             flex: false,
+            compress: false,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -611,6 +625,7 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             flex: false,
+            compress: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -631,6 +646,7 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             flex: false,
+            compress: false,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),

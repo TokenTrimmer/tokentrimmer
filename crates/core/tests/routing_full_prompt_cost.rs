@@ -196,6 +196,7 @@ async fn cost_condition_counts_full_prompt() {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         }],
     );

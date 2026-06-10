@@ -174,6 +174,7 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         }],
     );
@@ -239,6 +240,7 @@ async fn reroute_then_block_on_ceiling() {
                 disable_cache: false,
                 max_cost_usd: Some(0.0008),
                 flex: false,
+                compress: false,
             },
         }],
     );

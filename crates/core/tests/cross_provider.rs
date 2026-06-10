@@ -169,6 +169,7 @@ fn route(target: &str, fallbacks: Vec<String>) -> Route {
             disable_cache: false,
             max_cost_usd: None,
             flex: false,
+            compress: false,
         },
     }
 }

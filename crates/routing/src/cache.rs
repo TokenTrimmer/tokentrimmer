@@ -143,6 +143,7 @@ mod tests {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         }
     }
@@ -242,6 +243,7 @@ mod tests {
                         disable_cache: false,
                         max_cost_usd: None,
                         flex: false,
+                        compress: false,
                     },
                 },
             )

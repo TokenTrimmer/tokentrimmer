@@ -236,6 +236,7 @@ async fn build_harness(
                     disable_cache: false,
                     max_cost_usd: None,
                     flex: false,
+                    compress: false,
                 },
             }],
         );

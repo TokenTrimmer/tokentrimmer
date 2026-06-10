@@ -207,6 +207,7 @@ async fn route_to_local_dispatches_to_ollama_provider() {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         }],
     );
