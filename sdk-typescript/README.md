@@ -31,7 +31,27 @@ console.log(`cache ${response.tt.cache}`);
 console.log(`trace ${response.tt.traceId}`);
 ```
 
-The class is an `openai.OpenAI` subclass — every other method (`embeddings`, `models`, streaming, tools, vision) works unchanged.
+The class is an `openai.OpenAI` subclass — every other method (`embeddings`, `models`, tools, vision) works unchanged.
+
+### Streaming
+
+Streaming works as usual; per-request cost is on the stream's `.tt` once it's drained (the Gateway's terminal usage frame is stripped, so chunk iteration is clean):
+
+```ts
+const stream = await client.chat.completions.create({
+  model: 'claude-sonnet-4-6',
+  messages: [{ role: 'user', content: 'Hello' }],
+  stream: true,
+});
+
+for await (const chunk of stream) {
+  process.stdout.write(chunk.choices[0]?.delta?.content ?? '');
+}
+
+// Cost is known once the stream is fully consumed:
+console.log(`\ncost  $${stream.tt?.costUsd.toFixed(4)}`);
+console.log(`saved $${stream.tt?.savedUsd.toFixed(4)}`);
+```
 
 ## Self-hosted Gateway
 

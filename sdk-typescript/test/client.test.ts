@@ -1,5 +1,6 @@
+import type { ChatCompletionChunk } from 'openai/resources/chat/completions';
 import { describe, expect, it } from 'vitest';
-import { TokenTrimmer } from '../src/index.js';
+import { TokenTrimmer, type StreamCost } from '../src/index.js';
 
 const TT_HEADERS = {
   'x-tokentrimmer-trace-id': 'trace-1',
@@ -10,6 +11,28 @@ const TT_HEADERS = {
   'x-tokentrimmer-saved-usd': '0.0166',
   'x-tokentrimmer-cache': 'miss',
 };
+
+// A real-gateway-shaped SSE body: a normal OpenAI chunk stream, then the
+// terminal `tokentrimmer.usage` event (the gateway appends this after the
+// OpenAI stream — see docs/04-gateway-api-reference.md and
+// crates/core/src/routes/sse.rs::usage_event), then `[DONE]`.
+const GATEWAY_STREAM_SSE =
+  'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,' +
+  '"model":"claude-haiku-4-5","choices":[{"index":0,"delta":{"role":"assistant"},' +
+  '"finish_reason":null}]}\n\n' +
+  'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,' +
+  '"model":"claude-haiku-4-5","choices":[{"index":0,"delta":{"content":"Hello"},' +
+  '"finish_reason":null}]}\n\n' +
+  'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,' +
+  '"model":"claude-haiku-4-5","choices":[{"index":0,"delta":{"content":" world"},' +
+  '"finish_reason":null}]}\n\n' +
+  'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,' +
+  '"model":"claude-haiku-4-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],' +
+  '"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cached_tokens":0}}\n\n' +
+  'event: tokentrimmer.usage\n' +
+  'data: {"cost_usd":0.0001,"baseline_cost_usd":0.0004,"saved_usd":0.0003,' +
+  '"provider_cache_saved_usd":0.0,"input_tokens":10,"output_tokens":20,"cached_tokens":0}\n\n' +
+  'data: [DONE]\n\n';
 
 const COMPLETION_BODY = {
   id: 'chatcmpl-1',
@@ -52,9 +75,9 @@ describe('TokenTrimmer TS SDK', () => {
       model: 'claude-haiku-4-5',
       messages: [{ role: 'user', content: 'hi' }],
     });
-    expect((res as any).tt.traceId).toBe('trace-1');
-    expect((res as any).tt.costUsd).toBe(0.0034);
-    expect((res as any).tt.cache).toBe('miss');
+    expect(res.tt.traceId).toBe('trace-1');
+    expect(res.tt.costUsd).toBe(0.0034);
+    expect(res.tt.cache).toBe('miss');
   });
 
   it('parses a non-numeric cost header to null', async () => {
@@ -63,7 +86,7 @@ describe('TokenTrimmer TS SDK', () => {
       model: 'm',
       messages: [{ role: 'user', content: 'hi' }],
     });
-    expect((res as any).tt.costUsd).toBeNull();
+    expect(res.tt.costUsd).toBeNull();
   });
 
   it('injects max_tokens=4096 when absent and respects an explicit value', async () => {
@@ -91,7 +114,7 @@ describe('TokenTrimmer TS SDK', () => {
       ttTag: 'feature=chat',
       ttCostLimit: 0.05,
       ttCache: 'bypass',
-    } as any);
+    });
     const h = new Headers(calls.at(-1)!.init.headers as HeadersInit);
     expect(h.get('x-tokentrimmer-tag')).toBe('feature=chat');
     expect(h.get('x-tokentrimmer-cost-limit-usd')).toBe('0.05');
@@ -104,8 +127,10 @@ describe('TokenTrimmer TS SDK', () => {
       client(fetchImpl).chat.completions.create({
         model: 'm',
         messages: [{ role: 'user', content: 'hi' }],
-        ttCache: 'hit-l1', // a response value, not a valid request override
-      } as any),
+        // A response cache value, not a valid request override. Cast narrowly to
+        // the field's type to exercise the runtime guard a JS caller would hit.
+        ttCache: 'hit-l1' as 'bypass',
+      }),
     ).rejects.toThrow();
     expect(calls.length).toBe(0);
   });
@@ -118,7 +143,7 @@ describe('TokenTrimmer TS SDK', () => {
           model: 'm',
           messages: [{ role: 'user', content: 'hi' }],
           ttCostLimit: bad,
-        } as any),
+        }),
       ).rejects.toThrow();
     }
     expect(calls.length).toBe(0);
@@ -135,10 +160,53 @@ describe('TokenTrimmer TS SDK', () => {
       messages: [{ role: 'user', content: 'hi' }],
       stream: true,
     });
-    expect((stream as any).tt).toBeUndefined();
-    expect(typeof (stream as any)[Symbol.asyncIterator]).toBe('function');
-    const chunks: unknown[] = [];
-    for await (const c of stream as any) chunks.push(c);
+    expect(typeof stream[Symbol.asyncIterator]).toBe('function');
+    const chunks: ChatCompletionChunk[] = [];
+    for await (const c of stream) chunks.push(c);
     expect(chunks.length).toBeGreaterThanOrEqual(1);
+    // No tokentrimmer.usage frame in this stream, so no cost is surfaced.
+    expect(stream.tt).toBeNull();
+  });
+
+  it('strips the tokentrimmer.usage frame and yields only clean chunks', async () => {
+    const { fetchImpl } = stubFetch({ sse: GATEWAY_STREAM_SSE });
+    const stream = await client(fetchImpl).chat.completions.create({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    });
+    const chunks: ChatCompletionChunk[] = [];
+    for await (const c of stream) chunks.push(c);
+    // Every yielded chunk is a well-formed chat.completion.chunk with choices.
+    // Regression guard: the usage frame, passed to the OpenAI parser, yields a
+    // chunk with no `choices`, which crashes naive `chunk.choices[0]` access.
+    for (const c of chunks) {
+      expect(c.object).toBe('chat.completion.chunk');
+      expect(Array.isArray(c.choices)).toBe(true);
+      expect(c.choices.length).toBeGreaterThanOrEqual(1);
+    }
+    const text = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
+    expect(text).toBe('Hello world');
+  });
+
+  it('surfaces the stripped usage payload on stream.tt', async () => {
+    const { fetchImpl } = stubFetch({ sse: GATEWAY_STREAM_SSE });
+    const stream = await client(fetchImpl).chat.completions.create({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    });
+    // Cost isn't known until the stream is drained.
+    expect(stream.tt).toBeNull();
+    for await (const _c of stream) void _c;
+    const cost: StreamCost | null = stream.tt;
+    expect(cost).not.toBeNull();
+    expect(cost!.costUsd).toBe(0.0001);
+    expect(cost!.baselineCostUsd).toBe(0.0004);
+    expect(cost!.savedUsd).toBe(0.0003);
+    expect(cost!.providerCacheSavedUsd).toBe(0.0);
+    expect(cost!.inputTokens).toBe(10);
+    expect(cost!.outputTokens).toBe(20);
+    expect(cost!.cachedTokens).toBe(0);
   });
 });

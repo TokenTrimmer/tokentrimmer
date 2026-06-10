@@ -16,9 +16,45 @@ import pytest
 import respx
 
 from tokentrimmer import TokenTrimmer
-from tokentrimmer.client import TokenTrimmerMeta
+from tokentrimmer.client import StreamCost, TokenTrimmerMeta
 
 GATEWAY = "http://gw.test/v1"
+
+# A real-gateway-shaped SSE body: a normal OpenAI chunk stream, then the
+# terminal `tokentrimmer.usage` event (the gateway appends this after the
+# OpenAI stream — see docs/04-gateway-api-reference.md and
+# crates/core/src/routes/sse.rs::usage_event), then `[DONE]`.
+GATEWAY_STREAM_SSE = (
+    'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,'
+    '"model":"claude-haiku-4-5","choices":[{"index":0,'
+    '"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+    'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,'
+    '"model":"claude-haiku-4-5","choices":[{"index":0,'
+    '"delta":{"content":"Hello"},"finish_reason":null}]}\n\n'
+    'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,'
+    '"model":"claude-haiku-4-5","choices":[{"index":0,'
+    '"delta":{"content":" world"},"finish_reason":null}]}\n\n'
+    'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,'
+    '"model":"claude-haiku-4-5","choices":[{"index":0,"delta":{},'
+    '"finish_reason":"stop"}],'
+    '"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,'
+    '"cached_tokens":0}}\n\n'
+    "event: tokentrimmer.usage\n"
+    'data: {"cost_usd":0.0001,"baseline_cost_usd":0.0004,"saved_usd":0.0003,'
+    '"provider_cache_saved_usd":0.0,"input_tokens":10,"output_tokens":20,'
+    '"cached_tokens":0}\n\n'
+    "data: [DONE]\n\n"
+)
+
+
+def _gateway_stream_route() -> None:
+    respx.post(f"{GATEWAY}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=GATEWAY_STREAM_SSE,
+        )
+    )
 
 
 def _completion_route(cost: str = "0.0034", cache: str = "miss") -> respx.Route:
@@ -195,8 +231,62 @@ def test_metadata_is_per_call_correct_under_concurrency():
 
 
 @respx.mock
-def test_streaming_returns_stream_and_does_not_attach_tt():
-    # Build a minimal SSE body the OpenAI client can parse as a stream.
+def test_streaming_strips_usage_frame_and_yields_clean_chunks():
+    """The terminal tokentrimmer.usage frame must NOT reach the user as a chunk.
+
+    Regression guard: passed straight to the OpenAI SSE parser, the usage frame
+    yields a malformed ChatCompletionChunk (id=None, choices=None) that crashes
+    naive `chunk.choices[0]` iteration. We strip it before the parser sees it.
+    """
+    _gateway_stream_route()
+    stream = _client().chat.completions.create(
+        model="m", messages=[{"role": "user", "content": "hi"}], stream=True
+    )
+    chunks = list(stream)
+    # Every yielded chunk is a well-formed ChatCompletionChunk with choices.
+    for c in chunks:
+        assert c.object == "chat.completion.chunk"
+        assert c.choices is not None and len(c.choices) >= 1
+    # The reassembled assistant text is the full OpenAI stream, nothing dropped.
+    text = "".join(c.choices[0].delta.content or "" for c in chunks)
+    assert text == "Hello world"
+
+
+@respx.mock
+def test_streaming_surfaces_cost_on_stream_tt():
+    """The stripped usage payload is surfaced as `stream.tt` (StreamCost)."""
+    _gateway_stream_route()
+    stream = _client().chat.completions.create(
+        model="m", messages=[{"role": "user", "content": "hi"}], stream=True
+    )
+    # Cost isn't known until the stream is drained.
+    list(stream)
+    cost: StreamCost = stream.tt
+    assert cost is not None
+    assert cost.cost_usd == pytest.approx(0.0001)
+    assert cost.baseline_cost_usd == pytest.approx(0.0004)
+    assert cost.saved_usd == pytest.approx(0.0003)
+    assert cost.provider_cache_saved_usd == pytest.approx(0.0)
+    assert cost.input_tokens == 10
+    assert cost.output_tokens == 20
+    assert cost.cached_tokens == 0
+
+
+@respx.mock
+def test_streaming_tt_is_none_before_drain():
+    """`stream.tt` is None until the terminal usage frame has been consumed."""
+    _gateway_stream_route()
+    stream = _client().chat.completions.create(
+        model="m", messages=[{"role": "user", "content": "hi"}], stream=True
+    )
+    assert stream.tt is None
+    list(stream)
+    assert stream.tt is not None
+
+
+@respx.mock
+def test_streaming_without_usage_frame_still_works():
+    """A plain OpenAI stream (no usage frame) iterates cleanly; tt stays None."""
     sse = (
         'data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m",'
         '"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
@@ -210,7 +300,6 @@ def test_streaming_returns_stream_and_does_not_attach_tt():
     stream = _client().chat.completions.create(
         model="m", messages=[{"role": "user", "content": "hi"}], stream=True
     )
-    # It's an iterable stream, not a parsed completion with .tt.
-    assert not hasattr(stream, "tt")
     chunks = list(stream)
     assert chunks[0].choices[0].delta.content == "hi"
+    assert stream.tt is None

@@ -30,7 +30,7 @@ Usage::
     print(f"Cache: {response.tt.cache}  Trace: {response.tt.trace_id}")
 """
 
-from tokentrimmer.client import TokenTrimmer, TokenTrimmerMeta
+from tokentrimmer.client import StreamCost, TokenTrimmer, TokenTrimmerMeta
 
-__all__ = ["TokenTrimmer", "TokenTrimmerMeta"]
+__all__ = ["TokenTrimmer", "TokenTrimmerMeta", "StreamCost"]
 __version__ = "0.1.0"
