@@ -282,6 +282,15 @@ impl AppState {
         self
     }
 
+    /// Start background catalogue refreshers (currently: OpenRouter's dynamic
+    /// `GET /models` fetch). Call once from the gateway's async `main` after
+    /// building the state. Best-effort and non-blocking — a failed fetch is
+    /// logged and the provider keeps serving its static baseline, so this never
+    /// delays startup or the request path. A no-op when OpenRouter is disabled.
+    pub fn spawn_background_refreshers(&self) {
+        crate::registry::spawn_openrouter_catalog_refresh(&self.registry);
+    }
+
     /// Builder-style attach: enable per-org spend cap + rate enforcement.
     pub fn with_budget(mut self, enforcer: Arc<dyn BudgetEnforcer>) -> Self {
         self.budget = Some(enforcer);

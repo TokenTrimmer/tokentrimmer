@@ -19,6 +19,11 @@ pub struct ProviderRegistry {
     by_id: HashMap<&'static str, Arc<dyn Provider>>,
     by_model: HashMap<String, Arc<dyn Provider>>,
     model_info: HashMap<String, ModelInfo>,
+    /// Concrete handle to the OpenRouter adapter when registered, kept so the
+    /// gateway can drive its dynamic `GET /models` catalogue refresh (the
+    /// `Arc<dyn Provider>` in `by_id` erases the concrete type needed to call
+    /// `refresh_models`). `None` when OpenRouter is not enabled.
+    openrouter: Option<Arc<OpenRouterProvider>>,
 }
 
 impl ProviderRegistry {
@@ -72,6 +77,50 @@ impl ProviderRegistry {
     pub fn iter(&self) -> impl Iterator<Item = (&'static str, &Arc<dyn Provider>)> {
         self.by_id.iter().map(|(id, p)| (*id, p))
     }
+
+    /// The concrete OpenRouter adapter, when registered. Used by the startup
+    /// path to drive its dynamic `GET /models` catalogue refresh; `None` when
+    /// OpenRouter is not enabled.
+    pub fn openrouter(&self) -> Option<Arc<OpenRouterProvider>> {
+        self.openrouter.clone()
+    }
+}
+
+/// How often to re-fetch the OpenRouter `GET /models` catalogue after the
+/// initial startup fetch. OpenRouter's catalogue (models + prices) changes on
+/// the order of days, so an hourly refresh is ample and cheap.
+pub const OPENROUTER_REFRESH_INTERVAL_SECS: u64 = 3600;
+
+/// Spawn a background task that keeps the OpenRouter dynamic catalogue fresh.
+///
+/// Refreshes once immediately (so model availability + pricing reflect the live
+/// catalogue shortly after boot) and then every
+/// [`OPENROUTER_REFRESH_INTERVAL_SECS`]. A failed fetch is logged and skipped —
+/// the provider keeps serving its last-good (or static baseline) catalogue, so
+/// this never blocks startup or the request path. A no-op when OpenRouter is
+/// not registered.
+///
+/// Must be called from within a Tokio runtime (e.g. the gateway's async
+/// `main`). The handle is detached; it lives for the process.
+pub fn spawn_openrouter_catalog_refresh(registry: &ProviderRegistry) {
+    let Some(openrouter) = registry.openrouter() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            OPENROUTER_REFRESH_INTERVAL_SECS,
+        ));
+        loop {
+            ticker.tick().await;
+            match openrouter.refresh_models().await {
+                Ok(n) => tracing::info!(models = n, "refreshed OpenRouter /models catalogue"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "OpenRouter /models refresh failed; serving last-good catalogue"
+                ),
+            }
+        }
+    });
 }
 
 /// Which built-in providers to register. Defaults to all-on, preserving the
@@ -192,7 +241,14 @@ pub fn register_providers(registry: &mut ProviderRegistry, cfg: &ProvidersConfig
         registry.register(Arc::new(TogetherProvider::new(oai_cfg())));
     }
     if cfg.openrouter {
-        registry.register(Arc::new(OpenRouterProvider::new(oai_cfg())));
+        // Keep the concrete handle so the gateway can drive the dynamic
+        // `GET /models` catalogue refresh; register a type-erased clone for
+        // dispatch. The two share the same internal catalogue cache (Arc), so a
+        // background refresh on the handle is reflected by the registered
+        // provider's `models()` / `pricing()`.
+        let openrouter = Arc::new(OpenRouterProvider::new(oai_cfg()));
+        registry.register(Arc::clone(&openrouter) as Arc<dyn Provider>);
+        registry.openrouter = Some(openrouter);
     }
 
     // Local backends register only when their base-URL env var is set.
@@ -278,6 +334,76 @@ mod config_tests {
         assert!(reg.by_id("groq").is_some());
         assert!(reg.by_id("openai").is_none());
         assert!(reg.by_id("anthropic").is_none());
+    }
+
+    /// The concrete OpenRouter handle is exposed only when OpenRouter is
+    /// registered — so the startup path can drive its dynamic-catalogue refresh.
+    #[test]
+    fn openrouter_handle_exposed_only_when_registered() {
+        let mut with = ProviderRegistry::new();
+        let mut cfg = ProvidersConfig::none();
+        cfg.openrouter = true;
+        register_providers(&mut with, &cfg);
+        assert!(with.openrouter().is_some());
+        assert!(with.by_id("openrouter").is_some());
+
+        let mut without = ProviderRegistry::new();
+        let mut cfg2 = ProvidersConfig::none();
+        cfg2.groq = true;
+        register_providers(&mut without, &cfg2);
+        assert!(without.openrouter().is_none());
+    }
+
+    /// End-to-end wiring: a refresh driven through the concrete handle is
+    /// reflected by the type-erased provider in the registry (they share one
+    /// catalogue cache), so the live OpenRouter pricing feeds dispatch/cost.
+    #[tokio::test]
+    async fn dynamic_refresh_is_visible_through_registered_provider() {
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(GET).path("/models");
+            then.status(200)
+                .header("Content-Type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "data": [{
+                            "id": "x-ai/grok-vision",
+                            "context_length": 131_072,
+                            "pricing": { "prompt": "0.000002", "completion": "0.00001" }
+                        }]
+                    })
+                    .to_string(),
+                );
+        });
+
+        // Register an allow-local OpenRouter so the mock URL passes the SSRF
+        // guard, then expose it through the registry as `Arc<dyn Provider>`.
+        let openrouter = Arc::new(OpenRouterProvider::new_allow_local(
+            tt_provider_openai::ClientConfig::default(),
+        ));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::clone(&openrouter) as Arc<dyn Provider>);
+        reg.openrouter = Some(Arc::clone(&openrouter));
+
+        // A brand-new OpenRouter model is unknown before the fetch.
+        let registered = reg.by_id("openrouter").expect("registered");
+        assert!(registered.pricing("x-ai/grok-vision").is_none());
+
+        // Drive the refresh on the concrete handle.
+        openrouter
+            .refresh_models_at(&server.base_url())
+            .await
+            .expect("refresh ok");
+
+        // The TYPE-ERASED provider in the registry now prices it — proving the
+        // shared cache feeds dispatch/cost end-to-end.
+        let p = registered
+            .pricing("x-ai/grok-vision")
+            .expect("priced via shared dynamic catalogue");
+        assert!((p.input_per_million - 2.0).abs() < 1e-6);
+        assert!((p.output_per_million - 10.0).abs() < 1e-6);
     }
 
     #[test]

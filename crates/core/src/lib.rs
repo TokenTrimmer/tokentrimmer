@@ -29,7 +29,9 @@ pub use quality_sample::{
     risk_band_to_preview, spawn_quality_judge, GatewayLlmJudge, InMemoryJudgeBandStore,
     JudgeConfig, JudgeOutcome, JudgeSink, JudgeTaskClass, QualityJudgeJob, ReferenceSource,
 };
-pub use registry::{register_providers, ProviderRegistry, ProvidersConfig};
+pub use registry::{
+    register_providers, spawn_openrouter_catalog_refresh, ProviderRegistry, ProvidersConfig,
+};
 pub use retry::{with_retry, RetryPolicy};
 pub use server::{build_router, build_router_with_retrieval};
 pub use state::AppState;
