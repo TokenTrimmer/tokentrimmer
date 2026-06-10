@@ -4,7 +4,8 @@
         backlog backlog-take backlog-sync session-end review reflect \
         context-index context-for \
         loop-pause loop-resume loop-status \
-        sessions plans
+        sessions plans \
+        sync-licenses third-party-licenses licenses
 
 help:
 	@echo "TokenTrimmer dev targets:"
@@ -19,6 +20,11 @@ help:
 	@echo "  make fmt              cargo fmt"
 	@echo "  make inspect-self     Run our own Inspect against this repo"
 	@echo "  make latency-smoke    Probe TT_GATEWAY_URL p50 latency (release gate; skips if unset)"
+	@echo ""
+	@echo "License compliance:"
+	@echo "  make licenses             Sync per-crate LICENSE/NOTICE + regen THIRD-PARTY-LICENSES"
+	@echo "  make sync-licenses        Copy root LICENSE+NOTICE into every publishable crate"
+	@echo "  make third-party-licenses Regenerate THIRD-PARTY-LICENSES via cargo-about"
 	@echo ""
 	@echo "Autonomous-build harness:"
 	@echo "  make backlog          List open P0/P1 backlog items"
@@ -66,6 +72,14 @@ clippy:
 
 fmt:
 	cargo fmt --all
+
+sync-licenses:
+	./scripts/sync-licenses.sh
+
+third-party-licenses:
+	./scripts/gen-third-party-licenses.sh
+
+licenses: sync-licenses third-party-licenses
 
 inspect-self:
 	./scripts/tt-inspect-self.sh
