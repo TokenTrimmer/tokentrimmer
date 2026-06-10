@@ -47,7 +47,7 @@
 import OpenAI from 'openai';
 import type { ClientOptions } from 'openai';
 import type { APIPromise } from 'openai/core/api-promise';
-import type { Stream } from 'openai/core/streaming';
+import { Stream } from 'openai/core/streaming';
 import type {
   ChatCompletion,
   ChatCompletionChunk,
@@ -177,6 +177,11 @@ function toHeaders(src: unknown): Headers {
  * wrapper detects and removes that frame, parsing its payload into
  * {@link StreamCost}. Iterate with `for await … of`; read cost off `.tt` after
  * the stream is drained (`null` until then, or if no usage frame was emitted).
+ *
+ * Mirrors the OpenAI `Stream` surface beyond iteration: {@link controller},
+ * {@link tee} and {@link toReadableStream} are all forwarded, and every path
+ * applies the same usage-frame stripping (so consumers of `tee()` /
+ * `toReadableStream()` see clean chunks too, not the raw frame).
  */
 export class TokenTrimmerStream implements AsyncIterable<ChatCompletionChunk> {
   /** Streaming cost; `null` until the terminal usage frame is consumed. */
@@ -198,6 +203,36 @@ export class TokenTrimmerStream implements AsyncIterable<ChatCompletionChunk> {
       }
       yield chunk;
     }
+  }
+
+  /**
+   * Splits the stream into two independently-readable streams, mirroring the
+   * OpenAI `Stream.tee()`. Both branches draw from THIS wrapper's stripping
+   * iterator, so the `tokentrimmer.usage` frame is removed on either side and
+   * its cost lands on this object's {@link tt} once a branch is drained (the
+   * underlying request is shared, so a single usage frame is seen once).
+   */
+  tee(): [Stream<ChatCompletionChunk>, Stream<ChatCompletionChunk>] {
+    return this.asStream().tee();
+  }
+
+  /**
+   * Converts this stream to a newline-separated `ReadableStream` of JSON
+   * stringified chunks, mirroring the OpenAI `Stream.toReadableStream()`. The
+   * `tokentrimmer.usage` frame is stripped (it never reaches the ReadableStream)
+   * and its cost is surfaced on {@link tt} once the ReadableStream is drained.
+   */
+  toReadableStream(): ReturnType<Stream<ChatCompletionChunk>['toReadableStream']> {
+    return this.asStream().toReadableStream();
+  }
+
+  /**
+   * Wrap this stripping iterator in a fresh OpenAI `Stream` so we can reuse its
+   * `tee()` / `toReadableStream()` implementations (and exact return types)
+   * while keeping the usage-frame filtering intact on every consumption path.
+   */
+  private asStream(): Stream<ChatCompletionChunk> {
+    return new Stream<ChatCompletionChunk>(() => this[Symbol.asyncIterator](), this.controller);
   }
 }
 

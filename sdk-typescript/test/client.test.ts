@@ -189,6 +189,69 @@ describe('TokenTrimmer TS SDK', () => {
     expect(text).toBe('Hello world');
   });
 
+  it('forwards tee() and strips the usage frame on both branches', async () => {
+    const { fetchImpl } = stubFetch({ sse: GATEWAY_STREAM_SSE });
+    const stream = await client(fetchImpl).chat.completions.create({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    });
+    // tee() must exist on the wrapper (regression: surface reduction dropped it).
+    expect(typeof stream.tee).toBe('function');
+    const [a, b] = stream.tee();
+    const drain = async (s: AsyncIterable<ChatCompletionChunk>) => {
+      const chunks: ChatCompletionChunk[] = [];
+      for await (const c of s) chunks.push(c);
+      return chunks;
+    };
+    const [left, right] = await Promise.all([drain(a), drain(b)]);
+    for (const chunks of [left, right]) {
+      // Every chunk on each branch is a clean chat.completion.chunk — the usage
+      // frame was stripped before it reached the tee'd streams.
+      for (const c of chunks) {
+        expect(c.object).toBe('chat.completion.chunk');
+        expect(c.choices.length).toBeGreaterThanOrEqual(1);
+      }
+      expect(chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('')).toBe('Hello world');
+    }
+    // The shared request yields the usage frame once, surfaced on the wrapper.
+    expect(stream.tt).not.toBeNull();
+    expect(stream.tt!.costUsd).toBe(0.0001);
+  });
+
+  it('forwards toReadableStream() with the usage frame stripped', async () => {
+    const { fetchImpl } = stubFetch({ sse: GATEWAY_STREAM_SSE });
+    const stream = await client(fetchImpl).chat.completions.create({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    });
+    // toReadableStream() must exist on the wrapper (regression guard).
+    expect(typeof stream.toReadableStream).toBe('function');
+    const rs = stream.toReadableStream();
+    const reader = (rs as ReadableStream<Uint8Array>).getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    // Each newline-separated line is a JSON-stringified clean chunk; no usage
+    // frame (which has no `choices`) leaked into the ReadableStream.
+    const lines = text.split('\n').filter((l) => l.length > 0);
+    let content = '';
+    for (const line of lines) {
+      const obj = JSON.parse(line) as ChatCompletionChunk & { cost_usd?: number };
+      expect(obj.cost_usd).toBeUndefined();
+      expect(obj.object).toBe('chat.completion.chunk');
+      content += obj.choices[0]?.delta?.content ?? '';
+    }
+    expect(content).toBe('Hello world');
+    expect(stream.tt!.costUsd).toBe(0.0001);
+  });
+
   it('surfaces the stripped usage payload on stream.tt', async () => {
     const { fetchImpl } = stubFetch({ sse: GATEWAY_STREAM_SSE });
     const stream = await client(fetchImpl).chat.completions.create({
