@@ -108,7 +108,7 @@ The directory is created (0700) on first write.
   0700 if needed). `--token -` reads the key from **stdin** (keeps it out of shell history/argv).
   Optional `--base-url <URL>` persists to `config.toml`. Prints a masked confirmation (prefix + base).
   Bare `tt login` (no `--token`) errors: *"browser login arrives in V2 — use `tt login --token <KEY>`
-  for now (get a key at app.tokentrimmer.com)."* — reserving the name for V2.
+  for now (get a key at dashboard.tokentrimmer.com)."* — reserving the name for V2.
 - **`tt whoami`** — local only, no network in V0. Resolves via env + file and prints: key presence +
   **masked** prefix (e.g. `tt_live_a1b2…`, never the full key) + source; effective base URL + source;
   config dir. Exit `0` if a key is configured, `1` if not (scriptable, like `gh auth status`).

@@ -596,7 +596,7 @@ pub fn login_with_token(token: Option<String>, base_url: Option<String>) -> anyh
     if token.is_none() {
         anyhow::bail!(
             "browser login arrives in V2 — use `tt login --token <KEY>` for now \
-             (get a key at app.tokentrimmer.com)"
+             (get a key at dashboard.tokentrimmer.com)"
         );
     }
     let stdin = if token.as_deref() == Some("-") {

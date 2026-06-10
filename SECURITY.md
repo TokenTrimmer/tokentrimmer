@@ -10,7 +10,7 @@ Please do **not** open public GitHub issues for security vulnerabilities.
 
 ## Scope
 
-The OSS Gateway, Inspect CLI, Plan engine, and SDKs in this repository are in scope. The hosted SaaS (`api.tokentrimmer.com`, `app.tokentrimmer.com`) is in scope and is the primary concern.
+The OSS Gateway, Inspect CLI, Plan engine, and SDKs in this repository are in scope. The hosted SaaS (`api.tokentrimmer.com`, `dashboard.tokentrimmer.com`) is in scope and is the primary concern.
 
 ## What we consider in-scope
 
