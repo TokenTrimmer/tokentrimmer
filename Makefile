@@ -5,6 +5,7 @@
         context-index context-for \
         loop-pause loop-resume loop-status \
         sessions plans \
+        latency-smoke load-test-gateway bench bench-litellm \
         sync-licenses third-party-licenses licenses
 
 help:
@@ -20,6 +21,8 @@ help:
 	@echo "  make fmt              cargo fmt"
 	@echo "  make inspect-self     Run our own Inspect against this repo"
 	@echo "  make latency-smoke    Probe TT_GATEWAY_URL p50 latency (release gate; skips if unset)"
+	@echo "  make bench            Proxy-overhead benchmark vs null upstream (manual; not a CI gate)"
+	@echo "  make bench-litellm    Same, plus the dockerized LiteLLM comparison"
 	@echo ""
 	@echo "License compliance:"
 	@echo "  make licenses             Sync per-crate LICENSE/NOTICE + regen THIRD-PARTY-LICENSES"
@@ -89,6 +92,15 @@ latency-smoke:
 
 load-test-gateway:
 	./scripts/load-test-gateway.sh
+
+# Proxy-OVERHEAD benchmark vs a null mock upstream (manual/nightly, NOT a CI
+# gate). Measures dispatch overhead, not provider latency or savings — read
+# scripts/benchmarks/README.md before quoting numbers.
+bench:
+	./scripts/benchmarks/run-all.sh
+
+bench-litellm:
+	./scripts/benchmarks/run-all.sh --with-litellm
 
 loop:
 	./scripts/ralph-iteration.sh

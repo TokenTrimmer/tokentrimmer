@@ -1,0 +1,25 @@
+# TokenTrimmer proxy-OVERHEAD benchmark — committed baseline.
+#
+# These TokenTrimmer rows were measured LOCALLY against the null mock upstream
+# (scripts/benchmarks/mock-upstream.py), isolating gateway dispatch overhead
+# from real-provider latency. They are NOT a savings claim and NOT a "fastest
+# proxy" claim — read scripts/benchmarks/README.md before quoting any number.
+#
+# Provenance: machine Darwin/arm64 (Apple Silicon, macOS), 2026-06-11, oha 1.14.0,
+#   tt release build, BENCH_DURATION=20s, BENCH_CONCURRENCY=20, MOCK_DELAY_MS=0,
+#   no DATABASE_URL / no REDIS_URL (L1 cache disabled — see README "cache-hit caveat",
+#   so chat-hit here is a steady-state MISS, not a cache win).
+#
+# REPOPULATE on your machine:  ./scripts/benchmarks/run-all.sh
+#   (add --with-litellm for the dockerized LiteLLM comparison row)
+#
+# Latencies are milliseconds. Competitor rows are NEVER invented: each is either
+# produced locally by a harness in this dir, or a #-prefixed limitation note.
+timestamp,label,requests,rps,p50_ms,p95_ms,p99_ms,success_rate
+2026-06-11T02:53:21+00:00,tokentrimmer:health,2128617,106404.5,0.183,0.244,0.287,1.0000
+2026-06-11T02:53:41+00:00,tokentrimmer:chat-miss,389746,19484.5,0.877,2.231,3.049,1.0000
+2026-06-11T02:54:01+00:00,tokentrimmer:chat-hit,342834,17139.0,0.971,2.604,4.185,1.0000
+# --- documented limitations (NOT benchmarked here, NOT fabricated) ---
+# litellm: runnable but opt-in — ./scripts/benchmarks/litellm/run.sh (needs Docker; pinned image)
+# helicone: SaaS-only — no apples-to-apples local self-host overhead measurement; see README
+# bifrost: separate runtime — requires its own server + config; harness not bundled; see README
