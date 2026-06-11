@@ -6,8 +6,11 @@
 //! [`crate::AppState::with_quality_judge_persistent`] (a
 //! [`crate::quality_sample::FanoutJudgeSink`]), so one recorded verdict both
 //! feeds the live `/v1/preview` enrichment AND lands durably for Phase 2
-//! attribution netting (`quality_verdicts.request_id` joins
-//! `request_logs.trace_id`).
+//! attribution netting. `quality_verdicts.request_id` is the request's trace
+//! id; the Phase-2 join against `request_logs.trace_id` (a NULLABLE TEXT
+//! column) needs `request_id::text = trace_id` — casting `trace_id::uuid`
+//! would throw on non-UUID values — and `request_logs.trace_id` is unindexed
+//! today, so Phase 2 should add an index alongside its netting query.
 //!
 //! # Invariants
 //!
@@ -17,7 +20,8 @@
 //! * **Measurement tax stays out of the savings ledger.** `judge_cost_usd` /
 //!   `baseline_cost_usd` live ONLY here (+ the
 //!   `tokentrimmer.quality.judge_cost_usd` span attribute) — never in
-//!   `request_logs.cost_usd`, never counted as or against savings.
+//!   `request_logs.cost_usd`, never counted as or against savings. `NULL`
+//!   cost = unmetered (billed but unpriced), never persisted as `0`.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -53,17 +57,17 @@ impl std::fmt::Debug for PostgresJudgeSink {
 pub const INSERT_SQL: &str = r#"INSERT INTO quality_verdicts
                  (id, org_id, route_id, request_id, ts,
                   requested_model, served_model, verdict, reason, judge_model,
-                  judge_cost_usd, baseline_cost_usd,
+                  judge_cost_usd, baseline_cost_usd, baseline_dispatched,
                   optimized_position, orders_judged, orders_agreed)
                VALUES
                  ($1, $2, $3, $4, $5,
                   $6, $7, $8, $9, $10,
-                  $11, $12,
-                  $13, $14, $15)"#;
+                  $11, $12, $13,
+                  $14, $15, $16)"#;
 
 /// Number of `.bind(...)` calls in [`PostgresJudgeSink::record`]. Must stay in
 /// sync with [`INSERT_SQL`] and the actual bind chain.
-pub const INSERT_BIND_COUNT: usize = 15;
+pub const INSERT_BIND_COUNT: usize = 16;
 
 #[async_trait]
 impl JudgeSink for PostgresJudgeSink {
@@ -79,11 +83,12 @@ impl JudgeSink for PostgresJudgeSink {
             .bind(verdict_str(outcome.score.verdict)) // $8 verdict
             .bind(&outcome.score.reason) // $9 reason
             .bind(&outcome.judge_model) // $10 judge_model
-            .bind(outcome.judge_cost_usd) // $11 judge_cost_usd
+            .bind(outcome.judge_cost_usd) // $11 judge_cost_usd (NULL = unmetered)
             .bind(outcome.baseline_cost_usd) // $12 baseline_cost_usd
-            .bind(ab_position_str(outcome.optimized_position)) // $13 optimized_position
-            .bind(i16::from(outcome.orders_judged)) // $14 orders_judged
-            .bind(outcome.orders_agreed) // $15 orders_agreed
+            .bind(outcome.baseline_dispatched) // $13 baseline_dispatched
+            .bind(ab_position_str(outcome.optimized_position)) // $14 optimized_position
+            .bind(i16::from(outcome.orders_judged)) // $15 orders_judged
+            .bind(outcome.orders_agreed) // $16 orders_agreed
             .execute(&self.pool)
             .await;
         if let Err(e) = result {

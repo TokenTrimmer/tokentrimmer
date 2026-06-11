@@ -29,9 +29,11 @@ pub(crate) struct MeasuredDispatch {
     /// reference path extracts the assistant text from it.
     pub(crate) response: ChatCompletionResponse,
     /// Cost (USD) of this dispatch on the served model's own pricing.
-    /// `0.0` when the model has no catalog pricing — **0.0 means unmetered,
-    /// never "free"** (same convention as the #146 shadow cost).
-    pub(crate) cost_usd: f64,
+    /// `None` when the model has no catalog pricing — **unmetered, never
+    /// "free"/`0`** — so callers can distinguish "genuinely ~$0" from
+    /// "billed but unpriced". (The #146 shadow caller flattens `None` to its
+    /// legacy `0.0` convention; the judge persists the distinction.)
+    pub(crate) cost_usd: Option<f64>,
 }
 
 /// Dispatch `req` ONCE on `provider`, non-streaming, with NO failover and NO
@@ -41,8 +43,8 @@ pub(crate) struct MeasuredDispatch {
 ///   streamed.
 /// * The cost is computed exactly like the #146 shadow: the served model's own
 ///   pricing on both sides of [`crate::routes::chat::compute_cost`] (no flex,
-///   no compression delta), times the provider's fee multiplier.
-///   [`crate::routes::chat::compute_cost`] yields `0.0` on `None` pricing.
+///   no compression delta), times the provider's fee multiplier. `None`
+///   pricing yields `cost_usd: None` (unmetered — see [`MeasuredDispatch`]).
 /// * A timeout maps to `Err("deadline exceeded")`; an upstream error maps to
 ///   its display string. The caller decides what an error means (the shadow
 ///   records `succeeded=false`; the judge records nothing).
@@ -58,13 +60,14 @@ pub(crate) async fn measured_single_dispatch(
         Ok(Err(e)) => return Err(e.to_string()),
         Err(_) => return Err("deadline exceeded".to_string()),
     };
-    let pricing = provider.pricing(&response.model);
-    let cost_usd = crate::routes::chat::compute_cost(
-        &response.usage,
-        pricing.as_ref(),
-        pricing.as_ref(),
-        provider.fee_multiplier(),
-    )
-    .cost_usd;
+    let cost_usd = provider.pricing(&response.model).map(|pricing| {
+        crate::routes::chat::compute_cost(
+            &response.usage,
+            Some(&pricing),
+            Some(&pricing),
+            provider.fee_multiplier(),
+        )
+        .cost_usd
+    });
     Ok(MeasuredDispatch { response, cost_usd })
 }

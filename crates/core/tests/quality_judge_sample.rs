@@ -587,8 +587,9 @@ async fn preview_enriches_quality_band_from_recorded_judge_outcome() {
             },
             risk_band: RiskBand::High,
             judge_model: JUDGE_MODEL.to_string(),
-            judge_cost_usd: 0.000_05,
+            judge_cost_usd: Some(0.000_05),
             baseline_cost_usd: Some(0.002),
+            baseline_dispatched: true,
             optimized_position: tt_core::AbOrder::OptimizedA,
             orders_judged: 1,
             orders_agreed: None,
@@ -740,16 +741,17 @@ async fn paired_baseline_dispatch_is_metered() {
         (baseline - 0.002).abs() < 1e-9,
         "baseline cost should be 0.002, got {baseline}"
     );
-    // Judge pricing (0.1 / 0.4 per M) on 100/100 usage: 0.00005.
     assert!(
-        o.judge_cost_usd > 0.0,
-        "the judge tax must be metered, got {}",
-        o.judge_cost_usd
+        o.baseline_dispatched,
+        "the baseline reference dispatch must be marked as billed"
     );
+    // Judge pricing (0.1 / 0.4 per M) on 100/100 usage: 0.00005.
+    let judge_cost = o
+        .judge_cost_usd
+        .expect("the judge tax must be metered (judge model is priced)");
     assert!(
-        (o.judge_cost_usd - 0.000_05).abs() < 1e-9,
-        "judge cost should be 0.00005, got {}",
-        o.judge_cost_usd
+        (judge_cost - 0.000_05).abs() < 1e-9,
+        "judge cost should be 0.00005, got {judge_cost}"
     );
     assert_eq!(o.judge_model, JUDGE_MODEL);
     assert_eq!(o.orders_judged, 1);
@@ -792,10 +794,10 @@ async fn both_orders_makes_two_judge_calls() {
             Some(true),
             "EQUIVALENT agrees across orders"
         );
+        let judge_cost = o.judge_cost_usd.expect("metered judge tax");
         assert!(
-            (o.judge_cost_usd - 2.0 * 0.000_05).abs() < 1e-9,
-            "judge tax sums over both orders, got {}",
-            o.judge_cost_usd
+            (judge_cost - 2.0 * 0.000_05).abs() < 1e-9,
+            "judge tax sums over both orders, got {judge_cost}"
         );
     }
 
@@ -821,8 +823,12 @@ async fn both_orders_makes_two_judge_calls() {
     );
 }
 
-/// A judge-model failure is FAIL-OPEN: the user response is untouched (200 +
-/// served body) and the sink records nothing — no fabricated verdicts.
+/// A judge-model failure is FAIL-OPEN for the user (200 + served body
+/// untouched) — but the measurement spend ALREADY BILLED before the failure
+/// (the baseline reference dispatch) is ledgered as an `unclear` row carrying
+/// the incurred tax, so Phase-2 netting stays invoice-complete. No quality
+/// signal is fabricated: `unclear` has no valence and is excluded from every
+/// quality aggregate.
 #[tokio::test]
 async fn judge_failure_is_fail_open() {
     let h = build_harness_opts(HarnessOpts {
@@ -865,10 +871,298 @@ async fn judge_failure_is_fail_open() {
     })
     .await
     .expect("the judge call should at least be attempted");
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // The baseline reference dispatch was billed BEFORE the judge failed, so
+    // the incurred tax must be ledgered (never silently dropped).
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.sink.recorded.notified(),
+    )
+    .await
+    .expect("the incurred measurement spend must be ledgered");
+    let outcomes = h.sink.outcomes.lock().unwrap();
+    assert_eq!(outcomes.len(), 1, "exactly one spend-ledger row");
+    let o = &outcomes[0];
     assert_eq!(
-        h.sink.outcomes.lock().unwrap().len(),
-        0,
-        "a failed judge records nothing — never a fabricated verdict"
+        o.score.verdict,
+        JudgeVerdict::Unclear,
+        "a failed judge never fabricates a verdict — unclear has no valence"
     );
+    assert!(
+        o.score.reason.starts_with("unjudged:"),
+        "the reason names the failure: {}",
+        o.score.reason
+    );
+    assert!(o.baseline_dispatched);
+    // gpt-4o (5/15 per M) on the mock's 100/100 usage = 0.002.
+    let baseline = o
+        .baseline_cost_usd
+        .expect("the billed baseline dispatch is metered");
+    assert!(
+        (baseline - 0.002).abs() < 1e-9,
+        "baseline tax must be ledgered, got {baseline}"
+    );
+    assert_eq!(o.judge_cost_usd, Some(0.0), "no judge call completed");
+    assert_eq!(o.orders_judged, 0);
+}
+
+// ── Cross-provider judge credentials (fail closed, never cross-sent) ────────
+
+/// A judge-only provider on a DIFFERENT provider id than the source request,
+/// recording the api key of every call so the test can prove which credential
+/// was transmitted.
+struct RemoteJudgeProvider {
+    keys_seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for RemoteJudgeProvider {
+    fn id(&self) -> &'static str {
+        "judgeprov"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: "judge-remote".into(),
+            provider: "judgeprov".into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 4096,
+            max_output_tokens: 4096,
+        }]
+    }
+    fn pricing(&self, _model: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 0.1,
+            output_per_million: 0.4,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            effective_at: Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.keys_seen
+            .lock()
+            .unwrap()
+            .push(ctx.credentials.api_key.expose().to_string());
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-remote".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text(
+                        "EQUIVALENT\nsame material information".into(),
+                    )),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 100,
+                completion_tokens: 100,
+                total_tokens: 200,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+            },
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+struct CrossProviderHarness {
+    app: axum::Router,
+    judge_calls: Arc<AtomicUsize>,
+    judge_keys_seen: Arc<Mutex<Vec<String>>>,
+    sink: Arc<RecordingSink>,
+    plaintext: String,
+}
+
+/// Harness with the judge model on a SECOND provider (`judgeprov`) and a
+/// per-org credential store. `with_judge_credential` controls whether the org
+/// has a stored credential for the judge provider.
+async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProviderHarness {
+    use tt_auth::{InMemoryProviderCredentialStore, ProviderCredentialStore};
+    use tt_shared::context::{ProviderCredentials, SecretString};
+
+    let judge_calls = Arc::new(AtomicUsize::new(0));
+    let served_calls = Arc::new(AtomicUsize::new(0));
+    let judge_keys_seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(JudgeAwareProvider {
+        judge_calls: Arc::new(AtomicUsize::new(0)), // unused: judge lives remote
+        served_calls: Arc::clone(&served_calls),
+        judge_gate: None,
+        judge_verdict_word: "ACCEPTABLE",
+        judge_fail: false,
+        judge_prompts: Arc::new(Mutex::new(Vec::new())),
+    }));
+    registry.register(Arc::new(RemoteJudgeProvider {
+        keys_seen: Arc::clone(&judge_keys_seen),
+    }));
+
+    let raw_store = InMemoryKeyStore::new();
+    let org_id = Uuid::now_v7();
+    let audit = InMemoryAuditWriter::new();
+    let plaintext = issue(
+        &raw_store,
+        &audit,
+        org_id,
+        "k",
+        Environment::Live,
+        Actor::System,
+    )
+    .await
+    .unwrap()
+    .plaintext;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
+
+    // Per-org credential store: the source provider always has a key; the
+    // judge provider's key is present only when `with_judge_credential`.
+    let creds = InMemoryProviderCredentialStore::new();
+    let cred = |key: &str| ProviderCredentials {
+        api_key: SecretString::new(key.to_string()),
+        base_url: None,
+        extra_headers: Vec::new(),
+    };
+    creds.insert(org_id, "judgeaware", cred("sk-source"));
+    if with_judge_credential {
+        creds.insert(org_id, "judgeprov", cred("sk-judge"));
+    }
+    let cred_store: Arc<dyn ProviderCredentialStore> = Arc::new(creds);
+
+    let routes_backing = Arc::new(InMemoryRoutingStore::new());
+    routes_backing.set_routes(
+        org_id,
+        vec![Route {
+            id: Uuid::now_v7(),
+            name: "downgrade-4o".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                ..Default::default()
+            },
+            then: RouteAction {
+                target_model: "gpt-4o-mini".into(),
+                fallbacks: Vec::new(),
+                disable_cache: false,
+                max_cost_usd: None,
+                flex: false,
+                compress: false,
+                redact: false,
+                traffic_pct: None,
+                shadow_model: None,
+            },
+        }],
+    );
+    let routing = Arc::new(CachingRoutingStore::new(
+        routes_backing as Arc<dyn RoutingStore>,
+    ));
+
+    let sink = Arc::new(RecordingSink::default());
+    let config = JudgeConfig {
+        enabled: true,
+        sample_rate: 1.0,
+        judge_model: "judge-remote".to_string(),
+        ..JudgeConfig::default()
+    };
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_credential_store(cred_store)
+            .with_routing_store(routing)
+            .with_quality_judge(sink.clone() as Arc<dyn JudgeSink>, config),
+    );
+
+    CrossProviderHarness {
+        app,
+        judge_calls,
+        judge_keys_seen,
+        sink,
+        plaintext,
+    }
+}
+
+/// A judge model on a DIFFERENT provider uses the judge provider's OWN stored
+/// credential — the source provider's key is never transmitted to the judge
+/// vendor (the #128 cross-provider credential leak, fixed).
+#[tokio::test]
+async fn cross_provider_judge_uses_judge_providers_own_credential() {
+    let h = build_cross_provider_harness(true).await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.sink.recorded.notified(),
+    )
+    .await
+    .expect("judge should record");
+
+    let keys = h.judge_keys_seen.lock().unwrap();
+    assert!(
+        !keys.is_empty(),
+        "the remote judge provider must have been called"
+    );
+    for key in keys.iter() {
+        assert_eq!(
+            key, "sk-judge",
+            "the judge call must carry the JUDGE provider's credential, \
+             never the source provider's key"
+        );
+    }
+    let outcomes = h.sink.outcomes.lock().unwrap();
+    assert_eq!(outcomes[0].score.verdict, JudgeVerdict::Acceptable);
+}
+
+/// A verified org with NO stored credential for the judge provider fails
+/// CLOSED: the judge is skipped entirely (no call, nothing recorded, no
+/// cross-provider key leak) and the user response is untouched.
+#[tokio::test]
+async fn cross_provider_judge_without_credential_fails_closed() {
+    let h = build_cross_provider_harness(false).await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "user path untouched");
+
+    // Give the detached task time to (not) fire.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        h.judge_keys_seen.lock().unwrap().is_empty(),
+        "no credential for the judge provider → the judge vendor must never \
+         be called (fail closed, no key leak)"
+    );
+    assert_eq!(h.judge_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
 }

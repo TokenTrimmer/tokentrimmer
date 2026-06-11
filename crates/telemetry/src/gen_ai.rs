@@ -107,9 +107,10 @@ pub const TT_QUALITY_VERDICT: &str = "tokentrimmer.quality.verdict";
 /// judge call(s) that produced this verdict. Measurement spend, kept OUT of
 /// the request cost attributes so savings stay invoice-reconcilable; the
 /// durable `quality_verdicts` row is canonical for Phase 2 attribution
-/// netting, this attribute is the ops-visible mirror. Always emitted for a
-/// judged request; `0.0` means the judge model had no catalog pricing
-/// (unmetered), never "free".
+/// netting, this attribute is the ops-visible mirror. Emitted only when the
+/// judge tax is fully METERED; omitted when any judge call had no catalog
+/// pricing (a real billed call of unknown price — emitting `0` would fabricate
+/// "free").
 pub const TT_QUALITY_JUDGE_COST_USD: &str = "tokentrimmer.quality.judge_cost_usd";
 
 /// **Reserved** wire name for a per-request quality score header in `[0, 1]`,
@@ -299,10 +300,11 @@ pub struct QualityVerdictAttributes<'a> {
     pub band: &'a str,
     /// Raw judge verdict (`acceptable`/`degraded`/`unclear`) → `tokentrimmer.quality.verdict`.
     pub verdict: &'a str,
-    /// Judge tax (USD) → `tokentrimmer.quality.judge_cost_usd`. Always emitted
-    /// for a judged request — `0.0` means the judge model had no catalog
-    /// pricing (unmetered), never "free". See [`TT_QUALITY_JUDGE_COST_USD`].
-    pub judge_cost_usd: f64,
+    /// Judge tax (USD) → `tokentrimmer.quality.judge_cost_usd`. `Some` only
+    /// when the tax is fully metered; `None` (attribute omitted) when any judge
+    /// call had no catalog pricing — a real billed call of unknown price must
+    /// never surface as `0.0`/"free". See [`TT_QUALITY_JUDGE_COST_USD`].
+    pub judge_cost_usd: Option<f64>,
 }
 
 /// Record the per-request quality verdict onto `span`.
@@ -332,7 +334,11 @@ pub fn record_quality_verdict(span: &Span, attrs: &QualityVerdictAttributes<'_>)
     }
     span.set_attribute(TT_QUALITY_BAND, attrs.band.to_string());
     span.set_attribute(TT_QUALITY_VERDICT, attrs.verdict.to_string());
-    span.set_attribute(TT_QUALITY_JUDGE_COST_USD, attrs.judge_cost_usd);
+    // Omit the judge tax when it is unmetered (`None`): a real billed call of
+    // unknown price must never surface as `0.0`/"free".
+    if let Some(judge_cost_usd) = attrs.judge_cost_usd {
+        span.set_attribute(TT_QUALITY_JUDGE_COST_USD, judge_cost_usd);
+    }
 }
 
 #[cfg(test)]
@@ -502,7 +508,7 @@ mod tests {
                     score: Some(1.0),
                     band: "low",
                     verdict: "acceptable",
-                    judge_cost_usd: 0.000_05,
+                    judge_cost_usd: Some(0.000_05),
                 },
             );
         });
@@ -553,7 +559,7 @@ mod tests {
                     score: None,
                     band: "low",
                     verdict: "unclear",
-                    judge_cost_usd: 0.0,
+                    judge_cost_usd: None,
                 },
             );
         });
@@ -561,6 +567,11 @@ mod tests {
         assert!(
             !attrs.contains_key(TT_QUALITY_SCORE),
             "score attribute must be omitted for an unclear verdict"
+        );
+        assert!(
+            !attrs.contains_key(TT_QUALITY_JUDGE_COST_USD),
+            "an UNMETERED judge tax (None) must omit the attribute — never \
+             fabricate a $0 for a billed call"
         );
         assert_eq!(
             attrs.get(TT_QUALITY_BAND),
