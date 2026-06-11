@@ -1,9 +1,9 @@
 # `tt` gateway commands
 
-Six `tt` subcommands talk to a TokenTrimmer Gateway (hosted or self-hosted) over
-its OpenAI-compatible API: `chat`, `advise`, `route`, `models`, `embed`, and
-`login`. This page documents each — purpose, the flags that exist in the binary,
-and a real example.
+Seven `tt` subcommands talk to a TokenTrimmer Gateway (hosted or self-hosted)
+over its OpenAI-compatible API: `chat`, `advise`, `route`, `recipes`, `models`,
+`embed`, and `login`. This page documents each — purpose, the flags that exist in
+the binary, and a real example.
 
 For `tt gateway` (running the gateway itself), `tt inspect`, `tt plan`,
 `tt init`, `tt mcp`, `tt proxy`, and `tt retrieval`, see `README.md`,
@@ -214,3 +214,42 @@ tt route add --always gpt-4o-mini \
 ```
 
 See `docs/routing-rules-guide.md` for the complete flag-to-field mapping.
+
+## `tt recipes`
+
+Curated, ready-to-apply savings route-sets. Instead of hand-building rules with
+`tt route add`, pick a recipe that targets a common cost lane and apply its whole
+route-set in one step. The recipe assets ship embedded in the binary, so `list`
+and `show` work fully offline; only `apply` talks to the gateway.
+
+### Subcommands
+
+```bash
+tt recipes list            # table: RECIPE, OPTIMIZES, LANE
+tt recipes show <recipe>   # humanized route-set + savings lane + description
+tt recipes apply <recipe>  # create the recipe's routes on the gateway
+```
+
+The five curated recipes:
+
+| Recipe | Optimizes |
+| --- | --- |
+| `cheap-classification` | Short classification-style prompts → a small model. |
+| `vision-gate` | Image requests pinned to a vision-capable model. |
+| `cost-ceiling` | Downshift expensive calls + a hard per-request cost cap. |
+| `outage-fallback` | Provider outages fail over to a backup chain. |
+| `long-context-downshift` | Huge-context prompts → a cheaper long-context model. |
+
+`apply` creates each route via the same `POST /v1/routes` endpoint `tt route add`
+uses, so it requires a key (`tt login --token <KEY>` or `TT_API_KEY`) and a
+gateway with a routing store configured. Without a key it fails with an
+actionable message and a non-zero exit — it never silently "applies" nothing.
+After applying, inspect or remove the created routes with `tt route list` /
+`tt route rm <id>`.
+
+### Example
+
+```bash
+tt recipes show cost-ceiling      # preview the rules before committing
+tt recipes apply cost-ceiling     # create them on your gateway
+```

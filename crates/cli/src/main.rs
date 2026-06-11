@@ -263,6 +263,17 @@ enum Command {
         #[arg(long, global = true)]
         tt_api_base: Option<String>,
     },
+    /// Curated savings recipes — list, inspect, and apply ready-made route-sets.
+    Recipes {
+        #[command(subcommand)]
+        action: RecipesAction,
+        /// Override the API key (else V0 resolution: env / ~/.tokentrimmer).
+        #[arg(long, global = true)]
+        tt_api_key: Option<String>,
+        /// Override the gateway base URL.
+        #[arg(long, global = true)]
+        tt_api_base: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -331,6 +342,22 @@ enum RouteAction {
         fallback: Vec<String>,
         #[arg(long)]
         disabled: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecipesAction {
+    /// List the curated savings recipes (name, what it optimizes, lane).
+    List,
+    /// Show one recipe's route-set (humanized) and its savings lane.
+    Show {
+        /// Recipe slug (see `tt recipes list`).
+        name: String,
+    },
+    /// Apply a recipe — create its routes via the hosted gateway (requires a key).
+    Apply {
+        /// Recipe slug (see `tt recipes list`).
+        name: String,
     },
 }
 
@@ -786,6 +813,22 @@ async fn main() -> anyhow::Result<()> {
                 }),
             };
             if let Err(e) = tt_cli::route::run(cmd, tt_api_key, tt_api_base).await {
+                tt_cli::ui::error(&format!("{e:#}"));
+                std::process::exit(1);
+            }
+        }
+        Command::Recipes {
+            action,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            use tt_cli::recipes::RecipesCmd;
+            let cmd = match action {
+                RecipesAction::List => RecipesCmd::List,
+                RecipesAction::Show { name } => RecipesCmd::Show(name),
+                RecipesAction::Apply { name } => RecipesCmd::Apply(name),
+            };
+            if let Err(e) = tt_cli::recipes::run(cmd, tt_api_key, tt_api_base).await {
                 tt_cli::ui::error(&format!("{e:#}"));
                 std::process::exit(1);
             }

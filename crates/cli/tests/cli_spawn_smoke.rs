@@ -247,3 +247,23 @@ fn route_spawns_without_panic() {
         REFUSED_BASE,
     ]);
 }
+
+#[test]
+fn recipes_list_spawns_without_panic() {
+    // `recipes list` is fully offline (embedded assets) → exits 0 cleanly.
+    assert_exits_cleanly(&["recipes", "list"]);
+}
+
+#[test]
+fn recipes_apply_spawns_without_panic() {
+    // Apply hits the gateway; a refused base → clean connection error, no panic.
+    assert_exits_cleanly(&[
+        "recipes",
+        "apply",
+        "cheap-classification",
+        "--tt-api-key",
+        "tt_test_smoke",
+        "--tt-api-base",
+        REFUSED_BASE,
+    ]);
+}
