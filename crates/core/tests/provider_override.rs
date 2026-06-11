@@ -441,6 +441,8 @@ async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

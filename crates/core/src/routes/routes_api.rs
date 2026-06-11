@@ -7,7 +7,7 @@ use axum::{
     Extension, Json,
 };
 use tt_auth::ApiKeyContext;
-use tt_routing::{validate_capability, NewRoute, Route, RoutingStore};
+use tt_routing::{validate_capability, validate_shadow_model, NewRoute, Route, RoutingStore};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
@@ -49,6 +49,10 @@ pub async fn create(
     let org = require_org(ctx)?;
     let registry = state.registry.clone();
     validate_capability(&spec.when, &spec.then, |m| registry.model_info(m).cloned())
+        .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
+    // #454: a route whose `shadow_model` cannot resolve to a registered provider
+    // is rejected at config time (not silently no-op'd at dispatch).
+    validate_shadow_model(&spec.then, |m| registry.resolve(m).is_some())
         .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
     let created = store(&state)?
         .create_route(org, spec)

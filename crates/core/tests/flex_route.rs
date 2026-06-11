@@ -292,6 +292,8 @@ async fn app_with_flex_route(
                 flex: true,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

@@ -359,6 +359,8 @@ mod tests {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }
     }
@@ -396,6 +398,8 @@ mod tests {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         };
         let created = s.create_route(org, spec).await.unwrap();
@@ -433,6 +437,8 @@ mod tests {
                         flex: false,
                         compress: false,
                         redact: false,
+                        traffic_pct: None,
+                        shadow_model: None,
                     },
                 },
             )

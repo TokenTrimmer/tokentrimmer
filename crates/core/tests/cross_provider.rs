@@ -171,6 +171,8 @@ fn route(target: &str, fallbacks: Vec<String>) -> Route {
             flex: false,
             compress: false,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     }
 }

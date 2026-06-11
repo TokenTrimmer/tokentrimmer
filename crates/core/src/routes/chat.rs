@@ -735,6 +735,29 @@ pub async fn handler(
             .unwrap_or_else(Uuid::now_v7)
     };
 
+    // Idempotency key for the sticky canary traffic split (#454). Precedence:
+    //   1. `X-Idempotency-Key` header (client-supplied stable per-logical-request
+    //      key — the strongest signal; a retry carrying the same key is sticky to
+    //      the same arm).
+    //   2. else the `trace_id` string (stable across a single request lifecycle,
+    //      and across replicas for that request, but NOT across client retries).
+    //   3. else a fresh uuid — only reached when neither exists, which for this
+    //      handler is effectively never (trace_id always resolves above). A fresh
+    //      uuid means the request is NOT sticky across retries; that is acceptable
+    //      and documented: it just makes that one request's arm a self-consistent
+    //      one-off. The split itself stays a pure function of (org, key, pct).
+    let idempotency_key = headers
+        .get("x-idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if trace_id != Uuid::nil() {
+                trace_id.to_string()
+            } else {
+                Uuid::now_v7().to_string()
+            }
+        });
+
     // 2b. Identity + credentials.
     //
     // If the auth middleware attached an `ApiKeyContext`, use the real
@@ -839,6 +862,15 @@ pub async fn handler(
     // dispatch; it never attributes a saving and surfaces a `redacted:<class>`
     // warning when it fires.
     let route_redact = route_match.as_ref().is_some_and(|m| m.redact);
+    // Canary traffic split (#454) + shadow mode, captured before `route_match`
+    // is consumed below. `route_traffic_pct` is the configured split percentage
+    // (None = unconditional rewrite). `route_shadow_model` is the discarded
+    // shadow candidate. `route_target_model` is the canary arm's model — used to
+    // revert to the originally-requested model when the split assigns this
+    // request to the control arm.
+    let route_traffic_pct = route_match.as_ref().and_then(|m| m.traffic_pct);
+    let route_shadow_model = route_match.as_ref().and_then(|m| m.shadow_model.clone());
+    let route_target_model = route_match.as_ref().map(|m| m.target_model.clone());
     // Per-request cost ceiling (V3d-2b) + the token estimate, captured before
     // `route_match` is consumed below.
     let route_max_cost_usd = route_match.as_ref().and_then(|m| m.max_cost_usd);
@@ -848,7 +880,47 @@ pub async fn handler(
         .unwrap_or(0);
     // Ordered fallback model ids from the matched route (empty = no failover).
     let mut route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
-    if matched_route_id.is_some() {
+
+    // ── Canary traffic split (#454) ──────────────────────────────────────────
+    //
+    // Evaluated HERE: AFTER the route match (so we know the candidate rewrite)
+    // and BEFORE the cache lookup (so the L1 key / L2 lookup use the arm's actual
+    // served model). When the matched route declares a `traffic_pct`, the sticky,
+    // replica-independent split (`tt_routing::sticky_traffic_split`) decides the
+    // arm from `(org_id, idempotency_key, traffic_pct)`:
+    //
+    //   * CANARY arm  → keep `apply_routing`'s rewrite (req.model == target_model).
+    //   * CONTROL arm → REVERT req.model to the originally-requested model so the
+    //     request is served unchanged; the route still attributes (route_id is
+    //     stamped) but with `arm="control"` and NO routing saving (baseline ==
+    //     served). `route_fallbacks` are dropped on the control arm — they belong
+    //     to the canary target, not the reverted original.
+    //
+    // No `traffic_pct` (the common case) → unconditional rewrite, arm = None.
+    let mut traffic_split_arm: Option<&'static str> = None;
+    let mut model_was_rewritten = matched_route_id.is_some();
+    if let Some(pct) = route_traffic_pct {
+        let in_canary = tt_routing::sticky_traffic_split(ctx.org_id, &idempotency_key, pct);
+        if in_canary {
+            traffic_split_arm = Some("canary");
+            // req.model already holds the canary target (apply_routing rewrote it).
+        } else {
+            traffic_split_arm = Some("control");
+            // Revert to the originally-requested model — serve unchanged.
+            if let Some(target) = route_target_model.as_deref() {
+                if req.model == target {
+                    req.model = requested_model.clone();
+                }
+            }
+            // The control arm is NOT a rewrite: no provider re-resolve, baseline
+            // priced against the served (== requested) model, no canary fallbacks.
+            model_was_rewritten = false;
+            route_fallbacks.clear();
+        }
+    }
+    let traffic_split_arm_owned = traffic_split_arm.map(str::to_string);
+
+    if model_was_rewritten {
         // Provider may change when a route crosses providers (V3d-1); the
         // registry is the source of truth.
         provider = state
@@ -1142,6 +1214,10 @@ pub async fn handler(
                             ),
                             "hit-l1",
                             None,
+                            // Cache hit — no canary split/shadow recorded.
+                            None,
+                            None,
+                            None,
                         );
                         let fake = sse::fake_stream_from_response(entry.response);
                         // L1 hit already logged above; no need for a second row.
@@ -1289,6 +1365,9 @@ pub async fn handler(
             response_model: served_model.clone(),
             cache_outcome: stream_cache_state.to_string(),
             route: route_matched_name.clone(),
+            // Canary split pct (additive span attr); shadow mode is non-streaming
+            // so it is never set on the streaming span.
+            traffic_split_pct: route_traffic_pct,
         });
 
         // Build a StreamLogContext whenever telemetry, span attributes, or cache
@@ -1308,9 +1387,12 @@ pub async fn handler(
                 input_tokens: estimated_input_tokens,
                 cached_tokens: 0,
                 pricing: provider.pricing(&served_model),
-                // Baseline against the originally-requested model when routed, so
-                // the streamed request_logs row carries the real routing saving.
-                baseline_pricing: if matched_route_id.is_some() {
+                // Baseline against the originally-requested model when the model
+                // was actually rewritten (canary arm / unconditional rewrite), so
+                // the streamed request_logs row carries the real routing saving. A
+                // control-arm request reverted to the original model is NOT a
+                // rewrite → baseline == served (no phantom saving).
+                baseline_pricing: if model_was_rewritten {
                     requested_pricing.clone()
                 } else {
                     provider.pricing(&served_model)
@@ -1335,6 +1417,9 @@ pub async fn handler(
                 // OpenAI-native final usage chunk when the client asked for it.
                 include_usage: client_requested_include_usage(&req),
                 span_ctx,
+                // Canary arm for the streamed request_logs row (None when no
+                // split). Shadow mode never fires on the streaming path.
+                traffic_split_arm: traffic_split_arm_owned.clone(),
             })
         } else {
             None
@@ -1505,7 +1590,7 @@ pub async fn handler(
         //     with retry. `provider` is rebound to whichever provider actually
         //     served the request so cost/headers/telemetry below reflect it.
         let __primary = provider.id();
-        let dispatch_result: ApiResult<_> = with_request_timeout(request_timeout, async {
+        let primary_dispatch = with_request_timeout(request_timeout, async {
             if route_fallbacks.is_empty() {
                 let __started = std::time::Instant::now();
                 let __dispatch = with_retry(&RetryPolicy::default(), || {
@@ -1551,8 +1636,26 @@ pub async fn handler(
                 .await
                 .map_err(ApiError::from)
             }
-        })
-        .await;
+        });
+
+        // Canary SHADOW dispatch (#454): when the matched route declares a
+        // `shadow_model`, run it CONCURRENTLY with the primary — same prompt,
+        // shadow model, non-streaming, single candidate, NO failover, its own
+        // short deadline. The shadow response is DISCARDED; only its cost is kept
+        // (in a separate column / span attr). Opt-in only: `route_shadow_model`
+        // is None for every request whose route did not set it, so the default
+        // path runs the primary alone with zero added work. We base the shadow on
+        // `req` AFTER redaction/compression so it exercises the exact prompt the
+        // primary dispatches. `tokio::join!` polls both on this task so the
+        // shadow never blocks the primary beyond their concurrent overlap.
+        let (dispatch_result, shadow_outcome): (ApiResult<_>, Option<ShadowOutcome>) =
+            if let Some(shadow_model) = route_shadow_model.as_deref() {
+                let shadow_fut = dispatch_shadow(&state, &ctx, &req, shadow_model, &raw_bearer);
+                let (primary, shadow) = tokio::join!(primary_dispatch, shadow_fut);
+                (primary, Some(shadow))
+            } else {
+                (primary_dispatch.await, None)
+            };
 
         // Attributed to the primary provider: the request deadline spans any
         // failover loop, so the in-flight candidate at timeout isn't known here
@@ -1786,6 +1889,17 @@ pub async fn handler(
         // 3g. Best-effort request_logs row. Cache-miss path: cached=false,
         //     cache_layer=None. L1/L2-hit paths log their own rows where
         //     they early-return.
+        //
+        // Canary shadow attribution: when a shadow fired, record its model +
+        // cost in their OWN columns (NEVER folded into `cost_usd`). `shadow_cost`
+        // is `Some` only when the shadow succeeded (a failed shadow still logs
+        // its model with `None` cost so the attempt is auditable). The doubled
+        // spend is thus visible and reconcilable as a distinct experiment cost.
+        let shadow_model_logged = shadow_outcome.as_ref().map(|s| s.model.clone());
+        let shadow_cost_logged = shadow_outcome
+            .as_ref()
+            .filter(|s| s.succeeded)
+            .map(|s| s.cost_usd);
         spawn_request_log(
             state.request_log_writer.as_ref(),
             RequestLogRow {
@@ -1811,6 +1925,9 @@ pub async fn handler(
                 error_class: None,
                 trace_id: Some(trace_id.to_string()),
                 truncated: false,
+                shadow_model: shadow_model_logged.clone(),
+                shadow_cost_usd: shadow_cost_logged,
+                traffic_split_arm: traffic_split_arm_owned.clone(),
             },
         );
 
@@ -1876,6 +1993,13 @@ pub async fn handler(
             span_cost(&cost_breakdown, input_tokens, output_tokens),
             cache_state,
             route_matched_name.as_deref(),
+            // Canary span attributes — additive; each omitted when its value is
+            // None (no split / no shadow). The shadow cost is recorded SEPARATELY
+            // here, never folded into `tokentrimmer.cost_usd` (carried by
+            // `cost_breakdown` above).
+            route_traffic_pct,
+            shadow_model_logged.as_deref(),
+            shadow_cost_logged,
         );
         attach_warnings(
             http_response.headers_mut(),
@@ -2074,6 +2198,10 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         span_cost(&cost, input_tokens, output_tokens),
         "hit-l1",
         None,
+        // Cache hit — no canary split/shadow recorded.
+        None,
+        None,
+        None,
     );
     http_response
 }
@@ -2135,6 +2263,10 @@ fn build_hit_l2_response(
         &provider_id,
         span_cost(&cost, input_tokens, output_tokens),
         "hit-l2",
+        None,
+        // Cache hit — no canary split/shadow recorded.
+        None,
+        None,
         None,
     );
     Ok(http_response)
@@ -2688,6 +2820,7 @@ fn span_cost(
 /// cross-model failover). On a span with no OpenTelemetry layer (dev `fmt`
 /// subscriber) this is a cheap no-op. This module handles only
 /// `POST /v1/chat/completions`, so the operation is always `chat`.
+#[allow(clippy::too_many_arguments)]
 fn record_request_span_attributes(
     request_model: &str,
     response_model: &str,
@@ -2695,6 +2828,9 @@ fn record_request_span_attributes(
     cost: tt_telemetry::gen_ai::RequestSpanCost,
     cache_outcome: &str,
     route: Option<&str>,
+    traffic_split_pct: Option<u32>,
+    shadow_model: Option<&str>,
+    shadow_cost_usd: Option<f64>,
 ) {
     tt_telemetry::gen_ai::record_request_attributes(
         &tracing::Span::current(),
@@ -2706,6 +2842,9 @@ fn record_request_span_attributes(
             cost,
             cache_outcome: Some(cache_outcome),
             route,
+            traffic_split_pct,
+            shadow_model,
+            shadow_cost_usd,
         },
     );
 }
@@ -2795,6 +2934,128 @@ fn spawn_request_log(writer: Option<&std::sync::Arc<dyn RequestLogWriter>>, row:
             tracing::warn!(error = %e, "request_logs write failed");
         }
     });
+}
+
+/// Outcome of a canary **shadow** dispatch (`RouteAction::shadow_model`).
+///
+/// The shadow response itself is DISCARDED — only its cost/usage are kept, in
+/// their own fields, so the doubled spend is attributed to the experiment and
+/// never folded into the primary cost.
+pub(crate) struct ShadowOutcome {
+    /// The shadow candidate model that was dispatched (recorded for the row /
+    /// span even on error, so a failed shadow is still auditable).
+    pub(crate) model: String,
+    /// Cost (USD) the shadow dispatch billed. `0.0` when the shadow errored or
+    /// the shadow model has no pricing.
+    pub(crate) cost_usd: f64,
+    /// Whether the shadow upstream call actually completed (`true`) or errored /
+    /// timed out (`false`). A `true` value is the proof the candidate provider
+    /// was really called — instrumented in tests via a mock provider.
+    pub(crate) succeeded: bool,
+}
+
+/// Dispatch a canary shadow candidate (`RouteAction::shadow_model`) ONCE,
+/// non-streaming, with NO failover, discarding the response and returning only
+/// its cost/usage. SEPARATE from the primary dispatch in every way:
+///
+/// * single candidate — the shadow never fails over to another model/provider;
+/// * its own short `shadow_timeout` (the result is discarded, so it must never
+///   delay the primary response);
+/// * its cost is computed independently and returned for SEPARATE recording
+///   (never added to the primary `cost_usd`).
+///
+/// Fails closed on a missing shadow credential (returns `succeeded=false`,
+/// `cost=0`) — it never forwards the caller's bearer to an unintended provider.
+/// `base_req` is the request as the gateway would dispatch it (post
+/// redaction/compression); only `model` is swapped to the shadow candidate so
+/// the shadow exercises the SAME prompt as the primary.
+async fn dispatch_shadow(
+    state: &AppState,
+    ctx: &RequestContext,
+    base_req: &ChatCompletionRequest,
+    shadow_model: &str,
+    raw_bearer: &str,
+) -> ShadowOutcome {
+    let mut outcome = ShadowOutcome {
+        model: shadow_model.to_string(),
+        cost_usd: 0.0,
+        succeeded: false,
+    };
+    let Some(shadow_provider) = state.registry.resolve(shadow_model) else {
+        // Should be unreachable: config validation rejects an unresolvable
+        // shadow model at route-creation time. Guard anyway (fail closed).
+        tracing::warn!(
+            shadow_model = %shadow_model,
+            "shadow model did not resolve to a provider — skipping shadow dispatch"
+        );
+        return outcome;
+    };
+    // Resolve the shadow provider's credential. `allow_bearer_fallback=true`
+    // here is gated INSIDE `resolve_credentials_for` to anonymous orgs only
+    // (`org_id.is_nil()`), so a VERIFIED org with no stored shadow credential
+    // fails closed (returns None → no shadow, no bearer leak). With no
+    // credential store wired (dev/dogfood) the bearer is forwarded, matching the
+    // primary path.
+    let Some(shadow_creds) =
+        resolve_credentials_for(state, ctx.org_id, shadow_provider.id(), raw_bearer, true).await
+    else {
+        tracing::warn!(
+            shadow_model = %shadow_model,
+            provider = shadow_provider.id(),
+            "no credential for shadow provider — skipping shadow dispatch (fail closed)"
+        );
+        return outcome;
+    };
+
+    // Build the shadow request: same prompt, shadow model, never streaming.
+    let mut shadow_req = base_req.clone();
+    shadow_req.model = shadow_model.to_string();
+    shadow_req.stream = false;
+    let shadow_ctx = RequestContext {
+        credentials: shadow_creds,
+        deadline: Some(state.shadow_timeout),
+        ..ctx.clone()
+    };
+
+    // SINGLE candidate, NO failover, NO retry storm — one shot under the short
+    // shadow deadline.
+    let dispatched = with_request_timeout(Some(state.shadow_timeout), async {
+        shadow_provider
+            .chat_completion(shadow_req, &shadow_ctx)
+            .await
+            .map_err(ApiError::from)
+    })
+    .await;
+
+    match dispatched {
+        Ok(resp) => {
+            // Cost the shadow on its OWN pricing — never the primary's. No flex,
+            // no compression delta: the shadow is a plain measurement dispatch.
+            let pricing = shadow_provider.pricing(&resp.model);
+            let breakdown = compute_cost(
+                &resp.usage,
+                pricing.as_ref(),
+                pricing.as_ref(),
+                shadow_provider.fee_multiplier(),
+            );
+            outcome.cost_usd = breakdown.cost_usd;
+            outcome.succeeded = true;
+            tracing::debug!(
+                shadow_model = %shadow_model,
+                shadow_cost_usd = outcome.cost_usd,
+                "shadow dispatch completed (response discarded)"
+            );
+            // resp is intentionally dropped here — the shadow output is discarded.
+        }
+        Err(e) => {
+            tracing::debug!(
+                shadow_model = %shadow_model,
+                error = %e,
+                "shadow dispatch failed — recording shadow_model with zero cost"
+            );
+        }
+    }
+    outcome
 }
 
 /// Extract the assistant text of a non-streaming response — the served
@@ -2970,6 +3231,12 @@ fn request_log_for_l1_hit(
         error_class: None,
         trace_id: Some(trace_id.to_string()),
         truncated: false,
+        // A cache hit performs no live dispatch, so no shadow fires and the
+        // canary arm is not re-derived here (the response is served from cache
+        // regardless of arm). Columns stay NULL.
+        shadow_model: None,
+        shadow_cost_usd: None,
+        traffic_split_arm: None,
     }
 }
 
@@ -3007,6 +3274,10 @@ fn request_log_for_l2_hit(
         error_class: None,
         trace_id: Some(trace_id.to_string()),
         truncated: false,
+        // L2 hit — no live dispatch, no shadow, arm not re-derived. NULL.
+        shadow_model: None,
+        shadow_cost_usd: None,
+        traffic_split_arm: None,
     }
 }
 
@@ -3038,6 +3309,23 @@ pub(crate) struct RouteMatch {
     /// the outbound request before dispatch (a SAFETY transform, not a saving);
     /// off by default (no redaction runs otherwise).
     pub(crate) redact: bool,
+    /// The matched route's canary `traffic_pct` (0-100), or `None` for an
+    /// unconditional rewrite. When `Some(pct)`, the handler evaluates the sticky
+    /// split (`tt_routing::sticky_traffic_split`) AFTER the rewrite to decide
+    /// whether this request stays on the canary (`target_model`) arm or is
+    /// reverted to its originally-requested model (the control arm).
+    pub(crate) traffic_pct: Option<u32>,
+    /// The matched route's shadow-mode candidate (`RouteAction::shadow_model`),
+    /// or `None`. When `Some(model)`, the handler ALSO dispatches `model` as a
+    /// discarded shadow (non-streaming, single candidate, no failover) and
+    /// records its cost separately. `target_model` (the rewrite) is captured
+    /// alongside so the handler can revert a control-arm request without
+    /// re-reading the route.
+    pub(crate) shadow_model: Option<String>,
+    /// The route's `target_model` (the canary arm's model) — captured so the
+    /// handler can revert `req.model` to the originally-requested model when the
+    /// sticky split assigns this request to the CONTROL arm.
+    pub(crate) target_model: String,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -3142,6 +3430,9 @@ pub(crate) async fn apply_routing(
     let flex = m.then.flex;
     let compress = m.then.compress;
     let redact = m.then.redact;
+    let traffic_pct = m.then.traffic_pct;
+    let shadow_model = m.then.shadow_model.clone();
+    let target_model_for_split = m.then.target_model.clone();
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -3184,6 +3475,9 @@ pub(crate) async fn apply_routing(
         flex,
         compress,
         redact,
+        traffic_pct,
+        shadow_model,
+        target_model: target_model_for_split,
     }))
 }
 

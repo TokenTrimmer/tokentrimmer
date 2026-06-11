@@ -394,6 +394,8 @@ async fn replay_with_quality_attaches_quality_field() {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
     let mut pricing = HashMap::new();

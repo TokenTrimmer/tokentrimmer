@@ -57,6 +57,8 @@ pub fn suggestions_to_proposed_routes(
                 disable_cache: false,
                 max_cost_usd: None,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         })
         .collect()

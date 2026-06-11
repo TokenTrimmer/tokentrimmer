@@ -209,6 +209,8 @@ async fn route_to_local_dispatches_to_ollama_provider() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

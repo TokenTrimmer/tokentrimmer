@@ -192,6 +192,27 @@ pub struct RouteAction {
     /// from JSON when false (back-compat).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub redact: bool,
+    /// Mirror of `tt_routing::RouteAction::traffic_pct`. A canary split — when
+    /// `Some(pct)`, only a deterministic `pct`% of matched requests take the
+    /// rewrite at runtime (chosen by `tt_routing::sticky_traffic_split`); the
+    /// rest pass through unchanged. The replay engine does not yet model the
+    /// split (a follow-up would re-derive the per-request arm via the same sticky
+    /// hash from the logged idempotency key, so projected savings match the
+    /// fraction that actually routed); the field is present so a
+    /// `tt_routing::RouteAction` carrying `traffic_pct` round-trips losslessly to
+    /// a `tt_plan_core::RouteAction` without dropping the split on read. Omitted
+    /// from JSON when `None` (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_pct: Option<u32>,
+    /// Mirror of `tt_routing::RouteAction::shadow_model`. Shadow mode is a
+    /// runtime-only side-channel (the gateway dispatches the candidate, discards
+    /// its response, and records its cost separately); it never changes the
+    /// served response, so the replay engine does not model it. Present so a
+    /// `tt_routing::RouteAction` carrying `shadow_model` round-trips losslessly to
+    /// a `tt_plan_core::RouteAction` without dropping it on read. Omitted from
+    /// JSON when `None` (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_model: Option<String>,
 }
 
 /// Per-model pricing keyed by `"provider:model"`.
@@ -475,6 +496,8 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -503,6 +526,8 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -524,6 +549,8 @@ mod tests {
             disable_cache: true,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(j.contains("\"disable_cache\":true"));
@@ -557,6 +584,8 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             redact: true,
+            traffic_pct: None,
+            shadow_model: None,
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(
@@ -583,6 +612,38 @@ mod tests {
         );
         let reemitted = serde_json::to_string(&plan_action).unwrap();
         assert_eq!(reemitted, gateway_json);
+    }
+
+    /// Cross-crate wire-compat for the canary fields (`traffic_pct` +
+    /// `shadow_model`): gateway-written JSON carrying both deserializes into the
+    /// plan-core type with the values set and re-emits the same wire form (same
+    /// field order + skip_serializing_if gating). Mirrors the gateway-side
+    /// `route_action_canary_cross_type_wire_compat` so the two `RouteAction`
+    /// shapes stay in lockstep on the canary fields.
+    #[test]
+    fn route_action_canary_cross_type_wire_compat() {
+        let gateway_json =
+            r#"{"target_model":"gpt-4o","traffic_pct":30,"shadow_model":"claude-haiku-4-5"}"#;
+        let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
+        assert_eq!(plan_action.target_model, "gpt-4o");
+        assert_eq!(plan_action.traffic_pct, Some(30));
+        assert_eq!(
+            plan_action.shadow_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        let reemitted = serde_json::to_string(&plan_action).unwrap();
+        assert_eq!(reemitted, gateway_json);
+    }
+
+    /// Canary fields default to `None` and are omitted from JSON when `None`.
+    #[test]
+    fn route_action_canary_fields_default_none_and_omit() {
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert_eq!(parsed.traffic_pct, None);
+        assert_eq!(parsed.shadow_model, None);
+        let j = serde_json::to_string(&parsed).unwrap();
+        assert!(!j.contains("traffic_pct"), "{j}");
+        assert!(!j.contains("shadow_model"), "{j}");
     }
 
     /// Cross-crate lockstep guard for `RouteConditions`, the companion to

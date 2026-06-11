@@ -176,6 +176,8 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );
@@ -243,6 +245,8 @@ async fn reroute_then_block_on_ceiling() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

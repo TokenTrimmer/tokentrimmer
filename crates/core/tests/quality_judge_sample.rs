@@ -238,6 +238,8 @@ async fn build_harness(
                     flex: false,
                     compress: false,
                     redact: false,
+                    traffic_pct: None,
+                    shadow_model: None,
                 },
             }],
         );

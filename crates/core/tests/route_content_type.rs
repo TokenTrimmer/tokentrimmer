@@ -214,6 +214,8 @@ async fn setup(target_model: &str) -> (Arc<Mutex<Vec<String>>>, String, axum::Ro
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

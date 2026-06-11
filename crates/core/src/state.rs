@@ -156,7 +156,18 @@ pub struct AppState {
     /// cold start) when evaluating routes. Always present (in-process,
     /// per-instance); see [`tt_routing::LatencyTracker`].
     pub latency_tracker: Arc<tt_routing::LatencyTracker>,
+    /// Upstream deadline for a canary **shadow** dispatch (`RouteAction::shadow_model`).
+    /// SEPARATE from the request's own timeout and intentionally short (default
+    /// 2s) — the shadow result is discarded, so it must never delay the primary
+    /// response. The shadow runs concurrently with the primary; this caps how
+    /// long the request handler will wait on the shadow before giving up and
+    /// recording a shadow error (the primary response is already returned).
+    pub shadow_timeout: std::time::Duration,
 }
+
+/// Default deadline for a discarded shadow dispatch (2s). Short by design: the
+/// shadow's only purpose is cost/quality measurement, never the served response.
+pub const DEFAULT_SHADOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl AppState {
     /// Construct from a caller-supplied registry. Tests and embedded uses.
@@ -183,6 +194,7 @@ impl AppState {
             judge_sink: None,
             judge_band_store: None,
             latency_tracker: Arc::new(tt_routing::LatencyTracker::new()),
+            shadow_timeout: DEFAULT_SHADOW_TIMEOUT,
         }
     }
 

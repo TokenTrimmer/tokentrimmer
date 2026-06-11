@@ -300,6 +300,8 @@ mod tests {
                 disable_cache: false,
                 max_cost_usd: None,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }]
     }
