@@ -520,12 +520,16 @@ impl TrackedEventStream {
         );
         // `saved_usd` is strictly TT-attributed; the provider's automatic
         // cache discount rides in its own field (mirrors the response-header
-        // split on the non-streaming path).
+        // split on the non-streaming path). `cache_bust_usd` is the explicit
+        // negative-savings entry already subtracted from `saved_usd` pre-clamp
+        // — surfaced so streaming clients see the bust MAGNITUDE, not just the
+        // reduced headline (parity with `x-tokentrimmer-cache-bust-usd`).
         let json = serde_json::json!({
             "cost_usd": breakdown.cost_usd,
             "baseline_cost_usd": breakdown.baseline_cost_usd,
             "saved_usd": breakdown.tt_saved_usd(),
             "provider_cache_saved_usd": breakdown.provider_cache_saved_usd,
+            "cache_bust_usd": breakdown.cache_bust_penalty_usd,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_tokens": usage.cached_tokens,
@@ -782,6 +786,9 @@ pub fn stream_response(
                     cost_usd,
                     baseline_cost_usd,
                     provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+                    // Fee-applied, matching the usage-event/span figure — keeps
+                    // the row-derived TT headline equal to `tt_saved_usd()`.
+                    cache_bust_penalty_usd: breakdown.cache_bust_penalty_usd,
                     cached: false,
                     cache_layer: None,
                     route_id,

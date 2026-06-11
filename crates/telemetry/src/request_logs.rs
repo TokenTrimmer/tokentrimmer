@@ -38,10 +38,21 @@ pub struct RequestLogRow {
     /// Provider-side automatic prompt-cache discount (USD) — savings the
     /// provider grants with or without TokenTrimmer. Kept separate so the
     /// TT-attributed saving (`baseline_cost_usd - cost_usd -
-    /// provider_cache_saved_usd`) survives invoice reconciliation. `0.0` for
-    /// TT cache hits (no provider call) and rows from before migration 0011.
+    /// provider_cache_saved_usd - cache_bust_penalty_usd`) survives invoice
+    /// reconciliation. `0.0` for TT cache hits (no provider call) and rows
+    /// from before migration 0011.
     #[serde(default)]
     pub provider_cache_saved_usd: f64,
+    /// Estimated USD penalty of a deliberate, non-deterministic stable-prefix
+    /// mutation (a booked `CacheBustEstimate`) — the NEGATIVE savings entry.
+    /// Persisted so the row-derived TT headline (see `provider_cache_saved_usd`
+    /// formula above) matches the `x-tokentrimmer-saved-usd` header / span on
+    /// every request. An estimate of induced future cost: NEVER folded into
+    /// `cost_usd` / `baseline_cost_usd`. `0.0` when no bust booked (all
+    /// current traffic — redaction is ingress-deterministic and busts
+    /// nothing), for TT cache hits, and for rows before migration 0016.
+    #[serde(default)]
+    pub cache_bust_penalty_usd: f64,
     /// `true` when ANY cache layer served the response (L1 or L2).
     pub cached: bool,
     /// `Some("l1")` / `Some("l2")` / `None`. Matches the SQL CHECK constraint.
@@ -182,6 +193,7 @@ pub mod postgres {
                      (id, org_id, api_key_id, ts, provider, model,
                       input_tokens, output_tokens, cached_tokens,
                       cost_usd, baseline_cost_usd, provider_cache_saved_usd,
+                      cache_bust_penalty_usd,
                       cached, cache_layer,
                       route_id, latency_ms, upstream_latency_ms, status,
                       tag, error_class, trace_id,
@@ -192,16 +204,17 @@ pub mod postgres {
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
                       $10, $11, $12,
-                      $13, $14,
-                      $15, $16, $17, $18,
-                      $19, $20, $21,
-                      $22,
-                      $23, $24, $25,
-                      $26, $27)"#;
+                      $13,
+                      $14, $15,
+                      $16, $17, $18, $19,
+                      $20, $21, $22,
+                      $23,
+                      $24, $25, $26,
+                      $27, $28)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 27;
+    pub const INSERT_BIND_COUNT: usize = 28;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -219,21 +232,22 @@ pub mod postgres {
                 .bind(row.cost_usd) // $10
                 .bind(row.baseline_cost_usd) // $11
                 .bind(row.provider_cache_saved_usd) // $12
-                .bind(row.cached) // $13
-                .bind(row.cache_layer.as_deref()) // $14
-                .bind(row.route_id) // $15
-                .bind(row.latency_ms) // $16
-                .bind(row.upstream_latency_ms) // $17
-                .bind(row.status) // $18
-                .bind(row.tag.as_deref()) // $19
-                .bind(row.error_class.as_deref()) // $20
-                .bind(row.trace_id.as_deref()) // $21
-                .bind(row.truncated) // $22
-                .bind(row.shadow_model.as_deref()) // $23
-                .bind(row.shadow_cost_usd) // $24
-                .bind(row.traffic_split_arm.as_deref()) // $25
-                .bind(row.cache_read_input_tokens) // $26
-                .bind(row.cache_creation_input_tokens) // $27
+                .bind(row.cache_bust_penalty_usd) // $13
+                .bind(row.cached) // $14
+                .bind(row.cache_layer.as_deref()) // $15
+                .bind(row.route_id) // $16
+                .bind(row.latency_ms) // $17
+                .bind(row.upstream_latency_ms) // $18
+                .bind(row.status) // $19
+                .bind(row.tag.as_deref()) // $20
+                .bind(row.error_class.as_deref()) // $21
+                .bind(row.trace_id.as_deref()) // $22
+                .bind(row.truncated) // $23
+                .bind(row.shadow_model.as_deref()) // $24
+                .bind(row.shadow_cost_usd) // $25
+                .bind(row.traffic_split_arm.as_deref()) // $26
+                .bind(row.cache_read_input_tokens) // $27
+                .bind(row.cache_creation_input_tokens) // $28
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -260,6 +274,7 @@ mod tests {
             cost_usd: 0.0045,
             baseline_cost_usd: 0.0045,
             provider_cache_saved_usd: 0.0,
+            cache_bust_penalty_usd: 0.0,
             cached: false,
             cache_layer: None,
             route_id: None,
@@ -405,10 +420,27 @@ mod tests {
         assert_eq!(row.shadow_model, None);
         assert_eq!(row.shadow_cost_usd, None);
         assert_eq!(row.traffic_split_arm, None);
+        // Pre-0016 rows default the bust penalty to 0 (no bust booked).
+        assert_eq!(row.cache_bust_penalty_usd, 0.0);
         let j = serde_json::to_string(&row).unwrap();
         assert!(!j.contains("shadow_model"), "{j}");
         assert!(!j.contains("shadow_cost_usd"), "{j}");
         assert!(!j.contains("traffic_split_arm"), "{j}");
+    }
+
+    /// The cache-bust penalty column (migration 0016) round-trips through the
+    /// writer in its OWN field — never folded into `cost_usd` (it is an
+    /// estimate of induced future cost, not a realized invoice figure).
+    #[tokio::test]
+    async fn in_memory_round_trips_cache_bust_penalty() {
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.01;
+        row.cache_bust_penalty_usd = 0.0025;
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert!((got.cache_bust_penalty_usd - 0.0025).abs() < 1e-12);
+        assert!((got.cost_usd - 0.01).abs() < 1e-12, "cost untouched");
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the
