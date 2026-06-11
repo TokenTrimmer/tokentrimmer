@@ -1991,7 +1991,25 @@ pub async fn handler(
                 shadow_model: shadow_model_logged.clone(),
                 shadow_cost_usd: shadow_cost_logged,
                 traffic_split_arm: traffic_split_arm_owned.clone(),
+                // Raw provider prompt-cache counts (research Phase 0.2):
+                // None (NULL) when the provider didn't report the field,
+                // Some(0) when it explicitly reported zero. The shadow
+                // dispatch is discarded — only the SERVED response's cache
+                // telemetry is recorded (shadow cost has its own columns).
+                cache_read_input_tokens: opt_tokens_i32(response.usage.cache_read_input_tokens),
+                cache_creation_input_tokens: opt_tokens_i32(
+                    response.usage.cache_creation_input_tokens,
+                ),
             },
+        );
+
+        // Per-route provider-cache counters from the same authoritative usage
+        // the row records.
+        crate::metrics::record_provider_cache_usage(
+            &provider_id,
+            route_matched_name.as_deref(),
+            response.usage.cache_read_input_tokens,
+            response.usage.cache_creation_input_tokens,
         );
 
         // 3h. Sampled async quality judge on rerouted-DOWN traffic. Spawns a
@@ -3545,6 +3563,13 @@ fn request_log_for_l1_hit(
         shadow_model: None,
         shadow_cost_usd: None,
         traffic_split_arm: None,
+        // TT cache hit — no provider call at serve time; the original miss row
+        // carries the provider-cache telemetry. NULL (not the entry's stored
+        // counts) so per-route aggregates never double-count provider cache
+        // reads. (`cached_tokens` above deliberately keeps its legacy
+        // echo-the-miss behavior for back-compat.)
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
     }
 }
 
@@ -3586,11 +3611,23 @@ fn request_log_for_l2_hit(
         shadow_model: None,
         shadow_cost_usd: None,
         traffic_split_arm: None,
+        // TT cache hit — no provider call at serve time; the original miss row
+        // carries the provider-cache telemetry. NULL so per-route aggregates
+        // never double-count provider cache reads.
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
     }
 }
 
 fn clamp_latency_ms(started: Instant) -> i32 {
     started.elapsed().as_millis().min(i32::MAX as u128) as i32
+}
+
+/// Clamp an optional raw provider token count into the `request_logs` INT
+/// columns, preserving the Option-ness (`None` -> SQL NULL = "provider did
+/// not report"; `Some(0)` = "provider explicitly reported zero").
+pub(crate) fn opt_tokens_i32(v: Option<u64>) -> Option<i32> {
+    v.map(|t| t.min(i32::MAX as u64) as i32)
 }
 
 /// Outcome of evaluating the routing engine against a request: the matched

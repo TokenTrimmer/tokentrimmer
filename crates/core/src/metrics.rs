@@ -68,3 +68,55 @@ pub fn record_provider_timeout(provider: &'static str, operation: &'static str) 
     )
     .increment(1);
 }
+
+/// Record provider prompt-cache usage counters once authoritative provider
+/// usage lands (research Phase 0.2). `route` is the matched route NAME
+/// (bounded cardinality), `"none"` when no route matched.
+///
+/// Emits:
+/// - `provider_cache_read_tokens_total{provider,route}` += read when reported,
+/// - `provider_cache_write_tokens_total{provider,route}` += write when reported,
+/// - `provider_cache_requests_total{provider,route,result}` += 1, where
+///   `result` is `"hit"` (reported read > 0), `"miss"` (reported read == 0, or
+///   read absent but a write was reported — the provider clearly supports
+///   caching and read nothing), or `"unreported"` (neither field reported).
+///
+/// Owned-String labels follow the `catalog_zero_price_total` precedent.
+pub fn record_provider_cache_usage(
+    provider: &str,
+    route: Option<&str>,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+) {
+    let provider = provider.to_string();
+    let route = route.unwrap_or("none").to_string();
+    if let Some(read) = cache_read {
+        metrics::counter!(
+            "provider_cache_read_tokens_total",
+            "provider" => provider.clone(),
+            "route" => route.clone(),
+        )
+        .increment(read);
+    }
+    if let Some(write) = cache_creation {
+        metrics::counter!(
+            "provider_cache_write_tokens_total",
+            "provider" => provider.clone(),
+            "route" => route.clone(),
+        )
+        .increment(write);
+    }
+    let result = match (cache_read, cache_creation) {
+        (Some(r), _) if r > 0 => "hit",
+        (Some(_), _) => "miss",
+        (None, Some(_)) => "miss",
+        (None, None) => "unreported",
+    };
+    metrics::counter!(
+        "provider_cache_requests_total",
+        "provider" => provider,
+        "route" => route,
+        "result" => result,
+    )
+    .increment(1);
+}

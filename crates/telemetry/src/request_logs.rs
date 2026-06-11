@@ -80,6 +80,18 @@ pub struct RequestLogRow {
     /// two arms' cost/quality without re-deriving the sticky hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_split_arm: Option<String>,
+    /// Raw provider-reported cache-read input tokens. `None` (-> SQL NULL) when
+    /// the provider did not report the field OR no provider call was made (TT
+    /// L1/L2 hits, truncated streams with no terminal usage). `Some(0)` means
+    /// the provider explicitly reported zero. Rows from before migration 0014
+    /// are NULL. The NOT NULL `cached_tokens` above keeps its folded
+    /// (absent => 0) semantics for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<i32>,
+    /// Raw provider-reported cache-write (creation) input tokens. Same NULL
+    /// semantics; Anthropic-only in practice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i32>,
 }
 
 /// Errors returned by [`RequestLogWriter`].
@@ -168,7 +180,8 @@ pub mod postgres {
                       route_id, latency_ms, upstream_latency_ms, status,
                       tag, error_class, trace_id,
                       truncated,
-                      shadow_model, shadow_cost_usd, traffic_split_arm)
+                      shadow_model, shadow_cost_usd, traffic_split_arm,
+                      cache_read_input_tokens, cache_creation_input_tokens)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -177,11 +190,12 @@ pub mod postgres {
                       $15, $16, $17, $18,
                       $19, $20, $21,
                       $22,
-                      $23, $24, $25)"#;
+                      $23, $24, $25,
+                      $26, $27)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 25;
+    pub const INSERT_BIND_COUNT: usize = 27;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -212,6 +226,8 @@ pub mod postgres {
                 .bind(row.shadow_model.as_deref()) // $23
                 .bind(row.shadow_cost_usd) // $24
                 .bind(row.traffic_split_arm.as_deref()) // $25
+                .bind(row.cache_read_input_tokens) // $26
+                .bind(row.cache_creation_input_tokens) // $27
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -251,6 +267,8 @@ mod tests {
             shadow_model: None,
             shadow_cost_usd: None,
             traffic_split_arm: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         }
     }
 
@@ -308,6 +326,55 @@ mod tests {
         assert_eq!(got.traffic_split_arm.as_deref(), Some("canary"));
         // The shadow cost is SEPARATE — the primary cost is untouched.
         assert!((got.cost_usd - 0.01).abs() < 1e-9);
+    }
+
+    /// A row carrying the provider prompt-cache token columns round-trips, and
+    /// `Some(0)` ("provider explicitly reported zero") stays distinct from
+    /// `None` ("provider did not report" / "no provider call").
+    #[tokio::test]
+    async fn in_memory_round_trips_provider_cache_token_columns() {
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cache_read_input_tokens = Some(80);
+        row.cache_creation_input_tokens = Some(20);
+        w.write(row).await.unwrap();
+
+        let mut zero = sample_row();
+        zero.cache_read_input_tokens = Some(0);
+        zero.cache_creation_input_tokens = None;
+        w.write(zero).await.unwrap();
+
+        let rows = w.rows();
+        assert_eq!(rows[0].cache_read_input_tokens, Some(80));
+        assert_eq!(rows[0].cache_creation_input_tokens, Some(20));
+        // NULL-vs-0: a reported zero survives as Some(0), not None.
+        assert_eq!(rows[1].cache_read_input_tokens, Some(0));
+        assert_eq!(rows[1].cache_creation_input_tokens, None);
+    }
+
+    /// Legacy JSON (rows serialized before migration 0014) deserializes with
+    /// both provider cache token fields defaulting to `None`, and `None`
+    /// fields are omitted on re-serialize.
+    #[test]
+    fn provider_cache_token_columns_serde_backward_compat() {
+        let legacy = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "org_id":"00000000-0000-0000-0000-000000000000",
+            "api_key_id":"00000000-0000-0000-0000-000000000000",
+            "ts":"2026-06-09T00:00:00Z",
+            "provider":"openai","model":"gpt-4o",
+            "input_tokens":1,"output_tokens":1,"cached_tokens":0,
+            "cost_usd":0.0,"baseline_cost_usd":0.0,
+            "cached":false,"cache_layer":null,"route_id":null,
+            "latency_ms":1,"upstream_latency_ms":null,"status":200,
+            "tag":null,"error_class":null,"trace_id":null
+        }"#;
+        let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
+        assert_eq!(row.cache_read_input_tokens, None);
+        assert_eq!(row.cache_creation_input_tokens, None);
+        let j = serde_json::to_string(&row).unwrap();
+        assert!(!j.contains("cache_read_input_tokens"), "{j}");
+        assert!(!j.contains("cache_creation_input_tokens"), "{j}");
     }
 
     /// Legacy JSON (rows serialized before the canary columns existed)
