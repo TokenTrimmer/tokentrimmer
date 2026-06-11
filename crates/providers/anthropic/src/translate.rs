@@ -403,27 +403,15 @@ const FALLBACK_CACHE_MIN_TOKENS: u32 = 4096;
 
 /// The Anthropic prompt-cache minimum prefix length, in tokens, for `model`.
 ///
-/// Reads `prompt_cache_min_tokens` from the pricing catalog for
-/// `("anthropic", model)`. Anthropic model ids sent to the wire may carry a
-/// date suffix (e.g. `claude-sonnet-4-6-20260101`) while the catalog keys on the
-/// bare id, so we fall back to a longest-prefix match before giving up. When the
-/// model is unknown or has no documented minimum, returns
+/// Delegates to the shared
+/// [`tt_shared::pricing::PricingCatalog::prompt_cache_min_tokens`] lookup
+/// (exact `("anthropic", model)` match, then longest-prefix match for dated
+/// wire ids like `claude-sonnet-4-6-20260101`) so this gate and the request-pass
+/// stable-prefix split in `tt-core::passes` can never disagree. When the model
+/// is unknown or has no documented minimum, returns
 /// [`FALLBACK_CACHE_MIN_TOKENS`] and logs at debug so the skip is observable.
 fn cache_min_tokens_for_model(model: &str) -> u32 {
-    let catalog = tt_shared::pricing::catalog();
-
-    // Exact match first; then longest catalog id that is a prefix of `model`
-    // (handles dated aliases like `claude-sonnet-4-6-20260101`).
-    let lookup = catalog.latest("anthropic", model).or_else(|| {
-        catalog
-            .pairs()
-            .into_iter()
-            .filter(|(provider, id)| provider == "anthropic" && model.starts_with(id.as_str()))
-            .max_by_key(|(_, id)| id.len())
-            .and_then(|(_, id)| catalog.latest("anthropic", &id))
-    });
-
-    match lookup.and_then(|p| p.prompt_cache_min_tokens) {
+    match tt_shared::pricing::catalog().prompt_cache_min_tokens("anthropic", model) {
         Some(min) => min,
         None => {
             tracing::debug!(
