@@ -42,6 +42,8 @@ impl Default for Registry {
     }
 }
 
+pub mod add_route;
+pub mod apply_plan;
 pub mod batch_savings;
 pub mod cost_control;
 pub mod find_route_for;
