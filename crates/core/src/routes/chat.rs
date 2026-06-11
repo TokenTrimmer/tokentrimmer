@@ -3065,34 +3065,29 @@ async fn dispatch_shadow(
     };
 
     // SINGLE candidate, NO failover, NO retry storm — one shot under the short
-    // shadow deadline.
-    let dispatched = with_request_timeout(Some(state.shadow_timeout), async {
-        shadow_provider
-            .chat_completion(shadow_req, &shadow_ctx)
-            .await
-            .map_err(ApiError::from)
-    })
-    .await;
-
-    match dispatched {
-        Ok(resp) => {
-            // Cost the shadow on its OWN pricing — never the primary's. No flex,
-            // no compression delta: the shadow is a plain measurement dispatch.
-            let pricing = shadow_provider.pricing(&resp.model);
-            let breakdown = compute_cost(
-                &resp.usage,
-                pricing.as_ref(),
-                pricing.as_ref(),
-                shadow_provider.fee_multiplier(),
-            );
-            outcome.cost_usd = breakdown.cost_usd;
+    // shadow deadline. The dispatch + costing core lives in the shared
+    // `measurement::measured_single_dispatch` helper (also used by the quality
+    // judge's baseline reference dispatch); the cost is computed on the shadow's
+    // OWN pricing — never the primary's. No flex, no compression delta: the
+    // shadow is a plain measurement dispatch.
+    match crate::measurement::measured_single_dispatch(
+        &shadow_provider,
+        shadow_req,
+        &shadow_ctx,
+        state.shadow_timeout,
+    )
+    .await
+    {
+        Ok(measured) => {
+            outcome.cost_usd = measured.cost_usd;
             outcome.succeeded = true;
             tracing::debug!(
                 shadow_model = %shadow_model,
                 shadow_cost_usd = outcome.cost_usd,
                 "shadow dispatch completed (response discarded)"
             );
-            // resp is intentionally dropped here — the shadow output is discarded.
+            // measured.response is intentionally dropped here — the shadow
+            // output is discarded.
         }
         Err(e) => {
             tracing::debug!(
