@@ -296,6 +296,11 @@ enum RetrievalAction {
     },
 }
 
+// The `Add` variant carries every `route add` flag inline (clap can't box an
+// inline struct variant's fields). This enum is parsed once at startup and never
+// stored in a hot collection, so its size is immaterial — suppress the lint here
+// rather than restructure the clap surface.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum RouteAction {
     /// List your routes.
@@ -328,6 +333,12 @@ enum RouteAction {
         /// Match only requests whose estimated cost (USD) is below this.
         #[arg(long)]
         when_cost_lt: Option<f64>,
+        /// Match only when the gateway's live observed p95 upstream latency for
+        /// the requested model exceeds this many milliseconds. Backed by the
+        /// gateway's own rolling window — does NOT fire until enough recent
+        /// samples exist (cold start), so a fresh/unknown primary is never gated.
+        #[arg(long)]
+        when_p95_gt: Option<u32>,
         /// Reject (402) any matched request whose estimated cost exceeds this (USD).
         #[arg(long)]
         max_cost: Option<f64>,
@@ -788,13 +799,14 @@ async fn main() -> anyhow::Result<()> {
                     when_prompt_contains,
                     when_cost_gt,
                     when_cost_lt,
+                    when_p95_gt,
                     max_cost,
                     disable_cache,
                     priority,
                     name,
                     fallback,
                     disabled,
-                } => RouteCmd::Add(AddArgs {
+                } => RouteCmd::Add(Box::new(AddArgs {
                     always,
                     from,
                     to,
@@ -804,13 +816,14 @@ async fn main() -> anyhow::Result<()> {
                     when_prompt_contains,
                     when_cost_gt,
                     when_cost_lt,
+                    when_p95_gt,
                     max_cost,
                     disable_cache,
                     priority,
                     name,
                     fallback,
                     disabled,
-                }),
+                })),
             };
             if let Err(e) = tt_cli::route::run(cmd, tt_api_key, tt_api_base).await {
                 tt_cli::ui::error(&format!("{e:#}"));

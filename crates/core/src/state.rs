@@ -149,6 +149,13 @@ pub struct AppState {
     /// recording `judge_sink` and this read-side, so a recorded outcome flows
     /// end-to-end into a populated band. Record-only: enrichment is advisory.
     pub judge_band_store: Option<Arc<crate::quality_sample::InMemoryJudgeBandStore>>,
+    /// Gateway-side rolling latency window — the REAL signal behind the
+    /// `upstream_latency_ms_p95_gt` route condition. Every live upstream dispatch
+    /// records its observed latency here keyed by `(provider, model)`; the chat
+    /// handler queries its live p95 (which is `None` until enough samples exist —
+    /// cold start) when evaluating routes. Always present (in-process,
+    /// per-instance); see [`tt_routing::LatencyTracker`].
+    pub latency_tracker: Arc<tt_routing::LatencyTracker>,
 }
 
 impl AppState {
@@ -175,6 +182,7 @@ impl AppState {
             judge_config: crate::quality_sample::JudgeConfig::from_env(),
             judge_sink: None,
             judge_band_store: None,
+            latency_tracker: Arc::new(tt_routing::LatencyTracker::new()),
         }
     }
 

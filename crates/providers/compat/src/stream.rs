@@ -72,6 +72,32 @@ pub async fn stream_chat_completion(
 ) -> Result<ChunkStream, ProviderError> {
     let url = format!("{base_url}/chat/completions");
     let api_key = ctx.credentials.api_key.expose().to_string();
+    stream_chat_completion_at(
+        client,
+        &url,
+        ("Authorization", format!("Bearer {api_key}")),
+        req,
+        ctx,
+    )
+    .await
+}
+
+/// Streaming chat completion against a fully-formed `url` with a caller-supplied
+/// auth header.
+///
+/// This is the endpoint-agnostic core of [`stream_chat_completion`]. The OpenAI
+/// path passes `{base_url}/chat/completions` + `("Authorization", "Bearer …")`;
+/// the Azure adapter passes its deployment URL (with the `api-version` query
+/// param baked in) + `("api-key", …)`. Translation, the `stream:true` /
+/// `include_usage` override, extra-header forwarding, error mapping, and the SSE
+/// parser are all shared.
+pub async fn stream_chat_completion_at(
+    client: Client,
+    url: &str,
+    auth_header: (&str, String),
+    req: ChatCompletionRequest,
+    ctx: &RequestContext,
+) -> Result<ChunkStream, ProviderError> {
     let extra_headers: Vec<(String, String)> = filter_extra_headers(&ctx.credentials.extra_headers);
 
     // Translate to the OpenAI wire shape, then override the stream flag and
@@ -85,8 +111,8 @@ pub async fn stream_chat_completion(
         .map_err(|e| ProviderError::Internal(format!("failed to serialize stream body: {e}")))?;
 
     let mut request_builder = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
+        .post(url)
+        .header(auth_header.0, auth_header.1)
         .header("Content-Type", "application/json")
         .body(body_bytes);
 

@@ -1179,11 +1179,16 @@ pub async fn handler(
                     provider.chat_completion_stream(req.clone(), &ctx)
                 })
                 .await;
-                crate::metrics::record_provider_latency(
-                    provider.id(),
-                    "chat_stream",
-                    __started.elapsed(),
-                );
+                let __elapsed = __started.elapsed();
+                crate::metrics::record_provider_latency(provider.id(), "chat_stream", __elapsed);
+                // Feed the rolling p95 window on successful stream establishment
+                // (time-to-first-byte). See the non-streaming hook above.
+                if __stream_result.is_ok() {
+                    let __ms = u32::try_from(__elapsed.as_millis()).unwrap_or(u32::MAX);
+                    state
+                        .latency_tracker
+                        .record(provider.id(), &req.model, __ms);
+                }
                 let stream = __stream_result?;
                 Ok((provider, req.model.clone(), stream))
             } else {
@@ -1507,7 +1512,18 @@ pub async fn handler(
                     provider.chat_completion(req.clone(), &ctx)
                 })
                 .await;
-                crate::metrics::record_provider_latency(provider.id(), "chat", __started.elapsed());
+                let __elapsed = __started.elapsed();
+                crate::metrics::record_provider_latency(provider.id(), "chat", __elapsed);
+                // Feed the rolling p95 window (the live signal behind the
+                // `upstream_latency_ms_p95_gt` route condition) on success only —
+                // errored/short-circuited dispatches aren't representative
+                // upstream latency. Keyed by the served `(provider, model)`.
+                if __dispatch.is_ok() {
+                    let __ms = u32::try_from(__elapsed.as_millis()).unwrap_or(u32::MAX);
+                    state
+                        .latency_tracker
+                        .record(provider.id(), &req.model, __ms);
+                }
                 __dispatch
                     .map(|resp| (provider, resp))
                     .map_err(ApiError::from)
@@ -3091,12 +3107,29 @@ pub(crate) async fn apply_routing(
         .and_then(|p| p.pricing(&req.model))
         .map(|pr| estimate_cost_usd(&pr, input_tokens, req.max_tokens));
 
+    // Live, gateway-observed p95 upstream latency for the originally-requested
+    // `(provider, model)`, feeding the `upstream_latency_ms_p95_gt` condition.
+    // `None` until the in-process rolling window has enough samples for this key
+    // (cold start) — which makes the latency condition FALSE, never a fabricated
+    // match. Computed once here (all routes evaluate the same requested model).
+    let observed_p95_ms = if provider_id.is_empty() {
+        None
+    } else {
+        state.latency_tracker.p95(provider_id, &req.model)
+    };
+
     // `m` is `&Route` (inferred from the engine accessors below) regardless of arm.
     let m = match forced_route {
         Some(name) => engine
             .find_by_name(name)
             .ok_or_else(|| ApiError::InvalidRequest(format!("unknown route: {name}")))?,
-        None => match engine.evaluate_with_cost(req, ctx, input_tokens, estimated_cost_usd) {
+        None => match engine.evaluate_with_signals(
+            req,
+            ctx,
+            input_tokens,
+            estimated_cost_usd,
+            observed_p95_ms,
+        ) {
             Some(r) => r,
             None => return Ok(None),
         },

@@ -143,6 +143,15 @@ pub struct RouteConditions {
     /// Mirror of `tt_routing::RouteConditions::estimated_cost_lt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_lt: Option<f64>,
+    /// Mirror of `tt_routing::RouteConditions::upstream_latency_ms_p95_gt`.
+    /// Carried for lossless wire round-trip only — NOT projectable in replay:
+    /// the gateway's live in-process p95 window does not exist for historical
+    /// `RequestLog` rows. Like the modality mirrors, a route carrying this
+    /// condition is treated as a conservative non-match in
+    /// `routing::matches_conditions`, so Plan never over-projects savings on a
+    /// latency route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_latency_ms_p95_gt: Option<u32>,
 }
 
 /// What a matching [`ProposedRoute`] does.
@@ -599,6 +608,7 @@ mod tests {
             prompt_contains_any_of: vec!["summarize".to_string()],
             estimated_cost_gt: Some(0.01),
             estimated_cost_lt: Some(5.0),
+            upstream_latency_ms_p95_gt: Some(1500),
         };
         let gateway_json = serde_json::to_string(&gateway).unwrap();
 
@@ -617,6 +627,7 @@ mod tests {
         );
         assert_eq!(plan_conditions.estimated_cost_gt, Some(0.01));
         assert_eq!(plan_conditions.estimated_cost_lt, Some(5.0));
+        assert_eq!(plan_conditions.upstream_latency_ms_p95_gt, Some(1500));
 
         // Re-serialize the plan-core value: must reproduce the gateway JSON
         // byte-for-byte (same field order + same skip_serializing_if gating).

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tt_provider_anthropic::{AnthropicProvider, ClientConfig as AnthropicClientConfig};
+use tt_provider_azure::AzureProvider;
 use tt_provider_gemini::{ClientConfig as GeminiClientConfig, GeminiProvider};
 use tt_provider_groq::GroqProvider;
 use tt_provider_local::{LocalBackend, LocalProvider};
@@ -136,6 +137,7 @@ pub struct ProvidersConfig {
     pub groq: bool,
     pub together: bool,
     pub openrouter: bool,
+    pub azure: bool,
 }
 
 impl ProvidersConfig {
@@ -149,6 +151,7 @@ impl ProvidersConfig {
             groq: true,
             together: true,
             openrouter: true,
+            azure: true,
         }
     }
 
@@ -162,6 +165,7 @@ impl ProvidersConfig {
             groq: false,
             together: false,
             openrouter: false,
+            azure: false,
         }
     }
 
@@ -188,6 +192,7 @@ impl ProvidersConfig {
                 "groq" => cfg.groq = true,
                 "together" => cfg.together = true,
                 "openrouter" => cfg.openrouter = true,
+                "azure" => cfg.azure = true,
                 _ => {} // ignore unknown / empty entries
             }
         }
@@ -227,6 +232,15 @@ pub fn register_providers(registry: &mut ProviderRegistry, cfg: &ProvidersConfig
     }
     if cfg.gemini {
         registry.register(Arc::new(GeminiProvider::new(GeminiClientConfig::default())));
+    }
+    if cfg.azure {
+        // Azure OpenAI is wire-compatible but deployment-scoped: every request
+        // resolves its endpoint from the caller's per-org `base_url` credential
+        // (the resource) + the requested deployment. The adapter advertises no
+        // static models (deployment names are customer-chosen), so it dispatches
+        // only via the `azure/<deployment>` routing prefix; registering it here
+        // makes that prefix resolvable.
+        registry.register(Arc::new(AzureProvider::new(OpenAiClientConfig::default())));
     }
 
     // OpenAI-compatible (use OpenAI's ClientConfig)
@@ -404,6 +418,23 @@ mod config_tests {
             .expect("priced via shared dynamic catalogue");
         assert!((p.input_per_million - 2.0).abs() < 1e-6);
         assert!((p.output_per_million - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn azure_provider_registers_and_resolves_prefixed_model() {
+        let mut reg = ProviderRegistry::new();
+        let mut cfg = ProvidersConfig::none();
+        cfg.azure = true;
+        register_providers(&mut reg, &cfg);
+        // Registered under its id.
+        assert!(reg.by_id("azure").is_some());
+        // An `azure/<deployment>` model resolves to the azure adapter via
+        // infer_provider, even though the deployment is named after an OpenAI
+        // model and openai is NOT registered here.
+        let p = reg.resolve("azure/gpt-4o-prod").expect("resolves to azure");
+        assert_eq!(p.id(), "azure");
+        // Best-effort public-rate-card pricing by deployment name.
+        assert!(p.pricing("gpt-4o").is_some());
     }
 
     #[test]

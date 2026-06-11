@@ -21,6 +21,7 @@ tt-auth.workspace = true
 tt-telemetry.workspace = true
 tt-config.workspace = true
 tt-provider-openai.workspace = true
+tt-provider-azure.workspace = true
 tt-provider-anthropic.workspace = true
 tt-provider-gemini.workspace = true
 tt-provider-mistral.workspace = true

@@ -23,9 +23,19 @@
 /// | `claude-*`                                                              | `anthropic`  |
 /// | `gemini-*`                                                              | `gemini`     |
 /// | `mistral-*`, `mixtral-*`, `pixtral-*`, `codestral-*`, `ministral-*`      | `mistral`    |
+/// | `azure/<deployment>`                                                     | `azure`      |
 pub fn infer_provider(model: &str) -> Option<&'static str> {
     if model.is_empty() {
         return None;
+    }
+
+    // Azure OpenAI — explicit `azure/<deployment>` prefix. The deployment name
+    // after the slash is customer-chosen (need not match an OpenAI model id), so
+    // the prefix is the only reliable signal — checked before the OpenAI
+    // gpt-*/o3-* prefixes so `azure/gpt-4o-prod` resolves to `azure`, not
+    // `openai`.
+    if azure_deployment(model).is_some() {
+        return Some("azure");
     }
 
     // OpenAI — gpt-*, chatgpt-*, o3, o3-*, o4-*, o5-*.
@@ -71,6 +81,16 @@ pub fn known_to_differ(a: &str, b: &str) -> bool {
         (Some(x), Some(y)) => x != y,
         _ => false,
     }
+}
+
+/// If `model` is an Azure-prefixed id (`azure/<deployment>`) with a non-empty
+/// deployment name, return the deployment (the part after `azure/`); else None.
+///
+/// Single source of truth for the Azure prefix — used by [`infer_provider`] for
+/// routing and by the Azure adapter to strip the prefix down to the bare
+/// deployment name it targets on the wire.
+pub fn azure_deployment(model: &str) -> Option<&str> {
+    model.strip_prefix("azure/").filter(|rest| !rest.is_empty())
 }
 
 /// If `model` is a local-backend-prefixed id (`ollama/…`, `vllm/…`,
@@ -123,6 +143,28 @@ mod tests {
         assert_eq!(infer_provider("pixtral-12b"), Some("mistral"));
         assert_eq!(infer_provider("codestral-22b"), Some("mistral"));
         assert_eq!(infer_provider("ministral-8b"), Some("mistral"));
+    }
+
+    #[test]
+    fn azure_prefix() {
+        // `azure/<deployment>` resolves to azure, taking precedence over the
+        // OpenAI gpt-*/o3-* prefixes even when the deployment is named after an
+        // OpenAI model.
+        assert_eq!(infer_provider("azure/gpt-4o-prod"), Some("azure"));
+        assert_eq!(infer_provider("azure/gpt-4o"), Some("azure"));
+        assert_eq!(infer_provider("azure/o3"), Some("azure"));
+        assert_eq!(infer_provider("azure/my-custom-deployment"), Some("azure"));
+        // Bare prefix with no deployment name is not Azure.
+        assert_eq!(infer_provider("azure/"), None);
+    }
+
+    #[test]
+    fn azure_deployment_strips_prefix() {
+        assert_eq!(azure_deployment("azure/gpt-4o-prod"), Some("gpt-4o-prod"));
+        assert_eq!(azure_deployment("azure/o3"), Some("o3"));
+        assert_eq!(azure_deployment("azure/"), None);
+        assert_eq!(azure_deployment("gpt-4o"), None);
+        assert_eq!(azure_deployment(""), None);
     }
 
     #[test]
