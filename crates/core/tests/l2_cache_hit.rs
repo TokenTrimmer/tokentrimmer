@@ -292,6 +292,8 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         output_tokens: 50,
         baseline_cost_usd: Some(stored_baseline),
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
     };
@@ -417,6 +419,8 @@ async fn l2_hit_with_null_baseline_uses_current_catalog_not_placeholder() {
         output_tokens: 50,
         baseline_cost_usd: None, // legacy row — predates migration 0010
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
     };
@@ -613,6 +617,8 @@ async fn free_tier_caller_skips_l2_lookup_and_write() {
         output_tokens: 50,
         baseline_cost_usd: None,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
     };

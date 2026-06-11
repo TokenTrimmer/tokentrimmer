@@ -37,7 +37,7 @@ pub use quality::{
 };
 pub use replay::{replay, replay_with_quality};
 pub use types::{
-    Aggregates, CacheProjection, ConfidenceIntervals, L2Projection, L2SweepResult, ModelPricing,
-    PerRouteBreakdown, PlanConfig, PlanInput, PlanResult, PricingTable, ProposedRoute, RequestLog,
-    RouteAction, RouteConditions,
+    Aggregates, CacheProjection, ConfidenceIntervals, L2Projection, L2SweepResult, L2TaskClass,
+    ModelPricing, PerClassL2Metrics, PerRouteBreakdown, PlanConfig, PlanInput, PlanResult,
+    PricingTable, ProposedRoute, RequestLog, RouteAction, RouteConditions,
 };

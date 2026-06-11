@@ -73,6 +73,7 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         let l2 = crate::l2_projection::project_l2_hits(&requests, &input.config);
         aggregates.l2_projections = l2.per_threshold;
         aggregates.l2_poisoning_candidates = l2.poisoning_candidates;
+        aggregates.l2_per_class = l2.per_class;
     }
 
     let confidence_intervals = compute_cis(&projection, input.seed, input.bootstrap_iterations);
@@ -388,10 +389,11 @@ fn aggregate(p: &Projection) -> Aggregates {
         requests_rerouted: p.requests_rerouted,
         requests_unchanged: p.requests_unchanged,
         requests_unprice_able: p.requests_unprice_able,
-        // L2 sweep + poisoning are populated downstream by `replay` when the
-        // window carries embeddings; default to empty/zero here.
+        // L2 sweep + poisoning + per-class are populated downstream by `replay`
+        // when the window carries embeddings; default to empty/zero here.
         l2_projections: Vec::new(),
         l2_poisoning_candidates: 0,
+        l2_per_class: Vec::new(),
     }
 }
 

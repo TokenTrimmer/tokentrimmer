@@ -55,6 +55,7 @@ fn make_req(
         finish_reason: finish_reason.map(String::from),
         body: None,
         response_body: None,
+        task_class: Default::default(),
     }
 }
 

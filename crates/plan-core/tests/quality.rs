@@ -62,6 +62,7 @@ fn req(
         finish_reason: None,
         body: body.map(String::from),
         response_body: response_body.map(String::from),
+        task_class: Default::default(),
     }
 }
 

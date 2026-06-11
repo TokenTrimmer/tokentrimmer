@@ -47,6 +47,8 @@ fn make_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         output_tokens: 5,
         baseline_cost_usd: None,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
     }
@@ -64,6 +66,8 @@ fn make_expired_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         output_tokens: 5,
         baseline_cost_usd: None,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now() - Duration::seconds(7200),
         expires_at: Utc::now() - Duration::seconds(1),
     }
@@ -406,6 +410,8 @@ async fn l2_different_embedding_model_is_not_returned() {
         output_tokens: 1,
         baseline_cost_usd: None,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
     };
@@ -532,6 +538,8 @@ async fn postgres_l2_round_trip() {
         output_tokens: 50,
         baseline_cost_usd: Some(0.000456),
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
     };
@@ -582,6 +590,8 @@ async fn postgres_l2_round_trip() {
         output_tokens: 5,
         baseline_cost_usd: None,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
     };
@@ -659,6 +669,8 @@ async fn postgres_l2_org_isolation_org_b_miss() {
         output_tokens: 5,
         baseline_cost_usd: None,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
     };

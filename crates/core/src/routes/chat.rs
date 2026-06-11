@@ -596,6 +596,16 @@ async fn try_l1_hit(
     }
 }
 
+/// The L2 [`tt_cache::TaskClass`] for a `POST /v1/chat/completions` request.
+///
+/// This is the single, extensible derivation point for the request's task class
+/// (V1 has exactly one class: `ChatCompletions`). A future endpoint
+/// (embeddings re-rank, messages-ingress, …) gets its own derivation and the
+/// per-class threshold map (`L2Config::class_thresholds`) keys off the result.
+fn l2_task_class_for_chat() -> Option<tt_cache::TaskClass> {
+    Some(tt_cache::TaskClass::ChatCompletions)
+}
+
 /// L2 semantic-cache lookup (step 3b). `None` falls through to dispatch.
 /// `Some(Err(_))` preserves the original `build_hit_l2_response(...)?` error
 /// propagation (a hit whose body fails to deserialize). Best-effort on the
@@ -621,12 +631,18 @@ async fn try_l2_hit(
         Ok(v) => v,
         Err(_) => return None,
     };
+    // Derive the L2 task class for this request. `/chat/completions` is the only
+    // v1 class; the helper is the single, extensible derivation point. The
+    // per-class threshold is floored at `l2.threshold` inside `lookup_classed`,
+    // so a classed lookup can never serve a hit below today's global bar.
+    let task_class = l2_task_class_for_chat();
     match l2
         .cache
-        .lookup(
+        .lookup_classed(
             ctx.org_id,
             &query_vec,
-            l2.threshold,
+            &l2.class_thresholds,
+            task_class,
             &req.model,
             l2.embedder.model(),
         )
@@ -2419,6 +2435,8 @@ async fn insert_into_l2(
         output_tokens: response.usage.completion_tokens,
         baseline_cost_usd,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
     };
@@ -3181,6 +3199,12 @@ fn maybe_spawn_quality_judge(
             request: Box::new(original_req),
             ctx: Box::new(source_ctx),
         },
+        // This judge fires on the rerouted-down DISPATCH path — an L2 hit
+        // short-circuits before dispatch, so there is no served-from-L2 entry to
+        // attribute the verdict to here. The L2 judge join (`L2EvictionTarget`)
+        // is exercised by a dedicated judge-on-L2-hit path; this dispatch path
+        // carries no eviction target.
+        l2_eviction: None,
     });
 }
 
@@ -3935,6 +3959,8 @@ mod l2_baseline_tests {
             output_tokens: 500_000,
             baseline_cost_usd,
             hit_count: 0,
+            quality_score: None,
+            judge_verdict: None,
             created_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::hours(1),
         }

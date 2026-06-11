@@ -33,6 +33,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tt_cache::{JudgeBand, JudgeRecordOutcome, L2Cache};
 use tt_plan_core::{JudgeProvider, JudgeVerdict, QualityError, RiskBand, SampleScore};
 use tt_shared::{
     messages::Message, ChatCompletionRequest, ChatCompletionResponse, MessageContent, ModelPricing,
@@ -283,6 +284,31 @@ pub fn risk_band_for_verdict(verdict: JudgeVerdict) -> RiskBand {
     }
 }
 
+/// Map the plan-core [`RiskBand`] onto the cache crate's eviction-decision band
+/// [`tt_cache::JudgeBand`]. The cache uses this to decide whether a
+/// served-from-L2 entry should be evicted: **only** `High` triggers an eviction.
+#[must_use]
+pub fn risk_band_to_cache_band(band: RiskBand) -> JudgeBand {
+    match band {
+        RiskBand::Low => JudgeBand::Low,
+        RiskBand::Medium => JudgeBand::Medium,
+        RiskBand::High => JudgeBand::High,
+    }
+}
+
+/// Where a judged-from-L2 verdict is recorded (and possibly evicted). Carried on
+/// a [`QualityJudgeJob`] only when the response being judged was **served from
+/// the L2 cache** — i.e. there is a specific entry whose quality this verdict
+/// reflects. Absent for the ordinary downgraded-dispatch judge path (there is no
+/// cache entry to attribute the verdict to).
+pub struct L2EvictionTarget {
+    /// The L2 cache to record the verdict / evict from.
+    pub cache: Arc<dyn L2Cache>,
+    /// The id of the specific entry that served the judged response. **Only**
+    /// this entry is ever touched — never a bulk operation.
+    pub entry_id: Uuid,
+}
+
 /// Lowercase wire string for a verdict (`acceptable` / `degraded` / `unclear`),
 /// matching the `tt_plan_core::JudgeVerdict` serde representation. Used on the
 /// `tokentrimmer.quality.verdict` telemetry attribute.
@@ -514,6 +540,13 @@ pub struct QualityJudgeJob {
     /// against. Resolved INSIDE the detached task so the reference dispatch never
     /// touches the user response path.
     pub reference: ReferenceSource,
+    /// When the judged response was **served from L2**, the specific cache entry
+    /// to record the verdict against (and evict iff `Degraded`/High). `None` for
+    /// the ordinary downgraded-dispatch path, where there is no cache entry to
+    /// attribute the verdict to. This is the cloud join the roadmap flagged:
+    /// closing it lets a clearly-degraded cached response be removed so it can't
+    /// be served again.
+    pub l2_eviction: Option<L2EvictionTarget>,
 }
 
 /// Where the original-model reference answer comes from.
@@ -561,7 +594,11 @@ impl ReferenceSource {
 /// [`RiskBand`], and record the [`JudgeOutcome`]. Returns `Ok(())` even when the
 /// judge declines (records `Unclear`); only a hard judge dispatch error or a
 /// missing reference short-circuits without recording.
-async fn run_job(job: QualityJudgeJob) -> Result<(), QualityError> {
+async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
+    // Extract the L2 eviction target up front: `reference.resolve()` below
+    // partially moves `job.reference`, after which `job` can't be field-accessed
+    // for `l2_eviction`. Taking it here keeps the move analysis simple.
+    let l2_eviction = job.l2_eviction.take();
     let reference = job.reference.resolve().await?;
     if reference.trim().is_empty() {
         // Empty reference (e.g. a tool-call-only original response) — nothing to
@@ -588,6 +625,37 @@ async fn run_job(job: QualityJudgeJob) -> Result<(), QualityError> {
         verdict,
         risk_band,
     );
+
+    // Close the L2 join: if this response was SERVED FROM L2, record the verdict
+    // on that specific entry and — only when the band is High (clearly
+    // Degraded) — evict exactly that entry so the degraded cached answer can't
+    // be served again. Targeted + conservative: a single-entry operation that
+    // fires on `High` alone, never on Low/Medium/Unclear, and never a bulk
+    // delete. Best-effort: a failure here never blocks the verdict recording.
+    if let Some(target) = l2_eviction {
+        let cache_band = risk_band_to_cache_band(risk_band);
+        match target
+            .cache
+            .record_judge_verdict(
+                target.entry_id,
+                verdict.quality_score().map(|s| s as f32),
+                verdict_str(verdict),
+                cache_band,
+            )
+            .await
+        {
+            Ok(JudgeRecordOutcome::Evicted) => {
+                tracing::info!(
+                    entry_id = %target.entry_id,
+                    "evicted L2 entry after degraded judge verdict"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, entry_id = %target.entry_id, "L2 verdict record failed");
+            }
+        }
+    }
 
     let score = SampleScore {
         request_id: job.request_id,
@@ -1007,6 +1075,7 @@ mod tests {
             input_text: "in".to_string(),
             served_answer: "served".to_string(),
             reference,
+            l2_eviction: None,
         }
     }
 
@@ -1114,5 +1183,115 @@ mod tests {
             !attrs.contains_key("tokentrimmer.quality.verdict"),
             "unjudged request must not carry a quality verdict"
         );
+    }
+
+    // ── L2 judge join: eviction on degraded served-from-L2 responses ─────────
+
+    use tt_cache::{CacheEntry, InMemoryL2Cache};
+
+    /// Build an L2 cache holding one entry and return `(cache, entry_id)`.
+    async fn l2_with_one_entry() -> (Arc<InMemoryL2Cache>, Uuid) {
+        let cache = Arc::new(InMemoryL2Cache::new());
+        let id = Uuid::now_v7();
+        let now = chrono::Utc::now();
+        cache
+            .insert(CacheEntry {
+                id,
+                org_id: Uuid::now_v7(),
+                embedding: vec![1.0, 0.0],
+                response: b"{}".to_vec(),
+                model: "gpt-4o".into(),
+                embedding_model: "mock-v1".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                baseline_cost_usd: None,
+                hit_count: 0,
+                quality_score: None,
+                judge_verdict: None,
+                created_at: now,
+                expires_at: now + chrono::Duration::seconds(3600),
+            })
+            .await
+            .unwrap();
+        (cache, id)
+    }
+
+    fn job_targeting_l2(
+        verdict_word: &'static str,
+        cache: Arc<InMemoryL2Cache>,
+        entry_id: Uuid,
+    ) -> QualityJudgeJob {
+        let mut job = job_with(
+            ReferenceSource::Ready("reference".to_string()),
+            verdict_word,
+        );
+        job.l2_eviction = Some(L2EvictionTarget { cache, entry_id });
+        job
+    }
+
+    /// A Degraded verdict on a SERVED-FROM-L2 response evicts exactly that entry.
+    #[tokio::test]
+    async fn degraded_l2_verdict_evicts_the_served_entry() {
+        let (cache, id) = l2_with_one_entry().await;
+        run_job(job_targeting_l2("degraded", cache.clone(), id))
+            .await
+            .expect("run_job ok");
+        // The entry is gone (lookup with threshold 0 can't find it).
+        let hit = cache
+            .lookup(
+                Uuid::nil(), // org doesn't matter — entry deleted regardless
+                &[1.0, 0.0],
+                0.0,
+                "gpt-4o",
+                "mock-v1",
+            )
+            .await
+            .unwrap();
+        assert!(hit.is_none(), "degraded served-from-L2 response must evict");
+    }
+
+    /// An Acceptable verdict records the score but KEEPS the entry.
+    #[tokio::test]
+    async fn acceptable_l2_verdict_keeps_the_entry() {
+        let (cache, id) = l2_with_one_entry().await;
+        run_job(job_targeting_l2("acceptable", cache.clone(), id))
+            .await
+            .expect("run_job ok");
+        // Probe existence: a record against the same id finds the entry
+        // (Recorded, not NotFound), proving it survived the Acceptable verdict.
+        let outcome = cache
+            .record_judge_verdict(id, Some(1.0), "acceptable", JudgeBand::Low)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            JudgeRecordOutcome::Recorded,
+            "acceptable served-from-L2 response must keep the entry"
+        );
+    }
+
+    /// An Unclear verdict KEEPS the entry (records only — no eviction on Unclear).
+    #[tokio::test]
+    async fn unclear_l2_verdict_keeps_the_entry() {
+        let (cache, id) = l2_with_one_entry().await;
+        run_job(job_targeting_l2("unclear", cache.clone(), id))
+            .await
+            .expect("run_job ok");
+        let outcome = cache
+            .record_judge_verdict(id, None, "unclear", JudgeBand::Low)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            JudgeRecordOutcome::Recorded,
+            "unclear served-from-L2 response must keep the entry"
+        );
+    }
+
+    #[test]
+    fn risk_band_to_cache_band_maps_high_to_high() {
+        assert_eq!(risk_band_to_cache_band(RiskBand::High), JudgeBand::High);
+        assert_eq!(risk_band_to_cache_band(RiskBand::Medium), JudgeBand::Medium);
+        assert_eq!(risk_band_to_cache_band(RiskBand::Low), JudgeBand::Low);
     }
 }

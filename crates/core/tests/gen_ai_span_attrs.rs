@@ -830,6 +830,8 @@ fn l2_hit_span_carries_gen_ai_and_cost_attributes() {
                 output_tokens: 50,
                 baseline_cost_usd: Some(stored_baseline),
                 hit_count: 0,
+                quality_score: None,
+                judge_verdict: None,
                 created_at: Utc::now(),
                 expires_at: Utc::now() + ChronoDuration::hours(1),
             };
