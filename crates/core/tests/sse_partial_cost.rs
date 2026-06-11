@@ -64,6 +64,7 @@ fn finish_chunk(completion_tokens: u64) -> ChatCompletionChunk {
             total_tokens: 20_u64 + completion_tokens,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         }),
         extra: Default::default(),
     }

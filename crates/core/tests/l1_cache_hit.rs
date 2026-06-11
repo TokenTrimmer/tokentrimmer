@@ -86,6 +86,7 @@ impl Provider for CountingProvider {
                 total_tokens: 150,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -269,6 +270,7 @@ async fn l1_legacy_entry_falls_back_to_synthetic_baseline() {
             total_tokens: 150,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     };
     let legacy_bytes = serde_json::to_vec(&legacy_response).unwrap();
@@ -472,6 +474,7 @@ impl Provider for CachedDiscountProvider {
                 // cache — only the remaining 50 are charged at the fresh rate.
                 cached_tokens: 50,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }

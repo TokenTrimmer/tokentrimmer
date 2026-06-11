@@ -139,8 +139,11 @@ struct StreamState {
     created: i64,
     /// Input tokens from `message_start`.
     input_tokens: u64,
-    /// Prompt-cache read tokens from `message_start` (billed at the cached rate).
-    cache_read_input_tokens: u64,
+    /// Prompt-cache read tokens from `message_start` (billed at the cached
+    /// rate). `None` when the provider reported no cache-read figure at all —
+    /// kept raw so telemetry can distinguish "reported zero" from "didn't
+    /// report"; arithmetic folds with `.unwrap_or(0)`.
+    cache_read_input_tokens: Option<u64>,
     /// Prompt-cache creation tokens from `message_start`.
     cache_creation_input_tokens: Option<u64>,
     /// Output tokens accumulated from `message_delta`.
@@ -375,7 +378,7 @@ fn handle_message_start(data: &str, state: &mut Option<StreamState>) -> SseOutco
 
     let usage = ev.message.usage.as_ref();
     let input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0);
-    let cache_read_input_tokens = usage.and_then(|u| u.cache_read_input_tokens).unwrap_or(0);
+    let cache_read_input_tokens = usage.and_then(|u| u.cache_read_input_tokens);
     let cache_creation_input_tokens = usage.and_then(|u| u.cache_creation_input_tokens);
 
     let new_state = StreamState {
@@ -564,14 +567,17 @@ fn handle_message_delta(data: &str, state: &mut Option<StreamState>) -> SseOutco
     // and non-streamed Claude calls report identical usage: prompt_tokens
     // INCLUDES cache reads (OpenAI subset convention) and cached_tokens is the
     // cache-read subset — instead of input_tokens-only with cache reads zeroed.
-    let prompt_tokens =
-        st.input_tokens + st.cache_read_input_tokens + st.cache_creation_input_tokens.unwrap_or(0);
+    let prompt_tokens = st.input_tokens
+        + st.cache_read_input_tokens.unwrap_or(0)
+        + st.cache_creation_input_tokens.unwrap_or(0);
     let usage = Usage {
         prompt_tokens,
         completion_tokens: st.output_tokens,
         total_tokens: prompt_tokens + st.output_tokens,
-        cached_tokens: st.cache_read_input_tokens,
+        cached_tokens: st.cache_read_input_tokens.unwrap_or(0),
         cache_creation_input_tokens: st.cache_creation_input_tokens,
+        // Raw Option preserved for telemetry NULL-vs-0 semantics.
+        cache_read_input_tokens: st.cache_read_input_tokens,
     };
 
     let chunk = ChatCompletionChunk {
@@ -668,7 +674,7 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             created: 0,
             input_tokens: 10,
-            cache_read_input_tokens: 0,
+            cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
             output_tokens: 0,
             current_tool: None,
@@ -747,7 +753,31 @@ mod tests {
             "cache reads must be reported, not zeroed"
         );
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
+        // Raw cache-read count preserved unfolded for telemetry NULL-vs-0.
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
         // prompt_tokens is the FULL input: 10 fresh + 80 cache-read + 20 create = 110.
         assert_eq!(usage.prompt_tokens, 110);
+    }
+
+    #[test]
+    fn message_delta_without_cache_report_keeps_raw_none() {
+        // message_start usage with NO cache fields: the terminal usage must
+        // carry raw `cache_read_input_tokens: None` (provider didn't report) —
+        // not Some(0) — while the folded `cached_tokens` stays 0.
+        let start = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"role\":\"assistant\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n";
+        let mut state = None;
+        let _ = process_sse_event(start, &mut state);
+
+        let delta = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n";
+        let outcome = process_sse_event(delta, &mut state);
+        let chunk = if let SseOutcome::Chunk(c) = outcome {
+            c
+        } else {
+            panic!("expected terminal chunk from message_delta");
+        };
+        let usage = chunk.usage.expect("terminal chunk carries usage");
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
     }
 }

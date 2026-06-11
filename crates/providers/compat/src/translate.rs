@@ -171,16 +171,17 @@ pub struct PromptTokensDetails {
 
 impl From<OpenAiUsage> for Usage {
     fn from(u: OpenAiUsage) -> Self {
-        let cached_tokens = u
-            .prompt_tokens_details
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0);
+        // Keep the raw Option-ness: `None` = OpenAI reported no
+        // prompt_tokens_details at all, distinct from a reported zero.
+        let cache_read = u.prompt_tokens_details.as_ref().map(|d| d.cached_tokens);
         Usage {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
-            cached_tokens,
+            cached_tokens: cache_read.unwrap_or(0),
+            // OpenAI-wire providers never report cache writes.
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: cache_read,
         }
     }
 }
@@ -393,6 +394,8 @@ mod tests {
         let usage = extract_usage(&raw).expect("extract ok");
         assert_eq!(usage.cached_tokens, 80);
         assert_eq!(usage.prompt_tokens, 100);
+        // Raw Option preserved alongside the fold (telemetry NULL-vs-0).
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
     }
 
     #[test]
@@ -406,5 +409,24 @@ mod tests {
         });
         let usage = extract_usage(&raw).expect("extract ok");
         assert_eq!(usage.cached_tokens, 0);
+        // No prompt_tokens_details at all → raw stays None, NOT Some(0).
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    /// A provider that reports `prompt_tokens_details.cached_tokens: 0` is
+    /// explicitly saying "zero cache reads" — raw must be Some(0), not None.
+    #[test]
+    fn usage_cached_tokens_reported_zero_is_some_zero() {
+        let raw = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_tokens_details": { "cached_tokens": 0 }
+            }
+        });
+        let usage = extract_usage(&raw).expect("extract ok");
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, Some(0));
     }
 }

@@ -2366,6 +2366,7 @@ fn sandbox_response(req: &ChatCompletionRequest, trace_id_str: &str) -> Response
             total_tokens: 22,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     };
 
@@ -3936,6 +3937,7 @@ mod cache_eligibility_tests {
                 total_tokens: 15,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         }
     }
@@ -4328,6 +4330,7 @@ mod fee_tests {
             total_tokens: 1_000_000,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let p = flat_pricing();
         let bd = compute_cost(&usage, Some(&p), Some(&p), 1.0);
@@ -4374,6 +4377,7 @@ mod fee_tests {
             total_tokens: 1_500,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let p = flex_pricing();
         let bd = compute_cost_with_flex(&usage, Some(&p), Some(&p), 1.0, true);
@@ -4407,6 +4411,7 @@ mod fee_tests {
             total_tokens: 1_500,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let p = flex_pricing();
         let bd = compute_cost_with_flex(&usage, Some(&p), Some(&p), 1.0, false);
@@ -4430,6 +4435,7 @@ mod fee_tests {
             total_tokens: 1_500,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let served = flex_pricing(); // $10/$30 std, $5/$15 flex
         let requested = ModelPricing {
@@ -4514,6 +4520,7 @@ mod cache_write_rate_tests {
             total_tokens: 1_000_000,
             cached_tokens: 0,
             cache_creation_input_tokens: Some(1_000_000),
+            cache_read_input_tokens: None,
         };
         let usage_base = Usage {
             prompt_tokens: 1_000_000,
@@ -4521,6 +4528,7 @@ mod cache_write_rate_tests {
             total_tokens: 1_000_000,
             cached_tokens: 0,
             cache_creation_input_tokens: None, // same tokens, no write bucket
+            cache_read_input_tokens: None,
         };
         let cost_write = compute_cost(&usage_write, Some(&p), Some(&p), 1.0).cost_usd;
         let cost_base = compute_cost(&usage_base, Some(&p), Some(&p), 1.0).cost_usd;
@@ -4545,6 +4553,7 @@ mod cache_write_rate_tests {
             total_tokens: 1_000_000,
             cached_tokens: 0,
             cache_creation_input_tokens: Some(1_000_000),
+            cache_read_input_tokens: None,
         };
         let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
         assert!(
@@ -4564,6 +4573,7 @@ mod cache_write_rate_tests {
             total_tokens: 1_000_000,
             cached_tokens: 1_000_000,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
         assert!(
@@ -4585,6 +4595,7 @@ mod cache_write_rate_tests {
             total_tokens: 1_000_000,
             cached_tokens: 300_000,
             cache_creation_input_tokens: Some(300_000),
+            cache_read_input_tokens: None,
         };
         let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
         let expected = (400_000.0 * 3.0 + 300_000.0 * 0.30 + 300_000.0 * 3.75) / 1_000_000.0;
@@ -4615,6 +4626,7 @@ mod cache_write_rate_tests {
             total_tokens: 1_100_000,
             cached_tokens: 300_000,
             cache_creation_input_tokens: Some(200_000),
+            cache_read_input_tokens: None,
         };
         let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
 
@@ -4661,6 +4673,7 @@ mod cache_write_rate_tests {
             total_tokens: 1_000_000,
             cached_tokens: 0,
             cache_creation_input_tokens: Some(1_000_000),
+            cache_read_input_tokens: None,
         };
         let cost = compute_cost(&usage, Some(&p), Some(&p), 1.0).cost_usd;
         // 5-min tier = $3.75/M; 1-hour tier would be 2×$3.00 = $6.00/M.
@@ -4715,6 +4728,7 @@ mod provider_cache_attribution_tests {
             total_tokens: 1_000_000,
             cached_tokens: 500_000,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let bd = compute_cost(&usage, Some(&p), Some(&p), 1.0);
         // Actual bill: 500K fresh @ $3/M + 500K read @ $0.30/M = $1.65.
@@ -4763,6 +4777,7 @@ mod provider_cache_attribution_tests {
             total_tokens: 1_000_000,
             cached_tokens: 500_000,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let bd = compute_cost(&usage, Some(&served), Some(&requested), 1.0);
         // Baseline (requested model, no discount): $10.00.
@@ -4799,6 +4814,7 @@ mod provider_cache_attribution_tests {
             total_tokens: 1_000_000,
             cached_tokens: 0,
             cache_creation_input_tokens: Some(1_000_000),
+            cache_read_input_tokens: None,
         };
         let bd = compute_cost(&usage, Some(&p), Some(&p), 1.0);
         assert_eq!(
@@ -4820,6 +4836,7 @@ mod provider_cache_attribution_tests {
             total_tokens: 1_000_000,
             cached_tokens: 500_000,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let base = compute_cost(&usage, Some(&p), Some(&p), 1.0);
         let scaled = compute_cost(&usage, Some(&p), Some(&p), 1.05);

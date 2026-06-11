@@ -147,6 +147,7 @@ impl UsageTrackingStream {
                 total_tokens: (prompt + completion) as u64,
                 cached_tokens: cached as u64,
                 cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation as u64),
+                cache_read_input_tokens: None,
             }),
             extra: Default::default(),
         })
@@ -167,6 +168,7 @@ impl UsageTrackingStream {
             total_tokens: (prompt_tokens + completion_tokens) as u64,
             cached_tokens: cached_tokens as u64,
             cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation as u64),
+            cache_read_input_tokens: None,
         };
         Some((text, finish_reason, usage))
     }
@@ -926,6 +928,7 @@ fn partial_to_usage(u: &PartialUsage) -> Usage {
         total_tokens: prompt + completion,
         cached_tokens: u.cached_tokens.max(0) as u64,
         cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation),
+        cache_read_input_tokens: None,
     }
 }
 
@@ -1121,6 +1124,7 @@ mod tests {
                 total_tokens: 9,
                 cached_tokens: 5,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         }
     }
@@ -1200,6 +1204,7 @@ mod tests {
                     total_tokens: 15,
                     cached_tokens: 2,
                     cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 }),
                 extra: Default::default(),
             }),
@@ -1354,6 +1359,7 @@ mod tests {
                 total_tokens: 110,
                 cached_tokens: 20,
                 cache_creation_input_tokens: Some(30),
+                cache_read_input_tokens: None,
             }),
             extra: Default::default(),
         })];

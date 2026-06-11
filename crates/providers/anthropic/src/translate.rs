@@ -729,6 +729,9 @@ pub fn translate_usage(u: AnthropicUsage) -> Usage {
         total_tokens: prompt_tokens + u.output_tokens,
         cached_tokens: cached,
         cache_creation_input_tokens: u.cache_creation_input_tokens,
+        // Raw cache-read count: preserve the provider's Option-ness so
+        // telemetry can distinguish "reported zero" from "didn't report".
+        cache_read_input_tokens: u.cache_read_input_tokens,
     }
 }
 
@@ -1109,6 +1112,24 @@ mod tests {
         assert_eq!(usage.total_tokens, 250);
         assert_eq!(usage.cached_tokens, 80);
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
+        // Raw cache-read count threads through unfolded (telemetry NULL-vs-0).
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+    }
+
+    /// When Anthropic reports no cache fields at all, the raw Options stay
+    /// `None` (provider didn't report) while the folded `cached_tokens` is 0.
+    #[test]
+    fn usage_translation_without_cache_fields_keeps_raw_none() {
+        let u = AnthropicUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let usage = translate_usage(u);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
     }
 
     /// Estimation goes through the shared tiktoken-based estimator, not a raw

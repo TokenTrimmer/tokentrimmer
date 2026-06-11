@@ -96,6 +96,7 @@ impl Provider for CountingProvider {
                 total_tokens: 150,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -273,6 +274,7 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
             total_tokens: 150,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     };
     let entry_vec = vec![1.0; 1536];
@@ -405,6 +407,7 @@ async fn l2_hit_with_null_baseline_uses_current_catalog_not_placeholder() {
             total_tokens: 150,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     };
     let entry_vec = vec![1.0; 1536];
@@ -603,6 +606,7 @@ async fn free_tier_caller_skips_l2_lookup_and_write() {
             total_tokens: 150,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     };
     let entry_vec = vec![1.0; 1536];
@@ -818,6 +822,7 @@ impl Provider for JudgingProvider {
                 total_tokens: 15,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -878,6 +883,7 @@ async fn l2_hit_degraded_judge_verdict_evicts_the_served_entry() {
             total_tokens: 150,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     };
     let entry_vec = vec![1.0_f32; 1536];

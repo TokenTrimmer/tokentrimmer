@@ -139,6 +139,7 @@ impl Provider for CleanStreamProvider {
                 total_tokens: 15,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -205,6 +206,7 @@ impl Provider for CleanStreamProvider {
                     total_tokens: 14,
                     cached_tokens: 0,
                     cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 }),
                 extra: Default::default(),
             }),

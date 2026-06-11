@@ -312,9 +312,10 @@ pub struct GeminiUsageMetadata {
     /// Total tokens.
     #[serde(rename = "totalTokenCount", default)]
     pub total_token_count: u64,
-    /// Tokens served from cache.
+    /// Tokens served from cache. `None` when Gemini omitted the field
+    /// entirely (didn't report), distinct from a reported zero.
     #[serde(rename = "cachedContentTokenCount", default)]
-    pub cached_content_token_count: u64,
+    pub cached_content_token_count: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -802,8 +803,11 @@ pub fn translate_usage(u: GeminiUsageMetadata) -> Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        cached_tokens: u.cached_content_token_count,
+        cached_tokens: u.cached_content_token_count.unwrap_or(0),
+        // Gemini never reports cache writes.
         cache_creation_input_tokens: None,
+        // Raw Option preserved for telemetry NULL-vs-0 semantics.
+        cache_read_input_tokens: u.cached_content_token_count,
     }
 }
 
@@ -819,7 +823,7 @@ mod tests {
             prompt_token_count: 10,
             candidates_token_count: 0,
             total_token_count: 25,
-            cached_content_token_count: 0,
+            cached_content_token_count: None,
         });
         assert_eq!(u.completion_tokens, 15);
         assert_eq!(u.total_tokens, 25);
@@ -827,14 +831,14 @@ mod tests {
             prompt_token_count: 10,
             candidates_token_count: 5,
             total_token_count: 0,
-            cached_content_token_count: 0,
+            cached_content_token_count: None,
         });
         assert_eq!(u.total_tokens, 15);
         let u = super::translate_usage(GeminiUsageMetadata {
             prompt_token_count: 10,
             candidates_token_count: 5,
             total_token_count: 15,
-            cached_content_token_count: 2,
+            cached_content_token_count: Some(2),
         });
         assert_eq!(
             (
@@ -851,7 +855,7 @@ mod tests {
             prompt_token_count: 10,
             candidates_token_count: 5,
             total_token_count: 100,
-            cached_content_token_count: 0,
+            cached_content_token_count: None,
         });
         assert_eq!((u.completion_tokens, u.total_tokens), (5, 100));
     }
