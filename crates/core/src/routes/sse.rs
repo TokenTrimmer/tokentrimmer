@@ -977,6 +977,8 @@ async fn stream_insert_into_l2(
         output_tokens: response.usage.completion_tokens,
         baseline_cost_usd,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
     };

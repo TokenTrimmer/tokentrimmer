@@ -33,8 +33,15 @@ pub const DEFAULT_L1_TTL_SECS: u64 = 24 * 60 * 60;
 pub struct L2Config {
     pub cache: Arc<dyn L2Cache>,
     pub embedder: Arc<dyn EmbeddingProvider>,
-    /// Cosine similarity threshold (0.0 = anything, 1.0 = exact). Default 0.92.
+    /// Global cosine similarity threshold (0.0 = anything, 1.0 = exact).
+    /// Default 0.92. This is the **floor** for every per-class threshold — a
+    /// classed lookup can raise the bar above it but never below it.
     pub threshold: f32,
+    /// Per-[`tt_cache::TaskClass`] thresholds. Globally-fixed for v1: every class
+    /// defaults to [`DEFAULT_L2_THRESHOLD`] (== `threshold`), so behaviour is
+    /// identical to the single-threshold gateway until a class is explicitly
+    /// raised. Never loosens a class below the global floor.
+    pub class_thresholds: tt_cache::ClassThresholds,
 }
 
 /// L1 exact-match lookup wiring. Cache hits short-circuit the provider call.
@@ -224,10 +231,16 @@ impl AppState {
         embedder: Arc<dyn EmbeddingProvider>,
         threshold: Option<f32>,
     ) -> Self {
+        let threshold = threshold.unwrap_or(DEFAULT_L2_THRESHOLD);
         self.l2 = Some(L2Config {
             cache,
             embedder,
-            threshold: threshold.unwrap_or(DEFAULT_L2_THRESHOLD),
+            threshold,
+            // v1: every task class at the global threshold (no per-org config, no
+            // A/B). The floor is the configured global threshold, itself clamped
+            // up to `DEFAULT_L2_THRESHOLD`, so a class can only ever raise the bar,
+            // never lower it below today's value.
+            class_thresholds: tt_cache::ClassThresholds::with_global_floor(threshold),
         });
         self
     }

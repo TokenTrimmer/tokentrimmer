@@ -31,6 +31,7 @@
 //! it on a per-request basis by passing a different `threshold` value to
 //! [`L2Cache::lookup`].
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -39,6 +40,106 @@ use tt_shared::{ChatCompletionRequest, ContentPart, Message, MessageContent};
 use uuid::Uuid;
 
 use crate::CacheError;
+
+// ---------------------------------------------------------------------------
+// Per-task-class thresholds
+// ---------------------------------------------------------------------------
+
+/// The global default L2 cosine-similarity threshold (ADR-008). This is the
+/// floor for **every** task class: the per-class config can only ever raise a
+/// class's threshold above this value, never lower it. Loosening below this
+/// would serve cached answers at a similarity the gateway never accepted
+/// before — a correctness regression, not a feature.
+pub const DEFAULT_THRESHOLD: f32 = 0.92;
+
+/// The class of request an L2 lookup belongs to. Mirrors (and is the cache-crate
+/// home for) the higher-level `JudgeTaskClass` in `tt-core`, so the cache crate
+/// can apply a per-class threshold without depending on `tt-core`. Callers in
+/// `tt-core` map their `JudgeTaskClass` onto this enum.
+///
+/// `#[non_exhaustive]` so additional classes (embeddings re-rank, messages
+/// ingress, …) can be added later without breaking match arms at call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TaskClass {
+    /// `POST /v1/chat/completions` — the general chat class (the only one wired
+    /// for v1; every other class falls back to the default threshold).
+    ChatCompletions,
+}
+
+/// Per-class L2 threshold configuration. Globally-fixed for v1 (no per-org
+/// config, no A/B). A class with no explicit entry resolves to
+/// [`DEFAULT_THRESHOLD`]; an explicit entry is **floored** at
+/// [`DEFAULT_THRESHOLD`] so no class can ever be configured below today's value.
+///
+/// Construct with [`ClassThresholds::new`] (every class at the default) and
+/// optionally raise a specific class with [`ClassThresholds::with_class`].
+#[derive(Debug, Clone)]
+pub struct ClassThresholds {
+    /// Floor + fallback for any class without an explicit (or `None`-class) entry.
+    default: f32,
+    /// Explicit per-class overrides. Always `>= default` (floored on insert).
+    by_class: HashMap<TaskClass, f32>,
+}
+
+impl Default for ClassThresholds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClassThresholds {
+    /// A config where every task class resolves to [`DEFAULT_THRESHOLD`] (0.92).
+    /// This is the safe v1 default: identical behaviour to the single-threshold
+    /// gateway, just expressed per-class.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            default: DEFAULT_THRESHOLD,
+            by_class: HashMap::new(),
+        }
+    }
+
+    /// A config whose default floor is the gateway's configured global threshold.
+    /// The floor is itself clamped up to [`DEFAULT_THRESHOLD`] so an operator who
+    /// sets a *lower* global threshold can never drag the L2 bar below today's
+    /// value — the per-class plumbing only ever tightens, never loosens.
+    #[must_use]
+    pub fn with_global_floor(global_threshold: f32) -> Self {
+        Self {
+            default: global_threshold.max(DEFAULT_THRESHOLD),
+            by_class: HashMap::new(),
+        }
+    }
+
+    /// Raise (never lower) the threshold for one class. The supplied value is
+    /// floored at the config's `default` (== [`DEFAULT_THRESHOLD`] for a config
+    /// built via [`ClassThresholds::new`]), so an accidental low value can never
+    /// loosen a class below today's similarity bar.
+    #[must_use]
+    pub fn with_class(mut self, class: TaskClass, threshold: f32) -> Self {
+        self.by_class.insert(class, threshold.max(self.default));
+        self
+    }
+
+    /// The effective threshold for `class`. `None` (unknown / unclassified
+    /// request) resolves to the default. Every result is `>= DEFAULT_THRESHOLD`.
+    #[must_use]
+    pub fn threshold_for(&self, class: Option<TaskClass>) -> f32 {
+        match class.and_then(|c| self.by_class.get(&c).copied()) {
+            Some(t) => t.max(self.default),
+            None => self.default,
+        }
+    }
+}
+
+/// The safe per-class default threshold for `class`: always [`DEFAULT_THRESHOLD`]
+/// for v1, for **every** class including unknown / unclassified (`None`). This is
+/// the pure function the safety tests pin — no class may resolve below 0.92.
+#[must_use]
+pub fn class_threshold_for(class: Option<TaskClass>) -> f32 {
+    ClassThresholds::new().threshold_for(class)
+}
 
 // ---------------------------------------------------------------------------
 // CacheEntry
@@ -81,11 +182,114 @@ pub struct CacheEntry {
     pub baseline_cost_usd: Option<f64>,
     /// How many times this entry has been served from cache.
     pub hit_count: u64,
+    /// Latest judge quality score in `[0, 1]` for a response served from this
+    /// entry (`1.0` = quality preserved, `0.0` = degraded). `None` until a judge
+    /// has scored a response served from this entry (the common case — only a
+    /// ~2% sample of downgraded traffic is judged). Additive + nullable
+    /// (migration 0013); pre-0013 rows read as `None`.
+    pub quality_score: Option<f32>,
+    /// Latest judge verdict recorded against this entry
+    /// (`acceptable` / `degraded` / `unclear`). `None` until a judge has scored a
+    /// response served from this entry. Additive + nullable (migration 0013).
+    pub judge_verdict: Option<String>,
     /// Wall-clock time the entry was created.
     pub created_at: DateTime<Utc>,
     /// Wall-clock time after which the entry must not be served.
     pub expires_at: DateTime<Utc>,
 }
+
+// ---------------------------------------------------------------------------
+// Judge-driven eviction
+// ---------------------------------------------------------------------------
+
+/// The judge's risk band for a response that was **served from L2**. The cache
+/// crate's own minimal mirror of `tt_plan_core::RiskBand`, so the cache can make
+/// an eviction decision without depending on `tt-plan-core`. Callers map their
+/// `RiskBand` onto this enum.
+///
+/// Only [`JudgeBand::High`] (a clearly degraded response) triggers a targeted
+/// eviction; `Low` / `Medium` / unclassified verdicts only record the score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgeBand {
+    /// Degraded share ≤ 5% — quality preserved. Record only, never evict.
+    Low,
+    /// Degraded share in `(5%, 15%]`. Record only, never evict.
+    Medium,
+    /// Degraded share > 15% — clearly degraded. The single-entry eviction signal.
+    High,
+}
+
+impl JudgeBand {
+    /// Whether this band warrants evicting the specific entry that served the
+    /// judged response. **Only** `High` does — the conservative, targeted rule.
+    #[must_use]
+    pub fn warrants_eviction(self) -> bool {
+        matches!(self, JudgeBand::High)
+    }
+}
+
+/// What [`L2Cache::record_judge_verdict`] did with a judged-from-L2 verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgeRecordOutcome {
+    /// The score/verdict was recorded on the entry; the entry was kept.
+    Recorded,
+    /// The band was `High`/Degraded: the specific entry was evicted (deleted by
+    /// id) and is no longer servable. The verdict is recorded for audit where
+    /// the backing store supports it.
+    Evicted,
+    /// The entry id was not found (already expired/evicted). No-op.
+    NotFound,
+}
+
+// ---------------------------------------------------------------------------
+// Paraphrase-dedup analytics (read-only)
+// ---------------------------------------------------------------------------
+
+/// One near-duplicate cluster found by [`L2Cache::analyze_dedup`]. A cluster is
+/// a set of cache entries whose embeddings are mutually near-duplicate (cosine
+/// `>= DEDUP_SIMILARITY`). Reported for analytics only — never mutated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupCluster {
+    /// The entry id chosen as the cluster representative (the highest-`hit_count`
+    /// member — the one worth keeping).
+    pub representative_id: Uuid,
+    /// All entry ids in the cluster, including the representative. Length ≥ 2
+    /// (singletons are not reported as clusters).
+    pub member_ids: Vec<Uuid>,
+    /// Sum of `hit_count` across all members — the dedup opportunity's "weight".
+    pub total_hit_count: u64,
+}
+
+/// The result of [`L2Cache::analyze_dedup`] for one org. Read-only analytics:
+/// reports where near-duplicate embeddings cluster so a later admin tool can
+/// quantify the dedup opportunity. Never deletes or updates anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DedupReport {
+    /// Total non-expired entries considered (after any sampling bound).
+    pub total_entries: u64,
+    /// Number of multi-member near-duplicate clusters found.
+    pub cluster_count: u64,
+    /// Count of entries that are a *non-representative* member of some cluster —
+    /// i.e. the entries that could be deduped away. `entries_deduped /
+    /// total_entries` is the dedup ratio.
+    pub entries_deduped: u64,
+    /// Top clusters by `total_hit_count`, descending (bounded — see
+    /// [`DEDUP_TOP_CLUSTERS`]).
+    pub top_clusters: Vec<DedupCluster>,
+}
+
+/// Cosine-similarity threshold above which two embeddings are treated as
+/// near-duplicates for dedup analytics. Deliberately higher than the L2 *serving*
+/// threshold (0.92): dedup is about "these are effectively the same prompt",
+/// which is a tighter bar than "close enough to serve a cached answer".
+pub const DEDUP_SIMILARITY: f32 = 0.95;
+
+/// Largest org the in-memory dedup analysis scans without sampling. Bounds the
+/// O(N²) clustering so a huge org can't stall the analytics path.
+pub const DEDUP_MAX_ENTRIES: usize = 5_000;
+
+/// How many top clusters [`DedupReport::top_clusters`] retains.
+pub const DEDUP_TOP_CLUSTERS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // L2Cache trait
@@ -129,6 +333,67 @@ pub trait L2Cache: Send + Sync {
     /// This is a best-effort, idempotent operation. Implementations may
     /// silently swallow errors to avoid blocking the hot path.
     async fn bump_hit_count(&self, id: Uuid) -> Result<(), CacheError>;
+
+    /// Delete the single entry identified by `id`. Targeted + idempotent: if the
+    /// id no longer exists, this is a no-op `Ok(())`. Used by judge-driven
+    /// eviction to remove **exactly** the entry that served a degraded response —
+    /// never a bulk delete.
+    async fn evict(&self, id: Uuid) -> Result<(), CacheError>;
+
+    /// Record the latest judge `score` (and verdict string) against the entry
+    /// `id` that served a judged-from-L2 response. The score is recorded
+    /// regardless of band; **only** a `High`/Degraded `band` additionally
+    /// evicts that one entry (see [`JudgeBand::warrants_eviction`]).
+    ///
+    /// Returns what happened: [`JudgeRecordOutcome::Evicted`] when the band was
+    /// `High`, [`JudgeRecordOutcome::Recorded`] when it was kept, or
+    /// [`JudgeRecordOutcome::NotFound`] when the entry was already gone.
+    ///
+    /// Conservative by construction: never bulk-deletes, never touches any other
+    /// entry, and never evicts on `Low` / `Medium`.
+    async fn record_judge_verdict(
+        &self,
+        id: Uuid,
+        score: Option<f32>,
+        verdict: &str,
+        band: JudgeBand,
+    ) -> Result<JudgeRecordOutcome, CacheError>;
+
+    /// Read-only paraphrase-dedup analytics for `org_id`. Clusters non-expired
+    /// entries whose embeddings are mutually near-duplicate (cosine
+    /// `>= DEDUP_SIMILARITY`) and reports the dedup opportunity. Never mutates
+    /// the cache (no DELETE/UPDATE). Large orgs are bounded/sampled.
+    async fn analyze_dedup(&self, org_id: Uuid) -> Result<DedupReport, CacheError>;
+
+    /// Look up the nearest entry, applying the **per-class** threshold for
+    /// `task_class` from `thresholds`. Falls back to the config default when
+    /// `task_class` is `None`. The resolved threshold is always `>= the config's
+    /// default floor`, which is itself `>= DEFAULT_THRESHOLD` (see
+    /// [`ClassThresholds::with_global_floor`]) — so a classed lookup can never
+    /// serve a hit below today's similarity bar. This is the hard safety
+    /// invariant.
+    ///
+    /// Default impl delegates to [`L2Cache::lookup`] with the resolved threshold,
+    /// so every implementation gets per-class behaviour for free.
+    async fn lookup_classed(
+        &self,
+        org_id: Uuid,
+        query_embedding: &[f32],
+        thresholds: &ClassThresholds,
+        task_class: Option<TaskClass>,
+        chat_model: &str,
+        embedding_model: &str,
+    ) -> Result<Option<(CacheEntry, f32)>, CacheError> {
+        let effective = thresholds.threshold_for(task_class);
+        self.lookup(
+            org_id,
+            query_embedding,
+            effective,
+            chat_model,
+            embedding_model,
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +533,8 @@ pub fn l2_context_text(req: &ChatCompletionRequest) -> Option<String> {
 ///     output_tokens: 5,
 ///     baseline_cost_usd: Some(0.000045),
 ///     hit_count: 0,
+///     quality_score: None,
+///     judge_verdict: None,
 ///     created_at: Utc::now(),
 ///     expires_at: Utc::now() + chrono::Duration::seconds(3600),
 /// };
@@ -344,6 +611,139 @@ impl L2Cache for InMemoryL2Cache {
             entry.hit_count += 1;
         }
         Ok(())
+    }
+
+    /// Remove exactly the entry with `id`. No-op if absent.
+    async fn evict(&self, id: Uuid) -> Result<(), CacheError> {
+        let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|e| e.id != id);
+        Ok(())
+    }
+
+    /// Record the judge score/verdict on the entry, evicting it iff the band is
+    /// `High`. Conservative: touches only the single entry identified by `id`.
+    async fn record_judge_verdict(
+        &self,
+        id: Uuid,
+        score: Option<f32>,
+        verdict: &str,
+        band: JudgeBand,
+    ) -> Result<JudgeRecordOutcome, CacheError> {
+        let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(pos) = guard.iter().position(|e| e.id == id) else {
+            return Ok(JudgeRecordOutcome::NotFound);
+        };
+        // Record on the live row first so an evicted entry's last-known verdict
+        // is consistent if a store later persists it.
+        guard[pos].quality_score = score;
+        guard[pos].judge_verdict = Some(verdict.to_string());
+        if band.warrants_eviction() {
+            guard.remove(pos);
+            return Ok(JudgeRecordOutcome::Evicted);
+        }
+        Ok(JudgeRecordOutcome::Recorded)
+    }
+
+    /// Cluster this org's non-expired entries by near-duplicate cosine
+    /// similarity. Read-only — never mutates the store.
+    async fn analyze_dedup(&self, org_id: Uuid) -> Result<DedupReport, CacheError> {
+        let now = Utc::now();
+        let guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let mut candidates: Vec<(Uuid, &[f32], u64)> = guard
+            .iter()
+            .filter(|e| e.org_id == org_id && e.expires_at > now)
+            .map(|e| (e.id, e.embedding.as_slice(), e.hit_count))
+            .collect();
+        // Bound large orgs: deterministically keep the highest-hit_count entries
+        // (the dedup signal that matters) so the O(N²) clustering stays cheap.
+        // Sort by (hit_count desc, id) for a stable, reproducible sample.
+        if candidates.len() > DEDUP_MAX_ENTRIES {
+            candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            candidates.truncate(DEDUP_MAX_ENTRIES);
+        }
+        Ok(cluster_near_duplicates(&candidates))
+    }
+}
+
+/// Pure near-duplicate clustering over `(id, embedding, hit_count)` rows. Single
+/// linkage by cosine `>= DEDUP_SIMILARITY`: two entries land in the same cluster
+/// if either is within the threshold of a member. Read-only — produces a
+/// [`DedupReport`] without touching any cache. Shared by the in-memory impl and
+/// directly unit-testable on synthetic vectors.
+#[must_use]
+fn cluster_near_duplicates(entries: &[(Uuid, &[f32], u64)]) -> DedupReport {
+    let n = entries.len();
+    let total_entries = n as u64;
+    // Union-find over the entry indices.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if cosine(entries[i].1, entries[j].1) >= DEDUP_SIMILARITY {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    // Group indices by root.
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+
+    let mut clusters: Vec<DedupCluster> = Vec::new();
+    let mut entries_deduped: u64 = 0;
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue; // singletons are not a dedup opportunity
+        }
+        // Representative = highest hit_count (ties broken by smallest id) — the
+        // entry worth keeping.
+        let rep_idx = *members
+            .iter()
+            .max_by(|&&a, &&b| {
+                entries[a]
+                    .2
+                    .cmp(&entries[b].2)
+                    .then_with(|| entries[b].0.cmp(&entries[a].0))
+            })
+            .expect("non-empty cluster");
+        let representative_id = entries[rep_idx].0;
+        let member_ids: Vec<Uuid> = members.iter().map(|&i| entries[i].0).collect();
+        let total_hit_count: u64 = members.iter().map(|&i| entries[i].2).sum();
+        entries_deduped += (members.len() - 1) as u64;
+        clusters.push(DedupCluster {
+            representative_id,
+            member_ids,
+            total_hit_count,
+        });
+    }
+
+    let cluster_count = clusters.len() as u64;
+    // Top clusters by total_hit_count desc (ties by representative id for
+    // determinism), bounded.
+    clusters.sort_by(|a, b| {
+        b.total_hit_count
+            .cmp(&a.total_hit_count)
+            .then_with(|| a.representative_id.cmp(&b.representative_id))
+    });
+    clusters.truncate(DEDUP_TOP_CLUSTERS);
+
+    DedupReport {
+        total_entries,
+        cluster_count,
+        entries_deduped,
+        top_clusters: clusters,
     }
 }
 
@@ -427,8 +827,8 @@ impl L2Cache for PostgresL2Cache {
             INSERT INTO cache_entries
                 (id, org_id, embedding, response, model, embedding_model,
                  input_tokens, output_tokens, baseline_cost_usd, hit_count,
-                 created_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 quality_score, judge_verdict, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT DO NOTHING
             "#,
         )
@@ -445,6 +845,8 @@ impl L2Cache for PostgresL2Cache {
         .bind(entry.output_tokens as i64)
         .bind(entry.baseline_cost_usd)
         .bind(entry.hit_count as i64)
+        .bind(entry.quality_score)
+        .bind(&entry.judge_verdict)
         .bind(entry.created_at)
         .bind(entry.expires_at)
         .execute(&self.pool)
@@ -490,7 +892,7 @@ impl L2Cache for PostgresL2Cache {
             r#"
             SELECT id, org_id, embedding, response, model, embedding_model,
                    input_tokens, output_tokens, baseline_cost_usd, hit_count,
-                   created_at, expires_at,
+                   quality_score, judge_verdict, created_at, expires_at,
                    CAST(1.0 - (embedding <=> $2) AS REAL) AS similarity
               FROM cache_entries
              WHERE org_id = $1
@@ -535,6 +937,11 @@ impl L2Cache for PostgresL2Cache {
         let baseline_cost_usd: Option<f64> =
             row.try_get("baseline_cost_usd").map_err(CacheError::Sqlx)?;
         let hit_count: i64 = row.try_get("hit_count").map_err(CacheError::Sqlx)?;
+        // NULL for rows inserted before migration 0013 (judge join) or never
+        // judged — surfaced as `None`.
+        let quality_score: Option<f32> = row.try_get("quality_score").map_err(CacheError::Sqlx)?;
+        let judge_verdict: Option<String> =
+            row.try_get("judge_verdict").map_err(CacheError::Sqlx)?;
         let created_at: DateTime<Utc> = row.try_get("created_at").map_err(CacheError::Sqlx)?;
         let expires_at: DateTime<Utc> = row.try_get("expires_at").map_err(CacheError::Sqlx)?;
         let similarity: f32 = row.try_get("similarity").map_err(CacheError::Sqlx)?;
@@ -552,6 +959,8 @@ impl L2Cache for PostgresL2Cache {
             output_tokens: output_tokens.max(0) as u64,
             baseline_cost_usd,
             hit_count: hit_count as u64,
+            quality_score,
+            judge_verdict,
             created_at,
             expires_at,
         };
@@ -570,6 +979,82 @@ impl L2Cache for PostgresL2Cache {
             .map_err(CacheError::Sqlx)?;
 
         Ok(())
+    }
+
+    /// Delete exactly one row by id. Targeted single-entry eviction — never a
+    /// bulk delete. No-op when the id is absent.
+    async fn evict(&self, id: Uuid) -> Result<(), CacheError> {
+        sqlx::query("DELETE FROM cache_entries WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(CacheError::Sqlx)?;
+        Ok(())
+    }
+
+    /// Record the judge score/verdict on the row, then evict that single row iff
+    /// the band is `High`. Two statements, no bulk operations.
+    async fn record_judge_verdict(
+        &self,
+        id: Uuid,
+        score: Option<f32>,
+        verdict: &str,
+        band: JudgeBand,
+    ) -> Result<JudgeRecordOutcome, CacheError> {
+        let updated = sqlx::query(
+            "UPDATE cache_entries SET quality_score = $2, judge_verdict = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(score)
+        .bind(verdict)
+        .execute(&self.pool)
+        .await
+        .map_err(CacheError::Sqlx)?;
+
+        if updated.rows_affected() == 0 {
+            return Ok(JudgeRecordOutcome::NotFound);
+        }
+        if band.warrants_eviction() {
+            self.evict(id).await?;
+            return Ok(JudgeRecordOutcome::Evicted);
+        }
+        Ok(JudgeRecordOutcome::Recorded)
+    }
+
+    /// Read-only paraphrase-dedup analytics. Pulls a bounded sample of the org's
+    /// non-expired `(id, embedding, hit_count)` rows (highest `hit_count` first)
+    /// and clusters them in-process via [`cluster_near_duplicates`]. Issues no
+    /// DELETE/UPDATE — strictly a SELECT.
+    async fn analyze_dedup(&self, org_id: Uuid) -> Result<DedupReport, CacheError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, embedding, hit_count
+              FROM cache_entries
+             WHERE org_id = $1
+               AND expires_at > now()
+             ORDER BY hit_count DESC, id ASC
+             LIMIT $2
+            "#,
+        )
+        .bind(org_id)
+        .bind(DEDUP_MAX_ENTRIES as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(CacheError::Sqlx)?;
+
+        use sqlx::Row;
+        let mut decoded: Vec<(Uuid, Vec<f32>, u64)> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: Uuid = row.try_get("id").map_err(CacheError::Sqlx)?;
+            let emb: pgvector::Vector = row.try_get("embedding").map_err(CacheError::Sqlx)?;
+            let hit_count: i64 = row.try_get("hit_count").map_err(CacheError::Sqlx)?;
+            decoded.push((id, emb.to_vec(), hit_count.max(0) as u64));
+        }
+        let view: Vec<(Uuid, &[f32], u64)> = decoded
+            .iter()
+            .map(|(id, emb, hc)| (*id, emb.as_slice(), *hc))
+            .collect();
+        Ok(cluster_near_duplicates(&view))
     }
 }
 
@@ -616,6 +1101,8 @@ mod tests {
             output_tokens: 1,
             baseline_cost_usd: None,
             hit_count: 0,
+            quality_score: None,
+            judge_verdict: None,
             created_at: now,
             expires_at: now + chrono::Duration::seconds(3600),
         }
@@ -720,5 +1207,269 @@ mod tests {
             .insert(entry_at(Uuid::new_v4(), org, vec![1.0, 0.0], now))
             .await
             .expect("finite embedding inserts");
+    }
+
+    // ── Per-class thresholds (SAFETY: never below today's 0.92) ─────────────
+
+    #[test]
+    fn class_threshold_defaults_to_global_for_every_class() {
+        // Every known class — and the unknown / unclassified `None` case —
+        // resolves to exactly the current global default. No loosening.
+        assert_eq!(class_threshold_for(None), DEFAULT_THRESHOLD);
+        assert_eq!(
+            class_threshold_for(Some(TaskClass::ChatCompletions)),
+            DEFAULT_THRESHOLD
+        );
+        assert!(
+            (DEFAULT_THRESHOLD - 0.92).abs() < f32::EPSILON,
+            "default is 0.92"
+        );
+    }
+
+    #[test]
+    fn class_thresholds_floor_prevents_loosening() {
+        // An accidental low per-class value is floored at the default — the bar
+        // can be raised, never lowered.
+        let cfg = ClassThresholds::new().with_class(TaskClass::ChatCompletions, 0.50);
+        assert_eq!(
+            cfg.threshold_for(Some(TaskClass::ChatCompletions)),
+            DEFAULT_THRESHOLD,
+            "0.50 must be floored up to 0.92"
+        );
+        // A higher value is honoured.
+        let strict = ClassThresholds::new().with_class(TaskClass::ChatCompletions, 0.97);
+        assert!((strict.threshold_for(Some(TaskClass::ChatCompletions)) - 0.97).abs() < 1e-6);
+    }
+
+    #[test]
+    fn with_global_floor_never_drops_below_default() {
+        // A LOWER global threshold is clamped up to the 0.92 default — the floor
+        // can be raised, never lowered.
+        let loose = ClassThresholds::with_global_floor(0.50);
+        assert_eq!(loose.threshold_for(None), DEFAULT_THRESHOLD);
+        assert_eq!(
+            loose.threshold_for(Some(TaskClass::ChatCompletions)),
+            DEFAULT_THRESHOLD
+        );
+        // A HIGHER global threshold becomes the floor for every class.
+        let strict = ClassThresholds::with_global_floor(0.96);
+        assert!((strict.threshold_for(None) - 0.96).abs() < 1e-6);
+    }
+
+    /// A classed lookup must never return a hit below the class threshold — and
+    /// the global floor wins even if the config somehow held a lower value.
+    #[tokio::test]
+    async fn classed_lookup_never_returns_hit_below_threshold() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let org = Uuid::new_v4();
+        // Two vectors ~0.93 apart in cosine (below 0.95, above 0.92).
+        let stored = vec![1.0_f32, 0.0];
+        let query = vec![0.93_f32, 0.37]; // cosine ≈ 0.93
+        cache
+            .insert(entry_at(Uuid::new_v4(), org, stored, now))
+            .await
+            .unwrap();
+
+        let sim = cosine(&[1.0, 0.0], &[0.93, 0.37]);
+        assert!(
+            (0.92..0.95).contains(&sim),
+            "fixture must sit between 0.92 and 0.95; got {sim}"
+        );
+
+        // Default class threshold (0.92) → this 0.93 match is a hit.
+        let cfg = ClassThresholds::new();
+        let hit = cache
+            .lookup_classed(
+                org,
+                &query,
+                &cfg,
+                Some(TaskClass::ChatCompletions),
+                "gpt-4o",
+                "mock-v1",
+            )
+            .await
+            .unwrap();
+        assert!(hit.is_some(), "0.93 ≥ 0.92 default → hit");
+        assert!(hit.unwrap().1 >= DEFAULT_THRESHOLD);
+
+        // Raise the class threshold to 0.95 → the same 0.93 match must miss.
+        let strict = ClassThresholds::new().with_class(TaskClass::ChatCompletions, 0.95);
+        let miss = cache
+            .lookup_classed(
+                org,
+                &query,
+                &strict,
+                Some(TaskClass::ChatCompletions),
+                "gpt-4o",
+                "mock-v1",
+            )
+            .await
+            .unwrap();
+        assert!(miss.is_none(), "0.93 < 0.95 class threshold → miss");
+    }
+
+    // ── Judge-driven eviction (targeted + conservative) ─────────────────────
+
+    #[tokio::test]
+    async fn eviction_fires_only_on_high_band_and_removes_exactly_that_entry() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let org = Uuid::new_v4();
+        let victim = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        cache
+            .insert(entry_at(victim, org, vec![1.0, 0.0], now))
+            .await
+            .unwrap();
+        cache
+            .insert(entry_at(bystander, org, vec![0.0, 1.0], now))
+            .await
+            .unwrap();
+
+        // High band → evicts exactly the victim.
+        let outcome = cache
+            .record_judge_verdict(victim, Some(0.0), "degraded", JudgeBand::High)
+            .await
+            .unwrap();
+        assert_eq!(outcome, JudgeRecordOutcome::Evicted);
+
+        // Victim gone; bystander untouched.
+        assert!(cache
+            .lookup(org, &[1.0, 0.0], 0.99, "gpt-4o", "mock-v1")
+            .await
+            .unwrap()
+            .is_none());
+        let (still, _) = cache
+            .lookup(org, &[0.0, 1.0], 0.99, "gpt-4o", "mock-v1")
+            .await
+            .unwrap()
+            .expect("bystander must survive");
+        assert_eq!(still.id, bystander);
+    }
+
+    #[tokio::test]
+    async fn eviction_does_not_fire_on_low_medium_or_records_only() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let org = Uuid::new_v4();
+        for band in [JudgeBand::Low, JudgeBand::Medium] {
+            let id = Uuid::new_v4();
+            cache
+                .insert(entry_at(id, org, vec![1.0, 0.0], now))
+                .await
+                .unwrap();
+            let outcome = cache
+                .record_judge_verdict(id, Some(1.0), "acceptable", band)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                JudgeRecordOutcome::Recorded,
+                "{band:?} records only"
+            );
+            // Entry survives and carries the recorded verdict.
+            let (entry, _) = cache
+                .lookup(org, &[1.0, 0.0], 0.99, "gpt-4o", "mock-v1")
+                .await
+                .unwrap()
+                .expect("entry must survive a non-High verdict");
+            assert_eq!(entry.quality_score, Some(1.0));
+            assert_eq!(entry.judge_verdict.as_deref(), Some("acceptable"));
+            cache.evict(id).await.unwrap(); // clean up for the next loop
+        }
+    }
+
+    #[tokio::test]
+    async fn record_verdict_on_missing_entry_is_not_found() {
+        let cache = InMemoryL2Cache::new();
+        let outcome = cache
+            .record_judge_verdict(Uuid::new_v4(), Some(0.0), "degraded", JudgeBand::High)
+            .await
+            .unwrap();
+        assert_eq!(outcome, JudgeRecordOutcome::NotFound);
+    }
+
+    #[test]
+    fn judge_band_eviction_policy() {
+        assert!(JudgeBand::High.warrants_eviction());
+        assert!(!JudgeBand::Medium.warrants_eviction());
+        assert!(!JudgeBand::Low.warrants_eviction());
+    }
+
+    // ── Paraphrase-dedup analytics (read-only) ──────────────────────────────
+
+    #[tokio::test]
+    async fn dedup_clusters_near_duplicates_and_is_read_only() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let org = Uuid::new_v4();
+        // Cluster A: three near-identical vectors (cosine ≈ 1.0 ≥ 0.95).
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let a3 = Uuid::new_v4();
+        for (id, v, hits) in [
+            (a1, vec![1.0_f32, 0.0, 0.0], 10_u64),
+            (a2, vec![0.999_f32, 0.01, 0.0], 3),
+            (a3, vec![0.998_f32, 0.02, 0.0], 1),
+        ] {
+            let mut e = entry_at(id, org, v, now);
+            e.hit_count = hits;
+            cache.insert(e).await.unwrap();
+        }
+        // A lone, orthogonal singleton — not a cluster.
+        cache
+            .insert(entry_at(Uuid::new_v4(), org, vec![0.0, 1.0, 0.0], now))
+            .await
+            .unwrap();
+
+        let before = cache
+            .lookup(org, &[1.0, 0.0, 0.0], 0.0, "gpt-4o", "mock-v1")
+            .await
+            .unwrap();
+        let report = cache.analyze_dedup(org).await.unwrap();
+
+        assert_eq!(report.total_entries, 4);
+        assert_eq!(report.cluster_count, 1, "one near-dup cluster");
+        assert_eq!(report.entries_deduped, 2, "3-member cluster → 2 deduped");
+        let cluster = &report.top_clusters[0];
+        assert_eq!(cluster.member_ids.len(), 3);
+        assert_eq!(
+            cluster.representative_id, a1,
+            "highest hit_count is the rep"
+        );
+        assert_eq!(cluster.total_hit_count, 14);
+
+        // READ-ONLY: nothing was deleted/modified — the same lookup still works.
+        let after = cache
+            .lookup(org, &[1.0, 0.0, 0.0], 0.0, "gpt-4o", "mock-v1")
+            .await
+            .unwrap();
+        assert_eq!(before.is_some(), after.is_some());
+        assert_eq!(
+            cache.analyze_dedup(org).await.unwrap().total_entries,
+            4,
+            "re-running analysis still sees all 4 entries (no mutation)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_does_not_cross_orgs() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let org_a = Uuid::new_v4();
+        let org_b = Uuid::new_v4();
+        // Two near-dups, but in DIFFERENT orgs → not a cluster.
+        cache
+            .insert(entry_at(Uuid::new_v4(), org_a, vec![1.0, 0.0], now))
+            .await
+            .unwrap();
+        cache
+            .insert(entry_at(Uuid::new_v4(), org_b, vec![1.0, 0.0], now))
+            .await
+            .unwrap();
+        let report = cache.analyze_dedup(org_a).await.unwrap();
+        assert_eq!(report.total_entries, 1);
+        assert_eq!(report.cluster_count, 0);
     }
 }

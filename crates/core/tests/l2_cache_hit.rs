@@ -26,7 +26,7 @@ use tower::util::ServiceExt;
 
 use tt_auth::ApiKeyContext;
 use tt_cache::{CacheEntry, EmbeddingProvider, InMemoryL2Cache, L2Cache};
-use tt_core::{build_router, AppState, ProviderRegistry};
+use tt_core::{build_router, AppState, InMemoryJudgeBandStore, JudgeConfig, ProviderRegistry};
 use tt_shared::{
     messages::{Choice, ChunkChoice, ChunkDelta, Message, MessageContent},
     pricing::Capability,
@@ -292,6 +292,8 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         output_tokens: 50,
         baseline_cost_usd: Some(stored_baseline),
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
     };
@@ -417,6 +419,8 @@ async fn l2_hit_with_null_baseline_uses_current_catalog_not_placeholder() {
         output_tokens: 50,
         baseline_cost_usd: None, // legacy row — predates migration 0010
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
     };
@@ -613,6 +617,8 @@ async fn free_tier_caller_skips_l2_lookup_and_write() {
         output_tokens: 50,
         baseline_cost_usd: None,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
     };
@@ -712,5 +718,228 @@ async fn free_tier_streaming_does_not_write_l2() {
     assert!(
         hit.is_none(),
         "Free-tier streaming completion must NOT write to L2; found an entry: {hit:?}"
+    );
+}
+
+// ── A provider that serves BOTH the reference model and the judge model.
+//
+// `counting-1` (the served/reference model) returns a normal answer; the judge
+// model `judge-1` returns text containing "DEGRADED" so the parsed verdict is
+// `Degraded` → `RiskBand::High` → eviction. Used to drive the judge-on-L2-hit
+// path end-to-end and assert the served-from-L2 entry is evicted.
+struct JudgingProvider {
+    ref_calls: Arc<AtomicUsize>,
+    judge_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for JudgingProvider {
+    fn id(&self) -> &'static str {
+        "judging"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        ["counting-1", "judge-1"]
+            .into_iter()
+            .map(|id| ModelInfo {
+                id: id.into(),
+                provider: "judging".into(),
+                capabilities: vec![Capability::Text],
+                max_input_tokens: 4096,
+                max_output_tokens: 4096,
+            })
+            .collect()
+    }
+    fn pricing(&self, _: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 6.0,
+            cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        // The judge model returns a verdict; the reference model returns a
+        // plain answer (the off-path reference dispatch).
+        let text = if req.model == "judge-1" {
+            self.judge_calls.fetch_add(1, Ordering::Relaxed);
+            "DEGRADED — the cached answer does not address the query".to_string()
+        } else {
+            self.ref_calls.fetch_add(1, Ordering::Relaxed);
+            "a fresh reference answer".to_string()
+        };
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-judge".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text(text)),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+            },
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Err(ProviderError::Unsupported("no stream".into()))
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+/// The headline join: a response SERVED FROM L2 is judged on a detached task,
+/// and a clearly-degraded verdict evicts EXACTLY that entry so the poisoned
+/// near-duplicate can't be served again.
+///
+/// Wires the judge with `sample_rate = 1.0` (always sample) so the deterministic
+/// gate fires for every request. The served answer is the cached body; the
+/// reference is the original request re-dispatched to `counting-1`; the judge
+/// model `judge-1` returns "DEGRADED". After the hit response returns, the
+/// detached judge runs and evicts the served entry — proving the production
+/// `L2EvictionTarget` is constructed (it was previously hardcoded to `None`).
+#[tokio::test]
+async fn l2_hit_degraded_judge_verdict_evicts_the_served_entry() {
+    let ref_calls = Arc::new(AtomicUsize::new(0));
+    let judge_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(JudgingProvider {
+        ref_calls: Arc::clone(&ref_calls),
+        judge_calls: Arc::clone(&judge_calls),
+    }));
+    let cache = Arc::new(InMemoryL2Cache::new());
+
+    let primed = ChatCompletionResponse {
+        id: "chatcmpl-cached".into(),
+        object: "chat.completion".into(),
+        created: 0,
+        model: "counting-1".into(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message::Assistant {
+                content: Some(MessageContent::Text("a stale cached answer".into())),
+                tool_calls: vec![],
+                name: None,
+            },
+            finish_reason: Some("stop".into()),
+        }],
+        usage: Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+        },
+    };
+    let entry_vec = vec![1.0_f32; 1536];
+    let entry_id = Uuid::now_v7();
+    let entry = CacheEntry {
+        id: entry_id,
+        org_id: Uuid::nil(),
+        embedding: entry_vec.clone(),
+        response: serde_json::to_vec(&primed).unwrap(),
+        model: "counting-1".into(),
+        embedding_model: "fixed-embed".into(),
+        input_tokens: 100,
+        output_tokens: 50,
+        baseline_cost_usd: Some(0.0006),
+        hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
+        created_at: Utc::now(),
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+    };
+    cache.insert(entry).await.unwrap();
+
+    let embedder = Arc::new(FixedEmbedder {
+        vec: entry_vec.clone(),
+    });
+    let store = Arc::new(InMemoryJudgeBandStore::new());
+    let judge_config = JudgeConfig {
+        enabled: true,
+        sample_rate: 1.0, // always sample so the deterministic gate fires
+        judge_model: "judge-1".to_string(),
+    };
+    let state = AppState::new(registry)
+        .with_l2(cache.clone(), embedder, Some(0.99))
+        .with_quality_judge(store, judge_config);
+    let app = build_router(state);
+
+    // Paid-tier so the L2 lookup is allowed and serves the cached entry.
+    let response = app
+        .oneshot(chat_request_with_tier(
+            "counting-1",
+            false,
+            Some(CallerTier::Pro),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-tokentrimmer-cache")
+            .and_then(|v| v.to_str().ok()),
+        Some("hit-l2"),
+        "the request must be served from L2"
+    );
+    let _ = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+
+    // The judge runs on a detached task; poll the cache until the degraded
+    // verdict evicts the served entry.
+    let mut evicted = false;
+    for _ in 0..500 {
+        tokio::task::yield_now().await;
+        let still_there = cache
+            .lookup(Uuid::nil(), &entry_vec, 0.0, "counting-1", "fixed-embed")
+            .await
+            .unwrap()
+            .is_some();
+        if !still_there {
+            evicted = true;
+            break;
+        }
+    }
+    assert!(
+        evicted,
+        "a degraded judge verdict on an L2-served response must evict that entry"
+    );
+    assert_eq!(
+        ref_calls.load(Ordering::Relaxed),
+        1,
+        "the judge must re-dispatch the original request once for the reference"
+    );
+    assert_eq!(
+        judge_calls.load(Ordering::Relaxed),
+        1,
+        "the judge model must be called once"
     );
 }

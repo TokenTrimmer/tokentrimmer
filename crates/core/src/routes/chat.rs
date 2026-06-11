@@ -596,6 +596,16 @@ async fn try_l1_hit(
     }
 }
 
+/// The L2 [`tt_cache::TaskClass`] for a `POST /v1/chat/completions` request.
+///
+/// This is the single, extensible derivation point for the request's task class
+/// (V1 has exactly one class: `ChatCompletions`). A future endpoint
+/// (embeddings re-rank, messages-ingress, …) gets its own derivation and the
+/// per-class threshold map (`L2Config::class_thresholds`) keys off the result.
+fn l2_task_class_for_chat() -> Option<tt_cache::TaskClass> {
+    Some(tt_cache::TaskClass::ChatCompletions)
+}
+
 /// L2 semantic-cache lookup (step 3b). `None` falls through to dispatch.
 /// `Some(Err(_))` preserves the original `build_hit_l2_response(...)?` error
 /// propagation (a hit whose body fails to deserialize). Best-effort on the
@@ -606,6 +616,7 @@ async fn try_l1_hit(
 /// fallback for rows that predate migration 0010.
 #[allow(clippy::too_many_arguments)]
 async fn try_l2_hit(
+    state: &AppState,
     l2: &L2Config,
     ctx: &RequestContext,
     req: &ChatCompletionRequest,
@@ -615,18 +626,27 @@ async fn try_l2_hit(
     request_started: Instant,
     matched_route_id: Option<Uuid>,
     route_matched_name: Option<&str>,
+    judge_source_provider: Option<&std::sync::Arc<dyn tt_shared::Provider>>,
+    judge_source_ctx: Option<&RequestContext>,
+    judge_original_req: Option<&ChatCompletionRequest>,
 ) -> Option<ApiResult<Response>> {
     let query_text = l2_context_text(req)?;
     let query_vec = match l2.embedder.embed(&query_text).await {
         Ok(v) => v,
         Err(_) => return None,
     };
+    // Derive the L2 task class for this request. `/chat/completions` is the only
+    // v1 class; the helper is the single, extensible derivation point. The
+    // per-class threshold is floored at `l2.threshold` inside `lookup_classed`,
+    // so a classed lookup can never serve a hit below today's global bar.
+    let task_class = l2_task_class_for_chat();
     match l2
         .cache
-        .lookup(
+        .lookup_classed(
             ctx.org_id,
             &query_vec,
-            l2.threshold,
+            &l2.class_thresholds,
+            task_class,
             &req.model,
             l2.embedder.model(),
         )
@@ -637,6 +657,27 @@ async fn try_l2_hit(
                 .increment(1);
             // Cache hit — best-effort bump and return.
             let _ = l2.cache.bump_hit_count(entry.id).await;
+            // 3b-judge. Close the QualityRiskBand → L2 join: spawn the sampled
+            // async quality judge on the SERVED-FROM-L2 response. This is the
+            // dedicated judge-on-L2-hit path — the only production code path
+            // that constructs an `L2EvictionTarget`, so a clearly-degraded
+            // cached answer (a near-duplicate paraphrase that the threshold
+            // admitted but the judge rejects) gets evicted and can't be served
+            // again. Detached + deterministically sampled → zero user latency
+            // and bounded extra spend. The judge re-dispatches the ORIGINAL
+            // request to its source provider for the reference answer; an L2
+            // hit never re-runs routing, so the served (cached) model equals
+            // the requested model.
+            maybe_spawn_l2_hit_judge(
+                state,
+                l2,
+                &entry,
+                trace_id,
+                ctx.org_id,
+                judge_source_provider,
+                judge_source_ctx,
+                judge_original_req,
+            );
             // Resolve the baseline ONCE so the response headers and the
             // request_logs row report the same figure.
             let baseline_cost_usd = l2_entry_baseline(&entry, current_pricing);
@@ -1480,6 +1521,7 @@ pub async fn handler(
                 // model always equals `req.model` here (lookup filters on it).
                 let current_pricing = provider.pricing(&req.model);
                 if let Some(result) = try_l2_hit(
+                    &state,
                     l2,
                     &ctx,
                     &req,
@@ -1489,6 +1531,9 @@ pub async fn handler(
                     request_started,
                     matched_route_id,
                     route_matched_name.as_deref(),
+                    judge_source_provider.as_ref(),
+                    judge_source_ctx.as_ref(),
+                    judge_original_req.as_ref(),
                 )
                 .await
                 {
@@ -2419,6 +2464,8 @@ async fn insert_into_l2(
         output_tokens: response.usage.completion_tokens,
         baseline_cost_usd,
         hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
         created_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
     };
@@ -3181,6 +3228,129 @@ fn maybe_spawn_quality_judge(
             request: Box::new(original_req),
             ctx: Box::new(source_ctx),
         },
+        // This judge fires on the rerouted-down DISPATCH path — an L2 hit
+        // short-circuits before dispatch, so there is no served-from-L2 entry to
+        // attribute the verdict to here. The L2 judge join (`L2EvictionTarget`)
+        // is exercised by `maybe_spawn_l2_hit_judge` on the served-from-L2 path;
+        // this dispatch path carries no eviction target.
+        l2_eviction: None,
+    });
+}
+
+/// Gate + spawn the sampled async quality judge for a response **served from
+/// the L2 semantic cache** — the production code path that closes the
+/// QualityRiskBand → L2 eviction join.
+///
+/// Unlike [`maybe_spawn_quality_judge`] (which fires on a rerouted-DOWN model
+/// DOWNGRADE), this fires on a cache HIT: the served answer is the cached
+/// response, and the reference is the ORIGINAL request re-dispatched to its
+/// source provider (an L2 hit never re-runs routing, so the served model equals
+/// the requested model). The judge therefore measures whether the cached
+/// near-duplicate answer is still faithful to *this* query — exactly the
+/// cache-poisoning signal the per-class thresholds aim to keep out. A clearly
+/// degraded verdict (`High` band) evicts EXACTLY this entry via the
+/// [`qs::L2EvictionTarget`] carried on the job; Low/Medium/Unclear only record
+/// the score. Detached + deterministically sampled → zero user latency and
+/// bounded extra spend.
+///
+/// Spawns only when ALL hold:
+/// - the judge is enabled and a sink is wired,
+/// - the pre-routing source captures are present (provider/ctx/original req),
+/// - this task class (chat-completions) is in scope,
+/// - the trace falls in the deterministic sample ([`qs::should_sample`]),
+/// - the cached answer is non-empty (tool-call-only responses are skipped),
+/// - the cached body deserializes and the judge model resolves to a provider.
+#[allow(clippy::too_many_arguments)]
+fn maybe_spawn_l2_hit_judge(
+    state: &AppState,
+    l2: &L2Config,
+    entry: &CacheEntry,
+    trace_id: Uuid,
+    org_id: Uuid,
+    judge_source_provider: Option<&std::sync::Arc<dyn tt_shared::Provider>>,
+    judge_source_ctx: Option<&RequestContext>,
+    judge_original_req: Option<&ChatCompletionRequest>,
+) {
+    use crate::quality_sample as qs;
+
+    // Enable gate + the pre-routing captures (all-or-nothing).
+    let (Some(sink), Some(source_provider), Some(source_ctx), Some(original_req)) = (
+        state.judge_sink.as_ref(),
+        judge_source_provider,
+        judge_source_ctx,
+        judge_original_req,
+    ) else {
+        return;
+    };
+    if !state.judge_config.enabled {
+        return;
+    }
+    // MVP task-class filter: chat-completions only (explicit + extensible).
+    if !qs::JudgeTaskClass::ChatCompletions.is_sampled() {
+        return;
+    }
+    // Deterministic sample keyed on the trace id. Shares the dispatch-path
+    // sample rate so the combined judge spend stays within the configured
+    // budget.
+    if !qs::should_sample(trace_id, state.judge_config.sample_rate) {
+        return;
+    }
+    // The served answer is the cached response body. A body that fails to
+    // deserialize (or a tool-call-only response with no assistant text) carries
+    // nothing textual to judge — skip rather than record a meaningless verdict.
+    let Ok(cached_response) = serde_json::from_slice::<ChatCompletionResponse>(&entry.response)
+    else {
+        return;
+    };
+    let served_answer = response_assistant_text(&cached_response);
+    if served_answer.trim().is_empty() {
+        return;
+    }
+    // Resolve a provider that serves the (cheap) judge model.
+    let Some(judge_provider) = state.registry.resolve(&state.judge_config.judge_model) else {
+        tracing::warn!(
+            judge_model = %state.judge_config.judge_model,
+            "quality judge model not resolvable — skipping L2-hit sample"
+        );
+        return;
+    };
+
+    // The judge reuses the org's source-provider context for credentials.
+    let judge = std::sync::Arc::new(qs::GatewayLlmJudge::new(
+        judge_provider,
+        state.judge_config.judge_model.clone(),
+        source_ctx.clone(),
+    ));
+    let input_text = tt_shared::message_text_for_estimation(original_req);
+
+    qs::spawn_quality_judge(qs::QualityJudgeJob {
+        judge,
+        sink: sink.clone(),
+        org_id,
+        // No route fired on a cache hit — the verdict attributes to the L2 entry.
+        route_id: None,
+        request_id: trace_id,
+        // An L2 hit never re-runs routing: the served (cached) model equals the
+        // requested model.
+        requested_model: entry.model.clone(),
+        served_model: entry.model.clone(),
+        input_text,
+        served_answer,
+        // Reference = the ORIGINAL request re-dispatched off-path inside the
+        // task, so the judge scores the cached answer against a fresh answer to
+        // THIS query.
+        reference: qs::ReferenceSource::Dispatch {
+            provider: source_provider.clone(),
+            request: Box::new(original_req.clone()),
+            ctx: Box::new(source_ctx.clone()),
+        },
+        // The join the roadmap flagged: a High-band verdict evicts EXACTLY this
+        // served-from-L2 entry (single-row, never bulk); Low/Medium/Unclear only
+        // record the score.
+        l2_eviction: Some(qs::L2EvictionTarget {
+            cache: l2.cache.clone(),
+            entry_id: entry.id,
+        }),
     });
 }
 
@@ -3935,6 +4105,8 @@ mod l2_baseline_tests {
             output_tokens: 500_000,
             baseline_cost_usd,
             hit_count: 0,
+            quality_score: None,
+            judge_verdict: None,
             created_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::hours(1),
         }

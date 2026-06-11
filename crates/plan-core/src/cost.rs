@@ -76,6 +76,7 @@ mod tests {
             finish_reason: None,
             body: None,
             response_body: None,
+            task_class: Default::default(),
         }
     }
 

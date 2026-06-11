@@ -334,6 +334,7 @@ mod tests {
                 requests_unprice_able: 0,
                 l2_projections: Vec::new(),
                 l2_poisoning_candidates: 0,
+                l2_per_class: Vec::new(),
             },
             confidence_intervals: ConfidenceIntervals {
                 savings_usd_95: (3.5, 4.5),

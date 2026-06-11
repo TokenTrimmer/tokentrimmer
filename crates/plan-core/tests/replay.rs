@@ -53,6 +53,7 @@ fn make_req(
         finish_reason: None,
         body: None,
         response_body: None,
+        task_class: Default::default(),
     }
 }
 
@@ -455,6 +456,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             finish_reason: None,
             body: None,
             response_body: None,
+            task_class: Default::default(),
         };
         let baseline = cost::compute_baseline_cost(&req_template, &pricing);
         requests.push(RequestLog {

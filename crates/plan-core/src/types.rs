@@ -87,6 +87,64 @@ pub struct RequestLog {
     /// for Tier 3 quality scoring. Same opt-in + back-compat constraints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_body: Option<String>,
+    /// The L2 task class this request belongs to — used by the L2 projection to
+    /// break down per-class effectiveness. Defaults to
+    /// [`L2TaskClass::ChatCompletions`] for the v1 chat-completions corpus and
+    /// for older serialized rows that predate this field.
+    #[serde(default)]
+    pub task_class: L2TaskClass,
+}
+
+/// The L2 task class of a replayed request — the plan-core mirror of the
+/// gateway's `JudgeTaskClass` / `tt_cache::TaskClass`, kept here so the Plan can
+/// report L2 effectiveness per class without depending on those crates.
+///
+/// `#[non_exhaustive]` so additional classes can be added without breaking
+/// downstream match arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum L2TaskClass {
+    /// `POST /v1/chat/completions` — the only class in the v1 corpus.
+    ChatCompletions,
+}
+
+impl Default for L2TaskClass {
+    fn default() -> Self {
+        Self::ChatCompletions
+    }
+}
+
+impl L2TaskClass {
+    /// Stable lowercase wire string (`chat_completions`), matching the serde
+    /// representation — handy for keying report rows / telemetry.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            L2TaskClass::ChatCompletions => "chat_completions",
+        }
+    }
+}
+
+/// Per-task-class L2 effectiveness, aggregated across the whole threshold
+/// sweep. Lets the Plan answer "how well does the L2 cache work for this class
+/// of request?" — hits vs. considered, plus the poisoning-candidate count.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PerClassL2Metrics {
+    /// The task class these metrics are for.
+    pub task_class: L2TaskClass,
+    /// Requests of this class that carried an embedding (the L2-eligible
+    /// denominator), summed across every threshold in the sweep.
+    pub considered: u32,
+    /// Projected L2 hits for this class, summed across every threshold.
+    pub hits: u32,
+    /// Projected L2 misses for this class (`considered - hits`), summed across
+    /// every threshold.
+    pub misses: u32,
+    /// Count of **distinct** requests of this class that the poisoning
+    /// heuristic flagged at any threshold (deduped across the sweep, mirroring
+    /// the top-level aggregate).
+    pub poisoning_candidates: u32,
 }
 
 /// A route in the proposed config: when conditions match, route to
@@ -384,6 +442,11 @@ pub struct Aggregates {
     /// threshold sweep — see [`crate::l2_projection`] for the heuristic.
     #[serde(default)]
     pub l2_poisoning_candidates: u32,
+    /// Per-[`L2TaskClass`] L2 effectiveness breakdown. Empty when L2 projection
+    /// was skipped (no embeddings). `#[serde(default)]` keeps older plan_runs
+    /// rows / snapshots byte-identical (they decode to an empty Vec).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub l2_per_class: Vec<PerClassL2Metrics>,
 }
 
 /// 95% bootstrap CIs for the headline metrics.
@@ -471,6 +534,10 @@ pub struct L2SweepResult {
     /// per-threshold counts (which would inflate the metric up to N× for an
     /// N-threshold sweep). See [`crate::l2_projection`] for the rules.
     pub poisoning_candidates: u32,
+    /// Per-[`L2TaskClass`] effectiveness breakdown, sorted by class for
+    /// determinism. Empty when no request carried an embedding. Lets the Plan
+    /// surface L2 hit/miss/poisoning metrics by request class.
+    pub per_class: Vec<PerClassL2Metrics>,
 }
 
 /// `(provider, model)` tuple — handy for the few places that produce a

@@ -56,7 +56,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::types::{L2Projection, L2SweepResult, PlanConfig, RequestLog};
+use crate::types::{
+    L2Projection, L2SweepResult, L2TaskClass, PerClassL2Metrics, PlanConfig, RequestLog,
+};
 
 /// Live entry in a per-`(provider, model)` bucket. Kept lightweight — just
 /// the fields the cosine search + poisoning heuristic need.
@@ -107,18 +109,54 @@ pub fn project_l2_hits(requests: &[RequestLog], config: &PlanConfig) -> L2SweepR
     // BTreeSet (not HashSet) keeps the cardinality deterministic regardless of
     // insertion order.
     let mut distinct_poisoning: BTreeSet<Uuid> = BTreeSet::new();
+    // Per-class accumulators. `considered`/`hits` sum across thresholds; the
+    // poisoning set is deduped per class across the whole sweep (mirroring the
+    // top-level aggregate). BTreeMap keeps the emitted order deterministic.
+    let mut per_class: BTreeMap<L2TaskClass, ClassAccum> = BTreeMap::new();
 
     for &threshold in &config.l2_threshold_sweep {
-        let proj = run_single_threshold(&sorted, threshold, ttl, &mut distinct_poisoning);
+        let proj = run_single_threshold(
+            &sorted,
+            threshold,
+            ttl,
+            &mut distinct_poisoning,
+            &mut per_class,
+        );
         per_threshold.push(proj);
     }
 
     let poisoning_candidates = u32::try_from(distinct_poisoning.len()).unwrap_or(u32::MAX);
 
+    let per_class = per_class
+        .into_iter()
+        .map(|(task_class, acc)| {
+            let considered = acc.considered;
+            let hits = acc.hits;
+            PerClassL2Metrics {
+                task_class,
+                considered,
+                hits,
+                misses: considered.saturating_sub(hits),
+                poisoning_candidates: u32::try_from(acc.poisoning.len()).unwrap_or(u32::MAX),
+            }
+        })
+        .collect();
+
     L2SweepResult {
         per_threshold,
         poisoning_candidates,
+        per_class,
     }
+}
+
+/// Per-class running totals accumulated across the threshold sweep. `considered`
+/// and `hits` sum every threshold's contribution; `poisoning` is a deduped set
+/// of distinct flagged request ids for that class.
+#[derive(Default)]
+struct ClassAccum {
+    considered: u32,
+    hits: u32,
+    poisoning: BTreeSet<Uuid>,
 }
 
 /// Run one threshold pass. The requests slice MUST already be sorted by
@@ -134,6 +172,7 @@ fn run_single_threshold(
     threshold: f32,
     ttl: chrono::Duration,
     distinct_poisoning: &mut BTreeSet<Uuid>,
+    per_class: &mut BTreeMap<L2TaskClass, ClassAccum>,
 ) -> L2Projection {
     // BTreeMap (rather than HashMap) so iteration order — and thus any
     // future bucket-mutation order — stays deterministic. The buckets
@@ -151,6 +190,8 @@ fn run_single_threshold(
             continue;
         };
         total_considered = total_considered.saturating_add(1);
+        let class_acc = per_class.entry(req.task_class).or_default();
+        class_acc.considered = class_acc.considered.saturating_add(1);
 
         let key = (req.provider.clone(), req.model.clone());
         let bucket = active.entry(key).or_default();
@@ -170,6 +211,7 @@ fn run_single_threshold(
 
         if let Some((idx, _sim)) = best {
             hits = hits.saturating_add(1);
+            class_acc.hits = class_acc.hits.saturating_add(1);
             // Cache-poisoning heuristic: did the matched source diverge
             // from the current request's historical outcome?
             let source = &bucket[idx];
@@ -180,6 +222,7 @@ fn run_single_threshold(
                 // time so each threshold reports its own (possibly repeated)
                 // candidate.
                 distinct_poisoning.insert(req.id);
+                class_acc.poisoning.insert(req.id);
             }
             // Hits do not reset / re-insert — the original miss already
             // populated the cache. The source entry keeps its `ts`.
@@ -280,6 +323,7 @@ mod tests {
             finish_reason: finish_reason.map(String::from),
             body: None,
             response_body: None,
+            task_class: Default::default(),
         }
     }
 
@@ -430,5 +474,44 @@ mod tests {
         let cfg = PlanConfig::default(); // l2_ttl_seconds is None
         let result = project_l2_hits(&reqs, &cfg);
         assert!(result.per_threshold.is_empty());
+    }
+
+    #[test]
+    fn per_class_metrics_report_hits_misses_and_poisoning() {
+        // Identical-embedding pair: req 2 hits req 1 at every threshold, and
+        // their outcomes diverge → req 2 is a poisoning candidate. Both are
+        // ChatCompletions (the v1 default class).
+        let emb = Some(vec![1.0_f32, 0.0, 0.0]);
+        let reqs = vec![
+            req_with(1, 0, emb.clone(), Some("length"), 100),
+            req_with(2, 1, emb.clone(), Some("stop"), 100),
+        ];
+        let cfg = PlanConfig {
+            l2_ttl_seconds: Some(600),
+            l2_threshold_sweep: vec![0.90, 0.92],
+            ..PlanConfig::default()
+        };
+        let result = project_l2_hits(&reqs, &cfg);
+
+        assert_eq!(result.per_class.len(), 1, "one class present (chat)");
+        let m = &result.per_class[0];
+        assert_eq!(m.task_class, L2TaskClass::ChatCompletions);
+        // 2 thresholds × 2 considered = 4 considered; req 2 hits at both → 2 hits.
+        assert_eq!(m.considered, 4);
+        assert_eq!(m.hits, 2);
+        assert_eq!(m.misses, 2);
+        // Distinct poisoning request ids for the class, deduped across the sweep.
+        assert_eq!(m.poisoning_candidates, 1);
+    }
+
+    #[test]
+    fn per_class_metrics_empty_without_embeddings() {
+        let reqs = vec![req_with(1, 0, None, None, 10)];
+        let cfg = PlanConfig {
+            l2_ttl_seconds: Some(60),
+            ..PlanConfig::default()
+        };
+        let result = project_l2_hits(&reqs, &cfg);
+        assert!(result.per_class.is_empty());
     }
 }
