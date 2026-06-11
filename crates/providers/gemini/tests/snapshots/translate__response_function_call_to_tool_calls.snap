@@ -1,6 +1,5 @@
 ---
 source: crates/providers/gemini/tests/translate.rs
-assertion_line: 633
 expression: "&resp"
 ---
 {
