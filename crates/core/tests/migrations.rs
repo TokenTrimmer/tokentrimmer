@@ -96,6 +96,21 @@ fn migrator_includes_provider_cache_saved_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_provider_cache_tokens_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let fourteenth = migrations
+        .iter()
+        .find(|m| m.version == 14)
+        .expect("migration version 14 not found");
+    let desc = fourteenth.description.to_lowercase();
+    assert!(
+        desc.contains("cache") || desc.contains("tokens"),
+        "migration 0014 description is '{}', expected to mention cache/tokens",
+        fourteenth.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -134,4 +149,101 @@ fn migrator_includes_quality_verdicts_migration() {
         "migration 0014 description is '{}', expected to mention quality/verdicts",
         fourteenth.description,
     );
+}
+
+/// DB-gated: a real `PostgresRequestLogWriter` INSERT against the migrated
+/// schema round-trips the provider prompt-cache token columns (migration
+/// 0015), keeping NULL ("provider didn't report") distinct from 0
+/// ("provider reported zero"). Catches column-order/type drift in INSERT_SQL
+/// that the parser-based bind-count guard cannot.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn request_log_insert_round_trips_provider_cache_token_columns() {
+    use tt_telemetry::request_logs::{
+        postgres::PostgresRequestLogWriter, RequestLogRow, RequestLogWriter,
+    };
+    use uuid::Uuid;
+
+    let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+    tt_core::migrate_only(&url).await.expect("migrate");
+    let pool = tt_core::connect(&url, 2).await.expect("connect");
+    let writer = PostgresRequestLogWriter::new(pool.clone());
+
+    let base = RequestLogRow {
+        id: Uuid::now_v7(),
+        org_id: Uuid::nil(),
+        api_key_id: Uuid::nil(),
+        ts: chrono::Utc::now(),
+        provider: "test-provider".into(),
+        model: "test-1".into(),
+        input_tokens: 120,
+        output_tokens: 60,
+        cached_tokens: 80,
+        cost_usd: 0.001,
+        baseline_cost_usd: 0.001,
+        provider_cache_saved_usd: 0.0002,
+        cached: false,
+        cache_layer: None,
+        route_id: None,
+        latency_ms: 5,
+        upstream_latency_ms: None,
+        status: 200,
+        tag: Some("db-cache-tokens".into()),
+        error_class: None,
+        trace_id: None,
+        truncated: false,
+        shadow_model: None,
+        shadow_cost_usd: None,
+        traffic_split_arm: None,
+        cache_read_input_tokens: Some(80),
+        cache_creation_input_tokens: Some(20),
+    };
+    let reported_id = base.id;
+    writer.write(base.clone()).await.expect("insert reported");
+
+    let mut unreported = base.clone();
+    unreported.id = Uuid::now_v7();
+    unreported.cache_read_input_tokens = None;
+    unreported.cache_creation_input_tokens = None;
+    let unreported_id = unreported.id;
+    writer.write(unreported).await.expect("insert unreported");
+
+    let mut zero = base;
+    zero.id = Uuid::now_v7();
+    zero.cache_read_input_tokens = Some(0);
+    zero.cache_creation_input_tokens = Some(0);
+    let zero_id = zero.id;
+    writer.write(zero).await.expect("insert zero");
+
+    let fetch = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
+                "SELECT cache_read_input_tokens, cache_creation_input_tokens \
+                 FROM request_logs WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch row")
+        }
+    };
+
+    assert_eq!(fetch(reported_id).await, (Some(80), Some(20)));
+    assert_eq!(
+        fetch(unreported_id).await,
+        (None, None),
+        "unreported must persist as SQL NULL"
+    );
+    assert_eq!(
+        fetch(zero_id).await,
+        (Some(0), Some(0)),
+        "an explicit provider-reported zero must persist as 0, not NULL"
+    );
+
+    // Cleanup so reruns / other DB tests see a stable table.
+    sqlx::query("DELETE FROM request_logs WHERE tag = 'db-cache-tokens'")
+        .execute(&pool)
+        .await
+        .expect("cleanup");
 }

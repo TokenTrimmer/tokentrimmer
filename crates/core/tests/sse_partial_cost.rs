@@ -70,6 +70,20 @@ fn finish_chunk(completion_tokens: u64) -> ChatCompletionChunk {
     }
 }
 
+/// A finish chunk whose terminal usage carries raw provider cache counts.
+fn finish_chunk_with_cache(
+    completion_tokens: u64,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+) -> ChatCompletionChunk {
+    let mut chunk = finish_chunk(completion_tokens);
+    let usage = chunk.usage.as_mut().unwrap();
+    usage.cached_tokens = cache_read.unwrap_or(0);
+    usage.cache_read_input_tokens = cache_read;
+    usage.cache_creation_input_tokens = cache_creation;
+    chunk
+}
+
 // ─── Mock Provider ────────────────────────────────────────────────────────────
 
 struct MockProvider;
@@ -560,6 +574,136 @@ async fn unknown_provider_chunk_field_survives_passthrough() {
     assert!(
         text.contains("\"logprobs\""),
         "unknown per-choice chunk field must survive; body:\n{text}"
+    );
+}
+
+// ─── Provider-cache token telemetry (research Phase 0.2) ─────────────────────
+
+/// A cleanly-completed stream whose terminal usage reports raw provider cache
+/// counts persists them verbatim on the request_logs row.
+#[tokio::test]
+async fn sse_clean_completion_logs_provider_cache_token_counts() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> = vec![
+        Ok(content_chunk("Hi")),
+        Ok(finish_chunk_with_cache(42, Some(80), Some(20))),
+    ];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(make_log_ctx(Arc::clone(&writer))),
+    );
+    drain_response(response).await;
+    wait_for_rows(&writer, 1).await;
+
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(!row.truncated);
+    assert_eq!(row.cache_read_input_tokens, Some(80));
+    assert_eq!(row.cache_creation_input_tokens, Some(20));
+    // The folded column keeps its legacy semantics alongside.
+    assert_eq!(row.cached_tokens, 80);
+}
+
+/// A truncated stream (no terminal usage) logs NULL provider-cache counts —
+/// estimates are never fabricated into the raw columns.
+#[tokio::test]
+async fn sse_truncated_stream_logs_null_provider_cache_tokens() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+
+    // Content but no finish/usage chunk → truncated.
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("Hello")), Ok(content_chunk(" world"))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(make_log_ctx(Arc::clone(&writer))),
+    );
+    drain_response(response).await;
+    wait_for_rows(&writer, 1).await;
+
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(row.truncated);
+    assert_eq!(
+        row.cache_read_input_tokens, None,
+        "truncated stream must log NULL, never an estimate"
+    );
+    assert_eq!(row.cache_creation_input_tokens, None);
+}
+
+/// A terminal usage block WITHOUT raw cache fields (provider didn't report)
+/// logs NULL — Some(0) is reserved for an explicit provider-reported zero.
+#[tokio::test]
+async fn sse_clean_completion_without_cache_report_logs_null() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("Hi")), Ok(finish_chunk(42))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(make_log_ctx(Arc::clone(&writer))),
+    );
+    drain_response(response).await;
+    wait_for_rows(&writer, 1).await;
+
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(!row.truncated);
+    assert_eq!(row.cache_read_input_tokens, None);
+    assert_eq!(row.cache_creation_input_tokens, None);
+}
+
+/// Pre-fix folded chunks (cached_tokens > 0 but no raw field — e.g. a cached
+/// L1 fake-stream or an older adapter) must not regress real cache reads to
+/// NULL: the nonzero fold maps to Some(n).
+#[tokio::test]
+async fn sse_folded_nonzero_cached_tokens_maps_to_some() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockProvider) as Arc<dyn Provider>;
+
+    let mut chunk = finish_chunk(42);
+    {
+        let usage = chunk.usage.as_mut().unwrap();
+        usage.cached_tokens = 15; // folded only; raw field absent
+        usage.cache_read_input_tokens = None;
+    }
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("Hi")), Ok(chunk)];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(make_log_ctx(Arc::clone(&writer))),
+    );
+    drain_response(response).await;
+    wait_for_rows(&writer, 1).await;
+
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].cache_read_input_tokens,
+        Some(15),
+        "a nonzero fold proves real cache reads — must not regress to NULL"
     );
 }
 

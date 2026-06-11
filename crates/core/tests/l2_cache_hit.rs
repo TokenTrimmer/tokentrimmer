@@ -305,7 +305,10 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
     }
 
     let embedder = Arc::new(FixedEmbedder { vec: entry_vec });
-    let state = AppState::new(registry).with_l2(cache.clone(), embedder, Some(0.99));
+    let log_writer = Arc::new(tt_telemetry::request_logs::InMemoryRequestLogWriter::new());
+    let state = AppState::new(registry)
+        .with_l2(cache.clone(), embedder, Some(0.99))
+        .with_request_log_writer(log_writer.clone());
     let app = build_router(state);
 
     // L2 lookup is paid-tier only; inject a Pro-tier context so the hit fires.
@@ -369,6 +372,23 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
     let bytes = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["id"], "chatcmpl-cached");
+
+    // The L2-hit request_logs row: cache_layer=l2, and the provider-cache
+    // token columns are NULL — a TT hit makes no provider call at serve time,
+    // so echoing stored counts would double-count provider cache reads.
+    for _ in 0..20 {
+        if !log_writer.rows().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let rows = log_writer.rows();
+    assert_eq!(rows.len(), 1, "expected exactly one L2-hit telemetry row");
+    let row = &rows[0];
+    assert_eq!(row.cache_layer.as_deref(), Some("l2"));
+    assert!(row.cached);
+    assert_eq!(row.cache_read_input_tokens, None);
+    assert_eq!(row.cache_creation_input_tokens, None);
 }
 
 /// A legacy L2 row (inserted before migration 0010, `baseline_cost_usd: None`)

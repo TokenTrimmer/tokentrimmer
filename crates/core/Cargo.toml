@@ -79,6 +79,10 @@ tower = { workspace = true }
 serde_json.workspace = true
 httpmock.workspace = true
 tt-retrieval.workspace = true
+# DB-gated migrations test: drive a real PostgresRequestLogWriter INSERT
+# against the migrated schema (catches column-order/type drift that the
+# parser-based bind-count guard cannot).
+tt-telemetry = { workspace = true, features = ["postgres"] }
 reqwest.workspace = true
 # Traceparent-ingest test: in-memory span exporter + a scoped tracing-opentelemetry
 # subscriber to capture the gateway request span's trace_id/parent_span_id.

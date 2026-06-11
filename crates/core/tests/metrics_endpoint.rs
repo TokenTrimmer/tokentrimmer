@@ -152,6 +152,139 @@ mod nopricing {
     }
 }
 
+mod cachereporting {
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use futures::stream::BoxStream;
+    use tt_shared::messages::{Choice, Message, MessageContent};
+    use tt_shared::pricing::Capability;
+    use tt_shared::{
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
+        EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+        Usage,
+    };
+
+    /// A provider whose usage block reports provider prompt-cache reads/writes.
+    pub struct CacheReportingEcho;
+
+    #[async_trait]
+    impl Provider for CacheReportingEcho {
+        fn id(&self) -> &'static str {
+            "cachereporting"
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                id: "cr-1".into(),
+                provider: "cachereporting".into(),
+                capabilities: vec![Capability::Text],
+                max_input_tokens: 4096,
+                max_output_tokens: 4096,
+            }]
+        }
+        fn pricing(&self, _: &str) -> Option<ModelPricing> {
+            Some(ModelPricing {
+                input_per_million: 3.0,
+                output_per_million: 6.0,
+                cached_input_per_million: Some(0.3),
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: Utc::now(),
+            })
+        }
+        async fn chat_completion(
+            &self,
+            req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            Ok(ChatCompletionResponse {
+                id: "chatcmpl-cr".into(),
+                object: "chat.completion".into(),
+                created: 0,
+                model: req.model,
+                choices: vec![Choice {
+                    index: 0,
+                    message: Message::Assistant {
+                        content: Some(MessageContent::Text("ok".into())),
+                        tool_calls: vec![],
+                        name: None,
+                    },
+                    finish_reason: Some("stop".into()),
+                }],
+                usage: Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 10,
+                    total_tokens: 110,
+                    cached_tokens: 80,
+                    cache_creation_input_tokens: Some(20),
+                    cache_read_input_tokens: Some(80),
+                },
+            })
+        }
+        async fn chat_completion_stream(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+        async fn embeddings(
+            &self,
+            _req: EmbeddingsRequest,
+            _ctx: &RequestContext,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+    }
+}
+
+/// A dispatch whose provider reports prompt-cache reads/writes surfaces the
+/// per-route provider-cache counters on /metrics (presence-only — the
+/// recorder is shared across this test binary).
+#[tokio::test]
+async fn provider_cache_usage_counters_recorded() {
+    use std::sync::Arc;
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(cachereporting::CacheReportingEcho));
+    let app = build_router(AppState::new(registry));
+
+    let body = serde_json::json!({
+        "model": "cr-1",
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (_s, _h, metrics_body) = get(app, "/metrics").await;
+    assert!(
+        metrics_body.contains("provider_cache_read_tokens_total"),
+        "cache read counter missing: {metrics_body}"
+    );
+    assert!(
+        metrics_body.contains("provider_cache_write_tokens_total"),
+        "cache write counter missing: {metrics_body}"
+    );
+    assert!(
+        metrics_body.contains("provider_cache_requests_total"),
+        "cache requests counter missing: {metrics_body}"
+    );
+    assert!(
+        metrics_body.contains("result=\"hit\""),
+        "hit result label missing: {metrics_body}"
+    );
+}
+
 #[tokio::test]
 async fn provider_and_catalog_metrics_recorded() {
     use std::sync::Arc;
