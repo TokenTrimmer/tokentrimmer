@@ -232,6 +232,17 @@ upstreams unchanged rather than being dropped. (TokenTrimmer-internal
   distinct from the always-present folded `cached_tokens`. The same additive
   fields appear on streamed usage chunks (final/`include_usage`); the
   `tokentrimmer.usage` cost frame keeps its exact 7-key shape unchanged.
+  Two caveats: (1) on streams, if the upstream reported only a folded
+  `cached_tokens > 0` without the raw field (an older TokenTrimmer hop or
+  pre-fix adapter), the gateway reconstructs `cache_read_input_tokens` from
+  that fold — the value still reflects provider-reported cache reads, never a
+  fabrication; (2) TokenTrimmer L1/L2 cache hits replay the original miss's
+  stored usage verbatim (like every other usage field), so on a hit these
+  fields describe the provider call that produced the cached response — no
+  provider call happened on the hit itself, and the telemetry ledger logs
+  NULL for hit rows. Clients reconciling per-request provider cache reads
+  from response bodies should exclude replayed responses
+  (`x-tokentrimmer-cache: hit-l1` / `hit-l2`).
 - `model` reflects the *actually used* model, which may differ from the requested model if a route rewrote it
 
 ### 3.4 Response (streaming)
