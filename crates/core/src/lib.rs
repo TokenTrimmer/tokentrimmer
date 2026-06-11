@@ -10,6 +10,7 @@ pub(crate) mod measurement;
 pub mod metrics;
 pub mod middleware;
 pub mod passes;
+pub mod quality_persist;
 pub mod quality_sample;
 pub mod registry;
 pub mod retry;

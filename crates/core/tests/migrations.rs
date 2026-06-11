@@ -120,3 +120,18 @@ async fn migrate_only_applies_schema() {
     .expect("query");
     assert!(exists, "request_logs table should exist after migrate_only");
 }
+
+#[test]
+fn migrator_includes_quality_verdicts_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let fourteenth = migrations
+        .iter()
+        .find(|m| m.version == 14)
+        .expect("migration version 14 not found");
+    let desc = fourteenth.description.to_lowercase();
+    assert!(
+        desc.contains("quality") || desc.contains("verdicts"),
+        "migration 0014 description is '{}', expected to mention quality/verdicts",
+        fourteenth.description,
+    );
+}
