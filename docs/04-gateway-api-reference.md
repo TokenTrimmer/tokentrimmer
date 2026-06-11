@@ -224,6 +224,14 @@ upstreams unchanged rather than being dropped. (TokenTrimmer-internal
 
 **TokenTrimmer additions:**
 - `usage.cached_tokens` is always present (0 if no caching applied)
+- `usage.cache_read_input_tokens` / `usage.cache_creation_input_tokens` — raw
+  provider-reported prompt-cache token counts (Anthropic cache fields, OpenAI
+  `prompt_tokens_details.cached_tokens`, Gemini `cachedContentTokenCount`).
+  Present **only when the provider reported the field** — omitted means
+  "unreported", `0` means the provider explicitly reported zero. This is
+  distinct from the always-present folded `cached_tokens`. The same additive
+  fields appear on streamed usage chunks (final/`include_usage`); the
+  `tokentrimmer.usage` cost frame keeps its exact 7-key shape unchanged.
 - `model` reflects the *actually used* model, which may differ from the requested model if a route rewrote it
 
 ### 3.4 Response (streaming)
