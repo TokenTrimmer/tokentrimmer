@@ -160,7 +160,8 @@ async fn spend_cap_returns_429_after_spend_recorded() {
         "over-cap request should 429"
     );
     assert!(
-        r2.headers().contains_key("x-tt-budget-remaining-usd"),
+        r2.headers()
+            .contains_key("x-tokentrimmer-budget-remaining-usd"),
         "429 should carry the budget-remaining header"
     );
 }

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 
@@ -209,6 +210,12 @@ class TokenTrimmer(OpenAI):
         base_url: str = DEFAULT_BASE_URL,
         **kwargs: Any,
     ) -> None:
+        # API-key precedence: explicit `api_key` arg > TOKENTRIMMER_API_KEY env >
+        # the base OpenAI SDK's own OPENAI_API_KEY fallback (which kicks in when
+        # we pass api_key=None). We only consult TOKENTRIMMER_API_KEY when the
+        # caller passed no key, so an explicit argument always wins.
+        if api_key is None:
+            api_key = os.environ.get("TOKENTRIMMER_API_KEY")
         super().__init__(api_key=api_key, base_url=base_url, **kwargs)
         self._wrap_chat_completions()
 

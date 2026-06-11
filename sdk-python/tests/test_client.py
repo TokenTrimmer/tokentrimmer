@@ -303,3 +303,35 @@ def test_streaming_without_usage_frame_still_works():
     chunks = list(stream)
     assert chunks[0].choices[0].delta.content == "hi"
     assert stream.tt is None
+
+
+# --- API-key resolution -----------------------------------------------------
+# Precedence: explicit api_key arg > TOKENTRIMMER_API_KEY > OPENAI_API_KEY.
+
+
+def test_explicit_api_key_wins_over_env(monkeypatch):
+    monkeypatch.setenv("TOKENTRIMMER_API_KEY", "tt_from_env")
+    monkeypatch.setenv("OPENAI_API_KEY", "tt_from_openai_env")
+    client = TokenTrimmer(api_key="tt_explicit", base_url=GATEWAY)
+    assert client.api_key == "tt_explicit"
+
+
+def test_tokentrimmer_env_used_when_arg_absent(monkeypatch):
+    monkeypatch.setenv("TOKENTRIMMER_API_KEY", "tt_from_env")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    client = TokenTrimmer(base_url=GATEWAY)
+    assert client.api_key == "tt_from_env"
+
+
+def test_tokentrimmer_env_takes_precedence_over_openai_env(monkeypatch):
+    monkeypatch.setenv("TOKENTRIMMER_API_KEY", "tt_from_env")
+    monkeypatch.setenv("OPENAI_API_KEY", "tt_from_openai_env")
+    client = TokenTrimmer(base_url=GATEWAY)
+    assert client.api_key == "tt_from_env"
+
+
+def test_falls_back_to_openai_env_when_no_tokentrimmer_key(monkeypatch):
+    monkeypatch.delenv("TOKENTRIMMER_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "tt_from_openai_env")
+    client = TokenTrimmer(base_url=GATEWAY)
+    assert client.api_key == "tt_from_openai_env"

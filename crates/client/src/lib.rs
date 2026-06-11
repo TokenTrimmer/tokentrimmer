@@ -319,6 +319,10 @@ pub struct Client {
 impl Client {
     /// New client for `base` (e.g. `https://api.tokentrimmer.com`) with `key`.
     ///
+    /// API-key precedence: the explicit `key` argument wins; pass an EMPTY string
+    /// to fall back to the `TOKENTRIMMER_API_KEY` environment variable (also empty
+    /// if that is unset — the gateway then rejects the request with `401`).
+    ///
     /// Uses safe defaults: a 10s connect timeout, a 10-minute read-inactivity
     /// timeout (aborts a gateway that goes silent — incl. before the first byte —
     /// for 10 min, so a hung connection can't hang the caller forever, while
@@ -336,6 +340,13 @@ impl Client {
             // Keep `new` infallible; the only failure is a rare TLS-backend init
             // error, where the plain default client is no worse than today.
             .unwrap_or_else(|_| reqwest::Client::new());
+        // Explicit key wins; an empty key falls back to TOKENTRIMMER_API_KEY.
+        let mut key = key.into();
+        if key.is_empty() {
+            if let Ok(env_key) = std::env::var("TOKENTRIMMER_API_KEY") {
+                key = env_key;
+            }
+        }
         Self::with_http_client(http, base, key)
     }
 
@@ -1339,5 +1350,70 @@ mod tests {
         // configured timeouts, so this only guards against a build/panic
         // regression — the read-timeout behaviour is covered by the test above.)
         let _client = Client::new("http://127.0.0.1:0", "tt_test_k");
+    }
+
+    // --- API-key resolution -------------------------------------------------
+    // Precedence: an explicit `key` arg wins; an EMPTY key falls back to the
+    // `TOKENTRIMMER_API_KEY` env var. These tests mutate that process-global env
+    // var, so they serialize on a shared lock (the multi-threaded runner would
+    // otherwise race them). The `tests` module lives inside the crate, so it can
+    // read `Client`'s private `key` field directly — the most precise assertion
+    // of what `new` resolved (no network needed).
+    static KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn explicit_key_wins_over_env() {
+        let _guard = KEY_ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("TOKENTRIMMER_API_KEY", "tt_from_env");
+        let client = Client::new("http://127.0.0.1:0", "tt_explicit");
+        std::env::remove_var("TOKENTRIMMER_API_KEY");
+        assert_eq!(client.key, "tt_explicit");
+    }
+
+    #[test]
+    fn empty_key_falls_back_to_env() {
+        let _guard = KEY_ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("TOKENTRIMMER_API_KEY", "tt_from_env");
+        let client = Client::new("http://127.0.0.1:0", "");
+        std::env::remove_var("TOKENTRIMMER_API_KEY");
+        assert_eq!(client.key, "tt_from_env");
+    }
+
+    #[test]
+    fn empty_key_with_no_env_stays_empty() {
+        let _guard = KEY_ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("TOKENTRIMMER_API_KEY");
+        // No explicit key and no env var → the key stays empty (the gateway then
+        // rejects the request with 401). Crucially it must NOT pick up a stale
+        // value from anywhere.
+        let client = Client::new("http://127.0.0.1:0", "");
+        assert_eq!(client.key, "");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn resolved_env_key_is_sent_as_bearer() {
+        // End-to-end check that the env-resolved key reaches the wire as the
+        // Authorization bearer (complements the field-level tests above).
+        let _guard = KEY_ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("TOKENTRIMMER_API_KEY", "tt_from_env");
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("authorization", "Bearer tt_from_env");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(sample_response());
+        });
+        let result = Client::new(server.base_url(), "")
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .send()
+            .await;
+        std::env::remove_var("TOKENTRIMMER_API_KEY");
+        result.unwrap();
+        m.assert();
     }
 }

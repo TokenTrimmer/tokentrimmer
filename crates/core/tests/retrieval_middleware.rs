@@ -1,15 +1,15 @@
 //! Integration tests for the retrieval middleware activation.
 //!
 //! Test 1: retrieval disabled (no state) — request forwarded unchanged,
-//!         `x-tt-retrieval-enabled: disabled` header present.
+//!         `x-tokentrimmer-retrieval-enabled: disabled` header present.
 //!
 //! Test 2: retrieval enabled (injected MemoryStore + mock embedding server)
 //!         with a request body containing `<retrievable ...>` — forwarded body
 //!         has chunk text substituted in, response carries
-//!         `x-tt-retrieval-tokens-saved` header.
+//!         `x-tokentrimmer-retrieval-tokens-saved` header.
 //!
 //! Test 3: retrieval enabled but no `<retrievable` tag present — forwarded
-//!         unchanged, header `x-tt-retrieval-enabled: ready`.
+//!         unchanged, header `x-tokentrimmer-retrieval-enabled: ready`.
 
 use std::sync::Arc;
 
@@ -136,7 +136,7 @@ fn app_with_echo(retrieval: Option<RetrievalState>) -> axum::Router {
 // ── Test 1 ─────────────────────────────────────────────────────────────────
 
 /// When no retrieval state is provided (disabled path), the request is forwarded
-/// unchanged and the response carries `x-tt-retrieval-enabled: disabled`.
+/// unchanged and the response carries `x-tokentrimmer-retrieval-enabled: disabled`.
 #[tokio::test]
 async fn retrieval_disabled_sets_disabled_header() {
     let app = app_with_echo(None);
@@ -160,7 +160,7 @@ async fn retrieval_disabled_sets_disabled_header() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()
-            .get("x-tt-retrieval-enabled")
+            .get("x-tokentrimmer-retrieval-enabled")
             .and_then(|v| v.to_str().ok()),
         Some("disabled"),
         "disabled header must be present when retrieval is not configured"
@@ -171,7 +171,7 @@ async fn retrieval_disabled_sets_disabled_header() {
 
 /// When retrieval is enabled and the request body has a `<retrievable>` tag,
 /// the middleware substitutes the tag with the retrieved chunk text and sets
-/// `x-tt-retrieval-tokens-saved` in the response.
+/// `x-tokentrimmer-retrieval-tokens-saved` in the response.
 #[tokio::test]
 async fn retrieval_enabled_substitutes_retrievable_tag() {
     // Start a mock embedding server.
@@ -261,12 +261,12 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
     //   net_saved     = 20 − 7 = 13
     let tokens_saved_str = resp
         .headers()
-        .get("x-tt-retrieval-tokens-saved")
-        .expect("x-tt-retrieval-tokens-saved header must be present on successful substitution")
+        .get("x-tokentrimmer-retrieval-tokens-saved")
+        .expect("x-tokentrimmer-retrieval-tokens-saved header must be present on successful substitution")
         .to_str()
         .unwrap();
     let tokens_saved: i64 = tokens_saved_str.parse().unwrap_or_else(|_| {
-        panic!("x-tt-retrieval-tokens-saved must be an integer; got {tokens_saved_str:?}")
+        panic!("x-tokentrimmer-retrieval-tokens-saved must be an integer; got {tokens_saved_str:?}")
     });
     assert_eq!(
         tokens_saved, 13,
@@ -274,17 +274,17 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
     );
     assert_eq!(
         resp.headers()
-            .get("x-tt-retrieval-enabled")
+            .get("x-tokentrimmer-retrieval-enabled")
             .and_then(|v| v.to_str().ok()),
         Some("active"),
-        "x-tt-retrieval-enabled must be 'active' when substitution ran"
+        "x-tokentrimmer-retrieval-enabled must be 'active' when substitution ran"
     );
     assert_eq!(
         resp.headers()
-            .get("x-tt-retrieval-substitutions")
+            .get("x-tokentrimmer-retrieval-substitutions")
             .and_then(|v| v.to_str().ok()),
         Some("1"),
-        "x-tt-retrieval-substitutions must be '1'"
+        "x-tokentrimmer-retrieval-substitutions must be '1'"
     );
 
     // The echo provider returns the (now-substituted) user content as the
@@ -308,7 +308,7 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
 // ── Test 3 ─────────────────────────────────────────────────────────────────
 
 /// When retrieval is enabled but the request has no `<retrievable` tag,
-/// the request is forwarded unchanged with `x-tt-retrieval-enabled: ready`.
+/// the request is forwarded unchanged with `x-tokentrimmer-retrieval-enabled: ready`.
 #[tokio::test]
 async fn retrieval_enabled_no_tag_sets_ready_header() {
     let emb_server = MockServer::start_async().await;
@@ -345,13 +345,15 @@ async fn retrieval_enabled_no_tag_sets_ready_header() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()
-            .get("x-tt-retrieval-enabled")
+            .get("x-tokentrimmer-retrieval-enabled")
             .and_then(|v| v.to_str().ok()),
         Some("ready"),
         "header must be 'ready' when enabled but no tag present"
     );
     assert!(
-        !resp.headers().contains_key("x-tt-retrieval-tokens-saved"),
+        !resp
+            .headers()
+            .contains_key("x-tokentrimmer-retrieval-tokens-saved"),
         "tokens-saved header must not be set when no substitution ran"
     );
 }

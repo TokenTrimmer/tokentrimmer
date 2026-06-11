@@ -802,14 +802,20 @@ DELETE /v1/routes/:id      → delete a route
 
 ## 11. SDKs
 
-TokenTrimmer ships official SDKs that wrap the official OpenAI and Anthropic SDKs and add convenience:
+TokenTrimmer ships official SDKs. The Python and TypeScript SDKs are thin
+subclasses of the official OpenAI SDK (default `base_url` → TokenTrimmer, plus
+`tt_*` convenience params and a parsed `.tt` cost accessor); the Rust
+`tokentrimmer-client` crate is a standalone typed client. All three resolve the
+API key in the same order: an explicit constructor argument wins, then the
+`TOKENTRIMMER_API_KEY` environment variable (the Python/TypeScript SDKs then
+fall back to the OpenAI SDK's own `OPENAI_API_KEY`).
 
 ### 11.1 Python
 
 ```python
-from tokentrimmer import Client
+from tokentrimmer import TokenTrimmer
 
-client = Client(api_key="tt_live_...")
+client = TokenTrimmer(api_key="tt_live_...")  # or set TOKENTRIMMER_API_KEY
 
 # Standard chat completion
 response = client.chat.completions.create(
@@ -827,7 +833,7 @@ print(response.tt.cost_usd, response.tt.saved_usd, response.tt.cache)
 ```typescript
 import { TokenTrimmer } from '@tokentrimmer/client';
 
-const client = new TokenTrimmer({ apiKey: 'tt_live_...' });
+const client = new TokenTrimmer({ apiKey: 'tt_live_...' }); // or set TOKENTRIMMER_API_KEY
 
 const response = await client.chat.completions.create({
   model: 'claude-3-5-sonnet',
@@ -838,7 +844,30 @@ const response = await client.chat.completions.create({
 console.log(response.tt.costUsd, response.tt.savedUsd, response.tt.cache);
 ```
 
-Both SDKs are thin — the underlying request goes through the OpenAI/Anthropic SDK, with `base_url` set to TokenTrimmer. Customers can also use the OpenAI SDK directly without the TokenTrimmer wrapper.
+The Python and TypeScript SDKs are thin — the underlying request goes through the OpenAI SDK, with `base_url` set to TokenTrimmer. Customers can also use the OpenAI SDK directly (point its `base_url` at the gateway) without the TokenTrimmer wrapper.
+
+### 11.3 Rust
+
+The `tokentrimmer-client` crate (`tt-client`) is a standalone typed client (it does not wrap another SDK). `Client::new` reads `TOKENTRIMMER_API_KEY` when you pass an empty key.
+
+```rust
+use tt_client::{user, Client};
+
+// Pass an empty key to read TOKENTRIMMER_API_KEY from the environment.
+let client = Client::new("https://api.tokentrimmer.com", "");
+
+let outcome = client
+    .chat()
+    .model("claude-3-5-sonnet")
+    .message(user("Hello"))
+    .tag("feature=onboarding") // X-TokenTrimmer-Tag
+    .send()
+    .await?;
+
+println!("{:?}", outcome.text());
+// Cost/savings parsed from the x-tokentrimmer-* response headers.
+println!("{:?} {:?}", outcome.cost.cost_usd, outcome.cost.saved_usd);
+```
 
 ---
 
