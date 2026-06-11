@@ -8,11 +8,13 @@ on:
   pull_request:
     paths:
       - 'scripts/*.sh'
+      - 'scripts/benchmarks/**/*.sh'
       - '.github/workflows/shellcheck.yml'
   push:
     branches: [main]
     paths:
       - 'scripts/*.sh'
+      - 'scripts/benchmarks/**/*.sh'
       - '.github/workflows/shellcheck.yml'
 
 jobs:
@@ -25,4 +27,5 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: Lint scripts (severity=warning)
-        run: shellcheck --severity=warning scripts/*.sh
+        # -x lets shellcheck follow the `source`d benchmark lib.sh.
+        run: shellcheck -x --severity=warning scripts/*.sh scripts/benchmarks/*.sh scripts/benchmarks/litellm/*.sh

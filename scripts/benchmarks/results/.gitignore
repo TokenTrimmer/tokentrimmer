@@ -1,0 +1,6 @@
+# Every benchmark RUN regenerates these — don't track run output. The curated,
+# self-documenting `baseline.csv` (machine/date labeled in its header) is the
+# single tracked result; force-keep it below.
+*.csv
+*.csv.prov
+!baseline.csv

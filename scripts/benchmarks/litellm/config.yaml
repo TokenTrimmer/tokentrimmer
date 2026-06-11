@@ -1,0 +1,25 @@
+# LiteLLM proxy config for the overhead benchmark.
+#
+# Points a single OpenAI-compatible model at the mock upstream so we measure
+# LiteLLM's proxy dispatch overhead — NOT a real provider. `api_base` is set to
+# the mock via the LITELLM_MOCK_BASE env var injected by run.sh.
+#
+# Version-pinned image: see run.sh (LITELLM_IMAGE). Keep this config and that
+# pin in lockstep so results are reproducible.
+model_list:
+  - model_name: mock-model
+    litellm_params:
+      model: openai/mock-model
+      api_base: os.environ/LITELLM_MOCK_BASE
+      api_key: sk-mock-anything
+
+litellm_settings:
+  drop_params: true
+  # Disable LiteLLM's own caching so we measure the steady-state dispatch path,
+  # matching how the TokenTrimmer harness runs with its cache bypassed.
+  cache: false
+
+general_settings:
+  # No master key / DB — keep the proxy stateless so the benchmark isolates
+  # request dispatch, not auth-store round-trips.
+  disable_spend_logs: true

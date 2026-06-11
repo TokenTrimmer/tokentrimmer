@@ -1,0 +1,56 @@
+name: benchmark-nightly
+
+# Non-blocking, scheduled proxy-OVERHEAD benchmark.
+#
+# This is NOT a PR gate. It never runs on `pull_request`, gates nothing, and
+# cannot fail a merge. It runs the TokenTrimmer harness against the null mock
+# upstream on a schedule (and on manual dispatch) purely to track the overhead
+# trend over time, uploading the CSV as an artifact.
+#
+# It deliberately does NOT run the LiteLLM comparison (Docker pull is heavy and
+# competitor numbers must not be auto-committed) — that stays a run-it-yourself
+# script. See scripts/benchmarks/README.md.
+
+on:
+  schedule:
+    # 07:00 UTC daily — off the PR critical path.
+    - cron: '0 7 * * *'
+  workflow_dispatch: {}
+
+# No special permissions needed; read-only checkout + artifact upload.
+permissions:
+  contents: read
+
+jobs:
+  overhead:
+    name: proxy-overhead (TokenTrimmer vs null upstream)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install oha
+        run: cargo install oha --locked --version 1.14.0
+
+      - name: Build tt (release)
+        run: cargo build --release -p tt-cli --bin tt
+
+      - name: Run benchmark suite (TokenTrimmer only)
+        env:
+          SKIP_BUILD: '1'
+          BENCH_DURATION: '20s'
+          BENCH_CONCURRENCY: '20'
+        run: ./scripts/benchmarks/run-all.sh
+
+      - name: Upload results CSV
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: proxy-overhead-results
+          path: |
+            scripts/benchmarks/results/results.csv
+            scripts/benchmarks/results/results.csv.prov
+          if-no-files-found: warn
