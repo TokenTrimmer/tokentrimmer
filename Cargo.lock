@@ -5520,6 +5520,7 @@ dependencies = [
  "tt-inspect-rules-tier1",
  "tt-plan-core",
  "tt-preview",
+ "tt-routing",
  "tt-shared",
  "tt-telemetry",
  "url",
