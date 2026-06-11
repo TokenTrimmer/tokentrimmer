@@ -9,10 +9,13 @@
 //!   not appear in `messages`.
 //! - **`max_tokens` is required** — defaults to 4096 if omitted.
 //! - **Auto cache_control**: `cache_control: { type: "ephemeral" }` is applied
-//!   to the system prefix only when its estimated token count meets the
-//!   model's per-model prompt-cache minimum (`prompt_cache_min_tokens` from the
-//!   pricing catalog; 1024–4096 tokens). Below that minimum Anthropic silently
-//!   refuses to cache, so injecting a breakpoint would be a no-op.
+//!   to the system prefix when its estimated token count meets the model's
+//!   per-model prompt-cache minimum (`prompt_cache_min_tokens` from the pricing
+//!   catalog; 1024–4096 tokens). Below that minimum Anthropic silently refuses
+//!   to cache, so injecting a breakpoint would be a no-op. On **multi-turn**
+//!   conversations a second breakpoint is placed on the last message so the
+//!   recurring history is a cache-READ on the next turn (Anthropic, unlike
+//!   OpenAI, never auto-caches) — see `maybe_inject_message_cache_control`.
 //! - **Tool format** differs: OpenAI `{type, function:{name,description,parameters}}`
 //!   → Anthropic `{name, description, input_schema}`.
 //! - **`tool_choice`**: OpenAI `auto` string → `{type:"auto"}`, specific →
@@ -80,20 +83,47 @@ pub struct AnthropicMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicContentBlock {
     /// Plain text.
-    Text { text: String },
+    Text {
+        text: String,
+        /// Prompt-cache breakpoint; set only on the last block of the last
+        /// message (see `maybe_inject_message_cache_control`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
     /// Image from a URL.
-    Image { source: AnthropicImageSource },
+    Image {
+        source: AnthropicImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
     /// A tool call initiated by the assistant.
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     /// A tool result sent back in a user turn.
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
+}
+
+impl AnthropicContentBlock {
+    /// Place a prompt-cache breakpoint on this block, regardless of variant.
+    fn set_cache_control(&mut self, cc: AnthropicCacheControl) {
+        let slot = match self {
+            AnthropicContentBlock::Text { cache_control, .. }
+            | AnthropicContentBlock::Image { cache_control, .. }
+            | AnthropicContentBlock::ToolUse { cache_control, .. }
+            | AnthropicContentBlock::ToolResult { cache_control, .. } => cache_control,
+        };
+        *slot = Some(cc);
+    }
 }
 
 /// Image source descriptor for Anthropic: a remote `url` or inline `base64`
@@ -267,6 +297,7 @@ pub fn translate_request(
                         id: tc.id,
                         name: tc.function.name,
                         input,
+                        cache_control: None,
                     });
                 }
                 messages.push(AnthropicMessage {
@@ -284,6 +315,7 @@ pub fn translate_request(
                     content: vec![AnthropicContentBlock::ToolResult {
                         tool_use_id: tool_call_id,
                         content: text,
+                        cache_control: None,
                     }],
                 });
             }
@@ -297,6 +329,13 @@ pub fn translate_request(
     // is cached. The minimum lives in the pricing catalog as
     // `prompt_cache_min_tokens`; see `maybe_inject_cache_control`.
     maybe_inject_cache_control(&mut system_blocks, &req.model);
+
+    // Also cache the recurring conversation prefix on multi-turn chats: place a
+    // breakpoint on the last message so the settled history is a cache-READ on
+    // the next turn instead of full-price re-sent input. Anthropic requires an
+    // explicit breakpoint here (unlike OpenAI's automatic prefix caching), so
+    // without this the entire growing history is billed at 1.0x every turn.
+    maybe_inject_message_cache_control(&mut messages, &system_blocks, &req.model);
 
     // `max_tokens` is required by Anthropic and is its output cap. Honor the
     // caller's spend cap from either `max_tokens` or the newer
@@ -440,6 +479,85 @@ fn maybe_inject_cache_control(system_blocks: &mut [AnthropicSystemBlock], model:
     }
 }
 
+/// Estimated tokens of a single message's textual content. Images contribute
+/// real tokens but are hard to size here, so they're ignored — undercounting
+/// keeps us on the safe side of the cache-min gate, matching the system-prefix
+/// estimator's deliberate undercount.
+fn estimate_message_tokens(m: &AnthropicMessage) -> u32 {
+    m.content
+        .iter()
+        .map(|b| match b {
+            AnthropicContentBlock::Text { text, .. } => {
+                tt_tokenize::estimate_tokens("anthropic", text)
+            }
+            AnthropicContentBlock::ToolResult { content, .. } => {
+                tt_tokenize::estimate_tokens("anthropic", content)
+            }
+            AnthropicContentBlock::ToolUse { name, input, .. } => {
+                tt_tokenize::estimate_tokens("anthropic", name)
+                    + tt_tokenize::estimate_tokens("anthropic", &input.to_string())
+            }
+            AnthropicContentBlock::Image { .. } => 0,
+        })
+        .sum()
+}
+
+/// Inject a `cache_control` breakpoint on the last block of the last message so
+/// the recurring conversation prefix (system + tools + settled history) is a
+/// cache-READ on subsequent turns instead of full-price re-sent input. Anthropic
+/// caches everything up to and including the marked block via exact-prefix
+/// matching; the next turn shares this prefix and reads it at ~0.1x. This is the
+/// dominant cost on long Anthropic chats, where the re-sent history grows
+/// ~quadratically and — without an explicit breakpoint here — is billed at full
+/// price every turn (Anthropic, unlike OpenAI, does not auto-cache).
+///
+/// Gated on TWO conditions so it never makes a one-shot call *more* expensive:
+/// 1. the conversation is already multi-turn (contains an assistant message) — a
+///    first single-shot request would pay the 1.25x cache-WRITE premium with no
+///    later read to amortize it;
+/// 2. the total estimated prefix (system + messages) clears the model's
+///    prompt-cache minimum, mirroring the system-block gate (below the minimum
+///    Anthropic silently refuses to cache, so a breakpoint would be a no-op).
+///
+/// The system-prefix breakpoint from [`maybe_inject_cache_control`] is kept
+/// alongside this one: it is a *durable* cache of the unchanging system/tools
+/// prefix, while this message breakpoint is the *rolling* cache of the history.
+/// Two breakpoints is well within Anthropic's limit of four.
+fn maybe_inject_message_cache_control(
+    messages: &mut [AnthropicMessage],
+    system_blocks: &[AnthropicSystemBlock],
+    model: &str,
+) {
+    // Only cache an ongoing conversation, never a one-shot request.
+    if !messages.iter().any(|m| m.role == "assistant") {
+        return;
+    }
+
+    let min_tokens = cache_min_tokens_for_model(model);
+    let system_tokens: u32 = system_blocks
+        .iter()
+        .map(|b| tt_tokenize::estimate_tokens("anthropic", &b.text))
+        .sum();
+    let message_tokens: u32 = messages.iter().map(estimate_message_tokens).sum();
+    let prefix_tokens = system_tokens.saturating_add(message_tokens);
+
+    if prefix_tokens < min_tokens {
+        tracing::debug!(
+            model,
+            prefix_tokens,
+            min_tokens,
+            "conversation prefix below model prompt-cache minimum — skipping message cache_control"
+        );
+        return;
+    }
+
+    if let Some(last_block) = messages.last_mut().and_then(|m| m.content.last_mut()) {
+        last_block.set_cache_control(AnthropicCacheControl {
+            ctype: "ephemeral".to_string(),
+        });
+    }
+}
+
 /// Extract a plain-text string from a [`MessageContent`].
 ///
 /// Returns `Err` if the content is a `Parts` block — system messages must be
@@ -467,13 +585,19 @@ fn translate_content_blocks(
     content: MessageContent,
 ) -> Result<Vec<AnthropicContentBlock>, ProviderError> {
     match content {
-        MessageContent::Text(t) => Ok(vec![AnthropicContentBlock::Text { text: t }]),
+        MessageContent::Text(t) => Ok(vec![AnthropicContentBlock::Text {
+            text: t,
+            cache_control: None,
+        }]),
         MessageContent::Parts(parts) => {
             let mut blocks = Vec::new();
             for part in parts {
                 match part {
                     ContentPart::Text { text } => {
-                        blocks.push(AnthropicContentBlock::Text { text });
+                        blocks.push(AnthropicContentBlock::Text {
+                            text,
+                            cache_control: None,
+                        });
                     }
                     ContentPart::ImageUrl { image_url } => {
                         // A base64 `data:` URI must be sent as an inline base64
@@ -484,7 +608,10 @@ fn translate_content_blocks(
                             }
                             None => AnthropicImageSource::Url { url: image_url.url },
                         };
-                        blocks.push(AnthropicContentBlock::Image { source });
+                        blocks.push(AnthropicContentBlock::Image {
+                            source,
+                            cache_control: None,
+                        });
                     }
                     ContentPart::InputAudio { .. } => {
                         return Err(ProviderError::Unsupported(

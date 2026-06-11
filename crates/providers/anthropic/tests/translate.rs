@@ -312,6 +312,84 @@ fn translate_short_system_no_cache_control() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. Multi-turn conversation prefix caching: a breakpoint on the LAST message
+//     so the recurring history is a cache-read next turn (Anthropic-specific —
+//     it never auto-caches like OpenAI).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn translate_multi_turn_history_gets_message_cache_control() {
+    // ~2500 estimated tokens clears Sonnet 4.6's 2048-token minimum; the
+    // assistant reply makes it multi-turn, so the rolling history is cached.
+    let long = "word ".repeat(2500);
+    let messages = vec![
+        user_text(&long),
+        assistant_text("ok"),
+        user_text("and now?"),
+    ];
+
+    let req = make_request("claude-sonnet-4-6", messages);
+    let body = translate_request(req).expect("translate ok");
+    let v = serde_json::to_value(&body).unwrap();
+    let msgs = v["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+
+    // Exactly one breakpoint, on the last block of the LAST message.
+    let last_block = msgs.last().unwrap()["content"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(
+        last_block["cache_control"]["type"], "ephemeral",
+        "last message should carry the rolling-history breakpoint: {last_block}"
+    );
+    // No breakpoint on the earlier turns.
+    for m in &msgs[..2] {
+        for b in m["content"].as_array().unwrap() {
+            assert!(
+                b.get("cache_control").is_none(),
+                "only the last message is marked: {b}"
+            );
+        }
+    }
+}
+
+#[test]
+fn translate_single_shot_no_message_cache_control() {
+    // A first, one-shot request (no assistant turn) must NOT get a message
+    // breakpoint — it would pay the 1.25x cache-write premium with no later
+    // read to amortize it, even though the prompt clears the size minimum.
+    let long = "word ".repeat(2500);
+    let req = make_request("claude-sonnet-4-6", vec![user_text(&long)]);
+    let body = translate_request(req).expect("translate ok");
+    let v = serde_json::to_value(&body).unwrap();
+    let block = &v["messages"][0]["content"][0];
+    assert!(
+        block.get("cache_control").is_none(),
+        "one-shot request must not pay a cache-write premium: {block}"
+    );
+}
+
+#[test]
+fn translate_short_multi_turn_no_message_cache_control() {
+    // Multi-turn but tiny — below the model's prompt-cache minimum, so a
+    // breakpoint would silently no-op; don't inject one.
+    let messages = vec![user_text("hi"), assistant_text("hello"), user_text("bye")];
+    let req = make_request("claude-sonnet-4-6", messages);
+    let body = translate_request(req).expect("translate ok");
+    let v = serde_json::to_value(&body).unwrap();
+    for m in v["messages"].as_array().unwrap() {
+        for b in m["content"].as_array().unwrap() {
+            assert!(
+                b.get("cache_control").is_none(),
+                "below the cache minimum → no breakpoint: {b}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 6. max_tokens default when omitted
 // ---------------------------------------------------------------------------
 
