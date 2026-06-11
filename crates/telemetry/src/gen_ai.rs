@@ -112,6 +112,15 @@ pub const TT_QUALITY_VERDICT: &str = "tokentrimmer.quality.verdict";
 /// pricing (a real billed call of unknown price — emitting `0` would fabricate
 /// "free").
 pub const TT_QUALITY_JUDGE_COST_USD: &str = "tokentrimmer.quality.judge_cost_usd";
+/// `tokentrimmer.quality.unjudged` — `true` on a measurement-spend-ledger
+/// record where the judge never issued a verdict (failed reference dispatch /
+/// judge call, or an empty billed reference). Such records carry
+/// `verdict = "unclear"` purely as the no-valence placeholder; this flag lets
+/// consumers exclude them from judged-sample counts (mirroring the durable
+/// row's `unjudged:` reason prefix). **Emitted only when `true`** — a real
+/// judge-issued verdict carries no `unjudged` attribute at all, keeping the
+/// judged attribute set unchanged.
+pub const TT_QUALITY_UNJUDGED: &str = "tokentrimmer.quality.unjudged";
 
 /// **Reserved** wire name for a per-request quality score header in `[0, 1]`,
 /// following the existing `x-tokentrimmer-*` header convention.
@@ -305,6 +314,10 @@ pub struct QualityVerdictAttributes<'a> {
     /// call had no catalog pricing — a real billed call of unknown price must
     /// never surface as `0.0`/"free". See [`TT_QUALITY_JUDGE_COST_USD`].
     pub judge_cost_usd: Option<f64>,
+    /// `true` for a measurement-spend-ledger record the judge never actually
+    /// scored → `tokentrimmer.quality.unjudged` (emitted only when `true`).
+    /// See [`TT_QUALITY_UNJUDGED`].
+    pub unjudged: bool,
 }
 
 /// Record the per-request quality verdict onto `span`.
@@ -338,6 +351,12 @@ pub fn record_quality_verdict(span: &Span, attrs: &QualityVerdictAttributes<'_>)
     // unknown price must never surface as `0.0`/"free".
     if let Some(judge_cost_usd) = attrs.judge_cost_usd {
         span.set_attribute(TT_QUALITY_JUDGE_COST_USD, judge_cost_usd);
+    }
+    // Mark spend-ledger records the judge never scored, so consumers counting
+    // `tokentrimmer.quality.verdict` can exclude them from judged-sample
+    // counts. Emitted only when true — judged records stay byte-identical.
+    if attrs.unjudged {
+        span.set_attribute(TT_QUALITY_UNJUDGED, true);
     }
 }
 
@@ -509,6 +528,7 @@ mod tests {
                     band: "low",
                     verdict: "acceptable",
                     judge_cost_usd: Some(0.000_05),
+                    unjudged: false,
                 },
             );
         });
@@ -560,6 +580,7 @@ mod tests {
                     band: "low",
                     verdict: "unclear",
                     judge_cost_usd: None,
+                    unjudged: false,
                 },
             );
         });
@@ -580,6 +601,39 @@ mod tests {
         assert_eq!(
             attrs.get(TT_QUALITY_VERDICT),
             Some(&Value::String("unclear".into()))
+        );
+        assert!(
+            !attrs.contains_key(TT_QUALITY_UNJUDGED),
+            "a judged record (unjudged=false) must not carry the unjudged flag"
+        );
+    }
+
+    /// A spend-ledger record the judge never scored carries
+    /// `tokentrimmer.quality.unjudged = true`, so consumers counting verdict
+    /// attributes can exclude it from judged-sample counts.
+    #[test]
+    fn unjudged_spend_record_marks_unjudged_attribute() {
+        let attrs = capture_attributes(|span| {
+            record_quality_verdict(
+                span,
+                &QualityVerdictAttributes {
+                    request_id: "33333333-3333-3333-3333-333333333333",
+                    requested_model: "gpt-4o",
+                    served_model: "gpt-4o-mini",
+                    score: None,
+                    band: "low",
+                    verdict: "unclear",
+                    judge_cost_usd: None,
+                    unjudged: true,
+                },
+            );
+        });
+
+        assert_eq!(
+            attrs.get(TT_QUALITY_UNJUDGED),
+            Some(&Value::Bool(true)),
+            "an unjudged spend-ledger record must be distinguishable from a \
+             real judge-issued unclear verdict"
         );
     }
 

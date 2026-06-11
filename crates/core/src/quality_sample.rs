@@ -29,6 +29,15 @@
 //!    judges every eligible request, `0.0` judges none.
 //! 5. **Record only.** The judge records a score + risk band. It never pauses a
 //!    route — auto-pause is a deliberate follow-up.
+//! 6. **Measurement tax is ledgered, not budgeted (MVP).** The baseline
+//!    reference dispatch and judge call(s) bill the org on its own provider
+//!    credentials, but they are deliberately NOT counted toward the
+//!    `monthly_cap_usd` enforcer and never appear in `request_logs` — they
+//!    live only in `quality_verdicts` (+ the `tokentrimmer.quality.*` span
+//!    attributes) so Phase-2 netting can reconcile them. At the default ~2%
+//!    sample this budget blind spot is bounded; raising
+//!    `TT_JUDGE_SAMPLE_RATE` (or enabling `TT_JUDGE_BOTH_ORDERS`) raises the
+//!    uncapped measurement spend proportionally.
 
 use std::sync::Arc;
 
@@ -184,22 +193,27 @@ pub struct JudgeOutcome {
     /// over both orders in both-orders mode. **Measurement tax**: recorded here
     /// (and on the `tokentrimmer.quality.judge_cost_usd` span attribute) only,
     /// never folded into `request_logs.cost_usd`, never counted as or against
-    /// savings. `None` means a judge call was billed but UNMETERED (no catalog
-    /// pricing for the judge model) — never persisted as `0`, so downstream can
+    /// savings. `None` means the tax is UNMETERED: a judge call was attempted
+    /// whose billed cost we cannot state — no catalog pricing for the judge
+    /// model, OR the call failed/timed out after dispatch (the provider may
+    /// have billed it anyway). Never persisted as `0`, so downstream can
     /// distinguish "genuinely ~$0" from "unknown". Phase 2 nets this into
     /// routing attribution.
     pub judge_cost_usd: Option<f64>,
     /// Cost (USD) of the baseline reference dispatch, when the reference was
     /// produced by re-dispatching the baseline model inside the detached task
-    /// ([`ReferenceSource::Dispatch`]). `None` when no dispatch was billed
-    /// ([`ReferenceSource::Ready`]) OR the dispatch was unmetered —
-    /// `baseline_dispatched` disambiguates the two. Same measurement-tax rules
-    /// as `judge_cost_usd`.
+    /// ([`ReferenceSource::Dispatch`]). `None` when no dispatch was attempted
+    /// ([`ReferenceSource::Ready`]) OR the dispatch was unmetered (unpriced
+    /// model / failed or timed-out attempt that may still have been billed) —
+    /// `baseline_dispatched` disambiguates. Same measurement-tax rules as
+    /// `judge_cost_usd`.
     pub baseline_cost_usd: Option<f64>,
-    /// Whether a baseline reference dispatch actually ran (and was billed
-    /// upstream). `true` with `baseline_cost_usd == None` = a real billed
-    /// dispatch on an unpriced model (unmetered, never "free"); `false` = the
-    /// reference pre-existed, nothing extra was billed.
+    /// Whether a baseline reference dispatch was actually attempted (and so may
+    /// have been billed upstream — including a dispatch that timed out
+    /// client-side after the provider started serving it). `true` with
+    /// `baseline_cost_usd == None` = a real attempted dispatch whose price we
+    /// cannot state (unpriced model or failed attempt — unmetered, never
+    /// "free"); `false` = the reference pre-existed, nothing extra was billed.
     pub baseline_dispatched: bool,
     /// The blind slot (`a`/`b`) the OPTIMIZED answer occupied in the paired
     /// prompt — makes the position debiasing auditable.
@@ -562,16 +576,19 @@ pub struct PairedJudgeOutcome {
     pub orders_agreed: Option<bool>,
 }
 
-/// A [`judge_paired`] failure that still carries the judge tax incurred by the
-/// call(s) that COMPLETED before the failing one, so the caller can ledger the
+/// A [`judge_paired`] failure, carried so the caller can ledger the
 /// measurement spend instead of dropping it (Phase-2 netting must stay
 /// invoice-complete even when the judge model is flaky).
 #[derive(Debug)]
 pub struct PairedJudgeFailure {
     /// The underlying judge error.
     pub error: QualityError,
-    /// Judge tax (USD) billed by completed calls: `Some(0.0)` when no call
-    /// completed, `None` when a completed call was unmetered.
+    /// Judge tax (USD) for this sample. Always `None` (unmetered) on a
+    /// failure: the failing call was ATTEMPTED, and an attempted call that
+    /// timed out client-side (or errored after dispatch) may still have been
+    /// billed server-side — its cost is unknowable here, and a partial sum
+    /// over the completed calls must never masquerade as the full tax.
+    /// `None` = "look at the provider invoice", never "free".
     pub judge_cost_usd: Option<f64>,
     /// How many A/B orders completed before the failure (0 or 1).
     pub orders_completed: u8,
@@ -617,12 +634,20 @@ fn map_pair_verdict(verdict: PairVerdict, optimized: AbOrder) -> JudgeVerdict {
 /// The rubric demands EXACTLY one token on the FIRST line, so only the first
 /// non-empty line is scanned for tokens — a token echoed inside the
 /// explanation can never override the verdict line. Matching is whole-token
-/// (split on non-`[A-Za-z0-9_]`), and a negated `EQUIVALENT`
-/// ("NOT EQUIVALENT", "NON-EQUIVALENT", "INEQUIVALENT") parses `Unclear`, not
-/// `Equivalent` — a sloppy judge reply must fail CONSERVATIVE, never book an
-/// optimistic pass on the gate every lossy lever depends on. `A_MISSING` xor
-/// `B_MISSING` wins; naming BOTH sides is `Unclear` (unclassifiable, not a
-/// coin flip); anything un-tokened is `Unclear`.
+/// (split on non-`[A-Za-z0-9_]`).
+///
+/// Negation guard: a verdict token counts as NEGATED only when the token
+/// IMMEDIATELY before it is a negator ("NOT EQUIVALENT", "NON-EQUIVALENT",
+/// "NO A_MISSING"), or it is the fused "INEQUIVALENT". ANY negated verdict
+/// token — `EQUIVALENT` *or* `*_MISSING` — makes the whole reply `Unclear`:
+/// a sloppy judge reply must fail CONSERVATIVE, never book an optimistic pass
+/// (a negated "NOT A_MISSING" must not parse as `AMissing`, whose flip side
+/// is an `Acceptable`) on the gate every lossy lever depends on. Adjacency —
+/// not whole-line scanning — keeps a compliant-in-spirit elaboration like
+/// "EQUIVALENT — no material differences" from false-negating into `Unclear`
+/// and discarding a sample whose baseline + judge calls were already billed.
+/// `A_MISSING` xor `B_MISSING` wins; naming BOTH sides is `Unclear`
+/// (unclassifiable, not a coin flip); anything un-tokened is `Unclear`.
 ///
 /// The returned reason is the SECOND non-empty line (the explanation the
 /// rubric asks for), falling back to the first line for single-line replies —
@@ -640,16 +665,35 @@ fn parse_pair_verdict(reply: &str) -> (PairVerdict, String) {
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|t| !t.is_empty())
         .collect();
-    let has = |t: &str| tokens.contains(&t);
-    let negated = has("NOT") || has("NO") || has("NON") || has("NEVER") || has("INEQUIVALENT");
-    let a_missing = has("A_MISSING");
-    let b_missing = has("B_MISSING");
-    let verdict = match (a_missing, b_missing) {
-        (true, true) => PairVerdict::Unclear,
-        (true, false) => PairVerdict::AMissing,
-        (false, true) => PairVerdict::BMissing,
-        (false, false) if has("EQUIVALENT") && !negated => PairVerdict::Equivalent,
-        (false, false) => PairVerdict::Unclear,
+    let negator = |t: &str| matches!(t, "NOT" | "NO" | "NON" | "NEVER");
+    let mut equivalent = false;
+    let mut a_missing = false;
+    let mut b_missing = false;
+    let mut negated = false;
+    for (i, t) in tokens.iter().enumerate() {
+        let neg = i > 0 && negator(tokens[i - 1]);
+        match *t {
+            "EQUIVALENT" | "A_MISSING" | "B_MISSING" if neg => negated = true,
+            "EQUIVALENT" => equivalent = true,
+            "A_MISSING" => a_missing = true,
+            "B_MISSING" => b_missing = true,
+            "INEQUIVALENT" => negated = true,
+            _ => {}
+        }
+    }
+    let verdict = if negated {
+        // Any negated verdict token = unclassifiable, regardless of what else
+        // the line claims (conservative: never reconstruct intent from a
+        // reply that broke the one-token rubric).
+        PairVerdict::Unclear
+    } else {
+        match (a_missing, b_missing) {
+            (true, true) => PairVerdict::Unclear,
+            (true, false) => PairVerdict::AMissing,
+            (false, true) => PairVerdict::BMissing,
+            (false, false) if equivalent => PairVerdict::Equivalent,
+            (false, false) => PairVerdict::Unclear,
+        }
     };
     let reason = lines.next().unwrap_or(first).to_string();
     (verdict, reason)
@@ -667,9 +711,11 @@ fn parse_pair_verdict(reply: &str) -> (PairVerdict, String) {
 /// [`JudgeVerdict::Unclear`] (`Some(false)`) — a position-sensitive judgment
 /// is genuinely unclassifiable. The judge tax sums over all calls either way.
 ///
-/// On error the returned [`PairedJudgeFailure`] carries the judge tax already
-/// incurred by completed calls, so the caller can ledger the measurement
-/// spend instead of dropping it.
+/// On error the returned [`PairedJudgeFailure`] carries an UNMETERED
+/// (`None`) judge tax: the failing call was attempted and may still have
+/// been billed server-side (a client-side timeout aborts only our wait), so
+/// no definite figure — `0.0` or a partial sum — is ever reported. The
+/// caller ledgers the failure as an `unclear` row with the unknown tax.
 pub async fn judge_paired(
     judge: &dyn PairedJudgeProvider,
     input: &str,
@@ -687,7 +733,10 @@ pub async fn judge_paired(
         .await
         .map_err(|error| PairedJudgeFailure {
             error,
-            judge_cost_usd: Some(0.0),
+            // The call was ATTEMPTED: a client-side timeout (or an error after
+            // dispatch) may still have been billed server-side, so the tax is
+            // unknown — `None` (unmetered), never a fabricated `$0`.
+            judge_cost_usd: None,
             orders_completed: 0,
         })?;
     let first_verdict = map_pair_verdict(first.verdict, order);
@@ -710,11 +759,14 @@ pub async fn judge_paired(
     let second = match judge.judge_pair(input, b, a).await {
         Ok(second) => second,
         Err(error) => {
-            // The FIRST call already completed (and was billed): surface its
-            // tax with the error so it isn't silently dropped from the ledger.
+            // The FIRST call completed (and was billed at `first.cost_usd`),
+            // but the SECOND was attempted and may ALSO have been billed
+            // (e.g. a client-side timeout). Summing a known cost with an
+            // unknown one is unknown — `None` (unmetered), so the partial sum
+            // never masquerades as the full tax.
             return Err(PairedJudgeFailure {
                 error,
-                judge_cost_usd: first.cost_usd,
+                judge_cost_usd: None,
                 orders_completed: 1,
             });
         }
@@ -1088,8 +1140,11 @@ impl ReferenceSource {
     /// (single shot, non-streaming, no failover, deadline-bounded — the same
     /// plumbing as the #146 canary shadow) and returns the assistant text plus
     /// the metered baseline cost. A dispatch error surfaces as
-    /// [`QualityError::Judge`] so the job records nothing rather than a
-    /// misleading verdict (a failed dispatch carries no metered spend).
+    /// [`QualityError::Judge`]; the caller (`run_job`) ledgers the ATTEMPT as
+    /// an `unclear` row with an unmetered (`NULL`) baseline cost — a dispatch
+    /// that errored or timed out client-side may still have been billed
+    /// server-side, so it must appear in the ledger with an unknown price
+    /// rather than vanish.
     async fn resolve(self) -> Result<ResolvedReference, QualityError> {
         match self {
             ReferenceSource::Ready(s) => Ok(ResolvedReference {
@@ -1127,14 +1182,18 @@ impl ReferenceSource {
     }
 }
 
-/// Ledger measurement spend that was actually billed even though no verdict
-/// could be produced (the judge call failed, or the billed baseline reference
-/// came back empty). Records an `unclear` row + span attributes carrying the
-/// incurred judge/baseline tax so Phase-2 netting stays invoice-complete — a
-/// CFO reconciling provider invoices finds every billed measurement dispatch
-/// in `quality_verdicts`. Never fabricates a quality signal: `unclear` has no
-/// valence and is excluded from every quality aggregate (band stores,
-/// preserved summaries); the reason string names the failure.
+/// Ledger measurement spend that was (or may have been) billed even though no
+/// verdict could be produced (the reference dispatch or judge call failed, or
+/// the billed baseline reference came back empty). Records an `unclear` row +
+/// span attributes carrying the incurred judge/baseline tax so Phase-2
+/// netting stays invoice-complete — a CFO reconciling provider invoices finds
+/// every ATTEMPTED measurement dispatch in `quality_verdicts` (a `NULL` cost
+/// = "price unknown, check the invoice", never "free"). Never fabricates a
+/// quality signal: `unclear` has no valence and is excluded from every
+/// quality aggregate (band stores, preserved summaries); the reason string
+/// names the failure, and the span carries `tokentrimmer.quality.unjudged =
+/// true` so telemetry consumers never count these rows as judge-issued
+/// verdicts.
 async fn record_unjudged_spend(
     job: &QualityJudgeJob,
     baseline_cost_usd: Option<f64>,
@@ -1152,6 +1211,7 @@ async fn record_unjudged_spend(
         verdict,
         risk_band,
         judge_cost_usd,
+        true, // unjudged: no judge-issued verdict backs these attributes
     );
     job.sink
         .record(JudgeOutcome {
@@ -1178,21 +1238,45 @@ async fn record_unjudged_spend(
 
 /// Run one judge job to completion: call the judge, build a [`SampleScore`] +
 /// [`RiskBand`], and record the [`JudgeOutcome`]. Returns `Ok(())` even when the
-/// judge declines (records `Unclear`). Partial failures that already incurred
-/// billed measurement spend (a billed baseline dispatch followed by a judge
-/// error or an empty reference; a billed first order followed by a second-order
-/// error) still record an `unclear` row carrying the incurred tax — the ledger
-/// stays invoice-complete. Only failures with NO billed spend (a failed
-/// reference dispatch, a pre-existing reference + a failed first judge call)
-/// short-circuit without recording.
+/// judge declines (records `Unclear`). EVERY failure after an upstream call was
+/// attempted records an `unclear` spend-ledger row (reason prefixed
+/// `unjudged:`) — a failed/timed-out reference dispatch, an empty billed
+/// reference, a failed judge call at any order — because an attempted call may
+/// have been billed even when it did not complete (a client-side timeout aborts
+/// only our wait). The ledger therefore stays invoice-complete: the only path
+/// that records nothing is one where no upstream call was attempted at all (a
+/// pre-existing `Ready` reference that is empty).
 async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
     // Extract the L2 eviction target up front: `reference.resolve()` below
     // partially moves `job.reference`, after which `job` can't be field-accessed
     // for `l2_eviction`. Taking it here keeps the move analysis simple.
     let l2_eviction = job.l2_eviction.take();
-    let reference = std::mem::replace(&mut job.reference, ReferenceSource::Ready(String::new()))
-        .resolve()
-        .await?;
+    let reference_source =
+        std::mem::replace(&mut job.reference, ReferenceSource::Ready(String::new()));
+    let dispatch_attempted = matches!(reference_source, ReferenceSource::Dispatch { .. });
+    let reference = match reference_source.resolve().await {
+        Ok(reference) => reference,
+        Err(error) => {
+            // The reference dispatch was ATTEMPTED but failed/timed out. The
+            // provider may still have billed it (non-streaming generations
+            // generally complete server-side even when the client abandons
+            // them), so ledger the attempt with an unmetered (`NULL`) baseline
+            // cost — never silence, never a fabricated `$0`. The judge tax IS
+            // genuinely `$0` here: no judge call was attempted yet.
+            if dispatch_attempted {
+                record_unjudged_spend(
+                    &job,
+                    None,
+                    true,
+                    Some(0.0),
+                    0,
+                    format!("unjudged: reference dispatch failed: {error}"),
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
     if reference.text.trim().is_empty() {
         // Empty reference (e.g. a tool-call-only original response) — nothing
         // to compare against, so never record a meaningless verdict. But when
@@ -1223,22 +1307,21 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
     {
         Ok(paired) => paired,
         Err(failure) => {
-            // Fail-open for the user, but never drop billed measurement spend:
-            // when the baseline dispatch and/or a completed judge call was
-            // billed before the failure, record an `unclear` row carrying the
-            // incurred tax. With NO billed spend, record nothing (no fabricated
-            // verdicts, nothing missing from the invoice either).
-            if reference.dispatched || failure.orders_completed > 0 {
-                record_unjudged_spend(
-                    &job,
-                    reference.cost_usd,
-                    reference.dispatched,
-                    failure.judge_cost_usd,
-                    failure.orders_completed,
-                    format!("unjudged: judge failed: {}", failure.error),
-                )
-                .await;
-            }
+            // Fail-open for the user, but never drop measurement spend that
+            // was (or may have been) billed: reaching `judge_paired` means at
+            // least one judge call was ATTEMPTED — and an attempted call that
+            // failed/timed out may still have been billed server-side — so
+            // ALWAYS record an `unclear` row carrying the incurred tax
+            // (unmetered/`NULL` where the price is unknowable).
+            record_unjudged_spend(
+                &job,
+                reference.cost_usd,
+                reference.dispatched,
+                failure.judge_cost_usd,
+                failure.orders_completed,
+                format!("unjudged: judge failed: {}", failure.error),
+            )
+            .await;
             return Err(failure.error);
         }
     };
@@ -1259,6 +1342,7 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
         verdict,
         risk_band,
         paired.judge_cost_usd,
+        false, // a judge really issued this verdict
     );
 
     // Close the L2 join: if this response was SERVED FROM L2, record the verdict
@@ -1324,6 +1408,13 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
 /// attribute is omitted (band/verdict still surface) rather than fabricating a
 /// "preserved" score — keeping the emitted per-request scores consistent with
 /// `quality_preserved_summary`, which drops `Unclear` from its denominator.
+///
+/// `unjudged` marks a spend-ledger row where the judge never issued a verdict
+/// (failed dispatch/judge call, empty billed reference) — it surfaces as
+/// `tokentrimmer.quality.unjudged = true` so telemetry consumers can exclude
+/// these rows from judged-sample counts (the DB row's `unjudged:` reason
+/// prefix carries the same distinction durably).
+#[allow(clippy::too_many_arguments)]
 fn record_quality_verdict_telemetry(
     request_id: Uuid,
     requested_model: &str,
@@ -1331,6 +1422,7 @@ fn record_quality_verdict_telemetry(
     verdict: JudgeVerdict,
     risk_band: RiskBand,
     judge_cost_usd: Option<f64>,
+    unjudged: bool,
 ) {
     tt_telemetry::gen_ai::record_quality_verdict(
         &tracing::Span::current(),
@@ -1342,6 +1434,7 @@ fn record_quality_verdict_telemetry(
             band: band_str(risk_band),
             verdict: verdict_str(verdict),
             judge_cost_usd,
+            unjudged,
         },
     );
 }
@@ -1666,6 +1759,26 @@ mod tests {
         );
         assert_eq!(parse_pair_verdict("INEQUIVALENT").0, PairVerdict::Unclear);
         assert_eq!(parse_pair_verdict("NON-EQUIVALENT").0, PairVerdict::Unclear);
+        // A negated *_MISSING must NOT parse as the missing verdict — that
+        // would book the OPPOSITE of the judge's intent (and an optimistic
+        // pass when the optimized answer holds the other slot).
+        assert_eq!(parse_pair_verdict("NOT A_MISSING").0, PairVerdict::Unclear);
+        assert_eq!(
+            parse_pair_verdict("NO B_MISSING here, both fine").0,
+            PairVerdict::Unclear
+        );
+        // The negation guard is ADJACENT-token only: an affirmative first line
+        // that merely contains "no" later ("EQUIVALENT — no material
+        // differences") must NOT false-negate into Unclear — each false
+        // Unclear discards a sample whose baseline + judge calls were billed.
+        assert_eq!(
+            parse_pair_verdict("EQUIVALENT — no material differences").0,
+            PairVerdict::Equivalent
+        );
+        assert_eq!(
+            parse_pair_verdict("EQUIVALENT, no information missing").0,
+            PairVerdict::Equivalent
+        );
         // A token echoed in the EXPLANATION line never overrides the verdict
         // line (the rubric puts exactly one token on line 1).
         assert_eq!(
@@ -1866,10 +1979,12 @@ mod tests {
         assert!(out.reason.contains("position-sensitive"), "{}", out.reason);
     }
 
-    /// Both-orders mode: the SECOND call failing surfaces the FIRST call's
-    /// already-billed tax on the failure, so the caller can ledger it.
+    /// Both-orders mode: the SECOND call failing makes the judge tax
+    /// UNMETERED (`None`) — the failed call was attempted and may also have
+    /// been billed (e.g. a client-side timeout), so the first call's known
+    /// cost is a partial sum that must never masquerade as the full tax.
     #[tokio::test]
-    async fn both_orders_second_failure_carries_first_call_cost() {
+    async fn both_orders_second_failure_makes_tax_unmetered() {
         let judge = SequenceJudge::new(vec![
             Ok(PairCall {
                 verdict: PairVerdict::Equivalent,
@@ -1883,21 +1998,23 @@ mod tests {
             .expect_err("second-order failure propagates");
         assert_eq!(failure.orders_completed, 1);
         assert_eq!(
-            failure.judge_cost_usd,
-            Some(0.001),
-            "the first call's billed tax must ride the failure"
+            failure.judge_cost_usd, None,
+            "an attempted-but-failed call makes the total tax unknown — a \
+             partial sum must never masquerade as the full tax"
         );
     }
 
-    /// A first-call failure incurred no judge spend: `Some(0.0)` (zero
-    /// completed calls), zero orders completed.
+    /// A first-call failure carries an UNMETERED (`None`) judge tax — the
+    /// call was attempted, and an attempted call that timed out client-side
+    /// may still have been billed server-side. Never `Some(0.0)`: a definite
+    /// $0 would conflate "possibly billed, unknown" with "free".
     #[tokio::test]
-    async fn first_call_failure_incurs_no_judge_cost() {
+    async fn first_call_failure_carries_unmetered_judge_cost() {
         let failure = judge_paired(&FailingJudge, "in", "b", "o", AbOrder::OptimizedA, false)
             .await
             .expect_err("first-call failure propagates");
         assert_eq!(failure.orders_completed, 0);
-        assert_eq!(failure.judge_cost_usd, Some(0.0));
+        assert_eq!(failure.judge_cost_usd, None);
     }
 
     /// An unmetered call anywhere makes the summed judge tax unmetered
@@ -1954,7 +2071,11 @@ mod tests {
             (o.baseline_cost_usd.expect("metered baseline") - 0.002).abs() < 1e-12,
             "the billed baseline cost lands in the ledger"
         );
-        assert_eq!(o.judge_cost_usd, Some(0.0), "no judge call completed");
+        assert_eq!(
+            o.judge_cost_usd, None,
+            "the failed judge call was ATTEMPTED (possibly billed) — its tax \
+             is unknown, never a fabricated $0"
+        );
         assert_eq!(o.orders_judged, 0);
         assert_eq!(o.orders_agreed, None);
     }
@@ -2016,11 +2137,132 @@ mod tests {
         );
     }
 
-    /// No billed spend (pre-existing reference + first judge call fails) →
-    /// record NOTHING: the fail-open silence is preserved exactly where it is
-    /// honest (nothing on the provider invoice, nothing in the ledger).
+    /// A baseline reference dispatch that ERRORS was still ATTEMPTED — the
+    /// provider may have billed it — so the job ledgers an `unclear` row with
+    /// `dispatched=true` and an unmetered (`None`) baseline cost instead of
+    /// recording nothing. The judge tax IS a genuine `$0` (no judge call was
+    /// attempted yet), and the error still propagates to the spawn's warn log.
     #[tokio::test]
-    async fn judge_failure_with_no_billed_spend_records_nothing() {
+    async fn failed_reference_dispatch_ledgers_unmetered_attempt() {
+        let sink = Arc::new(RecordingSink::default());
+        let mut job = job_with(ReferenceSource::Ready(String::new()), "acceptable");
+        job.reference = ReferenceSource::Dispatch {
+            provider: Arc::new(ErroringProvider),
+            request: Box::new(
+                serde_json::from_str(r#"{"model":"gpt-4o","messages":[]}"#)
+                    .expect("static minimal request JSON is valid"),
+            ),
+            ctx: Box::new(test_ctx()),
+            deadline: std::time::Duration::from_secs(5),
+        };
+        job.sink = sink.clone();
+        run_job(job).await.expect_err("dispatch failure propagates");
+
+        let outcomes = sink.0.lock().unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "an attempted (possibly billed) reference dispatch must be ledgered"
+        );
+        let o = &outcomes[0];
+        assert_eq!(o.score.verdict, JudgeVerdict::Unclear);
+        assert!(
+            o.score
+                .reason
+                .starts_with("unjudged: reference dispatch failed"),
+            "{}",
+            o.score.reason
+        );
+        assert!(o.baseline_dispatched, "the dispatch WAS attempted");
+        assert_eq!(
+            o.baseline_cost_usd, None,
+            "a failed attempt's billed cost is unknown — NULL, never $0"
+        );
+        assert_eq!(o.judge_cost_usd, Some(0.0), "no judge call was attempted");
+        assert_eq!(o.orders_judged, 0);
+    }
+
+    /// A baseline reference dispatch that exceeds its deadline (client-side
+    /// timeout — the provider typically completes and bills the generation
+    /// anyway) is ledgered exactly like a failed dispatch: `dispatched=true`,
+    /// baseline cost `None`. Paused tokio time keeps the test instant.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_reference_dispatch_ledgers_unmetered_attempt() {
+        let sink = Arc::new(RecordingSink::default());
+        let mut job = job_with(ReferenceSource::Ready(String::new()), "acceptable");
+        job.reference = ReferenceSource::Dispatch {
+            provider: Arc::new(HangingProvider),
+            request: Box::new(
+                serde_json::from_str(r#"{"model":"gpt-4o","messages":[]}"#)
+                    .expect("static minimal request JSON is valid"),
+            ),
+            ctx: Box::new(test_ctx()),
+            deadline: std::time::Duration::from_secs(1),
+        };
+        job.sink = sink.clone();
+        let err = run_job(job).await.expect_err("timeout propagates");
+        assert!(
+            err.to_string().contains("deadline exceeded"),
+            "the error names the timeout: {err}"
+        );
+
+        let outcomes = sink.0.lock().unwrap();
+        assert_eq!(outcomes.len(), 1, "the timed-out attempt must be ledgered");
+        let o = &outcomes[0];
+        assert!(o.baseline_dispatched);
+        assert_eq!(o.baseline_cost_usd, None);
+        assert!(
+            o.score.reason.contains("deadline exceeded"),
+            "{}",
+            o.score.reason
+        );
+    }
+
+    /// `GatewayLlmJudge::with_call_timeout` bounds a hung judge upstream: the
+    /// call fails with a deadline error instead of pinning the detached task.
+    /// This pins the timeout branch the production spawn paths wire.
+    #[tokio::test(start_paused = true)]
+    async fn with_call_timeout_bounds_hung_judge_call() {
+        let judge =
+            GatewayLlmJudge::new(Arc::new(HangingProvider), "judge-x".to_string(), test_ctx())
+                .with_call_timeout(std::time::Duration::from_secs(2));
+        let err = judge
+            .judge_pair("in", "a", "b")
+            .await
+            .expect_err("a hung judge call must be bounded by the timeout");
+        assert!(
+            err.to_string().contains("deadline exceeded"),
+            "the error names the timeout: {err}"
+        );
+    }
+
+    /// An unbounded judge (`new`, no `with_call_timeout`) really does hang on
+    /// a hung upstream — the contrast proving the timeout branch above is
+    /// load-bearing and not vacuously green.
+    #[tokio::test(start_paused = true)]
+    async fn judge_without_call_timeout_hangs_on_hung_upstream() {
+        let judge =
+            GatewayLlmJudge::new(Arc::new(HangingProvider), "judge-x".to_string(), test_ctx());
+        let bounded = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            judge.judge_pair("in", "a", "b"),
+        )
+        .await;
+        assert!(
+            bounded.is_err(),
+            "without with_call_timeout the judge call must still be pending"
+        );
+    }
+
+    /// A pre-existing (`Ready`) reference + a failed first judge call still
+    /// records a spend-ledger row: the judge call was ATTEMPTED, and an
+    /// attempted call may have been billed even though it did not complete
+    /// (a client-side timeout aborts only our wait). The row carries no
+    /// baseline dispatch and an unmetered (`None`) judge tax — never silence
+    /// (which would assume non-completed == non-billed), never a fabricated
+    /// `$0`.
+    #[tokio::test]
+    async fn judge_failure_with_ready_reference_ledgers_attempted_call() {
         let sink = Arc::new(RecordingSink::default());
         let mut job = job_with(
             ReferenceSource::Ready("reference".to_string()),
@@ -2029,10 +2271,26 @@ mod tests {
         job.sink = sink.clone();
         job.judge = Arc::new(FailingJudge);
         run_job(job).await.expect_err("failure propagates");
-        assert!(
-            sink.0.lock().unwrap().is_empty(),
-            "nothing billed, nothing ledgered"
+        let outcomes = sink.0.lock().unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "an attempted (possibly billed) judge call must be ledgered"
         );
+        let o = &outcomes[0];
+        assert_eq!(o.score.verdict, JudgeVerdict::Unclear);
+        assert!(
+            o.score.reason.starts_with("unjudged:"),
+            "{}",
+            o.score.reason
+        );
+        assert!(
+            !o.baseline_dispatched,
+            "a Ready reference dispatched nothing"
+        );
+        assert_eq!(o.baseline_cost_usd, None);
+        assert_eq!(o.judge_cost_usd, None, "attempted call → unknown tax");
+        assert_eq!(o.orders_judged, 0);
     }
 
     /// run_job persists the measurement tax + debiasing audit trail onto the
@@ -2248,6 +2506,96 @@ mod tests {
             _ctx: &RequestContext,
         ) -> Result<tt_shared::EmbeddingsResponse, tt_shared::ProviderError> {
             Err(tt_shared::ProviderError::Unsupported("static".into()))
+        }
+    }
+
+    /// Provider whose `chat_completion` always errors — the failed-dispatch
+    /// stand-in for the attempted-but-unbilled-cost ledger tests.
+    struct ErroringProvider;
+
+    #[async_trait]
+    impl Provider for ErroringProvider {
+        fn id(&self) -> &'static str {
+            "erroring"
+        }
+        fn models(&self) -> Vec<tt_shared::ModelInfo> {
+            Vec::new()
+        }
+        fn pricing(&self, _model: &str) -> Option<ModelPricing> {
+            Some(pricing(5.0, 15.0))
+        }
+        async fn chat_completion(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<ChatCompletionResponse, tt_shared::ProviderError> {
+            Err(tt_shared::ProviderError::Unsupported("upstream 500".into()))
+        }
+        async fn chat_completion_stream(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<tt_shared::ChatCompletionChunk, tt_shared::ProviderError>,
+            >,
+            tt_shared::ProviderError,
+        > {
+            Err(tt_shared::ProviderError::Unsupported("erroring".into()))
+        }
+        async fn embeddings(
+            &self,
+            _req: tt_shared::EmbeddingsRequest,
+            _ctx: &RequestContext,
+        ) -> Result<tt_shared::EmbeddingsResponse, tt_shared::ProviderError> {
+            Err(tt_shared::ProviderError::Unsupported("erroring".into()))
+        }
+    }
+
+    /// Provider whose `chat_completion` parks for an hour — the hung-upstream
+    /// stand-in for the deadline/timeout tests (run under paused tokio time,
+    /// so nothing actually waits).
+    struct HangingProvider;
+
+    #[async_trait]
+    impl Provider for HangingProvider {
+        fn id(&self) -> &'static str {
+            "hanging"
+        }
+        fn models(&self) -> Vec<tt_shared::ModelInfo> {
+            Vec::new()
+        }
+        fn pricing(&self, _model: &str) -> Option<ModelPricing> {
+            Some(pricing(5.0, 15.0))
+        }
+        async fn chat_completion(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<ChatCompletionResponse, tt_shared::ProviderError> {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Err(tt_shared::ProviderError::Unsupported("hung".into()))
+        }
+        async fn chat_completion_stream(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<tt_shared::ChatCompletionChunk, tt_shared::ProviderError>,
+            >,
+            tt_shared::ProviderError,
+        > {
+            Err(tt_shared::ProviderError::Unsupported("hanging".into()))
+        }
+        async fn embeddings(
+            &self,
+            _req: tt_shared::EmbeddingsRequest,
+            _ctx: &RequestContext,
+        ) -> Result<tt_shared::EmbeddingsResponse, tt_shared::ProviderError> {
+            Err(tt_shared::ProviderError::Unsupported("hanging".into()))
         }
     }
 
@@ -2660,6 +3008,47 @@ mod tests {
         assert!(
             !attrs.contains_key("tokentrimmer.quality.verdict"),
             "unjudged request must not carry a quality verdict"
+        );
+    }
+
+    /// A SPEND-LEDGER row (billed reference, no judge verdict) marks its span
+    /// with `quality.unjudged = true`, so a telemetry consumer counting
+    /// verdict attributes can exclude it from judged-sample counts — while a
+    /// genuinely judged request (previous tests) never carries the flag.
+    #[test]
+    fn unjudged_spend_ledger_row_marks_span_unjudged() {
+        let mut job = dispatch_job(StaticProvider {
+            reply: "   ", // billed dispatch, empty reference → unjudged ledger row
+            priced: true,
+        });
+        job.sink = Arc::new(NullSink);
+        let attrs = capture_judge_span_attributes(|| async move {
+            run_job(job).await.expect("empty reference is not an error");
+        });
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.unjudged"),
+            Some(&Value::Bool(true)),
+            "spend-ledger rows must be distinguishable from judged verdicts"
+        );
+        assert_eq!(
+            attrs.get("tokentrimmer.quality.verdict"),
+            Some(&Value::String("unclear".into()))
+        );
+    }
+
+    /// A judged request's span does NOT carry the `unjudged` flag.
+    #[test]
+    fn judged_request_span_omits_unjudged_flag() {
+        let job = job_with(
+            ReferenceSource::Ready("reference".to_string()),
+            "acceptable",
+        );
+        let attrs = capture_judge_span_attributes(|| async move {
+            run_job(job).await.expect("run_job ok");
+        });
+        assert!(
+            !attrs.contains_key("tokentrimmer.quality.unjudged"),
+            "a judge-issued verdict must not be marked unjudged"
         );
     }
 

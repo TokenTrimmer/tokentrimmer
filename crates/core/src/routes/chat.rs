@@ -877,7 +877,8 @@ pub async fn handler(
     // hot path when the judge is disabled because we only build the job later
     // when sampling actually fires.
     let judge_enabled = state.judge_config.enabled && state.judge_sink.is_some();
-    let (judge_source_provider, judge_source_ctx, judge_original_req) = if judge_enabled {
+    let (mut judge_source_provider, mut judge_source_ctx, mut judge_original_req) = if judge_enabled
+    {
         (Some(provider.clone()), Some(ctx.clone()), Some(req.clone()))
     } else {
         (None, None, None)
@@ -905,6 +906,20 @@ pub async fn handler(
     // dispatch; it never attributes a saving and surfaces a `redacted:<class>`
     // warning when it fires.
     let route_redact = route_match.as_ref().is_some_and(|m| m.redact);
+    // Redaction × judge sampling: the judge captures above hold the
+    // PRE-redaction request — the judge job re-dispatches it verbatim to the
+    // source provider for the baseline reference AND embeds its text in the
+    // judge prompt (potentially a THIRD vendor serving the judge model). On a
+    // redact route that would bypass the "the secret never reaches the
+    // upstream provider" guarantee the redaction pass exists to enforce, so
+    // the judge is skipped wholesale for redact routes (both the dispatch-path
+    // and the L2-hit judge no-op via the all-or-nothing capture gate). The
+    // measurement path must never out-leak the dispatch path.
+    if route_redact {
+        judge_source_provider = None;
+        judge_source_ctx = None;
+        judge_original_req = None;
+    }
     // Canary traffic split (#454) + shadow mode, captured before `route_match`
     // is consumed below. `route_traffic_pct` is the configured split percentage
     // (None = unconditional rewrite). `route_shadow_model` is the discarded
@@ -3141,6 +3156,9 @@ fn response_assistant_text(resp: &ChatCompletionResponse) -> String {
 ///
 /// Spawns only when ALL hold:
 /// - the judge is enabled and a sink is wired (`judge_source_*` are `Some`),
+/// - the matched route did NOT opt into redaction (`redact` routes clear the
+///   judge captures at the handler — the pre-redaction request must never
+///   ride the measurement path to any vendor),
 /// - a route rewrote the model (`matched_route_id.is_some()`),
 /// - the served model is cheaper than the originally-requested one (a true
 ///   downgrade priced on realized usage — [`crate::quality_sample::is_downgrade`]),
@@ -3148,8 +3166,20 @@ fn response_assistant_text(resp: &ChatCompletionResponse) -> String {
 /// - the trace falls in the deterministic ~2% sample
 ///   ([`crate::quality_sample::should_sample`]),
 /// - the judge model resolves to a provider,
-/// - a credential for the judge model's provider resolves (fail closed —
-///   never forward the source provider's key to a different vendor).
+/// - a credential for the judge model's provider resolves.
+///
+/// Credential scope (matches [`resolve_credentials_for`] / the #146 shadow
+/// precedent exactly): with a per-org credential store configured (the
+/// hosted/verified-org model) a cross-provider judge FAILS CLOSED on a store
+/// miss — the source provider's key is never forwarded to a different vendor.
+/// With NO store configured (dev / dogfood / BYO-key passthrough) there is no
+/// per-provider credential model to enforce, and the caller's raw bearer is
+/// forwarded to every provider — judge included — like every other dispatch.
+///
+/// Budget scope: the baseline reference dispatch and judge call(s) bill the
+/// org on its own provider credentials but are NOT counted toward
+/// `monthly_cap_usd` and never appear in `request_logs` — they are ledgered
+/// only in `quality_verdicts` (see `quality_sample` module docs, invariant 6).
 #[allow(clippy::too_many_arguments)]
 fn maybe_spawn_quality_judge(
     state: &AppState,
@@ -3308,13 +3338,17 @@ fn maybe_spawn_quality_judge(
 ///
 /// Spawns only when ALL hold:
 /// - the judge is enabled and a sink is wired,
-/// - the pre-routing source captures are present (provider/ctx/original req),
+/// - the pre-routing source captures are present (provider/ctx/original req —
+///   cleared at the handler for `redact` routes, so a redact route's
+///   pre-redaction request never rides the measurement path),
 /// - this task class (chat-completions) is in scope,
 /// - the trace falls in the deterministic sample ([`qs::should_sample`]),
 /// - the cached answer is non-empty (tool-call-only responses are skipped),
 /// - the cached body deserializes and the judge model resolves to a provider,
-/// - a credential for the judge model's provider resolves (fail closed —
-///   never forward the source provider's key to a different vendor).
+/// - a credential for the judge model's provider resolves (fail closed on a
+///   verified-org store miss; with NO credential store configured the raw
+///   bearer is forwarded to every provider — see
+///   [`maybe_spawn_quality_judge`]'s credential-scope note).
 #[allow(clippy::too_many_arguments)]
 fn maybe_spawn_l2_hit_judge(
     state: &AppState,

@@ -243,6 +243,13 @@ struct HarnessOpts {
     judge_verdict_word: &'static str,
     judge_fail: bool,
     both_orders: bool,
+    /// The planted route opts into the redaction guardrail (`redact: true`) —
+    /// the judge must then be skipped wholesale (the captured pre-redaction
+    /// request must never ride the measurement path).
+    redact_route: bool,
+    /// Override `JudgeConfig::baseline_timeout` (also the per-judge-call
+    /// timeout the production spawn wires via `with_call_timeout`).
+    baseline_timeout: Option<std::time::Duration>,
 }
 
 impl Default for HarnessOpts {
@@ -254,6 +261,8 @@ impl Default for HarnessOpts {
             judge_verdict_word: "ACCEPTABLE",
             judge_fail: false,
             both_orders: false,
+            redact_route: false,
+            baseline_timeout: None,
         }
     }
 }
@@ -324,7 +333,7 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     max_cost_usd: None,
                     flex: false,
                     compress: false,
-                    redact: false,
+                    redact: opts.redact_route,
                     traffic_pct: None,
                     shadow_model: None,
                 },
@@ -336,13 +345,16 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
     ));
 
     let sink = Arc::new(RecordingSink::default());
-    let config = JudgeConfig {
+    let mut config = JudgeConfig {
         enabled: true,
         sample_rate: opts.rate,
         judge_model: JUDGE_MODEL.to_string(),
         both_orders: opts.both_orders,
         ..JudgeConfig::default()
     };
+    if let Some(t) = opts.baseline_timeout {
+        config.baseline_timeout = t;
+    }
     let app = build_router(
         AppState::new(registry)
             .with_key_store(key_store)
@@ -901,8 +913,115 @@ async fn judge_failure_is_fail_open() {
         (baseline - 0.002).abs() < 1e-9,
         "baseline tax must be ledgered, got {baseline}"
     );
-    assert_eq!(o.judge_cost_usd, Some(0.0), "no judge call completed");
+    assert_eq!(
+        o.judge_cost_usd, None,
+        "the failed judge call was ATTEMPTED (possibly billed upstream) — \
+         its tax is unknown (NULL), never a fabricated $0"
+    );
     assert_eq!(o.orders_judged, 0);
+}
+
+/// A route that opted into the redaction guardrail (`redact: true`) skips the
+/// judge WHOLESALE: the judge captures hold the pre-redaction request, and the
+/// judge job would re-dispatch it verbatim (baseline reference) and embed its
+/// text in the judge prompt — potentially to a third vendor. The redaction
+/// promise ("the secret never reaches the upstream provider") must hold on the
+/// measurement path too, so no judge call fires and nothing is recorded even
+/// at sample rate 1.0.
+#[tokio::test]
+async fn redact_route_skips_judge_entirely() {
+    let h = build_harness_opts(HarnessOpts {
+        redact_route: true,
+        ..Default::default()
+    })
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["x-tokentrimmer-model-used"]
+            .to_str()
+            .unwrap(),
+        "gpt-4o-mini",
+        "the downgrade route still fires — only the judge is skipped"
+    );
+
+    // Give any (erroneously) spawned judge task a chance to run.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        h.judge_calls.load(Ordering::SeqCst),
+        0,
+        "a redact route must never spawn the judge (the pre-redaction \
+         request must not ride the measurement path)"
+    );
+    assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
+    // Exactly ONE upstream dispatch: the user's own request. No baseline
+    // reference re-dispatch of the unredacted original.
+    assert_eq!(
+        h.served_calls.load(Ordering::SeqCst),
+        1,
+        "no baseline reference dispatch of the unredacted request"
+    );
+}
+
+/// The production judge wiring bounds each judge call with
+/// `with_call_timeout` (the baseline timeout): a judge upstream that HANGS
+/// (gate never released) times out instead of pinning the detached task, and
+/// the attempted (possibly billed) call + the billed baseline dispatch are
+/// ledgered as an `unclear` spend row. Deleting the `with_call_timeout` wiring
+/// in `maybe_spawn_quality_judge` makes this test hang past its bound and
+/// fail.
+#[tokio::test]
+async fn hung_judge_call_is_bounded_and_ledgered() {
+    let gate = Arc::new(Notify::new()); // never released — the judge hangs
+    let h = build_harness_opts(HarnessOpts {
+        judge_gate: Some(gate),
+        baseline_timeout: Some(std::time::Duration::from_millis(100)),
+        ..Default::default()
+    })
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "user path untouched");
+
+    // The judge call times out after ~100ms; the spend row must land well
+    // within the 5s bound. Without the call timeout the gated judge call
+    // would hang forever and nothing would ever be recorded.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.sink.recorded.notified(),
+    )
+    .await
+    .expect("a timed-out judge call must still ledger its measurement spend");
+
+    let outcomes = h.sink.outcomes.lock().unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let o = &outcomes[0];
+    assert_eq!(o.score.verdict, JudgeVerdict::Unclear);
+    assert!(
+        o.score.reason.contains("deadline exceeded"),
+        "the reason names the timeout: {}",
+        o.score.reason
+    );
+    assert!(o.baseline_dispatched, "the baseline dispatch was billed");
+    assert!(
+        o.baseline_cost_usd.is_some(),
+        "the completed baseline dispatch is metered"
+    );
+    assert_eq!(
+        o.judge_cost_usd, None,
+        "a timed-out judge call's tax is unknown — NULL, never $0"
+    );
 }
 
 // ── Cross-provider judge credentials (fail closed, never cross-sent) ────────
@@ -994,7 +1113,9 @@ impl Provider for RemoteJudgeProvider {
 
 struct CrossProviderHarness {
     app: axum::Router,
-    judge_calls: Arc<AtomicUsize>,
+    /// Api key of every call that reached the REMOTE judge provider. Emptiness
+    /// proves the judge vendor was never called at all (the fail-closed
+    /// assertion); contents prove WHICH credential was transmitted.
     judge_keys_seen: Arc<Mutex<Vec<String>>>,
     sink: Arc<RecordingSink>,
     plaintext: String,
@@ -1007,7 +1128,6 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
     use tt_auth::{InMemoryProviderCredentialStore, ProviderCredentialStore};
     use tt_shared::context::{ProviderCredentials, SecretString};
 
-    let judge_calls = Arc::new(AtomicUsize::new(0));
     let served_calls = Arc::new(AtomicUsize::new(0));
     let judge_keys_seen = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ProviderRegistry::new();
@@ -1099,7 +1219,6 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
 
     CrossProviderHarness {
         app,
-        judge_calls,
         judge_keys_seen,
         sink,
         plaintext,
@@ -1163,6 +1282,5 @@ async fn cross_provider_judge_without_credential_fails_closed() {
         "no credential for the judge provider → the judge vendor must never \
          be called (fail closed, no key leak)"
     );
-    assert_eq!(h.judge_calls.load(Ordering::SeqCst), 0);
     assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
 }

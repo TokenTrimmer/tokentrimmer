@@ -31,8 +31,8 @@ pub use middleware::retrieval::RetrievalState;
 pub use quality_sample::{
     ab_order_for, judge_paired, risk_band_to_preview, spawn_quality_judge, AbOrder,
     FanoutJudgeSink, GatewayLlmJudge, InMemoryJudgeBandStore, JudgeConfig, JudgeOutcome, JudgeSink,
-    JudgeTaskClass, PairCall, PairVerdict, PairedJudgeOutcome, PairedJudgeProvider,
-    QualityJudgeJob, ReferenceSource,
+    JudgeTaskClass, PairCall, PairVerdict, PairedJudgeFailure, PairedJudgeOutcome,
+    PairedJudgeProvider, QualityJudgeJob, ReferenceSource,
 };
 pub use registry::{
     register_providers, spawn_openrouter_catalog_refresh, ProviderRegistry, ProvidersConfig,

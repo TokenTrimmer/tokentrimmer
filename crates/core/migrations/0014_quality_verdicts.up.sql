@@ -13,24 +13,31 @@
 -- Cost conventions (the honesty-of-the-ledger rules):
 --   * judge_cost_usd      — the judge tax: cost of the judge call(s), summed
 --                           over both orders in both-orders mode. NULL means
---                           a judge call was billed but UNMETERED (no catalog
---                           pricing) — never persisted as 0, so downstream
---                           can tell "genuinely ~$0" from "unknown".
+--                           UNMETERED: a judge call was attempted whose billed
+--                           cost cannot be stated — no catalog pricing, OR the
+--                           call errored/timed out client-side after dispatch
+--                           (the provider may have billed it anyway). Never
+--                           persisted as 0, so downstream can tell "genuinely
+--                           ~$0" from "unknown".
 --   * baseline_cost_usd   — cost of the baseline reference dispatch inside
 --                           the detached judge task; NULL when nothing extra
---                           was dispatched OR the dispatch was unmetered —
+--                           was dispatched OR the dispatch was unmetered
+--                           (unpriced model / failed or timed-out attempt) —
 --                           baseline_dispatched disambiguates.
---   * baseline_dispatched — TRUE when a baseline reference dispatch actually
---                           ran (and was billed upstream). TRUE with NULL
---                           baseline_cost_usd = a real billed dispatch on an
---                           unpriced model.
+--   * baseline_dispatched — TRUE when a baseline reference dispatch was
+--                           actually attempted (and so may have been billed
+--                           upstream, even when it timed out client-side).
+--                           TRUE with NULL baseline_cost_usd = an attempted
+--                           dispatch whose price is unknown.
 --   Both costs are measurement tax: kept OUT of request_logs cost columns so
---   savings stay invoice-reconcilable; never counted as or against savings.
---   Partial failures that already incurred billed spend (baseline billed,
---   then the judge errored; first order billed, then the second errored;
---   baseline billed but came back empty) still record a row — verdict
---   'unclear', reason prefixed 'unjudged:' — so the ledger is
---   invoice-complete even when the judge model is flaky.
+--   savings stay invoice-reconcilable; never counted as or against savings —
+--   and (MVP) NOT counted toward monthly_cap_usd budget enforcement either.
+--   EVERY failure after an upstream call was attempted records a row —
+--   verdict 'unclear', reason prefixed 'unjudged:' — including a reference
+--   dispatch or judge call that errored/timed out without completing, so the
+--   ledger is invoice-complete even when the judge model is flaky (a
+--   client-side timeout aborts only our wait; the provider generally
+--   completes and bills a non-streaming generation).
 --
 -- Debiasing audit trail:
 --   * optimized_position — the blind slot ('a'/'b') the OPTIMIZED answer

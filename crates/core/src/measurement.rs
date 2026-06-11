@@ -46,8 +46,12 @@ pub(crate) struct MeasuredDispatch {
 ///   no compression delta), times the provider's fee multiplier. `None`
 ///   pricing yields `cost_usd: None` (unmetered — see [`MeasuredDispatch`]).
 /// * A timeout maps to `Err("deadline exceeded")`; an upstream error maps to
-///   its display string. The caller decides what an error means (the shadow
-///   records `succeeded=false`; the judge records nothing).
+///   its display string. NOTE a client-side timeout aborts only OUR wait —
+///   the provider typically completes (and bills) a non-streaming generation
+///   anyway. The caller decides what an error means (the shadow records
+///   `succeeded=false` with its legacy `cost=0` convention; the judge ledgers
+///   an `unjudged` row with an unmetered/`NULL` cost so the possibly-billed
+///   attempt stays invoice-visible).
 pub(crate) async fn measured_single_dispatch(
     provider: &Arc<dyn Provider>,
     mut req: ChatCompletionRequest,
