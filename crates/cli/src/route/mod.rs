@@ -18,6 +18,9 @@ pub struct AddArgs {
     pub when_prompt_contains: Vec<String>,
     pub when_cost_gt: Option<f64>,
     pub when_cost_lt: Option<f64>,
+    /// `--when-p95-gt <ms>`: match only when the gateway's live observed p95
+    /// upstream latency for the requested model exceeds this many milliseconds.
+    pub when_p95_gt: Option<u32>,
     pub max_cost: Option<f64>,
     pub disable_cache: bool,
     pub priority: u32,
@@ -64,6 +67,9 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     if let Some(v) = args.when_cost_lt {
         when.insert("estimated_cost_lt".into(), json!(v));
     }
+    if let Some(v) = args.when_p95_gt {
+        when.insert("upstream_latency_ms_p95_gt".into(), json!(v));
+    }
     let mut then = serde_json::Map::new();
     then.insert("target_model".into(), json!(target));
     if !args.fallback.is_empty() {
@@ -96,7 +102,9 @@ pub enum RouteCmd {
     List,
     Show(String),
     Rm(String),
-    Add(AddArgs),
+    // `AddArgs` is much larger than the other variants (many flags) — box it so
+    // the enum doesn't carry that size on every variant (clippy large_enum_variant).
+    Add(Box<AddArgs>),
 }
 
 /// Dispatch a `tt route` subcommand against the gateway.
@@ -253,6 +261,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
             priority: 100,
@@ -279,6 +288,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
             priority: 50,
@@ -307,6 +317,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
             priority: 100,
@@ -329,6 +340,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: None,
             disable_cache: true,
             priority: 100,
@@ -353,6 +365,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
             priority: 100,
@@ -377,6 +390,7 @@ mod tests {
             when_prompt_contains: vec!["confidential".into(), "salary".into()],
             when_cost_gt: None,
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
             priority: 100,
@@ -403,6 +417,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
             priority: 100,
@@ -426,6 +441,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: Some(0.05),
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
             priority: 100,
@@ -436,6 +452,54 @@ mod tests {
         .unwrap();
         assert_eq!(body["when"]["estimated_cost_gt"], 0.05);
         assert!(body["when"].get("estimated_cost_lt").is_none());
+    }
+
+    #[test]
+    fn when_p95_gt_serializes_into_when_clause() {
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-4o-mini".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: None,
+            when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
+            when_p95_gt: Some(1500),
+            max_cost: None,
+            disable_cache: false,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        })
+        .unwrap();
+        assert_eq!(body["when"]["upstream_latency_ms_p95_gt"], 1500);
+    }
+
+    #[test]
+    fn when_p95_gt_omitted_when_absent() {
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-4o-mini".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: None,
+            when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
+            when_p95_gt: None,
+            max_cost: None,
+            disable_cache: false,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        })
+        .unwrap();
+        assert!(body["when"].get("upstream_latency_ms_p95_gt").is_none());
     }
 
     #[test]
@@ -450,6 +514,7 @@ mod tests {
             when_prompt_contains: vec![],
             when_cost_gt: None,
             when_cost_lt: None,
+            when_p95_gt: None,
             max_cost: Some(0.1),
             disable_cache: false,
             priority: 100,

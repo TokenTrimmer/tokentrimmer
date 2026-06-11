@@ -292,6 +292,7 @@ mod tests {
                 prompt_contains_any_of: vec![],
                 estimated_cost_gt: None,
                 estimated_cost_lt: None,
+                upstream_latency_ms_p95_gt: None,
             },
             then: RouteAction {
                 target_model: "claude-haiku-4-5".into(),

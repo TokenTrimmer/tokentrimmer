@@ -5450,6 +5450,7 @@ dependencies = [
  "tt-plan-core",
  "tt-preview",
  "tt-provider-anthropic",
+ "tt-provider-azure",
  "tt-provider-gemini",
  "tt-provider-groq",
  "tt-provider-local",
@@ -5590,6 +5591,27 @@ dependencies = [
  "tracing",
  "tt-shared",
  "tt-tokenize",
+ "uuid",
+]
+
+[[package]]
+name = "tt-provider-azure"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "httpmock",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tt-provider-compat",
+ "tt-shared",
  "uuid",
 ]
 

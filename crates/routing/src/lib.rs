@@ -14,10 +14,12 @@
 //! Rules are stored sorted descending by priority. First match wins.
 
 pub mod cache;
+pub mod latency;
 pub mod store;
 pub mod validate;
 
 pub use cache::CachingRoutingStore;
+pub use latency::{LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
 #[cfg(feature = "postgres")]
 pub use store::PostgresRoutingStore;
 pub use store::{InMemoryRoutingStore, NewRoute, RoutingStore, RoutingStoreError};
@@ -83,6 +85,27 @@ pub struct RouteConditions {
     /// Match only if the request's estimated cost (USD) is less than this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_lt: Option<f64>,
+    /// Match only when the *live, gateway-observed* p95 upstream latency (in
+    /// milliseconds) for the originally-requested `(provider, model)` exceeds
+    /// this threshold — letting a route shift traffic off a primary that is
+    /// currently slow.
+    ///
+    /// # In-process-window + cold-start behavior (READ THIS)
+    ///
+    /// The signal is the gateway's OWN bounded rolling latency window
+    /// ([`crate::LatencyTracker`]), NOT any cloud/`request_logs` data — those are
+    /// unavailable at decision time. The window is per-instance and reflects only
+    /// recent upstream behavior this replica observed. Consequently:
+    ///
+    /// - The condition is TRUE only when there are **enough samples**
+    ///   (`>= LATENCY_MIN_SAMPLES`) AND the observed p95 strictly exceeds the
+    ///   threshold — i.e. a genuinely slow primary triggers the alternate route.
+    /// - The condition is **FALSE on cold start / insufficient data**: with no
+    ///   tracker supplied, or fewer than the minimum samples for the key, an
+    ///   unknown primary does NOT match. This is deliberate — the feature must
+    ///   never gate on a fabricated signal. See `matches` / `LatencyTracker::p95`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_latency_ms_p95_gt: Option<u32>,
 }
 
 /// What a matching [`Route`] does to the request before dispatch.
@@ -208,9 +231,40 @@ impl RoutingEngine {
         input_tokens_estimate: u32,
         estimated_cost_usd: Option<f64>,
     ) -> Option<&Route> {
-        self.routes
-            .iter()
-            .find(|r| r.enabled && matches(r, req, ctx, input_tokens_estimate, estimated_cost_usd))
+        // No latency signal — latency conditions never fire (cold-start FALSE).
+        self.evaluate_with_signals(req, ctx, input_tokens_estimate, estimated_cost_usd, None)
+    }
+
+    /// Like [`RoutingEngine::evaluate_with_cost`] but also threads the live,
+    /// gateway-observed p95 upstream latency (milliseconds) for the
+    /// originally-requested `(provider, model)`, for the
+    /// `upstream_latency_ms_p95_gt` condition.
+    ///
+    /// `observed_p95_ms` is `None` when the gateway's
+    /// [`crate::LatencyTracker`] has insufficient samples for that key (cold
+    /// start) or no tracker is wired. A `None` latency makes the latency
+    /// condition FALSE — never a fabricated match. The caller computes this once
+    /// (all routes evaluate the same originally-requested model) and passes it
+    /// in, mirroring `estimated_cost_usd`.
+    pub fn evaluate_with_signals(
+        &self,
+        req: &ChatCompletionRequest,
+        ctx: &RequestContext,
+        input_tokens_estimate: u32,
+        estimated_cost_usd: Option<f64>,
+        observed_p95_ms: Option<u32>,
+    ) -> Option<&Route> {
+        self.routes.iter().find(|r| {
+            r.enabled
+                && matches(
+                    r,
+                    req,
+                    ctx,
+                    input_tokens_estimate,
+                    estimated_cost_usd,
+                    observed_p95_ms,
+                )
+        })
     }
 
     /// Find an enabled route by exact name (case-sensitive), bypassing condition
@@ -226,6 +280,7 @@ fn matches(
     ctx: &RequestContext,
     input_tokens: u32,
     estimated_cost_usd: Option<f64>,
+    observed_p95_ms: Option<u32>,
 ) -> bool {
     let c = &r.when;
     if !c.model_in.is_empty() && !c.model_in.iter().any(|m| m == &req.model) {
@@ -249,6 +304,16 @@ fn matches(
     }
     if let Some(t) = c.estimated_cost_lt {
         if !matches!(estimated_cost_usd, Some(cost) if cost < t) {
+            return false;
+        }
+    }
+    if let Some(t) = c.upstream_latency_ms_p95_gt {
+        // Live, gateway-observed p95 (in-process window). `None` = insufficient
+        // samples for this `(provider, model)` (cold start) or no tracker wired
+        // — which must NOT match, so a fresh/unknown primary never gates on a
+        // fabricated signal. Only an observed p95 STRICTLY above the threshold
+        // fires the route, shifting traffic off a genuinely-slow primary.
+        if !matches!(observed_p95_ms, Some(p95) if p95 > t) {
             return false;
         }
     }
@@ -870,6 +935,141 @@ mod tests {
             .is_none());
         assert!(eng
             .evaluate_with_cost(&make_req("gpt-4o"), &make_ctx(None), 100, None)
+            .is_none());
+    }
+
+    // --- upstream_latency_ms_p95_gt: live-signal condition tests ---
+
+    fn latency_route(threshold_ms: u32) -> Route {
+        Route {
+            when: RouteConditions {
+                upstream_latency_ms_p95_gt: Some(threshold_ms),
+                ..Default::default()
+            },
+            ..make_route("slow-primary", 10, vec![], "faster-alt")
+        }
+    }
+
+    #[test]
+    fn p95_condition_false_without_tracker_signal() {
+        // No latency signal (None) → cold start → never matches, even though the
+        // route would otherwise match any model. This is the anti-masquerading
+        // guarantee: with no real data, the latency route does NOT fire.
+        let eng = RoutingEngine::with_routes(vec![latency_route(1000)]);
+        assert!(
+            eng.evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+                .is_none(),
+            "no signal → no match"
+        );
+        assert!(eng
+            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, None)
+            .is_none());
+    }
+
+    #[test]
+    fn p95_condition_false_when_p95_at_or_below_threshold() {
+        let eng = RoutingEngine::with_routes(vec![latency_route(1000)]);
+        // p95 == threshold → strictly-greater requirement not met → no match.
+        assert!(eng
+            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(1000))
+            .is_none());
+        // p95 below threshold → no match.
+        assert!(eng
+            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(800))
+            .is_none());
+    }
+
+    #[test]
+    fn p95_condition_true_when_p95_exceeds_threshold() {
+        let eng = RoutingEngine::with_routes(vec![latency_route(1000)]);
+        let m = eng
+            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(1500))
+            .expect("slow primary → alternate route fires");
+        assert_eq!(m.then.target_model, "faster-alt");
+    }
+
+    #[test]
+    fn p95_condition_fed_by_tracker_min_samples_gate() {
+        use crate::LatencyTracker;
+        // End-to-end with the real tracker: below MIN_SAMPLES p95 is None →
+        // condition FALSE; once enough slow samples exist, p95 > threshold → TRUE.
+        let tracker = LatencyTracker::new();
+        let eng = RoutingEngine::with_routes(vec![latency_route(1000)]);
+
+        // Feed a handful of slow samples — not yet enough to report a p95.
+        for _ in 0..(crate::LATENCY_MIN_SAMPLES - 1) {
+            tracker.record("openai", "gpt-4o", 3000);
+        }
+        let p95_cold = tracker.p95("openai", "gpt-4o");
+        assert!(p95_cold.is_none(), "still cold");
+        assert!(
+            eng.evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, p95_cold)
+                .is_none(),
+            "cold start (insufficient samples) → no match"
+        );
+
+        // One more slow sample crosses MIN_SAMPLES → p95 is reported and high.
+        tracker.record("openai", "gpt-4o", 3000);
+        let p95_warm = tracker.p95("openai", "gpt-4o");
+        assert_eq!(p95_warm, Some(3000));
+        assert!(
+            eng.evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, p95_warm)
+                .is_some(),
+            "warm + slow → alternate route fires"
+        );
+    }
+
+    #[test]
+    fn p95_condition_serde_round_trip_and_omitted_when_none() {
+        // Omitted from JSON when None (back-compat with existing route rows).
+        let when = RouteConditions::default();
+        let j = serde_json::to_string(&when).unwrap();
+        assert!(
+            !j.contains("upstream_latency_ms_p95_gt"),
+            "must be omitted when None: {j}"
+        );
+        // Present + round-trips when set.
+        let when2 = RouteConditions {
+            upstream_latency_ms_p95_gt: Some(1500),
+            ..Default::default()
+        };
+        let j2 = serde_json::to_string(&when2).unwrap();
+        assert!(j2.contains("\"upstream_latency_ms_p95_gt\":1500"), "{j2}");
+        let back: RouteConditions = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back.upstream_latency_ms_p95_gt, Some(1500));
+        // Legacy JSON without the field still deserializes (serde default None).
+        let legacy: RouteConditions = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.upstream_latency_ms_p95_gt, None);
+    }
+
+    #[test]
+    fn p95_condition_anded_with_model_in() {
+        let route = Route {
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                upstream_latency_ms_p95_gt: Some(1000),
+                ..Default::default()
+            },
+            ..make_route("both", 10, vec!["gpt-4o"], "faster-alt")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        // Right model + slow p95 → match.
+        assert!(eng
+            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(2000))
+            .is_some());
+        // Wrong model → no match even though p95 is high.
+        assert!(eng
+            .evaluate_with_signals(
+                &make_req("claude-x"),
+                &make_ctx(None),
+                100,
+                None,
+                Some(2000)
+            )
+            .is_none());
+        // Right model but fast → no match.
+        assert!(eng
+            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(500))
             .is_none());
     }
 

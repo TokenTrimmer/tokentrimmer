@@ -19,6 +19,7 @@ members = [
     "crates/client",
     "crates/providers/compat",
     "crates/providers/openai",
+    "crates/providers/azure",
     "crates/providers/anthropic",
     "crates/providers/gemini",
     "crates/providers/mistral",
@@ -162,6 +163,7 @@ tt-inspect-rules-tier1 = { path = "crates/inspect-rules-tier1", version = "0.1" 
 tt-plan-core = { path = "crates/plan-core", version = "0.1" }
 tt-provider-compat = { path = "crates/providers/compat", version = "0.1" }
 tt-provider-openai = { path = "crates/providers/openai", version = "0.1" }
+tt-provider-azure = { path = "crates/providers/azure", version = "0.1" }
 tt-provider-anthropic = { path = "crates/providers/anthropic", version = "0.1" }
 tt-provider-gemini = { path = "crates/providers/gemini", version = "0.1" }
 tt-provider-mistral = { path = "crates/providers/mistral", version = "0.1" }

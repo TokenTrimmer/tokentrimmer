@@ -54,6 +54,7 @@ is ignored, so a route with an empty `when` matches every request.
 | `prompt_contains_any_of` | `[string]`  | the request's user+system text contains **any** keyword (case-insensitive substring). |
 | `estimated_cost_gt`      | `float` USD | the request's estimated cost is **greater than** this.                        |
 | `estimated_cost_lt`      | `float` USD | the request's estimated cost is **less than** this.                           |
+| `upstream_latency_ms_p95_gt` | `int` ms | the gateway's **live observed** p95 upstream latency for the requested model is **greater than** this. |
 
 Notes that change behavior in practice:
 
@@ -70,6 +71,16 @@ Notes that change behavior in practice:
   target is permissive.
 - **`prompt_contains_any_of` is case-insensitive** and matches any one of the
   keywords. It is useful for keeping sensitive topics on a local/private model.
+- **`upstream_latency_ms_p95_gt` is backed by a live, in-process signal.** The
+  gateway keeps a bounded rolling window of the upstream latencies *it itself*
+  observes per `(provider, model)` and checks that window's live p95 at route
+  time — so the condition shifts traffic off a primary that is *currently* slow.
+  It is **per-instance** (each gateway replica routes on what it has observed) and
+  **cold-start safe**: until the window has enough recent samples for the model,
+  the p95 is unknown and the condition does **not** match — a fresh or unknown
+  primary is never gated on a fabricated signal. Not evaluable in Plan replay
+  (historical logs have no in-process window), so a Plan never projects savings
+  for a latency-gated route.
 
 ## Actions (`then`)
 
@@ -124,6 +135,7 @@ required: pass `--always <model>` (match-all) **or** `--from <m> --to <m>`
 | `--when-prompt-contains <kw>` | appended to `when.prompt_contains_any_of` (repeatable) |
 | `--when-cost-gt <usd>`        | `when.estimated_cost_gt`                         |
 | `--when-cost-lt <usd>`        | `when.estimated_cost_lt`                         |
+| `--when-p95-gt <ms>`          | `when.upstream_latency_ms_p95_gt`               |
 | `--max-cost <usd>`            | `then.max_cost_usd`                              |
 | `--disable-cache`             | `then.disable_cache = true`                      |
 | `--fallback <model>`          | appended to `then.fallbacks` (repeatable)        |
