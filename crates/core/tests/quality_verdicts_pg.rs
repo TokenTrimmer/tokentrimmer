@@ -16,6 +16,25 @@ use tt_core::quality_sample::{AbOrder, JudgeOutcome, JudgeSink};
 use tt_plan_core::{JudgeVerdict, RiskBand, SampleScore};
 use uuid::Uuid;
 
+/// The full persisted column set read back in the round-trip assert:
+/// (org_id, route_id, requested_model, served_model, verdict, reason,
+/// judge_model, judge_cost_usd, baseline_cost_usd, optimized_position,
+/// orders_judged, orders_agreed).
+type VerdictRow = (
+    Uuid,
+    Option<Uuid>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    f64,
+    Option<f64>,
+    Option<String>,
+    i16,
+    Option<bool>,
+);
+
 /// Full-fidelity round trip: migrate an empty DB, record one outcome through
 /// the production sink, read the row back and assert every persisted column;
 /// then prove the CHECK constraint rejects a bogus verdict string.
@@ -53,20 +72,7 @@ async fn pg_judge_sink_round_trips_verdict() {
     .await;
 
     // Read the row back. NUMERIC columns are cast to FLOAT8 for the assert.
-    let row: (
-        Uuid,
-        Option<Uuid>,
-        String,
-        String,
-        String,
-        String,
-        String,
-        f64,
-        Option<f64>,
-        Option<String>,
-        i16,
-        Option<bool>,
-    ) = sqlx::query_as(
+    let row: VerdictRow = sqlx::query_as(
         "SELECT org_id, route_id, requested_model, served_model, verdict, reason, judge_model, \
          judge_cost_usd::FLOAT8, baseline_cost_usd::FLOAT8, optimized_position, orders_judged, \
          orders_agreed \
