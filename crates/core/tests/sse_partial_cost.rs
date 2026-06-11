@@ -179,7 +179,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         spend_sink: tt_core::budget::SpendSink::None,
         fee_multiplier: 1.0,
         flex_applied: false,
-        compression_tokens_removed: 0,
+        pass_effects: tt_core::passes::PassEffects::default(),
         cache_insert: None,
         include_usage: false,
         span_ctx: None,

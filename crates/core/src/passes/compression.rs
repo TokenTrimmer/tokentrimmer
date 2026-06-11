@@ -5,11 +5,17 @@
 //! a request never needed, without altering meaning. It runs **only** when a
 //! matched route opted in (`RouteAction::compress`) and is **off by default**.
 //!
-//! # What it touches (non-prose only)
+//! # What it touches (non-prose only, VOLATILE TAIL only)
+//!
+//! The pass operates on the [`VolatileTail`] the pipeline hands it — it cannot
+//! reach the cache-stable prefix by type (see the [`crate::passes`] module
+//! docs). Within the tail it touches:
 //!
 //! - **System messages** — instructions/scaffolding assembled by tooling, not
 //!   typed prose. Frameworks routinely concatenate templates with stray blank
-//!   lines and trailing whitespace.
+//!   lines and trailing whitespace. (A cache-qualified system prefix sits in
+//!   the STABLE region and is therefore out of reach — trimming it would bust
+//!   the provider prompt cache for a fraction of the cache discount.)
 //! - **Tool messages** (`role: "tool"`) — tool-result / RAG-document payloads.
 //!   Verbose machine output: logs, JSON dumps, scraped documents.
 //! - **Assistant `tool_calls` arguments** — a stringified-JSON blob the model
@@ -18,11 +24,13 @@
 //!
 //! # What it NEVER touches
 //!
+//! - **The cache-stable prefix** — structurally unreachable (type-level).
 //! - **User messages** — the actual instruction / prose. Left byte-identical.
 //! - **Assistant text content** — model prose in the transcript. Left
 //!   byte-identical.
 //! - **Image / audio parts** — bytes are never inspected.
-//! - **`tools` definitions, `tool_choice`, every non-message field** — untouched.
+//! - **`tools` definitions, `tool_choice`, every non-message field** —
+//!   structurally unreachable through the tail handle.
 //!
 //! # Why each trim is provably safe
 //!
@@ -59,9 +67,9 @@
 //! [`crate::passes::PassPipeline::run`] for any future, more aggressive stage.
 
 use tt_shared::messages::{Message, MessageContent};
-use tt_shared::ChatCompletionRequest;
 
-use super::{PassOutcome, RequestPass};
+use super::split::{PassContext, StablePrefix, VolatileTail};
+use super::{push_content_text, PassOutcome, RequestPass};
 
 /// The conservative, content-lossless compression stage (compression pass #1).
 #[derive(Debug, Clone, Copy, Default)]
@@ -80,19 +88,25 @@ impl RequestPass for CompressionPass {
         "compression-1"
     }
 
-    fn apply(&self, req: &mut ChatCompletionRequest, provider_id: &str) -> PassOutcome {
+    fn apply(
+        &self,
+        _stable: &StablePrefix<'_>,
+        tail: &mut VolatileTail<'_>,
+        cx: &PassContext<'_>,
+    ) -> PassOutcome {
         // Measure the non-prose text we are allowed to touch BEFORE the trim,
-        // then again AFTER, and report the tokenized delta. Measuring only the
-        // touched blocks (not the whole request) keeps the count tight and
-        // avoids attributing untouched-prose tokens to compression.
-        let before = touchable_text(req);
-        compress_in_place(req);
-        let after = touchable_text(req);
+        // then again AFTER, and report the tokenized delta. (Informational:
+        // the pipeline's token-true gate measures the whole-tail delta itself
+        // and uses that for attribution; this self-report is drift telemetry.)
+        let before = touchable_text(tail.messages());
+        compress_in_place(tail);
+        let after = touchable_text(tail.messages());
 
-        let before_tokens = tt_tokenize::estimate_tokens(provider_id, &before);
-        let after_tokens = tt_tokenize::estimate_tokens(provider_id, &after);
+        let before_tokens = tt_tokenize::estimate_tokens(cx.provider_id, &before);
+        let after_tokens = tt_tokenize::estimate_tokens(cx.provider_id, &after);
         PassOutcome {
             tokens_removed: before_tokens.saturating_sub(after_tokens),
+            warnings: Vec::new(),
         }
     }
 }
@@ -101,9 +115,9 @@ impl RequestPass for CompressionPass {
 /// to measure the token delta. Mirrors exactly which blocks
 /// [`compress_in_place`] rewrites: System + Tool message text, and Assistant
 /// `tool_calls` arguments. User/Assistant prose is excluded.
-fn touchable_text(req: &ChatCompletionRequest) -> String {
+fn touchable_text(msgs: &[Message]) -> String {
     let mut out = String::new();
-    for m in &req.messages {
+    for m in msgs {
         match m {
             Message::System { content } | Message::Tool { content, .. } => {
                 push_content_text(&mut out, content);
@@ -121,27 +135,10 @@ fn touchable_text(req: &ChatCompletionRequest) -> String {
     out
 }
 
-fn push_content_text(out: &mut String, content: &MessageContent) {
-    match content {
-        MessageContent::Text(s) => {
-            out.push_str(s);
-            out.push('\n');
-        }
-        MessageContent::Parts(parts) => {
-            for p in parts {
-                if let tt_shared::messages::ContentPart::Text { text } = p {
-                    out.push_str(text);
-                    out.push('\n');
-                }
-            }
-        }
-    }
-}
-
-/// Apply the conservative trims in place.
-fn compress_in_place(req: &mut ChatCompletionRequest) {
+/// Apply the conservative trims to the volatile tail in place.
+fn compress_in_place(tail: &mut VolatileTail<'_>) {
     // 1. Per-message trims on non-prose roles.
-    for m in &mut req.messages {
+    for m in tail.messages_mut() {
         match m {
             Message::System { content } | Message::Tool { content, .. } => {
                 compress_content(content);
@@ -162,12 +159,15 @@ fn compress_in_place(req: &mut ChatCompletionRequest) {
 
     // 2. De-duplicate exactly-repeated ADJACENT non-prose blocks (same role +
     //    byte-identical content). Walk back-to-front so index removal is stable.
-    let mut i = req.messages.len();
+    //    Tail-relative indices: the stable prefix is not part of this walk, so
+    //    a tail block can never be deduplicated against a stable one (which
+    //    would mutate nothing but still requires the boundary to be respected).
+    let mut i = tail.len();
     while i >= 2 {
         let cur = i - 1;
         let prev = i - 2;
-        if adjacent_nonprose_duplicate(&req.messages[prev], &req.messages[cur]) {
-            req.messages.remove(cur);
+        if adjacent_nonprose_duplicate(&tail.messages()[prev], &tail.messages()[cur]) {
+            tail.remove(cur);
         }
         i -= 1;
     }
@@ -296,10 +296,26 @@ fn content_eq(a: &MessageContent, b: &MessageContent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::passes::split::SplitRequest;
+    use crate::passes::PassPipeline;
+    use chrono::Utc;
     use tt_shared::messages::{ContentPart, ToolCall, ToolCallFunction};
+    use tt_shared::pricing::ModelPricing;
+    use tt_shared::ChatCompletionRequest;
 
+    /// Apply the pass through an ALL-VOLATILE split (no pricing → no cache
+    /// minimum → empty stable prefix), so every assertion below exercises the
+    /// exact pre-split behavior.
     fn run(req: &mut ChatCompletionRequest) -> u32 {
-        CompressionPass::new().apply(req, "openai").tokens_removed
+        let cx = PassContext {
+            provider_id: "openai",
+            model: "gpt-4o",
+            pricing: None,
+        };
+        let mut split = SplitRequest::compute(req, &cx);
+        split
+            .run_pass(|stable, tail| CompressionPass::new().apply(stable, tail, &cx))
+            .tokens_removed
     }
 
     fn sys(text: &str) -> Message {
@@ -508,6 +524,67 @@ mod tests {
         assert_eq!(
             text_of(&req.messages[0]),
             "def f(x):\n    return x + 1\n\nprint('ok')"
+        );
+    }
+
+    /// THE type-invariant behavioral pin: on a cache-qualified multi-turn
+    /// request the entire message list is stable, so the pipeline leaves every
+    /// message byte-identical — dirty system whitespace, settled tool blocks,
+    /// duplicates and all — and books exactly zero. (Before the cache-span
+    /// invariant, the pass would have trimmed the system/tool whitespace here
+    /// and booked a "saving" that busts the provider prompt cache.)
+    #[test]
+    fn compression_cannot_touch_stable_prefix() {
+        let pricing = ModelPricing {
+            input_per_million: 10.0,
+            output_per_million: 30.0,
+            cached_input_per_million: Some(1.0),
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: Some(8),
+            effective_at: Utc::now(),
+        };
+        let cx = PassContext {
+            provider_id: "openai",
+            model: "gpt-x",
+            pricing: Some(&pricing),
+        };
+        // Multi-turn (assistant present) + comfortably over the 8-token min →
+        // MultiTurnHistory: everything is stable.
+        let mut req = ChatCompletionRequest {
+            model: "gpt-x".into(),
+            messages: vec![
+                sys("You are concise.   \n\n\n\n\nFollow the rules.   "),
+                user("Please summarize."),
+                Message::Assistant {
+                    content: Some(MessageContent::Text("Working on it.".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                tool("RESULT   \n\n\n\n\nDATA", "call_x"),
+                tool("RESULT   \n\n\n\n\nDATA", "call_x"),
+            ],
+            ..Default::default()
+        };
+        let before = serde_json::to_string(&req).unwrap();
+
+        let out = {
+            let mut split = SplitRequest::compute(&mut req, &cx);
+            PassPipeline::conservative_compression().run(&mut split, &cx)
+        };
+
+        assert_eq!(out.tokens_removed, 0, "stable prefix books zero");
+        assert!(
+            out.rejected.is_empty(),
+            "a structural no-op is not a rejection"
+        );
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            before,
+            "every message must be byte-identical on the cache-qualified path"
         );
     }
 

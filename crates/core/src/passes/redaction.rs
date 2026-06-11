@@ -1,4 +1,4 @@
-//! Redaction pass — a conservative, **safety** transform that strips PII and
+//! Redaction — a conservative, **safety** transform that strips PII and
 //! secrets from the OUTBOUND request before it is dispatched upstream.
 //!
 //! This is a guardrail, not a savings feature. It runs **only** when a matched
@@ -6,15 +6,27 @@
 //! fires it replaces each matched span with the fixed placeholder
 //! `[REDACTED]` so the secret/PII never reaches the upstream provider.
 //!
+//! # Outside the pipeline type system — the escape-hatch user
+//!
+//! Redaction is NOT a [`RequestPass`](crate::passes::RequestPass): a secret in
+//! the cache-stable prefix MUST still be stripped (safety beats cost), so it
+//! needs whole-request reach that the pipeline's type-level cache-span
+//! invariant deliberately forbids. The chat handler therefore drives it
+//! through [`SplitRequest::mutate_whole_request`](crate::passes::SplitRequest::mutate_whole_request)
+//! — the deliberate escape hatch — and when [`RedactionPass::redact_indexed`]
+//! reports a hit at a message index inside the stable prefix, the handler
+//! books the returned [`CacheBustEstimate`](crate::passes::CacheBustEstimate)
+//! as a NEGATIVE savings entry (`cache_bust:redaction-1` warning +
+//! `x-tokentrimmer-cache-bust-usd`). The redaction always proceeds; the
+//! cache-bust cost is just never hidden.
+//!
 //! # Honest framing
 //!
-//! Redaction is a SAFETY transform, NOT a savings feature. Any token delta this
-//! pass reports is internal accounting only — there is no user-facing "savings"
-//! claim for redaction, and the gateway never brands a redaction token delta as
-//! a saving. The primary signal that redaction occurred is the
-//! `x-tokentrimmer-warnings` header (e.g. `redacted:system`, `redacted:body`,
-//! `redacted:tool_result`). This pass redacts the *upstream request* — it does
-//! NOT redact the gateway's own logs.
+//! Redaction is a SAFETY transform, NOT a savings feature. No token delta it
+//! causes is ever branded as a saving. The primary signal that redaction
+//! occurred is the `x-tokentrimmer-warnings` header (e.g. `redacted:system`,
+//! `redacted:body`, `redacted:tool_result`). This redacts the *upstream
+//! request* — it does NOT redact the gateway's own logs.
 //!
 //! # What it touches
 //!
@@ -49,8 +61,6 @@ use regex::Regex;
 
 use tt_shared::messages::{Message, MessageContent};
 use tt_shared::ChatCompletionRequest;
-
-use super::{PassOutcome, RequestPass};
 
 /// The placeholder substituted for every matched secret / PII span. Fixed so the
 /// redacted value is never derivable from the output and so the redaction is
@@ -135,7 +145,19 @@ impl RedactedField {
     }
 }
 
-/// The conservative request-redaction guardrail pass.
+/// One redaction firing, located by message index — the handler uses the index
+/// to decide whether the hit landed inside the cache-stable prefix (and must
+/// therefore book a [`CacheBustEstimate`](crate::passes::CacheBustEstimate)).
+/// The secret VALUE is never carried; only the location and class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedactedHit {
+    /// Index of the redacted message within `req.messages`.
+    pub msg_index: usize,
+    /// The field class that fired at that index.
+    pub field: RedactedField,
+}
+
+/// The conservative request-redaction guardrail.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RedactionPass;
 
@@ -146,100 +168,50 @@ impl RedactionPass {
         Self
     }
 
-    /// Redact `req` in place, returning the SORTED, DEDUPLICATED set of field
-    /// classes in which at least one redaction fired. An empty result means the
-    /// request was left byte-for-byte unchanged.
+    /// Redact `req` in place, returning one [`RedactedHit`] per message in
+    /// which at least one redaction fired (in message order). An empty result
+    /// means the request was left byte-for-byte unchanged.
     ///
-    /// This is the entry point the gateway uses to build the warnings-header
-    /// entries; the [`RequestPass`] impl wraps it for the pipeline.
+    /// This is the entry point the gateway uses: the indices let the handler
+    /// detect a hit inside the cache-stable prefix and book the cache bust.
     #[must_use]
-    pub fn redact(&self, req: &mut ChatCompletionRequest) -> Vec<RedactedField> {
-        let mut fired: Vec<RedactedField> = Vec::new();
-        for m in &mut req.messages {
-            match m {
+    pub fn redact_indexed(&self, req: &mut ChatCompletionRequest) -> Vec<RedactedHit> {
+        let mut fired: Vec<RedactedHit> = Vec::new();
+        for (msg_index, m) in req.messages.iter_mut().enumerate() {
+            let field = match m {
                 Message::System { content } => {
-                    if redact_content(content) {
-                        fired.push(RedactedField::System);
-                    }
+                    redact_content(content).then_some(RedactedField::System)
                 }
                 Message::User { content, .. } => {
-                    if redact_content(content) {
-                        fired.push(RedactedField::Body);
-                    }
+                    redact_content(content).then_some(RedactedField::Body)
                 }
                 Message::Tool { content, .. } => {
-                    if redact_content(content) {
-                        fired.push(RedactedField::ToolResult);
-                    }
+                    redact_content(content).then_some(RedactedField::ToolResult)
                 }
                 // The assistant transcript (model output / tool_calls) is the
                 // model's own text — out of scope for a REQUEST guardrail.
-                Message::Assistant { .. } => {}
+                Message::Assistant { .. } => None,
+            };
+            if let Some(field) = field {
+                fired.push(RedactedHit { msg_index, field });
             }
         }
+        fired
+    }
+
+    /// Redact `req` in place, returning the SORTED, DEDUPLICATED set of field
+    /// classes in which at least one redaction fired — the warnings-header
+    /// shape. Thin wrapper over [`Self::redact_indexed`].
+    #[must_use]
+    pub fn redact(&self, req: &mut ChatCompletionRequest) -> Vec<RedactedField> {
+        let mut fired: Vec<RedactedField> = self
+            .redact_indexed(req)
+            .into_iter()
+            .map(|h| h.field)
+            .collect();
         fired.sort_unstable();
         fired.dedup();
         fired
-    }
-}
-
-impl RequestPass for RedactionPass {
-    fn name(&self) -> &'static str {
-        "redaction-1"
-    }
-
-    fn apply(&self, req: &mut ChatCompletionRequest, provider_id: &str) -> PassOutcome {
-        // Measure the redactable text before and after so the pipeline can sum a
-        // token delta for internal accounting. NOTE: redaction is a SAFETY
-        // transform — this delta is NOT a saving and must never be branded as
-        // one. Replacing a long secret with the short placeholder can shrink the
-        // prompt, but that is incidental.
-        let before = redactable_text(req);
-        let fired = self.redact(req);
-        if fired.is_empty() {
-            return PassOutcome::NONE;
-        }
-        let after = redactable_text(req);
-        let before_tokens = tt_tokenize::estimate_tokens(provider_id, &before);
-        let after_tokens = tt_tokenize::estimate_tokens(provider_id, &after);
-        PassOutcome {
-            tokens_removed: before_tokens.saturating_sub(after_tokens),
-        }
-    }
-}
-
-/// Concatenate the text of every block the pass is allowed to scan — used only
-/// to measure the (internal-accounting) token delta. Mirrors exactly which
-/// blocks [`RedactionPass::redact`] touches: System + User + Tool message text.
-fn redactable_text(req: &ChatCompletionRequest) -> String {
-    let mut out = String::new();
-    for m in &req.messages {
-        match m {
-            Message::System { content }
-            | Message::User { content, .. }
-            | Message::Tool { content, .. } => {
-                push_content_text(&mut out, content);
-            }
-            Message::Assistant { .. } => {}
-        }
-    }
-    out
-}
-
-fn push_content_text(out: &mut String, content: &MessageContent) {
-    match content {
-        MessageContent::Text(s) => {
-            out.push_str(s);
-            out.push('\n');
-        }
-        MessageContent::Parts(parts) => {
-            for p in parts {
-                if let tt_shared::messages::ContentPart::Text { text } = p {
-                    out.push_str(text);
-                    out.push('\n');
-                }
-            }
-        }
     }
 }
 
@@ -516,36 +488,41 @@ mod tests {
         assert_eq!(text, "ping me at [REDACTED]");
     }
 
-    // --- RequestPass impl / pipeline behavior ---
+    // --- indexed hits (cache-bust booking input) ---
 
     #[test]
-    fn apply_is_noop_outcome_on_clean_request() {
-        let mut r = req(vec![user("nothing sensitive here")]);
-        let before = serde_json::to_string(&r).unwrap();
-        let outcome = RedactionPass::new().apply(&mut r, "openai");
-        assert!(outcome.is_noop());
-        assert_eq!(serde_json::to_string(&r).unwrap(), before);
+    fn redact_indexed_reports_message_indices() {
+        // Secrets in messages 0 (system) and 2 (tool); message 1 is clean.
+        let mut r = req(vec![
+            sys("config token sk-ant-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            user("nothing sensitive here"),
+            tool("scraped 123-45-6789 from upstream", "c1"),
+        ]);
+        let hits = RedactionPass::new().redact_indexed(&mut r);
+        assert_eq!(
+            hits,
+            vec![
+                RedactedHit {
+                    msg_index: 0,
+                    field: RedactedField::System
+                },
+                RedactedHit {
+                    msg_index: 2,
+                    field: RedactedField::ToolResult
+                },
+            ]
+        );
+        // The clean user message is untouched.
+        assert_eq!(text_of(&r.messages[1]), "nothing sensitive here");
     }
 
     #[test]
-    fn apply_redacts_and_returns_an_outcome_when_fired() {
-        // A long secret replaced by the short placeholder shrinks the block, so
-        // the (internal-accounting) token delta is reported. This is NOT a
-        // user-facing saving — see the module docs.
-        let key = "a".repeat(60);
-        let mut r = req(vec![user(&format!("key sk-ant-{key}"))]);
-        let outcome = RedactionPass::new().apply(&mut r, "openai");
-        // It fired (content changed); the token delta is accounting-only.
-        let Message::User { content, .. } = &r.messages[0] else {
-            panic!();
-        };
-        let MessageContent::Text(s) = content else {
-            panic!();
-        };
-        assert_eq!(s, "key [REDACTED]");
-        // The placeholder is shorter than the secret, so tokens_removed >= 0;
-        // we only assert it does not underflow / panic.
-        let _ = outcome.tokens_removed;
+    fn redact_indexed_empty_on_clean_request() {
+        let mut r = req(vec![user("nothing sensitive here")]);
+        let before = serde_json::to_string(&r).unwrap();
+        let hits = RedactionPass::new().redact_indexed(&mut r);
+        assert!(hits.is_empty());
+        assert_eq!(serde_json::to_string(&r).unwrap(), before);
     }
 
     #[test]

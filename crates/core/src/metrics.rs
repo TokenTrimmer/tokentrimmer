@@ -148,4 +148,32 @@ mod tests {
         assert_eq!(cache_result(None, Some(0)), "unreported");
         assert_eq!(cache_result(None, None), "unreported");
     }
+
+/// Count a request pass discarded by the token-true gate (its transform ADDED
+/// tokens and was rolled back, booking zero savings). Labelled by pass name so
+/// a misbehaving pass is attributable.
+pub fn record_request_pass_rejected(pass: &'static str) {
+    metrics::counter!("request_pass_rejected_total", "pass" => pass).increment(1);
+}
+
+/// Record a deliberate stable-prefix mutation (a booked
+/// [`CacheBustEstimate`](crate::passes::CacheBustEstimate)): one count per
+/// bust by source, plus the estimated USD penalty accumulated into a monotone
+/// sum. The USD series uses a gauge-backed monotone accumulator because the
+/// `metrics` counter API is integer-only — it only ever increases, so
+/// dashboards may treat it as a counter.
+pub fn record_cache_bust(source: &'static str, penalty_usd: f64) {
+    metrics::counter!("cache_bust_total", "source" => source).increment(1);
+    metrics::gauge!("cache_bust_penalty_usd_total").increment(penalty_usd);
+}
+
+/// Record a cache-classifier finding: a volatile marker (timestamp / uuid /
+/// hex-token) inside a would-be-stable cached prefix. One count per kind, plus
+/// the estimated per-request USD waste accumulated into a monotone sum (the
+/// caller books the waste exactly once per request — pass 0.0 for additional
+/// kinds on the same request). Monthly cost = a 30d aggregation over the
+/// waste series in the dashboard; the handler cannot know per-route volume.
+pub fn record_cache_dynamic_prefix(kind: &'static str, est_wasted_usd: f64) {
+    metrics::counter!("cache_dynamic_prefix_total", "kind" => kind).increment(1);
+    metrics::gauge!("cache_dynamic_prefix_waste_usd_total").increment(est_wasted_usd);
 }
