@@ -99,15 +99,15 @@ fn migrator_includes_provider_cache_saved_migration() {
 #[test]
 fn migrator_includes_provider_cache_tokens_migration() {
     let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
-    let fourteenth = migrations
+    let fifteenth = migrations
         .iter()
-        .find(|m| m.version == 14)
-        .expect("migration version 14 not found");
-    let desc = fourteenth.description.to_lowercase();
+        .find(|m| m.version == 15)
+        .expect("migration version 15 not found");
+    let desc = fifteenth.description.to_lowercase();
     assert!(
         desc.contains("cache") || desc.contains("tokens"),
-        "migration 0014 description is '{}', expected to mention cache/tokens",
-        fourteenth.description,
+        "migration 0015 description is '{}', expected to mention cache/tokens",
+        fifteenth.description,
     );
 }
 

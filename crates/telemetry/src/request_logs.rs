@@ -83,9 +83,15 @@ pub struct RequestLogRow {
     /// Raw provider-reported cache-read input tokens. `None` (-> SQL NULL) when
     /// the provider did not report the field OR no provider call was made (TT
     /// L1/L2 hits, truncated streams with no terminal usage). `Some(0)` means
-    /// the provider explicitly reported zero. Rows from before migration 0014
+    /// the provider explicitly reported zero. Rows from before migration 0015
     /// are NULL. The NOT NULL `cached_tokens` above keeps its folded
     /// (absent => 0) semantics for back-compat.
+    ///
+    /// One deliberate exception (streamed fold-rescue): a terminal usage chunk
+    /// with folded `cached_tokens > 0` but the raw field absent (pre-fix
+    /// adapter / older TT hop) is recorded as `Some(fold)` — a nonzero fold
+    /// proves real provider cache reads and must not regress to NULL. A folded
+    /// 0 without the raw field stays `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<i32>,
     /// Raw provider-reported cache-write (creation) input tokens. Same NULL
@@ -352,7 +358,7 @@ mod tests {
         assert_eq!(rows[1].cache_creation_input_tokens, None);
     }
 
-    /// Legacy JSON (rows serialized before migration 0014) deserializes with
+    /// Legacy JSON (rows serialized before migration 0015) deserializes with
     /// both provider cache token fields defaulting to `None`, and `None`
     /// fields are omitted on re-serialize.
     #[test]
