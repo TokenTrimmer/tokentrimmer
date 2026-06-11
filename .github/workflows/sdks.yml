@@ -58,7 +58,9 @@ jobs:
         with:
           node-version: '20'
       - name: Install
-        run: cd n8n-nodes-tokentrimmer && npm install
+        # --ignore-scripts: n8n-workflow's transitive isolated-vm fails its native
+        # node-gyp build on runners, and nothing in typecheck/build/test needs it.
+        run: cd n8n-nodes-tokentrimmer && npm install --ignore-scripts
       - name: Typecheck (src + tests)
         run: cd n8n-nodes-tokentrimmer && npm run typecheck
       - name: Build

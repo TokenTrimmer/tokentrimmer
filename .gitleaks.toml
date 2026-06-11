@@ -21,6 +21,13 @@ regexes = [
   # token, so scripts/benchmarks/* send a literal `sk-mock-anything` — not a
   # real credential.
   '''sk-mock-anything''',
+  # n8n node test fixtures mirror the documented x-tokentrimmer-* response
+  # headers; generic-api-key false-positives on the model-id header value
+  # (`claude-3-5-haiku-…`). Response-header names are never secrets.
+  '''x-tokentrimmer-model-used''',
+  # cache-classifier unit test uses an obviously-sequential fake hex token to
+  # exercise the long-hex volatile-marker detection.
+  '''a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6''',
 ]
 paths = [
   # Deleted product-review doc; prose ("Argon2 keys") tripped generic-api-key.
