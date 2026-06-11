@@ -123,3 +123,16 @@ Verified-open items remaining after the F1–F12 series + post-roadmap queue (#3
 - [ ] [P3] [post-clickhouse-migration] rust-crate-builder: ClickHouse dual-write for request_logs at Scale rate. [BLOCKED — post-beta] (est: $2.00)
 - [ ] [P1] [env-secret-split-rotate] ops: Rotate live keys read this session (TT_MASTER_KEY re-encrypt, TT_ADMIN_TOKEN, FLY_DEPLOY_KEY, Stripe) + split dev/prod secret sets. [BLOCKED — human: key rotation] Re-encryption primitive + runbook already shipped. (est: —)
 - [x] [P2] [rv-ssrf-gemini-guard] rust-crate-builder: Apply tt_shared::url_guard::validate_provider_url to the Gemini adapter base_url (non-stream + stream) — rv-ssrf-url-guard covered compat/openai/anthropic but missed gemini; add allow_local test seam like the other native adapters (§5.2) (est: $0.30)
+
+---
+
+## Explicit strategic skips (recorded 2026-06-11, per COMPREHENSIVE_REVIEW_2026-06-09 §10.1/§10.3/§11)
+
+Deliberate decisions NOT to build, each with a revisit trigger. Do not re-litigate without the trigger firing; when one fires, open a spec item rather than building directly.
+
+- **SKIP: general-purpose workflow canvas builder** (triggers + arbitrary API/internet nodes). Dilutes the "swap a base URL, save money, prove it" wedge into n8n/Zapier/Dify territory; adds a third-party-secrets-vault liability. *Revisit:* only as short linear chains inside Hosted Endpoints, and only if Hosted Endpoints v1 ships and customers ask for chaining.
+- **SKIP: internet connectors / third-party credential custody.** Custody of customers' third-party API credentials is a Zapier-class secrets-vault obligation + SSRF/egress liability. Substitute (shipped/planned): be the cost-aware node inside builders users already run (n8n node, base-URL-swap docs) + MCP write-tools (#149). *Revisit:* never for custody; connector-shaped demand routes to Hosted Endpoints with LLM-only steps.
+- **SKIP: unified-billing marketplace** (one key, TT re-bills provider usage). Margin war against zero-markup incumbents (Helicone, Vercel, OpenRouter at 5.5%). *Revisit:* if ≥3 paying customers independently name one-key billing as a deal-blocker in a quarter.
+- **SKIP: learned-routing-as-the-product** (Martian's research moat). TT ships a learned router as a *feature* — suggestions-first, judge-labeled, replay-evaluated (review §10.2 idea 7) — never as the headline pitch. *Revisit:* when the judge loop has accumulated enough labels that offline replay shows the learned policy beating hand rules by a clear margin on ≥2 real orgs.
+- **SKIP: MCP traffic-governance gateway** (auth/policy proxy for MCP fleets). PANW×Portkey/Bifrost land-grab; not the savings wedge. *Revisit:* when >20% of gateway traffic is MCP-originated.
+- **SKIP: wasm-edge gateway rewrite.** tokio/sqlx/argon2 don't target wasm32; the right wasm bet is the cost-preview playground (tt-tokenize + pricing compile cleanly to wasm). *Revisit:* only if a credible edge-deploy requirement arrives from a paying customer AND the playground proved the toolchain.
