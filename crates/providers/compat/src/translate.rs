@@ -163,17 +163,26 @@ pub struct OpenAiUsage {
 }
 
 /// OpenAI `prompt_tokens_details` sub-object.
+///
+/// `cached_tokens` is `Option` so the NULL-vs-0 telemetry distinction holds at
+/// key granularity: a details object *without* a `cached_tokens` key (e.g. one
+/// carrying only `audio_tokens`) — or with an explicit `null` — means "provider
+/// did not report cache reads" (`None` → SQL NULL), not "reported zero".
 #[derive(Debug, Deserialize)]
 pub struct PromptTokensDetails {
     #[serde(default)]
-    pub cached_tokens: u64,
+    pub cached_tokens: Option<u64>,
 }
 
 impl From<OpenAiUsage> for Usage {
     fn from(u: OpenAiUsage) -> Self {
         // Keep the raw Option-ness: `None` = OpenAI reported no
-        // prompt_tokens_details at all, distinct from a reported zero.
-        let cache_read = u.prompt_tokens_details.as_ref().map(|d| d.cached_tokens);
+        // prompt_tokens_details at all (or no cached_tokens key inside it),
+        // distinct from a reported zero.
+        let cache_read = u
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens);
         Usage {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
@@ -410,6 +419,41 @@ mod tests {
         let usage = extract_usage(&raw).expect("extract ok");
         assert_eq!(usage.cached_tokens, 0);
         // No prompt_tokens_details at all → raw stays None, NOT Some(0).
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    /// A details object that carries other keys but NO `cached_tokens` key
+    /// means the provider did not report cache reads — raw must stay None
+    /// (SQL NULL), not become a fabricated Some(0).
+    #[test]
+    fn usage_details_without_cached_tokens_key_is_none() {
+        let raw = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_tokens_details": { "audio_tokens": 5 }
+            }
+        });
+        let usage = extract_usage(&raw).expect("extract ok");
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    /// An explicit `"cached_tokens": null` must parse (not error the request)
+    /// and map to "unreported" (None).
+    #[test]
+    fn usage_details_null_cached_tokens_is_lenient_none() {
+        let raw = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_tokens_details": { "cached_tokens": null }
+            }
+        });
+        let usage = extract_usage(&raw).expect("extract ok");
+        assert_eq!(usage.cached_tokens, 0);
         assert_eq!(usage.cache_read_input_tokens, None);
     }
 

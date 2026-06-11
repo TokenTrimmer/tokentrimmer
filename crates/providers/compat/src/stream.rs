@@ -278,7 +278,10 @@ impl RawUsage {
     fn into_canonical(self) -> Usage {
         // Wire detail wins when present; raw Option-ness is preserved so
         // telemetry can tell "reported zero" from "didn't report".
-        let detail = self.prompt_tokens_details.as_ref().map(|d| d.cached_tokens);
+        let detail = self
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens);
         Usage {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
@@ -1043,6 +1046,32 @@ mod tests {
         let usage = canonical[0].usage.as_ref().expect("usage present");
         assert_eq!(usage.cached_tokens, 0);
         assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    /// A details object with an explicit `"cached_tokens": null` (or carrying
+    /// only other keys like audio_tokens) must NOT error the chunk parse —
+    /// the terminal usage frame still reaches the client, and the raw
+    /// cache-read stays None ("unreported"), not a fabricated Some(0).
+    #[test]
+    fn streaming_usage_chunk_with_null_or_missing_cached_tokens_is_lenient_none() {
+        for details in [r#"{"cached_tokens":null}"#, r#"{"audio_tokens":5}"#] {
+            let chunk_json = format!(
+                r#"{{"id":"c9","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[],"usage":{{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{details}}}}}"#
+            );
+            let event = format!("data: {chunk_json}\n\n");
+            let mut acc = ToolAccum::default();
+            let mut canonical = Vec::new();
+            for ev in parse_sse_event(event.as_bytes()) {
+                if let SseEvent::Chunk(raw) = ev {
+                    canonical.extend(handle_raw_chunk(&mut acc, raw));
+                } else {
+                    panic!("usage chunk with details {details} must parse, got {ev:?}");
+                }
+            }
+            let usage = canonical[0].usage.as_ref().expect("usage present");
+            assert_eq!(usage.cached_tokens, 0);
+            assert_eq!(usage.cache_read_input_tokens, None);
+        }
     }
 
     /// Usage riding on the tool-call drain path (finish chunk carries both the
