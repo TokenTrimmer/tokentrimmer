@@ -28,8 +28,10 @@ pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use middleware::retrieval::RetrievalState;
 pub use quality_sample::{
-    risk_band_to_preview, spawn_quality_judge, GatewayLlmJudge, InMemoryJudgeBandStore,
-    JudgeConfig, JudgeOutcome, JudgeSink, JudgeTaskClass, QualityJudgeJob, ReferenceSource,
+    ab_order_for, judge_paired, risk_band_to_preview, spawn_quality_judge, AbOrder,
+    FanoutJudgeSink, GatewayLlmJudge, InMemoryJudgeBandStore, JudgeConfig, JudgeOutcome, JudgeSink,
+    JudgeTaskClass, PairCall, PairVerdict, PairedJudgeOutcome, PairedJudgeProvider,
+    QualityJudgeJob, ReferenceSource,
 };
 pub use registry::{
     register_providers, spawn_openrouter_catalog_refresh, ProviderRegistry, ProvidersConfig,

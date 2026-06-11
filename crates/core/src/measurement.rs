@@ -27,9 +27,6 @@ use tt_shared::{ChatCompletionRequest, ChatCompletionResponse, Provider, Request
 pub(crate) struct MeasuredDispatch {
     /// The upstream response. The shadow path drops it; the judge's baseline
     /// reference path extracts the assistant text from it.
-    // TEMP allow(dead_code): read by quality_sample::ReferenceSource::Dispatch
-    // in the next commit of this lane (the shadow caller drops the response).
-    #[allow(dead_code)]
     pub(crate) response: ChatCompletionResponse,
     /// Cost (USD) of this dispatch on the served model's own pricing.
     /// `0.0` when the model has no catalog pricing — **0.0 means unmetered,

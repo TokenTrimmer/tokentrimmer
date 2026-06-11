@@ -103,6 +103,14 @@ pub const TT_QUALITY_BAND: &str = "tokentrimmer.quality.band";
 /// `tokentrimmer.quality.verdict` — raw judge verdict (`acceptable` / `degraded`
 /// / `unclear`).
 pub const TT_QUALITY_VERDICT: &str = "tokentrimmer.quality.verdict";
+/// `tokentrimmer.quality.judge_cost_usd` — the judge tax: cost (USD) of the
+/// judge call(s) that produced this verdict. Measurement spend, kept OUT of
+/// the request cost attributes so savings stay invoice-reconcilable; the
+/// durable `quality_verdicts` row is canonical for Phase 2 attribution
+/// netting, this attribute is the ops-visible mirror. Always emitted for a
+/// judged request; `0.0` means the judge model had no catalog pricing
+/// (unmetered), never "free".
+pub const TT_QUALITY_JUDGE_COST_USD: &str = "tokentrimmer.quality.judge_cost_usd";
 
 /// **Reserved** wire name for a per-request quality score header in `[0, 1]`,
 /// following the existing `x-tokentrimmer-*` header convention.
@@ -291,6 +299,10 @@ pub struct QualityVerdictAttributes<'a> {
     pub band: &'a str,
     /// Raw judge verdict (`acceptable`/`degraded`/`unclear`) → `tokentrimmer.quality.verdict`.
     pub verdict: &'a str,
+    /// Judge tax (USD) → `tokentrimmer.quality.judge_cost_usd`. Always emitted
+    /// for a judged request — `0.0` means the judge model had no catalog
+    /// pricing (unmetered), never "free". See [`TT_QUALITY_JUDGE_COST_USD`].
+    pub judge_cost_usd: f64,
 }
 
 /// Record the per-request quality verdict onto `span`.
@@ -320,6 +332,7 @@ pub fn record_quality_verdict(span: &Span, attrs: &QualityVerdictAttributes<'_>)
     }
     span.set_attribute(TT_QUALITY_BAND, attrs.band.to_string());
     span.set_attribute(TT_QUALITY_VERDICT, attrs.verdict.to_string());
+    span.set_attribute(TT_QUALITY_JUDGE_COST_USD, attrs.judge_cost_usd);
 }
 
 #[cfg(test)]
@@ -489,6 +502,7 @@ mod tests {
                     score: Some(1.0),
                     band: "low",
                     verdict: "acceptable",
+                    judge_cost_usd: 0.000_05,
                 },
             );
         });
@@ -516,6 +530,11 @@ mod tests {
             attrs.get(TT_QUALITY_VERDICT),
             Some(&Value::String("acceptable".into()))
         );
+        assert_eq!(
+            attrs.get(TT_QUALITY_JUDGE_COST_USD),
+            Some(&Value::F64(0.000_05)),
+            "the judge tax must land on the span"
+        );
     }
 
     /// An `unclear` verdict carries no `score` (`None`), so the
@@ -534,6 +553,7 @@ mod tests {
                     score: None,
                     band: "low",
                     verdict: "unclear",
+                    judge_cost_usd: 0.0,
                 },
             );
         });

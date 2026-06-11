@@ -58,8 +58,52 @@ struct JudgeAwareProvider {
     /// When set, the judge call awaits this gate before returning — lets a test
     /// hold the judge mid-flight while asserting the HTTP response already landed.
     judge_gate: Option<Arc<Notify>>,
-    /// The verdict the judge model returns (first line of its reply).
+    /// The verdict intent the judge model expresses with pair tokens:
+    /// `"ACCEPTABLE"` → `EQUIVALENT`; `"DEGRADED"` → `A_MISSING`/`B_MISSING`
+    /// naming whichever blind slot holds the optimized (cheaper-model) answer.
     judge_verdict_word: &'static str,
+    /// When true, every judge-model call errors (fail-open test).
+    judge_fail: bool,
+    /// Full prompt text (system + user) of every judge-model request, captured
+    /// for the blind-prompt assertions.
+    judge_prompts: Arc<Mutex<Vec<String>>>,
+}
+
+/// Build the judge model's pair-token reply. For a "DEGRADED" intent the mock
+/// must name whichever blind slot holds the OPTIMIZED (cheaper-model) answer —
+/// the slot is randomized per trace, so the mock inspects the prompt rather
+/// than assuming a fixed position.
+fn pair_reply(user_text: &str, verdict_word: &'static str) -> String {
+    match verdict_word {
+        "ACCEPTABLE" => "EQUIVALENT\nsame material information".to_string(),
+        "DEGRADED" => {
+            let a_start = user_text.find("ANSWER A:").unwrap_or(0);
+            let b_start = user_text.find("ANSWER B:").unwrap_or(user_text.len());
+            let slot_a = &user_text[a_start..b_start];
+            if slot_a.contains("gpt-4o-mini") {
+                "A_MISSING — dropped material info".to_string()
+            } else {
+                "B_MISSING — dropped material info".to_string()
+            }
+        }
+        other => format!("{other}\nreason line"),
+    }
+}
+
+/// Concatenated text content of a request's messages (system + user), used to
+/// capture and assert on the judge prompt.
+fn request_text(req: &ChatCompletionRequest) -> String {
+    req.messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::System { content } | Message::User { content, .. } => match content {
+                MessageContent::Text(s) => Some(s.clone()),
+                MessageContent::Parts(_) => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[async_trait]
@@ -107,6 +151,10 @@ impl Provider for JudgeAwareProvider {
         let is_judge = req.model == JUDGE_MODEL;
         if is_judge {
             self.judge_calls.fetch_add(1, Ordering::SeqCst);
+            self.judge_prompts.lock().unwrap().push(request_text(&req));
+            if self.judge_fail {
+                return Err(ProviderError::Unsupported("judge down".into()));
+            }
             if let Some(gate) = &self.judge_gate {
                 // Block the judge call until the test releases it. Proves the
                 // user response is independent of judge progress.
@@ -116,7 +164,7 @@ impl Provider for JudgeAwareProvider {
             self.served_calls.fetch_add(1, Ordering::SeqCst);
         }
         let text = if is_judge {
-            format!("{}\nreason line", self.judge_verdict_word)
+            pair_reply(&request_text(&req), self.judge_verdict_word)
         } else {
             // Served + reference (original-model) answers.
             format!("answer from {}", req.model)
@@ -183,6 +231,31 @@ struct Harness {
     served_calls: Arc<AtomicUsize>,
     sink: Arc<RecordingSink>,
     plaintext: String,
+    judge_prompts: Arc<Mutex<Vec<String>>>,
+}
+
+/// Harness knobs beyond the original four (new tests opt in via
+/// [`build_harness_opts`]; the existing call sites keep [`build_harness`]).
+struct HarnessOpts {
+    rate: f64,
+    plant_downgrade_route: bool,
+    judge_gate: Option<Arc<Notify>>,
+    judge_verdict_word: &'static str,
+    judge_fail: bool,
+    both_orders: bool,
+}
+
+impl Default for HarnessOpts {
+    fn default() -> Self {
+        Self {
+            rate: 1.0,
+            plant_downgrade_route: true,
+            judge_gate: None,
+            judge_verdict_word: "ACCEPTABLE",
+            judge_fail: false,
+            both_orders: false,
+        }
+    }
 }
 
 async fn build_harness(
@@ -191,14 +264,28 @@ async fn build_harness(
     judge_gate: Option<Arc<Notify>>,
     judge_verdict_word: &'static str,
 ) -> Harness {
+    build_harness_opts(HarnessOpts {
+        rate,
+        plant_downgrade_route,
+        judge_gate,
+        judge_verdict_word,
+        ..Default::default()
+    })
+    .await
+}
+
+async fn build_harness_opts(opts: HarnessOpts) -> Harness {
     let judge_calls = Arc::new(AtomicUsize::new(0));
     let served_calls = Arc::new(AtomicUsize::new(0));
+    let judge_prompts = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(JudgeAwareProvider {
         judge_calls: Arc::clone(&judge_calls),
         served_calls: Arc::clone(&served_calls),
-        judge_gate,
-        judge_verdict_word,
+        judge_gate: opts.judge_gate,
+        judge_verdict_word: opts.judge_verdict_word,
+        judge_fail: opts.judge_fail,
+        judge_prompts: Arc::clone(&judge_prompts),
     }));
 
     let raw_store = InMemoryKeyStore::new();
@@ -218,7 +305,7 @@ async fn build_harness(
     let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
 
     let routes_backing = Arc::new(InMemoryRoutingStore::new());
-    if plant_downgrade_route {
+    if opts.plant_downgrade_route {
         routes_backing.set_routes(
             org_id,
             vec![Route {
@@ -251,8 +338,10 @@ async fn build_harness(
     let sink = Arc::new(RecordingSink::default());
     let config = JudgeConfig {
         enabled: true,
-        sample_rate: rate,
+        sample_rate: opts.rate,
         judge_model: JUDGE_MODEL.to_string(),
+        both_orders: opts.both_orders,
+        ..JudgeConfig::default()
     };
     let app = build_router(
         AppState::new(registry)
@@ -267,6 +356,7 @@ async fn build_harness(
         served_calls,
         sink,
         plaintext,
+        judge_prompts,
     }
 }
 
@@ -496,6 +586,12 @@ async fn preview_enriches_quality_band_from_recorded_judge_outcome() {
                 reason: "lost nuance".into(),
             },
             risk_band: RiskBand::High,
+            judge_model: JUDGE_MODEL.to_string(),
+            judge_cost_usd: 0.000_05,
+            baseline_cost_usd: Some(0.002),
+            optimized_position: tt_core::AbOrder::OptimizedA,
+            orders_judged: 1,
+            orders_agreed: None,
         })
         .await;
 
@@ -521,6 +617,7 @@ async fn preview_enriches_quality_band_from_recorded_judge_outcome() {
         enabled: true,
         sample_rate: 1.0,
         judge_model: JUDGE_MODEL.to_string(),
+        ..JudgeConfig::default()
     };
     let app = build_router(
         AppState::new(registry)
@@ -570,4 +667,208 @@ async fn preview_enriches_quality_band_from_recorded_judge_outcome() {
             );
         }
     }
+}
+
+// ── Paired A/B sampler (research Phase 0.4) ─────────────────────────────────
+
+/// The judge prompt that actually reaches the judge model is BLIND: the two
+/// answers appear only as ANSWER A / ANSWER B, with no ORIGINAL/CHEAPER role
+/// labels (the #128 label-bias regression guard, end-to-end).
+#[tokio::test]
+async fn judge_prompt_is_blind_end_to_end() {
+    let h = build_harness_opts(HarnessOpts::default()).await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.sink.recorded.notified(),
+    )
+    .await
+    .expect("judge should record");
+
+    let prompts = h.judge_prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "one judge prompt captured");
+    let prompt = &prompts[0];
+    assert!(prompt.contains("ANSWER A"), "blind slot labels: {prompt}");
+    assert!(prompt.contains("ANSWER B"), "blind slot labels: {prompt}");
+    assert!(
+        !prompt.contains("ORIGINAL ANSWER"),
+        "the role-leaking #128 label must be gone: {prompt}"
+    );
+    assert!(
+        !prompt.contains("CHEAPER"),
+        "the role-leaking #128 label must be gone: {prompt}"
+    );
+}
+
+/// The baseline reference dispatch is METERED: the recorded outcome carries
+/// the baseline model's cost on its own pricing (the measurement tax Phase 2
+/// nets into attribution) plus a non-zero judge tax.
+#[tokio::test]
+async fn paired_baseline_dispatch_is_metered() {
+    let h = build_harness_opts(HarnessOpts::default()).await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.sink.recorded.notified(),
+    )
+    .await
+    .expect("judge should record");
+
+    let outcomes = h.sink.outcomes.lock().unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let o = &outcomes[0];
+    // gpt-4o pricing (5.0 in / 15.0 out per M) on the mock's fixed 100/100
+    // usage: (100*5 + 100*15) / 1e6 = 0.002.
+    let baseline = o
+        .baseline_cost_usd
+        .expect("a re-dispatched baseline must be metered");
+    assert!(
+        (baseline - 0.002).abs() < 1e-9,
+        "baseline cost should be 0.002, got {baseline}"
+    );
+    // Judge pricing (0.1 / 0.4 per M) on 100/100 usage: 0.00005.
+    assert!(
+        o.judge_cost_usd > 0.0,
+        "the judge tax must be metered, got {}",
+        o.judge_cost_usd
+    );
+    assert!(
+        (o.judge_cost_usd - 0.000_05).abs() < 1e-9,
+        "judge cost should be 0.00005, got {}",
+        o.judge_cost_usd
+    );
+    assert_eq!(o.judge_model, JUDGE_MODEL);
+    assert_eq!(o.orders_judged, 1);
+    assert_eq!(o.orders_agreed, None);
+}
+
+/// Both-orders mode makes exactly TWO judge calls per sampled request (and
+/// sums the judge tax); single-order mode makes exactly one.
+#[tokio::test]
+async fn both_orders_makes_two_judge_calls() {
+    let h = build_harness_opts(HarnessOpts {
+        both_orders: true,
+        ..Default::default()
+    })
+    .await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.sink.recorded.notified(),
+    )
+    .await
+    .expect("judge should record");
+    assert_eq!(
+        h.judge_calls.load(Ordering::SeqCst),
+        2,
+        "both-orders mode judges the pair twice (slots swapped)"
+    );
+    {
+        let outcomes = h.sink.outcomes.lock().unwrap();
+        let o = &outcomes[0];
+        assert_eq!(o.orders_judged, 2);
+        assert_eq!(
+            o.orders_agreed,
+            Some(true),
+            "EQUIVALENT agrees across orders"
+        );
+        assert!(
+            (o.judge_cost_usd - 2.0 * 0.000_05).abs() < 1e-9,
+            "judge tax sums over both orders, got {}",
+            o.judge_cost_usd
+        );
+    }
+
+    // Single-order control: exactly one judge call.
+    let h1 = build_harness_opts(HarnessOpts::default()).await;
+    let resp = h1
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h1.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h1.sink.recorded.notified(),
+    )
+    .await
+    .expect("judge should record");
+    assert_eq!(
+        h1.judge_calls.load(Ordering::SeqCst),
+        1,
+        "single-order mode judges once"
+    );
+}
+
+/// A judge-model failure is FAIL-OPEN: the user response is untouched (200 +
+/// served body) and the sink records nothing — no fabricated verdicts.
+#[tokio::test]
+async fn judge_failure_is_fail_open() {
+    let h = build_harness_opts(HarnessOpts {
+        judge_fail: true,
+        ..Default::default()
+    })
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a judge failure must never touch the user response"
+    );
+    assert_eq!(
+        resp.headers()["x-tokentrimmer-model-used"]
+            .to_str()
+            .unwrap(),
+        "gpt-4o-mini"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "answer from gpt-4o-mini",
+        "the served body is intact"
+    );
+
+    // Give the detached judge task time to attempt + fail.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while h.judge_calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the judge call should at least be attempted");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        h.sink.outcomes.lock().unwrap().len(),
+        0,
+        "a failed judge records nothing — never a fabricated verdict"
+    );
 }

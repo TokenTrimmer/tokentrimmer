@@ -3217,11 +3217,19 @@ fn maybe_spawn_quality_judge(
         served_model,
         input_text,
         served_answer,
-        // Reference = the ORIGINAL model re-dispatched off-path inside the task.
+        judge_model: state.judge_config.judge_model.clone(),
+        // Deterministic per-trace blind slot for the optimized answer (position
+        // debiasing), independent of the keep/drop sampling decision.
+        ab_order: qs::ab_order_for(trace_id),
+        both_orders: state.judge_config.both_orders,
+        // Reference = the ORIGINAL model re-dispatched off-path inside the task,
+        // metered + bounded by the judge's own baseline deadline (not the 2s
+        // shadow timeout — nobody is waiting on the detached task).
         reference: qs::ReferenceSource::Dispatch {
             provider: source_provider,
             request: Box::new(original_req),
             ctx: Box::new(source_ctx),
+            deadline: state.judge_config.baseline_timeout,
         },
         // This judge fires on the rerouted-down DISPATCH path — an L2 hit
         // short-circuits before dispatch, so there is no served-from-L2 entry to
@@ -3331,13 +3339,18 @@ fn maybe_spawn_l2_hit_judge(
         served_model: entry.model.clone(),
         input_text,
         served_answer,
+        judge_model: state.judge_config.judge_model.clone(),
+        // Deterministic per-trace blind slot for the optimized (cached) answer.
+        ab_order: qs::ab_order_for(trace_id),
+        both_orders: state.judge_config.both_orders,
         // Reference = the ORIGINAL request re-dispatched off-path inside the
         // task, so the judge scores the cached answer against a fresh answer to
-        // THIS query.
+        // THIS query. Metered + bounded by the judge's baseline deadline.
         reference: qs::ReferenceSource::Dispatch {
             provider: source_provider.clone(),
             request: Box::new(original_req.clone()),
             ctx: Box::new(source_ctx.clone()),
+            deadline: state.judge_config.baseline_timeout,
         },
         // The join the roadmap flagged: a High-band verdict evicts EXACTLY this
         // served-from-L2 entry (single-row, never bulk); Low/Medium/Unclear only
