@@ -52,8 +52,10 @@ use uuid::Uuid;
 struct RecordingProvider {
     seen_messages: Arc<Mutex<Vec<Vec<Message>>>>,
     /// `Some(min)` makes the model cache-capable: the request-pass split then
-    /// computes a stable prefix, and a redaction inside it must book a
-    /// cache-bust penalty. `None` (the default everywhere below) keeps the
+    /// computes a stable prefix. Redaction is DETERMINISTIC on the ingress
+    /// bytes, so even a hit inside that prefix books NO cache-bust penalty
+    /// (the dispatched prefix is byte-identical every turn — the provider
+    /// cache keeps hitting). `None` (the default everywhere below) keeps the
     /// pre-lane all-volatile behavior.
     cache_min_tokens: Option<u32>,
 }
@@ -513,17 +515,20 @@ async fn cache_hit_does_not_re_run_redaction() {
     );
 }
 
-/// NEGATIVE SAVINGS BOOKING: on a cache-capable model (min present) the
-/// pii_request is multi-turn (assistant present) and comfortably over the tiny
-/// minimum, so the WHOLE message list is the cache-stable prefix. The system
-/// secret redaction therefore fires INSIDE the stable prefix and must book a
-/// cache-bust entry: `x-tokentrimmer-cache-bust-usd` > 0, a
-/// `cache_bust:redaction-1` warning next to the `redacted:*` tokens, and the
-/// headline saving reduced (here: clamped to 0, since there is no routing /
-/// flex / compression saving to absorb the penalty). The redaction itself
-/// still proceeds — safety beats cost, the cost is just never hidden.
+/// NO PHANTOM BUST: on a cache-capable model (min present) the pii_request is
+/// multi-turn (assistant present) and comfortably over the tiny minimum, so
+/// the WHOLE message list is the cache-stable prefix — and the system secret
+/// redaction fires INSIDE it. But redaction is DETERMINISTIC on the ingress
+/// bytes (fixed regexes, fixed `[REDACTED]` placeholder): the dispatched
+/// prefix is byte-identical on every request/turn, the provider's
+/// exact-prefix cache keeps hitting, and NO bust occurs. Booking one anyway
+/// would wipe the savings headline of every redact+cache-capable customer on
+/// every turn for a cost no provider invoice would ever show (the phantom
+/// recurring penalty this lane's review caught). So:
+/// `x-tokentrimmer-cache-bust-usd` reads 0.000000, no `cache_bust:` token is
+/// emitted, and the redaction itself still proceeds — safety beats cost.
 #[tokio::test]
-async fn redaction_in_stable_prefix_books_negative_entry() {
+async fn deterministic_redaction_in_stable_prefix_books_no_bust() {
     let (app, key, seen) = app_with_redact_route_and_cache_min(true, Some(8)).await;
 
     let resp = app.oneshot(request_with_key(false, &key)).await.unwrap();
@@ -534,15 +539,13 @@ async fn redaction_in_stable_prefix_books_negative_entry() {
     let all_upstream_text: String = msgs[0].iter().filter_map(text_of).collect();
     assert!(!all_upstream_text.contains(SECRET_KEY));
 
-    // The bust is booked and surfaced.
-    let bust: f64 = resp.headers()["x-tokentrimmer-cache-bust-usd"]
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(
-        bust > 0.0,
-        "a redaction inside the stable prefix must book a positive bust, got {bust}"
+    // No bust is booked: deterministic egress ⇒ the provider cache still hits.
+    assert_eq!(
+        resp.headers()["x-tokentrimmer-cache-bust-usd"]
+            .to_str()
+            .unwrap(),
+        "0.000000",
+        "deterministic redaction must never book a cache bust"
     );
 
     let warnings = resp
@@ -553,26 +556,26 @@ async fn redaction_in_stable_prefix_books_negative_entry() {
         .unwrap()
         .to_string();
     assert!(
-        warnings.contains("cache_bust:redaction-1"),
-        "the bust source must be named: {warnings}"
+        !warnings.contains("cache_bust:"),
+        "no bust token for a deterministic mutation: {warnings}"
     );
     assert!(
         warnings.contains("redacted:system"),
         "the redaction class tokens are unchanged: {warnings}"
     );
 
-    // The penalty reduces the headline pre-clamp. With no other savings source
-    // (baseline == cost: same model, no cache, no compression) the headline
-    // clamps to exactly 0 — never negative.
+    // The headline is NOT suppressed by a phantom penalty: with baseline ==
+    // cost (same model, no cache, no compression) it is exactly 0 because
+    // there is nothing saved — not because a penalty wiped it.
     let saved: f64 = resp.headers()["x-tokentrimmer-saved-usd"]
         .to_str()
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(saved, 0.0, "penalty-reduced headline clamps at 0");
+    assert_eq!(saved, 0.0);
 
-    // The penalty is an estimate of induced future cost — it must NOT be
-    // folded into the invoice-reconcilable cost figure.
+    // And the realized cost figure is untouched (estimates are never folded
+    // into the invoice-reconcilable cost).
     let cost: f64 = resp.headers()["x-tokentrimmer-cost-usd"]
         .to_str()
         .unwrap()

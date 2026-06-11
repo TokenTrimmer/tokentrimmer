@@ -11,6 +11,16 @@
 //! re-bills at full input price — a silent cost leak the static lints can only
 //! see in source code, while this classifier sees it in live request bytes.
 //!
+//! The qualifying region is [`compute_stable_region`] — the SAME rule the
+//! split and the adapters' injection gates use. In particular a SHORT system
+//! prompt on a cache-qualified multi-turn conversation still fires: per #150
+//! the Anthropic adapter injects the rolling last-message breakpoint when
+//! system + history clears the minimum, so a per-request timestamp in a
+//! 500-token system prompt of a 4000-token conversation busts the ENTIRE
+//! conversation cache every call — the costliest real-world shape, and
+//! exactly what the per-request waste figure quantifies (the FULL stable
+//! prefix, not just the system tokens).
+//!
 //! # Conservative scope (deliberate)
 //!
 //! - **NEVER mutates.** The pass is read-only; it emits
@@ -40,25 +50,31 @@
 //! # Quantification
 //!
 //! Per request, the estimated waste of the busted prefix is
-//! `sys_tokens × (input − cached_input) / 1e6` USD — accumulated into the
-//! `cache_dynamic_prefix_waste_usd_total` counter (plus
+//! `stable_prefix_tokens × (input − cached_input) / 1e6` USD — the WHOLE
+//! would-be-cached prefix (system + history on multi-turn), because an
+//! exact-prefix match fails from the first changed byte — accumulated into
+//! the `cache_dynamic_prefix_waste_microusd_total` counter (plus
 //! `cache_dynamic_prefix_total{kind}`). The handler cannot know per-route
 //! volume, so the *monthly* cost is a dashboard aggregation (30d rate over the
-//! counter), not a per-request figure.
+//! counter), not a per-request figure. NOTE: both series meter in the pass
+//! stage, BEFORE the L1/L2 lookups — a request later served from
+//! TokenTrimmer's own cache still counts (see `crate::metrics` docs).
 //!
 //! Default-on: invoked directly by the chat handler on EVERY request (mirrors
 //! the `RedactionPass::redact` direct-call precedent) — allowed because it is
-//! observability-only and changes no request/response semantics.
+//! observability-only and changes no request/response semantics. Per-request
+//! logging is at DEBUG (a volatile prefix is volatile on every call — WARN
+//! would spam the hot path indefinitely); the persistent signals are the
+//! metrics and the `cache_dynamic_prefix:<kind>` warning tokens.
 
 use std::sync::OnceLock;
 
 use regex::Regex;
 
-use tt_shared::messages::Message;
 use tt_shared::ChatCompletionRequest;
 
-use super::split::{cache_min_tokens, PassContext, StablePrefix, VolatileTail};
-use super::{push_content_text, PassOutcome, RequestPass};
+use super::split::{compute_stable_region, PassContext, StablePrefix, VolatileTail};
+use super::{system_text, PassOutcome, RequestPass};
 
 /// The diagnostics-only stable/volatile classifier pass.
 #[derive(Debug, Clone, Copy, Default)]
@@ -106,54 +122,40 @@ fn volatile_kinds(text: &str) -> Vec<&'static str> {
     kinds
 }
 
-/// Concatenated text of the SYSTEM messages only — the conservative scope: a
-/// volatile marker in user/tool content is normal payload, not a cached-prefix
-/// leak.
-fn system_text(msgs: &[Message]) -> String {
-    let mut out = String::new();
-    for m in msgs {
-        if let Message::System { content } = m {
-            push_content_text(&mut out, content);
-        }
-    }
-    out
-}
-
-/// Classify `sys_text` under `cx`, returning the warning tokens and emitting
-/// the log/metric side effects. Shared by the direct-call API and the
-/// pipeline impl.
-fn classify_system(sys_text: &str, cx: &PassContext<'_>) -> Vec<String> {
-    // Below the model's cache minimum nothing would cache anyway — no cached
-    // prefix exists to bust, so there is no waste to report. Models with no
-    // minimum at all (test/local providers) never fire.
-    let Some(min) = cache_min_tokens(cx) else {
-        return Vec::new();
-    };
-    let sys_tokens = tt_tokenize::estimate_tokens(cx.provider_id, sys_text);
-    if sys_tokens < min {
-        return Vec::new();
-    }
-
+/// Classify a qualified stable prefix: scan its SYSTEM text for volatile
+/// markers (the conservative scope — a marker in user/tool content is normal
+/// payload, not a cached-prefix leak) and, when any fire, meter the estimated
+/// per-request waste of busting the WHOLE `prefix_tokens`-sized prefix.
+/// Shared by the direct-call API and the pipeline impl; callers must have
+/// already established that the region qualifies for caching.
+fn classify_qualified_prefix(
+    sys_text: &str,
+    prefix_tokens: u32,
+    cx: &PassContext<'_>,
+) -> Vec<String> {
     let kinds = volatile_kinds(sys_text);
     if kinds.is_empty() {
         return Vec::new();
     }
 
-    // Estimated per-request waste: the whole prefix re-bills at the full input
-    // rate instead of the cached rate, every call. 0 when the model documents
-    // no cache-read discount.
+    // Estimated per-request waste: the whole would-be-cached prefix re-bills
+    // at the full input rate instead of the cached rate, every call (the
+    // exact-prefix match fails from the first changed byte). 0 when the model
+    // documents no cache-read discount.
     let est_wasted_usd = match cx.pricing.and_then(|p| {
         p.cached_input_per_million
             .map(|cached| (p.input_per_million - cached).max(0.0))
     }) {
-        Some(delta_rate) => (sys_tokens as f64) * delta_rate / 1_000_000.0,
+        Some(delta_rate) => (prefix_tokens as f64) * delta_rate / 1_000_000.0,
         None => 0.0,
     };
 
     for (i, kind) in kinds.iter().enumerate() {
-        tracing::warn!(
+        // DEBUG, not WARN: a volatile prefix fires on every call of that
+        // route — the metrics + warning tokens carry the persistent signal.
+        tracing::debug!(
             kind,
-            prefix_tokens = sys_tokens,
+            prefix_tokens,
             est_wasted_usd_per_request = est_wasted_usd,
             "volatile marker inside would-be-stable prefix — provider prompt cache \
              busts every call"
@@ -178,9 +180,19 @@ impl CacheClassifierPass {
     /// chat handler can run the classifier on EVERY request — diagnostics
     /// only, never mutates. Returns warning tokens for the
     /// `x-tokentrimmer-warnings` header, e.g. `cache_dynamic_prefix:uuid`.
+    ///
+    /// Gates on [`compute_stable_region`] — the same prefix rule the split
+    /// and the adapters' injection gates use — so a short system prompt on a
+    /// cache-qualified multi-turn conversation is correctly IN scope (the
+    /// adapter's rolling breakpoint caches it; a marker there busts the whole
+    /// conversation), while a request where nothing would cache stays silent.
     #[must_use]
     pub fn classify(req: &ChatCompletionRequest, cx: &PassContext<'_>) -> Vec<String> {
-        classify_system(&system_text(&req.messages), cx)
+        let (stable_len, prefix_tokens, _reason) = compute_stable_region(&req.messages, cx);
+        if stable_len == 0 {
+            return Vec::new();
+        }
+        classify_qualified_prefix(&system_text(&req.messages[..stable_len]), prefix_tokens, cx)
     }
 }
 
@@ -189,20 +201,23 @@ impl RequestPass for CacheClassifierPass {
         "cache-classifier-1"
     }
 
-    /// Read-only: scans system text across the stable prefix AND the tail
-    /// (system messages can sit in either region depending on the split),
-    /// removes nothing, and surfaces the classification as warnings.
+    /// Read-only: scans the SYSTEM text of the split's stable prefix (system
+    /// messages in the volatile tail are, by definition, not in the cached
+    /// prefix), removes nothing, and surfaces the classification as warnings.
     fn apply(
         &self,
         stable: &StablePrefix<'_>,
-        tail: &mut VolatileTail<'_>,
+        _tail: &mut VolatileTail<'_>,
         cx: &PassContext<'_>,
     ) -> PassOutcome {
-        let mut sys = system_text(stable.messages);
-        sys.push_str(&system_text(tail.messages()));
+        let warnings = if stable.messages.is_empty() {
+            Vec::new()
+        } else {
+            classify_qualified_prefix(&system_text(stable.messages), stable.est_tokens, cx)
+        };
         PassOutcome {
             tokens_removed: 0,
-            warnings: classify_system(&sys, cx),
+            warnings,
         }
     }
 }
@@ -211,7 +226,7 @@ impl RequestPass for CacheClassifierPass {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use tt_shared::messages::MessageContent;
+    use tt_shared::messages::{Message, MessageContent};
     use tt_shared::pricing::ModelPricing;
 
     const UUID_SYSTEM: &str =
@@ -357,6 +372,41 @@ mod tests {
                 "cache_dynamic_prefix:timestamp".to_string(),
                 "cache_dynamic_prefix:uuid".to_string(),
             ]
+        );
+    }
+
+    /// THE costliest real-world shape (#150): a volatile marker in a SHORT
+    /// system prompt on a cache-qualified MULTI-TURN conversation. The system
+    /// alone is below the minimum, but system + history clears it — the
+    /// adapter's rolling breakpoint caches the whole conversation, so the
+    /// marker busts the entire prefix every call and the classifier must fire.
+    #[test]
+    fn classifier_fires_on_short_system_in_qualified_multi_turn() {
+        // min = 64: the ~20-token system prompt alone is below it; the whole
+        // conversation is comfortably above it.
+        let p = pricing(Some(64));
+        let history_filler = "the previous answer covered the quarterly numbers in detail ";
+        let r = req_with(vec![
+            sys("Current time: 2026-06-11T09:30:00Z. Be helpful."),
+            user(&history_filler.repeat(10)),
+            Message::Assistant {
+                content: Some(MessageContent::Text(history_filler.repeat(10))),
+                tool_calls: vec![],
+                name: None,
+            },
+            user("follow-up question"),
+        ]);
+        // Sanity: the system text alone is below the minimum.
+        let sys_tokens =
+            tt_tokenize::estimate_tokens_for_model("openai", "gpt-x", &system_text(&r.messages));
+        assert!(
+            sys_tokens < 64,
+            "system alone must be below min (got {sys_tokens})"
+        );
+        assert_eq!(
+            classify(&r, Some(&p)),
+            vec!["cache_dynamic_prefix:timestamp".to_string()],
+            "marker in a short system prompt of a qualified conversation must fire"
         );
     }
 

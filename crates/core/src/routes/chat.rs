@@ -1078,19 +1078,20 @@ pub async fn handler(
 
     // ── Request-pass stage ───────────────────────────────────────────────────
     //
-    // Order: redaction (escape hatch + cache-bust booking) → compression
-    // pipeline (cache-aware split + token-true gate) → cache classifier
-    // (always-on diagnostics). The stage works on a cache-aware SPLIT of the
-    // request: `SplitRequest::compute` derives the cache-stable prefix
-    // (everything the Anthropic adapter would mark with `cache_control` per
-    // #126/#150 — the system prefix on a single-shot request, the entire
-    // message list on a cache-qualified multi-turn conversation; for OpenAI
-    // the ≥1024-token auto-cached prefix) and passes only the volatile tail to
-    // the pipeline mutably. The stable prefix is read-only BY TYPE — see the
+    // Order: redaction (escape hatch) → compression pipeline (cache-aware
+    // split + token-true gate) → cache classifier (always-on diagnostics).
+    // The stage works on a cache-aware SPLIT of the request:
+    // `SplitRequest::compute` derives the cache-stable prefix (everything the
+    // provider's prompt cache keys on — Anthropic: the system prefix the
+    // adapter marks per #126/#150 on a single-shot, the entire message list
+    // on a cache-qualified multi-turn conversation; OpenAI-style positional
+    // auto-cache: the entire message list whenever the prompt clears the
+    // model's minimum) and passes only the volatile tail to the pipeline
+    // mutably. The stable prefix is read-only BY TYPE — see the
     // `crate::passes` module docs. Busting a cache-warm prefix reprices ~0.1x
-    // cache reads back to 1.0x, so a transform that deliberately mutates it
-    // must book the estimated cost as a NEGATIVE savings entry
-    // (`CacheBustEstimate`) — never hide a cache bust.
+    // cache reads back to 1.0x, so a NON-deterministic transform that
+    // deliberately mutates it must book the estimated cost as a NEGATIVE
+    // savings entry (`CacheBustEstimate`) — never hide a cache bust.
     //
     // The model/pricing snapshot is taken AFTER routing/pin (the FINAL served
     // provider) so token counts and penalties price what the upstream bills.
@@ -1121,17 +1122,24 @@ pub async fn handler(
     // Redaction needs whole-request reach — a secret inside the cache-stable
     // prefix MUST still be stripped (safety beats cost) — so it is the
     // escape-hatch user, not a pipeline pass: the handler consumes the split
-    // via `mutate_whole_request` and, when a hit landed inside the stable
-    // prefix, books the returned `CacheBustEstimate` (conservatively pricing
-    // the WHOLE pre-mutation prefix) as a negative savings entry surfaced via
-    // `cache_bust:redaction-1` + `x-tokentrimmer-cache-bust-usd`.
+    // via `mutate_whole_request`. Redaction is DETERMINISTIC on the ingress
+    // bytes (fixed regexes, fixed `[REDACTED]` placeholder), so the dispatched
+    // prefix is byte-identical on every request/turn of a conversation and
+    // the provider's exact-prefix cache keeps hitting: NO bust occurs and the
+    // returned `CacheBustEstimate` is zero by construction (see
+    // `MutationDeterminism::DeterministicOnIngress`). A future
+    // NON-deterministic escape-hatch user (e.g. periodic history compaction)
+    // gets a real estimate from the same call and the booking below fires.
     let mut cache_bust = crate::passes::CacheBustEstimate::NONE;
     if route_redact {
         // Boundary + prefix token estimate are computed BEFORE the mutation:
         // the warm prefix the provider cached is the pre-mutation bytes.
         let split = crate::passes::SplitRequest::compute(&mut req, &pass_cx);
         let stable_len = split.stable().messages.len();
-        let (req_mut, bust_token) = split.mutate_whole_request("redaction-1");
+        let (req_mut, bust_token) = split.mutate_whole_request(
+            "redaction-1",
+            crate::passes::MutationDeterminism::DeterministicOnIngress,
+        );
         let hits = crate::passes::RedactionPass::new().redact_indexed(req_mut);
         if hits.is_empty() {
             // Nothing fired — the prefix bytes are untouched, nothing to book.
@@ -1150,12 +1158,17 @@ pub async fn handler(
             for field in classes {
                 warnings.push(field.warning_token().to_string());
             }
-            if stable_len > 0 && hits.iter().any(|h| h.msg_index < stable_len) {
-                // A redaction fired INSIDE the cache-stable prefix: the cached
-                // bytes changed, so the provider's exact-prefix match misses
-                // and the prefix re-bills at the full input rate instead of
-                // ~0.1x. Book the negative entry — safety always wins, but the
-                // induced cost is never hidden.
+            if bust_token.busted_prefix_tokens > 0
+                && stable_len > 0
+                && hits.iter().any(|h| h.msg_index < stable_len)
+            {
+                // A NON-deterministic mutation fired INSIDE the cache-stable
+                // prefix: the dispatched bytes diverge from the warm prefix,
+                // the provider's exact-prefix match misses, and the prefix
+                // re-bills at the full input rate instead of ~0.1x. Book the
+                // negative entry — never hide a cache bust. (Unreachable for
+                // redaction, whose deterministic estimate is zero; kept live
+                // so the next escape-hatch user books automatically.)
                 warnings.push(format!("cache_bust:{}", bust_token.source));
                 crate::metrics::record_cache_bust(
                     bust_token.source,
@@ -1163,8 +1176,9 @@ pub async fn handler(
                 );
                 cache_bust = bust_token;
             } else {
-                // All hits were in the volatile tail — no cached prefix bytes
-                // changed (or nothing was cache-qualified), nothing to book.
+                // Deterministic mutation (no bust by construction), hits only
+                // in the volatile tail, or nothing cache-qualified — nothing
+                // to book.
                 bust_token.discard_unused();
             }
         }
@@ -2076,6 +2090,9 @@ pub async fn handler(
                 cost_usd,
                 baseline_cost_usd,
                 provider_cache_saved_usd,
+                // Fee-applied, matching the header/span figure — keeps the
+                // row-derived TT headline equal to `tt_saved_usd()`.
+                cache_bust_penalty_usd: cost_breakdown.cache_bust_penalty_usd,
                 cached: false,
                 cache_layer: None,
                 route_id: matched_route_id,
@@ -2655,15 +2672,18 @@ pub(crate) struct CostBreakdown {
     /// discount, so it belongs in the TT headline).
     pub compression_saved_usd: f64,
     /// NEGATIVE savings entry: the estimated cost induced by a deliberate
-    /// stable-prefix mutation (today: redaction firing inside a cache-warm
-    /// prefix) — the prefix tokens repriced from the ~0.1x cache-read rate
-    /// back to the full input rate, fee-applied. Zero on every request whose
-    /// stable prefix was untouched. It REDUCES
-    /// [`tt_saved_usd`](Self::tt_saved_usd) pre-clamp (conservative in TT's
-    /// disfavor, same precedent as the cache-write premium) but is NEVER
-    /// folded into `cost_usd` / `baseline_cost_usd`: it is an estimate of
-    /// induced FUTURE cost, and those two fields must reconcile against the
-    /// realized provider invoice.
+    /// NON-deterministic stable-prefix mutation (a booked
+    /// `CacheBustEstimate`; no shipped transform books one today — redaction
+    /// is ingress-deterministic and busts nothing) — the prefix tokens
+    /// repriced from the ~0.1x cache-read rate back to the full input rate,
+    /// fee-applied. Zero on every request whose stable prefix was untouched.
+    /// It REDUCES [`tt_saved_usd`](Self::tt_saved_usd) pre-clamp
+    /// (conservative in TT's disfavor, same precedent as the cache-write
+    /// premium) but is NEVER folded into `cost_usd` / `baseline_cost_usd`:
+    /// it is an estimate of induced FUTURE cost, and those two fields must
+    /// reconcile against the realized provider invoice. Persisted on the
+    /// `request_logs` row (migration 0014) so the row-derived ledger agrees
+    /// with the header/span headline.
     pub cache_bust_penalty_usd: f64,
 }
 
@@ -2998,10 +3018,12 @@ pub(crate) fn attach_cost_headers(
             "x-tokentrimmer-compression-saved-usd",
             format!("{:.6}", cost.compression_saved_usd),
         ),
-        // NEGATIVE savings entry: estimated cost of a deliberate stable-prefix
-        // mutation (e.g. redaction inside a cache-warm prefix) — already
-        // subtracted from `saved_usd` pre-clamp. 0.000000 on every request
-        // whose stable prefix was untouched. Never folded into cost/baseline
+        // NEGATIVE savings entry: estimated cost of a deliberate
+        // NON-deterministic stable-prefix mutation — already subtracted from
+        // `saved_usd` pre-clamp. 0.000000 on every request whose stable
+        // prefix was untouched (and for all redaction traffic: an
+        // ingress-deterministic mutation dispatches byte-identical prefixes
+        // every turn, so it busts nothing). Never folded into cost/baseline
         // (those reconcile against the realized invoice).
         (
             "x-tokentrimmer-cache-bust-usd",
@@ -3685,8 +3707,10 @@ fn request_log_for_l1_hit(
         cached_tokens: entry.response.usage.cached_tokens as i32,
         cost_usd: 0.0,
         baseline_cost_usd: baseline,
-        // TT cache hit — no provider call, no provider-side discount.
+        // TT cache hit — no provider call, no provider-side discount, and no
+        // upstream prompt cache exists to bust.
         provider_cache_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
         cached: true,
         cache_layer: Some("l1".into()),
         route_id,
@@ -3735,8 +3759,10 @@ fn request_log_for_l2_hit(
         cached_tokens: 0,
         cost_usd: 0.0,
         baseline_cost_usd,
-        // TT cache hit — no provider call, no provider-side discount.
+        // TT cache hit — no provider call, no provider-side discount, and no
+        // upstream prompt cache exists to bust.
         provider_cache_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
         cached: true,
         cache_layer: Some("l2".into()),
         route_id,

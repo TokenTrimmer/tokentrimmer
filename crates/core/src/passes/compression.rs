@@ -102,8 +102,9 @@ impl RequestPass for CompressionPass {
         compress_in_place(tail);
         let after = touchable_text(tail.messages());
 
-        let before_tokens = tt_tokenize::estimate_tokens(cx.provider_id, &before);
-        let after_tokens = tt_tokenize::estimate_tokens(cx.provider_id, &after);
+        let before_tokens =
+            tt_tokenize::estimate_tokens_for_model(cx.provider_id, cx.model, &before);
+        let after_tokens = tt_tokenize::estimate_tokens_for_model(cx.provider_id, cx.model, &after);
         PassOutcome {
             tokens_removed: before_tokens.saturating_sub(after_tokens),
             warnings: Vec::new(),

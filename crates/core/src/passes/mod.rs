@@ -19,6 +19,10 @@
 //! `#[must_use]` [`CacheBustEstimate`] which MUST be booked as a **negative
 //! savings entry** (the prefix tokens repriced from the ~0.1x cache-read rate
 //! back to 1.0x full input) into the same attribution channel the savings use.
+//! The estimate is sized by the mutation's [`MutationDeterminism`]: an
+//! ingress-deterministic transform (redaction) dispatches byte-identical
+//! prefixes every turn — the provider cache keeps hitting, so its estimate is
+//! zero by construction; only a non-deterministic mutator books the prefix.
 //!
 //! Rationale: busting a cache-warm prefix re-bills it at up to ~6.4x what
 //! leaving it alone costs (cache reads are ~0.1x; rewriting the prefix also
@@ -32,15 +36,36 @@
 //! # The token-true gate
 //!
 //! [`PassPipeline::run`] enforces "reject anything that adds tokens" at
-//! runtime: for each pass it snapshots the volatile tail, counts its tokens
-//! with the route's served-provider tokenizer ([`tt_tokenize::estimate_tokens`]
-//! — the same estimator routing/preview/cost use), applies the pass, and
-//! recounts. A pass whose transform INCREASED the token count is discarded
-//! (the tail is restored byte-identical — fail-open to the original request),
-//! metered (`request_pass_rejected_total{pass}`), and books exactly zero
-//! savings. Savings attribution uses the pipeline-measured tokenizer delta of
+//! runtime: for each pass it snapshots the volatile tail, counts it with the
+//! route's served provider + model tokenizer
+//! ([`tt_tokenize::estimate_input_tokens_for_model`] — the billing-correct
+//! encoding where one exists, a real-BPE proxy elsewhere, never characters),
+//! applies the pass, and recounts. A pass is DISCARDED (tail restored
+//! byte-identical — fail-open to the original request), metered
+//! (`request_pass_rejected_total{pass}`), and books exactly zero savings when
+//! ANY of these fired:
+//!
+//! - the text-projection token count increased;
+//! - the token count of the tail's canonical JSON serialization increased —
+//!   this covers every field the text projection cannot see (tool-call
+//!   names/ids, message `name` fields, image/audio parts, per-message
+//!   framing), so a pass cannot inflate the request through a non-text field
+//!   invisibly;
+//! - the tail message COUNT increased (splitting one message into several
+//!   adds billed per-message framing the text projection cannot price);
+//! - the number of NON-TEXT content parts changed in either direction (a pass
+//!   has no business adding OR removing image/audio parts — their token cost
+//!   cannot be measured here, so any change is unverifiable).
+//!
+//! Savings attribution uses the pipeline-measured TEXT-projection delta of
 //! committed passes — never a pass's self-reported figure (logged at debug for
-//! drift detection only) and never characters.
+//! drift detection only). Known conservative gap: deleting a whole message
+//! (dedup) books only its text tokens, not the freed per-message framing
+//! overhead — savings are understated, never overstated. When the tokenizer
+//! degrades to the `chars / 4` heuristic (tiktoken failed to load —
+//! [`tt_tokenize::Confidence::Low`]) the gate still rejects inflation but
+//! books **zero** savings: a character-derived delta is not a reconcilable
+//! token saving.
 //!
 //! # Design constraints (this is the seam that makes "TokenTrimmer that
 //! trims" true)
@@ -58,9 +83,10 @@
 //!
 //! - [`compression::CompressionPass`] (compression pass #1) — a conservative,
 //!   content-lossless trim of non-prose VOLATILE-TAIL blocks, enabled by
-//!   `RouteAction::compress`. On a cache-qualified multi-turn request it
-//!   structurally no-ops (the whole conversation is stable) — deliberate:
-//!   the cache-read rate dominates any whitespace trim of re-sent history.
+//!   `RouteAction::compress`. On a cache-qualified multi-turn request — or a
+//!   cache-qualified single-shot on a positional-auto-cache provider — it
+//!   structurally no-ops (the whole prompt is stable) — deliberate: the
+//!   cache-read rate dominates any whitespace trim of re-sent history.
 //! - [`cache_classifier::CacheClassifierPass`] — an ACTIVE, lossless,
 //!   diagnostics-only classifier (promoted from the Tier-1 inspect lints)
 //!   that flags volatile markers inside a would-be-stable prefix. Driven
@@ -68,9 +94,12 @@
 //! - [`redaction::RedactionPass`] — a SAFETY guardrail (`RouteAction::redact`)
 //!   that strips PII/secrets ANYWHERE in the request, stable prefix included.
 //!   It is exactly the escape-hatch user: safety beats cost, so the handler
-//!   drives it through [`SplitRequest::mutate_whole_request`] and books the
-//!   [`CacheBustEstimate`] when a redaction fired inside the stable prefix.
-//!   It is NOT a pipeline pass and NOT a savings feature.
+//!   drives it through [`SplitRequest::mutate_whole_request`]. Because
+//!   redaction is DETERMINISTIC on the ingress bytes, its bust estimate is
+//!   zero by construction ([`MutationDeterminism::DeterministicOnIngress`] —
+//!   the dispatched prefix is byte-identical every turn, so the provider
+//!   cache keeps hitting); only a future NON-deterministic mutator books a
+//!   real negative entry. It is NOT a pipeline pass and NOT a savings feature.
 //!
 //! A judge gate for a future non-lossless pass would attach inside
 //! [`PassPipeline::run`], wrapping the apply/recount step so a rewrite is only
@@ -85,7 +114,8 @@ pub use cache_classifier::CacheClassifierPass;
 pub use compression::CompressionPass;
 pub use redaction::{RedactedField, RedactedHit, RedactionPass};
 pub use split::{
-    CacheBustEstimate, PassContext, SplitRequest, StablePrefix, StableReason, VolatileTail,
+    CacheBustEstimate, MutationDeterminism, PassContext, SplitRequest, StablePrefix, StableReason,
+    VolatileTail,
 };
 
 use tt_shared::messages::{Message, MessageContent};
@@ -209,43 +239,78 @@ impl PassPipeline {
     /// Run every pass in order under the **token-true gate**, returning the
     /// pipeline-measured outcome.
     ///
-    /// Per pass: snapshot the volatile tail → count its tokens with the served
-    /// provider's tokenizer → apply the pass → recount. If the count INCREASED
-    /// the transform is discarded (tail restored byte-identical — fail-open),
-    /// the rejection is metered + warned, and zero savings book for that pass.
-    /// Otherwise the transform commits and `before − after` (the measured
-    /// delta, NOT the pass's self-report) accrues to
-    /// [`PipelineOutcome::tokens_removed`]. The stable prefix is immutable by
-    /// type, so counting the tail alone covers everything a pass can touch.
+    /// Per pass: snapshot the volatile tail → count it (text projection +
+    /// canonical serialization + structure) with the served provider+model
+    /// tokenizer → apply the pass → recount. Any inflation or unverifiable
+    /// structural change discards the transform (tail restored byte-identical
+    /// — fail-open), meters the rejection, and books zero — see the module
+    /// docs for the full rejection list. Otherwise the transform commits and
+    /// `before − after` on the TEXT projection (the measured delta, NOT the
+    /// pass's self-report) accrues to [`PipelineOutcome::tokens_removed`] —
+    /// unless the count came from the chars/4 heuristic (Low confidence),
+    /// which books zero. The stable prefix is immutable by type, so gating
+    /// the tail alone covers everything a pass can touch.
     ///
     /// This is also where a judge gate would attach for a future non-lossless
     /// pass: wrap the apply/recount in a verify step so the rewrite is only
     /// committed when the Wave-B2 judge confirms semantic equivalence.
     pub fn run(&self, split: &mut SplitRequest<'_>, cx: &PassContext<'_>) -> PipelineOutcome {
+        let count = |text: &str| {
+            tt_tokenize::estimate_input_tokens_for_model(cx.provider_id, cx.model, text)
+        };
         let mut out = PipelineOutcome::default();
         for pass in &self.passes {
             let snapshot = split.tail_snapshot();
-            let before = tt_tokenize::estimate_tokens(cx.provider_id, &split.tail_text());
-            let outcome = split.run_pass(|stable, tail| pass.apply(stable, tail, cx));
-            let after = tt_tokenize::estimate_tokens(cx.provider_id, &split.tail_text());
+            let (before_msgs, before_nontext) = tail_structure(&snapshot);
+            let before_serialized = count(&serialized_messages_text(&snapshot)).tokens;
+            let before = count(&split.tail_text());
 
-            if after > before {
-                // The transform ADDED tokens: discard it, fail open to the
-                // original bytes, meter the rejection, book zero.
+            let outcome = split.run_pass(|stable, tail| pass.apply(stable, tail, cx));
+
+            let after = count(&split.tail_text());
+            let after_tail = split.tail_snapshot();
+            let (after_msgs, after_nontext) = tail_structure(&after_tail);
+            let after_serialized = count(&serialized_messages_text(&after_tail)).tokens;
+
+            let reject_reason = if after.tokens > before.tokens {
+                Some("transform added text tokens")
+            } else if after_serialized > before_serialized {
+                Some("transform inflated the serialized request (non-text field or framing)")
+            } else if after_msgs > before_msgs {
+                Some("transform increased the message count (adds billed framing)")
+            } else if after_nontext != before_nontext {
+                Some("transform changed non-text content parts (unverifiable token effect)")
+            } else {
+                None
+            };
+            if let Some(reason) = reject_reason {
+                // Discard the transform, fail open to the original bytes,
+                // meter the rejection, book zero.
                 split.restore_tail(snapshot);
                 crate::metrics::record_request_pass_rejected(pass.name());
                 tracing::warn!(
                     pass = pass.name(),
-                    tokens_before = before,
-                    tokens_after = after,
-                    "token-true gate rejected request pass — transform added tokens; \
-                     failing open to the original request"
+                    tokens_before = before.tokens,
+                    tokens_after = after.tokens,
+                    reason,
+                    "token-true gate rejected request pass; failing open to the original request"
                 );
                 out.rejected.push(pass.name());
                 continue;
             }
 
-            let measured = before.saturating_sub(after);
+            let mut measured = before.tokens.saturating_sub(after.tokens);
+            if measured > 0 && before.confidence == tt_tokenize::Confidence::Low {
+                // chars/4 fallback (tiktoken failed to load): a character
+                // delta is not a reconcilable token saving — keep the (still
+                // lossless, still dispatched) transform but book $0.
+                tracing::warn!(
+                    pass = pass.name(),
+                    char_delta = measured,
+                    "tokenizer degraded to chars/4 — committing transform but booking zero savings"
+                );
+                measured = 0;
+            }
             if measured != outcome.tokens_removed {
                 // Self-report drift is informational only — attribution always
                 // uses the measured delta.
@@ -270,26 +335,53 @@ impl PassPipeline {
     }
 }
 
-/// Concatenate the text of every message field a pass could affect — used by
-/// the split's token estimates and the token-true gate. Covers System / User /
-/// Tool content (`Text` + `Parts::Text`) plus Assistant content and
-/// `tool_calls` arguments, '\n'-joined.
+/// Concatenate the text of every STRING field a pass could affect — used by
+/// the split's token estimates and the token-true gate's booked delta. Covers
+/// System / User / Tool content (`Text` + `Parts::Text`), user/assistant
+/// `name` fields, tool `tool_call_id`s, plus Assistant content and
+/// `tool_calls` (id, function name, arguments), '\n'-joined. (Names/ids are
+/// approximations of their billed framing cost, but including them means a
+/// pass mutating them moves the gate's count instead of being invisible —
+/// and it nudges the multi-turn split estimate toward the Anthropic adapter's
+/// basis, which counts tool-use names.) Non-text parts are handled by the
+/// gate's structural check, not this projection.
 pub(crate) fn messages_text(msgs: &[Message]) -> String {
     let mut out = String::new();
+    let push_opt = |out: &mut String, s: &Option<String>| {
+        if let Some(s) = s {
+            out.push_str(s);
+            out.push('\n');
+        }
+    };
     for m in msgs {
         match m {
-            Message::System { content }
-            | Message::User { content, .. }
-            | Message::Tool { content, .. } => push_content_text(&mut out, content),
+            Message::System { content } => push_content_text(&mut out, content),
+            Message::User { content, name } => {
+                push_content_text(&mut out, content);
+                push_opt(&mut out, name);
+            }
+            Message::Tool {
+                content,
+                tool_call_id,
+            } => {
+                push_content_text(&mut out, content);
+                out.push_str(tool_call_id);
+                out.push('\n');
+            }
             Message::Assistant {
                 content,
                 tool_calls,
-                ..
+                name,
             } => {
                 if let Some(c) = content {
                     push_content_text(&mut out, c);
                 }
+                push_opt(&mut out, name);
                 for tc in tool_calls {
+                    out.push_str(&tc.id);
+                    out.push('\n');
+                    out.push_str(&tc.function.name);
+                    out.push('\n');
                     out.push_str(&tc.function.arguments);
                     out.push('\n');
                 }
@@ -297,6 +389,50 @@ pub(crate) fn messages_text(msgs: &[Message]) -> String {
         }
     }
     out
+}
+
+/// Concatenated text of the SYSTEM messages only — the bytes the Anthropic
+/// adapter hoists into the cached system prefix. Shared by the single-shot
+/// split qualification and the cache classifier's marker scan.
+pub(crate) fn system_text(msgs: &[Message]) -> String {
+    let mut out = String::new();
+    for m in msgs {
+        if let Message::System { content } = m {
+            push_content_text(&mut out, content);
+        }
+    }
+    out
+}
+
+/// Canonical JSON serialization of `msgs` — the gate's catch-all inflation
+/// surface: every string field, non-text part, and per-message framing shows
+/// up here, so nothing a pass can reach through the tail handle is invisible.
+fn serialized_messages_text(msgs: &[Message]) -> String {
+    serde_json::to_string(msgs).unwrap_or_default()
+}
+
+/// Structural fingerprint of a tail: `(message_count, non_text_part_count)`.
+/// The gate rejects a pass that increases the former or changes the latter.
+fn tail_structure(msgs: &[Message]) -> (usize, usize) {
+    let non_text = msgs
+        .iter()
+        .map(|m| {
+            let content = match m {
+                Message::System { content }
+                | Message::User { content, .. }
+                | Message::Tool { content, .. } => Some(content),
+                Message::Assistant { content, .. } => content.as_ref(),
+            };
+            content.map_or(0, |c| match c {
+                MessageContent::Text(_) => 0,
+                MessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter(|p| !matches!(p, tt_shared::messages::ContentPart::Text { .. }))
+                    .count(),
+            })
+        })
+        .sum();
+    (msgs.len(), non_text)
 }
 
 /// Append a [`MessageContent`]'s text parts to `out`, '\n'-terminated.
@@ -512,6 +648,99 @@ mod tests {
             before,
             "the shrinking transform must be committed"
         );
+    }
+
+    /// A pass that INJECTS an image part claims no text tokens — the old
+    /// text-only gate was blind to it. The structural check rejects it.
+    struct ImageInjectingPass;
+    impl RequestPass for ImageInjectingPass {
+        fn name(&self) -> &'static str {
+            "image-inject"
+        }
+        fn apply(
+            &self,
+            _stable: &StablePrefix<'_>,
+            tail: &mut VolatileTail<'_>,
+            _cx: &PassContext<'_>,
+        ) -> PassOutcome {
+            if let Some(Message::User { content, .. }) = tail.messages_mut().first_mut() {
+                let text = match content {
+                    MessageContent::Text(s) => s.clone(),
+                    MessageContent::Parts(_) => String::new(),
+                };
+                *content = MessageContent::Parts(vec![
+                    tt_shared::messages::ContentPart::Text { text },
+                    tt_shared::messages::ContentPart::ImageUrl {
+                        image_url: tt_shared::messages::ImageUrl {
+                            url: "https://example.com/huge.png".into(),
+                            detail: None,
+                        },
+                    },
+                ]);
+            }
+            PassOutcome::none()
+        }
+    }
+
+    #[test]
+    fn gate_rejects_non_text_part_injection() {
+        let pipe = PassPipeline::new().with(ImageInjectingPass);
+        let mut req = req_with(vec![Message::User {
+            content: MessageContent::Text("hello".into()),
+            name: None,
+        }]);
+        let before = serde_json::to_string(&req).unwrap();
+        let out = run_pipeline(&pipe, &mut req);
+        assert_eq!(out.rejected, vec!["image-inject"]);
+        assert_eq!(out.tokens_removed, 0);
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            before,
+            "image injection must be rolled back byte-identical"
+        );
+    }
+
+    /// Inflating a tool-call function NAME (a billed string the old text
+    /// projection ignored) is caught: the projection now includes names/ids.
+    struct NameInflatingPass;
+    impl RequestPass for NameInflatingPass {
+        fn name(&self) -> &'static str {
+            "name-inflate"
+        }
+        fn apply(
+            &self,
+            _stable: &StablePrefix<'_>,
+            tail: &mut VolatileTail<'_>,
+            _cx: &PassContext<'_>,
+        ) -> PassOutcome {
+            if let Some(Message::Assistant { tool_calls, .. }) = tail.messages_mut().first_mut() {
+                if let Some(tc) = tool_calls.first_mut() {
+                    tc.function.name.push_str(&"_padding".repeat(40));
+                }
+            }
+            PassOutcome::none()
+        }
+    }
+
+    #[test]
+    fn gate_rejects_tool_call_name_inflation() {
+        let pipe = PassPipeline::new().with(NameInflatingPass);
+        let mut req = req_with(vec![Message::Assistant {
+            content: None,
+            tool_calls: vec![tt_shared::messages::ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: tt_shared::messages::ToolCallFunction {
+                    name: "f".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+            name: None,
+        }]);
+        let before = serde_json::to_string(&req).unwrap();
+        let out = run_pipeline(&pipe, &mut req);
+        assert_eq!(out.rejected, vec!["name-inflate"]);
+        assert_eq!(serde_json::to_string(&req).unwrap(), before);
     }
 
     /// A pass after a rejected pass still runs against the restored bytes —

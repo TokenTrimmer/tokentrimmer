@@ -12,9 +12,11 @@
 //! Both fields of [`SplitRequest`] are private and there is no public path to
 //! a `&mut ChatCompletionRequest` except [`SplitRequest::mutate_whole_request`]
 //! — the deliberate escape hatch, which consumes the split and returns a
-//! `#[must_use]` [`CacheBustEstimate`] that the caller MUST book as a negative
-//! savings entry. See the [`crate::passes`] module docs for the full invariant
-//! and its rationale.
+//! `#[must_use]` [`CacheBustEstimate`] (sized by the mutation's
+//! [`MutationDeterminism`] — zero for ingress-deterministic transforms, the
+//! full prefix otherwise) that the caller MUST book as a negative savings
+//! entry or explicitly discard. See the [`crate::passes`] module docs for the
+//! full invariant and its rationale.
 //!
 //! # The split rule
 //!
@@ -33,19 +35,38 @@
 //!   transformed bytes, re-billing it at 1.0x + the 1.25x write premium. A
 //!   whitespace trim can never buy that back (the −145% per-turn re-selection
 //!   trap in miniature).
-//! - **Single-shot** (no assistant message) → the stable region is the system
-//!   prefix `messages[..=last_system_idx]` when its estimated tokens ≥ `min`
-//!   ([`StableReason::SystemPrefix`]); the user/tool tail stays mutable because
-//!   no warm per-conversation prefix exists yet, and deterministic trims
-//!   preserve cross-request OpenAI prefix sharing. (Covering up to the *last*
-//!   system message also protects any out-of-order system block the Anthropic
-//!   adapter would hoist into the cached system prefix.)
+//! - **Single-shot** (no assistant message) splits by provider cache style:
+//!   - `anthropic` (explicit-breakpoint style): the stable region is the
+//!     system prefix `messages[..=last_system_idx]` when the estimated tokens
+//!     of the SYSTEM text alone ≥ `min` ([`StableReason::SystemPrefix`]) —
+//!     exactly the gate `maybe_inject_cache_control` uses, so the split and
+//!     the adapter qualify on the same basis. The user/tool tail stays
+//!     mutable: a single-shot request gets no last-message breakpoint, so
+//!     nothing past the system prefix is cached. (Covering up to the *last*
+//!     system message also protects any out-of-order system block the adapter
+//!     would hoist into the cached system prefix.)
+//!   - everything else (OpenAI-style **positional auto-cache**): the provider
+//!     auto-caches the ≥ `min`-token prefix of the WHOLE prompt, role-agnostic
+//!     — so when the estimated tokens of the whole message list ≥ `min` the
+//!     ENTIRE list is stable ([`StableReason::AutoCachedPrefix`]). Trimming
+//!     "just the tail" of a single-shot would dispatch bytes inside the
+//!     auto-cached region; if the conversation then continues, turn 2 is
+//!     multi-turn (structurally a no-op) and dispatches the RAW history, which
+//!     diverges from turn 1's trimmed cached bytes and forfeits the cache
+//!     read on the whole divergent region — a 0.9x repricing no whitespace
+//!     trim buys back.
 //! - Otherwise → nothing qualifies for caching, the whole request is volatile
 //!   ([`StableReason::BelowMinTokens`]).
 //!
-//! Token estimation uses [`tt_tokenize::estimate_tokens`] with the route's
-//! FINAL served provider id — the same estimator routing, preview, and savings
-//! attribution use — never characters.
+//! Token estimation uses [`tt_tokenize::estimate_tokens_for_model`] with the
+//! route's FINAL served provider id and model — the billing-correct encoding
+//! where one exists (o200k for modern OpenAI), a real-BPE proxy elsewhere —
+//! never characters. NOTE the documented Anthropic bias: the cl100k proxy
+//! undercounts Anthropic by ~15–20%, so Anthropic prefix-token estimates (and
+//! therefore any [`CacheBustEstimate`] priced from them) are systematically
+//! LOW. That under-books a negative entry — the one place the proxy errs in
+//! TT's favor — which is acceptable for this estimate-only channel but must
+//! not be copied into invoice-reconciled figures.
 //!
 //! [`RequestPass`]: crate::passes::RequestPass
 
@@ -53,7 +74,7 @@ use tt_shared::messages::Message;
 use tt_shared::pricing::ModelPricing;
 use tt_shared::ChatCompletionRequest;
 
-use super::messages_text;
+use super::{messages_text, system_text};
 
 /// Everything a pass may consult but never mutate: the served provider id (the
 /// tokenizer key), the served model, and its catalog pricing.
@@ -78,12 +99,17 @@ pub enum StableReason {
     /// A minimum exists but the candidate prefix is below it — the provider
     /// would silently refuse to cache it, the stable prefix is empty.
     BelowMinTokens,
-    /// Single-shot request with a cache-qualified system prefix: the system
+    /// Anthropic single-shot request with a cache-qualified system prefix
+    /// (system text ≥ min, the adapter's own injection gate): the system
     /// messages are stable, the rest of the request is the volatile tail.
     SystemPrefix,
     /// Cache-qualified multi-turn conversation: the entire message list is
     /// stable (this turn's tail is next turn's cached prefix).
     MultiTurnHistory,
+    /// Positional auto-cache provider (OpenAI-style), single-shot whose whole
+    /// prompt clears the minimum: the provider auto-caches the prompt prefix
+    /// role-agnostically, so the entire message list is stable.
+    AutoCachedPrefix,
 }
 
 /// Read-only view of the cache-stable region. Passes can inspect it (e.g. to
@@ -171,6 +197,65 @@ pub(crate) fn cache_min_tokens(cx: &PassContext<'_>) -> Option<u32> {
     }
 }
 
+/// Compute the stable region of `messages` under `cx` — the shared rule (see
+/// the module docs) used by [`SplitRequest::compute`] and the cache classifier
+/// (so the classifier warns on exactly the prefix the adapters cache).
+///
+/// Returns `(stable_len, est_tokens, reason)` where `est_tokens` is the token
+/// estimate of the region the provider's cache keys on: the whole message
+/// list for [`StableReason::MultiTurnHistory`] / [`StableReason::AutoCachedPrefix`],
+/// the SYSTEM text for [`StableReason::SystemPrefix`] (the only bytes the
+/// Anthropic adapter marks on a single-shot request).
+pub(crate) fn compute_stable_region(
+    messages: &[Message],
+    cx: &PassContext<'_>,
+) -> (usize, u32, StableReason) {
+    let est = |text: &str| tt_tokenize::estimate_tokens_for_model(cx.provider_id, cx.model, text);
+    let Some(min) = cache_min_tokens(cx) else {
+        return (0, 0, StableReason::NotCacheCapable);
+    };
+    let multi_turn = messages
+        .iter()
+        .any(|m| matches!(m, Message::Assistant { .. }));
+    if multi_turn {
+        // Both cache styles qualify a conversation on system + history (the
+        // Anthropic rolling-breakpoint gate counts system_tokens +
+        // message_tokens; OpenAI's auto-cache is positional over the whole
+        // prompt) — `messages_text` over the full list is that basis.
+        let tokens = est(&messages_text(messages));
+        if tokens >= min {
+            (messages.len(), tokens, StableReason::MultiTurnHistory)
+        } else {
+            (0, 0, StableReason::BelowMinTokens)
+        }
+    } else if cx.provider_id == "anthropic" {
+        // Explicit-breakpoint style: the adapter gates on (and marks) the
+        // hoisted SYSTEM blocks only — qualify on the system text alone so the
+        // split can never disagree with the adapter at the margin. The
+        // protected SPAN still runs to the last system message, covering any
+        // interleaved message the adapter's hoist would jump over.
+        let stable_len = messages
+            .iter()
+            .rposition(|m| matches!(m, Message::System { .. }))
+            .map_or(0, |i| i + 1);
+        let tokens = est(&system_text(&messages[..stable_len]));
+        if stable_len > 0 && tokens >= min {
+            (stable_len, tokens, StableReason::SystemPrefix)
+        } else {
+            (0, 0, StableReason::BelowMinTokens)
+        }
+    } else {
+        // Positional auto-cache: the provider caches the prompt prefix
+        // role-agnostically, so a qualifying single-shot is stable in full.
+        let tokens = est(&messages_text(messages));
+        if tokens >= min {
+            (messages.len(), tokens, StableReason::AutoCachedPrefix)
+        } else {
+            (0, 0, StableReason::BelowMinTokens)
+        }
+    }
+}
+
 /// A request split into a read-only stable prefix and a mutable volatile tail.
 ///
 /// Fields are private: there is no public `&mut ChatCompletionRequest` path
@@ -188,39 +273,7 @@ impl<'r> SplitRequest<'r> {
     /// CURRENT (pre-mutation) bytes: that is what the provider's cache keyed
     /// on, so that is what a later bust re-prices.
     pub fn compute(req: &'r mut ChatCompletionRequest, cx: &PassContext<'_>) -> Self {
-        let (stable_len, stable_tokens, reason) = match cache_min_tokens(cx) {
-            None => (0, 0, StableReason::NotCacheCapable),
-            Some(min) => {
-                let multi_turn = req
-                    .messages
-                    .iter()
-                    .any(|m| matches!(m, Message::Assistant { .. }));
-                if multi_turn {
-                    let est =
-                        tt_tokenize::estimate_tokens(cx.provider_id, &messages_text(&req.messages));
-                    if est >= min {
-                        (req.messages.len(), est, StableReason::MultiTurnHistory)
-                    } else {
-                        (0, 0, StableReason::BelowMinTokens)
-                    }
-                } else {
-                    let stable_len = req
-                        .messages
-                        .iter()
-                        .rposition(|m| matches!(m, Message::System { .. }))
-                        .map_or(0, |i| i + 1);
-                    let est = tt_tokenize::estimate_tokens(
-                        cx.provider_id,
-                        &messages_text(&req.messages[..stable_len]),
-                    );
-                    if stable_len > 0 && est >= min {
-                        (stable_len, est, StableReason::SystemPrefix)
-                    } else {
-                        (0, 0, StableReason::BelowMinTokens)
-                    }
-                }
-            }
-        };
+        let (stable_len, stable_tokens, reason) = compute_stable_region(&req.messages, cx);
         Self {
             req,
             stable_len,
@@ -289,28 +342,70 @@ impl<'r> SplitRequest<'r> {
     /// mutably, stable prefix included.
     ///
     /// Consumes the split and returns the raw `&mut ChatCompletionRequest`
-    /// plus a [`CacheBustEstimate`] for the WHOLE pre-mutation stable prefix
-    /// (conservative: any mutation inside the prefix busts the exact-prefix
-    /// match from byte 0 of the change onward). The estimate is `#[must_use]`:
-    /// the caller MUST either book it into the savings-attribution channel
-    /// (when the mutation actually touched the prefix) or explicitly
-    /// [`CacheBustEstimate::discard_unused`] it (when it did not). Never hide
-    /// a cache bust.
+    /// plus a [`CacheBustEstimate`] sized by `determinism`:
+    ///
+    /// - [`MutationDeterminism::NonDeterministic`] → the WHOLE pre-mutation
+    ///   stable prefix (conservative: the provider cache keys on the
+    ///   DISPATCHED bytes, and a mutation whose output varies across requests
+    ///   makes those bytes diverge from the warm prefix, re-billing it at the
+    ///   full input rate).
+    /// - [`MutationDeterminism::DeterministicOnIngress`] → **zero**. A
+    ///   mutation that is a pure function of the ingress bytes (fixed rules,
+    ///   fixed replacement — e.g. redaction) produces byte-identical egress on
+    ///   every request/turn for the same conversation, so the provider's
+    ///   exact-prefix cache keeps matching the dispatched bytes: no bust
+    ///   occurs and booking one would be a recurring phantom penalty. (A
+    ///   rotating ingress secret under deterministic redaction even
+    ///   STABILIZES the egress prefix — cache-helping.) The one unbookable
+    ///   residue is a single transition miss when the transform's rules
+    ///   change across a deploy — a one-time event indistinguishable, at
+    ///   request scope, from any other cold start.
+    ///
+    /// The estimate is `#[must_use]`: the caller MUST either book it into the
+    /// savings-attribution channel (when it is non-zero and the mutation
+    /// actually touched the prefix) or explicitly
+    /// [`CacheBustEstimate::discard_unused`] it. Never hide a cache bust.
+    /// (Known enforcement gap, accepted: `#[must_use]` does not fire on a
+    /// `let (_r, _) = …` tuple destructure — the booking contract for new
+    /// callers is held by this doc + review, not the compiler.)
     ///
     /// `source` is the stable identifier booked with the negative entry
     /// (e.g. `"redaction-1"`).
     pub fn mutate_whole_request(
         self,
         source: &'static str,
+        determinism: MutationDeterminism,
     ) -> (&'r mut ChatCompletionRequest, CacheBustEstimate) {
+        let busted_prefix_tokens = match determinism {
+            MutationDeterminism::DeterministicOnIngress => 0,
+            MutationDeterminism::NonDeterministic => self.stable_tokens,
+        };
         (
             self.req,
             CacheBustEstimate {
                 source,
-                busted_prefix_tokens: self.stable_tokens,
+                busted_prefix_tokens,
             },
         )
     }
+}
+
+/// Whether an escape-hatch mutation is a pure function of the ingress bytes —
+/// the property that decides if mutating the stable prefix can bust the
+/// provider's prompt cache at all (see
+/// [`SplitRequest::mutate_whole_request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationDeterminism {
+    /// Same ingress bytes ⇒ same egress bytes, across requests, turns,
+    /// replicas, and time (fixed rules + fixed replacement text). The
+    /// dispatched prefix is identical every turn, the provider cache keeps
+    /// hitting, no bust books. Redaction is this.
+    DeterministicOnIngress,
+    /// The output can differ for identical ingress bytes (time-, length-, or
+    /// state-dependent transforms — e.g. periodic history compaction). The
+    /// dispatched prefix diverges from the warm one, so the full prefix
+    /// estimate books as a negative savings entry.
+    NonDeterministic,
 }
 
 /// A negative savings entry for a deliberate stable-prefix mutation: the
@@ -320,7 +415,11 @@ impl<'r> SplitRequest<'r> {
 /// This is an ESTIMATE of induced future cost — it reduces the TT-attributed
 /// savings headline (pre-clamp) but is never folded into `cost_usd` /
 /// `baseline_cost_usd`, which must reconcile against the realized provider
-/// invoice.
+/// invoice. Estimate bias: on Anthropic the prefix tokens come from the
+/// cl100k proxy, which undercounts by ~15–20% — the booked penalty is
+/// systematically LOW there (under-booking a negative entry favors TT;
+/// acceptable only because this is an estimate channel, never an invoice
+/// figure).
 #[must_use = "a stable-prefix mutation MUST be booked into the savings channel \
               (or explicitly discarded via discard_unused) — never hide a cache bust"]
 #[derive(Debug, Clone, Copy)]
@@ -342,9 +441,13 @@ impl CacheBustEstimate {
     /// The estimated USD penalty: the warm prefix repriced from the cache-read
     /// rate back to the full input rate —
     /// `tokens × (input_per_million − cached_input_per_million) / 1e6`,
-    /// floored at 0. Returns 0 when pricing or the cached rate is absent:
-    /// with no documented cache-read discount nothing was cacheable, so there
-    /// is no bust to book.
+    /// floored at 0. Returns 0 when pricing or the cached rate is absent —
+    /// with no documented cache-read discount there is no rate delta to price
+    /// the bust at. (NOTE: absent pricing does NOT always mean "nothing was
+    /// cacheable": an unpriced Anthropic model still gets a protected stable
+    /// prefix via the 4096 fallback in [`cache_min_tokens`]. Its bust prices
+    /// at $0 only because an unpriced model produces an all-zero
+    /// `CostBreakdown` anyway — there are no savings to mis-reduce.)
     #[must_use]
     pub fn penalty_usd(&self, pricing: Option<&ModelPricing>) -> f64 {
         let Some(p) = pricing else { return 0.0 };
@@ -435,37 +538,58 @@ mod tests {
         assert!(split.stable().messages.is_empty());
     }
 
-    /// Single-shot with a long system prefix (≥ min) → system messages stable,
-    /// user tail volatile.
+    /// OpenAI-style positional auto-cache: a single-shot whose WHOLE prompt
+    /// clears the minimum is stable in full — system, user, everything — with
+    /// an empty volatile tail. (The provider auto-caches the prompt prefix
+    /// role-agnostically; trimming "just the tail" would mutate bytes inside
+    /// the auto-cached region.)
     #[test]
-    fn split_single_shot_long_system_protects_system_only() {
+    fn split_single_shot_positional_provider_protects_whole_prompt() {
         let p = pricing(Some(1024), 2.5, Some(1.25));
         let cx = PassContext {
             provider_id: "openai",
             model: "gpt-x",
             pricing: Some(&p),
         };
-        // ~1500 cl100k tokens of system text — comfortably over the 1024 min.
+        // ~1500 tokens of system text — comfortably over the 1024 min.
         let long_system = "word ".repeat(1500);
         let mut r = req_with(vec![sys(&long_system), user("question?")]);
         let mut split = SplitRequest::compute(&mut r, &cx);
         {
             let stable = split.stable();
-            assert_eq!(stable.reason, StableReason::SystemPrefix);
-            assert_eq!(stable.messages.len(), 1);
+            assert_eq!(stable.reason, StableReason::AutoCachedPrefix);
+            assert_eq!(stable.messages.len(), 2, "whole prompt is stable");
             assert!(stable.est_tokens >= 1024);
         }
         split.run_pass(|stable, tail| {
-            assert_eq!(stable.messages.len(), 1);
-            assert_eq!(tail.len(), 1);
-            assert!(matches!(tail.messages()[0], Message::User { .. }));
+            assert_eq!(stable.messages.len(), 2);
+            assert!(tail.is_empty(), "no message is mutable on this path");
         });
     }
 
-    /// Single-shot with a tiny system prefix (< min) → nothing would cache, the
-    /// whole request stays volatile.
+    /// Positional auto-cache qualification is role-agnostic: a single-shot
+    /// with a SHORT system but a long user payload still clears the minimum on
+    /// total prompt tokens — the whole list is stable (OpenAI auto-caches
+    /// across system+user, so nothing here is safely trimmable).
     #[test]
-    fn split_single_shot_short_system_below_min_all_volatile() {
+    fn split_single_shot_positional_qualifies_on_total_tokens() {
+        let p = pricing(Some(1024), 2.5, Some(1.25));
+        let cx = PassContext {
+            provider_id: "openai",
+            model: "gpt-x",
+            pricing: Some(&p),
+        };
+        let long_user = "word ".repeat(1500);
+        let mut r = req_with(vec![sys("be brief"), user(&long_user)]);
+        let split = SplitRequest::compute(&mut r, &cx);
+        assert_eq!(split.stable().reason, StableReason::AutoCachedPrefix);
+        assert_eq!(split.stable().messages.len(), 2);
+    }
+
+    /// Single-shot whose whole prompt is under the minimum → nothing would
+    /// cache, the whole request stays volatile.
+    #[test]
+    fn split_single_shot_below_min_all_volatile() {
         let p = pricing(Some(1024), 2.5, Some(1.25));
         let cx = PassContext {
             provider_id: "openai",
@@ -476,6 +600,56 @@ mod tests {
         let split = SplitRequest::compute(&mut r, &cx);
         assert_eq!(split.stable().reason, StableReason::BelowMinTokens);
         assert!(split.stable().messages.is_empty());
+    }
+
+    /// Anthropic single-shot: the stable region is the system prefix and the
+    /// user/tool tail STAYS volatile (no last-message breakpoint fires on a
+    /// single-shot, so nothing past the system prefix is cached).
+    #[test]
+    fn split_anthropic_single_shot_protects_system_only() {
+        let cx = PassContext {
+            provider_id: "anthropic",
+            model: "claude-sonnet-4-6",
+            pricing: None,
+        };
+        // ~3000 tokens of system text — above Sonnet's 2048 catalog minimum.
+        let long_system = "word ".repeat(3000);
+        let mut r = req_with(vec![sys(&long_system), user("question?")]);
+        let mut split = SplitRequest::compute(&mut r, &cx);
+        {
+            let stable = split.stable();
+            assert_eq!(stable.reason, StableReason::SystemPrefix);
+            assert_eq!(stable.messages.len(), 1);
+        }
+        split.run_pass(|stable, tail| {
+            assert_eq!(stable.messages.len(), 1);
+            assert_eq!(tail.len(), 1);
+            assert!(matches!(tail.messages()[0], Message::User { .. }));
+        });
+    }
+
+    /// Anthropic single-shot qualification counts the SYSTEM text alone —
+    /// exactly the adapter's injection-gate basis. Interleaved non-system
+    /// content before the last system message can NOT push a short system
+    /// prefix over the minimum (the adapter would not mark it).
+    #[test]
+    fn split_anthropic_qualifies_on_system_text_only() {
+        let cx = PassContext {
+            provider_id: "anthropic",
+            model: "claude-sonnet-4-6",
+            pricing: None,
+        };
+        // Huge user message BETWEEN two tiny system blocks: the protected-span
+        // candidate (..=last_system_idx) contains ~3000 tokens of text, but
+        // the system text alone is far below the 2048 minimum.
+        let long_user = "word ".repeat(3000);
+        let mut r = req_with(vec![sys("a"), user(&long_user), sys("b"), user("q")]);
+        let split = SplitRequest::compute(&mut r, &cx);
+        assert_eq!(
+            split.stable().reason,
+            StableReason::BelowMinTokens,
+            "interleaved user text must not qualify an unmarkable system prefix"
+        );
     }
 
     /// Cache-qualified multi-turn → the ENTIRE message list is stable and the
@@ -548,8 +722,9 @@ mod tests {
     }
 
     /// The escape hatch returns the whole request mutably plus a bust estimate
-    /// for the pre-mutation prefix; `penalty_usd` is the cache-read→full-input
-    /// repricing and is 0 without a cached rate.
+    /// for the pre-mutation prefix when the mutation is NON-deterministic;
+    /// `penalty_usd` is the cache-read→full-input repricing and is 0 without a
+    /// cached rate.
     #[test]
     fn escape_hatch_returns_must_use_bust_and_penalty_math() {
         let p = pricing(Some(8), 10.0, Some(1.0));
@@ -567,17 +742,18 @@ mod tests {
         let stable_tokens = split.stable().est_tokens;
         assert!(stable_tokens > 0);
 
-        let (req_mut, bust) = split.mutate_whole_request("redaction-1");
+        let (req_mut, bust) =
+            split.mutate_whole_request("compaction-1", MutationDeterminism::NonDeterministic);
         // Whole-request mutable access — including the stable prefix.
         req_mut.messages[0] = sys("MUTATED");
-        assert_eq!(bust.source, "redaction-1");
+        assert_eq!(bust.source, "compaction-1");
         assert_eq!(bust.busted_prefix_tokens, stable_tokens);
 
         // penalty = tokens × (input − cached) / 1e6.
         let expected = (stable_tokens as f64) * (10.0 - 1.0) / 1_000_000.0;
         assert!((bust.penalty_usd(Some(&p)) - expected).abs() < 1e-12);
 
-        // No pricing / no cached rate → nothing was cacheable → no bust.
+        // No pricing / no cached rate → no rate delta to price → $0.
         assert_eq!(bust.penalty_usd(None), 0.0);
         let no_cached = pricing(Some(8), 10.0, None);
         assert_eq!(bust.penalty_usd(Some(&no_cached)), 0.0);
@@ -586,6 +762,34 @@ mod tests {
         // at zero rather than booking a negative penalty.
         let inverted = pricing(Some(8), 1.0, Some(2.0));
         assert_eq!(bust.penalty_usd(Some(&inverted)), 0.0);
+    }
+
+    /// A DETERMINISTIC-on-ingress mutation (redaction) busts nothing: the
+    /// dispatched prefix is byte-identical on every request, so the estimate
+    /// is zero by construction even when the mutation lands inside a
+    /// cache-qualified stable prefix.
+    #[test]
+    fn escape_hatch_deterministic_mutation_books_zero() {
+        let p = pricing(Some(8), 10.0, Some(1.0));
+        let cx = PassContext {
+            provider_id: "openai",
+            model: "gpt-x",
+            pricing: Some(&p),
+        };
+        let mut r = req_with(vec![
+            sys("you are a helpful assistant, be concise"),
+            user("question"),
+            assistant("answer"),
+        ]);
+        let split = SplitRequest::compute(&mut r, &cx);
+        assert!(split.stable().est_tokens > 0, "prefix IS cache-qualified");
+
+        let (req_mut, bust) =
+            split.mutate_whole_request("redaction-1", MutationDeterminism::DeterministicOnIngress);
+        req_mut.messages[0] = sys("MUTATED [REDACTED]");
+        assert_eq!(bust.busted_prefix_tokens, 0);
+        assert_eq!(bust.penalty_usd(Some(&p)), 0.0);
+        bust.discard_unused();
     }
 
     /// `NONE` books nothing under any pricing.
@@ -598,18 +802,17 @@ mod tests {
 
     /// Snapshot/restore brings the tail back byte-identical (the gate's
     /// fail-open path) while the stable prefix is untouched throughout.
+    /// (Anthropic single-shot — the only shape with both a stable prefix and a
+    /// non-empty volatile tail.)
     #[test]
     fn tail_snapshot_restore_roundtrip() {
-        let p = pricing(Some(4), 1.0, Some(0.1));
         let cx = PassContext {
-            provider_id: "openai",
-            model: "gpt-x",
-            pricing: Some(&p),
+            provider_id: "anthropic",
+            model: "claude-sonnet-4-6",
+            pricing: None,
         };
-        let mut r = req_with(vec![
-            sys("a long enough system prefix for the tiny minimum"),
-            user("tail message"),
-        ]);
+        let long_system = "word ".repeat(3000);
+        let mut r = req_with(vec![sys(&long_system), user("tail message")]);
         let before = serde_json::to_string(&r).unwrap();
         let mut split = SplitRequest::compute(&mut r, &cx);
         assert_eq!(split.stable().reason, StableReason::SystemPrefix);

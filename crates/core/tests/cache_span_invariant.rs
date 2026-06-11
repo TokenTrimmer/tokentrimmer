@@ -7,10 +7,13 @@
 //! (1) cache-qualified MULTI-TURN request through a compress route → the
 //!     upstream request is byte-identical to ingress (the whole conversation
 //!     is next turn's cached prefix) and the compression saving books $0;
-//! (2) cache-qualified SINGLE-SHOT request with a long dirty system + dirty
-//!     tool content → the system prefix is preserved byte-identical, the
-//!     volatile tail is trimmed, and the saving is > 0;
-//! (3) the same requests against a provider with NO `prompt_cache_min_tokens`
+//! (2) cache-qualified SINGLE-SHOT request on a positional-auto-cache
+//!     provider (OpenAI-style — every non-Anthropic provider with a cache
+//!     minimum) → the WHOLE prompt is inside the auto-cached prefix, so the
+//!     upstream request is byte-identical and the saving books $0;
+//! (3) a single-shot BELOW the cache minimum → nothing can cache, so trims
+//!     apply everywhere and book a genuine saving;
+//! (4) the same requests against a provider with NO `prompt_cache_min_tokens`
 //!     → trims everywhere (the pre-lane behavior, pinned).
 //!
 //! No network: a mock provider records the exact upstream request it receives
@@ -226,8 +229,8 @@ fn multi_turn_body() -> serde_json::Value {
     })
 }
 
-/// Dirty single-shot system prefix (cache-qualified at min=8 under the chars/4
-/// estimator) — the bytes the provider's cache would key on.
+/// Dirty single-shot system prefix (comfortably over a min=8 qualification
+/// under the BPE estimator) — bytes inside the provider's auto-cached prefix.
 const SINGLE_SHOT_SYSTEM: &str =
     "You are a very concise assistant.   \n\n\n\n\nFollow every rule carefully.   ";
 
@@ -307,12 +310,47 @@ async fn multi_turn_cache_qualified_is_byte_identical_and_books_zero() {
     assert_eq!(header_f64(&resp, "x-tokentrimmer-saved-usd"), 0.0);
 }
 
-/// (2) Cache-qualified single-shot: the system prefix is stable (preserved
-/// byte-identical) while the volatile tail is still trimmed — and the saving
-/// for the tail trim is genuine (> 0).
+/// (2) Cache-qualified single-shot on a positional-auto-cache provider: the
+/// WHOLE prompt (system + user + tool) is inside the provider's auto-cached
+/// prefix, so nothing is trimmable — the upstream sees the ingress bytes
+/// unchanged and the saving books exactly $0. (Trimming "just the tail" would
+/// dispatch bytes inside the auto-cached region; a continued conversation
+/// would then dispatch the RAW history, diverge from the cached trimmed
+/// bytes, and forfeit the ~0.1x cache read on the whole region — a repricing
+/// no whitespace trim buys back.)
 #[tokio::test]
-async fn single_shot_protects_system_prefix_but_trims_tail() {
+async fn single_shot_auto_cached_is_byte_identical_and_books_zero() {
     let (app, key, seen) = app_with_compress_route(Some(8)).await;
+    let body = single_shot_body();
+
+    let resp = app.oneshot(request_with_key(&body, &key)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let ingress: Vec<Message> =
+        serde_json::from_value(body["messages"].clone()).expect("ingress messages parse");
+    let msgs = seen.lock().unwrap();
+    assert_eq!(
+        serde_json::to_string(&msgs[0]).unwrap(),
+        serde_json::to_string(&ingress).unwrap(),
+        "a cache-qualified single-shot on an auto-cache provider must reach \
+         the upstream unchanged (dirty system AND dirty tool tail included)"
+    );
+
+    assert_eq!(
+        header_f64(&resp, "x-tokentrimmer-compression-saved-usd"),
+        0.0,
+        "a structural no-op must book $0"
+    );
+}
+
+/// (3) A single-shot BELOW the cache minimum on the same provider: nothing
+/// can cache, so the pre-lane trims apply everywhere — system trimmed, tool
+/// trimmed — and the saving is genuine (> 0).
+#[tokio::test]
+async fn single_shot_below_min_trims_everywhere() {
+    // Minimum far above the prompt size — cache-capable model, unqualified
+    // request.
+    let (app, key, seen) = app_with_compress_route(Some(100_000)).await;
 
     let resp = app
         .oneshot(request_with_key(&single_shot_body(), &key))
@@ -323,35 +361,27 @@ async fn single_shot_protects_system_prefix_but_trims_tail() {
     let msgs = seen.lock().unwrap();
     let upstream = &msgs[0];
 
-    // The dirty system prefix is preserved byte-identical (it is what the
-    // provider's cache keys on).
     let system = upstream
         .iter()
         .find(|m| matches!(m, Message::System { .. }))
         .unwrap();
     assert_eq!(
         text_of(system).unwrap(),
-        SINGLE_SHOT_SYSTEM,
-        "the cache-stable system prefix must not be trimmed"
+        "You are a very concise assistant.\n\nFollow every rule carefully.",
+        "below the minimum nothing caches — the system block is trimmed"
     );
 
-    // The volatile tool tail IS trimmed.
     let tool = upstream
         .iter()
         .find(|m| matches!(m, Message::Tool { .. }))
         .unwrap();
-    assert_eq!(
-        text_of(tool).unwrap(),
-        "RESULT\n\nDATA",
-        "volatile tail content must still be trimmed"
-    );
+    assert_eq!(text_of(tool).unwrap(), "RESULT\n\nDATA");
 
-    // The tail trim books a genuine, positive saving.
     let saved = header_f64(&resp, "x-tokentrimmer-compression-saved-usd");
-    assert!(saved > 0.0, "tail trim must book a saving, got {saved}");
+    assert!(saved > 0.0, "below-min trim books a saving, got {saved}");
 }
 
-/// (3) No `prompt_cache_min_tokens` → not cache-capable → all-volatile: the
+/// (4) No `prompt_cache_min_tokens` → not cache-capable → all-volatile: the
 /// exact pre-lane behavior (system trimmed, duplicate dropped) is pinned.
 #[tokio::test]
 async fn non_cache_capable_provider_trims_everywhere() {
