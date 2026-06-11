@@ -158,6 +158,7 @@ fn dogfood_routing_store() -> Arc<CachingRoutingStore> {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         }],
     );

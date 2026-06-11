@@ -357,6 +357,7 @@ mod tests {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         }
     }
@@ -392,6 +393,7 @@ mod tests {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         };
         let created = s.create_route(org, spec).await.unwrap();
@@ -427,6 +429,7 @@ mod tests {
                         disable_cache: false,
                         max_cost_usd: None,
                         flex: false,
+                        compress: false,
                     },
                 },
             )

@@ -827,6 +827,11 @@ pub async fn handler(
     // A matched route requesting OpenAI Flex (`service_tier="flex"`). Applied to
     // the upstream request below, gated on the served model's flex-eligibility.
     let route_flex = route_match.as_ref().is_some_and(|m| m.flex);
+    // A matched route opting into the conservative compression pass
+    // (`RouteAction::compress`). When false (the default — no route or a route
+    // that did not enable it) the request-pass pipeline never runs and the
+    // request is byte-for-byte unchanged.
+    let route_compress = route_match.as_ref().is_some_and(|m| m.compress);
     // Per-request cost ceiling (V3d-2b) + the token estimate, captured before
     // `route_match` is consumed below.
     let route_max_cost_usd = route_match.as_ref().and_then(|m| m.max_cost_usd);
@@ -932,6 +937,33 @@ pub async fn handler(
     // cost computation below so savings attribute to the `flex` source. Evaluated
     // against the FINAL served provider/model (post-routing/pin/failover-primary).
     let flex_applied = maybe_apply_flex(&mut req, route_flex, provider.as_ref(), &mut warnings);
+
+    // Request-pass pipeline (compression pass #1): when the matched route opted
+    // in (`RouteAction::compress`), run the conservative, content-lossless trim
+    // of non-prose blocks BEFORE deriving cache keys / dispatching. Off by
+    // default — `route_compress` is false for every unrouted request and every
+    // route that did not enable it, so `req` is byte-for-byte unchanged on the
+    // default path. Running it here (against the FINAL served provider's
+    // tokenizer) means the trimmed prompt is what gets cached AND dispatched, so
+    // the upstream meters the reduced prompt-token count. The returned delta is
+    // the estimated input tokens removed; it drives the `compression` savings
+    // attribution in the cost path below (and is recorded for telemetry). A
+    // future, more-aggressive pass would attach a Wave-B2 judge gate inside
+    // `PassPipeline::run`; this conservative pass is lossless by construction.
+    let compression_tokens_removed: u32 = if route_compress {
+        let removed =
+            crate::passes::PassPipeline::conservative_compression().run(&mut req, provider.id());
+        if removed > 0 {
+            tracing::debug!(
+                org_id = %ctx.org_id,
+                tokens_removed = removed,
+                "compression pass removed input tokens"
+            );
+        }
+        removed
+    } else {
+        0
+    };
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
     // provider in the candidate set. The raw-Bearer fallback is allowed only for
@@ -1062,6 +1094,7 @@ pub async fn handler(
                             baseline_cost_usd,
                             provider_cache_saved_usd: 0.0,
                             flex_saved_usd: 0.0,
+                            compression_saved_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -1253,6 +1286,10 @@ pub async fn handler(
                 // at flex rates and attributes the standard-vs-flex saving to the
                 // `flex` source, matching the non-streaming path (FLEX-REWRITE (2)).
                 flex_applied,
+                // Thread the compression-pass token delta through so the streaming
+                // cost math attributes the standard-vs-compressed saving to the
+                // `compression` source, matching the non-streaming path.
+                compression_tokens_removed,
                 cache_insert: stream_cache_insert,
                 // Honor stream_options.include_usage end-to-end: emit an
                 // OpenAI-native final usage chunk when the client asked for it.
@@ -1564,12 +1601,13 @@ pub async fn handler(
         } else {
             pricing.clone()
         };
-        let cost_breakdown = compute_cost_with_flex(
+        let cost_breakdown = compute_cost_full(
             &response.usage,
             pricing.as_ref(),
             baseline_pricing.as_ref(),
             provider.fee_multiplier(),
             flex_applied,
+            compression_tokens_removed,
         );
         let cost_usd = cost_breakdown.cost_usd;
         let baseline_cost_usd = cost_breakdown.baseline_cost_usd;
@@ -1962,6 +2000,7 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         baseline_cost_usd,
         provider_cache_saved_usd: 0.0,
         flex_saved_usd: 0.0,
+        compression_saved_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -2022,6 +2061,7 @@ fn build_hit_l2_response(
         baseline_cost_usd,
         provider_cache_saved_usd: 0.0,
         flex_saved_usd: 0.0,
+        compression_saved_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -2233,6 +2273,19 @@ pub(crate) struct CostBreakdown {
     /// the request was not served via flex. Already included in
     /// [`tt_saved_usd`](Self::tt_saved_usd) (flex lowers `cost_usd`).
     pub flex_saved_usd: f64,
+    /// Savings attributed to the conservative **compression pass** specifically
+    /// — the cost of the input tokens the pass removed before dispatch, priced
+    /// at the served model's input rate (fee-applied). A distinct savings source
+    /// from routing/cache/flex so the headline + methodology can name it. Zero
+    /// when the request was not compressed. Already included in
+    /// [`tt_saved_usd`](Self::tt_saved_usd): the removed tokens raise
+    /// `baseline_cost_usd` (priced on the pre-compression prompt count) above the
+    /// realized `cost_usd` (priced on the reduced count), so the baseline − cost
+    /// delta picks the compression saving up. Catalog-priced like every other
+    /// source; consistent with the provider-cache-vs-TT attribution rules (this
+    /// is a genuine TT-caused reduction in billed input tokens, not a provider
+    /// discount, so it belongs in the TT headline).
+    pub compression_saved_usd: f64,
 }
 
 impl CostBreakdown {
@@ -2312,6 +2365,45 @@ pub(crate) fn compute_cost_with_flex(
     baseline_pricing: Option<&ModelPricing>,
     fee_multiplier: f64,
     flex_applied: bool,
+) -> CostBreakdown {
+    compute_cost_full(
+        usage,
+        pricing,
+        baseline_pricing,
+        fee_multiplier,
+        flex_applied,
+        0,
+    )
+}
+
+/// Like [`compute_cost_with_flex`] but additionally attributes the savings from
+/// the conservative **compression pass**.
+///
+/// `compression_tokens_removed` is the estimated input-token count the
+/// request-pass pipeline trimmed before dispatch (0 when the pass did not run).
+/// Those tokens are no longer in `usage.prompt_tokens` (the upstream metered the
+/// reduced prompt), so the realized `cost_usd` already excludes them. To
+/// attribute the saving we:
+///
+/// - value the removed tokens at the served model's **standard input rate**
+///   (fee-applied) → [`CostBreakdown::compression_saved_usd`]: an exact,
+///   invoice-reconcilable reduction in billed input tokens, and
+/// - add that amount to `baseline_cost_usd` so the no-TT baseline reflects the
+///   *uncompressed* prompt the request would have sent without TokenTrimmer.
+///   This keeps [`CostBreakdown::tt_saved_usd`] honest — the compression saving
+///   shows up in the headline as `baseline − cost`, the same way routing/flex
+///   savings do.
+///
+/// Compression is a genuine TT-caused reduction in the input the customer sends
+/// upstream (not a provider discount), so it belongs in the TT headline —
+/// consistent with the provider-cache-vs-TT attribution rules.
+pub(crate) fn compute_cost_full(
+    usage: &Usage,
+    pricing: Option<&ModelPricing>,
+    baseline_pricing: Option<&ModelPricing>,
+    fee_multiplier: f64,
+    flex_applied: bool,
+    compression_tokens_removed: u32,
 ) -> CostBreakdown {
     let Some(pricing) = pricing else {
         return CostBreakdown::default();
@@ -2405,6 +2497,21 @@ pub(crate) fn compute_cost_with_flex(
         / 1_000_000.0
         + (usage.completion_tokens as f64) * baseline_pricing.output_per_million / 1_000_000.0;
 
+    // Compression saving: the input tokens the pass removed are no longer in
+    // `usage.prompt_tokens`, so the realized cost already excludes them. Value
+    // them at the served model's STANDARD input rate (a genuine, reconcilable
+    // reduction in billed input tokens) and add the SAME amount to the baseline
+    // so the no-TT baseline reflects the *uncompressed* prompt — the
+    // `baseline − cost` headline then includes the compression saving. Zero when
+    // the pass did not run.
+    let compression_saved_usd =
+        (compression_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
+    // Fold the removed-token value into the baseline at the baseline model's
+    // input rate (what the customer would have paid sending the uncompressed
+    // prompt to the baseline model).
+    let baseline_compression_usd =
+        (compression_tokens_removed as f64) * baseline_pricing.input_per_million / 1_000_000.0;
+
     // Apply the provider surcharge (e.g. OpenRouter's 5% BYOK fee) to all
     // figures so the saved splits stay consistent (same scale factor). The
     // provider-cache discount is metered against the STANDARD cost (not the
@@ -2412,10 +2519,11 @@ pub(crate) fn compute_cost_with_flex(
     // double-count.
     CostBreakdown {
         cost_usd: cost_usd * fee_multiplier,
-        baseline_cost_usd: baseline_cost_usd * fee_multiplier,
+        baseline_cost_usd: (baseline_cost_usd + baseline_compression_usd) * fee_multiplier,
         provider_cache_saved_usd: ((no_cache_cost_usd - standard_cost_usd) * fee_multiplier)
             .max(0.0),
         flex_saved_usd: flex_saved_usd * fee_multiplier,
+        compression_saved_usd: compression_saved_usd * fee_multiplier,
     }
 }
 
@@ -2446,7 +2554,9 @@ fn with_route_matched(mut resp: Response, name: Option<&str>) -> Response {
     resp
 }
 
-/// Insert all seven required `X-TokenTrimmer-*` response headers.
+/// Insert the `X-TokenTrimmer-*` cost/savings response headers (trace-id,
+/// provider, model-used, cost, baseline, headline saved, provider-cache saved,
+/// flex saved, and compression saved).
 pub(crate) fn attach_cost_headers(
     headers: &mut axum::http::HeaderMap,
     trace_id: Uuid,
@@ -2481,6 +2591,13 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-flex-saved-usd",
             format!("{:.6}", cost.flex_saved_usd),
+        ),
+        // Compression-pass-attributed savings (removed input tokens × served
+        // input rate) — a distinct source from routing/cache/flex, included in
+        // `saved_usd`. Zero when the request was not compressed.
+        (
+            "x-tokentrimmer-compression-saved-usd",
+            format!("{:.6}", cost.compression_saved_usd),
         ),
     ];
 
@@ -2861,6 +2978,10 @@ pub(crate) struct RouteMatch {
     /// actual opt-in is gated on the served model's flex-eligibility at the
     /// request-build step (an ineligible model is left untouched + warned).
     pub(crate) flex: bool,
+    /// The matched route opted into the conservative compression pass
+    /// (`RouteAction::compress`). When true the gateway runs the request-pass
+    /// pipeline before dispatch; off by default (no pass runs otherwise).
+    pub(crate) compress: bool,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -2946,6 +3067,7 @@ pub(crate) async fn apply_routing(
     let disable_cache = m.then.disable_cache;
     let max_cost_usd = m.then.max_cost_usd;
     let flex = m.then.flex;
+    let compress = m.then.compress;
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -2986,6 +3108,7 @@ pub(crate) async fn apply_routing(
         max_cost_usd,
         input_tokens_estimate: input_tokens,
         flex,
+        compress,
     }))
 }
 

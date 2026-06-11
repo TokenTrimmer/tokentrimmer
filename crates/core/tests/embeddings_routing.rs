@@ -161,6 +161,7 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                compress: false,
             },
         }],
     );
