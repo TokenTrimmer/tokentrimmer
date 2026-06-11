@@ -1,0 +1,32 @@
+# cargo-about configuration — generates THIRD-PARTY-LICENSES for the `tt` binary.
+#
+# Regenerate with:  scripts/gen-third-party-licenses.sh
+# The output (THIRD-PARTY-LICENSES) is copied into the GHCR Docker image so the
+# distributed binary carries attribution for every bundled dependency.
+#
+# `accepted` mirrors deny.toml's [licenses].allow: the set of SPDX licenses we
+# permit in the OSS workspace. With `cargo about generate --fail`, an
+# unaccepted or unresolvable license is a hard error — a second, independent
+# guard alongside `cargo deny check licenses`.
+
+# The GHCR image is built linux/amd64 (see Dockerfile / docker-build.yml), so
+# walk the dependency graph for that target — this drops crates that only link
+# on other platforms and keeps the attribution matched to what actually ships.
+targets = ["x86_64-unknown-linux-gnu"]
+
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]

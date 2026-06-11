@@ -20,6 +20,16 @@ else
   echo "(skipping: install with 'cargo install cargo-deny')"
 fi
 
+echo "==> per-crate LICENSE + NOTICE"
+./scripts/sync-licenses.sh --check
+
+echo "==> THIRD-PARTY-LICENSES up to date"
+if command -v cargo-about >/dev/null 2>&1; then
+  ./scripts/gen-third-party-licenses.sh --check
+else
+  echo "(skipping: install with 'cargo install --locked cargo-about --features cli')"
+fi
+
 echo "==> cargo audit"
 if command -v cargo-audit >/dev/null 2>&1; then
   cargo audit
