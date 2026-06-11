@@ -35,9 +35,13 @@ server stays read-only:
 - `apply_plan` — apply a previously-simulated plan (a `plan_run` UUID from
   `simulate_plan`)
 
-The `tt mcp` CLI does not yet expose a flag to enable them: today's `tt mcp`
-boots the server read-only. Embedders of the `tt-mcp` crate opt in via
-`Server::with_write_enabled(true)` + `Server::register_write_tools(...)`.
+Enable them with `tt mcp --allow-write`. The flag requires `DATABASE_URL`:
+write tools are scoped to your verified org, so the CLI verifies the operator
+key against the key store at boot and **refuses to start** (a clear error, not
+a silent read-only fallback) when the database is unset/unreachable or the key
+fails verification. Without the flag, `tt mcp` boots read-only as before.
+Embedders of the `tt-mcp` crate opt in via `Server::with_write_enabled(true)`
++ `Server::register_write_tools(...)`.
 
 ## Day-0 resources
 
