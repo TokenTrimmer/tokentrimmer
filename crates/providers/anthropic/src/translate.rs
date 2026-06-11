@@ -438,6 +438,15 @@ fn cache_min_tokens_for_model(model: &str) -> u32 {
 /// Anthropic proxy), which *undercounts* Anthropic tokens by ~15–20%; combined
 /// with the catalog minimum this keeps us on the safe side of the gate — a
 /// breakpoint we inject is comfortably above the real minimum, never below it.
+///
+/// Breadcrumb (cache-aware pass lane): `tt-core`'s `CacheClassifierPass` flags
+/// volatile markers (timestamp/uuid/hex token) inside this very prefix as
+/// `cache_dynamic_prefix:<kind>` diagnostics. We deliberately do NOT suppress
+/// this injection on a volatile-looking system prompt: a single-request
+/// heuristic cannot distinguish a per-call UUID from a STABLE one, and wrongly
+/// skipping the breakpoint forfeits the ~0.1x read rate (worth far more than
+/// the 1.25x write premium suppression would save). Wiring suppression would
+/// need cross-request prefix-hash evidence — see the classifier's module docs.
 fn maybe_inject_cache_control(system_blocks: &mut [AnthropicSystemBlock], model: &str) {
     if system_blocks.is_empty() {
         return;
