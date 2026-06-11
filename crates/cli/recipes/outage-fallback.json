@@ -1,0 +1,21 @@
+{
+  "slug": "outage-fallback",
+  "name": "Outage fallback",
+  "optimizes": "Provider outages and 5xx errors fail over to a backup chain instead of erroring the caller.",
+  "savings_lane": "failover",
+  "description": "Keep traffic flowing when a provider is degraded. The primary stays gpt-4o, but on a fallback-eligible failure (provider down, 5xx, timeout) the gateway retries the ordered fallback chain — first a same-class alternative, then a cheaper, widely-available model. Fallbacks may cross providers.",
+  "routes": [
+    {
+      "name": "recipe:outage-fallback",
+      "priority": 80,
+      "enabled": true,
+      "when": {
+        "model_in": ["gpt-4o"]
+      },
+      "then": {
+        "target_model": "gpt-4o",
+        "fallbacks": ["claude-sonnet-4-6", "gemini-3.5-flash"]
+      }
+    }
+  ]
+}

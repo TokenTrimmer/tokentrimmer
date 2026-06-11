@@ -11,6 +11,7 @@ pub mod embed;
 pub mod init;
 pub mod plan_suggest;
 pub mod proxy;
+pub mod recipes;
 pub mod retrieval;
 pub mod route;
 pub mod ui;

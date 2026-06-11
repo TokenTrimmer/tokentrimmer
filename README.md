@@ -123,7 +123,7 @@ docs/                          Architecture spec + per-surface design and usage 
 
 ## Architecture
 
-Read [`docs/tokentrimmer-architecture-spec-v1.md`](docs/tokentrimmer-architecture-spec-v1.md) for the full system design. The numbered docs cover the Inspect rule catalog, the provider adapter contract, the Plan replay design, the cost-preview API, and the Gateway API reference; the `docs/tt-*-usage.md` guides cover `init`, `mcp`, `proxy`, and `retrieval`. The gateway-touching CLI commands (`chat`, `advise`, `route`, `models`, `embed`, `login`) are documented in [`docs/tt-cli-commands.md`](docs/tt-cli-commands.md), and the routing rule model — conditions, actions, and how a route is chosen — in [`docs/routing-rules-guide.md`](docs/routing-rules-guide.md).
+Read [`docs/tokentrimmer-architecture-spec-v1.md`](docs/tokentrimmer-architecture-spec-v1.md) for the full system design. The numbered docs cover the Inspect rule catalog, the provider adapter contract, the Plan replay design, the cost-preview API, and the Gateway API reference; the `docs/tt-*-usage.md` guides cover `init`, `mcp`, `proxy`, and `retrieval`. The gateway-touching CLI commands (`chat`, `advise`, `route`, `recipes`, `models`, `embed`, `login`) are documented in [`docs/tt-cli-commands.md`](docs/tt-cli-commands.md), and the routing rule model — conditions, actions, and how a route is chosen — in [`docs/routing-rules-guide.md`](docs/routing-rules-guide.md).
 
 ## Contributing
 
