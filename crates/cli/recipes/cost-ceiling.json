@@ -1,0 +1,21 @@
+{
+  "slug": "cost-ceiling",
+  "name": "Cost ceiling",
+  "optimizes": "Expensive single calls are downshifted, and a hard per-request cost cap blocks runaway spend.",
+  "savings_lane": "cap",
+  "description": "When a request's estimated cost crosses a threshold, reroute it to a cheaper model and enforce a hard per-request ceiling. If even the cheaper model would exceed the ceiling, the gateway rejects the request (402) instead of silently spending. Tune estimated_cost_gt and max_cost_usd to your budget.",
+  "routes": [
+    {
+      "name": "recipe:cost-ceiling",
+      "priority": 90,
+      "enabled": true,
+      "when": {
+        "estimated_cost_gt": 0.05
+      },
+      "then": {
+        "target_model": "gpt-4o-mini",
+        "max_cost_usd": 0.05
+      }
+    }
+  ]
+}

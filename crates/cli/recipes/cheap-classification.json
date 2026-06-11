@@ -1,0 +1,33 @@
+{
+  "slug": "cheap-classification",
+  "name": "Cheap classification lane",
+  "optimizes": "Short, classification-style prompts are served by a small model instead of a flagship.",
+  "savings_lane": "downgrade",
+  "description": "Many apps send tiny prompts (label this, is this spam, pick a category) to an expensive flagship model. This recipe detects short prompts that look like classification work and reroutes them to gpt-4o-mini, which handles them at a fraction of the cost.",
+  "routes": [
+    {
+      "name": "recipe:cheap-classification",
+      "priority": 120,
+      "enabled": true,
+      "when": {
+        "model_in": ["gpt-4o", "gpt-5.4", "gpt-5.5"],
+        "input_tokens_lt": 400,
+        "prompt_contains_any_of": [
+          "classify",
+          "classification",
+          "category",
+          "categorize",
+          "label",
+          "sentiment",
+          "intent",
+          "is this",
+          "yes or no",
+          "true or false"
+        ]
+      },
+      "then": {
+        "target_model": "gpt-4o-mini"
+      }
+    }
+  ]
+}

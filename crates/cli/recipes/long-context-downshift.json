@@ -1,0 +1,21 @@
+{
+  "slug": "long-context-downshift",
+  "name": "Long-context downshift",
+  "optimizes": "Huge-context requests go to a cheaper long-context model instead of an expensive flagship.",
+  "savings_lane": "downshift",
+  "description": "Large prompts (long documents, big RAG payloads, full chat histories) dominate token spend. This recipe sends any request over ~32k input tokens to gemini-3.1-flash-lite — a 1M-token-window model priced far below the flagships — so your biggest prompts cost the least per token.",
+  "routes": [
+    {
+      "name": "recipe:long-context-downshift",
+      "priority": 110,
+      "enabled": true,
+      "when": {
+        "model_in": ["gpt-4o", "gpt-5.4", "gpt-5.5", "claude-opus-4-8", "claude-sonnet-4-6"],
+        "input_tokens_gt": 32000
+      },
+      "then": {
+        "target_model": "gemini-3.1-flash-lite"
+      }
+    }
+  ]
+}

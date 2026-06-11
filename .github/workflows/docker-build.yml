@@ -2,6 +2,11 @@ name: docker build & publish
 
 # Build the `tt` CLI image and push to GHCR on every merge to main.
 # PRs build but do NOT push — they verify the Dockerfile still works.
+#
+# The Dockerfile COPYs the committed THIRD-PARTY-LICENSES (plus LICENSE +
+# NOTICE) into the image for dependency attribution. That file is kept current
+# by the `third-party-licenses` job in ci.yml (cargo-about --check), so this
+# workflow trusts the committed copy rather than re-running cargo-about here.
 
 on:
   push:

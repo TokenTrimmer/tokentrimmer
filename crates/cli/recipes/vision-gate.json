@@ -1,0 +1,20 @@
+{
+  "slug": "vision-gate",
+  "name": "Vision gate",
+  "optimizes": "Image requests land on a vision-capable model; text-only traffic stays cheap.",
+  "savings_lane": "reroute",
+  "description": "Pin every request that carries an image to a vision-capable model (gpt-4o), so multimodal calls never fail capability checks. Pair this with a cheaper text default so only the requests that actually need vision pay for it.",
+  "routes": [
+    {
+      "name": "recipe:vision-gate",
+      "priority": 200,
+      "enabled": true,
+      "when": {
+        "has_images": true
+      },
+      "then": {
+        "target_model": "gpt-4o"
+      }
+    }
+  ]
+}
