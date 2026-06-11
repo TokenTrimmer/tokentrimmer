@@ -1,5 +1,5 @@
 import type { ChatCompletionChunk } from 'openai/resources/chat/completions';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { TokenTrimmer, type StreamCost } from '../src/index.js';
 
 const TT_HEADERS = {
@@ -271,5 +271,62 @@ describe('TokenTrimmer TS SDK', () => {
     expect(cost!.inputTokens).toBe(10);
     expect(cost!.outputTokens).toBe(20);
     expect(cost!.cachedTokens).toBe(0);
+  });
+});
+
+describe('TokenTrimmer API-key resolution', () => {
+  // Precedence: explicit `apiKey` option > TOKENTRIMMER_API_KEY > OPENAI_API_KEY.
+  const saved = {
+    tt: process.env.TOKENTRIMMER_API_KEY,
+    openai: process.env.OPENAI_API_KEY,
+  };
+
+  afterEach(() => {
+    if (saved.tt === undefined) delete process.env.TOKENTRIMMER_API_KEY;
+    else process.env.TOKENTRIMMER_API_KEY = saved.tt;
+    if (saved.openai === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = saved.openai;
+  });
+
+  it('explicit apiKey wins over TOKENTRIMMER_API_KEY', () => {
+    process.env.TOKENTRIMMER_API_KEY = 'tt_from_env';
+    const c = new TokenTrimmer({ apiKey: 'tt_explicit' });
+    expect(c.apiKey).toBe('tt_explicit');
+  });
+
+  it('uses TOKENTRIMMER_API_KEY when no apiKey is passed', () => {
+    process.env.TOKENTRIMMER_API_KEY = 'tt_from_env';
+    delete process.env.OPENAI_API_KEY;
+    const c = new TokenTrimmer();
+    expect(c.apiKey).toBe('tt_from_env');
+  });
+
+  it('prefers TOKENTRIMMER_API_KEY over OPENAI_API_KEY', () => {
+    process.env.TOKENTRIMMER_API_KEY = 'tt_from_env';
+    process.env.OPENAI_API_KEY = 'tt_from_openai_env';
+    const c = new TokenTrimmer();
+    expect(c.apiKey).toBe('tt_from_env');
+  });
+
+  it('falls back to OPENAI_API_KEY when TOKENTRIMMER_API_KEY is unset', () => {
+    delete process.env.TOKENTRIMMER_API_KEY;
+    process.env.OPENAI_API_KEY = 'tt_from_openai_env';
+    const c = new TokenTrimmer();
+    expect(c.apiKey).toBe('tt_from_openai_env');
+  });
+
+  it('does not throw reading env in a browser-like env (no process)', () => {
+    // Simulate a browser/edge runtime where `process` is undefined: the env
+    // lookup must be guarded so the constructor never throws on `process.env`.
+    const realProcess = globalThis.process;
+    // @ts-expect-error - deliberately removing the Node `process` global.
+    delete globalThis.process;
+    try {
+      // An explicit apiKey is supplied (the browser path has no env to read);
+      // the assertion is that constructing it does not throw a ReferenceError.
+      expect(() => new TokenTrimmer({ apiKey: 'tt_browser' })).not.toThrow();
+    } finally {
+      globalThis.process = realProcess;
+    }
   });
 });

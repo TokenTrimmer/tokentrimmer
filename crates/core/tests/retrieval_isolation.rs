@@ -260,7 +260,7 @@ async fn different_orgs_do_not_share_retrieval_data() {
     assert_eq!(
         resp_a
             .headers()
-            .get("x-tt-retrieval-enabled")
+            .get("x-tokentrimmer-retrieval-enabled")
             .and_then(|v| v.to_str().ok()),
         Some("active"),
         "retrieval should be active for an authenticated org_a request"
@@ -302,7 +302,7 @@ async fn different_orgs_do_not_share_retrieval_data() {
     assert_eq!(
         resp_b
             .headers()
-            .get("x-tt-retrieval-enabled")
+            .get("x-tokentrimmer-retrieval-enabled")
             .and_then(|v| v.to_str().ok()),
         Some("active"),
         "retrieval should be active for an authenticated org_b request"

@@ -221,14 +221,15 @@ pub async fn middleware(
     // Surface remaining monthly headroom on successful responses too.
     if let Some(rem) = spend_remaining {
         if let Ok(v) = format!("{rem:.6}").parse() {
-            resp.headers_mut().insert("x-tt-budget-remaining-usd", v);
+            resp.headers_mut()
+                .insert("x-tokentrimmer-budget-remaining-usd", v);
         }
     }
     Ok(resp)
 }
 
 /// Build a `429 Too Many Requests` response for a budget/rate denial, with the
-/// `X-TT-Budget-Remaining-Usd` and (for rate limits) `Retry-After` headers.
+/// `X-TokenTrimmer-Budget-Remaining-Usd` and (for rate limits) `Retry-After` headers.
 fn budget_denied_response(
     message: &str,
     kind: &str,
@@ -240,7 +241,7 @@ fn budget_denied_response(
     let headers = resp.headers_mut();
     if let Some(rem) = remaining_usd {
         if let Ok(v) = format!("{rem:.6}").parse() {
-            headers.insert("x-tt-budget-remaining-usd", v);
+            headers.insert("x-tokentrimmer-budget-remaining-usd", v);
         }
     }
     if let Some(secs) = retry_after_secs {

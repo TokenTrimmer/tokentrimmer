@@ -2,14 +2,14 @@
 //! and, if present, runs substitution before the chat handler dispatches.
 //!
 //! Wired via `Router::layer(axum::middleware::from_fn_with_state(...))` in
-//! `server.rs`. When the substitution succeeds, sets an X-TT-Retrieval-*
+//! `server.rs`. When the substitution succeeds, sets an X-TokenTrimmer-Retrieval-*
 //! response header on the response.
 //!
 //! # Activation
 //! Set `TT_RETRIEVAL_STORE=memory|postgres` and `TT_OPENAI_EMBED_KEY=<key>` at
 //! Gateway boot (the `postgres` store also needs `DATABASE_URL`). When the
 //! required vars are absent, retrieval is disabled and
-//! `x-tt-retrieval-enabled: disabled` is returned on every response.
+//! `x-tokentrimmer-retrieval-enabled: disabled` is returned on every response.
 
 use std::sync::Arc;
 
@@ -110,7 +110,7 @@ pub fn build_retrieval_state() -> Option<RetrievalState> {
 }
 
 /// Middleware entry point when retrieval is **disabled** (no env vars or
-/// invalid config). Adds `x-tt-retrieval-enabled: disabled` to every response.
+/// invalid config). Adds `x-tokentrimmer-retrieval-enabled: disabled` to every response.
 ///
 /// This path NEVER buffers the request body — it forwards `req` straight to
 /// `next` with no `to_bytes` call, so the gateway pays zero body-buffering cost
@@ -120,7 +120,7 @@ pub fn build_retrieval_state() -> Option<RetrievalState> {
 pub async fn maybe_substitute_disabled(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     resp.headers_mut().insert(
-        "x-tt-retrieval-enabled",
+        "x-tokentrimmer-retrieval-enabled",
         HeaderValue::from_static("disabled"),
     );
     resp
@@ -142,8 +142,10 @@ pub async fn maybe_substitute(
     if !is_chat_path || parts.method != axum::http::Method::POST {
         let req = Request::from_parts(parts, body);
         let mut resp = next.run(req).await;
-        resp.headers_mut()
-            .insert("x-tt-retrieval-enabled", HeaderValue::from_static("ready"));
+        resp.headers_mut().insert(
+            "x-tokentrimmer-retrieval-enabled",
+            HeaderValue::from_static("ready"),
+        );
         return resp;
     }
 
@@ -155,7 +157,7 @@ pub async fn maybe_substitute(
             let req = Request::from_parts(parts, Body::empty());
             let mut resp = next.run(req).await;
             resp.headers_mut().insert(
-                "x-tt-retrieval-error",
+                "x-tokentrimmer-retrieval-error",
                 HeaderValue::from_static("body-too-large"),
             );
             return resp;
@@ -170,7 +172,7 @@ pub async fn maybe_substitute(
             let req = Request::from_parts(parts, Body::from(bytes));
             let mut resp = next.run(req).await;
             resp.headers_mut().insert(
-                "x-tt-retrieval-error",
+                "x-tokentrimmer-retrieval-error",
                 HeaderValue::from_static("json-parse-failed"),
             );
             return resp;
@@ -182,8 +184,10 @@ pub async fn maybe_substitute(
     if !body_str.contains("<retrievable") {
         let req = Request::from_parts(parts, Body::from(bytes));
         let mut resp = next.run(req).await;
-        resp.headers_mut()
-            .insert("x-tt-retrieval-enabled", HeaderValue::from_static("ready"));
+        resp.headers_mut().insert(
+            "x-tokentrimmer-retrieval-enabled",
+            HeaderValue::from_static("ready"),
+        );
         return resp;
     }
 
@@ -194,8 +198,10 @@ pub async fn maybe_substitute(
             // No messages array — forward unchanged.
             let req = Request::from_parts(parts, Body::from(bytes));
             let mut resp = next.run(req).await;
-            resp.headers_mut()
-                .insert("x-tt-retrieval-enabled", HeaderValue::from_static("ready"));
+            resp.headers_mut().insert(
+                "x-tokentrimmer-retrieval-enabled",
+                HeaderValue::from_static("ready"),
+            );
             return resp;
         }
     };
@@ -234,7 +240,7 @@ pub async fn maybe_substitute(
                 let req = Request::from_parts(parts, Body::from(bytes));
                 let mut resp = next.run(req).await;
                 resp.headers_mut().insert(
-                    "x-tt-retrieval-skipped",
+                    "x-tokentrimmer-retrieval-skipped",
                     HeaderValue::from_static("no-auth"),
                 );
                 return resp;
@@ -253,7 +259,7 @@ pub async fn maybe_substitute(
                     let req = Request::from_parts(parts, Body::from(bytes));
                     let mut resp = next.run(req).await;
                     resp.headers_mut().insert(
-                        "x-tt-retrieval-error",
+                        "x-tokentrimmer-retrieval-error",
                         HeaderValue::from_static("serialize-failed"),
                     );
                     return resp;
@@ -263,18 +269,22 @@ pub async fn maybe_substitute(
             let req = Request::from_parts(parts, Body::from(new_bytes));
             let mut resp = next.run(req).await;
 
-            resp.headers_mut()
-                .insert("x-tt-retrieval-enabled", HeaderValue::from_static("active"));
+            resp.headers_mut().insert(
+                "x-tokentrimmer-retrieval-enabled",
+                HeaderValue::from_static("active"),
+            );
             if let Ok(v) = HeaderValue::from_str(&report.substitutions.to_string()) {
-                resp.headers_mut().insert("x-tt-retrieval-substitutions", v);
+                resp.headers_mut()
+                    .insert("x-tokentrimmer-retrieval-substitutions", v);
             }
             if let Ok(v) = HeaderValue::from_str(&report.tokens_saved_estimate.to_string()) {
-                resp.headers_mut().insert("x-tt-retrieval-tokens-saved", v);
+                resp.headers_mut()
+                    .insert("x-tokentrimmer-retrieval-tokens-saved", v);
             }
             if report.low_confidence_skips > 0 {
                 if let Ok(v) = HeaderValue::from_str(&report.low_confidence_skips.to_string()) {
                     resp.headers_mut()
-                        .insert("x-tt-retrieval-low-confidence", v);
+                        .insert("x-tokentrimmer-retrieval-low-confidence", v);
                 }
             }
 
@@ -314,7 +324,8 @@ pub async fn maybe_substitute(
                 tt_retrieval::RetrievalError::InvalidEmbedding => "invalid-embedding",
             };
             if let Ok(v) = HeaderValue::from_str(kind) {
-                resp.headers_mut().insert("x-tt-retrieval-error", v);
+                resp.headers_mut()
+                    .insert("x-tokentrimmer-retrieval-error", v);
             }
             resp
         }
@@ -398,7 +409,7 @@ mod tests {
     }
 
     // (a) No ApiKeyContext + dev flag OFF → body forwarded unchanged,
-    //     x-tt-retrieval-skipped: no-auth header set, no search runs.
+    //     x-tokentrimmer-retrieval-skipped: no-auth header set, no search runs.
     #[tokio::test]
     async fn fail_closed_no_auth_no_flag() {
         let _guard = ENV_LOCK.lock().expect("env lock");
@@ -416,16 +427,18 @@ mod tests {
         // Must emit the skipped header.
         assert_eq!(
             resp.headers()
-                .get("x-tt-retrieval-skipped")
+                .get("x-tokentrimmer-retrieval-skipped")
                 .map(|v| v.as_bytes()),
             Some(b"no-auth".as_slice()),
-            "expected x-tt-retrieval-skipped: no-auth when no ApiKeyContext and flag off"
+            "expected x-tokentrimmer-retrieval-skipped: no-auth when no ApiKeyContext and flag off"
         );
 
         // Must NOT emit the active/ready retrieval header (no substitution ran).
         assert!(
-            resp.headers().get("x-tt-retrieval-enabled").is_none(),
-            "x-tt-retrieval-enabled should be absent when substitution is skipped"
+            resp.headers()
+                .get("x-tokentrimmer-retrieval-enabled")
+                .is_none(),
+            "x-tokentrimmer-retrieval-enabled should be absent when substitution is skipped"
         );
 
         // The body forwarded to the handler must be the original bytes unchanged.
@@ -459,16 +472,21 @@ mod tests {
 
         // The skipped header must NOT be present (we took the anon path).
         assert!(
-            resp.headers().get("x-tt-retrieval-skipped").is_none(),
-            "x-tt-retrieval-skipped must be absent when TT_RETRIEVAL_ALLOW_ANON=1"
+            resp.headers()
+                .get("x-tokentrimmer-retrieval-skipped")
+                .is_none(),
+            "x-tokentrimmer-retrieval-skipped must be absent when TT_RETRIEVAL_ALLOW_ANON=1"
         );
 
         // Embedding will fail (fake key), so we expect an error header — but
         // crucially we did NOT short-circuit before substitution.
-        let has_error = resp.headers().get("x-tt-retrieval-error").is_some();
+        let has_error = resp
+            .headers()
+            .get("x-tokentrimmer-retrieval-error")
+            .is_some();
         let has_active = resp
             .headers()
-            .get("x-tt-retrieval-enabled")
+            .get("x-tokentrimmer-retrieval-enabled")
             .map(|v| v == "active")
             .unwrap_or(false);
         assert!(
@@ -505,16 +523,21 @@ mod tests {
 
         // Skipped header must NOT be present.
         assert!(
-            resp.headers().get("x-tt-retrieval-skipped").is_none(),
-            "x-tt-retrieval-skipped must be absent when ApiKeyContext is present"
+            resp.headers()
+                .get("x-tokentrimmer-retrieval-skipped")
+                .is_none(),
+            "x-tokentrimmer-retrieval-skipped must be absent when ApiKeyContext is present"
         );
 
         // Substitution was attempted (embedding fails w/ test key → error
         // header; OR it somehow succeeds → active header).
-        let has_error = resp.headers().get("x-tt-retrieval-error").is_some();
+        let has_error = resp
+            .headers()
+            .get("x-tokentrimmer-retrieval-error")
+            .is_some();
         let has_active = resp
             .headers()
-            .get("x-tt-retrieval-enabled")
+            .get("x-tokentrimmer-retrieval-enabled")
             .map(|v| v == "active")
             .unwrap_or(false);
         assert!(
@@ -556,7 +579,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
-                .get("x-tt-retrieval-enabled")
+                .get("x-tokentrimmer-retrieval-enabled")
                 .map(|v| v.as_bytes()),
             Some(&b"disabled"[..]),
             "disabled middleware must mark the response"

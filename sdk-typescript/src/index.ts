@@ -58,6 +58,20 @@ import type {
 
 export const DEFAULT_BASE_URL = 'https://api.tokentrimmer.com/v1';
 
+/**
+ * Resolve the API key from `TOKENTRIMMER_API_KEY` when the caller passed none.
+ *
+ * Returns `undefined` if the env var is unset OR there is no `process` (a
+ * browser/edge runtime), so the `typeof process` guard means this never throws
+ * outside Node. When it returns `undefined`, the base OpenAI constructor's own
+ * default falls back to `OPENAI_API_KEY` — giving the precedence chain
+ * `options.apiKey` > `TOKENTRIMMER_API_KEY` > `OPENAI_API_KEY`.
+ */
+function resolveApiKey(): string | undefined {
+  if (typeof process === 'undefined' || process.env == null) return undefined;
+  return process.env.TOKENTRIMMER_API_KEY;
+}
+
 // The per-request options type, derived from the inherited `create` overload so
 // we don't depend on an unexported `internal/*` subpath of the openai package.
 type RequestOptions = NonNullable<Parameters<OpenAI['chat']['completions']['create']>[1]>;
@@ -325,6 +339,7 @@ export class TokenTrimmer extends OpenAI {
   constructor(options: ClientOptions = {}) {
     super({
       ...options,
+      apiKey: options.apiKey ?? resolveApiKey(),
       baseURL: options.baseURL ?? DEFAULT_BASE_URL,
     });
 
