@@ -94,4 +94,4 @@ Caveat: Dify's provider UI cannot set custom request headers, so per-request `X-
 
 ## Agent stacks (MCP)
 
-For Claude Code / Cursor / any MCP client, `tt mcp` exposes the gateway's cost, plan, and routing tools — including the write tools (`add_route`, `apply_plan`) behind `--allow-write`. See [`tt-mcp-usage.md`](tt-mcp-usage.md).
+For Claude Code / Cursor / any MCP client, `tt mcp` exposes the gateway's cost, plan, and routing tools (read-only). Mutating write tools (`add_route`, `apply_plan`) ship in the MCP server behind an off-by-default write gate; the `tt mcp` CLI does not yet expose a flag to enable them. See [`tt-mcp-usage.md`](tt-mcp-usage.md).
