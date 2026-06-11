@@ -151,6 +151,7 @@ fn route(name: &str, priority: u32, tag: Option<&str>, target: &str) -> Route {
             max_cost_usd: None,
             flex: false,
             compress: false,
+            redact: false,
         },
     }
 }

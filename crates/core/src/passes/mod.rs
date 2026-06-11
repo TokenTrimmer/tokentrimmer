@@ -18,15 +18,28 @@
 //! - **Composable + ordered.** Adding a second pass (a future, more aggressive
 //!   stage gated behind the Wave-B2 judge) is `pipeline.with(pass)`.
 //!
-//! The only pass shipped today is the conservative, content-lossless
-//! [`compression::CompressionPass`] (compression pass #1). A judge gate would
-//! attach at [`PassPipeline::run`] — wrapping a non-lossless pass so its output
-//! is only accepted when the judge confirms semantic equivalence. The
-//! conservative pass needs no judge because it is lossless by construction.
+//! Two passes ship today, each off-by-default and route-gated:
+//!
+//! - [`compression::CompressionPass`] (compression pass #1) — a conservative,
+//!   content-lossless trim that REMOVES redundant tokens (a savings feature),
+//!   enabled by `RouteAction::compress`.
+//! - [`redaction::RedactionPass`] — a SAFETY guardrail that replaces PII/secrets
+//!   in the outbound request with a placeholder, enabled by `RouteAction::redact`.
+//!   It is NOT a savings feature: any token delta it reports is internal
+//!   accounting only and is never branded as a saving. The
+//!   `x-tokentrimmer-warnings` header (`redacted:<class>`) is the signal that
+//!   redaction occurred.
+//!
+//! A judge gate would attach at [`PassPipeline::run`] — wrapping a non-lossless
+//! pass so its output is only accepted when the judge confirms semantic
+//! equivalence. Both passes shipped today need no judge: compression is lossless
+//! by construction and redaction is an intentional, conservative substitution.
 
 pub mod compression;
+pub mod redaction;
 
 pub use compression::CompressionPass;
+pub use redaction::{RedactedField, RedactionPass};
 
 use tt_shared::ChatCompletionRequest;
 
@@ -89,6 +102,18 @@ impl PassPipeline {
     #[must_use]
     pub fn conservative_compression() -> Self {
         Self::new().with(CompressionPass::new())
+    }
+
+    /// The request-redaction guardrail stage — enabled by `RouteAction::redact`.
+    ///
+    /// This is a SAFETY transform, not a savings feature: it strips PII/secrets
+    /// from the outbound request. The gateway drives redaction via
+    /// [`RedactionPass::redact`] directly (so it can name the redacted field
+    /// classes in the warnings header); this constructor exists for parity with
+    /// [`PassPipeline::conservative_compression`] and pipeline-level tests.
+    #[must_use]
+    pub fn redaction_guardrail() -> Self {
+        Self::new().with(RedactionPass::new())
     }
 
     /// Append a pass to the end of the pipeline (builder style).

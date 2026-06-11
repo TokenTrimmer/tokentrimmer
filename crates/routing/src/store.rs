@@ -358,6 +358,7 @@ mod tests {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }
     }
@@ -394,6 +395,7 @@ mod tests {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         };
         let created = s.create_route(org, spec).await.unwrap();
@@ -430,6 +432,7 @@ mod tests {
                         max_cost_usd: None,
                         flex: false,
                         compress: false,
+                        redact: false,
                     },
                 },
             )

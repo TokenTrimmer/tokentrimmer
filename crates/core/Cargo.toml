@@ -31,6 +31,9 @@ tt-provider-local.workspace = true
 
 sqlx.workspace = true
 blake3.workspace = true
+# Redaction guardrail (passes/redaction.rs) — secret/PII pattern matching,
+# ported from the Tier-1 inspect secret rule plus email/SSN matchers.
+regex.workspace = true
 dashmap.workspace = true
 rand_core.workspace = true
 # Pre-auth per-IP rate cap in front of the argon2 key-verify path

@@ -208,6 +208,7 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         },
     };
     let mut pricing = HashMap::new();
@@ -238,6 +239,7 @@ fn conservative_when_pricing_missing() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         },
     };
     let input = input_with_routes(vec![req], vec![route], HashMap::new(), 100);
@@ -272,6 +274,7 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         },
     };
     let mut pricing = HashMap::new();
@@ -303,6 +306,7 @@ fn cross_provider_target_absent_is_conservative() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         },
     };
     let result = replay(input_with_routes(
@@ -333,6 +337,7 @@ fn route_over_ceiling_is_blocked_not_saved() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: Some(0.01), // haiku on 1M/1M tokens still far exceeds $0.01
+            redact: false,
         },
     };
     let mut pricing = HashMap::new();
@@ -385,6 +390,7 @@ fn rerouted_latency_projected_from_target_model_history() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         },
     };
     let mut pricing = HashMap::new();
@@ -460,6 +466,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         },
     };
 
@@ -577,6 +584,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         },
     };
     let route_b = ProposedRoute {
@@ -593,6 +601,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         },
     };
 

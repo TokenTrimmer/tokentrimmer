@@ -1351,6 +1351,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     max_cost_usd: None,
                     flex: false,
                     compress: false,
+                    redact: false,
                 },
             }],
         );

@@ -197,6 +197,7 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );
@@ -274,6 +275,7 @@ async fn routed_request_reports_savings_against_original_model() {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );
@@ -383,6 +385,7 @@ async fn route_for_other_org_does_not_match() {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );
@@ -437,6 +440,7 @@ async fn route_skipped_when_no_resolvable_org() {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );
@@ -521,6 +525,7 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );

@@ -144,6 +144,7 @@ mod tests {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }
     }
@@ -244,6 +245,7 @@ mod tests {
                         max_cost_usd: None,
                         flex: false,
                         compress: false,
+                        redact: false,
                     },
                 },
             )

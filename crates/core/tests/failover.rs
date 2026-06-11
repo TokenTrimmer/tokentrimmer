@@ -147,6 +147,7 @@ fn failover_routing_store() -> Arc<CachingRoutingStore> {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );

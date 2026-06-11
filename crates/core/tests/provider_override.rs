@@ -440,6 +440,7 @@ async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );

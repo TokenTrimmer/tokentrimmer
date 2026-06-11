@@ -131,6 +131,19 @@ pub struct RouteAction {
     /// unless a route enables it; omitted from JSON when false (back-compat).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compress: bool,
+    /// Opt the matched request into the **request-redaction guardrail**
+    /// (request-pass pipeline): a conservative SAFETY transform that replaces
+    /// PII/secrets in the OUTBOUND request (user prose, system blocks,
+    /// tool-result content) with a `[REDACTED]` placeholder BEFORE the request
+    /// is dispatched upstream. Reuses the Tier-1 secret patterns plus email/SSN
+    /// matchers and prefers over-redacting to leaking. This is **not** a savings
+    /// feature: no cost/savings is attributed to redaction; the
+    /// `x-tokentrimmer-warnings` header (`redacted:<class>`) is the signal that
+    /// redaction fired. It redacts the upstream request, not the gateway's logs.
+    /// **Off by default** — no behavior change unless a route enables it;
+    /// omitted from JSON when false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redact: bool,
 }
 
 /// Rule engine. Hold routes sorted by descending priority; iterate to find
@@ -293,6 +306,7 @@ mod tests {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }
     }
@@ -597,6 +611,7 @@ mod tests {
             max_cost_usd: None,
             flex: false,
             compress: false,
+            redact: false,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -626,6 +641,7 @@ mod tests {
             max_cost_usd: None,
             flex: false,
             compress: false,
+            redact: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -647,6 +663,7 @@ mod tests {
             max_cost_usd: None,
             flex: false,
             compress: false,
+            redact: false,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -676,6 +693,24 @@ mod tests {
         let gateway_action: RouteAction = serde_json::from_str(plan_side_json).unwrap();
         assert_eq!(gateway_action.target_model, "claude-3-5-haiku");
         assert_eq!(gateway_action.fallbacks, vec!["gpt-4o-mini"]);
+        let reemitted = serde_json::to_string(&gateway_action).unwrap();
+        assert_eq!(reemitted, plan_side_json);
+    }
+
+    /// Cross-type wire-compat for the `redact` guardrail flag: JSON written by
+    /// the plan side carrying `"redact":true` deserializes into a
+    /// `tt_routing::RouteAction` with the flag set and re-emits the same wire
+    /// form (same field order + skip_serializing_if gating). Locks `redact` into
+    /// the shared wire format alongside `flex`/`compress`.
+    #[test]
+    fn route_action_redact_cross_type_wire_compat() {
+        let plan_side_json = r#"{"target_model":"gpt-4o","redact":true}"#;
+        let gateway_action: RouteAction = serde_json::from_str(plan_side_json).unwrap();
+        assert_eq!(gateway_action.target_model, "gpt-4o");
+        assert!(
+            gateway_action.redact,
+            "redact must round-trip from plan JSON"
+        );
         let reemitted = serde_json::to_string(&gateway_action).unwrap();
         assert_eq!(reemitted, plan_side_json);
     }
@@ -781,6 +816,28 @@ mod tests {
         assert!(j.contains("\"flex\":true"), "flex=true must serialize: {j}");
         let back: RouteAction = serde_json::from_str(&j).unwrap();
         assert!(back.flex);
+    }
+
+    #[test]
+    fn route_action_redact_defaults_false_omits_and_round_trips() {
+        // Omitted from JSON when false (back-compat: existing rows unchanged).
+        let mut a = make_route("x", 10, vec![], "gpt-4o-mini").then;
+        assert!(
+            !serde_json::to_string(&a).unwrap().contains("redact"),
+            "redact must be omitted when false"
+        );
+        // Defaults false when absent from legacy JSON.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.redact, "redact must default false");
+        // Present + round-trips when true.
+        a.redact = true;
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(
+            j.contains("\"redact\":true"),
+            "redact=true must serialize: {j}"
+        );
+        let back: RouteAction = serde_json::from_str(&j).unwrap();
+        assert!(back.redact);
     }
 
     #[test]

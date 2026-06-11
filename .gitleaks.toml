@@ -25,4 +25,8 @@ paths = [
   # fake API keys (sk-proj-…, sk-ant-…) as test data — not real secrets.
   '''crates/inspect-rules-tier1/src/rules/config_agents_md_contains_secrets\.rs''',
   '''crates/inspect-rules-tier1/tests/rules/config-agents-md-contains-secrets/.*''',
+  # The in-path redaction pass: its #[cfg(test)] fixtures must contain
+  # secret-shaped strings (fake sk-proj-…, emails, SSNs) to verify redaction
+  # actually fires — not real secrets.
+  '''crates/core/src/passes/redaction\.rs''',
 ]

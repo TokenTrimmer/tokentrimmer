@@ -170,6 +170,7 @@ fn route(target: &str, fallbacks: Vec<String>) -> Route {
             max_cost_usd: None,
             flex: false,
             compress: false,
+            redact: false,
         },
     }
 }
