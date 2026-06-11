@@ -108,6 +108,13 @@ enum Command {
         /// Port to bind when using --transport http or sse (default 31416).
         #[arg(long, default_value_t = 31416)]
         sse_port: u16,
+        /// Enable the mutating write tools (`add_route`, `apply_plan`). OFF by
+        /// default — without this flag the server is read-only and the write
+        /// tools are absent from `tools/list`. Requires DATABASE_URL so the
+        /// operator key can be verified and org-bound at boot; refuses to
+        /// start otherwise (fail closed).
+        #[arg(long)]
+        allow_write: bool,
     },
     /// Log in: opens the dashboard to create an API key (paste it back), or pass --token <KEY>.
     Login {
@@ -496,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
             tt_api_key,
             tt_api_base,
             sse_port,
+            allow_write,
         } => {
             use tt_mcp::{
                 auth,
@@ -509,7 +517,7 @@ async fn main() -> anyhow::Result<()> {
             let ctx = tt_cli::context::ResolvedContext::load(tt_api_key, tt_api_base)?;
             let api_key = auth::validate_api_key(ctx.api_key_string())?;
             let tt_api_base = ctx.base_url;
-            let mut server = Server::new();
+            let mut server = Server::new().with_write_enabled(allow_write);
             server
                 .tools
                 .register(Box::new(preview_cost::PreviewCostTool));
@@ -601,8 +609,31 @@ async fn main() -> anyhow::Result<()> {
                                 tracing::info!(
                                     "MCP cost-control tools registered (org-scoped); backend: unconfigured seam"
                                 );
+                                if allow_write {
+                                    // The CLI has a single configured base; both
+                                    // write targets (`POST /v1/routes` on the
+                                    // gateway, `POST /v1/admin/plans/:id/apply`
+                                    // on the plan surface) resolve against it —
+                                    // the same convention the read tools
+                                    // (simulate_plan, plan_history) already use.
+                                    server.register_write_tools(
+                                        org_id,
+                                        tt_api_base.clone(),
+                                        tt_api_base.clone(),
+                                        api_key.clone(),
+                                        reqwest::Client::new(),
+                                    );
+                                    tracing::info!(
+                                        "MCP write tools registered (add_route, apply_plan; org-scoped)"
+                                    );
+                                }
                             }
                             Err(e) => {
+                                if allow_write {
+                                    anyhow::bail!(
+                                        "--allow-write requires a verified operator key, but verification failed: {e}"
+                                    );
+                                }
                                 tracing::error!(error = %e, "MCP operator key verification failed; cost-control tools not registered");
                             }
                         }
@@ -613,10 +644,20 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     Err(e) => {
+                        if allow_write {
+                            anyhow::bail!(
+                                "--allow-write requires store-backed key verification, but the database connection failed: {e}"
+                            );
+                        }
                         tracing::error!(error = %e, "MCP db connect failed; serving with loopback bearer guard only (no store-backed verification)");
                     }
                 }
             } else {
+                if allow_write {
+                    anyhow::bail!(
+                        "--allow-write requires DATABASE_URL: write tools are org-scoped and need store-backed key verification; refusing to start a writable MCP server without it"
+                    );
+                }
                 tracing::warn!("DATABASE_URL not set; MCP serving with loopback bearer guard only (no store-backed key verification); cost-control tools require a verified org and are not registered");
             }
 
