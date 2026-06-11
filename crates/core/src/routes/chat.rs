@@ -832,6 +832,13 @@ pub async fn handler(
     // that did not enable it) the request-pass pipeline never runs and the
     // request is byte-for-byte unchanged.
     let route_compress = route_match.as_ref().is_some_and(|m| m.compress);
+    // A matched route opting into the request-redaction guardrail
+    // (`RouteAction::redact`). When false (the default) the redaction pass never
+    // runs and the request is byte-for-byte unchanged. This is a SAFETY
+    // transform — it strips PII/secrets from the OUTBOUND request before
+    // dispatch; it never attributes a saving and surfaces a `redacted:<class>`
+    // warning when it fires.
+    let route_redact = route_match.as_ref().is_some_and(|m| m.redact);
     // Per-request cost ceiling (V3d-2b) + the token estimate, captured before
     // `route_match` is consumed below.
     let route_max_cost_usd = route_match.as_ref().and_then(|m| m.max_cost_usd);
@@ -937,6 +944,34 @@ pub async fn handler(
     // cost computation below so savings attribute to the `flex` source. Evaluated
     // against the FINAL served provider/model (post-routing/pin/failover-primary).
     let flex_applied = maybe_apply_flex(&mut req, route_flex, provider.as_ref(), &mut warnings);
+
+    // Request-redaction guardrail (`RouteAction::redact`): when the matched
+    // route opted in, strip PII/secrets from the OUTBOUND request (user prose,
+    // system blocks, tool-result content) BEFORE deriving cache keys /
+    // dispatching, so the secret never reaches the upstream provider AND the
+    // cache stores the redacted form. This is a SAFETY transform, NOT a savings
+    // feature: no cost/saving is attributed to it. When it fires we append a
+    // `redacted:<class>` entry to the warnings header naming WHICH field class
+    // was redacted (system / body / tool_result) — the matched secret VALUES are
+    // never placed in any header or log. Off by default (`route_redact` is false
+    // for every unrouted request and every route that did not enable it), so
+    // `req` is byte-for-byte unchanged on the default path. Runs before
+    // compression so secrets are removed first; the `[REDACTED]` placeholder is
+    // inert to the compression trims.
+    if route_redact {
+        let fired = crate::passes::RedactionPass::new().redact(&mut req);
+        if !fired.is_empty() {
+            // Do NOT log the redacted values — only the field classes that fired.
+            tracing::debug!(
+                org_id = %ctx.org_id,
+                redacted_classes = ?fired,
+                "redaction guardrail stripped PII/secrets from the outbound request"
+            );
+            for field in fired {
+                warnings.push(field.warning_token().to_string());
+            }
+        }
+    }
 
     // Request-pass pipeline (compression pass #1): when the matched route opted
     // in (`RouteAction::compress`), run the conservative, content-lossless trim
@@ -2982,6 +3017,11 @@ pub(crate) struct RouteMatch {
     /// (`RouteAction::compress`). When true the gateway runs the request-pass
     /// pipeline before dispatch; off by default (no pass runs otherwise).
     pub(crate) compress: bool,
+    /// The matched route opted into the request-redaction guardrail
+    /// (`RouteAction::redact`). When true the gateway redacts PII/secrets from
+    /// the outbound request before dispatch (a SAFETY transform, not a saving);
+    /// off by default (no redaction runs otherwise).
+    pub(crate) redact: bool,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -3068,6 +3108,7 @@ pub(crate) async fn apply_routing(
     let max_cost_usd = m.then.max_cost_usd;
     let flex = m.then.flex;
     let compress = m.then.compress;
+    let redact = m.then.redact;
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -3109,6 +3150,7 @@ pub(crate) async fn apply_routing(
         input_tokens_estimate: input_tokens,
         flex,
         compress,
+        redact,
     }))
 }
 

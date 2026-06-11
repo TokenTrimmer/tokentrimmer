@@ -169,6 +169,7 @@ async fn setup(disable_cache: bool) -> (axum::Router, String, Arc<AtomicUsize>) 
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );

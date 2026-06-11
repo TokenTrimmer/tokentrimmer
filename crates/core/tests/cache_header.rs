@@ -365,6 +365,7 @@ async fn privacy_route_disable_cache_beats_force_write() {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );

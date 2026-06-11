@@ -276,6 +276,7 @@ async fn fallback_header_overrides_route_chain() {
                 max_cost_usd: None,
                 flex: false,
                 compress: false,
+                redact: false,
             },
         }],
     );

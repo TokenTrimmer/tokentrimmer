@@ -53,6 +53,7 @@ mod tests {
             max_cost_usd: None,
             flex: false,
             compress: false,
+            redact: false,
         }
     }
     fn vision_model(id: &str) -> ModelInfo {

@@ -174,6 +174,15 @@ pub struct RouteAction {
     /// it unchanged (no savings) and surfaces a caveat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+    /// Mirror of `tt_routing::RouteAction::redact`. The request-redaction
+    /// guardrail is a runtime-only SAFETY transform (it strips PII/secrets from
+    /// the outbound prompt); the replay engine does not model it (no cost/savings
+    /// effect to project). Present so a `tt_routing::RouteAction` carrying
+    /// `redact` round-trips losslessly to a `tt_plan_core::RouteAction` without
+    /// dropping the flag on read. Same serde gating as the gateway side: omitted
+    /// from JSON when false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redact: bool,
 }
 
 /// Per-model pricing keyed by `"provider:model"`.
@@ -456,6 +465,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -483,6 +493,7 @@ mod tests {
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
             max_cost_usd: None,
+            redact: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -503,6 +514,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: true,
             max_cost_usd: None,
+            redact: false,
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(j.contains("\"disable_cache\":true"));
@@ -521,6 +533,45 @@ mod tests {
         assert_eq!(plan_action.target_model, "gpt-4o-mini");
         assert_eq!(plan_action.fallbacks, vec!["claude-haiku"]);
         // Re-serialize: must re-produce the same JSON (declaration order).
+        let reemitted = serde_json::to_string(&plan_action).unwrap();
+        assert_eq!(reemitted, gateway_json);
+    }
+
+    #[test]
+    fn route_action_redact_round_trips() {
+        // Defaults false + omitted when absent.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.redact, "redact must default false");
+        let a = RouteAction {
+            target_model: "m".into(),
+            fallbacks: Vec::new(),
+            disable_cache: false,
+            max_cost_usd: None,
+            redact: true,
+        };
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(
+            j.contains("\"redact\":true"),
+            "redact=true must serialize: {j}"
+        );
+        let back: RouteAction = serde_json::from_str(&j).unwrap();
+        assert!(back.redact);
+    }
+
+    /// Cross-crate wire-compat for the `redact` guardrail flag: gateway-written
+    /// JSON carrying `"redact":true` deserializes into the plan-core type with
+    /// the flag set and re-emits the same wire form. Mirrors the gateway-side
+    /// `route_action_redact_cross_type_wire_compat` so the two `RouteAction`
+    /// shapes stay in lockstep on `redact`.
+    #[test]
+    fn route_action_redact_cross_type_wire_compat() {
+        let gateway_json = r#"{"target_model":"gpt-4o","redact":true}"#;
+        let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
+        assert_eq!(plan_action.target_model, "gpt-4o");
+        assert!(
+            plan_action.redact,
+            "redact must round-trip from gateway JSON"
+        );
         let reemitted = serde_json::to_string(&plan_action).unwrap();
         assert_eq!(reemitted, gateway_json);
     }

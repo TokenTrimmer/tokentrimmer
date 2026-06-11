@@ -187,6 +187,7 @@ async fn app_with_compress_route(
                 max_cost_usd: None,
                 flex: false,
                 compress: compress_flag,
+                redact: false,
             },
         }],
     );
