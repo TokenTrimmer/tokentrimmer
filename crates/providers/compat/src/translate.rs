@@ -148,18 +148,29 @@ pub fn translate_request(
 // Inbound response — usage extraction
 // ---------------------------------------------------------------------------
 
-/// OpenAI usage block as returned in a chat-completion response.
+/// OpenAI usage block as returned in a chat-completion response (or streamed
+/// usage chunk — the streaming path reuses this shape).
 ///
 /// We deserialize it separately from the top-level response so that we can
 /// pull out `prompt_tokens_details.cached_tokens` before constructing the
-/// canonical [`Usage`].
+/// canonical [`Usage`]. Already-canonical fields (top-level `cached_tokens` /
+/// `cache_read_input_tokens` / `cache_creation_input_tokens`, e.g. from a
+/// TokenTrimmer hop or our own fake-stream) pass through so chained
+/// deployments keep their cache telemetry and cached-rate pricing.
 #[derive(Debug, Deserialize)]
 pub struct OpenAiUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_prompt_tokens_details")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    // Passthrough for already-canonical usage shapes (TT hops, fake-streams).
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 /// OpenAI `prompt_tokens_details` sub-object.
@@ -174,12 +185,50 @@ pub struct PromptTokensDetails {
     pub cached_tokens: Option<u64>,
 }
 
+/// Deserialize `prompt_tokens_details` leniently: a malformed value (string,
+/// array, number — anything non-object) or a non-integer `cached_tokens`
+/// degrades to "unreported" (`None`) instead of failing the whole usage
+/// parse. A usage-block oddity from a nonconforming OpenAI-compat shim must
+/// never error a response — and on streams a usage parse failure would
+/// inject an error frame into an otherwise-healthy stream and lose the
+/// terminal usage. Degrading is the conservative direction for the ledger:
+/// the cached prompt is priced at the full input rate, never a fabricated
+/// saving.
+fn lenient_prompt_tokens_details<'de, D>(
+    deserializer: D,
+) -> Result<Option<PromptTokensDetails>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<Value>::deserialize(deserializer)?;
+    Ok(match v {
+        Some(Value::Object(map)) => Some(PromptTokensDetails {
+            cached_tokens: map.get("cached_tokens").and_then(lenient_token_count),
+        }),
+        _ => None,
+    })
+}
+
+/// Accept a JSON number as a token count when it is a non-negative integer —
+/// including integral floats like `80.0` from shims whose JSON encoders
+/// float-ify integers. Anything else (negative, fractional, non-number) is
+/// "unreported".
+fn lenient_token_count(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f as u64)
+    })
+}
+
 impl From<OpenAiUsage> for Usage {
     fn from(u: OpenAiUsage) -> Self {
         // Keep the raw Option-ness: `None` = OpenAI reported no
         // prompt_tokens_details at all (or no cached_tokens key inside it),
-        // distinct from a reported zero.
-        let cache_read = u
+        // distinct from a reported zero. The wire detail wins over the
+        // canonical passthrough when both are present (mirrors the streaming
+        // path; all real providers report exactly one shape).
+        let detail = u
             .prompt_tokens_details
             .as_ref()
             .and_then(|d| d.cached_tokens);
@@ -187,10 +236,12 @@ impl From<OpenAiUsage> for Usage {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
-            cached_tokens: cache_read.unwrap_or(0),
-            // OpenAI-wire providers never report cache writes.
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: cache_read,
+            cached_tokens: detail.unwrap_or(u.cached_tokens),
+            // OpenAI-wire providers never report cache writes; only an
+            // already-canonical upstream (e.g. a TokenTrimmer hop fronting
+            // Anthropic) populates this via passthrough.
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+            cache_read_input_tokens: detail.or(u.cache_read_input_tokens),
         }
     }
 }
@@ -472,5 +523,93 @@ mod tests {
         let usage = extract_usage(&raw).expect("extract ok");
         assert_eq!(usage.cached_tokens, 0);
         assert_eq!(usage.cache_read_input_tokens, Some(0));
+    }
+
+    /// An already-canonical usage block (a TokenTrimmer hop or fake-stream
+    /// upstream) passes its cache fields through on the NON-streaming path,
+    /// mirroring the streaming passthrough — chained deployments keep cache
+    /// telemetry and cached-rate pricing instead of logging NULL and billing
+    /// the cached prompt at the full input rate.
+    #[test]
+    fn usage_canonical_cache_fields_pass_through() {
+        let raw = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "cached_tokens": 40,
+                "cache_read_input_tokens": 40,
+                "cache_creation_input_tokens": 20
+            }
+        });
+        let usage = extract_usage(&raw).expect("extract ok");
+        assert_eq!(usage.cached_tokens, 40);
+        assert_eq!(usage.cache_read_input_tokens, Some(40));
+        assert_eq!(usage.cache_creation_input_tokens, Some(20));
+    }
+
+    /// When both shapes are present the OpenAI wire detail wins (mirrors the
+    /// streaming precedence; real providers emit exactly one shape).
+    #[test]
+    fn usage_wire_detail_wins_over_canonical_passthrough() {
+        let raw = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "cached_tokens": 40,
+                "cache_read_input_tokens": 40,
+                "prompt_tokens_details": { "cached_tokens": 80 }
+            }
+        });
+        let usage = extract_usage(&raw).expect("extract ok");
+        assert_eq!(usage.cached_tokens, 80);
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+    }
+
+    /// A malformed `prompt_tokens_details` (non-object) or a non-integer
+    /// `cached_tokens` must never fail the usage parse — it degrades to
+    /// "unreported" (raw None, fold 0): conservative for the ledger, and on
+    /// streams it keeps an error frame out of an otherwise-healthy stream.
+    #[test]
+    fn usage_malformed_details_is_lenient_unreported() {
+        for details in [
+            serde_json::json!("bogus"),
+            serde_json::json!(42),
+            serde_json::json!([1, 2]),
+            serde_json::json!({ "cached_tokens": "80" }),
+            serde_json::json!({ "cached_tokens": 80.5 }),
+            serde_json::json!({ "cached_tokens": -3 }),
+        ] {
+            let raw = serde_json::json!({
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "total_tokens": 150,
+                    "prompt_tokens_details": details
+                }
+            });
+            let usage = extract_usage(&raw)
+                .unwrap_or_else(|e| panic!("details {details:?} must not error: {e}"));
+            assert_eq!(usage.cached_tokens, 0, "details {details:?}");
+            assert_eq!(usage.cache_read_input_tokens, None, "details {details:?}");
+        }
+    }
+
+    /// An integral float `cached_tokens` (a shim whose JSON encoder
+    /// float-ifies integers) is accepted as the integer it denotes.
+    #[test]
+    fn usage_integral_float_cached_tokens_accepted() {
+        let raw = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "prompt_tokens_details": { "cached_tokens": 80.0 }
+            }
+        });
+        let usage = extract_usage(&raw).expect("extract ok");
+        assert_eq!(usage.cached_tokens, 80);
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
     }
 }
