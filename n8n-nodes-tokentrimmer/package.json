@@ -1,0 +1,47 @@
+{
+  "name": "n8n-nodes-tokentrimmer",
+  "version": "0.1.0",
+  "description": "n8n community node for the TokenTrimmer LLM gateway — chat completions with per-execution cost and savings (saved USD) parsed from the gateway's x-tokentrimmer-* headers.",
+  "keywords": [
+    "n8n-community-node-package",
+    "tokentrimmer",
+    "llm",
+    "openai",
+    "cost-optimization"
+  ],
+  "license": "Apache-2.0",
+  "homepage": "https://tokentrimmer.com",
+  "author": "TokenTrimmer Contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tokentrimmer/tokentrimmer.git",
+    "directory": "n8n-nodes-tokentrimmer"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node ./scripts/copy-icons.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": ["dist/credentials/TokenTrimmerApi.credentials.js"],
+    "nodes": ["dist/nodes/TokenTrimmerChat/TokenTrimmerChat.node.js"]
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "devDependencies": {
+    "n8n-workflow": "^1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8",
+    "@types/node": "^25.9.2"
+  },
+  "engines": {
+    "node": ">=20.12"
+  }
+}

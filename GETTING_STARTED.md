@@ -404,6 +404,7 @@ These are two different things, easy to confuse:
 
 - **Architecture:** `docs/tokentrimmer-architecture-spec-v1.md`
 - **Gateway API reference:** `docs/04-gateway-api-reference.md`
+- **Integrations (n8n, LangChain, LangGraph, Dify):** `docs/integrations.md`
 - **Cost Preview API:** `docs/04-cost-preview-api-reference.md`
 - **Inspect rule catalog:** `docs/01-inspect-rule-catalog.md`
 - **Provider adapter guide:** `docs/02-provider-adapter-guide.md`
