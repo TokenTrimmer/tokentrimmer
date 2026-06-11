@@ -323,6 +323,9 @@ pub struct StreamSpanContext {
     pub cache_outcome: String,
     /// Matched route name → `tokentrimmer.route` (when routing applied).
     pub route: Option<String>,
+    /// Canary `traffic_pct` (0-100) → `tokentrimmer.traffic_split_pct` (when the
+    /// matched route declared a split). `None` for non-canary traffic. ADDITIVE.
+    pub traffic_split_pct: Option<u32>,
 }
 
 // ─── LogContext ───────────────────────────────────────────────────────────────
@@ -387,6 +390,12 @@ pub struct StreamLogContext {
     /// the spend/savings/tokens/cache dashboards. `None` skips recording (e.g.
     /// the fake-stream cache-hit path, which logs its own row separately).
     pub span_ctx: Option<StreamSpanContext>,
+    /// Canary traffic-split arm (`"canary"` / `"control"`) the sticky split
+    /// assigned this streaming request to, recorded on the `request_logs` row.
+    /// `None` when the matched route declared no `traffic_pct` (or no route
+    /// matched). Shadow mode is non-streaming, so the streaming row never carries
+    /// a `shadow_model` / `shadow_cost_usd`.
+    pub traffic_split_arm: Option<String>,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -642,6 +651,7 @@ pub fn stream_response(
             let spend_sink = ctx.spend_sink.clone();
             let cache_insert = ctx.cache_insert;
             let span_ctx = ctx.span_ctx;
+            let traffic_split_arm = ctx.traffic_split_arm.clone();
 
             let guard = DropGuard::new(move || {
                 let inner = shared_for_guard
@@ -700,6 +710,15 @@ pub fn stream_response(
                             },
                             cache_outcome: Some(&sc.cache_outcome),
                             route: sc.route.as_deref(),
+                            // Shadow mode is non-streaming by design, so the
+                            // streaming span never carries a shadow cost. The
+                            // canary traffic-split pct/arm is recorded on the
+                            // request_logs row below (the rewrite already
+                            // happened before dispatch); we keep the streaming
+                            // span attrs additive + minimal here.
+                            traffic_split_pct: sc.traffic_split_pct,
+                            shadow_model: None,
+                            shadow_cost_usd: None,
                         },
                     );
                 }
@@ -727,6 +746,12 @@ pub fn stream_response(
                     error_class: None,
                     trace_id: Some(log_trace_id.to_string()),
                     truncated,
+                    // Shadow mode is non-streaming; the streaming row only ever
+                    // carries the canary arm (the rewrite already happened
+                    // pre-dispatch). Shadow columns stay NULL here.
+                    shadow_model: None,
+                    shadow_cost_usd: None,
+                    traffic_split_arm: traffic_split_arm.clone(),
                 };
 
                 if let Some(w) = writer {

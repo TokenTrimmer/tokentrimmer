@@ -70,6 +70,19 @@ pub const TT_PROVIDER_CACHE_SAVED_USD: &str = "tokentrimmer.provider_cache_saved
 pub const TT_CACHE: &str = "tokentrimmer.cache";
 /// `tokentrimmer.route` — the matched route name (when routing applied).
 pub const TT_ROUTE: &str = "tokentrimmer.route";
+/// `tokentrimmer.traffic_split_pct` — the matched route's canary `traffic_pct`
+/// (0-100) when a traffic split was configured. ADDITIVE: omitted entirely when
+/// the route declared no split, so dashboards unaware of it are unaffected.
+pub const TT_TRAFFIC_SPLIT_PCT: &str = "tokentrimmer.traffic_split_pct";
+/// `tokentrimmer.shadow_model` — the shadow-mode candidate model that was ALSO
+/// dispatched (and discarded) for this request. ADDITIVE: omitted when no shadow
+/// fired.
+pub const TT_SHADOW_MODEL: &str = "tokentrimmer.shadow_model";
+/// `tokentrimmer.shadow_cost_usd` — the cost (USD) the discarded shadow dispatch
+/// incurred, recorded SEPARATELY from `tokentrimmer.cost_usd` so the doubled
+/// spend never folds into the served-traffic cost. ADDITIVE: omitted when no
+/// shadow fired.
+pub const TT_SHADOW_COST_USD: &str = "tokentrimmer.shadow_cost_usd";
 
 /// `tokentrimmer.quality.request_id` — trace/request id of the judged request.
 pub const TT_QUALITY_REQUEST_ID: &str = "tokentrimmer.quality.request_id";
@@ -181,6 +194,15 @@ pub struct RequestSpanAttributes<'a> {
     pub cache_outcome: Option<&'a str>,
     /// Matched route name → `tokentrimmer.route` (omitted when `None`).
     pub route: Option<&'a str>,
+    /// Canary traffic-split percentage → `tokentrimmer.traffic_split_pct`
+    /// (omitted when `None` — i.e. the route declared no split). ADDITIVE.
+    pub traffic_split_pct: Option<u32>,
+    /// Shadow-mode candidate model → `tokentrimmer.shadow_model` (omitted when
+    /// `None`). ADDITIVE.
+    pub shadow_model: Option<&'a str>,
+    /// Cost (USD) of the discarded shadow dispatch → `tokentrimmer.shadow_cost_usd`
+    /// (omitted when `None` — kept SEPARATE from the primary cost). ADDITIVE.
+    pub shadow_cost_usd: Option<f64>,
 }
 
 /// Record the GenAI semantic-convention attributes plus TokenTrimmer cost
@@ -224,6 +246,18 @@ pub fn record_request_attributes(span: &Span, attrs: &RequestSpanAttributes<'_>)
     }
     if let Some(route) = attrs.route {
         span.set_attribute(TT_ROUTE, route.to_string());
+    }
+    // Canary attributes are ADDITIVE: each is set only when present, so a span
+    // for non-canary traffic carries none of them and existing dashboards keyed
+    // on the original attribute set are unaffected.
+    if let Some(pct) = attrs.traffic_split_pct {
+        span.set_attribute(TT_TRAFFIC_SPLIT_PCT, i64::from(pct));
+    }
+    if let Some(shadow) = attrs.shadow_model {
+        span.set_attribute(TT_SHADOW_MODEL, shadow.to_string());
+    }
+    if let Some(shadow_cost) = attrs.shadow_cost_usd {
+        span.set_attribute(TT_SHADOW_COST_USD, shadow_cost);
     }
 }
 
@@ -359,6 +393,9 @@ mod tests {
                     },
                     cache_outcome: Some("miss"),
                     route: Some("cheap-route"),
+                    traffic_split_pct: Some(30),
+                    shadow_model: Some("claude-haiku-4-5"),
+                    shadow_cost_usd: Some(0.000_9),
                 },
             );
         });
@@ -397,6 +434,47 @@ mod tests {
             attrs.get(TT_ROUTE),
             Some(&Value::String("cheap-route".into()))
         );
+        // Canary attributes are recorded when present.
+        assert_eq!(attrs.get(TT_TRAFFIC_SPLIT_PCT), Some(&Value::I64(30)));
+        assert_eq!(
+            attrs.get(TT_SHADOW_MODEL),
+            Some(&Value::String("claude-haiku-4-5".into()))
+        );
+        assert_eq!(attrs.get(TT_SHADOW_COST_USD), Some(&Value::F64(0.000_9)));
+    }
+
+    /// Canary attributes are ADDITIVE: when the request had no traffic split and
+    /// no shadow, none of the three keys appear on the span — existing dashboards
+    /// keyed on the original attribute set are unaffected.
+    #[test]
+    fn canary_attributes_omitted_when_absent() {
+        let attrs = capture_attributes(|span| {
+            record_request_attributes(
+                span,
+                &RequestSpanAttributes {
+                    provider_id: "openai",
+                    request_model: "gpt-4o",
+                    response_model: "gpt-4o",
+                    operation: "chat",
+                    cost: RequestSpanCost {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cost_usd: 0.0,
+                        baseline_cost_usd: 0.0,
+                        saved_usd: 0.0,
+                        provider_cache_saved_usd: 0.0,
+                    },
+                    cache_outcome: Some("miss"),
+                    route: None,
+                    traffic_split_pct: None,
+                    shadow_model: None,
+                    shadow_cost_usd: None,
+                },
+            );
+        });
+        assert!(!attrs.contains_key(TT_TRAFFIC_SPLIT_PCT));
+        assert!(!attrs.contains_key(TT_SHADOW_MODEL));
+        assert!(!attrs.contains_key(TT_SHADOW_COST_USD));
     }
 
     #[test]
@@ -502,6 +580,9 @@ mod tests {
                     },
                     cache_outcome: None,
                     route: None,
+                    traffic_split_pct: None,
+                    shadow_model: None,
+                    shadow_cost_usd: None,
                 },
             );
         });

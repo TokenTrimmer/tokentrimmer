@@ -277,6 +277,8 @@ async fn fallback_header_overrides_route_chain() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

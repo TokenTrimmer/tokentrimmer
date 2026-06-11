@@ -187,6 +187,8 @@ async fn app_with_redact_route(
                 flex: false,
                 compress: false,
                 redact: redact_flag,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

@@ -198,6 +198,8 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );
@@ -276,6 +278,8 @@ async fn routed_request_reports_savings_against_original_model() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );
@@ -386,6 +390,8 @@ async fn route_for_other_org_does_not_match() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );
@@ -441,6 +447,8 @@ async fn route_skipped_when_no_resolvable_org() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );
@@ -526,6 +534,8 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

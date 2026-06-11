@@ -58,6 +58,28 @@ pub struct RequestLogRow {
     /// responses and for streams that completed cleanly.
     #[serde(default)]
     pub truncated: bool,
+    /// Canary shadow-mode candidate model (`RouteAction::shadow_model`) that the
+    /// gateway ALSO dispatched for this request, discarding its response. `None`
+    /// for the overwhelming majority of rows (shadow is opt-in per route) and for
+    /// rows written before migration 0012. Kept SEPARATE from `model` (the served
+    /// model) so the shadow arm is auditable without inflating served-traffic
+    /// stats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_model: Option<String>,
+    /// Cost (USD) the discarded shadow dispatch incurred. Recorded in its OWN
+    /// column — never folded into `cost_usd` — so reconciliation can attribute
+    /// the extra (doubled) spend to the canary experiment rather than to served
+    /// traffic. `None` when no shadow fired (and for rows before migration 0012).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_cost_usd: Option<f64>,
+    /// Which arm the `RouteAction::traffic_pct` canary split assigned this
+    /// request to: `Some("canary")` (routed to the new `target_model`),
+    /// `Some("control")` (passed through on the original model), or `None` when
+    /// the route declared no `traffic_pct` (unconditional rewrite) / no route
+    /// matched (and for rows before migration 0012). Lets dashboards compare the
+    /// two arms' cost/quality without re-deriving the sticky hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_split_arm: Option<String>,
 }
 
 /// Errors returned by [`RequestLogWriter`].
@@ -145,7 +167,8 @@ pub mod postgres {
                       cached, cache_layer,
                       route_id, latency_ms, upstream_latency_ms, status,
                       tag, error_class, trace_id,
-                      truncated)
+                      truncated,
+                      shadow_model, shadow_cost_usd, traffic_split_arm)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -153,11 +176,12 @@ pub mod postgres {
                       $13, $14,
                       $15, $16, $17, $18,
                       $19, $20, $21,
-                      $22)"#;
+                      $22,
+                      $23, $24, $25)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 22;
+    pub const INSERT_BIND_COUNT: usize = 25;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -185,6 +209,9 @@ pub mod postgres {
                 .bind(row.error_class.as_deref()) // $20
                 .bind(row.trace_id.as_deref()) // $21
                 .bind(row.truncated) // $22
+                .bind(row.shadow_model.as_deref()) // $23
+                .bind(row.shadow_cost_usd) // $24
+                .bind(row.traffic_split_arm.as_deref()) // $25
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -221,6 +248,9 @@ mod tests {
             error_class: None,
             trace_id: Some("trace-abc".into()),
             truncated: false,
+            shadow_model: None,
+            shadow_cost_usd: None,
+            traffic_split_arm: None,
         }
     }
 
@@ -258,6 +288,54 @@ mod tests {
             w.rows()[0].truncated,
             "truncated=true must survive write→read"
         );
+    }
+
+    /// A row carrying the canary columns (shadow_model / shadow_cost_usd /
+    /// traffic_split_arm) round-trips through the writer with the shadow cost in
+    /// its OWN field — never folded into `cost_usd`.
+    #[tokio::test]
+    async fn in_memory_round_trips_canary_columns() {
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.01;
+        row.shadow_model = Some("claude-haiku-4-5".into());
+        row.shadow_cost_usd = Some(0.004);
+        row.traffic_split_arm = Some("canary".into());
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert_eq!(got.shadow_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(got.shadow_cost_usd, Some(0.004));
+        assert_eq!(got.traffic_split_arm.as_deref(), Some("canary"));
+        // The shadow cost is SEPARATE — the primary cost is untouched.
+        assert!((got.cost_usd - 0.01).abs() < 1e-9);
+    }
+
+    /// Legacy JSON (rows serialized before the canary columns existed)
+    /// deserializes with all three new fields defaulting to `None`, and a
+    /// `None`-valued row omits them on re-serialize (back-compat with old
+    /// deploys / persisted rows).
+    #[test]
+    fn canary_columns_serde_backward_compat() {
+        let legacy = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "org_id":"00000000-0000-0000-0000-000000000000",
+            "api_key_id":"00000000-0000-0000-0000-000000000000",
+            "ts":"2026-06-09T00:00:00Z",
+            "provider":"openai","model":"gpt-4o",
+            "input_tokens":1,"output_tokens":1,"cached_tokens":0,
+            "cost_usd":0.0,"baseline_cost_usd":0.0,
+            "cached":false,"cache_layer":null,"route_id":null,
+            "latency_ms":1,"upstream_latency_ms":null,"status":200,
+            "tag":null,"error_class":null,"trace_id":null
+        }"#;
+        let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
+        assert_eq!(row.shadow_model, None);
+        assert_eq!(row.shadow_cost_usd, None);
+        assert_eq!(row.traffic_split_arm, None);
+        let j = serde_json::to_string(&row).unwrap();
+        assert!(!j.contains("shadow_model"), "{j}");
+        assert!(!j.contains("shadow_cost_usd"), "{j}");
+        assert!(!j.contains("traffic_split_arm"), "{j}");
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the

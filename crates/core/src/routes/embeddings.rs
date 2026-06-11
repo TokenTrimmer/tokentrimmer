@@ -309,6 +309,11 @@ pub async fn handler(
             // so the cache-hit-rate denominator can include them consistently.
             cache_outcome: Some("none"),
             route: route_matched_name.as_deref(),
+            // Canary traffic-split + shadow mode are chat-completions-only; the
+            // embeddings path never sets them.
+            traffic_split_pct: None,
+            shadow_model: None,
+            shadow_cost_usd: None,
         },
     );
 

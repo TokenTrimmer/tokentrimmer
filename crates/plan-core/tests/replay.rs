@@ -209,6 +209,8 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -240,6 +242,8 @@ fn conservative_when_pricing_missing() {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
     let input = input_with_routes(vec![req], vec![route], HashMap::new(), 100);
@@ -275,6 +279,8 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -307,6 +313,8 @@ fn cross_provider_target_absent_is_conservative() {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
     let result = replay(input_with_routes(
@@ -338,6 +346,8 @@ fn route_over_ceiling_is_blocked_not_saved() {
             disable_cache: false,
             max_cost_usd: Some(0.01), // haiku on 1M/1M tokens still far exceeds $0.01
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -391,6 +401,8 @@ fn rerouted_latency_projected_from_target_model_history() {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -467,6 +479,8 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
 
@@ -585,6 +599,8 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
     let route_b = ProposedRoute {
@@ -602,6 +618,8 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             disable_cache: false,
             max_cost_usd: None,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         },
     };
 

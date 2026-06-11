@@ -145,6 +145,8 @@ mod tests {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }
     }
@@ -246,6 +248,8 @@ mod tests {
                         flex: false,
                         compress: false,
                         redact: false,
+                        traffic_pct: None,
+                        shadow_model: None,
                     },
                 },
             )

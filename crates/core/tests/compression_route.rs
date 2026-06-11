@@ -188,6 +188,8 @@ async fn app_with_compress_route(
                 flex: false,
                 compress: compress_flag,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }],
     );

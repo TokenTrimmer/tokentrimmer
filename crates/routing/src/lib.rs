@@ -23,7 +23,7 @@ pub use latency::{LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
 #[cfg(feature = "postgres")]
 pub use store::PostgresRoutingStore;
 pub use store::{InMemoryRoutingStore, NewRoute, RoutingStore, RoutingStoreError};
-pub use validate::{validate_capability, ValidationError};
+pub use validate::{validate_capability, validate_shadow_model, ValidationError};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -167,6 +167,98 @@ pub struct RouteAction {
     /// omitted from JSON when false (back-compat).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub redact: bool,
+    /// Canary traffic split (0-100). When `Some(pct)`, only a deterministic
+    /// `pct`% of the matched requests are routed to `target_model` (the canary
+    /// arm); the remaining `(100 - pct)%` pass through on their
+    /// originally-requested model (the control arm). The arm is chosen by the
+    /// replica-independent [`sticky_traffic_split`] hash so the same logical
+    /// request always lands in the same arm across replicas and retries.
+    ///
+    /// `None` (the default) = 100% of matched requests take the route
+    /// (unconditional rewrite, today's behavior). `Some(0)` = 0% canary (the
+    /// route never rewrites, only its `shadow_model`/side-effects could fire).
+    /// Values above 100 are clamped to 100 by the split function. Omitted from
+    /// JSON when `None` (back-compat with existing rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_pct: Option<u32>,
+    /// Shadow-mode candidate model. When `Some(model)`, the gateway ALSO
+    /// dispatches the matched request to `model` as a **shadow** (non-streaming,
+    /// single candidate, NO failover), DISCARDS the shadow response, and records
+    /// the shadow's cost/usage SEPARATELY (never folded into the primary cost).
+    /// Only the primary (control/canary) response is ever returned to the client.
+    ///
+    /// Shadow mode DOUBLES upstream spend for matched requests, so it is opt-in
+    /// (default `None`) and the shadow cost is logged in its own column /
+    /// span attribute for reconciliation. A `shadow_model` with no `traffic_pct`
+    /// means 100% of matched requests are shadowed (the primary still serves
+    /// normally). The configured `shadow_model` MUST resolve to a registered
+    /// provider — config validation rejects an unresolvable shadow at route
+    /// creation time (fail at config time, not silently at dispatch). Omitted
+    /// from JSON when `None` (back-compat with existing rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_model: Option<String>,
+}
+
+/// Deterministic, replica-independent canary arm selection.
+///
+/// Returns `true` when this request falls in the **canary** arm (route to the
+/// new `target_model`) and `false` when it falls in the **control** arm (pass
+/// through unchanged), such that — over many distinct idempotency keys — about
+/// `traffic_pct`% land in the canary arm.
+///
+/// # Determinism + replica independence (READ THIS)
+///
+/// This is a PURE function of its three arguments. It uses the std-library
+/// [`DefaultHasher`](std::collections::hash_map::DefaultHasher) — exactly the
+/// deterministic pattern in `quality_sample::should_sample` — and contains NO
+/// RNG, NO clock, NO per-instance/process state. Therefore every gateway
+/// replica computes the SAME arm for the SAME `(org_id, idempotency_key,
+/// traffic_pct)`, and a client retry with the same idempotency key is sticky to
+/// the same arm. This is required so a canary split is consistent fleet-wide
+/// rather than re-rolling the dice per replica or per retry.
+///
+/// # Hash input
+///
+/// The hash absorbs, in order: the 16 raw bytes of `org_id`, a `0xff` domain
+/// separator byte (so an org id and an idempotency key that happen to share a
+/// byte boundary cannot collide), and the UTF-8 bytes of `idempotency_key`. The
+/// 64-bit hash is mapped to a bucket in `[0, 100)` via the top-of-range modulo;
+/// the request is in the canary arm iff `bucket < traffic_pct`. Keying on
+/// `org_id` as well as the idempotency key means two different orgs that reuse
+/// the same idempotency-key string get independent (uncorrelated) splits.
+///
+/// # Edge cases
+///
+/// - `traffic_pct == 0` → always `false` (no request is canaried).
+/// - `traffic_pct >= 100` → always `true` (every request is canaried); values
+///   above 100 are clamped to 100.
+/// - An EMPTY `idempotency_key` still hashes deterministically (it just means
+///   every request with an empty key for a given org lands in the same arm) —
+///   callers that cannot supply a stable key should pass a fresh uuid string so
+///   the request is treated as a one-off (its arm is then effectively random
+///   but still self-consistent for that single request).
+#[must_use]
+pub fn sticky_traffic_split(org_id: Uuid, idempotency_key: &str, traffic_pct: u32) -> bool {
+    if traffic_pct == 0 {
+        return false;
+    }
+    if traffic_pct >= 100 {
+        return true;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Absorb the org id's raw bytes, a domain separator, then the key bytes.
+    // Hashing the bytes directly (rather than `Uuid::hash`) keeps the input
+    // wire-stable regardless of any future change to `Uuid`'s `Hash` impl.
+    org_id.as_bytes().hash(&mut hasher);
+    0xffu8.hash(&mut hasher);
+    idempotency_key.as_bytes().hash(&mut hasher);
+    let h = hasher.finish();
+    // Map uniformly into [0, 100). `% 100` is uniform enough for a canary split
+    // given a well-mixed 64-bit hash (the modulo bias against 100 across 2^64 is
+    // ~6e-18, far below any traffic-shaping precision we need).
+    let bucket = (h % 100) as u32;
+    bucket < traffic_pct
 }
 
 /// Rule engine. Hold routes sorted by descending priority; iterate to find
@@ -372,6 +464,8 @@ mod tests {
                 flex: false,
                 compress: false,
                 redact: false,
+                traffic_pct: None,
+                shadow_model: None,
             },
         }
     }
@@ -677,6 +771,8 @@ mod tests {
             flex: false,
             compress: false,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -707,6 +803,8 @@ mod tests {
             flex: false,
             compress: false,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -729,6 +827,8 @@ mod tests {
             flex: false,
             compress: false,
             redact: false,
+            traffic_pct: None,
+            shadow_model: None,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -1095,5 +1195,143 @@ mod tests {
         assert!(eng
             .evaluate_with_cost(&make_req("claude-x"), &make_ctx(None), 100, Some(0.01))
             .is_none());
+    }
+
+    // --- canary: traffic_pct + shadow_model serde + sticky split tests ---
+
+    /// `traffic_pct` / `shadow_model` default to `None` from legacy JSON and are
+    /// omitted from the wire form when `None` (back-compat with existing rows).
+    #[test]
+    fn canary_fields_default_none_and_omit() {
+        let a = make_route("x", 10, vec![], "gpt-4o-mini").then;
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(
+            !j.contains("traffic_pct"),
+            "traffic_pct must be omitted when None: {j}"
+        );
+        assert!(
+            !j.contains("shadow_model"),
+            "shadow_model must be omitted when None: {j}"
+        );
+        // Legacy JSON without the fields still deserializes with None defaults.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert_eq!(parsed.traffic_pct, None);
+        assert_eq!(parsed.shadow_model, None);
+    }
+
+    /// `traffic_pct` + `shadow_model` round-trip and serialize when set.
+    #[test]
+    fn canary_fields_round_trip_when_set() {
+        let mut a = make_route("x", 10, vec![], "gpt-4o-mini").then;
+        a.traffic_pct = Some(25);
+        a.shadow_model = Some("claude-haiku-4-5".into());
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(j.contains("\"traffic_pct\":25"), "{j}");
+        assert!(j.contains("\"shadow_model\":\"claude-haiku-4-5\""), "{j}");
+        let back: RouteAction = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.traffic_pct, Some(25));
+        assert_eq!(back.shadow_model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    /// Cross-type wire-compat: JSON written by the plan side carrying the canary
+    /// fields deserializes into a `tt_routing::RouteAction` with both set and
+    /// re-emits the same wire form (same field order + skip_serializing_if
+    /// gating). Locks `traffic_pct`/`shadow_model` into the shared wire format
+    /// alongside `flex`/`compress`/`redact`. Mirrored by
+    /// `tt_plan_core::types::tests::route_action_canary_cross_type_wire_compat`.
+    #[test]
+    fn route_action_canary_cross_type_wire_compat() {
+        let plan_side_json =
+            r#"{"target_model":"gpt-4o","traffic_pct":30,"shadow_model":"claude-haiku-4-5"}"#;
+        let gateway_action: RouteAction = serde_json::from_str(plan_side_json).unwrap();
+        assert_eq!(gateway_action.target_model, "gpt-4o");
+        assert_eq!(gateway_action.traffic_pct, Some(30));
+        assert_eq!(
+            gateway_action.shadow_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        let reemitted = serde_json::to_string(&gateway_action).unwrap();
+        assert_eq!(reemitted, plan_side_json);
+    }
+
+    /// `sticky_traffic_split` is deterministic: the SAME `(org, key, pct)` always
+    /// returns the SAME arm — the property a multi-replica fleet and client
+    /// retries depend on. (Replica-independence is implied by purity: no RNG, no
+    /// clock, no captured state — the same inputs always produce the same output
+    /// in any process.)
+    #[test]
+    fn sticky_split_is_deterministic_for_same_key() {
+        let org = Uuid::now_v7();
+        for key in ["req-1", "req-2", "abc", ""] {
+            let first = sticky_traffic_split(org, key, 50);
+            for _ in 0..1000 {
+                assert_eq!(
+                    sticky_traffic_split(org, key, 50),
+                    first,
+                    "same (org,key,pct) must always pick the same arm — key={key:?}"
+                );
+            }
+        }
+    }
+
+    /// `pct == 0` never canaries; `pct >= 100` always canaries (and values above
+    /// 100 are clamped, not arithmetic-overflowed).
+    #[test]
+    fn sticky_split_boundary_pcts() {
+        let org = Uuid::now_v7();
+        for key in ["a", "b", "c", "really-long-idempotency-key-value", ""] {
+            assert!(
+                !sticky_traffic_split(org, key, 0),
+                "pct=0 must never canary"
+            );
+            assert!(
+                sticky_traffic_split(org, key, 100),
+                "pct=100 must always canary"
+            );
+            assert!(
+                sticky_traffic_split(org, key, 250),
+                "pct>100 clamps to always-canary"
+            );
+        }
+    }
+
+    /// Over many distinct idempotency keys the canary fraction is close to
+    /// `traffic_pct`% — i.e. the split actually shapes traffic by the configured
+    /// percentage rather than being all-or-nothing.
+    #[test]
+    fn sticky_split_distribution_approximates_pct() {
+        let org = Uuid::now_v7();
+        const N: usize = 20_000;
+        for pct in [10u32, 30, 50, 70, 90] {
+            let canaried = (0..N)
+                .filter(|i| sticky_traffic_split(org, &format!("key-{i}"), pct))
+                .count();
+            let observed = canaried as f64 / N as f64 * 100.0;
+            // 20k samples → the std error on the proportion is well under 0.5pp;
+            // a 3pp tolerance is comfortably loose yet still proves shaping.
+            assert!(
+                (observed - pct as f64).abs() < 3.0,
+                "pct={pct}: observed canary share {observed:.2}% off target by >3pp"
+            );
+        }
+    }
+
+    /// Two different orgs reusing the SAME idempotency-key string get
+    /// independent (uncorrelated) splits — keying on `org_id` prevents one org's
+    /// key-space from dictating another's arms.
+    #[test]
+    fn sticky_split_is_org_scoped() {
+        // Find a key that lands in different arms for two orgs (exists with high
+        // probability since the splits are independent at pct=50).
+        let org_a = Uuid::from_u128(1);
+        let org_b = Uuid::from_u128(2);
+        let differs = (0..1000).any(|i| {
+            let k = format!("shared-{i}");
+            sticky_traffic_split(org_a, &k, 50) != sticky_traffic_split(org_b, &k, 50)
+        });
+        assert!(
+            differs,
+            "two orgs must not be forced into identical arms for every shared key"
+        );
     }
 }
