@@ -13,6 +13,7 @@ tt-auth.workspace = true
 tt-inspect-core.workspace = true
 tt-inspect-rules-tier1.workspace = true
 tt-plan-core.workspace = true
+tt-routing.workspace = true
 tt-preview = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +27,7 @@ url = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures.workspace = true
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 
 [features]
 default = ["preview"]

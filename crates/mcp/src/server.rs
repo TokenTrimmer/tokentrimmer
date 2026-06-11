@@ -1,11 +1,15 @@
 //! Server dispatcher. Owns the tool + resource registries.
 
+use uuid::Uuid;
+
 use serde_json::{json, Value};
 
 use crate::auth::Authenticator;
 use crate::error::McpError;
 use crate::protocol::{methods, JsonRpcRequest, JsonRpcResponse};
 use crate::resources::Registry as ResourceRegistry;
+use crate::tools::add_route::AddRouteTool;
+use crate::tools::apply_plan::ApplyPlanTool;
 use crate::tools::Registry as ToolRegistry;
 
 pub struct Server {
@@ -18,6 +22,14 @@ pub struct Server {
     /// transport's bearer guard is the gate and no key store exists to verify
     /// against), dispatch proceeds without store-backed verification.
     authenticator: Option<Authenticator>,
+    /// Whether mutating ("write") tools (`add_route`, `apply_plan`) may be
+    /// exposed. **Off by default** — read-only is the safe default. A write
+    /// tool is registered ONLY when this is true (see
+    /// [`Server::register_write_tools`]); when false those tools are never in
+    /// the registry, so `tools/list` omits them and `tools/call` on them
+    /// returns `MethodNotFound` (-32601) — NOT `Unauthorized`. The boot wires
+    /// this from `--allow-write` / `TT_MCP_ALLOW_WRITE`.
+    write_enabled: bool,
 }
 
 impl Server {
@@ -26,7 +38,64 @@ impl Server {
             tools: ToolRegistry::new(),
             resources: ResourceRegistry::new(),
             authenticator: None,
+            write_enabled: false,
         }
+    }
+
+    /// Enable the mutating write tools (`add_route`, `apply_plan`). Off by
+    /// default; the boot sets this from `--allow-write` / `TT_MCP_ALLOW_WRITE`.
+    /// Enabling the flag does not by itself register any tool — call
+    /// [`Server::register_write_tools`] (which is a no-op unless this is set) to
+    /// add them once the bound org + outbound HTTP client are known.
+    #[must_use]
+    pub fn with_write_enabled(mut self, write_enabled: bool) -> Self {
+        self.write_enabled = write_enabled;
+        self
+    }
+
+    /// Whether write tools are permitted on this server (the read-only safe
+    /// default is `false`). The boot consults this before registering write
+    /// tools; exposed so callers don't duplicate the gating decision.
+    #[must_use]
+    pub fn write_enabled(&self) -> bool {
+        self.write_enabled
+    }
+
+    /// Conditionally register the mutating write tools, scoped to the bound
+    /// `org_id` (the operator key's verified org). A **no-op when
+    /// [`Server::write_enabled`] is false** — this is the single gate that keeps
+    /// write tools off by default: when disabled they are never added to the
+    /// registry, so `tools/list` cannot reveal them and `tools/call` falls
+    /// through to `MethodNotFound` (-32601) rather than `Unauthorized`.
+    ///
+    /// `gateway_base` is where `add_route` POSTs `/v1/routes`; `cloud_base` is
+    /// where `apply_plan` POSTs `/v1/admin/plans/:id/apply`. Both forward
+    /// `api_key` as the operator bearer (the only org that can be written). The
+    /// `http` client is shared by both tools.
+    pub fn register_write_tools(
+        &mut self,
+        org_id: Uuid,
+        gateway_base: impl Into<String>,
+        cloud_base: impl Into<String>,
+        api_key: impl Into<String>,
+        http: reqwest::Client,
+    ) {
+        if !self.write_enabled {
+            return;
+        }
+        let api_key = api_key.into();
+        self.tools.register(Box::new(AddRouteTool {
+            gateway_base: gateway_base.into(),
+            api_key: api_key.clone(),
+            http: http.clone(),
+            org_id,
+        }));
+        self.tools.register(Box::new(ApplyPlanTool {
+            cloud_base: cloud_base.into(),
+            api_key,
+            http,
+            org_id,
+        }));
     }
 
     /// Attach a process-lifetime [`Authenticator`] so the server performs real,
@@ -209,5 +278,88 @@ mod tests {
             resp.error.is_none(),
             "no authenticator → unguarded dispatch"
         );
+    }
+
+    // ── write-tool gating (SAFETY: off by default) ───────────────────────────
+
+    fn tool_names(server: &Server) -> Vec<&'static str> {
+        server.tools.list().into_iter().map(|d| d.name).collect()
+    }
+
+    fn register_writes(server: &mut Server) {
+        server.register_write_tools(
+            Uuid::now_v7(),
+            "http://gateway.invalid",
+            "http://cloud.invalid",
+            "tt_live_op",
+            reqwest::Client::new(),
+        );
+    }
+
+    fn call_tool_req(name: &str) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            method: methods::TOOLS_CALL.into(),
+            params: json!({ "name": name, "arguments": {} }),
+            id: Some(json!(7)),
+        }
+    }
+
+    /// Default server is read-only: `write_enabled()` is false and registering
+    /// write tools is a no-op — neither write tool appears in `tools/list`.
+    #[tokio::test]
+    async fn write_disabled_by_default_hides_write_tools() {
+        let mut server = Server::new();
+        assert!(!server.write_enabled(), "read-only must be the default");
+        register_writes(&mut server); // no-op while disabled
+        let names = tool_names(&server);
+        assert!(
+            !names.contains(&"add_route"),
+            "add_route must be hidden by default"
+        );
+        assert!(
+            !names.contains(&"apply_plan"),
+            "apply_plan must be hidden by default"
+        );
+    }
+
+    /// With write disabled, `tools/call` on a write tool returns
+    /// `MethodNotFound` (-32601) — NOT `Unauthorized`. A read-only deployment
+    /// behaves as if the tool simply does not exist.
+    #[tokio::test]
+    async fn write_disabled_tools_call_returns_method_not_found() {
+        let mut server = Server::new();
+        register_writes(&mut server); // no-op while disabled
+        for name in ["add_route", "apply_plan"] {
+            let resp = server.dispatch(call_tool_req(name)).await;
+            let err = resp.error.unwrap_or_else(|| panic!("{name} must error"));
+            assert_eq!(
+                err.code, -32601,
+                "{name} must be MethodNotFound, not Unauthorized"
+            );
+            assert_ne!(err.code, -32001, "{name} must NOT be Unauthorized");
+        }
+    }
+
+    /// With write enabled, both write tools are registered and appear in
+    /// `tools/list`.
+    #[tokio::test]
+    async fn write_enabled_exposes_both_write_tools() {
+        let mut server = Server::new().with_write_enabled(true);
+        assert!(server.write_enabled());
+        register_writes(&mut server);
+        let names = tool_names(&server);
+        assert!(names.contains(&"add_route"), "add_route must be listed");
+        assert!(names.contains(&"apply_plan"), "apply_plan must be listed");
+    }
+
+    /// Enabling the flag without calling `register_write_tools` still exposes
+    /// nothing — registration is the second, explicit step.
+    #[tokio::test]
+    async fn write_enabled_without_registration_exposes_nothing() {
+        let server = Server::new().with_write_enabled(true);
+        let names = tool_names(&server);
+        assert!(!names.contains(&"add_route"));
+        assert!(!names.contains(&"apply_plan"));
     }
 }
