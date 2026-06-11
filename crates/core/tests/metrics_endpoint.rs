@@ -242,6 +242,161 @@ mod cachereporting {
     }
 }
 
+mod streamnousage {
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use futures::stream::{BoxStream, StreamExt};
+    use tt_shared::messages::{ChunkChoice, ChunkDelta};
+    use tt_shared::pricing::Capability;
+    use tt_shared::{
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
+        EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+    };
+
+    /// A streaming provider that finishes cleanly (finish_reason chunk) but
+    /// never sends a terminal usage block — like an OpenAI-compat upstream
+    /// streaming without `include_usage`.
+    pub struct StreamNoUsageEcho;
+
+    #[async_trait]
+    impl Provider for StreamNoUsageEcho {
+        fn id(&self) -> &'static str {
+            "streamnousage"
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                id: "snu-1".into(),
+                provider: "streamnousage".into(),
+                capabilities: vec![Capability::Text],
+                max_input_tokens: 4096,
+                max_output_tokens: 4096,
+            }]
+        }
+        fn pricing(&self, _: &str) -> Option<ModelPricing> {
+            Some(ModelPricing {
+                input_per_million: 3.0,
+                output_per_million: 6.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: Utc::now(),
+            })
+        }
+        async fn chat_completion(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+        async fn chat_completion_stream(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
+            let content = ChatCompletionChunk {
+                id: "id".into(),
+                object: "chat.completion.chunk".into(),
+                created: 0,
+                model: "snu-1".into(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: Some("ok".into()),
+                        tool_calls: vec![],
+                        extra: Default::default(),
+                    },
+                    finish_reason: None,
+                    extra: Default::default(),
+                }],
+                usage: None,
+                extra: Default::default(),
+            };
+            let finish = ChatCompletionChunk {
+                id: "id".into(),
+                object: "chat.completion.chunk".into(),
+                created: 0,
+                model: "snu-1".into(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta::default(),
+                    finish_reason: Some("stop".into()),
+                    extra: Default::default(),
+                }],
+                usage: None, // clean finish, but NO terminal usage block
+                extra: Default::default(),
+            };
+            Ok(futures::stream::iter(vec![Ok(content), Ok(finish)]).boxed())
+        }
+        async fn embeddings(
+            &self,
+            _req: EmbeddingsRequest,
+            _ctx: &RequestContext,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+    }
+}
+
+/// A cleanly-finished stream whose provider never sent a terminal usage block
+/// must still count toward the per-route denominator as result="unreported"
+/// ("unreported" is a fact, not an estimate), matching the non-streaming
+/// path. Token counters must NOT appear for this provider — no estimates.
+#[tokio::test]
+async fn streaming_clean_finish_without_usage_counts_unreported() {
+    use std::sync::Arc;
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(streamnousage::StreamNoUsageEcho));
+    let app = build_router(AppState::new(registry));
+
+    let body = serde_json::json!({
+        "model": "snu-1",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": true
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Drain the SSE body so the DropGuard fires (counters increment there).
+    let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+    let (_s, _h, metrics_body) = get(app, "/metrics").await;
+    let line = metrics_body
+        .lines()
+        .find(|l| {
+            l.starts_with("provider_cache_requests_total")
+                && l.contains("provider=\"streamnousage\"")
+        })
+        .unwrap_or_else(|| {
+            panic!("no provider_cache_requests_total line for streamnousage:\n{metrics_body}")
+        });
+    assert!(
+        line.contains("result=\"unreported\""),
+        "expected result=\"unreported\", got: {line}"
+    );
+    // No token counters from an unreported stream (estimates never counted).
+    assert!(
+        !metrics_body.lines().any(|l| {
+            (l.starts_with("provider_cache_read_tokens_total")
+                || l.starts_with("provider_cache_write_tokens_total"))
+                && l.contains("provider=\"streamnousage\"")
+        }),
+        "token counters must not exist for an unreported stream:\n{metrics_body}"
+    );
+}
+
 /// A dispatch whose provider reports prompt-cache reads/writes surfaces the
 /// per-route provider-cache counters on /metrics (presence-only — the
 /// recorder is shared across this test binary).

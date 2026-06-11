@@ -800,15 +800,27 @@ pub fn stream_response(
                     cache_creation_input_tokens: usage.cache_creation_tokens,
                 };
 
-                // Per-route provider-cache counters — only from authoritative
-                // provider usage on cleanly completed streams (no counters
-                // from tokenizer estimates).
-                if !truncated && authoritative {
+                // Per-route provider-cache counters on cleanly completed
+                // streams. Token counters only from authoritative provider
+                // usage (never tokenizer estimates); a clean stream whose
+                // provider sent no terminal usage block still counts as
+                // result="unreported" — that's a fact, not an estimate — so
+                // the hit/(hit+miss+unreported) denominator matches the
+                // non-streaming path. Truncated streams count nothing.
+                if !truncated {
+                    let (cache_read, cache_creation) = if authoritative {
+                        (
+                            usage.cache_read_tokens.map(|v| v.max(0) as u64),
+                            usage.cache_creation_tokens.map(|v| v.max(0) as u64),
+                        )
+                    } else {
+                        (None, None)
+                    };
                     crate::metrics::record_provider_cache_usage(
                         &row.provider,
                         span_ctx.as_ref().and_then(|s| s.route.as_deref()),
-                        usage.cache_read_tokens.map(|v| v.max(0) as u64),
-                        usage.cache_creation_tokens.map(|v| v.max(0) as u64),
+                        cache_read,
+                        cache_creation,
                     );
                 }
 
