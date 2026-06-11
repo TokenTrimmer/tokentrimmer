@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["credentials", "nodes", "test"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1169,3 +1169,4 @@ Companion docs:
 - Provider adapter guide (adding new providers)
 - Plan replay design (how Plan simulations work)
 - Inspect rule catalog (full rule list with detection logic)
+- Integration guides (n8n, LangChain, LangGraph, Dify)
