@@ -8,6 +8,7 @@ import type {
 } from 'n8n-workflow';
 import { NodeApiError, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 
+import type { CostInfo } from './GenericFunctions';
 import {
 	buildMessages,
 	buildRequestBody,
@@ -15,6 +16,16 @@ import {
 	chatCompletionsUrl,
 	parseCostInfo,
 } from './GenericFunctions';
+
+/**
+ * NodeApiError enriched with cost/trace info parsed from the FAILED
+ * response's headers — `x-tokentrimmer-trace-id` is present on every gateway
+ * response including errors (API ref §6.2), and cost headers exist on
+ * post-dispatch failures, so continueOnFail items stay correlatable.
+ */
+interface TtNodeApiError extends NodeApiError {
+	ttCostInfo?: CostInfo;
+}
 
 interface ChatOptions {
 	tag?: string;
@@ -194,9 +205,12 @@ export class TokenTrimmerChat implements INodeType {
 							inputMode === 'prompt'
 								? (this.getNodeParameter('systemPrompt', i, '') as string)
 								: undefined,
+						// No string cast: a json-type parameter comes back as a real
+						// array/object when a pure expression resolves to one —
+						// buildMessages accepts both shapes.
 						messagesJson:
 							inputMode === 'messagesJson'
-								? (this.getNodeParameter('messagesJson', i) as string)
+								? (this.getNodeParameter('messagesJson', i) as unknown)
 								: undefined,
 					});
 					url = chatCompletionsUrl(credentials.baseUrl as string);
@@ -230,7 +244,18 @@ export class TokenTrimmerChat implements INodeType {
 						},
 					);
 				} catch (error) {
-					throw new NodeApiError(this.getNode(), error as JsonObject, { itemIndex: i });
+					const apiError = new NodeApiError(this.getNode(), error as JsonObject, {
+						itemIndex: i,
+					}) as TtNodeApiError;
+					// Preserve the failed response's x-tokentrimmer-* headers (trace
+					// id always; cost headers on post-dispatch failures) so the
+					// continueOnFail path can surface them.
+					const failedHeaders = (error as { response?: { headers?: unknown } } | null)
+						?.response?.headers;
+					if (failedHeaders !== null && typeof failedHeaders === 'object') {
+						apiError.ttCostInfo = parseCostInfo(failedHeaders as Record<string, unknown>);
+					}
+					throw apiError;
 				}
 
 				// costInfo is a top-level sibling of the completion fields on every
@@ -246,10 +271,17 @@ export class TokenTrimmerChat implements INodeType {
 				});
 			} catch (error) {
 				if (this.continueOnFail()) {
-					returnData.push({
-						json: { error: error instanceof Error ? error.message : String(error) },
-						pairedItem: { item: i },
-					});
+					const json: IDataObject = {
+						error: error instanceof Error ? error.message : String(error),
+					};
+					// HTTP failures carry the error response's parsed headers —
+					// costInfo.traceId correlates the failed item against gateway
+					// logs (and cost fields are set on post-dispatch failures).
+					const failedCostInfo = (error as TtNodeApiError).ttCostInfo;
+					if (failedCostInfo !== undefined) {
+						json.costInfo = failedCostInfo as unknown as IDataObject;
+					}
+					returnData.push({ json, pairedItem: { item: i } });
 					continue;
 				}
 				throw error;

@@ -22,6 +22,8 @@ Example `costInfo` (values from the [Gateway API reference](https://github.com/t
 
 > **Not yet on npm** — the package publishes at launch. Until then, install from source.
 
+**Requirements:** an n8n release that bundles `n8n-workflow` >= 1.83 (n8n releases from late March 2025 — the node uses its `NodeConnectionTypes` API; on older instances the node fails to load). Building from source needs Node >= 20.12.
+
 **Once published** (n8n self-hosted): Settings → Community Nodes → Install → enter `n8n-nodes-tokentrimmer` → Install. See the [n8n community nodes docs](https://docs.n8n.io/integrations/community-nodes/installation/) for details.
 
 **From source** (works today):
@@ -47,7 +49,7 @@ Create a **TokenTrimmer API** credential:
 | API Key | Hosted: a TokenTrimmer key (`tt_live_*` / `tt_test_*`). Self-hosted pass-through: your provider API key, forwarded upstream. |
 | Base URL | Gateway origin **without** `/v1` — the node appends it. Default `https://api.tokentrimmer.com`; self-host: `http://localhost:8080`. If your n8n runs in Docker and the gateway on the host, use `http://host.docker.internal:8080`. |
 
-The credential test probes `GET /v1/models`. Tip: `tt_test_*` sandbox keys return synthetic responses with all cost headers populated as if real ([API reference](https://github.com/tokentrimmer/tokentrimmer/blob/main/docs/04-gateway-api-reference.md) §8) — handy for trying the node without spend.
+The credential test probes `GET /v1/models` (both the test and the node forgive a pasted SDK-style base URL ending in `/v1`). Tip: `tt_test_*` sandbox keys return synthetic responses with all cost headers populated as if real ([API reference](https://github.com/tokentrimmer/tokentrimmer/blob/main/docs/04-gateway-api-reference.md) §8) — handy for trying the node without spend.
 
 ## Node usage
 
@@ -58,7 +60,7 @@ The credential test probes `GET /v1/models`. Tip: `tt_test_*` sandbox keys retur
 | Model | Model ID, e.g. `claude-haiku-4-5`; use `<provider>/<model>` to disambiguate. A routing rule may rewrite it. |
 | Input Mode | `Prompt` (single user prompt + optional system prompt) or `Messages (JSON)` (raw OpenAI messages array). |
 | Prompt / System Prompt | Expression-friendly, e.g. `{{ $json.chatInput }}`. |
-| Messages (JSON) | Passed through untouched — string or array-of-parts content both work. |
+| Messages (JSON) | Passed through untouched — string or array-of-parts content both work. Accepts a JSON string or an expression resolving to a real array (e.g. `={{ $json.messages }}`). |
 
 Options (request headers use these exact names):
 
@@ -87,6 +89,8 @@ Each output item is the OpenAI-shaped completion (`id`, `choices`, `usage` incl.
 | `traceId` | `x-tokentrimmer-trace-id` |
 
 All fields are nullable — cost headers are absent on early-rejected (4xx) responses.
+
+With **Continue On Fail** enabled, failed items carry `{ error, costInfo }` where `costInfo` is parsed from the error response's headers — `traceId` is present on every gateway response including errors, so failed executions stay correlatable against gateway logs. Cost fields are `null` on pre-dispatch rejections (e.g. a 402 cost-limit trip) and populated on post-dispatch failures.
 
 ## Development
 

@@ -249,6 +249,26 @@ describe('buildMessages (messagesJson mode)', () => {
 		).toThrow();
 	});
 
+	it('accepts an already-parsed array (expression resolved to a real value)', () => {
+		const messages = [
+			{ role: 'system', content: 'Be terse.' },
+			{ role: 'user', content: 'Hello' },
+		];
+		expect(buildMessages({ mode: 'messagesJson', messagesJson: messages })).toEqual(messages);
+	});
+
+	it('validates an already-parsed value the same as parsed JSON', () => {
+		expect(() =>
+			buildMessages({ mode: 'messagesJson', messagesJson: { role: 'user' } }),
+		).toThrow(/array/);
+		expect(() =>
+			buildMessages({ mode: 'messagesJson', messagesJson: [{ content: 'hi' }] }),
+		).toThrow(/string "role"/);
+		expect(() => buildMessages({ mode: 'messagesJson', messagesJson: undefined })).toThrow(
+			/array/,
+		);
+	});
+
 	it('throws when an element is missing a string role', () => {
 		expect(() =>
 			buildMessages({ mode: 'messagesJson', messagesJson: '[{"content":"hi"}]' }),

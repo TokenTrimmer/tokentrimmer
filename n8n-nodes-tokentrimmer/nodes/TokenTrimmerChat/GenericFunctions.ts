@@ -69,13 +69,18 @@ export function chatCompletionsUrl(baseUrl: string): string {
 
 /**
  * Build the OpenAI `messages` array from either a plain prompt
- * (+ optional system prompt) or a raw messages JSON string.
+ * (+ optional system prompt) or raw messages JSON.
+ *
+ * `messagesJson` is usually a JSON string, but n8n hands json-type
+ * parameters back as real values when a pure expression (e.g.
+ * `={{ $json.messages }}`) resolves to an actual array — both shapes are
+ * accepted and validated identically.
  */
 export function buildMessages(input: {
 	mode: 'prompt' | 'messagesJson';
 	prompt?: string;
 	systemPrompt?: string;
-	messagesJson?: string;
+	messagesJson?: unknown;
 }): ChatMessage[] {
 	if (input.mode === 'prompt') {
 		const prompt = input.prompt ?? '';
@@ -91,12 +96,17 @@ export function buildMessages(input: {
 	}
 
 	let parsed: unknown;
-	try {
-		parsed = JSON.parse(input.messagesJson ?? '');
-	} catch (error) {
-		throw new Error(
-			`Messages must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
-		);
+	if (typeof input.messagesJson === 'string') {
+		try {
+			parsed = JSON.parse(input.messagesJson);
+		} catch (error) {
+			throw new Error(
+				`Messages must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	} else {
+		// An expression already resolved to a real value — validate as-is.
+		parsed = input.messagesJson;
 	}
 	if (!Array.isArray(parsed)) {
 		throw new Error('Messages must be a JSON array of {role, content} objects');

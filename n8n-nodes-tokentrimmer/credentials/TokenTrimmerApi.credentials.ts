@@ -43,9 +43,14 @@ export class TokenTrimmerApi implements ICredentialType {
 	};
 
 	// GET /v1/models is a cheap authenticated probe (API ref §5.1).
+	// The baseURL expression mirrors the node's normalizeBaseUrl forgiveness
+	// (trim, strip trailing slashes, strip ONE trailing /v1) so a pasted
+	// SDK-style base URL passes the credential test exactly when the node
+	// itself would work. Kept in lockstep by test/credential.test.ts.
 	test: ICredentialTestRequest = {
 		request: {
-			baseURL: '={{$credentials.baseUrl}}',
+			baseURL:
+				'={{ $credentials.baseUrl.trim().replace(/\\/+$/, "").replace(/\\/v1$/i, "").replace(/\\/+$/, "") }}',
 			url: '/v1/models',
 		},
 	};
