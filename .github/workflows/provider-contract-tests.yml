@@ -28,6 +28,22 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Require provider secret
+        env:
+          PROVIDER: ${{ matrix.provider }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          key_var="$(echo "${PROVIDER}" | tr '[:lower:]' '[:upper:]')_API_KEY"
+          if [ -z "${!key_var}" ]; then
+            echo "::error::${key_var} repo secret is not configured — contract tests cannot run (operator step, see .claude/ops runbook §3)"
+            exit 1
+          fi
       - name: Run contract tests
         env:
           PROVIDER: ${{ matrix.provider }}
@@ -54,10 +70,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          TODAY: ${{ github.run_number }}
         run: |
           today_date=$(date -u +%Y-%m-%d)
-          gh issue create \
-            --title "provider contract tests failing (${today_date})" \
-            --label "provider-broken" \
-            --body "Weekly provider contract test run failed. See: ${RUN_URL}"
+          # The label must exist or `gh issue create --label` fails (the reason
+          # every prior failure notification itself failed). --force = idempotent.
+          gh label create provider-broken \
+            --description "Weekly provider contract tests failing" \
+            --color D93F0B --force
+          # Dedup: one open tracking issue, comment on repeats instead of spamming.
+          existing=$(gh issue list --state open --label provider-broken \
+            --json number --jq '.[0].number // empty')
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" \
+              --body "Weekly provider contract test run failed again (${today_date}). See: ${RUN_URL}"
+          else
+            gh issue create \
+              --title "provider contract tests failing (${today_date})" \
+              --label "provider-broken" \
+              --body "Weekly provider contract test run failed. See: ${RUN_URL}"
+          fi
