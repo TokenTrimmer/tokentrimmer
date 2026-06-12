@@ -295,7 +295,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::query::handle::{FileFormat, HandleAlias};
+    use crate::query::handle::HandleAlias;
     use crate::query::QueryConfig;
 
     /// Scripted executor: counts invocations; returns queued outcomes (or a
