@@ -11,6 +11,7 @@ use crate::ui;
 
 pub mod budget;
 pub mod command;
+pub mod compact;
 pub mod session;
 pub mod shape;
 pub mod tools;
@@ -75,6 +76,13 @@ pub struct Conversation {
     pub model: String,
     pub system: Option<String>,
     pub messages: Vec<Message>,
+    /// Frozen summary of turns folded away by `chat::compact`, carried on the
+    /// wire as a second `System` message right after the system prompt (the
+    /// STABLE-PREFIX position — see the invariants in `chat::budget`).
+    /// Optional + serde-default: old session files load as `None`, and old
+    /// CLI binaries reading new files ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<compact::FrozenSummary>,
 }
 
 impl Conversation {
@@ -84,6 +92,7 @@ impl Conversation {
             model,
             system,
             messages: Vec::new(),
+            summary: None,
         }
     }
     pub fn push_user(&mut self, text: String) {
@@ -101,14 +110,23 @@ impl Conversation {
     }
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.summary = None;
     }
-    /// The full message list to send: system message (if any) prepended.
+    /// The full message list to send, ordered STABLE → VOLATILE:
+    /// `[system?, frozen summary?, …messages]`. On Anthropic both `System`
+    /// messages land in the cached `system_blocks` prefix; on OpenAI they
+    /// extend the auto-cached stable prefix (see `chat::budget` docs).
     #[must_use]
     pub fn wire_messages(&self) -> Vec<Message> {
         let mut v = Vec::new();
         if let Some(s) = &self.system {
             v.push(Message::System {
                 content: MessageContent::Text(s.clone()),
+            });
+        }
+        if let Some(sum) = &self.summary {
+            v.push(Message::System {
+                content: MessageContent::Text(sum.wire_block().to_string()),
             });
         }
         v.extend(self.messages.iter().cloned());
@@ -127,6 +145,14 @@ pub struct Ledger {
     /// trimming. Token counts only — never converted into a USD savings claim
     /// (the gateway attributes no spend to these bytes).
     pub tool_trim_tokens: u64,
+    /// REAL SPEND on compaction summary calls (also included in `cost_usd`).
+    pub compaction_spend_usd: f64,
+    /// Number of metered compaction summary calls.
+    pub compaction_calls: u32,
+    /// Estimated tokens no longer re-sent per future turn thanks to
+    /// compaction (Σ dropped − summary). An ESTIMATE — always labeled
+    /// `est./unbooked` and never merged into `saved_usd`.
+    pub compaction_est_tok_per_turn: u64,
 }
 
 impl Ledger {
@@ -135,6 +161,16 @@ impl Ledger {
         self.cost_usd += u.cost_usd;
         self.saved_usd += u.saved_usd;
         self.baseline_usd += u.baseline_cost_usd;
+    }
+    /// Meter one compaction summary call. HONESTY GUARD: this is real money,
+    /// so it raises the headline `cost_usd` (plus the dedicated compaction
+    /// line) — and it NEVER touches `turns`, `saved_usd` or `baseline_usd`:
+    /// summarization "saves" only estimated future re-sends, which are not
+    /// gateway-attributed savings and must never inflate the saved figures.
+    pub fn add_compaction(&mut self, cost_usd: f64) {
+        self.cost_usd += cost_usd;
+        self.compaction_spend_usd += cost_usd;
+        self.compaction_calls += 1;
     }
     #[must_use]
     pub fn summary(&self) -> String {
@@ -147,6 +183,12 @@ impl Ledger {
             "session: {} turn(s) · ${:.4} spent · saved ${:.4} ({pct:.0}%)",
             self.turns, self.cost_usd, self.saved_usd
         );
+        if self.compaction_calls > 0 {
+            s.push_str(&format!(
+                " · compaction ${:.4} ({} call(s), est. −{} tok/turn, unbooked)",
+                self.compaction_spend_usd, self.compaction_calls, self.compaction_est_tok_per_turn
+            ));
+        }
         if self.tool_trim_tokens > 0 {
             s.push_str(&format!(
                 " · tool-trim −{} tok (est.)",
@@ -345,6 +387,13 @@ pub struct RunOpts {
     /// Disable lossless tool-result/arg trimming in the `/tools` loop
     /// (`chat::shape`; ON by default — lossless minify + class-safe drops).
     pub no_tool_trim: bool,
+    /// Enable cache-aware compaction (`chat::compact`). OFF by default — the
+    /// summary is a paid model call.
+    pub compact: bool,
+    /// Compact every K successful turns (0 → the default cadence).
+    pub compact_every: u32,
+    /// Model for the compaction summary call.
+    pub compact_model: Option<String>,
     /// `--tt-api-key` flag.
     pub flag_key: Option<String>,
     /// `--tt-api-base` flag.
@@ -360,6 +409,9 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
         tools,
         max_context,
         no_tool_trim,
+        compact,
+        compact_every,
+        compact_model,
         flag_key,
         flag_base,
     } = opts;
@@ -391,6 +443,14 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
         Err(_) => std::collections::HashMap::new(),
     };
     let mut ctx = budget::ContextState::new(max_context, catalog_windows);
+    // Cache-aware compaction (OFF by default — the summary is a paid call).
+    // K < 2 is rejected with the caching-tension rationale; 0 = default.
+    let mut cstate = compact::CompactionState::new(compact, compact_model);
+    if compact_every != 0 {
+        if let Err(msg) = cstate.set_every(compact_every) {
+            ui::warn(&msg);
+        }
+    }
     ui::heading(&format!(
         "tt chat · {} via TokenTrimmer{}   (/help)",
         conv.model,
@@ -422,11 +482,25 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                             // failed turn → no-op on history: drop the user turn
                             // AND undo any trim manage() did before sending.
                             conv.messages = snapshot;
+                        } else {
+                            // Compaction runs only AFTER a successful turn —
+                            // never between snapshot and dispatch, so the
+                            // restore contract above stays byte-for-byte.
+                            cstate.note_turn();
+                            compact::maybe_compact(
+                                &client,
+                                &mut conv,
+                                &mut cstate,
+                                &mut ctx,
+                                &mut ledger,
+                            )
+                            .await;
                         }
                     }
                     Command::Help => print_help(),
                     Command::Clear => {
                         conv.clear();
+                        cstate.reset_cadence(); // counter is runtime-only
                         ui::info("(conversation cleared)");
                     }
                     Command::Model(Some(m)) => {
@@ -452,6 +526,8 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                     Command::Resume(name) => match session::load(&session::sessions_dir(), &name) {
                         Ok(c) => {
                             conv = c;
+                            // first compaction fires K turns after a resume
+                            cstate.reset_cadence();
                             ui::info(&format!("(resumed · {} messages)", conv.messages.len()));
                         }
                         Err(e) => ui::error(&format!("{e:#}")),
@@ -505,6 +581,17 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                         }
                         ToolsArg::Bad(usage) => ui::warn(&usage),
                     },
+                    Command::Compact(arg) => {
+                        compact::handle(
+                            arg,
+                            &client,
+                            &mut conv,
+                            &mut cstate,
+                            &mut ctx,
+                            &mut ledger,
+                        )
+                        .await;
+                    }
                     Command::Editor => match compose_in_editor() {
                         Ok(Some(t)) => {
                             let snapshot = conv.messages.clone();
@@ -521,6 +608,16 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                             .await
                             {
                                 conv.messages = snapshot; // no-op on history
+                            } else {
+                                cstate.note_turn();
+                                compact::maybe_compact(
+                                    &client,
+                                    &mut conv,
+                                    &mut cstate,
+                                    &mut ctx,
+                                    &mut ledger,
+                                )
+                                .await;
                             }
                         }
                         Ok(None) => ui::info("(editor: nothing sent)"),

@@ -16,6 +16,26 @@ pub enum ToolsArg {
     Bad(String),
 }
 
+/// `/compact` argument: status, on/off, cadence, model, or manual trigger.
+/// Cadence VALIDATION (K ≥ 2, the caching-tension rule) lives in
+/// `compact::CompactionState::set_every` — the single gate for both this and
+/// the `--compact-every` flag.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompactArg {
+    /// Bare `/compact` — print status.
+    Status,
+    /// `/compact on|off`.
+    Set(bool),
+    /// `/compact every <K>`.
+    Every(u32),
+    /// `/compact model <m>`.
+    Model(String),
+    /// `/compact now` — manual trigger (same net-positive guard).
+    Now,
+    /// Unrecognized argument (carries the usage line).
+    Bad(String),
+}
+
 /// A REPL line, parsed.
 #[derive(Debug)]
 pub enum Command {
@@ -32,6 +52,7 @@ pub enum Command {
     Retry,
     Copy,
     Tools(ToolsArg),
+    Compact(CompactArg),
     Context(Option<u32>),
     Trim,
     Unknown(String),
@@ -80,6 +101,26 @@ impl Command {
                     }
                 }
             }),
+            "compact" => {
+                const USAGE: &str = "usage: /compact [on|off|now|every <K>|model <m>]";
+                Command::Compact(match arg.as_deref() {
+                    None => CompactArg::Status,
+                    Some("on" | "true" | "enable") => CompactArg::Set(true),
+                    Some("off" | "false" | "disable") => CompactArg::Set(false),
+                    Some("now") => CompactArg::Now,
+                    Some(rest) => {
+                        let mut words = rest.split_whitespace();
+                        match (words.next(), words.next(), words.next()) {
+                            (Some("every"), Some(k), None) => k.parse::<u32>().map_or_else(
+                                |_| CompactArg::Bad(USAGE.to_string()),
+                                CompactArg::Every,
+                            ),
+                            (Some("model"), Some(m), None) => CompactArg::Model(m.to_string()),
+                            _ => CompactArg::Bad(USAGE.to_string()),
+                        }
+                    }
+                })
+            }
             "context" => Command::Context(arg.as_deref().and_then(|a| a.parse().ok())),
             "trim" => Command::Trim,
             other => Command::Unknown(other.to_string()),
@@ -103,6 +144,10 @@ pub(super) fn print_help() {
         ),
         ("/context [n]", "show or set the token budget"),
         ("/trim", "drop oldest turns to fit the budget"),
+        (
+            "/compact [on|off|now|every K|model m]",
+            "cache-aware compaction of old turns (paid summary call; off by default)",
+        ),
         ("/save [name]", "save this conversation"),
         ("/resume <name>", "load a saved conversation"),
         ("/sessions", "list saved conversations"),
@@ -188,6 +233,48 @@ mod tests {
         assert!(matches!(
             Command::parse("/tools whatever"),
             Command::Tools(ToolsArg::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn compact_arg_parses_all_forms() {
+        assert!(matches!(
+            Command::parse("/compact"),
+            Command::Compact(CompactArg::Status)
+        ));
+        assert!(matches!(
+            Command::parse("/compact on"),
+            Command::Compact(CompactArg::Set(true))
+        ));
+        assert!(matches!(
+            Command::parse("/compact off"),
+            Command::Compact(CompactArg::Set(false))
+        ));
+        assert!(matches!(
+            Command::parse("/compact now"),
+            Command::Compact(CompactArg::Now)
+        ));
+        assert!(matches!(
+            Command::parse("/compact every 12"),
+            Command::Compact(CompactArg::Every(12))
+        ));
+        // K=1 parses; REJECTION (with the caching-tension rationale) happens
+        // in CompactionState::set_every — see compact::tests::k_below_two_is_rejected.
+        assert!(matches!(
+            Command::parse("/compact every 1"),
+            Command::Compact(CompactArg::Every(1))
+        ));
+        assert!(matches!(
+            Command::parse("/compact model gpt-4o-mini"),
+            Command::Compact(CompactArg::Model(m)) if m == "gpt-4o-mini"
+        ));
+        assert!(matches!(
+            Command::parse("/compact every nope"),
+            Command::Compact(CompactArg::Bad(_))
+        ));
+        assert!(matches!(
+            Command::parse("/compact whatever"),
+            Command::Compact(CompactArg::Bad(_))
         ));
     }
 

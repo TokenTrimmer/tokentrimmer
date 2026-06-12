@@ -1,6 +1,50 @@
 //! Context-window management for `tt chat`: estimate token usage, warn as the
 //! conversation fills a per-model budget, and trim the oldest turns before the
 //! limit. The gateway remains the authoritative gate; this is advisory.
+//!
+//! This module is also the home of the chat-side caching/honesty INVARIANTS
+//! (research Phase 4) that the trimmer and the compactor ([`super::compact`])
+//! jointly enforce. Each maps to a test:
+//!
+//! 1. **STABLE → VOLATILE order.** The wire order is `[system, frozen summary,
+//!    older-kept verbatim turns, recent turns]`
+//!    ([`Conversation::wire_messages`]). Emitting `cache_control` is the
+//!    GATEWAY adapter's job (#150: the Anthropic adapter lifts every `System`
+//!    message into the cached `system_blocks` prefix and injects the
+//!    breakpoints; OpenAI auto-caches ≥1024-token stable prefixes) — the CLI's
+//!    `tt_shared::Message` has no `cache_control` slot and must not try. The
+//!    CLI's enforceable half of "emit cache_control on the frozen prefix" is
+//!    PREFIX BYTE-STABILITY, which invariant 2 provides. Test:
+//!    `compact::tests::summary_block_is_byte_identical_across_non_compaction_turns`.
+//!
+//! 2. **Caching-tension rule.** Never re-select or rewrite inside the stable
+//!    prefix: naive per-turn re-selection measured −145% at 40 turns. The
+//!    summary block is BYTE-FROZEN between compactions —
+//!    [`super::compact::FrozenSummary`] has no mutator and a single
+//!    constructor called from one site — and a compaction busts the prefix at
+//!    most once per K turns by design, booking the bust as the negative term
+//!    `B` in the net-positive predicate `(D − S) × K > C_in + S + B`. K < 2
+//!    is rejected. Tests: `compact::tests::compaction_fires_only_every_k_turns`,
+//!    `compact::tests::k_below_two_is_rejected`,
+//!    `compact::tests::net_negative_compaction_is_skipped_with_warning_and_no_history_change`.
+//!
+//! 3. **Honesty guard.** The compaction summary call is REAL SPEND
+//!    (`Ledger::add_compaction` raises the headline `cost_usd` plus a
+//!    dedicated compaction line); the future re-send reduction is an ESTIMATE
+//!    — token-denominated, always labeled `est.`/`unbooked`, and never folded
+//!    into the gateway-attributed `saved_usd`. Holding the session saves
+//!    nothing by itself. Test:
+//!    `compact::tests::compaction_spend_metered_never_booked_as_savings`.
+//!
+//! 4. **Fallback trimmer.** [`trim_to_budget`] keeps all its V5b-3 invariants
+//!    — fires at 95% down to ~70%, drops oldest WHOLE turns, keeps the system
+//!    prompt, never orphans an `Assistant{tool_calls}` + `Tool` pair,
+//!    preserves the last turn — and remains the only mechanism when
+//!    compaction is off, skipped, or insufficient. It drains `conv.messages`
+//!    only, so it structurally cannot touch the frozen summary. Tests:
+//!    `trim_reduces_and_preserves_system_and_last`,
+//!    `trim_does_not_orphan_a_tool_exchange`,
+//!    `trim_fallback_never_touches_summary`.
 
 use std::collections::HashMap;
 
@@ -43,11 +87,17 @@ pub fn model_window(model: &str) -> u32 {
     }
 }
 
-/// All message text (system prompt + each `Text` content), for estimation.
+/// All message text (system prompt + frozen summary + each `Text` content),
+/// for estimation. The summary block is real wire bytes — `manage()` and the
+/// 95% valve must count it.
 fn conversation_text(conv: &Conversation) -> String {
     let mut out = String::new();
     if let Some(sys) = &conv.system {
         out.push_str(sys);
+        out.push('\n');
+    }
+    if let Some(sum) = &conv.summary {
+        out.push_str(sum.wire_block());
         out.push('\n');
     }
     for m in &conv.messages {
@@ -115,7 +165,6 @@ pub(crate) fn next_turn_start(messages: &[Message]) -> Option<usize> {
 /// start). Built on [`next_turn_start`] so the boundary definition cannot
 /// drift between the trimmer and the compactor.
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))] // consumed by chat::compact (next commit)
 pub(crate) fn turn_starts(messages: &[Message]) -> Vec<usize> {
     let mut starts = Vec::new();
     if messages.is_empty() {
@@ -188,6 +237,12 @@ impl ContextState {
     #[must_use]
     pub fn estimate(&self, conv: &Conversation) -> u32 {
         estimate_conversation_tokens(conv, ESTIMATE_PROVIDER)
+    }
+
+    /// Clear the one-shot 75% warning (a compaction just shrank the history,
+    /// so the next approach to the band should warn again).
+    pub(crate) fn reset_warned(&mut self) {
+        self.warned = false;
     }
 
     /// Warn at 75%, auto-trim at 95% (down to ~70%). Call after the user turn is
@@ -387,6 +442,48 @@ mod tests {
         assert_eq!(turn_starts(&c.messages), vec![0, 4, 6]);
         // and next_turn_start matches the second entry (shared boundary logic)
         assert_eq!(next_turn_start(&c.messages), Some(4));
+    }
+
+    /// The frozen summary is real wire bytes — the estimator (and therefore
+    /// `manage()` / the 95% valve) must count it.
+    #[test]
+    fn estimate_includes_frozen_summary() {
+        let mut c = Conversation::new("gpt-4o-mini".into(), None);
+        c.push_user("hello".into());
+        let without = estimate_conversation_tokens(&c, ESTIMATE_PROVIDER);
+        c.summary = Some(crate::chat::compact::FrozenSummary::replace_at_compaction(
+            "[Conversation summary — earlier turns were compacted by tt chat]\n\
+             the user asked many long questions about routing and caching"
+                .into(),
+            5,
+            "gpt-4o-mini".into(),
+        ));
+        let with = estimate_conversation_tokens(&c, ESTIMATE_PROVIDER);
+        assert!(with > without, "{with} > {without}");
+    }
+
+    /// Part D invariant 4: the fallback trimmer drains `conv.messages` only —
+    /// it can never touch the frozen summary block.
+    #[test]
+    fn trim_fallback_never_touches_summary() {
+        let mut c = Conversation::new("gpt-4o-mini".into(), Some("be terse".into()));
+        let block = "[Conversation summary — earlier turns were compacted by tt chat]\n\
+                     earlier turns folded";
+        c.summary = Some(crate::chat::compact::FrozenSummary::replace_at_compaction(
+            block.into(),
+            2,
+            "gpt-4o-mini".into(),
+        ));
+        for i in 0..8 {
+            c.push_user(format!("user message number {i} with some words"));
+            c.push_assistant(format!("assistant reply number {i} with some words"));
+        }
+        let dropped = trim_to_budget(&mut c, 60, ESTIMATE_PROVIDER); // force a trim
+        assert!(dropped > 0, "trim must have fired");
+        // summary block byte-identical; system kept; clean User boundary
+        assert_eq!(c.summary.as_ref().unwrap().wire_block(), block);
+        assert_eq!(c.system.as_deref(), Some("be terse"));
+        assert!(matches!(c.messages.first(), Some(Message::User { .. })));
     }
 
     #[test]
