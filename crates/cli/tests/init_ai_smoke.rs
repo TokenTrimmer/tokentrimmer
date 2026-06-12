@@ -32,7 +32,11 @@ fn base_opts(root: std::path::PathBuf) -> RunOptions {
 
 fn mock_chat(server: &MockServer, content: &str) {
     server.mock(|when, then| {
-        when.method(POST).path("/v1/chat/completions");
+        // The header pin proves the AI-init call declares interactive — the
+        // CLI's own human-waiting traffic is never batch-eligible.
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .header("x-tokentrimmer-interactive", "1");
         then.status(200)
             .header("content-type", "application/json")
             .json_body(json!({

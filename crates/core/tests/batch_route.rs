@@ -232,6 +232,24 @@ fn chat_request_with(model: &str, bearer: &str, stream: bool, interactive: bool)
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
+/// Like [`chat_request_with`], but with an arbitrary raw value on the
+/// `X-TokenTrimmer-Interactive` header — for the fail-safe parsing tests.
+fn chat_request_with_interactive_value(model: &str, bearer: &str, value: &str) -> Request<Body> {
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "hello world" }],
+        "stream": false,
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("x-tokentrimmer-interactive", value)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 async fn issue_key_for(store: &InMemoryKeyStore, org_id: Uuid) -> String {
     let audit = InMemoryAuditWriter::new();
     issue(
@@ -512,6 +530,74 @@ async fn interactive_header_clears_marker() {
     let row = wait_for_row(&h.log_writer).await;
     assert!(!row.batch_eligible);
     assert_eq!(row.batch_forgone_usd, 0.0);
+}
+
+/// (d2) Fail-SAFE parsing: an unrecognized truthy spelling of the interactive
+/// header (`X-TokenTrimmer-Interactive: yes`) still clears the marker — any
+/// non-empty value other than an explicit `0`/`false` opt-out errs toward
+/// "a human is waiting", never toward batch-markable.
+#[tokio::test]
+async fn unrecognized_interactive_value_clears_marker_fail_safe() {
+    let h = app_with_batch_route("batch-eligible", true).await;
+
+    let resp = h
+        .app
+        .oneshot(chat_request_with_interactive_value(
+            "batch-eligible",
+            &h.key,
+            "yes",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let warnings = warnings_of(&resp);
+    assert!(
+        warnings.iter().any(|w| w == "batch_ineligible:interactive"),
+        "unrecognized truthy value must fail interactive-safe, got: {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w == "batch_deferred_unavailable"),
+        "a cleared marker must not also claim deferral: {warnings:?}"
+    );
+    assert_eq!(
+        header_str(&resp, "x-tokentrimmer-batch-forgone-usd"),
+        "0.000000"
+    );
+
+    let row = wait_for_row(&h.log_writer).await;
+    assert!(!row.batch_eligible);
+    assert_eq!(row.batch_forgone_usd, 0.0);
+}
+
+/// (d3) Explicit opt-out: `X-TokenTrimmer-Interactive: 0` (and only the
+/// documented falsy spellings) declares "no human waiting" — the marker
+/// applies exactly as with no header at all.
+#[tokio::test]
+async fn explicit_interactive_opt_out_allows_marker() {
+    let h = app_with_batch_route("batch-eligible", true).await;
+
+    let resp = h
+        .app
+        .oneshot(chat_request_with_interactive_value(
+            "batch-eligible",
+            &h.key,
+            "0",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let warnings = warnings_of(&resp);
+    assert!(
+        warnings.iter().any(|w| w == "batch_deferred_unavailable"),
+        "an explicit `0` opt-out must mark exactly like no header, got: {warnings:?}"
+    );
+    assert!(header_f64(&resp, "x-tokentrimmer-batch-forgone-usd") > 0.0);
+
+    let row = wait_for_row(&h.log_writer).await;
+    assert!(row.batch_eligible);
+    assert!(row.batch_forgone_usd > 0.0);
 }
 
 /// (e) A served model with no catalog batch tier is not marked — no real rate,

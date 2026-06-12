@@ -423,7 +423,9 @@ fn batch_route_projects_discount_and_caveats() {
     );
     let expected_caveat = "1 request(s) projected at the target's Batch API rate via a \
                            batch-eligibility route — advisory today: the synchronous gateway \
-                           defers this discount until the async Batch Lane ships.";
+                           defers this discount until the async Batch Lane ships, and logs \
+                           carry no streamed/interactive marker, so this count can include \
+                           traffic the runtime gate would clear as batch-ineligible.";
     assert!(
         result.caveats.iter().any(|c| c == expected_caveat),
         "expected the advisory batch caveat, got: {:?}",
@@ -454,6 +456,43 @@ fn batch_route_without_rate_projects_standard_with_unpriced_caveat() {
             == "1 request(s) matched a batch-eligibility route whose target has no catalog \
                 batch rate — no batch discount projected."),
         "expected the unpriced batch caveat, got: {:?}",
+        result.caveats
+    );
+}
+
+/// When the cache-discounted STANDARD projection is already cheaper than the
+/// full-prompt batch-rate cost (heavy provider-cache traffic: cached input is
+/// priced ~0.1×, while the batch rate prices the FULL prompt), the standard
+/// figure stands AND the batch-deferred counter does not increment — the
+/// caveat must never claim a request was projected at the batch rate when it
+/// was not.
+#[test]
+fn batch_route_with_cheaper_standard_projection_skips_counter() {
+    // 1M input fully provider-cached, 0 output. Target haiku:
+    //   standard = 1M × $0.025/M (cached rate)  = $0.025
+    //   batch    = 1M × $0.125/M (full prompt)  = $0.125  → no discount
+    let req = RequestLog {
+        cached_tokens: 1_000_000,
+        ..make_req(1, 0, "claude-3-5-sonnet", 1_000_000, 0, 3.0, false)
+    };
+    let route = batch_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    let mut pricing = HashMap::new();
+    let (k, mut v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    v.batch_input_per_million = Some(0.125);
+    v.batch_output_per_million = Some(0.625);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    assert_eq!(result.aggregates.requests_rerouted, 1);
+    let standard_cached_cost = 1_000_000.0 * 0.025 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - standard_cached_cost).abs() < 1e-12,
+        "projected ({}) must keep the cheaper cache-discounted standard cost ({standard_cached_cost})",
+        result.aggregates.total_projected_cost_usd
+    );
+    assert!(
+        !result.caveats.iter().any(|c| c.contains("Batch API rate")),
+        "a request the batch rate did not discount must not be counted in the batch caveat: {:?}",
         result.caveats
     );
 }

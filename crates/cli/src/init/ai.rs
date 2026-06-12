@@ -186,11 +186,15 @@ pub async fn ai_tailor(
         detected.len()
     ));
 
+    // `.interactive()`: a human is sitting at the terminal waiting for this
+    // one-shot call — like `tt chat` and the /tools loop, the CLI's own
+    // interactive traffic is never batch-eligible.
     let out = client
         .chat()
         .model(model.unwrap_or_else(|| DEFAULT_MODEL.to_string()))
         .message(tt_client::system(INIT_AI_SYSTEM))
         .message(tt_client::user(build_init_context(&detected)))
+        .interactive()
         .send()
         .await?;
 

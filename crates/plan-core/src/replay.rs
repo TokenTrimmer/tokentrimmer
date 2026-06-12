@@ -206,9 +206,15 @@ struct Projection {
     would_block: u32,
     /// Requests projected at the target's Batch API rate because the matched
     /// route carries the `batch` action AND the target has a catalog batch
-    /// rate. Surfaced ONLY as a caveat string (#21 over-ceiling precedent — no
-    /// new serialized field): the discount is ADVISORY today, the synchronous
-    /// gateway defers it until the async Batch Lane ships.
+    /// rate AND that rate actually lowers the projection (heavy provider-cache
+    /// traffic can be cheaper at the cache-discounted standard rate — those
+    /// requests keep the standard figure and are not counted). Surfaced ONLY
+    /// as a caveat string (#21 over-ceiling precedent — no new serialized
+    /// field): the discount is ADVISORY today, the synchronous gateway defers
+    /// it until the async Batch Lane ships. Known over-projection: `RequestLog`
+    /// carries no streamed/interactive marker, so this projection cannot
+    /// exclude traffic the runtime gate would hard-clear as batch-ineligible —
+    /// the caveat wording discloses that.
     batch_deferred: u32,
     /// Requests matched by a `batch` route whose target has NO catalog batch
     /// rate — projected at the standard target cost (no fabricated 0.5×) and
@@ -310,15 +316,21 @@ fn project_requests(
                     // target's REAL catalog batch rate, never a fabricated 0.5×
                     // — and count it for the advisory caveat (#21 over-ceiling
                     // precedent: caveat string only, no new serialized field).
-                    // A blocked or cache-hit request gets no batch discount; the
-                    // `.min` guarantees the action never projects a cost above
-                    // the standard projection (no negative "savings").
+                    // A blocked or cache-hit request gets no batch discount, and
+                    // the counter only increments when the batch rate actually
+                    // LOWERS the projection: heavy provider-cache traffic can
+                    // price cheaper at the cache-discounted standard rate than
+                    // at the full-prompt batch rate, in which case the standard
+                    // figure stands and the request is not claimed as
+                    // batch-discounted (no negative "savings", no inflated
+                    // caveat count).
                     if route.then.batch && !is_cache_hit && !blocked {
                         match cost::project_batch_cost(req, p) {
-                            Some(b) => {
-                                projected_cost = b.cost_usd.min(projected_cost);
+                            Some(b) if b.cost_usd < projected_cost => {
+                                projected_cost = b.cost_usd;
                                 batch_deferred += 1;
                             }
+                            Some(_) => {} // batch rate delivers no discount — standard figure stands
                             None => {
                                 batch_unpriced += 1;
                             }
@@ -566,7 +578,7 @@ fn build_caveats(
     }
     if batch_deferred > 0 {
         caveats.push(format!(
-            "{batch_deferred} request(s) projected at the target's Batch API rate via a batch-eligibility route — advisory today: the synchronous gateway defers this discount until the async Batch Lane ships."
+            "{batch_deferred} request(s) projected at the target's Batch API rate via a batch-eligibility route — advisory today: the synchronous gateway defers this discount until the async Batch Lane ships, and logs carry no streamed/interactive marker, so this count can include traffic the runtime gate would clear as batch-ineligible."
         ));
     }
     if batch_unpriced > 0 {

@@ -904,10 +904,16 @@ pub async fn handler(
     // declares "a human is waiting" via `X-TokenTrimmer-Interactive: 1` (set by
     // `tt chat` and the /tools loop) is never marked batch-eligible. Read
     // directly from the header map — deliberately NOT a RequestContext field.
+    // Fails in the interactive-SAFE direction: ANY non-empty value other than
+    // an explicit opt-out (`0` / `false`) counts as interactive, so a client
+    // sending an unrecognized truthy spelling (`yes`, `on`, …) is never
+    // silently treated as batch-markable. This gate becomes load-bearing when
+    // the async Batch Lane ships — misparsing must err toward "human waiting".
     let interactive_client = headers
         .get("x-tokentrimmer-interactive")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s == "1" || s.eq_ignore_ascii_case("true"));
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false"));
     // A matched route opting into the conservative compression pass
     // (`RouteAction::compress`). When false (the default — no route or a route
     // that did not enable it) the request-pass pipeline never runs and the
