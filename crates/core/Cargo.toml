@@ -72,7 +72,9 @@ zeroize.workspace = true
 [dev-dependencies]
 argon2.workspace = true
 criterion.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the judge
+# deadline/timeout tests (paused time — no real waiting). Dev-only.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { workspace = true }
 serde_json.workspace = true
 httpmock.workspace = true

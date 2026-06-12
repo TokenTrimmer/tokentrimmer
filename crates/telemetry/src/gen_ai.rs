@@ -103,6 +103,24 @@ pub const TT_QUALITY_BAND: &str = "tokentrimmer.quality.band";
 /// `tokentrimmer.quality.verdict` — raw judge verdict (`acceptable` / `degraded`
 /// / `unclear`).
 pub const TT_QUALITY_VERDICT: &str = "tokentrimmer.quality.verdict";
+/// `tokentrimmer.quality.judge_cost_usd` — the judge tax: cost (USD) of the
+/// judge call(s) that produced this verdict. Measurement spend, kept OUT of
+/// the request cost attributes so savings stay invoice-reconcilable; the
+/// durable `quality_verdicts` row is canonical for Phase 2 attribution
+/// netting, this attribute is the ops-visible mirror. Emitted only when the
+/// judge tax is fully METERED; omitted when any judge call had no catalog
+/// pricing (a real billed call of unknown price — emitting `0` would fabricate
+/// "free").
+pub const TT_QUALITY_JUDGE_COST_USD: &str = "tokentrimmer.quality.judge_cost_usd";
+/// `tokentrimmer.quality.unjudged` — `true` on a measurement-spend-ledger
+/// record where the judge never issued a verdict (failed reference dispatch /
+/// judge call, or an empty billed reference). Such records carry
+/// `verdict = "unclear"` purely as the no-valence placeholder; this flag lets
+/// consumers exclude them from judged-sample counts (mirroring the durable
+/// row's `unjudged:` reason prefix). **Emitted only when `true`** — a real
+/// judge-issued verdict carries no `unjudged` attribute at all, keeping the
+/// judged attribute set unchanged.
+pub const TT_QUALITY_UNJUDGED: &str = "tokentrimmer.quality.unjudged";
 
 /// **Reserved** wire name for a per-request quality score header in `[0, 1]`,
 /// following the existing `x-tokentrimmer-*` header convention.
@@ -291,6 +309,15 @@ pub struct QualityVerdictAttributes<'a> {
     pub band: &'a str,
     /// Raw judge verdict (`acceptable`/`degraded`/`unclear`) → `tokentrimmer.quality.verdict`.
     pub verdict: &'a str,
+    /// Judge tax (USD) → `tokentrimmer.quality.judge_cost_usd`. `Some` only
+    /// when the tax is fully metered; `None` (attribute omitted) when any judge
+    /// call had no catalog pricing — a real billed call of unknown price must
+    /// never surface as `0.0`/"free". See [`TT_QUALITY_JUDGE_COST_USD`].
+    pub judge_cost_usd: Option<f64>,
+    /// `true` for a measurement-spend-ledger record the judge never actually
+    /// scored → `tokentrimmer.quality.unjudged` (emitted only when `true`).
+    /// See [`TT_QUALITY_UNJUDGED`].
+    pub unjudged: bool,
 }
 
 /// Record the per-request quality verdict onto `span`.
@@ -320,6 +347,17 @@ pub fn record_quality_verdict(span: &Span, attrs: &QualityVerdictAttributes<'_>)
     }
     span.set_attribute(TT_QUALITY_BAND, attrs.band.to_string());
     span.set_attribute(TT_QUALITY_VERDICT, attrs.verdict.to_string());
+    // Omit the judge tax when it is unmetered (`None`): a real billed call of
+    // unknown price must never surface as `0.0`/"free".
+    if let Some(judge_cost_usd) = attrs.judge_cost_usd {
+        span.set_attribute(TT_QUALITY_JUDGE_COST_USD, judge_cost_usd);
+    }
+    // Mark spend-ledger records the judge never scored, so consumers counting
+    // `tokentrimmer.quality.verdict` can exclude them from judged-sample
+    // counts. Emitted only when true — judged records stay byte-identical.
+    if attrs.unjudged {
+        span.set_attribute(TT_QUALITY_UNJUDGED, true);
+    }
 }
 
 #[cfg(test)]
@@ -489,6 +527,8 @@ mod tests {
                     score: Some(1.0),
                     band: "low",
                     verdict: "acceptable",
+                    judge_cost_usd: Some(0.000_05),
+                    unjudged: false,
                 },
             );
         });
@@ -516,6 +556,11 @@ mod tests {
             attrs.get(TT_QUALITY_VERDICT),
             Some(&Value::String("acceptable".into()))
         );
+        assert_eq!(
+            attrs.get(TT_QUALITY_JUDGE_COST_USD),
+            Some(&Value::F64(0.000_05)),
+            "the judge tax must land on the span"
+        );
     }
 
     /// An `unclear` verdict carries no `score` (`None`), so the
@@ -534,6 +579,8 @@ mod tests {
                     score: None,
                     band: "low",
                     verdict: "unclear",
+                    judge_cost_usd: None,
+                    unjudged: false,
                 },
             );
         });
@@ -542,6 +589,11 @@ mod tests {
             !attrs.contains_key(TT_QUALITY_SCORE),
             "score attribute must be omitted for an unclear verdict"
         );
+        assert!(
+            !attrs.contains_key(TT_QUALITY_JUDGE_COST_USD),
+            "an UNMETERED judge tax (None) must omit the attribute — never \
+             fabricate a $0 for a billed call"
+        );
         assert_eq!(
             attrs.get(TT_QUALITY_BAND),
             Some(&Value::String("low".into()))
@@ -549,6 +601,39 @@ mod tests {
         assert_eq!(
             attrs.get(TT_QUALITY_VERDICT),
             Some(&Value::String("unclear".into()))
+        );
+        assert!(
+            !attrs.contains_key(TT_QUALITY_UNJUDGED),
+            "a judged record (unjudged=false) must not carry the unjudged flag"
+        );
+    }
+
+    /// A spend-ledger record the judge never scored carries
+    /// `tokentrimmer.quality.unjudged = true`, so consumers counting verdict
+    /// attributes can exclude it from judged-sample counts.
+    #[test]
+    fn unjudged_spend_record_marks_unjudged_attribute() {
+        let attrs = capture_attributes(|span| {
+            record_quality_verdict(
+                span,
+                &QualityVerdictAttributes {
+                    request_id: "33333333-3333-3333-3333-333333333333",
+                    requested_model: "gpt-4o",
+                    served_model: "gpt-4o-mini",
+                    score: None,
+                    band: "low",
+                    verdict: "unclear",
+                    judge_cost_usd: None,
+                    unjudged: true,
+                },
+            );
+        });
+
+        assert_eq!(
+            attrs.get(TT_QUALITY_UNJUDGED),
+            Some(&Value::Bool(true)),
+            "an unjudged spend-ledger record must be distinguishable from a \
+             real judge-issued unclear verdict"
         );
     }
 

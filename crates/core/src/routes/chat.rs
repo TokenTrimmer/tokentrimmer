@@ -626,6 +626,7 @@ async fn try_l2_hit(
     request_started: Instant,
     matched_route_id: Option<Uuid>,
     route_matched_name: Option<&str>,
+    raw_bearer: &str,
     judge_source_provider: Option<&std::sync::Arc<dyn tt_shared::Provider>>,
     judge_source_ctx: Option<&RequestContext>,
     judge_original_req: Option<&ChatCompletionRequest>,
@@ -674,6 +675,7 @@ async fn try_l2_hit(
                 &entry,
                 trace_id,
                 ctx.org_id,
+                raw_bearer,
                 judge_source_provider,
                 judge_source_ctx,
                 judge_original_req,
@@ -875,7 +877,8 @@ pub async fn handler(
     // hot path when the judge is disabled because we only build the job later
     // when sampling actually fires.
     let judge_enabled = state.judge_config.enabled && state.judge_sink.is_some();
-    let (judge_source_provider, judge_source_ctx, judge_original_req) = if judge_enabled {
+    let (mut judge_source_provider, mut judge_source_ctx, mut judge_original_req) = if judge_enabled
+    {
         (Some(provider.clone()), Some(ctx.clone()), Some(req.clone()))
     } else {
         (None, None, None)
@@ -903,6 +906,20 @@ pub async fn handler(
     // dispatch; it never attributes a saving and surfaces a `redacted:<class>`
     // warning when it fires.
     let route_redact = route_match.as_ref().is_some_and(|m| m.redact);
+    // Redaction × judge sampling: the judge captures above hold the
+    // PRE-redaction request — the judge job re-dispatches it verbatim to the
+    // source provider for the baseline reference AND embeds its text in the
+    // judge prompt (potentially a THIRD vendor serving the judge model). On a
+    // redact route that would bypass the "the secret never reaches the
+    // upstream provider" guarantee the redaction pass exists to enforce, so
+    // the judge is skipped wholesale for redact routes (both the dispatch-path
+    // and the L2-hit judge no-op via the all-or-nothing capture gate). The
+    // measurement path must never out-leak the dispatch path.
+    if route_redact {
+        judge_source_provider = None;
+        judge_source_ctx = None;
+        judge_original_req = None;
+    }
     // Canary traffic split (#454) + shadow mode, captured before `route_match`
     // is consumed below. `route_traffic_pct` is the configured split percentage
     // (None = unconditional rewrite). `route_shadow_model` is the discarded
@@ -1531,6 +1548,7 @@ pub async fn handler(
                     request_started,
                     matched_route_id,
                     route_matched_name.as_deref(),
+                    &raw_bearer,
                     judge_source_provider.as_ref(),
                     judge_source_ctx.as_ref(),
                     judge_original_req.as_ref(),
@@ -1993,6 +2011,7 @@ pub async fn handler(
             pricing.as_ref(),
             trace_id,
             ctx.org_id,
+            &raw_bearer,
             judge_source_provider,
             judge_source_ctx,
             judge_original_req,
@@ -3065,34 +3084,31 @@ async fn dispatch_shadow(
     };
 
     // SINGLE candidate, NO failover, NO retry storm — one shot under the short
-    // shadow deadline.
-    let dispatched = with_request_timeout(Some(state.shadow_timeout), async {
-        shadow_provider
-            .chat_completion(shadow_req, &shadow_ctx)
-            .await
-            .map_err(ApiError::from)
-    })
-    .await;
-
-    match dispatched {
-        Ok(resp) => {
-            // Cost the shadow on its OWN pricing — never the primary's. No flex,
-            // no compression delta: the shadow is a plain measurement dispatch.
-            let pricing = shadow_provider.pricing(&resp.model);
-            let breakdown = compute_cost(
-                &resp.usage,
-                pricing.as_ref(),
-                pricing.as_ref(),
-                shadow_provider.fee_multiplier(),
-            );
-            outcome.cost_usd = breakdown.cost_usd;
+    // shadow deadline. The dispatch + costing core lives in the shared
+    // `measurement::measured_single_dispatch` helper (also used by the quality
+    // judge's baseline reference dispatch); the cost is computed on the shadow's
+    // OWN pricing — never the primary's. No flex, no compression delta: the
+    // shadow is a plain measurement dispatch.
+    match crate::measurement::measured_single_dispatch(
+        &shadow_provider,
+        shadow_req,
+        &shadow_ctx,
+        state.shadow_timeout,
+    )
+    .await
+    {
+        Ok(measured) => {
+            // Flatten unmetered (`None`) to the #146 shadow convention: `0.0`
+            // means "no catalog pricing", never "free".
+            outcome.cost_usd = measured.cost_usd.unwrap_or(0.0);
             outcome.succeeded = true;
             tracing::debug!(
                 shadow_model = %shadow_model,
                 shadow_cost_usd = outcome.cost_usd,
                 "shadow dispatch completed (response discarded)"
             );
-            // resp is intentionally dropped here — the shadow output is discarded.
+            // measured.response is intentionally dropped here — the shadow
+            // output is discarded.
         }
         Err(e) => {
             tracing::debug!(
@@ -3140,13 +3156,30 @@ fn response_assistant_text(resp: &ChatCompletionResponse) -> String {
 ///
 /// Spawns only when ALL hold:
 /// - the judge is enabled and a sink is wired (`judge_source_*` are `Some`),
+/// - the matched route did NOT opt into redaction (`redact` routes clear the
+///   judge captures at the handler — the pre-redaction request must never
+///   ride the measurement path to any vendor),
 /// - a route rewrote the model (`matched_route_id.is_some()`),
 /// - the served model is cheaper than the originally-requested one (a true
 ///   downgrade priced on realized usage — [`crate::quality_sample::is_downgrade`]),
 /// - the served answer is non-empty (tool-call-only responses are skipped),
 /// - the trace falls in the deterministic ~2% sample
 ///   ([`crate::quality_sample::should_sample`]),
-/// - the judge model resolves to a provider.
+/// - the judge model resolves to a provider,
+/// - a credential for the judge model's provider resolves.
+///
+/// Credential scope (matches [`resolve_credentials_for`] / the #146 shadow
+/// precedent exactly): with a per-org credential store configured (the
+/// hosted/verified-org model) a cross-provider judge FAILS CLOSED on a store
+/// miss — the source provider's key is never forwarded to a different vendor.
+/// With NO store configured (dev / dogfood / BYO-key passthrough) there is no
+/// per-provider credential model to enforce, and the caller's raw bearer is
+/// forwarded to every provider — judge included — like every other dispatch.
+///
+/// Budget scope: the baseline reference dispatch and judge call(s) bill the
+/// org on its own provider credentials but are NOT counted toward
+/// `monthly_cap_usd` and never appear in `request_logs` — they are ledgered
+/// only in `quality_verdicts` (see `quality_sample` module docs, invariant 6).
 #[allow(clippy::too_many_arguments)]
 fn maybe_spawn_quality_judge(
     state: &AppState,
@@ -3157,6 +3190,7 @@ fn maybe_spawn_quality_judge(
     served_pricing: Option<&ModelPricing>,
     trace_id: Uuid,
     org_id: Uuid,
+    raw_bearer: &str,
     judge_source_provider: Option<std::sync::Arc<dyn tt_shared::Provider>>,
     judge_source_ctx: Option<RequestContext>,
     judge_original_req: Option<ChatCompletionRequest>,
@@ -3202,38 +3236,87 @@ fn maybe_spawn_quality_judge(
         );
         return;
     };
-
-    // The judge reuses the org's source-provider context for credentials.
-    let judge = std::sync::Arc::new(qs::GatewayLlmJudge::new(
-        judge_provider,
-        state.judge_config.judge_model.clone(),
-        source_ctx.clone(),
-    ));
     let input_text = tt_shared::message_text_for_estimation(&original_req);
     let served_model = response.model.clone();
+    let requested_model = requested_model.to_string();
 
-    qs::spawn_quality_judge(qs::QualityJudgeJob {
-        judge,
-        sink: sink.clone(),
-        org_id,
-        route_id: matched_route_id,
-        request_id: trace_id,
-        requested_model: requested_model.to_string(),
-        served_model,
-        input_text,
-        served_answer,
-        // Reference = the ORIGINAL model re-dispatched off-path inside the task.
-        reference: qs::ReferenceSource::Dispatch {
-            provider: source_provider,
-            request: Box::new(original_req),
-            ctx: Box::new(source_ctx),
-        },
-        // This judge fires on the rerouted-down DISPATCH path — an L2 hit
-        // short-circuits before dispatch, so there is no served-from-L2 entry to
-        // attribute the verdict to here. The L2 judge join (`L2EvictionTarget`)
-        // is exercised by `maybe_spawn_l2_hit_judge` on the served-from-L2 path;
-        // this dispatch path carries no eviction target.
-        l2_eviction: None,
+    // The judge model may live on a DIFFERENT provider than the source request
+    // (e.g. an Anthropic-sourced org with an OpenAI judge model). Credentials
+    // are per-provider: resolve the judge provider's OWN credential rather than
+    // forwarding the source provider's key to the wrong vendor (the
+    // `dispatch_shadow` pattern; fail closed on a verified-org store miss).
+    // Resolution can hit the credential store (a DB lookup), so the whole job
+    // assembly runs inside a detached task — zero user latency, like the judge
+    // itself.
+    let state = state.clone();
+    let raw_bearer = raw_bearer.to_string();
+    let sink = sink.clone();
+    tokio::spawn(async move {
+        let judge_ctx = if judge_provider.id() == source_provider.id() {
+            // Same provider — the captured source credentials are the right ones.
+            source_ctx.clone()
+        } else {
+            match resolve_credentials_for(&state, org_id, judge_provider.id(), &raw_bearer, true)
+                .await
+            {
+                Some(credentials) => RequestContext {
+                    credentials,
+                    ..source_ctx.clone()
+                },
+                None => {
+                    tracing::warn!(
+                        judge_model = %state.judge_config.judge_model,
+                        provider = judge_provider.id(),
+                        "no credential for the judge provider — skipping quality sample (fail closed)"
+                    );
+                    return;
+                }
+            }
+        };
+        let judge = std::sync::Arc::new(
+            qs::GatewayLlmJudge::new(
+                judge_provider,
+                state.judge_config.judge_model.clone(),
+                judge_ctx,
+            )
+            // Bound each judge call like the baseline dispatch (a hung judge
+            // upstream must not pin the detached task indefinitely).
+            .with_call_timeout(state.judge_config.baseline_timeout),
+        );
+
+        qs::spawn_quality_judge(qs::QualityJudgeJob {
+            judge,
+            sink,
+            org_id,
+            route_id: matched_route_id,
+            request_id: trace_id,
+            requested_model,
+            served_model,
+            input_text,
+            served_answer,
+            judge_model: state.judge_config.judge_model.clone(),
+            // Deterministic per-trace blind slot for the optimized answer
+            // (position debiasing), independent of the keep/drop sampling
+            // decision.
+            ab_order: qs::ab_order_for(trace_id),
+            both_orders: state.judge_config.both_orders,
+            // Reference = the ORIGINAL model re-dispatched off-path inside the
+            // task, metered + bounded by the judge's own baseline deadline (not
+            // the 2s shadow timeout — nobody is waiting on the detached task).
+            reference: qs::ReferenceSource::Dispatch {
+                provider: source_provider,
+                request: Box::new(original_req),
+                ctx: Box::new(source_ctx),
+                deadline: state.judge_config.baseline_timeout,
+            },
+            // This judge fires on the rerouted-down DISPATCH path — an L2 hit
+            // short-circuits before dispatch, so there is no served-from-L2
+            // entry to attribute the verdict to here. The L2 judge join
+            // (`L2EvictionTarget`) is exercised by `maybe_spawn_l2_hit_judge`
+            // on the served-from-L2 path; this dispatch path carries no
+            // eviction target.
+            l2_eviction: None,
+        });
     });
 }
 
@@ -3255,11 +3338,17 @@ fn maybe_spawn_quality_judge(
 ///
 /// Spawns only when ALL hold:
 /// - the judge is enabled and a sink is wired,
-/// - the pre-routing source captures are present (provider/ctx/original req),
+/// - the pre-routing source captures are present (provider/ctx/original req —
+///   cleared at the handler for `redact` routes, so a redact route's
+///   pre-redaction request never rides the measurement path),
 /// - this task class (chat-completions) is in scope,
 /// - the trace falls in the deterministic sample ([`qs::should_sample`]),
 /// - the cached answer is non-empty (tool-call-only responses are skipped),
-/// - the cached body deserializes and the judge model resolves to a provider.
+/// - the cached body deserializes and the judge model resolves to a provider,
+/// - a credential for the judge model's provider resolves (fail closed on a
+///   verified-org store miss; with NO credential store configured the raw
+///   bearer is forwarded to every provider — see
+///   [`maybe_spawn_quality_judge`]'s credential-scope note).
 #[allow(clippy::too_many_arguments)]
 fn maybe_spawn_l2_hit_judge(
     state: &AppState,
@@ -3267,6 +3356,7 @@ fn maybe_spawn_l2_hit_judge(
     entry: &CacheEntry,
     trace_id: Uuid,
     org_id: Uuid,
+    raw_bearer: &str,
     judge_source_provider: Option<&std::sync::Arc<dyn tt_shared::Provider>>,
     judge_source_ctx: Option<&RequestContext>,
     judge_original_req: Option<&ChatCompletionRequest>,
@@ -3314,43 +3404,90 @@ fn maybe_spawn_l2_hit_judge(
         );
         return;
     };
-
-    // The judge reuses the org's source-provider context for credentials.
-    let judge = std::sync::Arc::new(qs::GatewayLlmJudge::new(
-        judge_provider,
-        state.judge_config.judge_model.clone(),
-        source_ctx.clone(),
-    ));
     let input_text = tt_shared::message_text_for_estimation(original_req);
 
-    qs::spawn_quality_judge(qs::QualityJudgeJob {
-        judge,
-        sink: sink.clone(),
-        org_id,
-        // No route fired on a cache hit — the verdict attributes to the L2 entry.
-        route_id: None,
-        request_id: trace_id,
-        // An L2 hit never re-runs routing: the served (cached) model equals the
-        // requested model.
-        requested_model: entry.model.clone(),
-        served_model: entry.model.clone(),
-        input_text,
-        served_answer,
-        // Reference = the ORIGINAL request re-dispatched off-path inside the
-        // task, so the judge scores the cached answer against a fresh answer to
-        // THIS query.
-        reference: qs::ReferenceSource::Dispatch {
-            provider: source_provider.clone(),
-            request: Box::new(original_req.clone()),
-            ctx: Box::new(source_ctx.clone()),
-        },
-        // The join the roadmap flagged: a High-band verdict evicts EXACTLY this
-        // served-from-L2 entry (single-row, never bulk); Low/Medium/Unclear only
-        // record the score.
-        l2_eviction: Some(qs::L2EvictionTarget {
-            cache: l2.cache.clone(),
-            entry_id: entry.id,
-        }),
+    // Per-provider judge credentials, resolved off-path inside a detached task
+    // (the `dispatch_shadow` pattern; fail closed on a verified-org store
+    // miss) — see `maybe_spawn_quality_judge` for the full rationale.
+    let state = state.clone();
+    let raw_bearer = raw_bearer.to_string();
+    let sink = sink.clone();
+    let source_provider = source_provider.clone();
+    let source_ctx = source_ctx.clone();
+    let original_req = original_req.clone();
+    let entry_model = entry.model.clone();
+    let entry_id = entry.id;
+    let l2_cache = l2.cache.clone();
+    tokio::spawn(async move {
+        let judge_ctx = if judge_provider.id() == source_provider.id() {
+            // Same provider — the captured source credentials are the right ones.
+            source_ctx.clone()
+        } else {
+            match resolve_credentials_for(&state, org_id, judge_provider.id(), &raw_bearer, true)
+                .await
+            {
+                Some(credentials) => RequestContext {
+                    credentials,
+                    ..source_ctx.clone()
+                },
+                None => {
+                    tracing::warn!(
+                        judge_model = %state.judge_config.judge_model,
+                        provider = judge_provider.id(),
+                        "no credential for the judge provider — skipping L2-hit sample (fail closed)"
+                    );
+                    return;
+                }
+            }
+        };
+        let judge = std::sync::Arc::new(
+            qs::GatewayLlmJudge::new(
+                judge_provider,
+                state.judge_config.judge_model.clone(),
+                judge_ctx,
+            )
+            // Bound each judge call like the baseline dispatch (a hung judge
+            // upstream must not pin the detached task indefinitely).
+            .with_call_timeout(state.judge_config.baseline_timeout),
+        );
+
+        qs::spawn_quality_judge(qs::QualityJudgeJob {
+            judge,
+            sink,
+            org_id,
+            // No route fired on a cache hit — the verdict attributes to the L2
+            // entry.
+            route_id: None,
+            request_id: trace_id,
+            // An L2 hit never re-runs routing: the served (cached) model equals
+            // the requested model.
+            requested_model: entry_model.clone(),
+            served_model: entry_model,
+            input_text,
+            served_answer,
+            judge_model: state.judge_config.judge_model.clone(),
+            // Deterministic per-trace blind slot for the optimized (cached)
+            // answer.
+            ab_order: qs::ab_order_for(trace_id),
+            both_orders: state.judge_config.both_orders,
+            // Reference = the ORIGINAL request re-dispatched off-path inside
+            // the task, so the judge scores the cached answer against a fresh
+            // answer to THIS query. Metered + bounded by the judge's baseline
+            // deadline.
+            reference: qs::ReferenceSource::Dispatch {
+                provider: source_provider,
+                request: Box::new(original_req),
+                ctx: Box::new(source_ctx),
+                deadline: state.judge_config.baseline_timeout,
+            },
+            // The join the roadmap flagged: a High-band verdict evicts EXACTLY
+            // this served-from-L2 entry (single-row, never bulk);
+            // Low/Medium/Unclear only record the score.
+            l2_eviction: Some(qs::L2EvictionTarget {
+                cache: l2_cache,
+                entry_id,
+            }),
+        });
     });
 }
 

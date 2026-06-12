@@ -307,6 +307,32 @@ impl AppState {
         self
     }
 
+    /// Builder-style attach: wire the sampled judge to BOTH the in-process
+    /// band store (the `/v1/preview` enrichment read-side, exactly as
+    /// [`AppState::with_quality_judge_band_store`]) AND a durable sink — in
+    /// production a [`crate::quality_persist::PostgresJudgeSink`] writing one
+    /// `quality_verdicts` row per judged sample, which Phase 2 joins against
+    /// `request_logs.trace_id` for attribution netting.
+    ///
+    /// Outcomes fan out through a [`crate::quality_sample::FanoutJudgeSink`]:
+    /// band store first, then the persistent sink. Record-only — neither sink
+    /// ever pauses routes; the judge still fires only for the deterministic
+    /// sample of eligible requests, after the user response is returned.
+    pub fn with_quality_judge_persistent(
+        mut self,
+        store: Arc<crate::quality_sample::InMemoryJudgeBandStore>,
+        persistent: Arc<dyn crate::quality_sample::JudgeSink>,
+        config: crate::quality_sample::JudgeConfig,
+    ) -> Self {
+        self.judge_sink = Some(Arc::new(crate::quality_sample::FanoutJudgeSink::new(vec![
+            store.clone() as Arc<dyn crate::quality_sample::JudgeSink>,
+            persistent,
+        ])));
+        self.judge_band_store = Some(store);
+        self.judge_config = config;
+        self
+    }
+
     /// Builder-style: enable dogfood routing mode. The auth middleware will
     /// inject a [`crate::DOGFOOD_ORG_ID`] identity for unauthenticated
     /// requests so the pre-seeded dogfood route fires.

@@ -6,9 +6,11 @@ pub mod budget;
 pub mod db;
 pub mod error;
 pub mod failover;
+pub(crate) mod measurement;
 pub mod metrics;
 pub mod middleware;
 pub mod passes;
+pub mod quality_persist;
 pub mod quality_sample;
 pub mod registry;
 pub mod retry;
@@ -27,8 +29,10 @@ pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
 pub use middleware::retrieval::RetrievalState;
 pub use quality_sample::{
-    risk_band_to_preview, spawn_quality_judge, GatewayLlmJudge, InMemoryJudgeBandStore,
-    JudgeConfig, JudgeOutcome, JudgeSink, JudgeTaskClass, QualityJudgeJob, ReferenceSource,
+    ab_order_for, judge_paired, risk_band_to_preview, spawn_quality_judge, AbOrder,
+    FanoutJudgeSink, GatewayLlmJudge, InMemoryJudgeBandStore, JudgeConfig, JudgeOutcome, JudgeSink,
+    JudgeTaskClass, PairCall, PairVerdict, PairedJudgeFailure, PairedJudgeOutcome,
+    PairedJudgeProvider, QualityJudgeJob, ReferenceSource,
 };
 pub use registry::{
     register_providers, spawn_openrouter_catalog_refresh, ProviderRegistry, ProvidersConfig,

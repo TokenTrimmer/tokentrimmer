@@ -768,11 +768,32 @@ impl Provider for JudgingProvider {
         req: ChatCompletionRequest,
         _ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
-        // The judge model returns a verdict; the reference model returns a
-        // plain answer (the off-path reference dispatch).
+        // The judge model returns a pair-token verdict naming whichever BLIND
+        // slot holds the cached (optimized) answer — the paired judge
+        // randomizes the slot per trace, so the mock inspects the prompt; the
+        // reference model returns a plain answer (the off-path reference
+        // dispatch).
         let text = if req.model == "judge-1" {
             self.judge_calls.fetch_add(1, Ordering::Relaxed);
-            "DEGRADED — the cached answer does not address the query".to_string()
+            let user_text = req
+                .messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::User {
+                        content: MessageContent::Text(s),
+                        ..
+                    } => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let a_start = user_text.find("ANSWER A:").unwrap_or(0);
+            let b_start = user_text.find("ANSWER B:").unwrap_or(user_text.len());
+            if user_text[a_start..b_start].contains("stale cached answer") {
+                "A_MISSING — the cached answer does not address the query".to_string()
+            } else {
+                "B_MISSING — the cached answer does not address the query".to_string()
+            }
         } else {
             self.ref_calls.fetch_add(1, Ordering::Relaxed);
             "a fresh reference answer".to_string()
@@ -887,6 +908,7 @@ async fn l2_hit_degraded_judge_verdict_evicts_the_served_entry() {
         enabled: true,
         sample_rate: 1.0, // always sample so the deterministic gate fires
         judge_model: "judge-1".to_string(),
+        ..JudgeConfig::default()
     };
     let state = AppState::new(registry)
         .with_l2(cache.clone(), embedder, Some(0.99))

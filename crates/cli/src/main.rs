@@ -1336,6 +1336,35 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         tracing::warn!("no DB pool; request_logs writes disabled");
     }
 
+    // Sampled paired A/B quality judge — opt-in via TT_JUDGE_ENABLED (off by
+    // default; request/response semantics change for nobody who hasn't opted
+    // in). When enabled, verdicts feed the in-memory band store (live
+    // /v1/preview enrichment) and — with a DB pool — land durably in the
+    // `quality_verdicts` table (migration 0014, applied by the standard boot
+    // migration path above) for Phase 2 attribution netting. Judge + baseline
+    // costs are measurement tax recorded only there, never in request_logs.
+    let judge_config = tt_core::quality_sample::JudgeConfig::from_env();
+    if judge_config.enabled {
+        let band_store = Arc::new(tt_core::quality_sample::InMemoryJudgeBandStore::new());
+        state = if let Some(pool) = db_pool.as_ref() {
+            tracing::info!(
+                "quality judge: paired A/B sampler enabled (verdicts → Postgres quality_verdicts)"
+            );
+            state.with_quality_judge_persistent(
+                band_store,
+                Arc::new(tt_core::quality_persist::PostgresJudgeSink::new(
+                    pool.clone(),
+                )),
+                judge_config,
+            )
+        } else {
+            tracing::warn!(
+                "quality judge: enabled without DB pool — verdicts in-memory only (not persisted)"
+            );
+            state.with_quality_judge_band_store(band_store, judge_config)
+        };
+    }
+
     // L2 semantic cache — opt-in via TT_L2_SEMANTIC_CACHE=1. Needs a pgvector
     // DB pool and an OpenAI embedding key (TT_OPENAI_EMBED_KEY); the embedder
     // reuses the registered OpenAI provider. A misconfig (flag on, dependency
