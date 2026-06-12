@@ -12,7 +12,7 @@ use tt_mcp::tools::preview_cost::PreviewCostTool;
 use tt_mcp::tools::Registry;
 use tt_shared::messages::{Message, MessageContent, ToolCall};
 
-use super::{format_turn_footer, Conversation, Ledger, UsageInfo};
+use super::{format_turn_footer, shape, Conversation, Ledger, UsageInfo};
 use crate::ui;
 
 /// Hard cap on tool-call rounds per turn (loop guard).
@@ -90,6 +90,10 @@ struct TurnTotals {
     in_tok: u64,
     out_tok: u64,
     billed_rounds: u32,
+    /// Estimated tokens of tool results + tool-call args before/after shaping
+    /// (`chat::shape`). Token counts only — never converted to a USD claim.
+    trim_before: u64,
+    trim_after: u64,
 }
 
 impl TurnTotals {
@@ -100,6 +104,10 @@ impl TurnTotals {
         self.in_tok += u.input_tokens;
         self.out_tok += u.output_tokens;
         self.billed_rounds += 1;
+    }
+    fn add_trim(&mut self, s: shape::ShapeStats) {
+        self.trim_before += u64::from(s.tokens_before);
+        self.trim_after += u64::from(s.tokens_after);
     }
     fn as_usage(&self) -> UsageInfo {
         UsageInfo {
@@ -177,6 +185,9 @@ async fn send_round(
 
 /// Push the final assistant answer, print it + a single per-turn footer, and
 /// record exactly one ledger turn for the whole (possibly multi-round) turn.
+/// A `· tool-trim −N tok` segment is appended ONLY when shaping actually
+/// removed tokens (built-in results are already minified, so an honest ~0
+/// prints no claim at all).
 fn finish_turn(
     conv: &mut Conversation,
     ledger: &mut Ledger,
@@ -186,20 +197,29 @@ fn finish_turn(
 ) {
     println!("{content}");
     conv.push_assistant(content);
+    let trimmed = turn.trim_before.saturating_sub(turn.trim_after);
+    if trimmed > 0 {
+        ledger.tool_trim_tokens += trimmed;
+    }
     if turn.billed_rounds > 0 {
         let u = turn.as_usage();
         ledger.add(&u);
-        println!(
-            "{}",
-            format_turn_footer(
-                served_model,
-                u.input_tokens,
-                u.output_tokens,
-                u.cost_usd,
-                u.saved_usd,
-                u.baseline_cost_usd
-            )
+        let mut footer = format_turn_footer(
+            served_model,
+            u.input_tokens,
+            u.output_tokens,
+            u.cost_usd,
+            u.saved_usd,
+            u.baseline_cost_usd,
         );
+        if trimmed > 0 {
+            footer.push_str(
+                &ui::muted()
+                    .apply_to(format!(" · tool-trim −{trimmed} tok"))
+                    .to_string(),
+            );
+        }
+        println!("{footer}");
     }
 }
 
@@ -209,11 +229,19 @@ fn finish_turn(
 /// the whole turn is recorded as one ledger entry. On failure the conversation
 /// is truncated back to its entry length (no partial tool messages), matching
 /// `do_turn`'s contract so the caller's "pop the user on false" stays correct.
+///
+/// `shape_results` (default ON; `--no-tool-trim` / `/tools trim off` disable)
+/// applies `chat::shape` to tool results + tool-call args ONCE, at the moment
+/// they are appended to history — never re-applied to messages already in
+/// `conv.messages` (shape-at-entry; re-shaping in place would be re-selection
+/// inside the provider-cached prefix). `tt advise` inherits this via the same
+/// fn — acceptable because all shaping is lossless or derived-field-only.
 pub async fn run_tool_turn(
     client: &tt_client::Client,
     conv: &mut Conversation,
     reg: &Registry,
     ledger: &mut Ledger,
+    shape_results: bool,
 ) -> bool {
     let start_len = conv.messages.len();
     let tools = registry_tools(reg);
@@ -241,9 +269,13 @@ pub async fn run_tool_turn(
             return true;
         }
 
-        // push the assistant message the SDK returned verbatim (already typed,
-        // carrying any accompanying text + the tool_calls)
-        if let Some(m) = round.assistant_msg.clone() {
+        // push the assistant message the SDK returned (already typed, carrying
+        // any accompanying text + the tool_calls); args are minified on the
+        // history copy only — `format_tool_call` below previews the original.
+        if let Some(mut m) = round.assistant_msg.clone() {
+            if shape_results {
+                turn.add_trim(shape::minify_tool_call_args(&mut m));
+            }
             conv.messages.push(m);
         }
         for tc in &round.calls {
@@ -257,7 +289,14 @@ pub async fn run_tool_turn(
                 Ok(v) => v,
                 Err(e) => json!({ "error": e.to_string() }),
             };
-            let out_str = out.to_string();
+            // shape-at-entry: trim the result once, as it enters history
+            let out_str = if shape_results {
+                let (s, stats) = shape::shape_tool_result(&tc.function.name, out);
+                turn.add_trim(stats);
+                s
+            } else {
+                out.to_string()
+            };
             let preview: String = out_str.chars().take(120).collect();
             println!("{}", ui::muted().apply_to(format!("  {preview}")));
             conv.messages.push(Message::Tool {
@@ -375,7 +414,7 @@ mod tests {
         let mut ledger = Ledger::default();
         let client = tt_client::Client::new(server.base_url(), "k");
 
-        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;
+        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger, true).await;
         assert!(ok);
         // [User, Assistant(tool_calls), Tool(result), Assistant("Use Haiku.")]
         assert_eq!(conv.messages.len(), 4);
@@ -437,7 +476,7 @@ mod tests {
         let mut ledger = Ledger::default();
         let client = tt_client::Client::new(server.base_url(), "k");
 
-        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;
+        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger, true).await;
         assert!(ok);
         // Must end with a real assistant answer, never a dangling Tool message.
         assert!(
@@ -455,6 +494,123 @@ mod tests {
         );
     }
 
+    /// Model emits PRETTY-printed tool-call args (whitespace = machine noise):
+    /// the history copy is minified, the delta metered in the ledger as token
+    /// counts (never USD), and the loop still converges as before.
+    #[tokio::test]
+    async fn tool_loop_meters_trim_tokens() {
+        console::set_colors_enabled(false);
+        let server = MockServer::start_async().await;
+        let pretty_args =
+            "{\n    \"task_description\" :   \"classify the sentiment of customer tweets\"\n}";
+        // round 2 (sees the tool result) → final text answer
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"tool\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .header("x-tokentrimmer-cost-usd", "0.0001")
+                .header("x-tokentrimmer-saved-usd", "0.0003")
+                .json_body(json!({
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Use Haiku." } }],
+                    "usage": { "prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16 }
+                }));
+        });
+        // round 1 → a tool call with pretty-printed JSON args
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .json_body(json!({
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": {
+                        "role": "assistant", "content": null,
+                        "tool_calls": [{ "id": "c1", "type": "function",
+                            "function": { "name": "find_route_for", "arguments": pretty_args } }]
+                    }}],
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6 }
+                }));
+        });
+
+        let mut conv = Conversation::new("gpt-4o-mini".into(), None);
+        conv.push_user("what model for sentiment?".into());
+        let reg = build_registry();
+        let mut ledger = Ledger::default();
+        let client = tt_client::Client::new(server.base_url(), "k");
+
+        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger, true).await;
+        assert!(ok);
+        // the HISTORY copy of the args is minified (value-identical)
+        let Message::Assistant { tool_calls, .. } = &conv.messages[1] else {
+            panic!("expected assistant tool-call message");
+        };
+        assert!(
+            !tool_calls[0].function.arguments.contains('\n'),
+            "args not minified: {:?}",
+            tool_calls[0].function.arguments
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_calls[0].function.arguments).unwrap(),
+            serde_json::from_str::<Value>(pretty_args).unwrap()
+        );
+        // the trim is metered (tokens only) in the session ledger
+        assert!(ledger.tool_trim_tokens > 0, "{}", ledger.tool_trim_tokens);
+        assert_eq!(ledger.turns, 1);
+        let s = ledger.summary();
+        assert!(s.contains("tool-trim"), "{s}");
+        assert!(s.contains("(est.)"), "{s}");
+    }
+
+    /// `--no-tool-trim` / `/tools trim off`: history keeps the model's bytes
+    /// verbatim and nothing is metered.
+    #[tokio::test]
+    async fn tool_loop_trim_off_keeps_args_verbatim() {
+        let server = MockServer::start_async().await;
+        let pretty_args = "{\n  \"task_description\": \"x\"\n}";
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"role\":\"tool\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                }));
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "c", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+                    "choices": [{ "index": 0, "message": {
+                        "role": "assistant", "content": null,
+                        "tool_calls": [{ "id": "c1", "type": "function",
+                            "function": { "name": "find_route_for", "arguments": pretty_args } }]
+                    }}],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                }));
+        });
+        let mut conv = Conversation::new("gpt-4o-mini".into(), None);
+        conv.push_user("go".into());
+        let reg = build_registry();
+        let mut ledger = Ledger::default();
+        let client = tt_client::Client::new(server.base_url(), "k");
+        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger, false).await;
+        assert!(ok);
+        let Message::Assistant { tool_calls, .. } = &conv.messages[1] else {
+            panic!("expected assistant tool-call message");
+        };
+        assert_eq!(tool_calls[0].function.arguments, pretty_args);
+        assert_eq!(ledger.tool_trim_tokens, 0);
+    }
+
     #[tokio::test]
     async fn tool_loop_rolls_back_on_error() {
         let server = MockServer::start_async().await;
@@ -468,7 +624,7 @@ mod tests {
         let reg = build_registry();
         let mut ledger = Ledger::default();
         let client = tt_client::Client::new(server.base_url(), "k");
-        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;
+        let ok = run_tool_turn(&client, &mut conv, &reg, &mut ledger, true).await;
         assert!(!ok);
         assert_eq!(
             conv.messages.len(),

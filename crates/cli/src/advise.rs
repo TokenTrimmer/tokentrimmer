@@ -235,7 +235,7 @@ pub async fn run(
     let reg = tools::build_advisor_registry();
     let mut ledger = Ledger::default();
     ui::heading("TokenTrimmer advisor");
-    tools::run_tool_turn(&client, &mut conv, &reg, &mut ledger).await;
+    tools::run_tool_turn(&client, &mut conv, &reg, &mut ledger, true).await;
     Ok(())
 }
 
