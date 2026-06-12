@@ -142,6 +142,203 @@ pub fn class_threshold_for(class: Option<TaskClass>) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Adaptive per-class thresholds (L2 false-positive gate, research Phase 2.2)
+// ---------------------------------------------------------------------------
+
+/// Hard ceiling for adaptive raises — a class threshold never exceeds this.
+/// At 0.99 a near-exact paraphrase still hits; raising further would make the
+/// L2 cache useless rather than safer.
+pub const ADAPTIVE_THRESHOLD_CEILING: f32 = 0.99;
+
+/// Tuning for the FP-rate → threshold controller. All defaults conservative.
+#[derive(Debug, Clone, Copy)]
+pub struct FpGateTuning {
+    /// Target false-positive tolerance in percent — the research band's route
+    /// tolerance (0.5–2%, default 1.0). Values outside `[0.5, 2.0]` are
+    /// clamped by [`FpGateTuning::new`] and defensively re-clamped wherever a
+    /// tolerance is consumed.
+    pub tolerance_pct: f64,
+    /// Judged in-band classified samples per adaptation batch (default 20).
+    /// A batch smaller than this never adapts — one unlucky degraded sample
+    /// must not move the threshold.
+    pub min_samples: u32,
+    /// Threshold raise per breaching batch (default 0.005). Small steps: the
+    /// ratchet converges over batches instead of overshooting on one.
+    pub step: f32,
+}
+
+impl Default for FpGateTuning {
+    fn default() -> Self {
+        Self {
+            tolerance_pct: 1.0,
+            min_samples: 20,
+            step: 0.005,
+        }
+    }
+}
+
+impl FpGateTuning {
+    /// Construct with the documented clamps: tolerance to `[0.5, 2.0]`,
+    /// `min_samples` floored at 1, `step` floored at 0 (a zero step disables
+    /// adaptation without disabling measurement).
+    #[must_use]
+    pub fn new(tolerance_pct: f64, min_samples: u32, step: f32) -> Self {
+        Self {
+            tolerance_pct: tolerance_pct.clamp(0.5, 2.0),
+            min_samples: min_samples.max(1),
+            step: step.max(0.0),
+        }
+    }
+}
+
+/// Per-class FP batch state behind the [`AdaptiveClassThresholds`] mutex.
+#[derive(Debug, Clone, Copy)]
+struct ClassFpState {
+    /// The adaptively-raised threshold for this class, when a batch has
+    /// breached. Always `>= base.threshold_for(class)` and
+    /// `<= ADAPTIVE_THRESHOLD_CEILING` by construction.
+    raised: Option<f32>,
+    /// Classified (non-Unclear) judged in-band samples in the current batch.
+    judged: u32,
+    /// Degraded verdicts in the current batch (the FP signal).
+    degraded: u32,
+    /// The strictest (minimum) tolerance seen across the batch — mixed
+    /// tolerances adapt against the strictest, the conservative choice.
+    min_tolerance_pct: f64,
+}
+
+impl Default for ClassFpState {
+    fn default() -> Self {
+        Self {
+            raised: None,
+            judged: 0,
+            degraded: 0,
+            min_tolerance_pct: f64::INFINITY,
+        }
+    }
+}
+
+/// Adaptive per-class thresholds: a **ratchet** over a static
+/// [`ClassThresholds`] base.
+///
+/// `effective(class) = max(base.threshold_for(class), raised[class])` — raises
+/// only, never lowers, never below the [`DEFAULT_THRESHOLD`] floor (inherited
+/// from the base), capped at [`ADAPTIVE_THRESHOLD_CEILING`]. The raise signal
+/// is the measured false-positive rate of judged *ambiguous-band* L2 hits: when
+/// a batch of `min_samples` classified verdicts shows
+/// `degraded/judged*100 > tolerance`, the class threshold steps up by
+/// `tuning.step`.
+///
+/// State is in-process (resets on restart) — the static base config is the
+/// durable floor, so a restart can only ever *loosen back to the configured
+/// floor*, never below today's bar. Durable raises are a deliberate follow-up.
+///
+/// `Send + Sync` (mutex inside) so one instance can be shared between the
+/// request path (threshold reads) and the detached judge tasks (verdict feeds).
+pub struct AdaptiveClassThresholds {
+    base: ClassThresholds,
+    tuning: FpGateTuning,
+    inner: Mutex<HashMap<Option<TaskClass>, ClassFpState>>,
+}
+
+impl std::fmt::Debug for AdaptiveClassThresholds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdaptiveClassThresholds")
+            .field("base", &self.base)
+            .field("tuning", &self.tuning)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdaptiveClassThresholds {
+    /// Wrap `base` with the FP controller `tuning`. Until a batch breaches,
+    /// `effective_threshold` equals `base.threshold_for` exactly.
+    #[must_use]
+    pub fn new(base: ClassThresholds, tuning: FpGateTuning) -> Self {
+        Self {
+            base,
+            tuning,
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The effective threshold for `class`: always
+    /// `>= base.threshold_for(class) >= DEFAULT_THRESHOLD`. This is the
+    /// invariant the safety tests pin — adaptation can only tighten.
+    #[must_use]
+    pub fn effective_threshold(&self, class: Option<TaskClass>) -> f32 {
+        let base = self.base.threshold_for(class);
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.get(&class).and_then(|s| s.raised) {
+            Some(raised) => raised.max(base),
+            None => base,
+        }
+    }
+
+    /// The adaptive raise currently applied to `class`, if any. Introspection
+    /// for tests and metrics — `None` means the static base is in force.
+    #[must_use]
+    pub fn raised_for(&self, class: Option<TaskClass>) -> Option<f32> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.get(&class).and_then(|s| s.raised)
+    }
+
+    /// Feed one judged AMBIGUOUS-BAND hit into the FP estimator.
+    ///
+    /// `degraded`: `Some(true)` = a confirmed false positive, `Some(false)` =
+    /// a clean hit, `None` = an `Unclear` verdict — ignored entirely (excluded
+    /// from the denominator, mirroring `VerdictTally`). `tolerance_pct` is the
+    /// effective tolerance at judgment time; a mixed batch adapts against the
+    /// MINIMUM seen (strictest wins — conservative).
+    ///
+    /// When the batch reaches `tuning.min_samples` classified verdicts:
+    /// `fp_pct = degraded/judged*100`; a breach (`fp_pct > min_tolerance`)
+    /// raises the effective threshold by `tuning.step` (capped at
+    /// [`ADAPTIVE_THRESHOLD_CEILING`]); the batch resets either way.
+    ///
+    /// Returns `true` iff this call raised the threshold — the caller's
+    /// metrics hook (tt-cache itself has no metrics dependency).
+    pub fn record_judged_band_hit(
+        &self,
+        class: Option<TaskClass>,
+        degraded: Option<bool>,
+        tolerance_pct: f64,
+    ) -> bool {
+        let Some(is_degraded) = degraded else {
+            return false; // Unclear: excluded from the denominator entirely.
+        };
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let state = guard.entry(class).or_default();
+        state.judged += 1;
+        if is_degraded {
+            state.degraded += 1;
+        }
+        state.min_tolerance_pct = state.min_tolerance_pct.min(tolerance_pct.clamp(0.5, 2.0));
+        if state.judged < self.tuning.min_samples {
+            return false;
+        }
+        let fp_pct = f64::from(state.degraded) / f64::from(state.judged) * 100.0;
+        let breached = fp_pct > state.min_tolerance_pct;
+        let mut raised_now = false;
+        if breached {
+            let base = self.base.threshold_for(class);
+            let effective = state.raised.map_or(base, |r| r.max(base));
+            let next = (effective + self.tuning.step).min(ADAPTIVE_THRESHOLD_CEILING);
+            if next > effective {
+                state.raised = Some(next);
+                raised_now = true;
+            }
+        }
+        // Reset the batch either way — each adaptation decision uses fresh
+        // samples taken AT the (possibly new) threshold.
+        state.judged = 0;
+        state.degraded = 0;
+        state.min_tolerance_pct = f64::INFINITY;
+        raised_now
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CacheEntry
 // ---------------------------------------------------------------------------
 
@@ -196,6 +393,13 @@ pub struct CacheEntry {
     pub created_at: DateTime<Utc>,
     /// Wall-clock time after which the entry must not be served.
     pub expires_at: DateTime<Utc>,
+    /// One-way 64-bit SimHash ([`crate::lexical_sig`]) of the canonicalized
+    /// embedded context text — NEVER the text itself (the privacy invariant of
+    /// migration 0002 stands: vectors + responses + a 64-bit sketch, no source
+    /// prompts). Read by the L2 verify gate to confirm an ambiguous-band hit
+    /// lexically agrees with the incoming query. `None` for rows inserted
+    /// before migration 0018; the verify gate fails open on `None`.
+    pub lexical_sig: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +741,7 @@ pub fn l2_context_text(req: &ChatCompletionRequest) -> Option<String> {
 ///     judge_verdict: None,
 ///     created_at: Utc::now(),
 ///     expires_at: Utc::now() + chrono::Duration::seconds(3600),
+///     lexical_sig: None,
 /// };
 /// cache.insert(entry).await.unwrap();
 /// # }
@@ -827,8 +1032,9 @@ impl L2Cache for PostgresL2Cache {
             INSERT INTO cache_entries
                 (id, org_id, embedding, response, model, embedding_model,
                  input_tokens, output_tokens, baseline_cost_usd, hit_count,
-                 quality_score, judge_verdict, created_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 quality_score, judge_verdict, created_at, expires_at,
+                 lexical_sig)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT DO NOTHING
             "#,
         )
@@ -849,6 +1055,7 @@ impl L2Cache for PostgresL2Cache {
         .bind(&entry.judge_verdict)
         .bind(entry.created_at)
         .bind(entry.expires_at)
+        .bind(entry.lexical_sig)
         .execute(&self.pool)
         .await
         .map_err(CacheError::Sqlx)?;
@@ -893,6 +1100,7 @@ impl L2Cache for PostgresL2Cache {
             SELECT id, org_id, embedding, response, model, embedding_model,
                    input_tokens, output_tokens, baseline_cost_usd, hit_count,
                    quality_score, judge_verdict, created_at, expires_at,
+                   lexical_sig,
                    CAST(1.0 - (embedding <=> $2) AS REAL) AS similarity
               FROM cache_entries
              WHERE org_id = $1
@@ -944,6 +1152,9 @@ impl L2Cache for PostgresL2Cache {
             row.try_get("judge_verdict").map_err(CacheError::Sqlx)?;
         let created_at: DateTime<Utc> = row.try_get("created_at").map_err(CacheError::Sqlx)?;
         let expires_at: DateTime<Utc> = row.try_get("expires_at").map_err(CacheError::Sqlx)?;
+        // NULL for rows inserted before migration 0018 — the verify gate fails
+        // open on None.
+        let lexical_sig: Option<i64> = row.try_get("lexical_sig").map_err(CacheError::Sqlx)?;
         let similarity: f32 = row.try_get("similarity").map_err(CacheError::Sqlx)?;
 
         let response_bytes = serde_json::to_vec(&response_json).map_err(CacheError::Serde)?;
@@ -963,6 +1174,7 @@ impl L2Cache for PostgresL2Cache {
             judge_verdict,
             created_at,
             expires_at,
+            lexical_sig,
         };
 
         Ok(Some((entry, similarity)))
@@ -1105,6 +1317,7 @@ mod tests {
             judge_verdict: None,
             created_at: now,
             expires_at: now + chrono::Duration::seconds(3600),
+            lexical_sig: None,
         }
     }
 
@@ -1471,5 +1684,157 @@ mod tests {
         let report = cache.analyze_dedup(org_a).await.unwrap();
         assert_eq!(report.total_entries, 1);
         assert_eq!(report.cluster_count, 0);
+    }
+
+    // ── Adaptive thresholds (FP gate ratchet — SAFETY: never below 0.92) ─────
+
+    fn gate(tolerance_pct: f64, min_samples: u32, step: f32) -> AdaptiveClassThresholds {
+        AdaptiveClassThresholds::new(
+            ClassThresholds::new(),
+            FpGateTuning::new(tolerance_pct, min_samples, step),
+        )
+    }
+
+    /// For every class (incl. unclassified `None`), the effective threshold is
+    /// `>= the ClassThresholds floor >= 0.92` — before AND after any record
+    /// sequence, including adversarial all-clean batches.
+    #[test]
+    fn effective_threshold_never_below_class_floor() {
+        let g = gate(1.0, 5, 0.005);
+        for class in [None, Some(TaskClass::ChatCompletions)] {
+            assert!(g.effective_threshold(class) >= DEFAULT_THRESHOLD);
+            assert_eq!(g.effective_threshold(class), class_threshold_for(class));
+        }
+        // Feed batches of every shape; the floor must hold throughout.
+        for class in [None, Some(TaskClass::ChatCompletions)] {
+            for verdict in [Some(false), Some(true), None] {
+                for _ in 0..25 {
+                    g.record_judged_band_hit(class, verdict, 1.0);
+                    assert!(
+                        g.effective_threshold(class) >= DEFAULT_THRESHOLD,
+                        "effective threshold dropped below the 0.92 floor"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A breaching batch (FP% > tolerance over min_samples) raises the
+    /// effective threshold by exactly `step`; repeated breaches ratchet up but
+    /// never exceed ADAPTIVE_THRESHOLD_CEILING.
+    #[test]
+    fn fp_breach_raises_threshold_by_step_and_caps_at_ceiling() {
+        let class = Some(TaskClass::ChatCompletions);
+        let g = gate(1.0, 20, 0.005);
+        // 20 degraded samples → 100% FP > 1% tolerance → one step.
+        for i in 0..20 {
+            let raised = g.record_judged_band_hit(class, Some(true), 1.0);
+            assert_eq!(raised, i == 19, "raise fires exactly at the batch close");
+        }
+        let after_one = g.effective_threshold(class);
+        assert!(
+            (after_one - (DEFAULT_THRESHOLD + 0.005)).abs() < 1e-6,
+            "one breach raises by step: got {after_one}"
+        );
+        assert_eq!(g.raised_for(class), Some(after_one));
+        // Hammer it with breaching batches; the ceiling must hold.
+        for _ in 0..100 {
+            for _ in 0..20 {
+                g.record_judged_band_hit(class, Some(true), 1.0);
+            }
+        }
+        let capped = g.effective_threshold(class);
+        assert!(
+            capped <= ADAPTIVE_THRESHOLD_CEILING + 1e-6,
+            "ratchet must cap at the ceiling; got {capped}"
+        );
+        assert!((capped - ADAPTIVE_THRESHOLD_CEILING).abs() < 1e-6);
+        // Once at the ceiling, a further breach reports no raise.
+        for _ in 0..19 {
+            g.record_judged_band_hit(class, Some(true), 1.0);
+        }
+        assert!(
+            !g.record_judged_band_hit(class, Some(true), 1.0),
+            "at the ceiling, no further raise is reported"
+        );
+    }
+
+    /// Fewer than min_samples classified verdicts never adapt — even when
+    /// every one of them is degraded.
+    #[test]
+    fn no_adaptation_below_min_samples() {
+        let class = Some(TaskClass::ChatCompletions);
+        let g = gate(1.0, 20, 0.005);
+        for _ in 0..19 {
+            assert!(!g.record_judged_band_hit(class, Some(true), 1.0));
+        }
+        assert_eq!(g.raised_for(class), None, "19 < 20 must not adapt");
+        assert_eq!(g.effective_threshold(class), DEFAULT_THRESHOLD);
+    }
+
+    /// The ratchet never lowers: after a raise, clean batches leave the
+    /// effective threshold unchanged.
+    #[test]
+    fn ratchet_never_lowers() {
+        let class = Some(TaskClass::ChatCompletions);
+        let g = gate(1.0, 5, 0.005);
+        for _ in 0..5 {
+            g.record_judged_band_hit(class, Some(true), 1.0);
+        }
+        let raised = g.effective_threshold(class);
+        assert!(raised > DEFAULT_THRESHOLD, "precondition: a raise happened");
+        for _ in 0..50 {
+            g.record_judged_band_hit(class, Some(false), 1.0);
+        }
+        assert_eq!(
+            g.effective_threshold(class),
+            raised,
+            "clean batches must never lower a raised threshold"
+        );
+    }
+
+    /// Unclear verdicts (`None`) are excluded from the denominator: a stream
+    /// of Unclear-only feeds never completes a batch, never adapts.
+    #[test]
+    fn unclear_verdicts_excluded_from_denominator() {
+        let class = Some(TaskClass::ChatCompletions);
+        let g = gate(1.0, 5, 0.005);
+        for _ in 0..100 {
+            assert!(!g.record_judged_band_hit(class, None, 1.0));
+        }
+        assert_eq!(g.raised_for(class), None);
+        // And Unclear mixed into a real batch doesn't count toward min_samples:
+        // 4 classified + many Unclear stays below the 5-sample batch size.
+        for _ in 0..4 {
+            g.record_judged_band_hit(class, Some(true), 1.0);
+        }
+        for _ in 0..50 {
+            g.record_judged_band_hit(class, None, 1.0);
+        }
+        assert_eq!(
+            g.raised_for(class),
+            None,
+            "Unclear must not fill the batch denominator"
+        );
+    }
+
+    /// Mixed tolerances in one batch adapt against the MINIMUM seen
+    /// (strictest wins): one degraded in five (20% FP) breaches a 0.5%
+    /// tolerance even when later samples arrive with a loose 2.0%.
+    #[test]
+    fn strictest_tolerance_in_batch_wins() {
+        let class = Some(TaskClass::ChatCompletions);
+        let g = gate(1.0, 5, 0.005);
+        // First sample carries the strict tolerance; the rest are loose.
+        g.record_judged_band_hit(class, Some(true), 0.5);
+        for _ in 0..3 {
+            g.record_judged_band_hit(class, Some(false), 2.0);
+        }
+        let raised = g.record_judged_band_hit(class, Some(false), 2.0);
+        assert!(
+            raised,
+            "20% FP must breach the strictest (0.5%) tolerance in the batch"
+        );
+        assert!(g.effective_threshold(class) > DEFAULT_THRESHOLD);
     }
 }

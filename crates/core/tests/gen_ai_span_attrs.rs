@@ -838,6 +838,7 @@ fn l2_hit_span_carries_gen_ai_and_cost_attributes() {
                 judge_verdict: None,
                 created_at: Utc::now(),
                 expires_at: Utc::now() + ChronoDuration::hours(1),
+                lexical_sig: None,
             };
             cache.insert(entry).await.unwrap();
 

@@ -58,16 +58,18 @@ pub const INSERT_SQL: &str = r#"INSERT INTO quality_verdicts
                  (id, org_id, route_id, request_id, ts,
                   requested_model, served_model, verdict, reason, judge_model,
                   judge_cost_usd, baseline_cost_usd, baseline_dispatched,
-                  optimized_position, orders_judged, orders_agreed)
+                  optimized_position, orders_judged, orders_agreed,
+                  cache_entry_id, hit_similarity)
                VALUES
                  ($1, $2, $3, $4, $5,
                   $6, $7, $8, $9, $10,
                   $11, $12, $13,
-                  $14, $15, $16)"#;
+                  $14, $15, $16,
+                  $17, $18)"#;
 
 /// Number of `.bind(...)` calls in [`PostgresJudgeSink::record`]. Must stay in
 /// sync with [`INSERT_SQL`] and the actual bind chain.
-pub const INSERT_BIND_COUNT: usize = 16;
+pub const INSERT_BIND_COUNT: usize = 18;
 
 #[async_trait]
 impl JudgeSink for PostgresJudgeSink {
@@ -89,6 +91,8 @@ impl JudgeSink for PostgresJudgeSink {
             .bind(ab_position_str(outcome.optimized_position)) // $14 optimized_position
             .bind(i16::from(outcome.orders_judged)) // $15 orders_judged
             .bind(outcome.orders_agreed) // $16 orders_agreed
+            .bind(outcome.cache_entry_id) // $17 cache_entry_id (NULL on dispatch path)
+            .bind(outcome.hit_similarity) // $18 hit_similarity (NULL on dispatch path)
             .execute(&self.pool)
             .await;
         if let Err(e) = result {

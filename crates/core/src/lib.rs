@@ -3,6 +3,7 @@
 //! See `docs/04-gateway-api-reference.md` for the public API contract.
 
 pub mod budget;
+pub mod cache_volatility;
 pub mod db;
 pub mod error;
 pub mod failover;
@@ -24,6 +25,7 @@ pub use budget::{
     tier_budget_limits, BudgetDecision, BudgetEnforcer, BudgetLimits, DynamicBudgetEnforcer,
     InMemoryBudgetEnforcer, SpendSink,
 };
+pub use cache_volatility::{classify_volatility, l2_ttl_with_volatility, VolatilityClass};
 pub use db::{connect, migrate, migrate_only, MIGRATOR};
 pub use error::{ApiError, ApiResult};
 pub use failover::{dispatch_with_failover, CircuitBreaker};
@@ -31,8 +33,8 @@ pub use middleware::retrieval::RetrievalState;
 pub use quality_sample::{
     ab_order_for, judge_paired, risk_band_to_preview, spawn_quality_judge, AbOrder,
     FanoutJudgeSink, GatewayLlmJudge, InMemoryJudgeBandStore, JudgeConfig, JudgeOutcome, JudgeSink,
-    JudgeTaskClass, PairCall, PairVerdict, PairedJudgeFailure, PairedJudgeOutcome,
-    PairedJudgeProvider, QualityJudgeJob, ReferenceSource,
+    JudgeTaskClass, L2FpFeed, L2HitJudgeLimiter, PairCall, PairVerdict, PairedJudgeFailure,
+    PairedJudgeOutcome, PairedJudgeProvider, QualityJudgeJob, ReferenceSource,
 };
 pub use registry::{
     register_providers, spawn_openrouter_catalog_refresh, ProviderRegistry, ProvidersConfig,

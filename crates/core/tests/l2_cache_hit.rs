@@ -298,6 +298,7 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
+        lexical_sig: None,
     };
     {
         use tt_cache::L2Cache;
@@ -446,6 +447,7 @@ async fn l2_hit_with_null_baseline_uses_current_catalog_not_placeholder() {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
+        lexical_sig: None,
     };
     {
         use tt_cache::L2Cache;
@@ -645,6 +647,7 @@ async fn free_tier_caller_skips_l2_lookup_and_write() {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
+        lexical_sig: None,
     };
     {
         use tt_cache::L2Cache;
@@ -923,6 +926,7 @@ async fn l2_hit_degraded_judge_verdict_evicts_the_served_entry() {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
+        lexical_sig: None,
     };
     cache.insert(entry).await.unwrap();
 

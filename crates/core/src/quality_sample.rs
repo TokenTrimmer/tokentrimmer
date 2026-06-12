@@ -65,6 +65,13 @@ pub const DEFAULT_JUDGE_MODEL: &str = "gpt-4o-mini";
 /// 2s would starve real baseline answers from slower flagship models.
 pub const DEFAULT_JUDGE_BASELINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Default hourly per-instance cap on L2-hit judge spawns
+/// (`TT_JUDGE_L2_HIT_MAX_PER_HOUR`). Bounds the worst-case measurement spend
+/// of a hot cache: even at a 100% hit rate the L2-hit judge dispatches at most
+/// this many baseline+judge pairs per hour. `0` = L2-hit judging fully capped
+/// off (dispatch-path judging unaffected).
+pub const DEFAULT_L2_HIT_MAX_PER_HOUR: u32 = 50;
+
 /// The task classes the sampled judge can score. MVP enables only
 /// [`JudgeTaskClass::ChatCompletions`]; the enum exists so additional classes
 /// (embeddings re-rank, messages-ingress, …) can be opted in without reshaping
@@ -109,6 +116,21 @@ pub struct JudgeConfig {
     /// task (`TT_JUDGE_BASELINE_TIMEOUT_SECS`, default
     /// [`DEFAULT_JUDGE_BASELINE_TIMEOUT`] = 30s).
     pub baseline_timeout: std::time::Duration,
+    /// Dedicated sample rate for served-from-L2 hits
+    /// (`TT_JUDGE_L2_HIT_SAMPLE_RATE`, clamped to `[0, 1]`). `None` = inherit
+    /// `sample_rate` (today's behavior, where the L2-hit path shares the
+    /// dispatch-path rate).
+    pub l2_hit_sample_rate: Option<f64>,
+    /// Sample rate for AMBIGUOUS-BAND L2 hits when the verify gate is on
+    /// (`TT_JUDGE_L2_BAND_SAMPLE_RATE`, clamped to `[0, 1]`). `None` = inherit
+    /// the L2-hit rate. A higher band rate lets the FP estimator converge
+    /// without judging every confident hit.
+    pub l2_band_sample_rate: Option<f64>,
+    /// Max L2-hit judge spawns per hour per gateway instance
+    /// (`TT_JUDGE_L2_HIT_MAX_PER_HOUR`, default
+    /// [`DEFAULT_L2_HIT_MAX_PER_HOUR`]). `0` = L2-hit judging fully capped off
+    /// (dispatch-path judging unaffected).
+    pub l2_hit_max_per_hour: u32,
 }
 
 impl Default for JudgeConfig {
@@ -119,6 +141,9 @@ impl Default for JudgeConfig {
             judge_model: DEFAULT_JUDGE_MODEL.to_string(),
             both_orders: false,
             baseline_timeout: DEFAULT_JUDGE_BASELINE_TIMEOUT,
+            l2_hit_sample_rate: None,
+            l2_band_sample_rate: None,
+            l2_hit_max_per_hour: DEFAULT_L2_HIT_MAX_PER_HOUR,
         }
     }
 }
@@ -159,13 +184,80 @@ impl JudgeConfig {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(std::time::Duration::from_secs)
             .unwrap_or(DEFAULT_JUDGE_BASELINE_TIMEOUT);
+        let parse_rate = |key: &str| {
+            get(key)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .map(|r| r.clamp(0.0, 1.0))
+        };
+        let l2_hit_sample_rate = parse_rate("TT_JUDGE_L2_HIT_SAMPLE_RATE");
+        let l2_band_sample_rate = parse_rate("TT_JUDGE_L2_BAND_SAMPLE_RATE");
+        let l2_hit_max_per_hour = get("TT_JUDGE_L2_HIT_MAX_PER_HOUR")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(DEFAULT_L2_HIT_MAX_PER_HOUR);
         Self {
             enabled,
             sample_rate,
             judge_model,
             both_orders,
             baseline_timeout,
+            l2_hit_sample_rate,
+            l2_band_sample_rate,
+            l2_hit_max_per_hour,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L2-hit judge rate cap
+// ---------------------------------------------------------------------------
+
+/// Coarse hourly token counter capping L2-hit judge spawns. In-process per
+/// instance, lock-free (two atomics). The cap is deliberately coarse: a couple
+/// of extra acquires racing an hour boundary are acceptable for a spend bound
+/// whose unit is whole judge dispatches.
+pub struct L2HitJudgeLimiter {
+    max: u32,
+    hour: std::sync::atomic::AtomicU64,
+    count: std::sync::atomic::AtomicU64,
+}
+
+impl L2HitJudgeLimiter {
+    /// A limiter allowing at most `max_per_hour` acquisitions per hour.
+    /// `0` = never allows (L2-hit judging fully capped off).
+    #[must_use]
+    pub fn new(max_per_hour: u32) -> Self {
+        Self {
+            max: max_per_hour,
+            hour: std::sync::atomic::AtomicU64::new(0),
+            count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// True iff a judge spawn is allowed in the hour window `now_hour`
+    /// (unix-epoch hours); increments the window counter on success. The
+    /// clock-injected seam the tests drive directly.
+    pub fn try_acquire_at(&self, now_hour: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.max == 0 {
+            return false;
+        }
+        if self.hour.load(Ordering::Relaxed) != now_hour {
+            // New hour window: reset. A racing thread may reset concurrently;
+            // worst case a few boundary acquires slip through — acceptable for
+            // a coarse spend cap.
+            self.hour.store(now_hour, Ordering::Relaxed);
+            self.count.store(0, Ordering::Relaxed);
+        }
+        self.count.fetch_add(1, Ordering::Relaxed) < u64::from(self.max)
+    }
+
+    /// [`Self::try_acquire_at`] with `now_hour = unix_seconds / 3600`.
+    pub fn try_acquire(&self) -> bool {
+        let now_hour = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 3600)
+            .unwrap_or(0);
+        self.try_acquire_at(now_hour)
     }
 }
 
@@ -223,6 +315,13 @@ pub struct JudgeOutcome {
     /// Whether the two orders' mapped verdicts agreed; `None` unless both
     /// orders were judged.
     pub orders_agreed: Option<bool>,
+    /// The L2 entry that served the judged response (`None` on the dispatch
+    /// path). Persisted (migration 0018) so FP-rate analysis can attribute a
+    /// verdict to the exact cache row that produced it.
+    pub cache_entry_id: Option<Uuid>,
+    /// Cosine similarity of the served L2 hit (`None` on the dispatch path).
+    /// Persisted for offline FP-rate-vs-similarity analysis.
+    pub hit_similarity: Option<f32>,
 }
 
 /// Sink that records a [`JudgeOutcome`]. Production wires a store-backed sink;
@@ -412,6 +511,22 @@ pub struct L2EvictionTarget {
     /// The id of the specific entry that served the judged response. **Only**
     /// this entry is ever touched — never a bulk operation.
     pub entry_id: Uuid,
+}
+
+/// FP-estimator feed for a judged AMBIGUOUS-BAND L2 hit. Carried on a
+/// [`QualityJudgeJob`] only when the served-from-L2 hit fell inside the verify
+/// gate's ambiguous band — its verdict is the gate's measured false-positive
+/// signal. Independent of [`L2EvictionTarget`] (eviction stays
+/// evict-on-High-only, exactly as #148 built it).
+pub struct L2FpFeed {
+    /// The shared adaptive per-class thresholds to feed
+    /// ([`tt_cache::AdaptiveClassThresholds::record_judged_band_hit`]).
+    pub gate: Arc<tt_cache::AdaptiveClassThresholds>,
+    /// The task class the served hit was looked up under.
+    pub task_class: Option<tt_cache::TaskClass>,
+    /// The effective FP tolerance (percent) at judgment time; the gate adapts
+    /// against the strictest tolerance seen per batch.
+    pub tolerance_pct: f64,
 }
 
 /// Lowercase wire string for a verdict (`acceptable` / `degraded` / `unclear`),
@@ -1097,6 +1212,12 @@ pub struct QualityJudgeJob {
     /// closing it lets a clearly-degraded cached response be removed so it can't
     /// be served again.
     pub l2_eviction: Option<L2EvictionTarget>,
+    /// Cosine similarity of the served L2 hit (`None` on the dispatch path).
+    /// Threaded onto the recorded [`JudgeOutcome`] for durable FP analysis.
+    pub hit_similarity: Option<f32>,
+    /// Present iff the judged hit fell in the verify gate's AMBIGUOUS band —
+    /// its verdict feeds the FP estimator. Independent of `l2_eviction`.
+    pub l2_fp_feed: Option<L2FpFeed>,
 }
 
 /// Where the original-model reference answer comes from.
@@ -1196,6 +1317,7 @@ impl ReferenceSource {
 /// verdicts.
 async fn record_unjudged_spend(
     job: &QualityJudgeJob,
+    cache_entry_id: Option<Uuid>,
     baseline_cost_usd: Option<f64>,
     baseline_dispatched: bool,
     judge_cost_usd: Option<f64>,
@@ -1232,6 +1354,8 @@ async fn record_unjudged_spend(
             optimized_position: job.ab_order,
             orders_judged,
             orders_agreed: None,
+            cache_entry_id,
+            hit_similarity: job.hit_similarity,
         })
         .await;
 }
@@ -1251,6 +1375,12 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
     // partially moves `job.reference`, after which `job` can't be field-accessed
     // for `l2_eviction`. Taking it here keeps the move analysis simple.
     let l2_eviction = job.l2_eviction.take();
+    // The served entry's id, for durable attribution on the persisted verdict
+    // row (None on the dispatch path, where no entry served the response).
+    let cache_entry_id = l2_eviction.as_ref().map(|t| t.entry_id);
+    // The FP-estimator feed for an ambiguous-band hit — fed AFTER a real
+    // verdict is produced (never on the unjudged spend-ledger path).
+    let fp_feed = job.l2_fp_feed.take();
     let reference_source =
         std::mem::replace(&mut job.reference, ReferenceSource::Ready(String::new()));
     let dispatch_attempted = matches!(reference_source, ReferenceSource::Dispatch { .. });
@@ -1266,6 +1396,7 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
             if dispatch_attempted {
                 record_unjudged_spend(
                     &job,
+                    cache_entry_id,
                     None,
                     true,
                     Some(0.0),
@@ -1285,6 +1416,7 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
         if reference.dispatched {
             record_unjudged_spend(
                 &job,
+                cache_entry_id,
                 reference.cost_usd,
                 true,
                 Some(0.0),
@@ -1315,6 +1447,7 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
             // (unmetered/`NULL` where the price is unknowable).
             record_unjudged_spend(
                 &job,
+                cache_entry_id,
                 reference.cost_usd,
                 reference.dispatched,
                 failure.judge_cost_usd,
@@ -1327,6 +1460,30 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
     };
     let verdict = paired.verdict;
     let risk_band = risk_band_for_verdict(verdict);
+
+    // Feed the verify gate's FP estimator with this judged AMBIGUOUS-BAND
+    // verdict. Degraded = a confirmed false positive, Acceptable = clean,
+    // Unclear = excluded from the denominator (`None` — mirrors VerdictTally).
+    // Best-effort and order-independent w.r.t. eviction below; a raise is
+    // counted so operators can see the ratchet move.
+    if let Some(feed) = fp_feed {
+        let raised = feed.gate.record_judged_band_hit(
+            feed.task_class,
+            match verdict {
+                JudgeVerdict::Degraded => Some(true),
+                JudgeVerdict::Acceptable => Some(false),
+                JudgeVerdict::Unclear => None,
+            },
+            feed.tolerance_pct,
+        );
+        if raised {
+            metrics::counter!(
+                "cache_l2_threshold_raised_total",
+                "class" => task_class_metric_label(feed.task_class),
+            )
+            .increment(1);
+        }
+    }
 
     // Surface the per-request verdict on the telemetry path — but ONLY here,
     // where a judge actually ran and produced a verdict. An unjudged request
@@ -1396,9 +1553,22 @@ async fn run_job(mut job: QualityJudgeJob) -> Result<(), QualityError> {
             optimized_position: job.ab_order,
             orders_judged: paired.orders_judged,
             orders_agreed: paired.orders_agreed,
+            cache_entry_id,
+            hit_similarity: job.hit_similarity,
         })
         .await;
     Ok(())
+}
+
+/// Stable metric label for an L2 task class (`cache_l2_threshold_raised_total`).
+fn task_class_metric_label(class: Option<tt_cache::TaskClass>) -> &'static str {
+    match class {
+        Some(tt_cache::TaskClass::ChatCompletions) => "chat_completions",
+        // `TaskClass` is #[non_exhaustive]; future classes label as unknown
+        // until they get a name here.
+        Some(_) => "unknown",
+        None => "unclassified",
+    }
 }
 
 /// Stamp the per-request quality verdict onto the current (judge-task) span via
@@ -2374,6 +2544,8 @@ mod tests {
             optimized_position: AbOrder::OptimizedA,
             orders_judged: 1,
             orders_agreed: None,
+            cache_entry_id: None,
+            hit_similarity: None,
         }
     }
 
@@ -2876,6 +3048,8 @@ mod tests {
             both_orders: false,
             reference,
             l2_eviction: None,
+            hit_similarity: None,
+            l2_fp_feed: None,
         }
     }
 
@@ -3078,6 +3252,7 @@ mod tests {
                 judge_verdict: None,
                 created_at: now,
                 expires_at: now + chrono::Duration::seconds(3600),
+                lexical_sig: None,
             })
             .await
             .unwrap();
@@ -3161,5 +3336,150 @@ mod tests {
         assert_eq!(risk_band_to_cache_band(RiskBand::High), JudgeBand::High);
         assert_eq!(risk_band_to_cache_band(RiskBand::Medium), JudgeBand::Medium);
         assert_eq!(risk_band_to_cache_band(RiskBand::Low), JudgeBand::Low);
+    }
+
+    // ── L2-hit judge: dedicated rates, hourly cap, FP-estimator feed ─────────
+
+    /// The new `TT_JUDGE_L2_*` knobs parse through the same lookup seam, clamp
+    /// to their documented ranges, and default to inherit/50.
+    #[test]
+    fn config_l2_hit_knobs_parse_and_default() {
+        let unset = JudgeConfig::from_lookup(|_| None);
+        assert_eq!(unset.l2_hit_sample_rate, None, "default: inherit");
+        assert_eq!(unset.l2_band_sample_rate, None, "default: inherit");
+        assert_eq!(unset.l2_hit_max_per_hour, DEFAULT_L2_HIT_MAX_PER_HOUR);
+
+        let set = JudgeConfig::from_lookup(|k| match k {
+            "TT_JUDGE_L2_HIT_SAMPLE_RATE" => Some("0.5".to_string()),
+            "TT_JUDGE_L2_BAND_SAMPLE_RATE" => Some("7.0".to_string()), // clamps to 1
+            "TT_JUDGE_L2_HIT_MAX_PER_HOUR" => Some("3".to_string()),
+            _ => None,
+        });
+        assert_eq!(set.l2_hit_sample_rate, Some(0.5));
+        assert_eq!(set.l2_band_sample_rate, Some(1.0), "rate clamps to [0,1]");
+        assert_eq!(set.l2_hit_max_per_hour, 3);
+
+        let bad = JudgeConfig::from_lookup(|k| {
+            (k == "TT_JUDGE_L2_HIT_MAX_PER_HOUR").then(|| "not-a-number".to_string())
+        });
+        assert_eq!(
+            bad.l2_hit_max_per_hour, DEFAULT_L2_HIT_MAX_PER_HOUR,
+            "malformed cap falls back to the default"
+        );
+    }
+
+    /// The hourly limiter: max=2 admits exactly two spawns in an hour, a new
+    /// hour resets the window, and max=0 admits nothing ever.
+    #[test]
+    fn l2_hit_judge_limiter_caps_per_hour() {
+        let limiter = L2HitJudgeLimiter::new(2);
+        assert!(limiter.try_acquire_at(100));
+        assert!(limiter.try_acquire_at(100));
+        assert!(!limiter.try_acquire_at(100), "third acquire is capped");
+        assert!(!limiter.try_acquire_at(100), "still capped within the hour");
+        // New hour → fresh window.
+        assert!(limiter.try_acquire_at(101));
+        assert!(limiter.try_acquire_at(101));
+        assert!(!limiter.try_acquire_at(101));
+
+        let off = L2HitJudgeLimiter::new(0);
+        assert!(!off.try_acquire_at(0), "max=0 never admits");
+        assert!(!off.try_acquire_at(1), "max=0 never admits in any hour");
+    }
+
+    /// A Degraded verdict on a job carrying an `l2_fp_feed` reaches the
+    /// adaptive gate: with min_samples=1 a single confirmed FP raises the
+    /// class threshold. An Unclear verdict feeds nothing.
+    #[tokio::test]
+    async fn degraded_in_band_verdict_feeds_fp_estimator() {
+        use tt_cache::{AdaptiveClassThresholds, ClassThresholds, FpGateTuning, TaskClass};
+        let gate = Arc::new(AdaptiveClassThresholds::new(
+            ClassThresholds::new(),
+            FpGateTuning::new(1.0, 1, 0.005),
+        ));
+        let class = Some(TaskClass::ChatCompletions);
+        let before = gate.effective_threshold(class);
+
+        let mut job = job_with(ReferenceSource::Ready("reference".to_string()), "degraded");
+        job.l2_fp_feed = Some(L2FpFeed {
+            gate: gate.clone(),
+            task_class: class,
+            tolerance_pct: 1.0,
+        });
+        run_job(job).await.expect("run_job ok");
+        let after = gate.effective_threshold(class);
+        assert!(
+            after > before,
+            "a judged Degraded in-band hit must raise the threshold (min_samples=1); \
+             {before} -> {after}"
+        );
+        assert_eq!(gate.raised_for(class), Some(after));
+
+        // Unclear: excluded from the denominator — the gate does not move.
+        let gate2 = Arc::new(AdaptiveClassThresholds::new(
+            ClassThresholds::new(),
+            FpGateTuning::new(1.0, 1, 0.005),
+        ));
+        let mut job = job_with(ReferenceSource::Ready("reference".to_string()), "unclear");
+        job.l2_fp_feed = Some(L2FpFeed {
+            gate: gate2.clone(),
+            task_class: class,
+            tolerance_pct: 1.0,
+        });
+        run_job(job).await.expect("run_job ok");
+        assert_eq!(
+            gate2.raised_for(class),
+            None,
+            "an Unclear verdict must feed nothing"
+        );
+    }
+
+    /// The recorded outcome carries the served entry id + hit similarity on
+    /// the L2 path, and None/None on the dispatch path — the durable
+    /// attribution columns of migration 0018.
+    #[tokio::test]
+    async fn l2_hit_judge_outcome_carries_entry_id_and_similarity() {
+        let (cache, id) = l2_with_one_entry().await;
+        let sink = Arc::new(RecordingSink::default());
+        let mut job = job_targeting_l2("acceptable", cache, id);
+        job.sink = sink.clone();
+        job.hit_similarity = Some(0.93);
+        run_job(job).await.expect("run_job ok");
+        {
+            let outcomes = sink.0.lock().unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].cache_entry_id, Some(id));
+            assert_eq!(outcomes[0].hit_similarity, Some(0.93));
+        }
+
+        // Dispatch path: no entry, no similarity.
+        let sink = Arc::new(RecordingSink::default());
+        let mut job = job_with(
+            ReferenceSource::Ready("reference".to_string()),
+            "acceptable",
+        );
+        job.sink = sink.clone();
+        run_job(job).await.expect("run_job ok");
+        let outcomes = sink.0.lock().unwrap();
+        assert_eq!(outcomes[0].cache_entry_id, None);
+        assert_eq!(outcomes[0].hit_similarity, None);
+    }
+
+    /// The unjudged spend-ledger path also carries the attribution columns —
+    /// a billed-but-unjudgeable L2-hit sample must still be attributable to
+    /// its entry.
+    #[tokio::test]
+    async fn unjudged_spend_row_carries_l2_attribution() {
+        let (cache, id) = l2_with_one_entry().await;
+        let sink = Arc::new(RecordingSink::default());
+        let mut job = job_targeting_l2("acceptable", cache, id);
+        job.sink = sink.clone();
+        job.hit_similarity = Some(0.93);
+        job.judge = Arc::new(FailingJudge);
+        run_job(job).await.expect_err("judge failure propagates");
+        let outcomes = sink.0.lock().unwrap();
+        assert_eq!(outcomes.len(), 1, "the attempted spend is ledgered");
+        assert_eq!(outcomes[0].cache_entry_id, Some(id));
+        assert_eq!(outcomes[0].hit_similarity, Some(0.93));
     }
 }

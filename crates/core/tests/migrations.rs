@@ -141,6 +141,21 @@ fn migrator_includes_request_logs_batch_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_l2_verify_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let eighteenth = migrations
+        .iter()
+        .find(|m| m.version == 18)
+        .expect("migration version 18 not found");
+    let desc = eighteenth.description.to_lowercase();
+    assert!(
+        desc.contains("l2") || desc.contains("verify") || desc.contains("lexical"),
+        "migration 0018 description is '{}', expected to mention l2/verify/lexical",
+        eighteenth.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
