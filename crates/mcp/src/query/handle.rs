@@ -100,10 +100,13 @@ pub(crate) enum DataSource {
 ///   * is obtainable ONLY via [`HandleRegistry::resolve`], whose contents
 ///     come from operator boot config — never from tool arguments.
 ///
-/// Caller JSON can therefore only *select* data by alias; it can never
-/// *carry* data into the executor. Inline-offload (paying tokens for rows
-/// that are already resident in context, then paying again for the tool
-/// round-trip) is unrepresentable at this boundary.
+/// Caller JSON can therefore only *select* data by alias; no parameter can
+/// carry a dataset into the executor. Strictly: free-form SQL on Postgres
+/// handles can embed literals (`SELECT sum(x) FROM (VALUES ..)`), so inline
+/// data is not impossible — it is BOUNDED to `MAX_QUERY_BYTES` (4 KiB),
+/// which makes inline-offload (paying tokens for rows already resident in
+/// context, then paying again for the tool round-trip) economically
+/// pointless rather than merely discouraged.
 ///
 /// The invariant is pinned so it cannot regress silently:
 ///

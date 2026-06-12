@@ -2,8 +2,11 @@
 //! dataset and return ONLY the computed result.
 //!
 //! Enforcement order in [`Tool::call`]:
-//! 1. outer [`MAX_ARGS_BYTES`] gate on the serialized arguments (zero
-//!    parsing, zero I/O on rejection),
+//! 1. outer [`MAX_ARGS_BYTES`] gate on the serialized arguments — rejected
+//!    before any dataset I/O or query parsing. (The JSON-RPC transport has
+//!    necessarily parsed the request envelope by this point; the stdio
+//!    transport caps each request line at 1 MiB and HTTP caps bodies at
+//!    1 MiB, so that earlier parse is bounded too.)
 //! 2. typed deserialization into `RunQueryArgs` (every field cap fires),
 //! 3. alias resolution (unknown alias → InvalidParams, never echoing
 //!    registry internals),
@@ -120,7 +123,7 @@ impl Tool for RunQueryTool {
                     },
                     "aggregate": {
                         "type": "object",
-                        "description": "Aggregation spec for file datasets: { op: count|sum|avg|min|max|count_distinct, column?, where?: [{column, op: eq|ne|lt|lte|gt|gte, value}], group_by?: [..], limit? }. Mutually exclusive with `query`.",
+                        "description": "Aggregation spec for file datasets: { op: count|sum|avg|min|max|count_distinct, column?, where?: [{column, op: eq|ne|lt|lte|gt|gte, value}], group_by?: [..], limit? }. `limit` returns the FIRST N groups in group-key sort order — NOT top-N by aggregate value. An empty match still returns one row when group_by is absent (count 0, sum 0, avg/min/max null). Mutually exclusive with `query`.",
                         "properties": {
                             "op": { "type": "string", "enum": ["count", "sum", "avg", "min", "max", "count_distinct"] },
                             "column": { "type": "string", "maxLength": 128 },
@@ -143,9 +146,11 @@ impl Tool for RunQueryTool {
     }
 
     async fn call(&self, params: Value) -> Result<Value, McpError> {
-        // (1) Outer gate BEFORE any parsing or I/O: the whole arguments
-        // object is size-capped, so a smuggled data blob in any field (even
-        // an unknown one) is rejected without being looked at.
+        // (1) Outer gate BEFORE any dataset I/O or query parsing: the whole
+        // arguments object is size-capped, so a smuggled data blob in any
+        // field (even an unknown one) never reaches an executor. (The
+        // transport has already parsed the JSON-RPC envelope — that parse is
+        // bounded by the transport-level line/body caps, not by this gate.)
         let serialized_len = serde_json::to_string(&params)
             .map(|s| s.len())
             .unwrap_or(usize::MAX);
@@ -185,9 +190,14 @@ impl Tool for RunQueryTool {
             _ => None,
         };
 
-        // "miss" is also reported for Postgres handles (which have no cache
-        // at all) rather than inventing a fourth state.
-        let mut cache_state: &'static str = if verify { "bypass" } else { "miss" };
+        // Cache state for the meter. Postgres handles have NO cache at all —
+        // reported as "none" (not "miss") so a ledger consumer can tell
+        // "consulted and missed" from "uncacheable".
+        let mut cache_state: &'static str = match (&cache_key, verify) {
+            (None, _) => "none",
+            (Some(_), true) => "bypass",
+            (Some(_), false) => "miss",
+        };
 
         let mut verified: Option<bool> = None;
         let mut runs: Option<Vec<Value>> = None;
@@ -247,6 +257,15 @@ impl Tool for RunQueryTool {
         let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let result_bytes = rows_bytes(&outcome);
 
+        // On a cache hit NO rows are scanned (only a content-hash pass
+        // proving the file is byte-identical) — repeating the original run's
+        // count would over-state this call's scan work, so hits report null.
+        let rows_scanned = if cache_state == "hit" {
+            None
+        } else {
+            outcome.rows_scanned
+        };
+
         // Non-token execution meter: one call == one line. Never fatal.
         self.ledger.append(&LedgerEntry {
             ts: chrono::Utc::now().to_rfc3339(),
@@ -254,7 +273,7 @@ impl Tool for RunQueryTool {
             dataset: alias.as_str().to_owned(),
             kind: handle.kind_str(),
             wall_ms,
-            rows_scanned: outcome.rows_scanned,
+            rows_scanned,
             result_rows: outcome.rows.len(),
             result_bytes,
             cache: cache_state,
@@ -273,7 +292,7 @@ impl Tool for RunQueryTool {
             "verified": verified,
             "execution": {
                 "wall_ms": wall_ms,
-                "rows_scanned": outcome.rows_scanned,
+                "rows_scanned": rows_scanned,
                 "cache": cache_state,
                 "unit": "execution",
                 "priced_as_tokens": false
@@ -560,7 +579,8 @@ mod tests {
     }
 
     /// Postgres handles never produce cache entries: repeated identical
-    /// calls re-execute every time.
+    /// calls re-execute every time, and the meter reports cache "none"
+    /// (uncacheable), never "miss" (which would read as a 0% hit rate).
     #[tokio::test]
     async fn pg_results_are_never_cached() {
         use crate::query::handle::DataSource;
@@ -573,13 +593,54 @@ mod tests {
             DataSource::Postgres { pool },
         )]));
         let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("l.jsonl");
         let exec = FakeExecutor::new(vec![]);
-        let t = tool(registry, &dir.path().join("l.jsonl"), exec.clone());
+        let t = tool(registry, &ledger_path, exec.clone());
         let args = json!({ "dataset": "warehouse", "query": "SELECT 1" });
 
-        t.call(args.clone()).await.unwrap();
-        t.call(args).await.unwrap();
+        let v1 = t.call(args.clone()).await.unwrap();
+        let v2 = t.call(args).await.unwrap();
         assert_eq!(exec.calls(), 2, "pg calls must never be served from cache");
+        assert_eq!(v1["execution"]["cache"], "none");
+        assert_eq!(v2["execution"]["cache"], "none");
+
+        let text = std::fs::read_to_string(&ledger_path).unwrap();
+        for line in text.lines() {
+            let line: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(line["cache"], "none", "pg has no cache to hit OR miss");
+        }
+    }
+
+    /// Cache-hit lines must not repeat the original run's rows_scanned: no
+    /// rows are scanned on a hit (only a content-hash pass), so both the
+    /// envelope and the ledger report null — summing rows_scanned across
+    /// ledger lines must equal actual scan work.
+    #[tokio::test]
+    async fn cache_hit_reports_null_rows_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("l.jsonl");
+        let exec = FakeExecutor::new(vec![]);
+        let t = tool(file_registry(&dir), &ledger_path, exec.clone());
+        let args = json!({ "dataset": "orders", "aggregate": { "op": "count" } });
+
+        let v1 = t.call(args.clone()).await.unwrap();
+        assert_eq!(v1["execution"]["rows_scanned"], json!(4), "miss is exact");
+        let v2 = t.call(args).await.unwrap();
+        assert_eq!(v2["execution"]["cache"], "hit");
+        assert!(
+            v2["execution"]["rows_scanned"].is_null(),
+            "hit scanned nothing: {v2}"
+        );
+
+        let text = std::fs::read_to_string(&ledger_path).unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["rows_scanned"], json!(4));
+        assert!(lines[1]["rows_scanned"].is_null());
+        assert_eq!(lines[1]["cache"], "hit");
     }
 
     /// Ledger line: alias only (no path/root), exact file rows_scanned,

@@ -2,9 +2,14 @@
 //!
 //! 1. **Parser allowlist** ([`validate_sql`]): exactly one statement, and it
 //!    must be a `SELECT` / `WITH..SELECT`. The whole AST (CTEs, subqueries,
-//!    function args, table-valued functions) is walked and a denylist of
-//!    escape functions (`dblink*`, `pg_read_file`, `pg_read_binary_file`,
-//!    `pg_ls_dir`, `lo_import`, `lo_export`) rejected. The output type
+//!    function args, table-valued functions) is walked: data-modifying set
+//!    expressions (`WITH t AS (INSERT/UPDATE/DELETE/MERGE .. RETURNING ..)`)
+//!    and `SELECT INTO` are rejected, and a denylist of escape/recon
+//!    function families (`dblink*`, `pg_read_*`, `pg_ls_*`, `lo_*`,
+//!    `loread`/`lowrite`, `pg_stat_file`) is applied. The denylist is a
+//!    BLOCKLIST — defense in depth, not exhaustive: `READ ONLY` does not
+//!    block reads, so unlisted privileged reads are stopped only by the
+//!    operator-granted role (the real boundary, below). The output type
 //!    [`ValidatedSql`] has a private constructor — only the validator
 //!    produces one, so unvalidated SQL is unrepresentable at the execution
 //!    seam.
@@ -13,8 +18,13 @@
 //!    commit). READ ONLY blocks writes/`nextval()` even if a parser gap is
 //!    found.
 //! 3. **Result caps while streaming**: at most `max_result_rows + 1` rows
-//!    fetched; a running serialized-byte counter — exceeding either is a
-//!    hard `result_too_large` error, never truncation.
+//!    fetched; every cell's RAW wire size is charged against the byte budget
+//!    BEFORE decoding (a single oversized cell cannot drive a large decode
+//!    allocation), then a running serialized-byte counter — exceeding either
+//!    is a hard `result_too_large` error, never truncation. Residual: sqlx
+//!    materializes each wire row before we see it (bounded by Postgres'
+//!    ~1 GB field limit); the caps bound what is decoded and returned, not
+//!    sqlx's transient row buffer.
 //!
 //! The REAL boundary is the operator-granted role behind `dsn_env`: grant a
 //! dedicated read-only role (`default_transaction_read_only = on`, minimal
@@ -29,7 +39,7 @@ use std::ops::ControlFlow;
 
 use futures::TryStreamExt;
 use serde_json::Value;
-use sqlparser::ast::{Expr, ObjectName, Select, Statement, Visit, Visitor};
+use sqlparser::ast::{Expr, ObjectName, Query, Select, SetExpr, Statement, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlx::postgres::PgRow;
@@ -52,14 +62,21 @@ impl ValidatedSql {
     }
 }
 
-/// Escape functions that read files / dial out / write large objects.
+/// Escape/recon functions that read or list server files, dial out, or touch
+/// large objects. A BLOCKLIST (defense in depth, not exhaustive): `SET
+/// TRANSACTION READ ONLY` does NOT block reads, so anything missing here is
+/// stopped only by the operator-granted role — see module docs.
 fn denied_function(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
+    // dblink*: dials out. pg_read_*: file contents. pg_ls_*: directory
+    // listings (logdir/waldir/tmpdir/archive_statusdir — EXECUTE is granted
+    // to pg_monitor by default). lo_* + loread/lowrite: large-object I/O
+    // incl. server-side import/export. pg_stat_file: file existence/size.
     n.starts_with("dblink")
-        || matches!(
-            n.as_str(),
-            "pg_read_file" | "pg_read_binary_file" | "pg_ls_dir" | "lo_import" | "lo_export"
-        )
+        || n.starts_with("pg_read_")
+        || n.starts_with("pg_ls_")
+        || n.starts_with("lo_")
+        || matches!(n.as_str(), "pg_stat_file" | "loread" | "lowrite")
 }
 
 fn check_object_name(name: &ObjectName) -> ControlFlow<String> {
@@ -75,8 +92,34 @@ fn check_object_name(name: &ObjectName) -> ControlFlow<String> {
     ControlFlow::Continue(())
 }
 
+/// Rejects data-modifying set expressions. sqlparser parses
+/// `WITH t AS (DELETE FROM x RETURNING *) SELECT ..` as a single top-level
+/// `Statement::Query`, so the statement-kind gate alone cannot see the
+/// write; the CTE body surfaces as `SetExpr::Delete` (likewise
+/// Insert/Update/Merge). READ ONLY would block these at runtime too — this
+/// keeps the parser layer's "only SELECT" promise honest. Set operations
+/// are recursed; nested `Query` bodies re-enter via `pre_visit_query`.
+fn deny_writing_set_expr(expr: &SetExpr) -> ControlFlow<String> {
+    match expr {
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {
+            ControlFlow::Break(
+                "data-modifying statements (INSERT/UPDATE/DELETE/MERGE) are not allowed, \
+                 including inside WITH (CTE) bodies"
+                    .into(),
+            )
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            deny_writing_set_expr(left)?;
+            deny_writing_set_expr(right)
+        }
+        SetExpr::Select(_) | SetExpr::Query(_) | SetExpr::Values(_) | SetExpr::Table(_) => {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
 /// Walks the full AST (including CTEs and subqueries) rejecting denylisted
-/// functions and `SELECT INTO`.
+/// functions, `SELECT INTO`, and data-modifying set expressions.
 struct DenyVisitor;
 
 impl Visitor for DenyVisitor {
@@ -101,6 +144,24 @@ impl Visitor for DenyVisitor {
             return ControlFlow::Break("SELECT INTO is not allowed".into());
         }
         ControlFlow::Continue(())
+    }
+
+    /// Every `Query` node (top level, CTE bodies, subqueries) flows through
+    /// here: its body must be a read-only set expression.
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<String> {
+        deny_writing_set_expr(&query.body)
+    }
+
+    /// Belt and braces: the only statement `validate_sql` lets through is
+    /// the single top-level `Statement::Query`, so any OTHER statement the
+    /// walker reaches is nested (e.g. a data-modifying CTE payload) —
+    /// rejected outright.
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<String> {
+        if matches!(statement, Statement::Query(_)) {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break("only SELECT statements are allowed".into())
+        }
     }
 }
 
@@ -211,6 +272,26 @@ pub(crate) async fn run(
             }
             if columns.is_empty() {
                 columns = row.columns().iter().map(|c| c.name().to_owned()).collect();
+            }
+            // Pre-decode byte guard: charge every cell's RAW wire size
+            // against the byte budget BEFORE decoding, so one oversized cell
+            // (e.g. `repeat('x', 500000000)`) is rejected without a second
+            // huge decode allocation — and types that decode to a short
+            // marker (e.g. bytea) cannot smuggle a huge fetch under the cap.
+            // (sqlx has already buffered the wire row; that transient is
+            // bounded by Postgres' ~1 GB field limit and is not observable
+            // from here — this bounds what WE decode and return.)
+            let raw_bytes: usize = (0..row.columns().len())
+                .map(|i| {
+                    row.try_get_raw(i)
+                        .ok()
+                        .filter(|raw| !raw.is_null())
+                        .and_then(|raw| raw.as_bytes().ok().map(<[u8]>::len))
+                        .unwrap_or(0)
+                })
+                .sum();
+            if bytes + raw_bytes > limits.max_result_bytes {
+                return Err(result_too_large("bytes", limits.max_result_bytes));
             }
             let jrow: Vec<Value> = (0..row.columns().len())
                 .map(|i| decode_col(&row, i))
@@ -345,6 +426,74 @@ mod tests {
         }
     }
 
+    /// Data-modifying CTEs parse as a top-level `Statement::Query`
+    /// (`SetExpr::Insert/Update/Delete`), so the statement-kind gate alone
+    /// would pass them — the visitor must reject them THROUGH the real
+    /// `validate_sql` entry point.
+    #[test]
+    fn rejects_data_modifying_ctes_through_the_real_gate() {
+        for bad in [
+            "WITH t AS (DELETE FROM orders RETURNING *) SELECT * FROM t",
+            "WITH t AS (INSERT INTO audit VALUES (1) RETURNING *) SELECT * FROM t",
+            "WITH t AS (UPDATE orders SET a = 1 RETURNING *) SELECT * FROM t",
+            // buried among innocent CTEs
+            "WITH a AS (SELECT 1), b AS (DELETE FROM t RETURNING *) SELECT * FROM a, b",
+            // nested inside a CTE's own WITH
+            "WITH t AS (WITH u AS (DELETE FROM x RETURNING *) SELECT * FROM u) SELECT * FROM t",
+        ] {
+            let err = validate(bad).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not allowed") || msg.contains("rejected"),
+                "{bad} must be rejected: {msg}"
+            );
+        }
+    }
+
+    /// Plain read-only CTEs (incl. set operations) still pass.
+    #[test]
+    fn read_only_ctes_and_set_operations_still_pass() {
+        for ok in [
+            "WITH t AS (SELECT 1 AS x) SELECT * FROM t",
+            "WITH t AS (SELECT 1 UNION ALL SELECT 2) SELECT count(*) FROM t",
+            "SELECT 1 UNION SELECT 2",
+        ] {
+            assert!(validate(ok).is_ok(), "{ok} should pass");
+        }
+    }
+
+    /// VALUES literals remain representable — by design this inline channel
+    /// is size-capped at MAX_QUERY_BYTES (4 KiB, useless as a data channel),
+    /// not denied. Pinned so the docs' "bounded, not unrepresentable"
+    /// framing stays true to the code.
+    #[test]
+    fn values_literals_remain_allowed_and_size_capped() {
+        assert!(validate("SELECT sum(x) FROM (VALUES (1), (2), (3)) v(x)").is_ok());
+    }
+
+    #[test]
+    fn rejects_filesystem_recon_and_large_object_functions() {
+        for bad in [
+            "SELECT * FROM pg_ls_waldir()",
+            "SELECT * FROM pg_ls_logdir()",
+            "SELECT * FROM pg_ls_tmpdir()",
+            "SELECT * FROM pg_ls_archive_statusdir()",
+            "SELECT pg_stat_file('/etc/passwd')",
+            "SELECT lo_get(1234)",
+            "SELECT loread(lo_open(1234, 262144), 1000000)",
+            "SELECT lowrite(0, 'x')",
+            // case-insensitive
+            "SELECT PG_STAT_FILE('/x')",
+        ] {
+            let err = validate(bad).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not allowed") || msg.contains("rejected"),
+                "{bad} must be denylisted, got: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn rejects_select_into() {
         let err = validate("SELECT * INTO newtab FROM t").unwrap_err();
@@ -455,6 +604,23 @@ mod tests {
             ..QueryLimits::default()
         };
         let sql = validate("SELECT generate_series(1, 100000)").unwrap();
+        let err = run(&pool, &sql, &limits).await.unwrap_err();
+        assert!(err.to_string().contains("result_too_large"), "{err}");
+    }
+
+    /// A single oversized cell is rejected on its RAW wire size before any
+    /// decode allocation. bytea decodes to a short `<unsupported>` marker,
+    /// so without the raw pre-check this query would sail under the byte
+    /// cap while having fetched ~100 KB.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL (Postgres) — run with --include-ignored"]
+    async fn oversized_single_cell_rejected_on_raw_size_before_decode() {
+        let pool = test_pool().await;
+        let limits = QueryLimits {
+            max_result_bytes: 1024,
+            ..QueryLimits::default()
+        };
+        let sql = validate("SELECT repeat('x', 100000)::bytea").unwrap();
         let err = run(&pool, &sql, &limits).await.unwrap_err();
         assert!(err.to_string().contains("result_too_large"), "{err}");
     }

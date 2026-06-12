@@ -20,7 +20,13 @@
 //!    ≤ 4096 B, [`bounded::BoundedStr`] fields in
 //!    [`spec::AggregationSpec`]).
 //! 3. An outer [`bounded::MAX_ARGS_BYTES`] gate on the serialized arguments
-//!    object rejects any smuggled blob before parsing or I/O.
+//!    object rejects any smuggled blob before any dataset I/O or query
+//!    parsing (the transport has already parsed the JSON-RPC envelope —
+//!    bounded by the 1 MiB stdio line / HTTP body caps).
+//!
+//! Strictly, "type-level" means *bounded*, not impossible: SQL on a
+//! Postgres handle can embed literals (`VALUES ..`) — capped at 4 KiB,
+//! which deletes the economics of inline-offload rather than the syntax.
 //!
 //! # Security model (threat: the caller is an LLM agent; its arguments are
 //! attacker-influencable via prompt injection)

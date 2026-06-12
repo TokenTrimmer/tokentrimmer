@@ -1,6 +1,11 @@
 //! Streaming CSV/JSONL aggregation executor.
 //!
 //! O(1)-per-row memory (group state only), never materializes the file.
+//! `count_distinct` retention is doubly budgeted: at most
+//! [`MAX_DISTINCT_VALUES`] distinct values per group AND at most
+//! [`MAX_TOTAL_DISTINCT_VALUES`] retained across all groups — the per-group
+//! and group-count ceilings are independent, so without the total budget
+//! their product would be an OOM.
 //! Re-canonicalizes the path and re-checks containment under the
 //! operator-allowlisted root at EVERY call (symlink-swap defense; the
 //! residual open-vs-check TOCTOU is accepted residual risk, see module docs
@@ -20,8 +25,45 @@ use super::handle::FileFormat;
 use super::spec::{AggOp, AggregationSpec, CmpOp, Predicate};
 use super::{result_too_large, QueryLimits, QueryOutcome, MAX_RESULT_ROWS_CEILING};
 
-/// Memory guard for `count_distinct` accumulation.
+/// Memory guard for `count_distinct` accumulation, PER GROUP.
 const MAX_DISTINCT_VALUES: usize = 100_000;
+
+/// Memory guard for `count_distinct` accumulation, summed ACROSS ALL groups.
+/// The per-group cap and the group-cardinality cap
+/// ([`MAX_RESULT_ROWS_CEILING`]) are otherwise independent — their product
+/// (10_000 × 100_000 ≈ 1e9 retained strings) would be an OOM on a
+/// high-cardinality dataset, so total retention is budgeted too.
+const MAX_TOTAL_DISTINCT_VALUES: usize = 1_000_000;
+
+/// Shared budget for total distinct values retained across all groups.
+struct DistinctBudget {
+    used: usize,
+    cap: usize,
+}
+
+impl DistinctBudget {
+    fn new() -> Self {
+        Self {
+            used: 0,
+            cap: MAX_TOTAL_DISTINCT_VALUES,
+        }
+    }
+
+    /// Charge one newly-retained distinct value (duplicates are free —
+    /// callers only charge on actual insertion).
+    fn charge_one(&mut self) -> Result<(), McpError> {
+        if self.used >= self.cap {
+            return Err(McpError::InvalidParams(format!(
+                "count_distinct retains more than {} distinct values across all groups; \
+                 narrow the query with `where` predicates or lower-cardinality \
+                 `group_by`/`column` choices",
+                self.cap
+            )));
+        }
+        self.used += 1;
+        Ok(())
+    }
+}
 
 /// One parsed input row, as column → string value lookups.
 trait Row {
@@ -101,7 +143,13 @@ impl Accum {
     /// Feed one row's target value (`None` for plain `count`, which needs no
     /// column). Returns `false` when the value was unusable (non-numeric for
     /// a numeric op) so the caller can count the row as skipped.
-    fn feed(&mut self, value: Option<&str>) -> Result<bool, McpError> {
+    /// `distinct_budget` is the cross-group retention budget; only
+    /// `count_distinct` charges it, and only for newly-retained values.
+    fn feed(
+        &mut self,
+        value: Option<&str>,
+        distinct_budget: &mut DistinctBudget,
+    ) -> Result<bool, McpError> {
         match self {
             Self::Count(n) => {
                 *n += 1;
@@ -138,13 +186,16 @@ impl Accum {
             },
             Self::CountDistinct(set) => match value {
                 Some(v) => {
-                    if set.len() >= MAX_DISTINCT_VALUES && !set.contains(v) {
-                        return Err(McpError::InvalidParams(format!(
-                            "count_distinct cardinality exceeds {MAX_DISTINCT_VALUES}; \
-                             narrow the query with `where` predicates"
-                        )));
+                    if !set.contains(v) {
+                        if set.len() >= MAX_DISTINCT_VALUES {
+                            return Err(McpError::InvalidParams(format!(
+                                "count_distinct cardinality exceeds {MAX_DISTINCT_VALUES}; \
+                                 narrow the query with `where` predicates"
+                            )));
+                        }
+                        distinct_budget.charge_one()?;
+                        set.insert(v.to_owned());
                     }
-                    set.insert(v.to_owned());
                     Ok(true)
                 }
                 None => Ok(false),
@@ -270,6 +321,9 @@ struct AggState<'a> {
     groups: BTreeMap<Vec<String>, Accum>,
     rows_scanned: u64,
     skipped: u64,
+    /// Cross-group `count_distinct` retention budget (the per-group and
+    /// group-count ceilings alone would multiply to ~1e9 retained strings).
+    distinct_budget: DistinctBudget,
 }
 
 impl<'a> AggState<'a> {
@@ -279,7 +333,16 @@ impl<'a> AggState<'a> {
             groups: BTreeMap::new(),
             rows_scanned: 0,
             skipped: 0,
+            distinct_budget: DistinctBudget::new(),
         }
+    }
+
+    /// Test hook: shrink the cross-group budget so the guard is exercisable
+    /// without retaining a million strings.
+    #[cfg(test)]
+    fn with_total_distinct_cap(mut self, cap: usize) -> Self {
+        self.distinct_budget.cap = cap;
+        self
     }
 
     fn skip(&mut self) {
@@ -344,7 +407,7 @@ impl<'a> AggState<'a> {
             .groups
             .entry(key)
             .or_insert_with(|| Accum::new(self.spec.op));
-        if !acc.feed(value.as_deref())? {
+        if !acc.feed(value.as_deref(), &mut self.distinct_budget)? {
             // Non-numeric value for a numeric op: surfaced, not dropped.
             self.skipped += 1;
         }
@@ -587,6 +650,48 @@ this is not json
         let s = spec(json!({"op":"count","group_by":["id"]}));
         let err = run_csv(&csv, s, &limits).unwrap_err();
         assert!(err.to_string().contains("result_too_large"), "{err}");
+    }
+
+    /// The 100k-per-group and 10k-group guards are independent — only the
+    /// TOTAL budget stops `groups × distinct` from multiplying into an OOM.
+    /// Exercised directly on AggState with a shrunken cap.
+    #[test]
+    fn total_distinct_budget_caps_retention_across_groups() {
+        let s = spec(json!({"op":"count_distinct","column":"v","group_by":["g"]}));
+        let limits = QueryLimits::default();
+        let mut state = AggState::new(&s, &limits).with_total_distinct_cap(10);
+
+        let mut err = None;
+        'outer: for g in 0..5 {
+            for v in 0..5 {
+                let row = json!({ "g": format!("g{g}"), "v": format!("v{v}") });
+                let Value::Object(map) = row else {
+                    unreachable!()
+                };
+                if let Err(e) = state.feed(&JsonRow(&map)) {
+                    err = Some(e);
+                    break 'outer;
+                }
+            }
+        }
+        let err = err.expect("25 retained values must exceed the cap of 10");
+        let msg = err.to_string();
+        assert!(msg.contains("across all groups"), "{msg}");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+
+        // Duplicates are budget-free: 5 distinct values fed 10 times each
+        // stay within a cap of exactly 5.
+        let s = spec(json!({"op":"count_distinct","column":"v"}));
+        let mut state = AggState::new(&s, &limits).with_total_distinct_cap(5);
+        for _ in 0..10 {
+            for v in 0..5 {
+                let row = json!({ "v": format!("v{v}") });
+                let Value::Object(map) = row else {
+                    unreachable!()
+                };
+                state.feed(&JsonRow(&map)).expect("duplicates are free");
+            }
+        }
     }
 
     #[test]

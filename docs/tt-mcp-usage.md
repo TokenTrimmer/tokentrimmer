@@ -50,13 +50,20 @@ query-offload tools keep the DATA external and return only the COMPUTED
 RESULT, deleting the data token class. (The trap is the opposite: pasting
 rows into the prompt and then "offloading" compute over them is *worse* than
 doing nothing — you pay the rows AND the tool round-trip. The tool's input
-types make that unrepresentable, see below.)
+types leave that no useful channel: data can only be *named* by alias, and
+every caller string is size-capped, so at most 4 KiB of literals can ever
+reach an executor — useless as a data channel. See below.)
 
 - `run_query` — run a bounded query against an operator-registered dataset:
   a single read-only `SELECT` for `postgres` datasets, or a structured
   aggregation (`count`/`sum`/`avg`/`min`/`max`/`count_distinct` with bounded
   `where`/`group_by`) for `file` (CSV/JSONL) datasets. Only the computed
-  result enters context.
+  result enters context. Aggregation semantics worth knowing:
+  `aggregate.limit` returns the **first N groups in group-key (alphabetical)
+  order** — not top-N by aggregate value; an empty match without `group_by`
+  still returns one row (`count` 0, `sum` 0, `avg`/`min`/`max` `null` —
+  note `sum` keeps the mathematical empty-sum-is-0 convention, where SQL
+  would return `NULL`).
 - `list_datasets` — the registered aliases (kind, format, description, CSV
   columns). Never returns paths, roots, or DSN material.
 
@@ -109,11 +116,17 @@ The MCP caller is an LLM agent; its arguments are attacker-influencable
   required `files.root`, canonicalized at boot AND at every call with a
   containment check (symlink-swap defense).
 - **Postgres datasets** — a sqlparser allowlist (exactly one
-  `SELECT`/`WITH..SELECT`; escape functions like `dblink*`, `pg_read_file`,
-  `pg_ls_dir`, `lo_import`/`lo_export` rejected anywhere in the AST), then a
-  `READ ONLY` transaction with `SET LOCAL statement_timeout`, streamed
-  row/byte caps, and an unconditional `ROLLBACK`. **The real boundary is the
-  role behind `dsn_env`**: point it at a dedicated read-only role
+  `SELECT`/`WITH..SELECT`; data-modifying CTE bodies like
+  `WITH t AS (INSERT/UPDATE/DELETE/MERGE .. RETURNING ..)` and `SELECT INTO`
+  rejected; escape/recon function families — `dblink*`, `pg_read_*`,
+  `pg_ls_*`, `pg_stat_file`, `lo_*`/`loread`/`lowrite` — rejected anywhere
+  in the AST; that denylist is defense in depth, **not exhaustive**: `READ
+  ONLY` does not block reads, so unlisted privileged reads are stopped only
+  by the role), then a `READ ONLY` transaction with `SET LOCAL
+  statement_timeout`, streamed row/byte caps (every cell's raw wire size is
+  charged against the byte budget before it is even decoded), and an
+  unconditional `ROLLBACK`. **The real boundary is the role behind
+  `dsn_env`**: point it at a dedicated read-only role
   (`default_transaction_read_only = on`, minimal grants) — the parser and
   transaction layers are defense in depth, not a substitute.
 - **Hard result caps, never truncation** — a result over `max_result_rows`
@@ -152,8 +165,16 @@ cache, verify, verified, unit: "execution", priced_as_tokens: false}`.
 Execution cost is a **distinct non-token cost class** — nothing converts it
 to USD or token counts; `rows_scanned` is exact for file scans and `null`
 for Postgres (no honest number exists in the MVP, so none is fabricated).
-Ledger write failures are logged and never fail the call. The ledger is
-readable via the `mcp://tokentrimmer/query-ledger/recent` resource.
+Cache-hit lines also carry `rows_scanned: null` — a hit scans nothing (the
+file is only re-hashed to prove byte-identity), so summing `rows_scanned`
+over ledger lines equals actual scan work. `cache` is
+`hit`/`miss`/`bypass` for file datasets and `none` for Postgres (no cache
+exists for live databases — `none` means *uncacheable*, not a 0% hit rate).
+Failed executions (e.g. a statement-timeout abort) currently write **no**
+ledger line — execution cost is under-counted for errored calls, never
+over-counted (recorded follow-up). Ledger write failures are logged and
+never fail the call. The ledger is readable via the
+`mcp://tokentrimmer/query-ledger/recent` resource.
 
 Results for **file** datasets are cached in-process, keyed on the blake3
 hash of the file content plus the canonical query spec — any byte change to
@@ -175,7 +196,9 @@ content fingerprint a cache would serve stale wrong numbers.
 | HTTP+SSE | `tt mcp --transport sse` | **deprecated** | legacy clients only (MCP spec 2024-11-05) |
 
 The stdio transport (default) requires no token — it communicates over the
-parent-process pipe and is not exposed over the network.
+parent-process pipe and is not exposed over the network. Each stdio request
+line is capped at 1 MiB (mirroring the HTTP body cap): an oversized line is
+drained without being buffered or parsed and answered with a parse error.
 
 ### Streamable HTTP (recommended HTTP transport)
 

@@ -28,11 +28,14 @@ pub struct LedgerEntry {
     /// `"file"` or `"postgres"`.
     pub kind: &'static str,
     pub wall_ms: u64,
-    /// Exact for file scans; `None` (JSON `null`) for Postgres — honest.
+    /// Exact for file scans; `None` (JSON `null`) for Postgres AND for
+    /// cache hits (a hit scans nothing — only a content-hash pass) — honest.
     pub rows_scanned: Option<u64>,
     pub result_rows: usize,
     pub result_bytes: usize,
-    /// `"hit"`, `"miss"`, or `"bypass"` (verify mode bypasses the cache).
+    /// `"hit"`, `"miss"`, `"bypass"` (verify mode bypasses the cache), or
+    /// `"none"` (Postgres: no cache exists for this kind — not a 0% hit
+    /// rate).
     pub cache: &'static str,
     pub verify: bool,
     /// `Some(true/false)` when `verify` ran; `None` otherwise.

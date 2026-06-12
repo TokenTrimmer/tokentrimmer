@@ -17,8 +17,11 @@ use serde::Deserialize;
 pub const MAX_QUERY_BYTES: usize = 4096;
 
 /// Outer gate on the whole serialized `arguments` object of a `run_query`
-/// call. Checked before typed deserialization, so a smuggled blob is
-/// rejected with zero parsing and zero I/O.
+/// call. Checked before typed deserialization, so a smuggled blob never
+/// reaches field handling or an executor. (The JSON-RPC transport has
+/// already parsed the request envelope by then — that earlier parse is
+/// bounded by the transport-level caps: 1 MiB per stdio line, 1 MiB per
+/// HTTP body.)
 pub const MAX_ARGS_BYTES: usize = 8192;
 
 /// Max number of `where` predicates in an aggregation spec.
