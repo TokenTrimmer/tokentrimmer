@@ -286,7 +286,6 @@ pub mod postgres {
                 .bind(row.batch_eligible) // $29
                 .bind(row.batch_forgone_usd) // $30
                 .bind(row.route_paused) // $31
-                .bind(row.route_paused) // $29
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;

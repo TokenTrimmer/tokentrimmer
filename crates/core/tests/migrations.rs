@@ -419,3 +419,81 @@ async fn request_log_insert_round_trips_batch_columns() {
         .await
         .expect("cleanup");
 }
+
+/// DB-gated T0: the FULL `PostgresRequestLogWriter::write` bind chain executes
+/// against a real Postgres and the row round-trips. The parser-based
+/// `insert_sql_column_placeholder_bind_counts_match` guard only checks the SQL
+/// STRING; it cannot see the `.bind(...)` chain itself — #163 shipped a stray
+/// duplicate bind (32 binds against 31 placeholders) that the string guard
+/// could not catch. (Empirically, sqlx 0.8 silently IGNORES surplus binds
+/// beyond the prepared statement's parameter count, so that wart was benign in
+/// production — but a chain that is short, mis-ordered, or type-mismatched is
+/// NOT benign, and only a real round-trip exercises it.) This test pins the
+/// chain itself.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn request_logs_insert_round_trips_against_postgres() {
+    use tt_telemetry::request_logs::{
+        postgres::PostgresRequestLogWriter, RequestLogRow, RequestLogWriter,
+    };
+    use uuid::Uuid;
+
+    let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+    tt_core::migrate_only(&url).await.expect("migrate");
+    let pool = tt_core::connect(&url, 2).await.expect("connect");
+    let writer = PostgresRequestLogWriter::new(pool.clone());
+
+    let row = RequestLogRow {
+        id: Uuid::now_v7(),
+        org_id: Uuid::nil(),
+        api_key_id: Uuid::nil(),
+        ts: chrono::Utc::now(),
+        provider: "test-provider".into(),
+        model: "test-1".into(),
+        input_tokens: 100,
+        output_tokens: 50,
+        cached_tokens: 0,
+        cost_usd: 0.0045,
+        baseline_cost_usd: 0.0045,
+        provider_cache_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
+        cached: false,
+        cache_layer: None,
+        route_id: None,
+        latency_ms: 800,
+        upstream_latency_ms: Some(750),
+        status: 200,
+        tag: Some("db-t0-bind-chain".into()),
+        error_class: None,
+        trace_id: Some("trace-t0".into()),
+        truncated: false,
+        shadow_model: None,
+        shadow_cost_usd: None,
+        traffic_split_arm: None,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+        batch_eligible: false,
+        batch_forgone_usd: 0.0,
+        route_paused: true,
+    };
+    let id = row.id;
+    writer
+        .write(row)
+        .await
+        .expect("PostgresRequestLogWriter::write must succeed (bind chain == placeholders)");
+
+    let (provider, route_paused) = sqlx::query_as::<_, (String, bool)>(
+        "SELECT provider, route_paused FROM request_logs WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch row");
+    assert_eq!(provider, "test-provider");
+    assert!(route_paused, "route_paused=true must survive write→read");
+
+    sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}
