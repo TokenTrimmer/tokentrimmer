@@ -469,6 +469,8 @@ mod tests {
 
     fn outcome(org: Uuid, route_id: Option<Uuid>, verdict: JudgeVerdict) -> JudgeOutcome {
         JudgeOutcome {
+            cache_entry_id: None,
+            hit_similarity: None,
             org_id: org,
             route_id,
             requested_model: "gpt-4o".into(),
