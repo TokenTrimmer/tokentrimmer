@@ -21,8 +21,8 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::InMemorySpanExporter;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::prelude::*;
 
 use tt_core::{build_router, AppState, ProviderRegistry};
@@ -136,9 +136,9 @@ fn chat_request(traceparent: Option<&str>) -> Request<Body> {
 /// A current-thread runtime keeps the whole request on this thread so the
 /// thread-local subscriber installed by `with_default` is in scope for the
 /// polled future as well.
-fn run_request_capturing_span(req: Request<Body>) -> opentelemetry_sdk::export::trace::SpanData {
+fn run_request_capturing_span(req: Request<Body>) -> opentelemetry_sdk::trace::SpanData {
     let exporter = InMemorySpanExporter::default();
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
     let tracer = provider.tracer("traceparent-test");
@@ -156,7 +156,7 @@ fn run_request_capturing_span(req: Request<Body>) -> opentelemetry_sdk::export::
     });
 
     // Spans export on close; the request span closed when the future finished.
-    provider.force_flush();
+    provider.force_flush().expect("force_flush should succeed");
     let spans = exporter.get_finished_spans().expect("finished spans");
     spans
         .into_iter()

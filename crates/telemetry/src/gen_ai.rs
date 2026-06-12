@@ -365,8 +365,8 @@ mod tests {
     use super::*;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry::Value;
-    use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
-    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use std::collections::HashMap;
     use tracing_subscriber::prelude::*;
 
@@ -386,7 +386,7 @@ mod tests {
     /// recorded on the single exported span as a name→Value map.
     fn capture_attributes(f: impl FnOnce(&Span)) -> HashMap<String, Value> {
         let exporter = InMemorySpanExporter::default();
-        let provider = TracerProvider::builder()
+        let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
         let tracer = provider.tracer("gen-ai-test");
@@ -399,7 +399,7 @@ mod tests {
             f(&span);
         });
 
-        provider.force_flush();
+        provider.force_flush().expect("force_flush should succeed");
         let spans = exporter.get_finished_spans().expect("finished spans");
         let span = spans
             .into_iter()

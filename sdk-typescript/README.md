@@ -38,6 +38,15 @@ console.log(`trace ${response.tt.traceId}`);
 
 The class is an `openai.OpenAI` subclass — every other method (`embeddings`, `models`, tools, vision) works unchanged.
 
+### `openai` version compatibility
+
+The wrapper depends on `openai@"^5.0.0 || ^6.0.0"` and its full test suite passes
+against both majors (CI locks and tests the v6 line). Because the class subclasses
+`openai.OpenAI`, your app's `openai` version is effectively coupled to this range:
+either major dedupes cleanly with an app that pins `^5` or `^6`. If you pin `openai`
+yourself, prefer `^6` — that is the resolution this package is locked and tested
+against day-to-day.
+
 ### Streaming
 
 Streaming works as usual; per-request cost is on the stream's `.tt` once it's drained (the Gateway's terminal usage frame is stripped, so chunk iteration is clean):

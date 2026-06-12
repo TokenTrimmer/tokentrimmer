@@ -55,7 +55,8 @@ sha2.workspace = true
 dialoguer.workspace = true
 toml.workspace = true
 chrono.workspace = true
-crossterm = "0.28"
+rustls.workspace = true
+crossterm = "0.29"
 console = "0.15"
 comfy-table = { version = "7", features = ["custom_styling"] }
 indicatif = "0.17"
