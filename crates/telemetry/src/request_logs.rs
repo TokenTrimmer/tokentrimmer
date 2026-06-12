@@ -140,6 +140,26 @@ pub struct RequestLogRow {
     /// rows from before migration 0019 (mirror of `truncated`).
     #[serde(default)]
     pub route_paused: bool,
+    /// ESTIMATED saving from minified-JSON output steering
+    /// (`RouteAction::minify_json`, research Phase 3.1, migration 0020): the
+    /// pretty-printed re-rendering of the emitted JSON re-tokenized with the
+    /// served model's tokenizer, minus the tokens actually emitted, priced at
+    /// the billed output rate (fee-applied). An ESTIMATE of an unmeasurable
+    /// counterfactual: NEVER part of `cost_usd` / `baseline_cost_usd` / the
+    /// saved-usd headline (those reconcile against the provider invoice).
+    /// `0.0` when the instruction was not injected, when the response was not
+    /// valid JSON, for streaming responses (v1 meters but does not estimate),
+    /// TT cache hits, and rows predating migration 0020 (zero omitted on
+    /// serialize so legacy row JSON stays byte-identical).
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
+    pub minify_saved_est_usd: f64,
+}
+
+/// `skip_serializing_if` helper: the minify estimate column is omitted from
+/// serialized rows when zero, keeping pre-0020 row JSON byte-identical.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn f64_is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Errors returned by [`RequestLogWriter`].
@@ -232,7 +252,8 @@ pub mod postgres {
                       shadow_model, shadow_cost_usd, traffic_split_arm,
                       cache_read_input_tokens, cache_creation_input_tokens,
                       batch_eligible, batch_forgone_usd,
-                      route_paused)
+                      route_paused,
+                      minify_saved_est_usd)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -245,11 +266,12 @@ pub mod postgres {
                       $24, $25, $26,
                       $27, $28,
                       $29, $30,
-                      $31)"#;
+                      $31,
+                      $32)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 31;
+    pub const INSERT_BIND_COUNT: usize = 32;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -286,6 +308,7 @@ pub mod postgres {
                 .bind(row.batch_eligible) // $29
                 .bind(row.batch_forgone_usd) // $30
                 .bind(row.route_paused) // $31
+                .bind(row.minify_saved_est_usd) // $32
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -331,6 +354,7 @@ mod tests {
             batch_eligible: false,
             batch_forgone_usd: 0.0,
             route_paused: false,
+            minify_saved_est_usd: 0.0,
         }
     }
 
@@ -554,6 +578,55 @@ mod tests {
         let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
         assert!(!row.batch_eligible, "pre-0017 rows default to ineligible");
         assert_eq!(row.batch_forgone_usd, 0.0, "pre-0017 rows forgo nothing");
+    }
+
+    /// The minify estimate column (migration 0020) round-trips through the
+    /// writer in its OWN field — an ESTIMATE of an unmeasurable counterfactual,
+    /// never folded into `cost_usd`.
+    #[tokio::test]
+    async fn in_memory_round_trips_minify_estimate() {
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.02;
+        row.minify_saved_est_usd = 0.0031;
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert!((got.minify_saved_est_usd - 0.0031).abs() < 1e-12);
+        assert!((got.cost_usd - 0.02).abs() < 1e-12, "cost untouched");
+    }
+
+    /// Legacy JSON (rows serialized before migration 0020) deserializes with
+    /// `minify_saved_est_usd = 0.0`, and a zero estimate is omitted on
+    /// re-serialize — pre-0020 row JSON stays byte-identical.
+    #[test]
+    fn minify_column_serde_backward_compat() {
+        let legacy = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "org_id":"00000000-0000-0000-0000-000000000000",
+            "api_key_id":"00000000-0000-0000-0000-000000000000",
+            "ts":"2026-06-09T00:00:00Z",
+            "provider":"openai","model":"gpt-4o",
+            "input_tokens":1,"output_tokens":1,"cached_tokens":0,
+            "cost_usd":0.0,"baseline_cost_usd":0.0,
+            "cached":false,"cache_layer":null,"route_id":null,
+            "latency_ms":1,"upstream_latency_ms":null,"status":200,
+            "tag":null,"error_class":null,"trace_id":null
+        }"#;
+        let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            row.minify_saved_est_usd, 0.0,
+            "pre-0020 rows must default to 0.0 (nothing estimated)"
+        );
+        let j = serde_json::to_string(&row).unwrap();
+        assert!(
+            !j.contains("minify_saved_est_usd"),
+            "zero estimate must be omitted on serialize: {j}"
+        );
+        // A nonzero estimate IS serialized.
+        let mut row2 = sample_row();
+        row2.minify_saved_est_usd = 0.001;
+        let j2 = serde_json::to_string(&row2).unwrap();
+        assert!(j2.contains("minify_saved_est_usd"), "{j2}");
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the

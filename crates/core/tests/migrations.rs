@@ -156,6 +156,21 @@ fn migrator_includes_l2_verify_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_request_logs_minify_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let twentieth = migrations
+        .iter()
+        .find(|m| m.version == 20)
+        .expect("migration version 20 not found");
+    let desc = twentieth.description.to_lowercase();
+    assert!(
+        desc.contains("minify"),
+        "migration 0020 description is '{}', expected to mention minify",
+        twentieth.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -274,6 +289,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused: false,
+        minify_saved_est_usd: 0.0,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");
@@ -376,6 +392,7 @@ async fn request_log_insert_round_trips_batch_columns() {
         cache_creation_input_tokens: None,
         batch_eligible: true,
         batch_forgone_usd: 0.0125,
+        minify_saved_est_usd: 0.0,
     };
     let marked_id = marked.id;
     writer.write(marked.clone()).await.expect("insert marked");
@@ -475,6 +492,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused: true,
+        minify_saved_est_usd: 0.0,
     };
     let id = row.id;
     writer

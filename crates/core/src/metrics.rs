@@ -198,6 +198,32 @@ pub fn record_cache_dynamic_prefix(kind: &'static str, est_wasted_usd: f64) {
         .increment(usd_to_microusd(est_wasted_usd));
 }
 
+/// Record one minified-JSON steering event (`RouteAction::minify_json`): the
+/// instruction was injected into the dispatched request. `route` is the
+/// matched route NAME (bounded cardinality; `"none"` never occurs in practice
+/// — the action is route-gated — but the label is total for safety).
+///
+/// Emits:
+/// - `output_minified_total{route}` += 1 (every injection, streaming included),
+/// - `minify_saved_tokens_total{route}` += the per-response tokenizer-grounded
+///   ESTIMATE (0 for streaming v1 / non-JSON responses),
+/// - `minify_saved_est_microusd_total{route}` += the estimate priced at the
+///   billed output rate, FEE-APPLIED (the same basis as the
+///   `x-tokentrimmer-minify-saved-est-usd` header / request_logs column —
+///   unlike `record_cache_bust`, which meters pre-fee), as integer micro-USD
+///   (divide by 1e6 in dashboards; the `record_cache_bust` counter pattern).
+///
+/// These series are ESTIMATES — dashboards must label them as such and never
+/// fold them into the invoice-reconciled saved-usd headline.
+pub fn record_minify_estimate(route: &str, est_tokens: u32, est_usd: f64) {
+    let route = route.to_string();
+    metrics::counter!("output_minified_total", "route" => route.clone()).increment(1);
+    metrics::counter!("minify_saved_tokens_total", "route" => route.clone())
+        .increment(u64::from(est_tokens));
+    metrics::counter!("minify_saved_est_microusd_total", "route" => route)
+        .increment(usd_to_microusd(est_usd));
+}
+
 #[cfg(test)]
 mod tests {
     use super::cache_result;

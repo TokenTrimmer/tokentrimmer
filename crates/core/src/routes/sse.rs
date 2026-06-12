@@ -530,6 +530,8 @@ impl TrackedEventStream {
             // for streaming requests at the gate (`batch_ineligible:streaming`).
             false,
             self.pass_effects,
+            // Streaming books $0 for the minify ESTIMATE in v1 (metered only).
+            0,
         );
         // `saved_usd` is strictly TT-attributed; the provider's automatic
         // cache discount rides in its own field (mirrors the response-header
@@ -745,6 +747,9 @@ pub fn stream_response(
                     // marker at the gate (`batch_ineligible:streaming`).
                     false,
                     pass_effects,
+                    // Streaming books $0 for the minify ESTIMATE in v1
+                    // (metered only — see `record_minify_estimate`).
+                    0,
                 );
                 let cost_usd = breakdown.cost_usd;
                 let baseline_cost_usd = breakdown.baseline_cost_usd;
@@ -832,6 +837,8 @@ pub fn stream_response(
                     batch_eligible: false,
                     batch_forgone_usd: 0.0,
                     route_paused,
+                    // Streaming books $0 for the minify estimate in v1.
+                    minify_saved_est_usd: 0.0,
                 };
 
                 // Per-route provider-cache counters on cleanly completed
