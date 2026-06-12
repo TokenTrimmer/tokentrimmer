@@ -346,6 +346,11 @@ pub async fn compact_now(
     ctx: &mut ContextState,
     ledger: &mut Ledger,
 ) -> CompactOutcome {
+    // NothingToFold intentionally does NOT reset the cadence counter: the
+    // automatic path can't reach it (`due()` already requires more history
+    // than the kept tail), so it only fires on a manual `/compact now` over a
+    // short conversation — where the next `due()` check should not be pushed
+    // back by K turns.
     let Some(plan) = build_plan(conv, cstate.every()) else {
         ui::info(&format!(
             "nothing to compact — the most recent {KEEP_RECENT_TURNS} turn(s) are kept verbatim"
@@ -438,6 +443,10 @@ pub async fn compact_now(
     conv.messages.drain(..plan.fold_len);
     ctx.reset_warned();
 
+    // Books (D − S_new) per compaction. On a RE-compaction the new block also
+    // replaces the prior summary on the wire, so the true cumulative per-turn
+    // reduction is larger by the replaced summary's size — i.e. this estimate
+    // errs LOW (conservative, the right direction for an unbooked figure).
     let est_delta = u64::from(plan.dropped_tokens - summary_tokens);
     ledger.compaction_est_tok_per_turn += est_delta;
     let cost = out.cost.cost_usd.unwrap_or(0.0);

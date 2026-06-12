@@ -390,7 +390,8 @@ pub struct RunOpts {
     /// Enable cache-aware compaction (`chat::compact`). OFF by default — the
     /// summary is a paid model call.
     pub compact: bool,
-    /// Compact every K successful turns (0 → the default cadence).
+    /// Compact every K successful turns. Routed through the single
+    /// `set_every` gate: K < 2 (incl. an explicit 0) warns + keeps the default.
     pub compact_every: u32,
     /// Model for the compaction summary call.
     pub compact_model: Option<String>,
@@ -444,12 +445,11 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
     };
     let mut ctx = budget::ContextState::new(max_context, catalog_windows);
     // Cache-aware compaction (OFF by default — the summary is a paid call).
-    // K < 2 is rejected with the caching-tension rationale; 0 = default.
+    // The flag shares the `/compact every` set_every gate: K < 2 (incl. an
+    // explicit `--compact-every 0`) warns and keeps the default cadence.
     let mut cstate = compact::CompactionState::new(compact, compact_model);
-    if compact_every != 0 {
-        if let Err(msg) = cstate.set_every(compact_every) {
-            ui::warn(&msg);
-        }
+    if let Err(msg) = cstate.set_every(compact_every) {
+        ui::warn(&msg);
     }
     ui::heading(&format!(
         "tt chat · {} via TokenTrimmer{}   (/help)",
