@@ -52,6 +52,8 @@ pub fn suggestions_to_proposed_routes(
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 target_model: s.model.clone(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

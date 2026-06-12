@@ -255,6 +255,8 @@ async fn rows_after(
 #[tokio::test]
 async fn shadow_mode_dispatches_candidate_and_records_cost_separately() {
     let then = RouteAction {
+        format_switch: None,
+        diff: false,
         auto_pause: false,
         pause_floor_pass_rate: None,
         pause_min_verdicts: None,
@@ -348,6 +350,8 @@ async fn shadow_mode_dispatches_candidate_and_records_cost_separately() {
 #[tokio::test]
 async fn no_shadow_when_route_does_not_opt_in() {
     let then = RouteAction {
+        format_switch: None,
+        diff: false,
         auto_pause: false,
         pause_floor_pass_rate: None,
         pause_min_verdicts: None,
@@ -391,6 +395,8 @@ async fn no_shadow_when_route_does_not_opt_in() {
 #[tokio::test]
 async fn canary_split_records_arm() {
     let then = RouteAction {
+        format_switch: None,
+        diff: false,
         auto_pause: false,
         pause_floor_pass_rate: None,
         pause_min_verdicts: None,
@@ -433,6 +439,8 @@ async fn zero_pct_split_serves_control_arm() {
     // Rewrite to the SHADOW_MODEL as the canary target so a control-arm revert is
     // observable (the served model differs between arms).
     let then = RouteAction {
+        format_switch: None,
+        diff: false,
         auto_pause: false,
         pause_floor_pass_rate: None,
         pause_min_verdicts: None,

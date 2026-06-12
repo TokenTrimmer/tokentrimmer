@@ -205,6 +205,8 @@ async fn route_to_local_dispatches_to_ollama_provider() {
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,

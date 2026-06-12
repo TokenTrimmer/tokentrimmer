@@ -207,6 +207,8 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             ..Default::default()
         },
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-3-5-haiku".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -247,6 +249,8 @@ fn conservative_when_pricing_missing() {
         enabled: true,
         when: RouteConditions::default(),
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "nonexistent-model".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -291,6 +295,8 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
             ..Default::default()
         },
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-haiku-4-5".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -332,6 +338,8 @@ fn cross_provider_target_absent_is_conservative() {
             ..Default::default()
         },
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-haiku-4-5".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -372,6 +380,8 @@ fn route_over_ceiling_is_blocked_not_saved() {
         enabled: true,
         when: RouteConditions::default(),
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-3-5-haiku".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -410,6 +420,8 @@ fn batch_route(target: &str, model_in: &str) -> ProposedRoute {
             ..Default::default()
         },
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
@@ -638,6 +650,8 @@ fn rerouted_latency_projected_from_target_model_history() {
             ..Default::default()
         },
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "cheap-model".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -726,6 +740,8 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             ..Default::default()
         },
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-3-5-haiku".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -853,6 +869,8 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             ..Default::default()
         },
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-3-5-haiku".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -879,6 +897,8 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             ..Default::default()
         },
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-3-haiku-pricier".into(),
             fallbacks: Vec::new(),
             disable_cache: false,

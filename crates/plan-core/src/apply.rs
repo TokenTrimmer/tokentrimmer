@@ -295,6 +295,8 @@ mod tests {
                 upstream_latency_ms_p95_gt: None,
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 target_model: "claude-haiku-4-5".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

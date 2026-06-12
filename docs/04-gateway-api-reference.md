@@ -541,8 +541,11 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Provider-Cache-Saved-Usd` | on dispatched/cached responses | `0.0009` |
 | `X-TokenTrimmer-Batch-Forgone-Usd` | on dispatched/cached responses — the **forgone** Batch-API discount for batch-eligible requests (advisory `then.batch` route action), priced from the served model's real catalog batch rate. An advisory projection for the future async Batch Lane: the request was dispatched synchronously and billed in full, so this figure is **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for all unmarked traffic. | `0.0125` |
 | `X-TokenTrimmer-Minify-Saved-Est-Usd` | on dispatched/cached responses — the **ESTIMATED** saving from minified-JSON output steering (`then.minify_json` route action): the emitted JSON re-rendered pretty and re-tokenized with the served model's tokenizer, minus the tokens actually emitted, priced at the billed output rate. An estimate of an unmeasurable counterfactual: **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for un-minified traffic, non-JSON responses, and streaming (v1 meters but does not estimate). | `0.000312` |
+| `X-TokenTrimmer-Diff-Saved-Usd` | on dispatched/cached responses — the **measured** saving of an applied `then.diff` patch: tokens of the reconstructed artifact minus the billed patch tokens, priced at the served model's output rate. Both sides are real tokenizer counts on real strings, so this figure **is** included in `X-TokenTrimmer-Saved-Usd` (via the baseline fold) and is itemized here for the methodology breakdown. `0.000000` for all undiffed traffic. | `0.0297` |
+| `X-TokenTrimmer-Format-Switch-Saved-Est-Usd` | on dispatched/cached responses — the **estimated** saving of a validated `then.format_switch` emission: a JSON-equivalent reconstruction minus the emitted body, output-rate-priced. The `Est` in the name is the label: an estimate, **never** included in `X-TokenTrimmer-Saved-Usd` / `Baseline-Cost-Usd` (those reconcile against the provider invoice). `0.000000` for unswitched traffic, whenever the reconstruction is not computable (booked $0), and on cache **hits** of a switched response (the hit still advertises `format_switch:<label>`, but its saving is attributed to the cache — the estimate belongs to the original miss's row, mirroring the diff/compression figures). | `0.0041` |
+| `X-TokenTrimmer-Diff-Failed-Cost-Usd` | on dispatched/cached responses — the realized cost of a FAILED `then.diff` patch attempt on a fail-closed double dispatch. Already **folded into** `X-TokenTrimmer-Cost-Usd` (the retry is real invoice spend for this trace); duplicated here so the retry tax can be unpicked. `0.000000` unless a patch failed on this trace. | `0.0106` |
 | `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
-| `X-TokenTrimmer-Warnings` | on dispatched responses, when the gateway altered the request | `param_dropped:frequency_penalty,param_dropped:n` |
+| `X-TokenTrimmer-Warnings` | on dispatched responses when the gateway altered the request, and on cache-hit responses carrying pre-dispatch tokens | `param_dropped:frequency_penalty,param_dropped:n` |
 
 `X-TokenTrimmer-Trace-Id` and `X-TokenTrimmer-Latency-Ms` are present on every
 response (success or error). The cost/provider/model/cache headers are attached on
@@ -576,13 +579,41 @@ Anthropic, whose max is `1.0`). A `route_paused:<route-name>` token is emitted
 when the matched route is **paused** (manually or by the quality auto-pause —
 see §10.7): the request was served on its originally-requested model with the
 route's rewrite and every other cost lever suppressed; the matching
-`request_logs` row carries `route_paused = true`. Like every warnings token,
-`route_paused` appears on dispatched chat/messages responses only: L1/L2
-cache-hit responses return before the warnings header is assembled (the
-durable `request_logs.route_paused` marker is still set on hit rows), and the
-embeddings endpoint has no warnings header — a paused embeddings passthrough
-is visible only in the `route_paused_passthrough_total` metric and the
-gateway log line.
+`request_logs` row carries `route_paused = true`. Pre-dispatch tokens
+(`route_paused:*`, `redacted:*`, the output-shaping tokens below) are attached
+on L1/L2 cache-hit responses as well as dispatched ones; `param_dropped:*`
+tokens appear on dispatched responses only (no dispatch happened on a hit).
+The embeddings endpoint has no warnings header — a paused embeddings
+passthrough is visible only in the `route_paused_passthrough_total` metric
+and the gateway log line.
+
+The contract-changing output-shaping route actions (`then.format_switch` /
+`then.diff` — see the routing rules guide) emit their own token families.
+Format switch: `format_switch:<csv|bare>` advertises every response served in
+the switched format (dispatched AND cache hits — only validated switched
+bodies are ever cached under a switched key); `format_switch_failed:<label>`
+marks a fail-open passthrough (the model did not comply, or the emission was
+cut short by the provider — a `finish_reason` other than `"stop"` is never
+accepted as a switched body, since a token-limit cut on a record boundary
+would otherwise pass shape validation while silently dropping records; the
+untouched body was served and nothing was booked);
+`format_switch_skipped:<reason>` names the
+eligibility gate that no-op'd the switch (`unknown_format`, `streaming`,
+`tools`, `n`, `no_schema`, `strict_schema`, `nested_schema`,
+`not_single_value`, `conflict`). Diff: `diff_applied` marks a reconstructed
+full artifact served from a billed patch; `diff_failed:<reason>` marks a
+fail-closed full re-emit (`truncated` — the patch emission carried a
+non-`"stop"` finish_reason, e.g. a token-limit cut that can parse as a
+valid-but-incomplete patch — `no_blocks`, `malformed_patch`,
+`anchor_missing`, `anchor_ambiguous`, `invalid_json`); `diff_degraded` marks
+the last-resort raw-patch passthrough when the re-emit dispatch itself
+errored; `diff_skipped:<reason>` names the no-op gate (`no_prior`,
+`prior_too_small`, `bad_prior_type` — a present `tt_extras.diff_prior` that
+is not a JSON string skips the lever rather than silently falling back to
+the assistant history — `streaming`, `tools`, `n`, `strict_schema`). On a
+canary route (`then.traffic_pct`) the CONTROL arm is served fully unchanged:
+neither shaping lever runs there (no `format_switch_*` / `diff_*` tokens at
+all), so the canary comparison never mixes shaped and unshaped responses.
 
 The advisory batch-eligibility route action (`then.batch`) emits its own
 tokens — honest by design, since the gateway dispatches synchronously today and

@@ -26,6 +26,10 @@ pub enum ValidationError {
     InvalidReasoningEffortCap { got: String },
     #[error("reasoning_budget_tokens must be >= 1024 (Anthropic's documented minimum), got {got}")]
     InvalidThinkingBudgetCap { got: u32 },
+    #[error("format_switch must be \"csv\" or \"bare\", got `{got}`")]
+    InvalidFormatSwitch { got: String },
+    #[error("format_switch and diff are mutually exclusive on one route")]
+    OutputShapingConflict,
 }
 
 /// Reject malformed auto-pause config at route-creation time: a
@@ -65,6 +69,21 @@ pub fn validate_output_shaping(then: &RouteAction) -> Result<(), ValidationError
     if let Some(budget) = then.reasoning_budget_tokens {
         if budget < 1024 {
             return Err(ValidationError::InvalidThinkingBudgetCap { got: budget });
+        }
+    }
+    // Phase 3.3/3.4 (contract-changing levers): `format_switch` must be
+    // `"csv"` or `"bare"` when set (an unknown value persisted anyway would
+    // silently no-op at dispatch), and a route may not declare BOTH
+    // `format_switch` and `diff` — the two levers issue conflicting emission
+    // instructions; the gateway would have to pick one arbitrarily.
+    if let Some(fmt) = then.format_switch.as_deref() {
+        if fmt != "csv" && fmt != "bare" {
+            return Err(ValidationError::InvalidFormatSwitch {
+                got: fmt.to_string(),
+            });
+        }
+        if then.diff {
+            return Err(ValidationError::OutputShapingConflict);
         }
     }
     Ok(())
@@ -133,6 +152,8 @@ mod tests {
             batch: false,
             compress: false,
             redact: false,
+            format_switch: None,
+            diff: false,
             traffic_pct: None,
             shadow_model: None,
             auto_pause: false,
@@ -305,6 +326,45 @@ mod tests {
         let mut c = action("m");
         c.minify_json = true;
         assert!(validate_output_shaping(&c).is_ok());
+    }
+
+    /// Output-shaping config: `format_switch` accepts only `"csv"` / `"bare"`
+    /// (or `None`), an unknown value is rejected at creation time, and
+    /// `format_switch` + `diff` together are a conflict (mutually exclusive
+    /// emission instructions). `diff` alone and `None` alone are fine.
+    #[test]
+    fn validate_output_shaping_rules() {
+        // No shaping config at all → OK.
+        assert!(validate_output_shaping(&action("m")).is_ok());
+
+        // csv / bare alone → OK.
+        let mut a = action("m");
+        a.format_switch = Some("csv".into());
+        assert!(validate_output_shaping(&a).is_ok());
+        a.format_switch = Some("bare".into());
+        assert!(validate_output_shaping(&a).is_ok());
+
+        // diff alone → OK.
+        let mut d = action("m");
+        d.diff = true;
+        assert!(validate_output_shaping(&d).is_ok());
+
+        // Unknown wire value → rejected with the offending value echoed.
+        let mut bad = action("m");
+        bad.format_switch = Some("yaml".into());
+        assert_eq!(
+            validate_output_shaping(&bad),
+            Err(ValidationError::InvalidFormatSwitch { got: "yaml".into() })
+        );
+
+        // Both levers on one route → conflict.
+        let mut both = action("m");
+        both.format_switch = Some("csv".into());
+        both.diff = true;
+        assert_eq!(
+            validate_output_shaping(&both),
+            Err(ValidationError::OutputShapingConflict)
+        );
     }
 
     /// A `shadow_model` with no `traffic_pct` (100% shadow, primary still serves)

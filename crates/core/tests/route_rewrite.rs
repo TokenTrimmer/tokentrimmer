@@ -193,6 +193,8 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
@@ -281,6 +283,8 @@ async fn routed_request_reports_savings_against_original_model() {
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
@@ -401,6 +405,8 @@ async fn route_for_other_org_does_not_match() {
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
@@ -466,6 +472,8 @@ async fn route_skipped_when_no_resolvable_org() {
             enabled: true,
             when: RouteConditions::default(),
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
@@ -561,6 +569,8 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,

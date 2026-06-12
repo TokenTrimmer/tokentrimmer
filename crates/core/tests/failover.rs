@@ -146,6 +146,8 @@ fn failover_routing_store() -> Arc<CachingRoutingStore> {
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,

@@ -67,6 +67,14 @@ pub struct RouteSavingsNet {
     /// shadow_model IS NOT NULL AND shadow_cost_usd IS NULL). When > 0 the
     /// taxes are LOWER bounds → net_saved_usd is an UPPER bound.
     pub unmetered_tax_rows: u64,
+    /// Σ `format_switch_saved_est_usd` over the route's rows — the
+    /// format-switch lever's LABELED ESTIMATE (research Phase 3.3:
+    /// JSON-equivalent reconstruction − emitted body). Reported as its own
+    /// clearly-estimated line and NEVER netted into `gross_saved_usd` /
+    /// `net_saved_usd` (those derive from invoice-reconciled row figures;
+    /// diff savings need no extra field — they already ride
+    /// `gross_saved_usd` via the baseline fold).
+    pub format_switch_saved_est_usd: f64,
     pub verdicts: VerdictCounts,
 }
 
@@ -122,6 +130,38 @@ pub fn assemble(
     degraded: u64,
     unclear: u64,
 ) -> RouteSavingsNet {
+    assemble_with_estimates(
+        route_id,
+        requests,
+        gross,
+        judge_tax,
+        shadow_tax,
+        unmetered_rows,
+        judged,
+        acceptable,
+        degraded,
+        unclear,
+        0.0,
+    )
+}
+
+/// [`assemble`] plus the format-switch ESTIMATE line (its own field, never
+/// netted — see [`RouteSavingsNet::format_switch_saved_est_usd`]).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn assemble_with_estimates(
+    route_id: Uuid,
+    requests: u64,
+    gross: f64,
+    judge_tax: f64,
+    shadow_tax: f64,
+    unmetered_rows: u64,
+    judged: u64,
+    acceptable: u64,
+    degraded: u64,
+    unclear: u64,
+    format_switch_saved_est: f64,
+) -> RouteSavingsNet {
     let classified = acceptable + degraded;
     let pass_rate = if classified == 0 {
         None
@@ -136,6 +176,7 @@ pub fn assemble(
         shadow_tax_usd: shadow_tax,
         net_saved_usd: gross - judge_tax - shadow_tax,
         unmetered_tax_rows: unmetered_rows,
+        format_switch_saved_est_usd: format_switch_saved_est,
         verdicts: VerdictCounts {
             judged,
             acceptable,
@@ -156,6 +197,7 @@ pub const ROUTE_SAVINGS_SQL: &str = r#"WITH gross AS (
          COUNT(*)::bigint AS requests,
          COALESCE(SUM(GREATEST(baseline_cost_usd - cost_usd - provider_cache_saved_usd - cache_bust_penalty_usd, 0)), 0)::float8 AS gross_saved_usd,
          COALESCE(SUM(COALESCE(shadow_cost_usd, 0)), 0)::float8 AS shadow_tax_usd,
+         COALESCE(SUM(format_switch_saved_est_usd), 0)::float8 AS format_switch_saved_est_usd,
          COUNT(*) FILTER (WHERE shadow_model IS NOT NULL AND shadow_cost_usd IS NULL)::bigint AS unmetered_shadow_rows
   FROM request_logs
   WHERE org_id = $1 AND ts >= $2 AND ts < $3 AND route_id IS NOT NULL
@@ -175,6 +217,7 @@ SELECT COALESCE(g.route_id, t.route_id) AS route_id,
        COALESCE(g.requests, 0) AS requests,
        COALESCE(g.gross_saved_usd, 0) AS gross_saved_usd,
        COALESCE(g.shadow_tax_usd, 0) AS shadow_tax_usd,
+       COALESCE(g.format_switch_saved_est_usd, 0) AS format_switch_saved_est_usd,
        COALESCE(g.unmetered_shadow_rows, 0) + COALESCE(t.unmetered_verdict_rows, 0) AS unmetered_tax_rows,
        COALESCE(t.judged, 0) AS judged,
        COALESCE(t.acceptable, 0) AS acceptable,
@@ -211,6 +254,7 @@ struct SavingsRow {
     requests: i64,
     gross_saved_usd: f64,
     shadow_tax_usd: f64,
+    format_switch_saved_est_usd: f64,
     unmetered_tax_rows: i64,
     judged: i64,
     acceptable: i64,
@@ -237,7 +281,7 @@ impl RouteSavingsSource for PostgresRouteSavingsSource {
         Ok(rows
             .into_iter()
             .map(|r| {
-                assemble(
+                assemble_with_estimates(
                     r.route_id,
                     r.requests.max(0) as u64,
                     r.gross_saved_usd,
@@ -248,6 +292,7 @@ impl RouteSavingsSource for PostgresRouteSavingsSource {
                     r.acceptable.max(0) as u64,
                     r.degraded.max(0) as u64,
                     r.unclear.max(0) as u64,
+                    r.format_switch_saved_est_usd,
                 )
             })
             .collect())
@@ -326,6 +371,22 @@ mod tests {
             unjudged.unmetered_tax_rows, 1,
             "unmetered rows must be flagged (taxes are lower bounds)"
         );
+    }
+
+    /// The format-switch ESTIMATE rides its OWN field and is NEVER netted
+    /// into gross/net (the invoice-reconciled figures) — a CFO must be able
+    /// to unpick the estimated lever from the realized ones.
+    #[test]
+    fn format_switch_estimate_never_netted() {
+        let id = Uuid::now_v7();
+        let with_est = assemble_with_estimates(id, 10, 5.0, 1.0, 0.5, 0, 2, 2, 0, 0, 7.25);
+        assert!((with_est.format_switch_saved_est_usd - 7.25).abs() < 1e-12);
+        // gross/net unchanged by the estimate.
+        assert!((with_est.gross_saved_usd - 5.0).abs() < 1e-12);
+        assert!((with_est.net_saved_usd - 3.5).abs() < 1e-12);
+        // The thin wrapper defaults the estimate to 0.
+        let plain = assemble(id, 10, 5.0, 1.0, 0.5, 0, 2, 2, 0, 0);
+        assert_eq!(plain.format_switch_saved_est_usd, 0.0);
     }
 
     /// The canonical SQL uses exactly the binds the source supplies

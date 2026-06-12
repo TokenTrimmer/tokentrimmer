@@ -195,6 +195,31 @@ pub struct RouteAction {
     /// omitted from JSON when false (back-compat).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub redact: bool,
+    /// OPT-IN format switch (research Phase 3.3): instruct the model to emit
+    /// `"csv"` (flat-uniform records) or `"bare"` (single value) instead of
+    /// verbose JSON. **This changes the parse contract** — the caller opted in
+    /// via the route, and every switched response is advertised with a
+    /// `format_switch:<label>` warnings token. Wire values `"csv"` | `"bare"`
+    /// are validated at route creation (`validate_output_shaping`); an unknown
+    /// value at dispatch time NO-OPs with a warning (fail-open
+    /// forward-compat). Eligibility is enforced in code at dispatch
+    /// (schema-shape detection; strict structured output, streaming, tools,
+    /// n>1 all no-op). Mutually exclusive with `diff` (rejected at creation).
+    /// Default `None` — no behavior change unless a route sets it; omitted
+    /// from JSON when `None` (back-compat with existing rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_switch: Option<String>,
+    /// OPT-IN delta/diff responses (research Phase 3.4) for edit/iteration
+    /// routes: when the prior artifact is identifiable FROM THE REQUEST
+    /// (`tt_extras["diff_prior"]` echo, else the last assistant message), the
+    /// gateway instructs the model to emit an anchored search/replace patch,
+    /// applies + validates it, and returns the FULL reconstructed artifact
+    /// (the caller's contract is preserved; the short patch is what the
+    /// provider bills). ANY validation failure fails CLOSED to a full
+    /// re-emit. Mutually exclusive with `format_switch` (rejected at
+    /// creation). Default false; omitted from JSON when false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub diff: bool,
     /// Canary traffic split (0-100). When `Some(pct)`, only a deterministic
     /// `pct`% of the matched requests are routed to `target_model` (the canary
     /// arm); the remaining `(100 - pct)%` pass through on their
@@ -538,6 +563,8 @@ mod tests {
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 target_model: target.into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -853,6 +880,8 @@ mod tests {
     #[test]
     fn route_action_minimal_serializes_without_new_fields() {
         let a = RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "x".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -892,6 +921,8 @@ mod tests {
     #[test]
     fn route_action_full_round_trip() {
         let original = RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-haiku-4-5".into(),
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
@@ -923,6 +954,8 @@ mod tests {
     fn route_action_disable_cache_defaults_false_and_omits() {
         // Omitted from JSON when false (back-compat: existing rows unchanged).
         let a = RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "x".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -955,6 +988,38 @@ mod tests {
         assert!(serde_json::to_string(&b)
             .unwrap()
             .contains("\"disable_cache\":true"));
+    }
+
+    /// `format_switch` defaults to `None`, is omitted from JSON when `None`
+    /// (legacy rows / payloads unchanged), and `Some("csv")` round-trips.
+    #[test]
+    fn route_action_format_switch_defaults_none_omits_and_round_trips() {
+        // Default: absent on read → None; None omitted on write.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert_eq!(parsed.format_switch, None);
+        let j = serde_json::to_string(&parsed).unwrap();
+        assert!(!j.contains("format_switch"), "{j}");
+
+        // Some("csv") round-trips byte-stably.
+        let json = r#"{"target_model":"m","format_switch":"csv"}"#;
+        let a: RouteAction = serde_json::from_str(json).unwrap();
+        assert_eq!(a.format_switch.as_deref(), Some("csv"));
+        assert_eq!(serde_json::to_string(&a).unwrap(), json);
+    }
+
+    /// `diff` defaults to false, is omitted from JSON when false (legacy rows
+    /// / payloads unchanged), and `true` round-trips.
+    #[test]
+    fn route_action_diff_defaults_false_omits_and_round_trips() {
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.diff);
+        let j = serde_json::to_string(&parsed).unwrap();
+        assert!(!j.contains("diff"), "{j}");
+
+        let json = r#"{"target_model":"m","diff":true}"#;
+        let a: RouteAction = serde_json::from_str(json).unwrap();
+        assert!(a.diff);
+        assert_eq!(serde_json::to_string(&a).unwrap(), json);
     }
 
     /// Cross-crate lossless round-trip: JSON produced by `tt_routing::RouteAction`

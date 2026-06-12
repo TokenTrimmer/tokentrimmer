@@ -626,3 +626,46 @@ async fn paused_route_no_judge_sample() {
         "judge model must never be dispatched for a paused route"
     );
 }
+
+/// Regression (hit-path token attachment): pre-dispatch warning tokens —
+/// here `route_paused:<name>` — must survive on an L1-HIT response, not just
+/// on the miss/dispatch path. Before the `attach_warning_tokens` helper, hit
+/// early-returns silently dropped every pre-dispatch token.
+#[tokio::test]
+async fn l1_hit_response_carries_route_paused_token() {
+    let h = harness(HarnessOpts {
+        paused: true,
+        with_l1: true,
+        ..Default::default()
+    })
+    .await;
+
+    // Miss → populates L1 (paused route, no rewrite).
+    let r1 = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.key))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert!(
+        warnings_of(&r1).contains(&format!("route_paused:{ROUTE_NAME}")),
+        "miss path carries the token (precondition)"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Hit → the SAME pre-dispatch token must still be advertised.
+    let r2 = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.key))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    assert_eq!(h.calls.load(Ordering::SeqCst), 1, "second request hit L1");
+    assert!(
+        warnings_of(&r2).contains(&format!("route_paused:{ROUTE_NAME}")),
+        "hit responses must carry pre-dispatch warning tokens too, got {:?}",
+        warnings_of(&r2)
+    );
+}

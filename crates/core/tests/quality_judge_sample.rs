@@ -67,6 +67,9 @@ struct JudgeAwareProvider {
     /// Full prompt text (system + user) of every judge-model request, captured
     /// for the blind-prompt assertions.
     judge_prompts: Arc<Mutex<Vec<String>>>,
+    /// Fixed assistant body for NON-judge dispatches (`None` → the default
+    /// `answer from <model>`). The output-shaping tests script a patch here.
+    served_body: Option<&'static str>,
 }
 
 /// Build the judge model's pair-token reply. For a "DEGRADED" intent the mock
@@ -165,6 +168,8 @@ impl Provider for JudgeAwareProvider {
         }
         let text = if is_judge {
             pair_reply(&request_text(&req), self.judge_verdict_word)
+        } else if let Some(body) = self.served_body {
+            body.to_string()
         } else {
             // Served + reference (original-model) answers.
             format!("answer from {}", req.model)
@@ -256,6 +261,17 @@ struct HarnessOpts {
     /// neither a downgrade nor output-shaped, so the judge must NOT spawn
     /// (guards the #3.x eligibility widening against over-widening).
     same_model_route: bool,
+    /// Plant a SAME-MODEL route (gpt-4o-mini → gpt-4o-mini; never a
+    /// downgrade) instead of the downgrade route — the output-shaping judge
+    /// tests use it to isolate the `response_shaped` gate arm.
+    plant_same_model_route: bool,
+    /// The planted same-model route opts into delta/diff responses
+    /// (`diff: true`).
+    same_model_route_diff: bool,
+    /// Fixed assistant body for NON-judge dispatches (both the served call
+    /// and the reference re-dispatch); `None` keeps the default
+    /// `answer from <model>`.
+    served_body: Option<&'static str>,
 }
 
 impl Default for HarnessOpts {
@@ -270,6 +286,9 @@ impl Default for HarnessOpts {
             redact_route: false,
             baseline_timeout: None,
             same_model_route: false,
+            plant_same_model_route: false,
+            same_model_route_diff: false,
+            served_body: None,
         }
     }
 }
@@ -302,6 +321,7 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
         judge_verdict_word: opts.judge_verdict_word,
         judge_fail: opts.judge_fail,
         judge_prompts: Arc::clone(&judge_prompts),
+        served_body: opts.served_body,
     }));
 
     let raw_store = InMemoryKeyStore::new();
@@ -321,7 +341,46 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
     let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
 
     let routes_backing = Arc::new(InMemoryRoutingStore::new());
-    if opts.plant_downgrade_route {
+    if opts.plant_same_model_route {
+        // SAME-model route: matched_route_id is stamped but the served model
+        // equals the requested one (same pricing → never a downgrade) — the
+        // output-shaping tests use it to isolate the `response_shaped` arm
+        // of the judge gate.
+        routes_backing.set_routes(
+            org_id,
+            vec![Route {
+                paused: false,
+                id: Uuid::now_v7(),
+                name: "same-model-shaping".into(),
+                priority: 100,
+                enabled: true,
+                when: RouteConditions {
+                    model_in: vec!["gpt-4o-mini".into()],
+                    ..Default::default()
+                },
+                then: RouteAction {
+                    target_model: "gpt-4o-mini".into(),
+                    fallbacks: Vec::new(),
+                    disable_cache: false,
+                    max_cost_usd: None,
+                    flex: false,
+                    batch: false,
+                    compress: false,
+                    redact: false,
+                    minify_json: false,
+                    reasoning_max_effort: None,
+                    reasoning_budget_tokens: None,
+                    format_switch: None,
+                    diff: opts.same_model_route_diff,
+                    traffic_pct: None,
+                    shadow_model: None,
+                    auto_pause: false,
+                    pause_floor_pass_rate: None,
+                    pause_min_verdicts: None,
+                },
+            }],
+        );
+    } else if opts.plant_downgrade_route {
         routes_backing.set_routes(
             org_id,
             vec![Route {
@@ -335,6 +394,8 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     ..Default::default()
                 },
                 then: RouteAction {
+                    format_switch: None,
+                    diff: false,
                     auto_pause: false,
                     pause_floor_pass_rate: None,
                     pause_min_verdicts: None,
@@ -542,6 +603,110 @@ async fn matched_unshaped_same_model_route_never_triggers_judge() {
     );
     assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
     assert_eq!(h.served_calls.load(Ordering::SeqCst), 1);
+}
+
+/// The prior document for the output-shaping judge tests (> 200 chars so the
+/// diff planner accepts it) and a patch whose anchor is unique within it.
+const SHAPING_PRIOR_LINE: &str =
+    "Item line: the quick brown fox jumps over the lazy dog yet again today.\n";
+const SHAPING_PATCH: &str =
+    "<<<<<<< SEARCH\nItem 0 marker line.\n=======\nItem ZERO marker line.\n>>>>>>> REPLACE";
+
+fn shaping_edit_request(bearer: &str) -> Request<Body> {
+    let mut prior = String::from("Item 0 marker line.\n");
+    for _ in 0..4 {
+        prior.push_str(SHAPING_PRIOR_LINE);
+    }
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "user", "content": "write the list"},
+                    {"role": "assistant", "content": prior},
+                    {"role": "user", "content": "capitalize the marker"}
+                ],
+                "stream": false,
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// A SHAPED response (applied diff) on a NON-downgrade route samples the
+/// paired judge — output shaping is exactly what the #155 gate exists to
+/// police, even when the served model's price did not change.
+#[tokio::test]
+async fn shaped_response_on_non_downgrade_route_samples_judge() {
+    let h = build_harness_opts(HarnessOpts {
+        rate: 1.0,
+        plant_downgrade_route: false,
+        plant_same_model_route: true,
+        same_model_route_diff: true,
+        served_body: Some(SHAPING_PATCH),
+        ..Default::default()
+    })
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(shaping_edit_request(&h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let warnings = resp
+        .headers()
+        .get("x-tokentrimmer-warnings")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        warnings.split(',').any(|w| w == "diff_applied"),
+        "precondition: the diff must have applied, got {warnings}"
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.sink.recorded.notified(),
+    )
+    .await
+    .expect("a shaped response on a non-downgrade route must sample the judge");
+    assert!(h.judge_calls.load(Ordering::SeqCst) >= 1);
+}
+
+/// Control: the SAME same-model route WITHOUT shaping still never samples —
+/// the `response_shaped` arm widened the gate for shaped traffic only.
+#[tokio::test]
+async fn unshaped_non_downgrade_route_still_never_samples_judge() {
+    let h = build_harness_opts(HarnessOpts {
+        rate: 1.0,
+        plant_downgrade_route: false,
+        plant_same_model_route: true,
+        same_model_route_diff: false,
+        ..Default::default()
+    })
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(shaping_edit_request(&h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        h.judge_calls.load(Ordering::SeqCst),
+        0,
+        "an unshaped non-downgrade route must not sample"
+    );
+    assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
 }
 
 /// (c) At rate 0.0 a rerouted-down request is never judged.
@@ -1197,6 +1362,7 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
         judge_verdict_word: "ACCEPTABLE",
         judge_fail: false,
         judge_prompts: Arc::new(Mutex::new(Vec::new())),
+        served_body: None,
     }));
     registry.register(Arc::new(RemoteJudgeProvider {
         keys_seen: Arc::clone(&judge_keys_seen),
@@ -1246,6 +1412,8 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
