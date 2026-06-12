@@ -159,7 +159,7 @@ async fn migrate_only_applies_schema() {
     .expect("query");
     assert!(
         bust_col,
-        "request_logs.cache_bust_penalty_usd should exist after migration 0014"
+        "request_logs.cache_bust_penalty_usd should exist after migration 0016"
     );
 }
 

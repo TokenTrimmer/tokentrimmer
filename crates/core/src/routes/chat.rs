@@ -2682,7 +2682,7 @@ pub(crate) struct CostBreakdown {
     /// premium) but is NEVER folded into `cost_usd` / `baseline_cost_usd`:
     /// it is an estimate of induced FUTURE cost, and those two fields must
     /// reconcile against the realized provider invoice. Persisted on the
-    /// `request_logs` row (migration 0014) so the row-derived ledger agrees
+    /// `request_logs` row (migration 0016) so the row-derived ledger agrees
     /// with the header/span headline.
     pub cache_bust_penalty_usd: f64,
 }
