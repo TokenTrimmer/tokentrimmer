@@ -48,6 +48,8 @@ pub mod batch_savings;
 pub mod cost_control;
 pub mod find_route_for;
 pub mod inspect_diff;
+pub mod list_datasets;
 pub mod lookup_semantic_cache;
 pub mod preview_cost;
+pub mod run_query;
 pub mod simulate_plan;

@@ -98,6 +98,52 @@ impl Server {
         }));
     }
 
+    /// Register the query-offload tools (`run_query`, `list_datasets`) and
+    /// the query-ledger resource.
+    ///
+    /// There is **no boolean flag** for these (contrast
+    /// [`Server::register_write_tools`], whose backends are ambient): the
+    /// only way to obtain a non-empty [`tt_query::HandleRegistry`] is to
+    /// load an operator query config (`--query-config` /
+    /// `TT_MCP_QUERY_CONFIG`), so authoring that config IS the explicit,
+    /// auditable opt-in. Without it nothing is registered, `tools/list`
+    /// omits both tools, and `tools/call` on them falls through to
+    /// `MethodNotFound` (-32601) — NOT `Unauthorized` — exactly the write
+    /// tools' off-by-default posture. A supplied-but-invalid config fails
+    /// boot (fail closed) in the CLI wiring.
+    ///
+    /// An empty registry registers nothing (defense in depth: a config with
+    /// zero datasets is rejected at load, but embedders could construct
+    /// one).
+    ///
+    /// [`tt_query::HandleRegistry`]: crate::query::HandleRegistry
+    pub fn register_query_tools(
+        &mut self,
+        registry: std::sync::Arc<crate::query::HandleRegistry>,
+        cache: std::sync::Arc<crate::query::cache::QueryCache>,
+        ledger: std::sync::Arc<crate::query::ledger::ExecutionLedger>,
+        limits: crate::query::QueryLimits,
+    ) {
+        if registry.is_empty() {
+            return;
+        }
+        let ledger_path = ledger.path().to_path_buf();
+        self.tools
+            .register(Box::new(crate::tools::run_query::RunQueryTool::new(
+                registry.clone(),
+                cache,
+                ledger,
+                limits,
+            )));
+        self.tools
+            .register(Box::new(crate::tools::list_datasets::ListDatasetsTool {
+                registry,
+            }));
+        self.resources.register(Box::new(
+            crate::resources::query_ledger::QueryLedgerResource { path: ledger_path },
+        ));
+    }
+
     /// Attach a process-lifetime [`Authenticator`] so the server performs real,
     /// store-backed key verification on the first tool/resource call and binds
     /// the verified tenant for the process lifetime (design §8). Without this,

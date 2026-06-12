@@ -59,6 +59,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"
+# Streaming CSV reader for the MCP query-offload file executor (no rand in its
+# dependency graph; Unlicense OR MIT).
+csv = "1.4"
+
+# SQL parsing — the allowlist gate for the MCP `run_query` tool's Postgres
+# surface (exactly-one-SELECT + escape-function denylist). `visitor` enables
+# whole-AST traversal so denylisted functions are caught in CTEs/subqueries.
+# Apache-2.0; no rand in its dependency graph.
+sqlparser = { version = "0.62", features = ["visitor"] }
 
 # Metrics
 metrics = "0.24"

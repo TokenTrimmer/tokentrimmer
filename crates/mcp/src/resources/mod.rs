@@ -46,3 +46,4 @@ impl Default for Registry {
 pub mod cost_ledger;
 pub mod inspect_baseline;
 pub mod plan_history;
+pub mod query_ledger;

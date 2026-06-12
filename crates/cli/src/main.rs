@@ -115,6 +115,12 @@ enum Command {
         /// start otherwise (fail closed).
         #[arg(long)]
         allow_write: bool,
+        /// Operator query-offload config (TOML registering dataset aliases
+        /// for `run_query`/`list_datasets`). The config file IS the opt-in:
+        /// without it the query tools are never registered; a supplied but
+        /// unreadable/invalid config refuses to start (fail closed).
+        #[arg(long, env = "TT_MCP_QUERY_CONFIG")]
+        query_config: Option<PathBuf>,
     },
     /// Log in: opens the dashboard to create an API key (paste it back), or pass --token <KEY>.
     Login {
@@ -551,6 +557,7 @@ async fn main() -> anyhow::Result<()> {
             tt_api_base,
             sse_port,
             allow_write,
+            query_config,
         } => {
             use tt_mcp::{
                 auth,
@@ -706,6 +713,39 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 tracing::warn!("DATABASE_URL not set; MCP serving with loopback bearer guard only (no store-backed key verification); cost-control tools require a verified org and are not registered");
+            }
+
+            // Query-offload tools (`run_query`, `list_datasets`): the
+            // operator config file is the explicit opt-in — no config means
+            // the tools are never registered (`tools/list` omits them,
+            // `tools/call` returns MethodNotFound). A supplied-but-invalid
+            // config FAILS BOOT (fail closed, the --allow-write posture);
+            // building the registry connects any postgres pools, so a bad
+            // DSN also refuses to start. Query tools are local-data only and
+            // need no DATABASE_URL/org binding.
+            if let Some(cfg_path) = query_config {
+                let qcfg = tt_mcp::query::QueryConfig::load(&cfg_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "--query-config {}: refusing to start: {e}",
+                        cfg_path.display()
+                    )
+                })?;
+                let registry = qcfg.build_registry().await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "--query-config {}: refusing to start: {e}",
+                        cfg_path.display()
+                    )
+                })?;
+                let ledger_path = tt_mcp::query::ledger::ExecutionLedger::default_path();
+                server.register_query_tools(
+                    Arc::new(registry),
+                    Arc::new(tt_mcp::query::cache::QueryCache::default()),
+                    Arc::new(tt_mcp::query::ledger::ExecutionLedger::new(ledger_path)),
+                    qcfg.limits(),
+                );
+                tracing::info!(
+                    "MCP query tools registered (run_query, list_datasets; gated by the operator query config)"
+                );
             }
 
             match transport.as_str() {

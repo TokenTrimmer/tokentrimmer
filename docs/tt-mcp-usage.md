@@ -43,10 +43,149 @@ fails verification. Without the flag, `tt mcp` boots read-only as before.
 Embedders of the `tt-mcp` crate opt in via `Server::with_write_enabled(true)`
 + `Server::register_write_tools(...)`.
 
+## Query-offload tools (gated by an operator config)
+
+A model asked to analyze data pays input tokens for every row it reads. The
+query-offload tools keep the DATA external and return only the COMPUTED
+RESULT, deleting the data token class. (The trap is the opposite: pasting
+rows into the prompt and then "offloading" compute over them is *worse* than
+doing nothing — you pay the rows AND the tool round-trip. The tool's input
+types leave that no useful channel: data can only be *named* by alias, and
+every caller string is size-capped, so at most 4 KiB of literals can ever
+reach an executor — useless as a data channel. See below.)
+
+- `run_query` — run a bounded query against an operator-registered dataset:
+  a single read-only `SELECT` for `postgres` datasets, or a structured
+  aggregation (`count`/`sum`/`avg`/`min`/`max`/`count_distinct` with bounded
+  `where`/`group_by`) for `file` (CSV/JSONL) datasets. Only the computed
+  result enters context. Aggregation semantics worth knowing:
+  `aggregate.limit` returns the **first N groups in group-key (alphabetical)
+  order** — not top-N by aggregate value; an empty match without `group_by`
+  still returns one row (`count` 0, `sum` 0, `avg`/`min`/`max` `null` —
+  note `sum` keeps the mathematical empty-sum-is-0 convention, where SQL
+  would return `NULL`).
+- `list_datasets` — the registered aliases (kind, format, description, CSV
+  columns). Never returns paths, roots, or DSN material.
+
+### Enabling: the config file is the gate
+
+There is **no `--allow-query` flag**. The tools register only when you pass
+an operator dataset config: `tt mcp --query-config <path>` (or
+`TT_MCP_QUERY_CONFIG`). No config → the tools are absent from `tools/list`
+and calling them is `MethodNotFound` (-32601). An unreadable or invalid
+config **refuses to start** (fail closed) — same posture as `--allow-write`.
+Unlike the write tools, no `DATABASE_URL` is needed: query datasets are
+local and have no org binding.
+
+```toml
+# query-datasets.toml — every entry is an explicit operator act.
+[limits]                      # optional; defaults shown; hard ceilings 60000/10000/1048576
+statement_timeout_ms = 5000
+max_result_rows = 100
+max_result_bytes = 65536
+
+[files]
+root = "/abs/data/dir"        # REQUIRED if any file dataset exists; no default
+
+[[dataset]]
+alias = "orders"              # [a-z0-9_-]{1,64}; what the model names
+kind = "file"
+path = "orders.csv"           # RELATIVE to files.root; absolute or `..` fails boot
+format = "csv"                # or "jsonl"
+description = "2025 orders export"
+
+[[dataset]]
+alias = "warehouse"
+kind = "postgres"
+dsn_env = "TT_QUERY_DSN_WAREHOUSE"   # DSN read from the env at boot — never inline
+```
+
+### Security model
+
+The MCP caller is an LLM agent; its arguments are attacker-influencable
+(prompt injection). The defenses, in order:
+
+- **Alias indirection** — no tool parameter is a path, URL, or DSN. The
+  model can only *name* operator-registered aliases, so path traversal and
+  SSRF are unrepresentable at the tool boundary.
+- **Type-level inline-data gate** — dataset handles implement no
+  deserialization (pinned by a `compile_fail` test) and every caller string
+  is size-capped (`query` ≤ 4 KiB, whole arguments object ≤ 8 KiB), so the
+  parameters are useless as a data channel.
+- **File datasets** — paths live only in the config, relative to the
+  required `files.root`, canonicalized at boot AND at every call with a
+  containment check (symlink-swap defense).
+- **Postgres datasets** — a sqlparser allowlist (exactly one
+  `SELECT`/`WITH..SELECT`; data-modifying CTE bodies like
+  `WITH t AS (INSERT/UPDATE/DELETE/MERGE .. RETURNING ..)` and `SELECT INTO`
+  rejected; escape/recon function families — `dblink*`, `pg_read_*`,
+  `pg_ls_*`, `pg_stat_file`, `lo_*`/`loread`/`lowrite` — rejected anywhere
+  in the AST; that denylist is defense in depth, **not exhaustive**: `READ
+  ONLY` does not block reads, so unlisted privileged reads are stopped only
+  by the role), then a `READ ONLY` transaction with `SET LOCAL
+  statement_timeout`, streamed row/byte caps (every cell's raw wire size is
+  charged against the byte budget before it is even decoded), and an
+  unconditional `ROLLBACK`. **The real boundary is the role behind
+  `dsn_env`**: point it at a dedicated read-only role
+  (`default_transaction_read_only = on`, minimal grants) — the parser and
+  transaction layers are defense in depth, not a substitute.
+- **Hard result caps, never truncation** — a result over `max_result_rows`
+  or `max_result_bytes` is an error telling the model to aggregate tighter.
+  Truncation would be a silent wrong number and a bulk-export channel.
+- **No code execution** — deliberately out of scope: an arbitrary code
+  primitive reachable from model-controlled tool calls on an operator
+  machine is an unacceptable escalation. The savings case holds with
+  query-offload alone.
+
+### Data residency
+
+Execution is **local by design**: dataset rows never leave your machine.
+Only the computed aggregate enters model context — and that aggregate IS
+then sent to your model provider like any other tool result, so size the
+result caps accordingly. This is exactly why the MVP is local-only: a
+hosted/provider-side execution variant would route raw data through provider
+infrastructure and is **not ZDR-eligible** (recorded as a hard constraint on
+any future hosted variant).
+
+### Verification (`verify: true`)
+
+Re-executes the query a second time (cache bypassed for both runs), compares
+results structurally, and returns `verified: true|false` plus per-run
+`blake3` result hashes. A mismatch is surfaced with a warning and the first
+run's result — never swallowed. This is the honest catch for
+silent-wrong-number failures; note that nondeterministic SQL (`now()`,
+`random()`, un-`ORDER`ed `LIMIT`) legitimately mismatches.
+
+### Execution ledger + result cache
+
+Every `run_query` call appends one JSONL line to the query ledger
+(`TT_MCP_QUERY_LEDGER_PATH`, default `.claude/query-ledger.jsonl`):
+`{ts, tool, dataset, kind, wall_ms, rows_scanned, result_rows, result_bytes,
+cache, verify, verified, unit: "execution", priced_as_tokens: false}`.
+Execution cost is a **distinct non-token cost class** — nothing converts it
+to USD or token counts; `rows_scanned` is exact for file scans and `null`
+for Postgres (no honest number exists in the MVP, so none is fabricated).
+Cache-hit lines also carry `rows_scanned: null` — a hit scans nothing (the
+file is only re-hashed to prove byte-identity), so summing `rows_scanned`
+over ledger lines equals actual scan work. `cache` is
+`hit`/`miss`/`bypass` for file datasets and `none` for Postgres (no cache
+exists for live databases — `none` means *uncacheable*, not a 0% hit rate).
+Failed executions (e.g. a statement-timeout abort) currently write **no**
+ledger line — execution cost is under-counted for errored calls, never
+over-counted (recorded follow-up). Ledger write failures are logged and
+never fail the call. The ledger is readable via the
+`mcp://tokentrimmer/query-ledger/recent` resource.
+
+Results for **file** datasets are cached in-process, keyed on the blake3
+hash of the file content plus the canonical query spec — any byte change to
+the file misses. **Postgres results are never cached**: without an honest
+content fingerprint a cache would serve stale wrong numbers.
+
 ## Day-0 resources
 
 - `mcp://tokentrimmer/cost-ledger/last-7d`
 - `mcp://tokentrimmer/inspect/baseline`
+- `mcp://tokentrimmer/query-ledger/recent` (only with `--query-config`)
 
 ## Transports
 
@@ -57,7 +196,9 @@ Embedders of the `tt-mcp` crate opt in via `Server::with_write_enabled(true)`
 | HTTP+SSE | `tt mcp --transport sse` | **deprecated** | legacy clients only (MCP spec 2024-11-05) |
 
 The stdio transport (default) requires no token — it communicates over the
-parent-process pipe and is not exposed over the network.
+parent-process pipe and is not exposed over the network. Each stdio request
+line is capped at 1 MiB (mirroring the HTTP body cap): an oversized line is
+drained without being buffered or parsed and answered with a parse error.
 
 ### Streamable HTTP (recommended HTTP transport)
 
