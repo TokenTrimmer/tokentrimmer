@@ -10,8 +10,14 @@ use crate::context::ResolvedContext;
 use crate::ui;
 
 pub mod budget;
+pub mod command;
+pub mod compact;
 pub mod session;
+pub mod shape;
 pub mod tools;
+
+pub use command::Command;
+use command::{osc52_copy, print_help, wrap_osc52_for_mux, ToolsArg, OSC52_MAX_BYTES};
 
 const DEFAULT_CHAT_MODEL: &str = "gpt-4o-mini";
 
@@ -40,69 +46,6 @@ impl From<tt_client::StreamUsage> for UsageInfo {
     }
 }
 
-/// A REPL line, parsed.
-#[derive(Debug)]
-pub enum Command {
-    Help,
-    Clear,
-    Exit,
-    Model(Option<String>),
-    System(Option<String>),
-    Save(Option<String>),
-    Resume(String),
-    Sessions,
-    Cost,
-    Editor,
-    Retry,
-    Copy,
-    Tools(Option<bool>),
-    Context(Option<u32>),
-    Trim,
-    Unknown(String),
-    Chat(String),
-}
-
-impl Command {
-    #[must_use]
-    pub fn parse(line: &str) -> Command {
-        let t = line.trim();
-        let Some(rest) = t.strip_prefix('/') else {
-            return Command::Chat(t.to_string());
-        };
-        let mut it = rest.splitn(2, char::is_whitespace);
-        let cmd = it.next().unwrap_or("");
-        let arg = it
-            .next()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        match cmd {
-            "help" | "h" | "?" => Command::Help,
-            "clear" => Command::Clear,
-            "exit" | "quit" | "q" => Command::Exit,
-            "model" => Command::Model(arg),
-            "system" => Command::System(arg),
-            "save" => Command::Save(arg),
-            "resume" | "load" => match arg {
-                Some(n) => Command::Resume(n),
-                None => Command::Unknown("resume (usage: /resume <name>)".to_string()),
-            },
-            "sessions" => Command::Sessions,
-            "cost" => Command::Cost,
-            "editor" | "e" => Command::Editor,
-            "retry" | "r" => Command::Retry,
-            "copy" | "y" => Command::Copy,
-            "tools" => Command::Tools(match arg.as_deref() {
-                Some("on") | Some("true") | Some("enable") => Some(true),
-                Some("off") | Some("false") | Some("disable") => Some(false),
-                _ => None,
-            }),
-            "context" => Command::Context(arg.as_deref().and_then(|a| a.parse().ok())),
-            "trim" => Command::Trim,
-            other => Command::Unknown(other.to_string()),
-        }
-    }
-}
-
 /// Muted per-turn footer. `saved …%` only when there is a positive saving.
 #[must_use]
 pub fn format_turn_footer(
@@ -127,41 +70,19 @@ pub fn format_turn_footer(
     ui::muted().apply_to(s).to_string()
 }
 
-/// Build the OSC52 terminal escape that copies `text` to the system clipboard.
-/// Works locally and over SSH — no platform clipboard dependency. Best-effort:
-/// terminals that don't support OSC52 simply ignore it.
-#[must_use]
-pub fn osc52_copy(text: &str) -> String {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
-    format!("\x1b]52;c;{b64}\x07")
-}
-
-/// xterm discards OSC52 payloads beyond ~74 994 base64 chars; cap the raw reply
-/// conservatively (base64 inflates ~4/3×) so `/copy` never silently truncates.
-const OSC52_MAX_BYTES: usize = 55 * 1024;
-
-/// Wrap a bare OSC52 sequence for tmux/screen passthrough so `/copy` works
-/// inside a multiplexer. Env is read at the call site so this stays pure.
-#[must_use]
-fn wrap_osc52_for_mux(seq: String, in_tmux: bool, term: &str) -> String {
-    if in_tmux {
-        // tmux DCS passthrough: ESC P tmux ; <seq, each ESC doubled> ESC \
-        format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
-    } else if term.starts_with("screen") {
-        // screen DCS chunk: ESC P <seq> ESC \
-        format!("\x1bP{seq}\x1b\\")
-    } else {
-        seq
-    }
-}
-
 /// In-memory conversation state (also the on-disk session format).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
     pub model: String,
     pub system: Option<String>,
     pub messages: Vec<Message>,
+    /// Frozen summary of turns folded away by `chat::compact`, carried on the
+    /// wire as a second `System` message right after the system prompt (the
+    /// STABLE-PREFIX position — see the invariants in `chat::budget`).
+    /// Optional + serde-default: old session files load as `None`, and old
+    /// CLI binaries reading new files ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<compact::FrozenSummary>,
 }
 
 impl Conversation {
@@ -171,6 +92,7 @@ impl Conversation {
             model,
             system,
             messages: Vec::new(),
+            summary: None,
         }
     }
     pub fn push_user(&mut self, text: String) {
@@ -188,14 +110,23 @@ impl Conversation {
     }
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.summary = None;
     }
-    /// The full message list to send: system message (if any) prepended.
+    /// The full message list to send, ordered STABLE → VOLATILE:
+    /// `[system?, frozen summary?, …messages]`. On Anthropic both `System`
+    /// messages land in the cached `system_blocks` prefix; on OpenAI they
+    /// extend the auto-cached stable prefix (see `chat::budget` docs).
     #[must_use]
     pub fn wire_messages(&self) -> Vec<Message> {
         let mut v = Vec::new();
         if let Some(s) = &self.system {
             v.push(Message::System {
                 content: MessageContent::Text(s.clone()),
+            });
+        }
+        if let Some(sum) = &self.summary {
+            v.push(Message::System {
+                content: MessageContent::Text(sum.wire_block().to_string()),
             });
         }
         v.extend(self.messages.iter().cloned());
@@ -210,6 +141,18 @@ pub struct Ledger {
     pub cost_usd: f64,
     pub saved_usd: f64,
     pub baseline_usd: f64,
+    /// Estimated tokens removed from history by `chat::shape` tool-result/arg
+    /// trimming. Token counts only — never converted into a USD savings claim
+    /// (the gateway attributes no spend to these bytes).
+    pub tool_trim_tokens: u64,
+    /// REAL SPEND on compaction summary calls (also included in `cost_usd`).
+    pub compaction_spend_usd: f64,
+    /// Number of metered compaction summary calls.
+    pub compaction_calls: u32,
+    /// Estimated tokens no longer re-sent per future turn thanks to
+    /// compaction (Σ dropped − summary). An ESTIMATE — always labeled
+    /// `est./unbooked` and never merged into `saved_usd`.
+    pub compaction_est_tok_per_turn: u64,
 }
 
 impl Ledger {
@@ -219,6 +162,16 @@ impl Ledger {
         self.saved_usd += u.saved_usd;
         self.baseline_usd += u.baseline_cost_usd;
     }
+    /// Meter one compaction summary call. HONESTY GUARD: this is real money,
+    /// so it raises the headline `cost_usd` (plus the dedicated compaction
+    /// line) — and it NEVER touches `turns`, `saved_usd` or `baseline_usd`:
+    /// summarization "saves" only estimated future re-sends, which are not
+    /// gateway-attributed savings and must never inflate the saved figures.
+    pub fn add_compaction(&mut self, cost_usd: f64) {
+        self.cost_usd += cost_usd;
+        self.compaction_spend_usd += cost_usd;
+        self.compaction_calls += 1;
+    }
     #[must_use]
     pub fn summary(&self) -> String {
         let pct = if self.baseline_usd > 0.0 {
@@ -226,10 +179,23 @@ impl Ledger {
         } else {
             0.0
         };
-        format!(
+        let mut s = format!(
             "session: {} turn(s) · ${:.4} spent · saved ${:.4} ({pct:.0}%)",
             self.turns, self.cost_usd, self.saved_usd
-        )
+        );
+        if self.compaction_calls > 0 {
+            s.push_str(&format!(
+                " · compaction ${:.4} ({} call(s), est. −{} tok/turn, unbooked)",
+                self.compaction_spend_usd, self.compaction_calls, self.compaction_est_tok_per_turn
+            ));
+        }
+        if self.tool_trim_tokens > 0 {
+            s.push_str(&format!(
+                " · tool-trim −{} tok (est.)",
+                self.tool_trim_tokens
+            ));
+        }
+        s
     }
 }
 
@@ -357,9 +323,10 @@ async fn dispatch_turn(
     ledger: &mut Ledger,
     reg: &tt_mcp::tools::Registry,
     tools_enabled: bool,
+    tool_trim: bool,
 ) -> bool {
     if tools_enabled {
-        tools::run_tool_turn(client, conv, reg, ledger).await
+        tools::run_tool_turn(client, conv, reg, ledger, tool_trim).await
     } else {
         do_turn(client, conv, ledger).await
     }
@@ -391,46 +358,64 @@ fn compose_in_editor() -> anyhow::Result<Option<String>> {
     Ok(if text.is_empty() { None } else { Some(text) })
 }
 
-fn print_help() {
-    ui::heading("commands");
-    for (c, d) in [
-        ("/help", "show this help"),
-        ("/clear", "reset the conversation"),
-        ("/model [m]", "show or switch the requested model"),
-        ("/system [s]", "show or set the system prompt"),
-        ("/editor", "compose a multi-line message in $VISUAL/$EDITOR"),
-        ("/retry", "re-run the last turn"),
-        ("/copy", "copy the last reply to the clipboard"),
-        (
-            "/tools [on|off]",
-            "toggle tool-calling (find_route_for, preview_cost, inspect_diff)",
-        ),
-        ("/context [n]", "show or set the token budget"),
-        ("/trim", "drop oldest turns to fit the budget"),
-        ("/save [name]", "save this conversation"),
-        ("/resume <name>", "load a saved conversation"),
-        ("/sessions", "list saved conversations"),
-        ("/cost", "session cost + savings so far"),
-        ("/exit", "quit (or Ctrl-D)"),
-    ] {
-        println!(
-            "  {}  {}",
-            ui::accent().apply_to(c),
-            ui::muted().apply_to(d)
-        );
+/// One-line `/tools` status: tool-calling state + result-trim state.
+fn print_tools_status(tools_enabled: bool, tool_trim: bool) {
+    let trim = if tool_trim { "on" } else { "off" };
+    if tools_enabled {
+        ui::info(&format!(
+            "tools: on (find_route_for, preview_cost, inspect_diff) · result-trim {trim}"
+        ));
+    } else {
+        ui::info(&format!("tools: off · result-trim {trim}"));
     }
 }
 
+/// Options for [`run`] — one struct instead of a long positional parameter
+/// list (clippy::too_many_arguments-clean and extensible).
+#[derive(Debug, Default)]
+pub struct RunOpts {
+    /// Model to request (the gateway may route it).
+    pub model: Option<String>,
+    /// Optional system prompt for the conversation.
+    pub system: Option<String>,
+    /// Resume a saved session by name.
+    pub resume: Option<String>,
+    /// Enable tool-calling from the start.
+    pub tools: bool,
+    /// Token budget override for context management.
+    pub max_context: Option<u32>,
+    /// Disable lossless tool-result/arg trimming in the `/tools` loop
+    /// (`chat::shape`; ON by default — lossless minify + class-safe drops).
+    pub no_tool_trim: bool,
+    /// Enable cache-aware compaction (`chat::compact`). OFF by default — the
+    /// summary is a paid model call.
+    pub compact: bool,
+    /// Compact every K successful turns. Routed through the single
+    /// `set_every` gate: K < 2 (incl. an explicit 0) warns + keeps the default.
+    pub compact_every: u32,
+    /// Model for the compaction summary call.
+    pub compact_model: Option<String>,
+    /// `--tt-api-key` flag.
+    pub flag_key: Option<String>,
+    /// `--tt-api-base` flag.
+    pub flag_base: Option<String>,
+}
+
 /// Entry point for `tt chat`.
-pub async fn run(
-    model: Option<String>,
-    system: Option<String>,
-    resume: Option<String>,
-    tools: bool,
-    max_context: Option<u32>,
-    flag_key: Option<String>,
-    flag_base: Option<String>,
-) -> anyhow::Result<()> {
+pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
+    let RunOpts {
+        model,
+        system,
+        resume,
+        tools,
+        max_context,
+        no_tool_trim,
+        compact,
+        compact_every,
+        compact_model,
+        flag_key,
+        flag_base,
+    } = opts;
     let ctx = ResolvedContext::load(flag_key, flag_base)?;
     let key = ctx
         .api_key_string()
@@ -451,6 +436,7 @@ pub async fn run(
     let mut ledger = Ledger::default();
     let registry = tools::build_registry();
     let mut tools_enabled = tools;
+    let mut tool_trim = !no_tool_trim;
     // Best-effort: real per-model windows from the gateway catalog. On any
     // failure (offline / old gateway / pre-auth) fall back to the prefix table.
     let catalog_windows = match crate::catalog::fetch_catalog(&http, &base, Some(&key)).await {
@@ -458,6 +444,13 @@ pub async fn run(
         Err(_) => std::collections::HashMap::new(),
     };
     let mut ctx = budget::ContextState::new(max_context, catalog_windows);
+    // Cache-aware compaction (OFF by default — the summary is a paid call).
+    // The flag shares the `/compact every` set_every gate: K < 2 (incl. an
+    // explicit `--compact-every 0`) warns and keeps the default cadence.
+    let mut cstate = compact::CompactionState::new(compact, compact_model);
+    if let Err(msg) = cstate.set_every(compact_every) {
+        ui::warn(&msg);
+    }
     ui::heading(&format!(
         "tt chat · {} via TokenTrimmer{}   (/help)",
         conv.model,
@@ -476,17 +469,38 @@ pub async fn run(
                         let snapshot = conv.messages.clone();
                         conv.push_user(t);
                         ctx.manage(&mut conv);
-                        if !dispatch_turn(&client, &mut conv, &mut ledger, &registry, tools_enabled)
-                            .await
+                        if !dispatch_turn(
+                            &client,
+                            &mut conv,
+                            &mut ledger,
+                            &registry,
+                            tools_enabled,
+                            tool_trim,
+                        )
+                        .await
                         {
                             // failed turn → no-op on history: drop the user turn
                             // AND undo any trim manage() did before sending.
                             conv.messages = snapshot;
+                        } else {
+                            // Compaction runs only AFTER a successful turn —
+                            // never between snapshot and dispatch, so the
+                            // restore contract above stays byte-for-byte.
+                            cstate.note_turn();
+                            compact::maybe_compact(
+                                &client,
+                                &mut conv,
+                                &mut cstate,
+                                &mut ctx,
+                                &mut ledger,
+                            )
+                            .await;
                         }
                     }
                     Command::Help => print_help(),
                     Command::Clear => {
                         conv.clear();
+                        cstate.reset_cadence(); // counter is runtime-only
                         ui::info("(conversation cleared)");
                     }
                     Command::Model(Some(m)) => {
@@ -512,6 +526,8 @@ pub async fn run(
                     Command::Resume(name) => match session::load(&session::sessions_dir(), &name) {
                         Ok(c) => {
                             conv = c;
+                            // first compaction fires K turns after a resume
+                            cstate.reset_cadence();
                             ui::info(&format!("(resumed · {} messages)", conv.messages.len()));
                         }
                         Err(e) => ui::error(&format!("{e:#}")),
@@ -551,13 +567,30 @@ pub async fn run(
                         let dropped = budget::manual_trim(&mut conv, &ctx);
                         ui::info(&format!("trimmed {dropped} old message(s)"));
                     }
-                    Command::Tools(set) => {
-                        tools_enabled = set.unwrap_or(!tools_enabled);
-                        if tools_enabled {
-                            ui::info("tools: on (find_route_for, preview_cost, inspect_diff)");
-                        } else {
-                            ui::info("tools: off");
+                    Command::Tools(arg) => match arg {
+                        ToolsArg::Toggle | ToolsArg::Set(_) => {
+                            tools_enabled = match arg {
+                                ToolsArg::Set(b) => b,
+                                _ => !tools_enabled,
+                            };
+                            print_tools_status(tools_enabled, tool_trim);
                         }
+                        ToolsArg::Trim(b) => {
+                            tool_trim = b;
+                            print_tools_status(tools_enabled, tool_trim);
+                        }
+                        ToolsArg::Bad(usage) => ui::warn(&usage),
+                    },
+                    Command::Compact(arg) => {
+                        compact::handle(
+                            arg,
+                            &client,
+                            &mut conv,
+                            &mut cstate,
+                            &mut ctx,
+                            &mut ledger,
+                        )
+                        .await;
                     }
                     Command::Editor => match compose_in_editor() {
                         Ok(Some(t)) => {
@@ -570,10 +603,21 @@ pub async fn run(
                                 &mut ledger,
                                 &registry,
                                 tools_enabled,
+                                tool_trim,
                             )
                             .await
                             {
                                 conv.messages = snapshot; // no-op on history
+                            } else {
+                                cstate.note_turn();
+                                compact::maybe_compact(
+                                    &client,
+                                    &mut conv,
+                                    &mut cstate,
+                                    &mut ctx,
+                                    &mut ledger,
+                                )
+                                .await;
                             }
                         }
                         Ok(None) => ui::info("(editor: nothing sent)"),
@@ -587,6 +631,7 @@ pub async fn run(
                                 &mut ledger,
                                 &registry,
                                 tools_enabled,
+                                tool_trim,
                             )
                             .await
                             {
@@ -681,19 +726,6 @@ mod tests {
     }
 
     #[test]
-    fn command_parse() {
-        assert!(matches!(Command::parse("/help"), Command::Help));
-        assert!(matches!(Command::parse("/clear"), Command::Clear));
-        assert!(matches!(Command::parse("/exit"), Command::Exit));
-        assert!(
-            matches!(Command::parse("/model gpt-4o"), Command::Model(Some(m)) if m == "gpt-4o")
-        );
-        assert!(matches!(Command::parse("/model"), Command::Model(None)));
-        assert!(matches!(Command::parse("/nope"), Command::Unknown(c) if c == "nope"));
-        assert!(matches!(Command::parse("hello there"), Command::Chat(t) if t == "hello there"));
-    }
-
-    #[test]
     fn footer_formats_with_savings() {
         console::set_colors_enabled(false);
         let s = format_turn_footer("gpt-4o-mini", 10, 20, 0.0001, 0.0003, 0.0004);
@@ -723,16 +755,6 @@ mod tests {
     }
 
     #[test]
-    fn command_parse_ergonomics() {
-        assert!(matches!(Command::parse("/editor"), Command::Editor));
-        assert!(matches!(Command::parse("/e"), Command::Editor));
-        assert!(matches!(Command::parse("/retry"), Command::Retry));
-        assert!(matches!(Command::parse("/r"), Command::Retry));
-        assert!(matches!(Command::parse("/copy"), Command::Copy));
-        assert!(matches!(Command::parse("/y"), Command::Copy));
-    }
-
-    #[test]
     fn prepare_retry_pops_and_classifies() {
         let mut c = Conversation::new("m".into(), None);
         assert!(matches!(prepare_retry(&mut c), RetryPlan::Nothing));
@@ -753,27 +775,6 @@ mod tests {
     }
 
     #[test]
-    fn osc52_mux_wrapping() {
-        let bare = osc52_copy("x");
-        // outside a multiplexer → unchanged
-        assert_eq!(
-            wrap_osc52_for_mux(bare.clone(), false, "xterm-256color"),
-            bare
-        );
-        // tmux → DCS passthrough with each inner ESC doubled
-        let t = wrap_osc52_for_mux(bare.clone(), true, "screen");
-        assert!(t.starts_with("\x1bPtmux;"), "{t:?}");
-        assert!(t.ends_with("\x1b\\"), "{t:?}");
-        assert!(
-            t.contains("\x1b\x1b]52"),
-            "inner ESC must be doubled: {t:?}"
-        );
-        // screen (no tmux) → DCS chunk
-        let s = wrap_osc52_for_mux(bare, false, "screen.xterm");
-        assert!(s.starts_with("\x1bP") && s.ends_with("\x1b\\"), "{s:?}");
-    }
-
-    #[test]
     fn last_assistant_text_finds_latest() {
         let mut c = Conversation::new("m".into(), None);
         assert!(last_assistant_text(&c).is_none());
@@ -782,14 +783,6 @@ mod tests {
         c.push_user("more".into());
         c.push_assistant("second".into());
         assert_eq!(last_assistant_text(&c).as_deref(), Some("second"));
-    }
-
-    #[test]
-    fn osc52_wraps_base64() {
-        let s = osc52_copy("hi");
-        assert!(s.starts_with("\x1b]52;c;"), "{s:?}");
-        assert!(s.ends_with('\x07'), "{s:?}");
-        assert!(s.contains("aGk="), "base64 of 'hi' missing: {s:?}");
     }
 
     #[test]

@@ -146,6 +146,35 @@ mod tests {
         assert_eq!(auto_name(&Conversation::new("m".into(), None)), "chat");
     }
 
+    /// The frozen summary round-trips byte-identically through save/load (a
+    /// re-encoded block would bust the provider-cached prefix on resume), and
+    /// old-format session files (no `summary` field) load as `None`.
+    #[test]
+    fn session_roundtrips_frozen_summary_bytes() {
+        let dir = std::env::temp_dir().join(format!("tt-sess-sum-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let block = "[Conversation summary — earlier turns were compacted by tt chat]\n\
+                     the user explored routing; café naïve ünïcode bytes must survive";
+        let mut c = Conversation::new("gpt-4o".into(), Some("be brief".into()));
+        c.summary = Some(crate::chat::compact::FrozenSummary::replace_at_compaction(
+            block.into(),
+            7,
+            "gpt-4o-mini".into(),
+        ));
+        c.push_user("hi".into());
+        c.push_assistant("yo".into());
+        save(&dir, "sum", &c).unwrap();
+        let loaded = load(&dir, "sum").unwrap();
+        let sum = loaded.summary.expect("summary survives the round-trip");
+        assert_eq!(sum.wire_block(), block, "bytes must be identical");
+        assert_eq!(sum.folded_turns(), 7);
+        // old-format JSON (pre-compaction CLI) → summary == None
+        let legacy = r#"{"model":"gpt-4o","system":null,"messages":[]}"#;
+        let old: Conversation = serde_json::from_str(legacy).unwrap();
+        assert!(old.summary.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn save_load_roundtrip_and_path_stays_in_dir() {
         let dir = std::env::temp_dir().join(format!("tt-sess-{}", std::process::id()));

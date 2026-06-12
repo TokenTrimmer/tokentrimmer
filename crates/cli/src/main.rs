@@ -149,6 +149,20 @@ enum Command {
         /// Token budget for context management (default: the per-model window).
         #[arg(long)]
         max_context: Option<u32>,
+        /// Disable lossless tool-result/arg trimming in the /tools loop.
+        #[arg(long)]
+        no_tool_trim: bool,
+        /// Enable cache-aware compaction: fold old turns into a frozen summary
+        /// every K turns. Off by default — the summary is a paid model call.
+        #[arg(long)]
+        compact: bool,
+        /// Compact every K successful turns (min 2 — K=1 would bust the
+        /// provider cache every turn; default 8).
+        #[arg(long, default_value_t = 8)]
+        compact_every: u32,
+        /// Model for the compaction summary call (default: gpt-4o-mini).
+        #[arg(long)]
+        compact_model: Option<String>,
         #[arg(long, global = true)]
         tt_api_key: Option<String>,
         #[arg(long, global = true)]
@@ -737,18 +751,26 @@ async fn main() -> anyhow::Result<()> {
             resume,
             tools,
             max_context,
+            no_tool_trim,
+            compact,
+            compact_every,
+            compact_model,
             tt_api_key,
             tt_api_base,
         } => {
-            tt_cli::chat::run(
+            tt_cli::chat::run(tt_cli::chat::RunOpts {
                 model,
                 system,
                 resume,
                 tools,
                 max_context,
-                tt_api_key,
-                tt_api_base,
-            )
+                no_tool_trim,
+                compact,
+                compact_every,
+                compact_model,
+                flag_key: tt_api_key,
+                flag_base: tt_api_base,
+            })
             .await?;
         }
         Command::Models {

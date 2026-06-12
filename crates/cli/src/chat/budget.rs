@@ -1,6 +1,50 @@
 //! Context-window management for `tt chat`: estimate token usage, warn as the
 //! conversation fills a per-model budget, and trim the oldest turns before the
 //! limit. The gateway remains the authoritative gate; this is advisory.
+//!
+//! This module is also the home of the chat-side caching/honesty INVARIANTS
+//! (research Phase 4) that the trimmer and the compactor ([`super::compact`])
+//! jointly enforce. Each maps to a test:
+//!
+//! 1. **STABLE → VOLATILE order.** The wire order is `[system, frozen summary,
+//!    older-kept verbatim turns, recent turns]`
+//!    ([`Conversation::wire_messages`]). Emitting `cache_control` is the
+//!    GATEWAY adapter's job (#150: the Anthropic adapter lifts every `System`
+//!    message into the cached `system_blocks` prefix and injects the
+//!    breakpoints; OpenAI auto-caches ≥1024-token stable prefixes) — the CLI's
+//!    `tt_shared::Message` has no `cache_control` slot and must not try. The
+//!    CLI's enforceable half of "emit cache_control on the frozen prefix" is
+//!    PREFIX BYTE-STABILITY, which invariant 2 provides. Test:
+//!    `compact::tests::summary_block_is_byte_identical_across_non_compaction_turns`.
+//!
+//! 2. **Caching-tension rule.** Never re-select or rewrite inside the stable
+//!    prefix: naive per-turn re-selection measured −145% at 40 turns. The
+//!    summary block is BYTE-FROZEN between compactions —
+//!    [`super::compact::FrozenSummary`] has no mutator and a single
+//!    constructor called from one site — and a compaction busts the prefix at
+//!    most once per K turns by design, booking the bust as the negative term
+//!    `B` in the net-positive predicate `(D − S) × K > C_in + S + B`. K < 2
+//!    is rejected. Tests: `compact::tests::compaction_fires_only_every_k_turns`,
+//!    `compact::tests::k_below_two_is_rejected`,
+//!    `compact::tests::net_negative_compaction_is_skipped_with_warning_and_no_history_change`.
+//!
+//! 3. **Honesty guard.** The compaction summary call is REAL SPEND
+//!    (`Ledger::add_compaction` raises the headline `cost_usd` plus a
+//!    dedicated compaction line); the future re-send reduction is an ESTIMATE
+//!    — token-denominated, always labeled `est.`/`unbooked`, and never folded
+//!    into the gateway-attributed `saved_usd`. Holding the session saves
+//!    nothing by itself. Test:
+//!    `compact::tests::compaction_spend_metered_never_booked_as_savings`.
+//!
+//! 4. **Fallback trimmer.** [`trim_to_budget`] keeps all its V5b-3 invariants
+//!    — fires at 95% down to ~70%, drops oldest WHOLE turns, keeps the system
+//!    prompt, never orphans an `Assistant{tool_calls}` + `Tool` pair,
+//!    preserves the last turn — and remains the only mechanism when
+//!    compaction is off, skipped, or insufficient. It drains `conv.messages`
+//!    only, so it structurally cannot touch the frozen summary. Tests:
+//!    `trim_reduces_and_preserves_system_and_last`,
+//!    `trim_does_not_orphan_a_tool_exchange`,
+//!    `trim_fallback_never_touches_summary`.
 
 use std::collections::HashMap;
 
@@ -16,7 +60,9 @@ const TRIM_FRAC: f64 = 0.95;
 const TRIM_TARGET_FRAC: f64 = 0.70;
 /// cl100k is a high-quality general estimator; the chat doesn't reliably know
 /// the routed provider, so we estimate with the OpenAI tokenizer for all models.
-const ESTIMATE_PROVIDER: &str = "openai";
+/// Shared with `chat::shape`/`chat::compact` so every chat-side token estimate
+/// uses the same tokenizer.
+pub(crate) const ESTIMATE_PROVIDER: &str = "openai";
 
 /// Best-effort context window (input tokens) for a model id, by prefix. These
 /// are approximate defaults — overridable via `--max-context` / `/context <n>`;
@@ -41,11 +87,17 @@ pub fn model_window(model: &str) -> u32 {
     }
 }
 
-/// All message text (system prompt + each `Text` content), for estimation.
+/// All message text (system prompt + frozen summary + each `Text` content),
+/// for estimation. The summary block is real wire bytes — `manage()` and the
+/// 95% valve must count it.
 fn conversation_text(conv: &Conversation) -> String {
     let mut out = String::new();
     if let Some(sys) = &conv.system {
         out.push_str(sys);
+        out.push('\n');
+    }
+    if let Some(sum) = &conv.summary {
+        out.push_str(sum.wire_block());
         out.push('\n');
     }
     for m in &conv.messages {
@@ -93,6 +145,40 @@ pub fn estimate_conversation_tokens(conv: &Conversation, provider: &str) -> u32 
     tt_tokenize::estimate_tokens(provider, &conversation_text(conv))
 }
 
+/// The start of the second turn: the index of the next `User` message after
+/// index 0, or `None` when only one turn remains. This is the single source of
+/// truth for turn boundaries — both the trimmer ([`trim_to_budget`]) and the
+/// compactor fold on these exact boundaries, so neither can orphan an
+/// `Assistant{tool_calls}` + `Tool` pair (a turn is a `User` message and
+/// everything up to, but not including, the next `User`).
+#[must_use]
+pub(crate) fn next_turn_start(messages: &[Message]) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, m)| matches!(m, Message::User { .. }))
+        .map(|(i, _)| i)
+}
+
+/// Indices where each whole turn starts (index 0 is always the first turn's
+/// start). Built on [`next_turn_start`] so the boundary definition cannot
+/// drift between the trimmer and the compactor.
+#[must_use]
+pub(crate) fn turn_starts(messages: &[Message]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    if messages.is_empty() {
+        return starts;
+    }
+    starts.push(0);
+    let mut base = 0;
+    while let Some(next) = next_turn_start(&messages[base..]) {
+        base += next;
+        starts.push(base);
+    }
+    starts
+}
+
 /// Drop the oldest whole turns until the estimate is `<= target`, or only the
 /// most recent turn remains. A "turn" is a `User` message and everything up to
 /// (but not including) the next `User`, so removing whole turns keeps the system
@@ -103,15 +189,7 @@ pub fn estimate_conversation_tokens(conv: &Conversation, provider: &str) -> u32 
 pub fn trim_to_budget(conv: &mut Conversation, target: u32, provider: &str) -> usize {
     let original = conv.messages.len();
     while estimate_conversation_tokens(conv, provider) > target {
-        // The start of the second turn = the next `User` after index 0.
-        let next_turn = conv
-            .messages
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, m)| matches!(m, Message::User { .. }))
-            .map(|(i, _)| i);
-        match next_turn {
+        match next_turn_start(&conv.messages) {
             // Drop the first whole turn.
             Some(idx) => {
                 conv.messages.drain(0..idx);
@@ -159,6 +237,12 @@ impl ContextState {
     #[must_use]
     pub fn estimate(&self, conv: &Conversation) -> u32 {
         estimate_conversation_tokens(conv, ESTIMATE_PROVIDER)
+    }
+
+    /// Clear the one-shot 75% warning (a compaction just shrank the history,
+    /// so the next approach to the band should warn again).
+    pub(crate) fn reset_warned(&mut self) {
+        self.warned = false;
     }
 
     /// Warn at 75%, auto-trim at 95% (down to ~70%). Call after the user turn is
@@ -327,6 +411,79 @@ mod tests {
             c.messages.first(),
             Some(Message::Assistant { tool_calls, .. }) if !tool_calls.is_empty()
         ));
+    }
+
+    #[test]
+    fn turn_starts_walks_user_boundaries() {
+        use tt_shared::messages::{ToolCall, ToolCallFunction};
+        let mut c = Conversation::new("m".into(), None);
+        assert!(turn_starts(&c.messages).is_empty());
+        c.push_user("q0".into()); // 0
+        c.messages.push(Message::Assistant {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: ToolCallFunction {
+                    name: "find_route_for".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+            name: None,
+        }); // 1 — same turn as 0
+        c.messages.push(Message::Tool {
+            content: MessageContent::Text("{}".into()),
+            tool_call_id: "c1".into(),
+        }); // 2 — same turn
+        c.push_assistant("a0".into()); // 3 — same turn
+        c.push_user("q1".into()); // 4 — new turn
+        c.push_assistant("a1".into()); // 5
+        c.push_user("q2".into()); // 6 — new turn
+        assert_eq!(turn_starts(&c.messages), vec![0, 4, 6]);
+        // and next_turn_start matches the second entry (shared boundary logic)
+        assert_eq!(next_turn_start(&c.messages), Some(4));
+    }
+
+    /// The frozen summary is real wire bytes — the estimator (and therefore
+    /// `manage()` / the 95% valve) must count it.
+    #[test]
+    fn estimate_includes_frozen_summary() {
+        let mut c = Conversation::new("gpt-4o-mini".into(), None);
+        c.push_user("hello".into());
+        let without = estimate_conversation_tokens(&c, ESTIMATE_PROVIDER);
+        c.summary = Some(crate::chat::compact::FrozenSummary::replace_at_compaction(
+            "[Conversation summary — earlier turns were compacted by tt chat]\n\
+             the user asked many long questions about routing and caching"
+                .into(),
+            5,
+            "gpt-4o-mini".into(),
+        ));
+        let with = estimate_conversation_tokens(&c, ESTIMATE_PROVIDER);
+        assert!(with > without, "{with} > {without}");
+    }
+
+    /// Part D invariant 4: the fallback trimmer drains `conv.messages` only —
+    /// it can never touch the frozen summary block.
+    #[test]
+    fn trim_fallback_never_touches_summary() {
+        let mut c = Conversation::new("gpt-4o-mini".into(), Some("be terse".into()));
+        let block = "[Conversation summary — earlier turns were compacted by tt chat]\n\
+                     earlier turns folded";
+        c.summary = Some(crate::chat::compact::FrozenSummary::replace_at_compaction(
+            block.into(),
+            2,
+            "gpt-4o-mini".into(),
+        ));
+        for i in 0..8 {
+            c.push_user(format!("user message number {i} with some words"));
+            c.push_assistant(format!("assistant reply number {i} with some words"));
+        }
+        let dropped = trim_to_budget(&mut c, 60, ESTIMATE_PROVIDER); // force a trim
+        assert!(dropped > 0, "trim must have fired");
+        // summary block byte-identical; system kept; clean User boundary
+        assert_eq!(c.summary.as_ref().unwrap().wire_block(), block);
+        assert_eq!(c.system.as_deref(), Some("be terse"));
+        assert!(matches!(c.messages.first(), Some(Message::User { .. })));
     }
 
     #[test]
