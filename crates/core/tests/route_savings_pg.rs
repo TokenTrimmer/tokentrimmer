@@ -404,3 +404,83 @@ async fn pg_verdict_window_recency_and_unclear_exclusion() {
         (0, 0)
     );
 }
+
+/// [`PgVerdictWindow`] is bounded by the resume watermark
+/// (`route_pauses.resumed_at`): after a resume, only POST-resume verdicts
+/// count — the frozen, mostly-degraded pre-pause window can never instantly
+/// re-pause a just-resumed route. An ACTIVE pause row (`resumed_at IS NULL`)
+/// and a missing row both leave the window unbounded.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn pg_verdict_window_bounded_by_resume_watermark() {
+    let pool = pool().await;
+    let org = Uuid::now_v7();
+    let route = Uuid::now_v7();
+
+    let seed = |verdict: &'static str, offset_secs: f64, n: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO quality_verdicts \
+                   (id, org_id, route_id, request_id, ts, requested_model, served_model, \
+                    verdict, judge_model) \
+                 SELECT gen_random_uuid(), $1, $2, gen_random_uuid(), \
+                        now() - make_interval(secs => $3 - i), \
+                        'gpt-4o', 'gpt-4o-mini', $4, 'judge-cheap' \
+                 FROM generate_series(1, $5) i",
+            )
+            .bind(org)
+            .bind(route)
+            .bind(offset_secs)
+            .bind(verdict)
+            .bind(n)
+            .execute(&pool)
+            .await
+            .expect("seed verdicts");
+        }
+    };
+
+    // The regression evidence that (hypothetically) triggered a pause…
+    seed("degraded", 100_000.0, 30).await;
+    // …a pause that was RESUMED between the old evidence and the new
+    // verdicts (resumed_at = now() - 50_000s)…
+    sqlx::query(
+        "INSERT INTO route_pauses (route_id, org_id, paused_by, reason, resumed_at) \
+         VALUES ($1, $2, 'auto', 'auto: regressed', now() - make_interval(secs => 50000))",
+    )
+    .bind(route)
+    .bind(org)
+    .execute(&pool)
+    .await
+    .expect("insert resumed watermark row");
+    // …and fresh post-resume verdicts.
+    seed("acceptable", 10_000.0, 5).await;
+
+    let window = PgVerdictWindow::new(pool.clone());
+    assert_eq!(
+        window
+            .recent_classified_counts(org, route, 100)
+            .await
+            .unwrap(),
+        (5, 0),
+        "post-resume window must exclude every pre-resume verdict"
+    );
+
+    // Re-activate the pause (resumed_at back to NULL — re-pause semantics):
+    // the bound disappears and the full history is visible again. (The
+    // evaluator never consults a paused route's window; this just pins the
+    // SQL's COALESCE(-infinity) branch.)
+    sqlx::query("UPDATE route_pauses SET resumed_at = NULL WHERE route_id = $1")
+        .bind(route)
+        .execute(&pool)
+        .await
+        .expect("re-activate pause");
+    assert_eq!(
+        window
+            .recent_classified_counts(org, route, 100)
+            .await
+            .unwrap(),
+        (5, 30),
+        "an active pause row must not bound the window"
+    );
+}

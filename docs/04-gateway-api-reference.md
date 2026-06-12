@@ -575,7 +575,13 @@ Anthropic, whose max is `1.0`). A `route_paused:<route-name>` token is emitted
 when the matched route is **paused** (manually or by the quality auto-pause —
 see §10.7): the request was served on its originally-requested model with the
 route's rewrite and every other cost lever suppressed; the matching
-`request_logs` row carries `route_paused = true`.
+`request_logs` row carries `route_paused = true`. Like every warnings token,
+`route_paused` appears on dispatched chat/messages responses only: L1/L2
+cache-hit responses return before the warnings header is assembled (the
+durable `request_logs.route_paused` marker is still set on hit rows), and the
+embeddings endpoint has no warnings header — a paused embeddings passthrough
+is visible only in the `route_paused_passthrough_total` metric and the
+gateway log line.
 
 The advisory batch-eligibility route action (`then.batch`) emits its own
 tokens — honest by design, since the gateway dispatches synchronously today and
@@ -861,12 +867,24 @@ guardrail. A forced `X-TokenTrimmer-Route` header does **not** bypass a pause.
 Pauses are **sticky**: created manually (`POST /v1/routes/:id/pause`) or by the
 opt-in quality auto-pause (`then.auto_pause` — see the
 [routing rules guide](routing-rules-guide.md)), they persist until an explicit
-`POST /v1/routes/:id/resume`. Pause/resume takes effect immediately on the
-replica that served the call and within the 60-second route-cache TTL on other
-replicas. `GET /v1/routes` / `GET /v1/routes/:id` surface `"paused": true` on
-paused routes (the key is omitted when false). Both endpoints are idempotent
-and answer `200`; `resume` reports `"was_paused"` so callers can tell whether a
-pause row was actually removed.
+`POST /v1/routes/:id/resume`. A resume retains the pause record with a
+`resumed_at` watermark: the auto-pause evaluator only counts verdicts recorded
+**after** the most recent resume, so a just-resumed route is re-evaluated on
+fresh evidence, never instantly re-paused by its frozen pre-pause window.
+Pause/resume takes effect immediately on the replica that served the call and
+within the 60-second route-cache TTL on other replicas. `GET /v1/routes` /
+`GET /v1/routes/:id` surface `"paused": true` on paused routes (the key is
+omitted when false). Both endpoints are idempotent and answer `200`; `resume`
+reports `"was_paused"` so callers can tell whether an active pause was
+actually cleared.
+
+Two caveats worth knowing: deleting a route deletes its pause record with it,
+so the documented delete-and-re-create edit flow starts the new route (a fresh
+id) **unpaused** — re-pause it explicitly if the quality concern still stands.
+And `paused` on the API is a bare flag: the recorded evidence (`paused_by`,
+`reason`, `pass_rate`, `paused_at`) lives in the `route_pauses` table and is
+not yet surfaced on a read endpoint (dashboard surfacing is tracked in the
+cloud repo).
 
 #### Per-route netted savings
 
@@ -898,9 +916,28 @@ never silently subtracted:
 whose verification spend exceeds its swap saving must show a negative net.
 Per-request figures (`X-TokenTrimmer-Saved-Usd`, `request_logs`) stay gross — a
 single request doesn't carry the amortized measurement tax; netting exists only
-at this aggregate surface. The endpoint answers `503` until the gateway is
-booted with a savings source (a Postgres-backed deployment), and an existing
+at this aggregate surface. The shipped gateway binary wires the Postgres
+savings source automatically at boot when `DATABASE_URL` is set; without a
+database the endpoint answers `503` (aggregation not configured). An existing
 route with no in-window traffic answers an honest all-zero body, not `404`.
+
+Two semantics to read the numbers with:
+
+- `gross_saved_usd` is the route's **full per-request savings headline**
+  (`X-TokenTrimmer-Saved-Usd`) summed over its rows — model-swap savings plus
+  any L1/L2 cache-hit, Flex, and compression savings on route-attributed
+  requests. It is **not** the model-swap delta alone; notably, a paused route
+  still serves L1/L2 hits (caching is a safety-neutral lever), so a paused
+  route's gross can keep growing from cache hits while its rewrite is
+  suppressed. The `verdicts` block and `net_saved_usd` are the
+  quality-regression signal; the gross line is invoice-reconcilable savings
+  attribution.
+- The window buckets `request_logs` rows and `quality_verdicts` rows
+  independently by their own timestamps, and a verdict is written by the
+  detached judge task seconds-to-minutes after its request — so a request near
+  `window_end` can land in this window while its judge tax lands in the next
+  one. Self-correcting across consecutive windows; negligible at the default
+  720 h window, visible at very short windows (`hours=1`).
 
 > **Planned (not yet honored):** in-place `PATCH /v1/routes/:id` update, and the hosted-only `/v1/admin/plans|inspect|usage|invoices` surfaces, are not served by the self-hosted binary.
 

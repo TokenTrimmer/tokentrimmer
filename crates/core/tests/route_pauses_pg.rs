@@ -1,8 +1,11 @@
 //! DB-gated tests for the sticky `route_pauses` table (migration 0017) driven
 //! through the REAL [`tt_routing::PostgresRoutingStore`] SQL: the
-//! ownership-guarded `INSERT..SELECT` pause, the `ON CONFLICT DO NOTHING`
-//! stickiness, the `LEFT JOIN` that surfaces `Route.paused` on every
-//! accessor, and the `DELETE` resume.
+//! ownership-guarded `INSERT..SELECT` pause, the conditional `ON CONFLICT`
+//! stickiness (an ACTIVE pause keeps its evidence; a resumed watermark row is
+//! overwritten by a re-pause), the active-only `LEFT JOIN` that surfaces
+//! `Route.paused` on every accessor, the watermark-stamping `UPDATE` resume
+//! (the row is RETAINED with `resumed_at` set), and the pause-record GC on
+//! route delete.
 //!
 //! The `routes` table is CLOUD-owned (tokentrimmer-cloud
 //! `crates/api/migrations/0002_routes.up.sql`) — public migrations
@@ -44,10 +47,22 @@ async fn store() -> (PostgresRoutingStore, sqlx::PgPool) {
         .await
         .expect("migrations (incl. 0017) apply cleanly");
     let pool = tt_core::connect(&url, 2).await.expect("connect");
+    // `CREATE TABLE IF NOT EXISTS` is NOT race-safe in Postgres: on a fresh
+    // database, two concurrent sessions can both pass the existence check and
+    // one then fails with a duplicate `pg_type` key (SQLSTATE 23505). The
+    // tests in this binary run concurrently and each calls this helper, so
+    // serialize the bootstrap with a transaction-scoped advisory lock (the
+    // sqlx migrator above is already advisory-locked internally).
+    let mut tx = pool.begin().await.expect("begin bootstrap tx");
+    sqlx::query("SELECT pg_advisory_xact_lock(0x74740017)")
+        .execute(&mut *tx)
+        .await
+        .expect("acquire bootstrap advisory lock");
     sqlx::query(CREATE_ROUTES_TABLE)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .expect("create minimal cloud-shaped routes table");
+    tx.commit().await.expect("commit bootstrap tx");
     (PostgresRoutingStore::new(pool.clone()), pool)
 }
 
@@ -138,8 +153,9 @@ async fn pg_pause_resume_round_trip_and_ownership() {
     assert!(s.list_for_org(org_a).await.unwrap()[0].paused);
     assert!(s.list_all_for_org(org_a).await.unwrap()[0].paused);
 
-    // Sticky: a second pause is ON CONFLICT DO NOTHING → Ok(false), and the
-    // FIRST pause's evidence is kept.
+    // Sticky: a second pause on an ACTIVE pause is Ok(false) (the conditional
+    // ON CONFLICT update matches no row), and the FIRST pause's evidence is
+    // kept.
     let second = NewRoutePause {
         paused_by: PausedBy::Manual,
         reason: "manual overwrite attempt".into(),
@@ -159,11 +175,30 @@ async fn pg_pause_resume_round_trip_and_ownership() {
 
     // Foreign org cannot resume.
     assert!(!s.resume_route(org_b, created.id).await.unwrap());
-    assert_eq!(pause_row_count(&pool, created.id).await, 1);
+    assert!(
+        s.get_route(org_a, created.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .paused
+    );
 
-    // Owner resume deletes; second resume is Ok(false).
+    // Owner resume: the record is RETAINED with resumed_at stamped (the
+    // auto-pause verdict-window watermark) — NOT deleted — and the route
+    // reads unpaused everywhere. A second resume is Ok(false).
     assert!(s.resume_route(org_a, created.id).await.unwrap());
-    assert_eq!(pause_row_count(&pool, created.id).await, 0);
+    assert_eq!(
+        pause_row_count(&pool, created.id).await,
+        1,
+        "resume must RETAIN the row as a watermark"
+    );
+    let resumed_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT resumed_at FROM route_pauses WHERE route_id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(resumed_at.is_some(), "resume must stamp resumed_at");
     assert!(
         !s.get_route(org_a, created.id)
             .await
@@ -171,7 +206,46 @@ async fn pg_pause_resume_round_trip_and_ownership() {
             .unwrap()
             .paused
     );
+    assert!(!s.list_for_org(org_a).await.unwrap()[0].paused);
     assert!(!s.resume_route(org_a, created.id).await.unwrap());
+
+    // Re-pause AFTER the resume: the resumed watermark row is overwritten by
+    // the NEW pause's evidence (resumed_at back to NULL, paused again).
+    let repause = NewRoutePause {
+        paused_by: PausedBy::Manual,
+        reason: "manual re-pause".into(),
+        pass_rate: None,
+        verdicts_in_window: None,
+    };
+    assert!(
+        s.pause_route(org_a, created.id, repause).await.unwrap(),
+        "re-pause after resume must succeed"
+    );
+    let (reason2, resumed2): (String, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT reason, resumed_at FROM route_pauses WHERE route_id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reason2, "manual re-pause", "NEW evidence must be recorded");
+    assert!(resumed2.is_none(), "re-pause must clear resumed_at");
+    assert!(
+        s.get_route(org_a, created.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .paused
+    );
+
+    // Deleting the route GCs its pause record (no orphaned rows; a recreated
+    // route gets a fresh id, so the documented delete-and-recreate edit flow
+    // starts clean).
+    assert!(s.delete_route(org_a, created.id).await.unwrap());
+    assert_eq!(
+        pause_row_count(&pool, created.id).await,
+        0,
+        "delete_route must GC the pause record"
+    );
 }
 
 /// A pause survives unrelated dashboard writes (route create/delete) — the

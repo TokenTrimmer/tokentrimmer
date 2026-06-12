@@ -110,6 +110,14 @@ the pass-rate (`acceptable / (acceptable + degraded)` — `unclear` never
 counts) drops **strictly below** `pause_floor_pass_rate` (default `0.90`), the
 route is **paused** automatically.
 
+The circuit breaker is doubly opt-in and needs two things at boot to exist at
+all: the judge must be enabled (`TT_JUDGE_ENABLED=1` — no judge, no verdicts,
+nothing to evaluate) **and** the gateway must run with `DATABASE_URL` set (the
+verdict window and the pause record are Postgres-backed). The shipped binary
+wires the evaluator automatically when both hold; `auto_pause: true` on a
+route still validates without them, but only manual pause/resume is in effect
+until they do.
+
 What a pause means:
 
 - **Matched but not rewritten.** The route still matches — requests attribute
@@ -125,6 +133,17 @@ What a pause means:
   dashboard edits to the route) until an explicit
   `POST /v1/routes/:id/resume`. A paused route stops rewriting, so it stops
   being judged, so its verdict window freezes — it can never un-pause itself.
+  One exception by construction: **deleting the route deletes its pause
+  record**, so the delete-and-re-create edit flow yields a fresh, unpaused
+  route — re-pause it explicitly if the quality concern still stands.
+- **Resume restarts the evidence.** A resume stamps a `resumed_at` watermark
+  on the retained pause record, and the evaluator only counts verdicts
+  recorded **after** it. The just-resumed route therefore needs
+  `pause_min_verdicts` fresh classified verdicts before the floor can trigger
+  again — its frozen, mostly-degraded pre-pause window can never instantly
+  re-pause it. (At the default ~2% sample rate, accumulating 20 fresh verdicts
+  takes on the order of a thousand matched requests — quality confidence
+  rebuilds at the same pace it was earned.)
 - **No saving is faked.** A paused passthrough books zero routing saving
   (served model == requested model), and the route-level
   `GET /v1/routes/:id/savings` report nets the judge/shadow measurement tax

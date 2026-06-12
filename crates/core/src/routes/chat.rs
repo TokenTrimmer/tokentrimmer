@@ -1204,11 +1204,12 @@ pub async fn handler(
     let mut warnings: Vec<String> = Vec::new();
     // Surface a paused-route passthrough on the warnings header (the
     // request_logs row carries the durable `route_paused` marker; this is the
-    // caller-visible signal) + the per-request metric.
+    // caller-visible signal). The `route_paused_passthrough_total` metric is
+    // recorded inside `apply_routing` — the single pause seam — so non-chat
+    // ingresses (embeddings) count too.
     if route_paused {
         let name = route_matched_name.as_deref().unwrap_or("unknown");
         warnings.push(format!("route_paused:{name}"));
-        crate::metrics::record_route_paused_passthrough(name);
     }
     maybe_downgrade_response_format(&mut req, provider.as_ref(), &mut warnings);
     maybe_clamp_temperature(&mut req, provider.as_ref(), &mut warnings);
@@ -4320,6 +4321,11 @@ pub(crate) async fn apply_routing(
             route = %m.name,
             "route_paused: rewrite suppressed — passing through on the requested model"
         );
+        // Metric lives at this single seam so EVERY ingress that routes
+        // (chat, streaming, /v1/messages, embeddings) counts its paused
+        // passthroughs — embeddings has no warnings-header or request_logs
+        // plumbing, so this counter is its only pause-visibility signal.
+        crate::metrics::record_route_paused_passthrough(&m.name);
         return Ok(Some(RouteMatch {
             route_id: m.id,
             route_name: m.name.clone(),

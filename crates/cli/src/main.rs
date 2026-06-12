@@ -1379,6 +1379,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // migration path above) for Phase 2 attribution netting. Judge + baseline
     // costs are measurement tax recorded only there, never in request_logs.
     let judge_config = tt_core::quality_sample::JudgeConfig::from_env();
+    let judge_enabled = judge_config.enabled;
     if judge_config.enabled {
         let band_store = Arc::new(tt_core::quality_sample::InMemoryJudgeBandStore::new());
         state = if let Some(pool) = db_pool.as_ref() {
@@ -1517,8 +1518,34 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     if let Some(pool) = db_pool.as_ref() {
         let backing: Arc<dyn tt_routing::RoutingStore> =
             Arc::new(tt_routing::PostgresRoutingStore::new(pool.clone()));
-        state = state.with_routing_store(Arc::new(tt_routing::CachingRoutingStore::new(backing)));
+        let routing_store = Arc::new(tt_routing::CachingRoutingStore::new(backing));
+        state = state.with_routing_store(routing_store.clone());
         tracing::info!("routing store: Postgres-backed (60s per-org cache)");
+
+        // Route-level netted savings read-side (GET /v1/routes/:id/savings).
+        // Pure read-side aggregation over request_logs × quality_verdicts —
+        // wiring it changes no request-path behavior. Without a DB pool the
+        // endpoint keeps answering 503 (aggregation not configured).
+        state = state.with_route_savings(Arc::new(
+            tt_core::route_savings::PostgresRouteSavingsSource::new(pool.clone()),
+        ));
+        tracing::info!("route savings: Postgres-backed netting (GET /v1/routes/:id/savings)");
+
+        // Opt-in quality auto-pause evaluator. Doubly gated: the judge must
+        // be enabled (TT_JUDGE_ENABLED → a persistent sink was wired above)
+        // AND each route must set `then.auto_pause: true`. Appended AFTER the
+        // persistent sink so the just-recorded verdict is already in the
+        // durable window when the evaluator consults it. Without this wiring
+        // a route's `auto_pause` flag validates but never fires.
+        if judge_enabled {
+            let window = Arc::new(tt_core::route_autopause::PgVerdictWindow::new(pool.clone()));
+            state = state.with_route_auto_pause(Arc::new(
+                tt_core::route_autopause::AutoPauseJudgeSink::new(routing_store, window),
+            ));
+            tracing::info!(
+                "route auto-pause: evaluator wired (fires only on routes with auto_pause: true)"
+            );
+        }
     } else if std::env::var("TT_DOGFOOD_GROQ_ROUTING").as_deref() == Ok("1") {
         // Dogfood mode: seed an in-memory route that redirects short flagship
         // model prompts to Groq's llama-3.1-8b-instant for internal testing.

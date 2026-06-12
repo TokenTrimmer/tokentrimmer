@@ -214,11 +214,16 @@ pub struct RouteConditions {
 
 /// What a matching [`ProposedRoute`] does.
 ///
-/// Field order matches `tt_routing::RouteAction` exactly so the two types
-/// produce identical JSON for the same logical value — a requirement for the
-/// Plan apply round-trip (a `ProposedRoute` serialized by the Plan engine and
-/// then deserialized by the Gateway must carry all fields without loss or
-/// reordering).
+/// Field order matches `tt_routing::RouteAction` so the two types produce
+/// identical JSON for the same logical value — a requirement for the Plan
+/// apply round-trip (a `ProposedRoute` serialized by the Plan engine and then
+/// deserialized by the Gateway must carry all fields without loss or
+/// reordering). KNOWN EXCEPTION: the gateway's `flex` / `compress` flags are
+/// not mirrored here (pre-existing drift; both are false-omitted on the wire,
+/// so identity holds whenever they are unset). The
+/// `route_action_cross_type_lockstep_guard` test below fails to compile when
+/// `tt_routing::RouteAction` grows a field, so any future addition must
+/// explicitly decide the mirror question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteAction {
     /// Rewrite to this model. May target a different provider than the request
@@ -280,6 +285,27 @@ pub struct RouteAction {
     /// JSON when `None` (back-compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_model: Option<String>,
+    /// Mirror of `tt_routing::RouteAction::auto_pause`. The quality circuit
+    /// breaker is a runtime-only guardrail (the gateway sticky-pauses the
+    /// route when its live paired-judge pass-rate regresses below the floor);
+    /// replay has no live verdict stream, so the engine does not simulate
+    /// pauses — it treats the route as always active and projects the route's
+    /// FULL savings (the same not-yet-modeled assumption it already makes for
+    /// `traffic_pct`; a real pause can only shrink realized savings, never
+    /// change quality). Present so a `tt_routing::RouteAction` carrying
+    /// `auto_pause` round-trips losslessly to a `tt_plan_core::RouteAction`
+    /// without dropping it on read. Omitted from JSON when false
+    /// (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_pause: bool,
+    /// Mirror of `tt_routing::RouteAction::pause_floor_pass_rate`. See
+    /// `auto_pause`. Omitted from JSON when `None` (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_floor_pass_rate: Option<f64>,
+    /// Mirror of `tt_routing::RouteAction::pause_min_verdicts`. See
+    /// `auto_pause`. Omitted from JSON when `None` (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_min_verdicts: Option<u32>,
 }
 
 /// Per-model pricing keyed by `"provider:model"`.
@@ -585,6 +611,9 @@ mod tests {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -616,6 +645,9 @@ mod tests {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -640,6 +672,9 @@ mod tests {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(j.contains("\"disable_cache\":true"));
@@ -676,6 +711,9 @@ mod tests {
             redact: true,
             traffic_pct: None,
             shadow_model: None,
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(
@@ -757,6 +795,85 @@ mod tests {
         let j = serde_json::to_string(&parsed).unwrap();
         assert!(!j.contains("traffic_pct"), "{j}");
         assert!(!j.contains("shadow_model"), "{j}");
+    }
+
+    /// Cross-crate wire-compat for the auto-pause config (`auto_pause` +
+    /// `pause_floor_pass_rate` + `pause_min_verdicts`): gateway-written JSON
+    /// carrying all three deserializes into the plan-core type with the
+    /// values set and re-emits the same wire form (same field order +
+    /// skip_serializing_if gating), so a gateway `RouteAction` carrying
+    /// auto-pause config round-trips through plan-core without loss. The
+    /// fields default false/None and are omitted when default, so every
+    /// existing plan JSON/snapshot stays byte-identical.
+    #[test]
+    fn route_action_auto_pause_cross_type_wire_compat() {
+        let gateway_json = r#"{"target_model":"gpt-4o-mini","auto_pause":true,"pause_floor_pass_rate":0.85,"pause_min_verdicts":30}"#;
+        let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
+        assert!(plan_action.auto_pause);
+        assert_eq!(plan_action.pause_floor_pass_rate, Some(0.85));
+        assert_eq!(plan_action.pause_min_verdicts, Some(30));
+        let reemitted = serde_json::to_string(&plan_action).unwrap();
+        assert_eq!(reemitted, gateway_json);
+
+        // Defaults: absent on read → false/None; default values omitted on write.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.auto_pause);
+        assert_eq!(parsed.pause_floor_pass_rate, None);
+        assert_eq!(parsed.pause_min_verdicts, None);
+        let j = serde_json::to_string(&parsed).unwrap();
+        assert!(!j.contains("pause"), "{j}");
+    }
+
+    /// Cross-crate lockstep guard for `RouteAction`, the companion to
+    /// `route_conditions_cross_type_wire_compat`. The
+    /// `tt_routing::RouteAction` literal below sets EVERY field with NO
+    /// `..Default::default()` on purpose: adding a field to
+    /// `tt_routing::RouteAction` makes this test fail to compile, forcing
+    /// whoever adds it to decide the mirror question here instead of letting
+    /// `tt_plan_core::RouteAction` silently drop it on read (the drift this
+    /// branch had to repair for the auto-pause fields).
+    ///
+    /// KNOWN PRE-EXISTING DRIFT: `flex` and `compress` are NOT mirrored in
+    /// `tt_plan_core::RouteAction` (they predate this guard); they are set to
+    /// `false` here, where their skip_serializing_if gating omits them from
+    /// the wire form, keeping the byte-identity assertion honest for every
+    /// mirrored field.
+    #[test]
+    fn route_action_cross_type_lockstep_guard() {
+        let gateway = tt_routing::RouteAction {
+            target_model: "gpt-4o-mini".to_string(),
+            fallbacks: vec!["claude-haiku-4-5".to_string()],
+            disable_cache: true,
+            max_cost_usd: Some(0.25),
+            flex: false,     // not mirrored (pre-existing) — omitted when false
+            compress: false, // not mirrored (pre-existing) — omitted when false
+            redact: true,
+            traffic_pct: Some(30),
+            shadow_model: Some("gemini-flash".to_string()),
+            auto_pause: true,
+            pause_floor_pass_rate: Some(0.9),
+            pause_min_verdicts: Some(25),
+        };
+        let gateway_json = serde_json::to_string(&gateway).unwrap();
+
+        // The gateway JSON deserializes into the plan-core type without
+        // dropping any mirrored field…
+        let plan_action: RouteAction = serde_json::from_str(&gateway_json).unwrap();
+        assert_eq!(plan_action.target_model, "gpt-4o-mini");
+        assert_eq!(plan_action.fallbacks, vec!["claude-haiku-4-5"]);
+        assert!(plan_action.disable_cache);
+        assert_eq!(plan_action.max_cost_usd, Some(0.25));
+        assert!(plan_action.redact);
+        assert_eq!(plan_action.traffic_pct, Some(30));
+        assert_eq!(plan_action.shadow_model.as_deref(), Some("gemini-flash"));
+        assert!(plan_action.auto_pause);
+        assert_eq!(plan_action.pause_floor_pass_rate, Some(0.9));
+        assert_eq!(plan_action.pause_min_verdicts, Some(25));
+
+        // …and re-emits the gateway wire form byte-for-byte (same declaration
+        // order + same skip_serializing_if gating).
+        let reemitted = serde_json::to_string(&plan_action).unwrap();
+        assert_eq!(reemitted, gateway_json);
     }
 
     /// Cross-crate lockstep guard for `RouteConditions`, the companion to

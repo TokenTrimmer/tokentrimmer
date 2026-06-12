@@ -23,6 +23,12 @@
 //!   `POST /v1/routes/:id/resume`; a paused route stops rewriting, so it
 //!   stops being judged, so its window freezes — it can never un-pause
 //!   itself.
+//! * **Resume restarts the evidence.** A resume RETAINS the `route_pauses`
+//!   row with `resumed_at` stamped, and [`RECENT_CLASSIFIED_SQL`] bounds the
+//!   window to verdicts AFTER that watermark — the frozen, mostly-degraded
+//!   pre-pause window can never instantly re-pause a just-resumed route. The
+//!   evaluator starts over: it needs `pause_min_verdicts` fresh post-resume
+//!   classified verdicts before the floor can trigger again.
 //! * **Best-effort, never user-facing.** Every error is warn-logged and
 //!   swallowed; the sink runs inside the detached judge task and can never
 //!   touch a user request.
@@ -75,11 +81,19 @@ pub trait VerdictWindowSource: Send + Sync {
 }
 
 /// SQL behind [`PgVerdictWindow`]: classified-only, recency-ordered, LIMITed
-/// — served by the migration-0017 `quality_verdicts_route_idx`.
+/// — served by the migration-0017 `quality_verdicts_route_idx` — and bounded
+/// below by the route's resume watermark (`route_pauses.resumed_at`): after a
+/// resume, only POST-resume verdicts count, so the frozen pre-pause window
+/// can never instantly re-pause a just-resumed route. No `route_pauses` row
+/// (never paused) or an active pause (`resumed_at IS NULL`) leaves the window
+/// unbounded.
 pub const RECENT_CLASSIFIED_SQL: &str = r#"SELECT COUNT(*) FILTER (WHERE verdict = 'acceptable'),
        COUNT(*) FILTER (WHERE verdict = 'degraded')
 FROM (SELECT verdict FROM quality_verdicts
       WHERE org_id = $1 AND route_id = $2 AND verdict IN ('acceptable','degraded')
+        AND ts > COALESCE((SELECT p.resumed_at FROM route_pauses p
+                           WHERE p.org_id = $1 AND p.route_id = $2),
+                          '-infinity'::timestamptz)
       ORDER BY ts DESC LIMIT $3) recent"#;
 
 /// Production window: reads the durable `quality_verdicts` table.
@@ -126,7 +140,9 @@ impl VerdictWindowSource for PgVerdictWindow {
 /// [`JudgeSink`] so an in-memory fanout can feed it exactly where the
 /// production fanout feeds Postgres (route-attributed classified verdicts
 /// only; unclear / route-less outcomes are ignored, mirroring
-/// [`RECENT_CLASSIFIED_SQL`]).
+/// [`RECENT_CLASSIFIED_SQL`]). Does NOT model the resume watermark — that
+/// bound lives in the production SQL (`route_pauses.resumed_at`); tests that
+/// need a post-resume window use a fresh instance.
 #[derive(Debug, Default)]
 pub struct InMemoryVerdictWindow {
     inner: Mutex<HashMap<(Uuid, Uuid), VecDeque<bool>>>,

@@ -110,9 +110,11 @@ pub trait RoutingStore: Send + Sync + std::fmt::Debug {
         ))
     }
     /// Sticky-pause a route's rewrite. `Ok(true)` = newly paused; `Ok(false)` =
-    /// already paused OR the route is not owned by `org_id` (the Postgres impl's
-    /// `INSERT .. SELECT` guards ownership). A paused route still matches but
-    /// every cost lever is suppressed — requests flow to the originally-
+    /// already actively paused OR the route is not owned by `org_id` (the
+    /// Postgres impl's `INSERT .. SELECT` guards ownership). An active pause's
+    /// evidence is never overwritten (sticky); a route paused again AFTER a
+    /// resume records the NEW pause's evidence. A paused route still matches
+    /// but every cost lever is suppressed — requests flow to the originally-
     /// requested model until [`RoutingStore::resume_route`].
     async fn pause_route(
         &self,
@@ -124,9 +126,13 @@ pub trait RoutingStore: Send + Sync + std::fmt::Debug {
             "pause unsupported by this store".into(),
         ))
     }
-    /// Remove a route's sticky pause. `Ok(true)` = a pause row was removed;
+    /// Clear a route's sticky pause. `Ok(true)` = an active pause was cleared;
     /// `Ok(false)` = the route was not paused or not owned by `org_id`. This is
-    /// the ONLY thing that clears a pause.
+    /// the ONLY thing that clears a pause. The pause record is RETAINED with
+    /// `resumed_at` stamped — that timestamp is the watermark the auto-pause
+    /// verdict window is bounded by, so a resumed route is re-evaluated only
+    /// on verdicts recorded AFTER the resume (the frozen pre-pause window can
+    /// never instantly re-pause it).
     async fn resume_route(
         &self,
         _org_id: Uuid,
@@ -155,7 +161,18 @@ pub enum RoutingStoreError {
 pub struct InMemoryRoutingStore {
     inner: RwLock<HashMap<Uuid, Vec<Route>>>,
     /// `route_id → pause record` (mirror of the `route_pauses` table).
-    pauses: RwLock<HashMap<Uuid, NewRoutePause>>,
+    /// `resumed == true` mirrors a row with `resumed_at` stamped: no longer an
+    /// active pause, retained as the resume watermark / historical record.
+    pauses: RwLock<HashMap<Uuid, PauseEntry>>,
+}
+
+/// In-memory mirror of one `route_pauses` row.
+#[derive(Debug)]
+struct PauseEntry {
+    pause: NewRoutePause,
+    /// Mirror of `resumed_at IS NOT NULL` — the pause was cleared by an
+    /// explicit resume (record retained).
+    resumed: bool,
 }
 
 impl InMemoryRoutingStore {
@@ -170,11 +187,12 @@ impl InMemoryRoutingStore {
     }
 
     /// Overlay the pause map onto a route list (keeps a directly-planted
-    /// `paused: true` as well).
+    /// `paused: true` as well). Only ACTIVE pauses count — a resumed entry is
+    /// a retained watermark, not a pause.
     fn overlay_paused(&self, mut routes: Vec<Route>) -> Vec<Route> {
         let p = self.pauses.read().expect("inmemory pause map poisoned");
         for r in &mut routes {
-            r.paused = r.paused || p.contains_key(&r.id);
+            r.paused = r.paused || p.get(&r.id).is_some_and(|e| !e.resumed);
         }
         routes
     }
@@ -182,6 +200,16 @@ impl InMemoryRoutingStore {
     fn route_exists(&self, org_id: Uuid, id: Uuid) -> bool {
         let g = self.inner.read().expect("inmemory routing store poisoned");
         g.get(&org_id).is_some_and(|v| v.iter().any(|r| r.id == id))
+    }
+
+    /// The stored pause record for `route_id`, with whether it has been
+    /// resumed (`true` mirrors `resumed_at IS NOT NULL` — a retained
+    /// watermark, not an active pause). Test/diagnostic accessor; `None` when
+    /// the route was never paused (or its record was GC'd by delete).
+    #[must_use]
+    pub fn pause_record(&self, route_id: Uuid) -> Option<(NewRoutePause, bool)> {
+        let p = self.pauses.read().expect("inmemory pause map poisoned");
+        p.get(&route_id).map(|e| (e.pause.clone(), e.resumed))
     }
 }
 
@@ -226,13 +254,23 @@ impl RoutingStore for InMemoryRoutingStore {
     }
 
     async fn delete_route(&self, org_id: Uuid, id: Uuid) -> Result<bool, RoutingStoreError> {
-        let mut g = self.inner.write().expect("inmemory routing store poisoned");
-        let Some(v) = g.get_mut(&org_id) else {
-            return Ok(false);
+        let removed = {
+            let mut g = self.inner.write().expect("inmemory routing store poisoned");
+            let Some(v) = g.get_mut(&org_id) else {
+                return Ok(false);
+            };
+            let before = v.len();
+            v.retain(|r| r.id != id);
+            v.len() != before
         };
-        let before = v.len();
-        v.retain(|r| r.id != id);
-        Ok(v.len() != before)
+        if removed {
+            // GC the pause record with its route (mirrors the Postgres impl);
+            // a recreated route gets a fresh id, so a sticky pause does NOT
+            // survive the documented delete-and-recreate edit flow.
+            let mut p = self.pauses.write().expect("inmemory pause map poisoned");
+            p.remove(&id);
+        }
+        Ok(removed)
     }
 
     async fn pause_route(
@@ -247,10 +285,19 @@ impl RoutingStore for InMemoryRoutingStore {
             return Ok(false);
         }
         let mut p = self.pauses.write().expect("inmemory pause map poisoned");
-        if p.contains_key(&route_id) {
-            return Ok(false); // sticky: already paused
+        if p.get(&route_id).is_some_and(|e| !e.resumed) {
+            return Ok(false); // sticky: an ACTIVE pause keeps its evidence
         }
-        p.insert(route_id, pause);
+        // New pause, or re-pause after a resume (the resumed watermark entry
+        // is replaced by the new pause's evidence — mirrors the Postgres
+        // ON CONFLICT DO UPDATE .. WHERE resumed_at IS NOT NULL).
+        p.insert(
+            route_id,
+            PauseEntry {
+                pause,
+                resumed: false,
+            },
+        );
         Ok(true)
     }
 
@@ -259,7 +306,15 @@ impl RoutingStore for InMemoryRoutingStore {
             return Ok(false);
         }
         let mut p = self.pauses.write().expect("inmemory pause map poisoned");
-        Ok(p.remove(&route_id).is_some())
+        match p.get_mut(&route_id) {
+            // Active pause → mark resumed (record retained as the watermark).
+            Some(e) if !e.resumed => {
+                e.resumed = true;
+                Ok(true)
+            }
+            // Not paused (or already resumed) → Ok(false).
+            _ => Ok(false),
+        }
     }
 }
 
@@ -293,9 +348,11 @@ mod pg {
     ///
     /// Pause state lives in the PUBLIC-owned `route_pauses` table (migration
     /// 0017 — the cloud-owned `routes` table cannot be ALTERed from public
-    /// migrations) and is surfaced on `Route.paused` via a LEFT JOIN in every
-    /// SELECT, so a sticky pause survives dashboard edits to the route row
-    /// itself.
+    /// migrations) and is surfaced on `Route.paused` via a LEFT JOIN (active
+    /// pauses only: `resumed_at IS NULL`) in every SELECT, so a sticky pause
+    /// survives dashboard edits to the route row itself. A resume RETAINS the
+    /// row with `resumed_at` stamped — the watermark the auto-pause verdict
+    /// window is bounded by; deleting the route deletes the record.
     #[derive(Clone, Debug)]
     pub struct PostgresRoutingStore {
         pool: PgPool,
@@ -313,7 +370,7 @@ mod pg {
             let rows = sqlx::query_as::<_, RouteRow>(
                 "SELECT r.id, r.name, r.priority, r.conditions, r.target, \
                         (p.route_id IS NOT NULL) AS paused \
-                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id \
+                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id AND p.resumed_at IS NULL \
                  WHERE r.org_id = $1 AND r.enabled = TRUE \
                  ORDER BY r.priority DESC, r.created_at ASC",
             )
@@ -329,7 +386,7 @@ mod pg {
             let rows = sqlx::query_as::<_, MgmtRouteRow>(
                 "SELECT r.id, r.name, r.priority, r.enabled, r.conditions, r.target, \
                         (p.route_id IS NOT NULL) AS paused \
-                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id \
+                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id AND p.resumed_at IS NULL \
                  WHERE r.org_id = $1 ORDER BY r.priority DESC, r.created_at ASC",
             )
             .bind(org_id)
@@ -379,7 +436,7 @@ mod pg {
             let row = sqlx::query_as::<_, MgmtRouteRow>(
                 "SELECT r.id, r.name, r.priority, r.enabled, r.conditions, r.target, \
                         (p.route_id IS NOT NULL) AS paused \
-                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id \
+                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id AND p.resumed_at IS NULL \
                  WHERE r.org_id = $1 AND r.id = $2",
             )
             .bind(org_id)
@@ -391,12 +448,22 @@ mod pg {
         }
 
         async fn delete_route(&self, org_id: Uuid, id: Uuid) -> Result<bool, RoutingStoreError> {
-            let res = sqlx::query("DELETE FROM routes WHERE org_id = $1 AND id = $2")
-                .bind(org_id)
-                .bind(id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            // The pause record (active OR resumed watermark) is GC'd with its
+            // route — `route_pauses` deliberately has no FK to the cloud-owned
+            // `routes` table, so the cleanup is explicit here. A recreated
+            // route gets a fresh id, so a sticky pause does NOT survive the
+            // documented delete-and-recreate edit flow. The data-modifying CTE
+            // runs atomically with the route delete; `rows_affected` reports
+            // the ROUTE delete only (the statement's top-level DELETE).
+            let res = sqlx::query(
+                "WITH gc AS (DELETE FROM route_pauses WHERE org_id = $1 AND route_id = $2) \
+                 DELETE FROM routes WHERE org_id = $1 AND id = $2",
+            )
+            .bind(org_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
             Ok(res.rows_affected() > 0)
         }
 
@@ -407,14 +474,21 @@ mod pg {
             pause: crate::store::NewRoutePause,
         ) -> Result<bool, RoutingStoreError> {
             // INSERT..SELECT guards ownership (a foreign org's pause inserts
-            // nothing); ON CONFLICT DO NOTHING keeps the FIRST pause's evidence
-            // (sticky: an already-paused route reports Ok(false)).
+            // nothing). An ACTIVE pause (resumed_at IS NULL) is sticky — the
+            // conditional ON CONFLICT update touches nothing and reports
+            // Ok(false), keeping the first pause's evidence. A RESUMED
+            // watermark row is overwritten by the new pause's evidence
+            // (re-pause after resume), resetting resumed_at to NULL.
             let res = sqlx::query(
                 "INSERT INTO route_pauses \
                    (route_id, org_id, paused_by, reason, pass_rate, verdicts_in_window) \
                  SELECT r.id, r.org_id, $3, $4, $5, $6 \
                  FROM routes r WHERE r.org_id = $1 AND r.id = $2 \
-                 ON CONFLICT (route_id) DO NOTHING",
+                 ON CONFLICT (route_id) DO UPDATE SET \
+                   paused_at = now(), paused_by = EXCLUDED.paused_by, \
+                   reason = EXCLUDED.reason, pass_rate = EXCLUDED.pass_rate, \
+                   verdicts_in_window = EXCLUDED.verdicts_in_window, resumed_at = NULL \
+                 WHERE route_pauses.resumed_at IS NOT NULL",
             )
             .bind(org_id)
             .bind(route_id)
@@ -433,12 +507,20 @@ mod pg {
             org_id: Uuid,
             route_id: Uuid,
         ) -> Result<bool, RoutingStoreError> {
-            let res = sqlx::query("DELETE FROM route_pauses WHERE org_id = $1 AND route_id = $2")
-                .bind(org_id)
-                .bind(route_id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            // The record is RETAINED with resumed_at stamped: that timestamp
+            // is the watermark `RECENT_CLASSIFIED_SQL` (tt-core) bounds the
+            // auto-pause verdict window by, so a resumed route is re-evaluated
+            // only on post-resume verdicts. Resuming an already-resumed (or
+            // never-paused) route touches nothing → Ok(false).
+            let res = sqlx::query(
+                "UPDATE route_pauses SET resumed_at = now() \
+                 WHERE org_id = $1 AND route_id = $2 AND resumed_at IS NULL",
+            )
+            .bind(org_id)
+            .bind(route_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
             Ok(res.rows_affected() > 0)
         }
     }
@@ -661,13 +743,43 @@ mod tests {
 
         assert!(
             s.resume_route(org, created.id).await.unwrap(),
-            "resume removes the pause"
+            "resume clears the pause"
         );
         assert!(!s.get_route(org, created.id).await.unwrap().unwrap().paused);
         assert!(!s.list_for_org(org).await.unwrap()[0].paused);
         assert!(
             !s.resume_route(org, created.id).await.unwrap(),
             "resume of an unpaused route is Ok(false)"
+        );
+        // The record is RETAINED as a resumed watermark (mirror of
+        // `resumed_at IS NOT NULL`), not deleted.
+        let (kept, resumed) = s.pause_record(created.id).expect("record retained");
+        assert!(resumed, "record must be marked resumed, not removed");
+        assert_eq!(kept.paused_by, PausedBy::Auto, "first pause's evidence");
+
+        // Re-pause AFTER a resume: allowed, and the NEW pause's evidence
+        // replaces the resumed watermark (resumed flag cleared).
+        assert!(
+            s.pause_route(org, created.id, pause(PausedBy::Manual))
+                .await
+                .unwrap(),
+            "re-pause after resume must succeed"
+        );
+        assert!(s.get_route(org, created.id).await.unwrap().unwrap().paused);
+        let (second, resumed) = s.pause_record(created.id).expect("record");
+        assert!(!resumed);
+        assert_eq!(
+            second.paused_by,
+            PausedBy::Manual,
+            "re-pause records the NEW evidence"
+        );
+
+        // Deleting the route GCs its pause record — a recreated route (fresh
+        // id) starts clean; no orphaned entries accumulate.
+        assert!(s.delete_route(org, created.id).await.unwrap());
+        assert!(
+            s.pause_record(created.id).is_none(),
+            "delete_route must GC the pause record"
         );
     }
 
