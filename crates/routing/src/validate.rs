@@ -50,8 +50,8 @@ pub fn validate_auto_pause(then: &RouteAction) -> Result<(), ValidationError> {
 /// `reasoning_max_effort` must be exactly `"low"` or `"medium"`: a `"high"`
 /// cap is a no-op lie (nothing ranks above high, so it could never lower
 /// anything), and an unknown/misspelled string would silently never act —
-/// reject both at config time instead. `reasoning_budget_tokens` must be
-/// >= 1024 (Anthropic's documented extended-thinking minimum; a smaller
+/// reject both at config time instead. `reasoning_budget_tokens` must be at
+/// least 1024 (Anthropic's documented extended-thinking minimum; a smaller
 /// budget would be rejected upstream, so capping TO it could only break
 /// requests). `minify_json` is a plain flag with no bounds.
 pub fn validate_output_shaping(then: &RouteAction) -> Result<(), ValidationError> {
