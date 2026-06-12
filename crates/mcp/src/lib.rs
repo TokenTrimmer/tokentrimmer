@@ -7,6 +7,7 @@ pub mod client;
 pub mod cost;
 pub mod error;
 pub mod protocol;
+pub mod query;
 pub mod resources;
 pub mod server;
 pub mod tools;
