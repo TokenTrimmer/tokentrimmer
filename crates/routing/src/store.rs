@@ -625,6 +625,9 @@ mod tests {
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
+                minify_json: false,
+                reasoning_max_effort: None,
+                reasoning_budget_tokens: None,
             },
             paused: false,
         }
@@ -669,6 +672,9 @@ mod tests {
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
+                minify_json: false,
+                reasoning_max_effort: None,
+                reasoning_budget_tokens: None,
             },
         };
         let created = s.create_route(org, spec).await.unwrap();
@@ -859,6 +865,9 @@ mod tests {
                         auto_pause: false,
                         pause_floor_pass_rate: None,
                         pause_min_verdicts: None,
+                        minify_json: false,
+                        reasoning_max_effort: None,
+                        reasoning_budget_tokens: None,
                     },
                 },
             )

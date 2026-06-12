@@ -421,6 +421,51 @@ async fn create_rejects_invalid_auto_pause_config() {
     assert_eq!(r.status(), StatusCode::CREATED);
 }
 
+/// POST /v1/routes with a malformed output-shaping cap → 400; valid caps and
+/// the minify flag are accepted (research Phase 3.1/3.2 config validation).
+#[tokio::test]
+async fn create_rejects_invalid_output_shaping_config() {
+    let (app, key, _) = app_with_key().await;
+    // A "high" effort cap is a no-op lie → rejected.
+    let spec = json!({
+        "name": "bad-effort-cap",
+        "when": {"model_in":["gpt-4o"]},
+        "then": {"target_model":"gpt-4o-mini", "reasoning_max_effort": "high"}
+    });
+    let r = app
+        .clone()
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // A thinking budget below Anthropic's 1024 floor → rejected.
+    let spec = json!({
+        "name": "bad-budget-cap",
+        "when": {"model_in":["gpt-4o"]},
+        "then": {"target_model":"gpt-4o-mini", "reasoning_budget_tokens": 512}
+    });
+    let r = app
+        .clone()
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // Valid output-shaping config is accepted.
+    let spec = json!({
+        "name": "good-shaping",
+        "when": {"model_in":["gpt-4o"]},
+        "then": {"target_model":"gpt-4o-mini", "minify_json": true,
+                  "reasoning_max_effort": "low", "reasoning_budget_tokens": 8192}
+    });
+    let r = app
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+}
+
 /// GET /v1/routes/:id/savings returns every tax line as its own field (the
 /// tax is never silently subtracted), plus the paused flag; an unconfigured
 /// source → 503; a route with no in-window traffic → an honest all-zero body

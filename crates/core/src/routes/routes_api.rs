@@ -9,8 +9,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use tt_auth::ApiKeyContext;
 use tt_routing::{
-    validate_auto_pause, validate_capability, validate_shadow_model, NewRoute, NewRoutePause,
-    PausedBy, Route, RoutingStore,
+    validate_auto_pause, validate_capability, validate_output_shaping, validate_shadow_model,
+    NewRoute, NewRoutePause, PausedBy, Route, RoutingStore,
 };
 use uuid::Uuid;
 
@@ -67,6 +67,10 @@ pub async fn create(
     // Phase 2.3: malformed auto-pause config (floor outside (0,1], min == 0)
     // is rejected at config time — validated even when auto_pause is false.
     validate_auto_pause(&spec.then).map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
+    // Phase 3.1/3.2: malformed output-shaping caps (effort outside low/medium,
+    // thinking budget below Anthropic's 1024 floor) are rejected at config
+    // time — validated even on disabled routes.
+    validate_output_shaping(&spec.then).map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
     let created = store(&state)?
         .create_route(org, spec)
         .await

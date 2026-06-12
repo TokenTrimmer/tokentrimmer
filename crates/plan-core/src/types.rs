@@ -306,6 +306,28 @@ pub struct RouteAction {
     /// `auto_pause`. Omitted from JSON when `None` (back-compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_min_verdicts: Option<u32>,
+    /// Mirror of `tt_routing::RouteAction::minify_json`. Carried, NOT modeled:
+    /// the per-request minify saving is a runtime ESTIMATE grounded in the
+    /// actual emitted JSON (pretty re-render re-tokenized with the served
+    /// model's tokenizer), which is not derivable from a historical
+    /// `RequestLog` row — so replay projects nothing for it (like
+    /// `redact`/`shadow_model`). Present so a `tt_routing::RouteAction`
+    /// carrying `minify_json` round-trips losslessly. Omitted from JSON when
+    /// false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub minify_json: bool,
+    /// Mirror of `tt_routing::RouteAction::reasoning_max_effort`. Carried, NOT
+    /// modeled: the reasoning-token cap books $0 at runtime (unspent thinking
+    /// tokens are only statistically visible) and `RequestLog` carries no
+    /// reasoning-spend signal to replay against. Omitted when `None`
+    /// (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_max_effort: Option<String>,
+    /// Mirror of `tt_routing::RouteAction::reasoning_budget_tokens`. Carried,
+    /// NOT modeled — see `reasoning_max_effort`. Omitted when `None`
+    /// (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget_tokens: Option<u32>,
 }
 
 /// Per-model pricing keyed by `"provider:model"`.
@@ -614,6 +636,9 @@ mod tests {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -648,6 +673,9 @@ mod tests {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -675,6 +703,9 @@ mod tests {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(j.contains("\"disable_cache\":true"));
@@ -714,6 +745,9 @@ mod tests {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         };
         let j = serde_json::to_string(&a).unwrap();
         assert!(
@@ -854,6 +888,9 @@ mod tests {
             auto_pause: true,
             pause_floor_pass_rate: Some(0.9),
             pause_min_verdicts: Some(25),
+            minify_json: true,
+            reasoning_max_effort: Some("low".to_string()),
+            reasoning_budget_tokens: Some(8192),
         };
         let gateway_json = serde_json::to_string(&gateway).unwrap();
 
@@ -870,6 +907,9 @@ mod tests {
         assert!(plan_action.auto_pause);
         assert_eq!(plan_action.pause_floor_pass_rate, Some(0.9));
         assert_eq!(plan_action.pause_min_verdicts, Some(25));
+        assert!(plan_action.minify_json);
+        assert_eq!(plan_action.reasoning_max_effort.as_deref(), Some("low"));
+        assert_eq!(plan_action.reasoning_budget_tokens, Some(8192));
 
         // …and re-emits the gateway wire form byte-for-byte (same declaration
         // order + same skip_serializing_if gating).

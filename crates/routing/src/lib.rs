@@ -26,7 +26,8 @@ pub use store::{
     InMemoryRoutingStore, NewRoute, NewRoutePause, PausedBy, RoutingStore, RoutingStoreError,
 };
 pub use validate::{
-    validate_auto_pause, validate_capability, validate_shadow_model, ValidationError,
+    validate_auto_pause, validate_capability, validate_output_shaping, validate_shadow_model,
+    ValidationError,
 };
 
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,39 @@ pub struct RouteAction {
     /// when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_min_verdicts: Option<u32>,
+    /// Opt matched traffic into **minified-JSON output steering** (research
+    /// Phase 3.1): the gateway appends a deterministic, conditionally-phrased
+    /// system-suffix instruction telling the model to emit JSON with no
+    /// indentation/newlines. Lossless by construction (whitespace between JSON
+    /// tokens carries no meaning); inert for non-JSON answers (the instruction
+    /// is phrased "when responding with JSON"). NEVER injected when the served
+    /// provider honors `response_format: json_schema` natively (grammar-locked
+    /// structured output already controls whitespace — no-op + no claim,
+    /// `minify_skipped:structured_output`). Savings are an ESTIMATE (own
+    /// column/header, never in the invoice-reconciled headline). Default false;
+    /// omitted from JSON when false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub minify_json: bool,
+    /// Cap OpenAI-style `reasoning_effort` for matched traffic at this level
+    /// (`"low"` | `"medium"`). Lower-only: a request already at or below the
+    /// cap is untouched; an absent effort on a catalog-Reasoning-capable model
+    /// is treated as the provider default ("medium") and lowered when the cap
+    /// is "low". HARD class gate: requests classified math/code/legal/medical
+    /// are never capped (`reasoning_cap_skipped:class:*`). Books $0 — the
+    /// unspent thinking tokens are only statistically visible; the event is
+    /// metered and the #163 netted route savings tell the truth over the
+    /// window. `None` = off (default); omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_max_effort: Option<String>,
+    /// Cap Anthropic-style extended-thinking spend: when the request carries a
+    /// `thinking` config (`extra["thinking"].budget_tokens`) above this, the
+    /// budget is lowered to this value. NEVER expressed via `max_tokens`
+    /// (Anthropic's max_tokens INCLUDES thinking — bounding it would truncate
+    /// the answer). Never ENABLES thinking on a request that didn't ask for
+    /// it. Minimum 1024 (Anthropic's floor). Same class gate / $0 booking as
+    /// `reasoning_max_effort`. `None` = off (default); omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget_tokens: Option<u32>,
 }
 
 /// Deterministic, replica-independent canary arm selection.
@@ -517,6 +551,9 @@ mod tests {
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
+                minify_json: false,
+                reasoning_max_effort: None,
+                reasoning_budget_tokens: None,
             },
             paused: false,
         }
@@ -829,6 +866,9 @@ mod tests {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -865,6 +905,9 @@ mod tests {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -893,6 +936,9 @@ mod tests {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -1459,6 +1505,50 @@ mod tests {
         assert!(back.auto_pause);
         assert_eq!(back.pause_floor_pass_rate, Some(0.85));
         assert_eq!(back.pause_min_verdicts, Some(10));
+    }
+
+    // --- output shaping (research Phase 3.1 + 3.2): minify_json + reasoning caps ---
+
+    /// The output-shaping fields default OFF (`minify_json=false`, both caps
+    /// `None`) when absent from legacy JSON, and a default-valued action
+    /// re-serializes WITHOUT the new keys — byte back-compat with existing
+    /// persisted rows / fixtures.
+    #[test]
+    fn output_shaping_fields_default_and_omitted() {
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.minify_json, "minify_json must default false (OFF)");
+        assert_eq!(parsed.reasoning_max_effort, None);
+        assert_eq!(parsed.reasoning_budget_tokens, None);
+
+        let a = make_route("x", 10, vec![], "gpt-4o-mini").then;
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(!j.contains("minify_json"), "{j}");
+        assert!(!j.contains("reasoning_max_effort"), "{j}");
+        assert!(!j.contains("reasoning_budget_tokens"), "{j}");
+        assert_eq!(
+            j, r#"{"target_model":"gpt-4o-mini"}"#,
+            "default action must stay byte-identical to the pre-3.x wire form"
+        );
+    }
+
+    /// All three output-shaping fields serialize → parse → byte-identical
+    /// re-emit (the cross-type wire-compat property the plan mirror relies on).
+    #[test]
+    fn output_shaping_fields_round_trip() {
+        let mut a = make_route("x", 10, vec![], "o3-mini").then;
+        a.minify_json = true;
+        a.reasoning_max_effort = Some("low".into());
+        a.reasoning_budget_tokens = Some(8192);
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(j.contains("\"minify_json\":true"), "{j}");
+        assert!(j.contains("\"reasoning_max_effort\":\"low\""), "{j}");
+        assert!(j.contains("\"reasoning_budget_tokens\":8192"), "{j}");
+        let back: RouteAction = serde_json::from_str(&j).unwrap();
+        assert!(back.minify_json);
+        assert_eq!(back.reasoning_max_effort.as_deref(), Some("low"));
+        assert_eq!(back.reasoning_budget_tokens, Some(8192));
+        let reemitted = serde_json::to_string(&back).unwrap();
+        assert_eq!(reemitted, j, "round-trip must be byte-identical");
     }
 
     /// Two different orgs reusing the SAME idempotency-key string get
