@@ -130,25 +130,6 @@ fn cache_result(cache_read: Option<u64>, cache_creation: Option<u64>) -> &'stati
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::cache_result;
-
-    /// Pins the `result` label semantics the cloud dashboard's hit-rate
-    /// denominator depends on. In particular: a reported write of ZERO with
-    /// no read field is "unreported", not "miss" — weak evidence must not
-    /// deflate a route's hit rate.
-    #[test]
-    fn cache_result_classification() {
-        assert_eq!(cache_result(Some(80), Some(20)), "hit");
-        assert_eq!(cache_result(Some(80), None), "hit");
-        assert_eq!(cache_result(Some(0), Some(20)), "miss");
-        assert_eq!(cache_result(Some(0), None), "miss");
-        assert_eq!(cache_result(None, Some(20)), "miss");
-        assert_eq!(cache_result(None, Some(0)), "unreported");
-        assert_eq!(cache_result(None, None), "unreported");
-    }
-
 /// Count a request pass discarded by the token-true gate (its transform ADDED
 /// tokens and was rolled back, booking zero savings). Labelled by pass name so
 /// a misbehaving pass is attributable.
@@ -197,4 +178,24 @@ pub fn record_cache_dynamic_prefix(kind: &'static str, est_wasted_usd: f64) {
     metrics::counter!("cache_dynamic_prefix_total", "kind" => kind).increment(1);
     metrics::counter!("cache_dynamic_prefix_waste_microusd_total")
         .increment(usd_to_microusd(est_wasted_usd));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_result;
+
+    /// Pins the `result` label semantics the cloud dashboard's hit-rate
+    /// denominator depends on. In particular: a reported write of ZERO with
+    /// no read field is "unreported", not "miss" — weak evidence must not
+    /// deflate a route's hit rate.
+    #[test]
+    fn cache_result_classification() {
+        assert_eq!(cache_result(Some(80), Some(20)), "hit");
+        assert_eq!(cache_result(Some(80), None), "hit");
+        assert_eq!(cache_result(Some(0), Some(20)), "miss");
+        assert_eq!(cache_result(Some(0), None), "miss");
+        assert_eq!(cache_result(None, Some(20)), "miss");
+        assert_eq!(cache_result(None, Some(0)), "unreported");
+        assert_eq!(cache_result(None, None), "unreported");
+    }
 }

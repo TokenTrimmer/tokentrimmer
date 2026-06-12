@@ -122,7 +122,8 @@ fn migrator_includes_cache_bust_penalty_migration() {
     assert!(
         desc.contains("cache") || desc.contains("bust"),
         "migration 0016 description is '{}', expected to mention cache/bust",
-        sixteenth.description,    );
+        sixteenth.description,
+    );
 }
 
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
@@ -209,6 +210,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         cost_usd: 0.001,
         baseline_cost_usd: 0.001,
         provider_cache_saved_usd: 0.0002,
+        cache_bust_penalty_usd: 0.0,
         cached: false,
         cache_layer: None,
         route_id: None,

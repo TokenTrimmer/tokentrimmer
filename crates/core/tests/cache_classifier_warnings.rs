@@ -91,6 +91,7 @@ impl Provider for RecordingProvider {
                 completion_tokens: 10,
                 total_tokens: 110,
                 cached_tokens: 0,
+                cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
             },
         })
