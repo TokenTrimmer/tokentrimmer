@@ -92,8 +92,52 @@ Notes that change behavior in practice:
 | `max_cost_usd` | `float` USD | a hard per-request ceiling. After the rewrite, if the rerouted model's estimated cost still exceeds this, the gateway rejects the request with `402` instead of dispatching. |
 | `batch`        | `bool`      | **ADVISORY** batch-eligibility marker. The gateway dispatches synchronously today (no async Batch Lane yet): the request is served and billed normally, the request-log row is tagged batch-eligible, the **forgone** Batch-API discount (priced from the served model's real catalog batch rate — never a hardcoded 0.5×) is reported on `X-TokenTrimmer-Batch-Forgone-Usd`, and a `batch_deferred_unavailable` warning is emitted. Hard-ineligible: streaming requests and interactive clients (`X-TokenTrimmer-Interactive`, set by `tt chat` / the `/tools` loop) are cleared with `batch_ineligible:<reason>`; a served model with no catalog batch tier gets `batch_not_available:<model>` and no claim. Omitted when false. |
 
+| `auto_pause`   | `bool`      | **opt-in quality auto-pause** (default `false`). When the route's recent paired-judge pass-rate regresses below the floor, the gateway sticky-pauses the route's rewrite. See [Auto-pause](#auto-pause-quality-circuit-breaker) below. |
+| `pause_floor_pass_rate` | `float` | pass-rate floor as a fraction in `(0, 1]`. Default `0.90`. Validated at create time even when `auto_pause` is false. |
+| `pause_min_verdicts`    | `int`   | minimum classified verdicts (acceptable + degraded) in the window before the floor can trigger. Default `20`; must be ≥ 1. |
+
 A vision-capable target is required whenever the `when` block gates on
 `has_images` / `has_audio` (see above).
+
+## Auto-pause (quality circuit breaker)
+
+A down-route trades cost for quality, and the gateway's sampled paired A/B
+judge (`TT_JUDGE_*`) scores a deterministic slice of its rerouted traffic
+(`acceptable` / `degraded` / `unclear`). With `auto_pause: true` on the route,
+the gateway watches the **most recent 100 classified verdicts** for that
+route; when at least `pause_min_verdicts` (default 20) have accumulated and
+the pass-rate (`acceptable / (acceptable + degraded)` — `unclear` never
+counts) drops **strictly below** `pause_floor_pass_rate` (default `0.90`), the
+route is **paused** automatically.
+
+What a pause means:
+
+- **Matched but not rewritten.** The route still matches — requests attribute
+  to it (`X-TokenTrimmer-Route-Matched`, a `route_paused:<name>` warnings
+  token, `request_logs.route_paused = true`) — but the rewrite and every
+  other **cost** lever (`fallbacks`, `flex`, `compress`, `traffic_pct`,
+  `shadow_model`, `max_cost_usd`) are suppressed. Requests flow to their
+  originally-requested model: the **expensive, quality-safe** direction, so a
+  malfunctioning quality gate can only ever cost you money, never quality.
+- **Safety levers stay on.** `redact` and `disable_cache` keep applying while
+  paused — pausing a quality gate never disables a privacy guardrail.
+- **Sticky.** The pause persists (its own `route_pauses` row, untouched by
+  dashboard edits to the route) until an explicit
+  `POST /v1/routes/:id/resume`. A paused route stops rewriting, so it stops
+  being judged, so its verdict window freezes — it can never un-pause itself.
+- **No saving is faked.** A paused passthrough books zero routing saving
+  (served model == requested model), and the route-level
+  `GET /v1/routes/:id/savings` report nets the judge/shadow measurement tax
+  out of the route's gross saving — itemized, never silently subtracted.
+- **Convergence.** Pause/resume invalidates the acting replica's route cache
+  immediately; other replicas converge within the 60-second route-cache TTL.
+- A forced `X-TokenTrimmer-Route` header does **not** bypass a pause.
+
+`POST /v1/routes/:id/pause` provides the same sticky pause manually. Both
+auto and manual pauses are visible as `"paused": true` on
+`GET /v1/routes` / `GET /v1/routes/:id`, and resumable only via
+`POST /v1/routes/:id/resume`. Endpoint details live in the
+[gateway API reference](04-gateway-api-reference.md#107-self-hosted-gateway-routes-api).
 
 ## How a route is chosen
 

@@ -571,7 +571,11 @@ Gemini, the OpenAI-compatible providers) or drop `response_format` outright
 (Anthropic), so this fires only for providers explicitly marked object-only. A
 `temperature_clamped` token is emitted when the request's `temperature` is
 clamped to the routed provider's accepted range (e.g. a `1.5` request to
-Anthropic, whose max is `1.0`).
+Anthropic, whose max is `1.0`). A `route_paused:<route-name>` token is emitted
+when the matched route is **paused** (manually or by the quality auto-pause —
+see §10.7): the request was served on its originally-requested model with the
+route's rewrite and every other cost lever suppressed; the matching
+`request_logs` row carries `route_paused = true`.
 
 The advisory batch-eligibility route action (`then.batch`) emits its own
 tokens — honest by design, since the gateway dispatches synchronously today and
@@ -831,14 +835,72 @@ GET /v1/admin/invoices
 
 ### 10.7 Self-hosted gateway routes API
 
-The open-source gateway binary serves a routes API at `/v1/routes` (note: **no `/admin/` prefix**). It supports list, create, get, and delete — there is **no PATCH/update** handler; to change a route, delete and re-create it.
+The open-source gateway binary serves a routes API at `/v1/routes` (note: **no `/admin/` prefix**). It supports list, create, get, delete, pause/resume, and a per-route savings report — there is **no PATCH/update** handler; to change a route, delete and re-create it.
 
 ```
-GET    /v1/routes          → list all routes
-POST   /v1/routes          → create a route (body identical to §10.2)
-GET    /v1/routes/:id      → fetch one route
-DELETE /v1/routes/:id      → delete a route
+GET    /v1/routes              → list all routes
+POST   /v1/routes              → create a route (body identical to §10.2)
+GET    /v1/routes/:id          → fetch one route
+DELETE /v1/routes/:id          → delete a route
+POST   /v1/routes/:id/pause    → sticky-pause the route's rewrite
+POST   /v1/routes/:id/resume   → the ONLY thing that clears a pause
+GET    /v1/routes/:id/savings  → windowed netted savings (see below)
 ```
+
+#### Pause / resume
+
+A **paused** route still *matches* — requests attribute to it
+(`X-TokenTrimmer-Route-Matched`, the `route_paused:<name>` warnings token, and
+`request_logs.route_paused = true`) — but its rewrite and every other **cost**
+lever (`fallbacks`, `flex`, `compress`, `traffic_pct`, `shadow_model`,
+`max_cost_usd`) are suppressed, so requests flow to their originally-requested
+model: the **expensive, quality-safe** direction. **Safety** levers (`redact`,
+`disable_cache`) stay live — pausing a quality gate never disables a privacy
+guardrail. A forced `X-TokenTrimmer-Route` header does **not** bypass a pause.
+
+Pauses are **sticky**: created manually (`POST /v1/routes/:id/pause`) or by the
+opt-in quality auto-pause (`then.auto_pause` — see the
+[routing rules guide](routing-rules-guide.md)), they persist until an explicit
+`POST /v1/routes/:id/resume`. Pause/resume takes effect immediately on the
+replica that served the call and within the 60-second route-cache TTL on other
+replicas. `GET /v1/routes` / `GET /v1/routes/:id` surface `"paused": true` on
+paused routes (the key is omitted when false). Both endpoints are idempotent
+and answer `200`; `resume` reports `"was_paused"` so callers can tell whether a
+pause row was actually removed.
+
+#### Per-route netted savings
+
+`GET /v1/routes/:id/savings?hours=N` (default `720` = 30 days, clamped to
+`1..=2160`) reports the route's savings over the window with the
+**measurement tax netted and itemized** — every tax line is its own field,
+never silently subtracted:
+
+```json
+{
+  "route_id": "0190…",
+  "window_start": "2026-05-12T00:00:00Z",
+  "window_end": "2026-06-11T00:00:00Z",
+  "paused": false,
+  "requests": 1842,
+  "gross_saved_usd": 12.41,      // Σ per-request Saved-Usd over the route's rows
+  "judge_tax_usd": 0.83,         // paired-judge calls + baseline reference dispatches
+  "shadow_tax_usd": 0.22,        // discarded shadow-arm spend
+  "net_saved_usd": 11.36,        // gross − judge_tax − shadow_tax; MAY BE NEGATIVE
+  "unmetered_tax_rows": 3,       // rows whose tax is unmetered (NULL cost) —
+                                 // when > 0 the taxes are lower bounds and the
+                                 // net is an upper bound
+  "verdicts": { "judged": 41, "acceptable": 38, "degraded": 2,
+                "unclear": 1, "pass_rate": 0.95 }
+}
+```
+
+`net_saved_usd` is deliberately **not clamped at zero**: a regressing route
+whose verification spend exceeds its swap saving must show a negative net.
+Per-request figures (`X-TokenTrimmer-Saved-Usd`, `request_logs`) stay gross — a
+single request doesn't carry the amortized measurement tax; netting exists only
+at this aggregate surface. The endpoint answers `503` until the gateway is
+booted with a savings source (a Postgres-backed deployment), and an existing
+route with no in-window traffic answers an honest all-zero body, not `404`.
 
 > **Planned (not yet honored):** in-place `PATCH /v1/routes/:id` update, and the hosted-only `/v1/admin/plans|inspect|usage|invoices` surfaces, are not served by the self-hosted binary.
 
