@@ -201,8 +201,12 @@ tt route add ...        # create a route
 
 `tt route add` needs a target — `--always <model>` (match all) or
 `--from <m> --to <m>` — plus optional `--when-*` conditions and `--max-cost` /
-`--disable-cache` / `--fallback` / `--priority` / `--name` / `--disabled`
-modifiers. There is no in-place update: `rm` and re-`add` to change a route.
+`--disable-cache` / `--batch` / `--fallback` / `--priority` / `--name` /
+`--disabled` modifiers. `--batch` sets the *advisory* batch-eligibility marker
+(`then.batch`): matched traffic is still served and billed normally today, but
+the forgone Batch-API discount is attributed for the future async Batch Lane —
+never applied to streaming or interactive requests. There is no in-place
+update: `rm` and re-`add` to change a route.
 
 ### Example
 
