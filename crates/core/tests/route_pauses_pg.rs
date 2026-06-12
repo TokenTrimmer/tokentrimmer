@@ -1,4 +1,4 @@
-//! DB-gated tests for the sticky `route_pauses` table (migration 0017) driven
+//! DB-gated tests for the sticky `route_pauses` table (migration 0019) driven
 //! through the REAL [`tt_routing::PostgresRoutingStore`] SQL: the
 //! ownership-guarded `INSERT..SELECT` pause, the conditional `ON CONFLICT`
 //! stickiness (an ACTIVE pause keeps its evidence; a resumed watermark row is

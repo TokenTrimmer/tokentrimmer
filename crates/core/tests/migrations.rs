@@ -199,12 +199,12 @@ fn migrator_includes_routing_honesty_migration() {
     let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
     let seventeenth = migrations
         .iter()
-        .find(|m| m.version == 17)
-        .expect("migration version 17 not found");
+        .find(|m| m.version == 19)
+        .expect("migration version 19 not found");
     let desc = seventeenth.description.to_lowercase();
     assert!(
         desc.contains("routing") || desc.contains("honesty") || desc.contains("pause"),
-        "migration 0017 description is '{}', expected to mention routing/honesty/pause",
+        "migration 0019 description is '{}', expected to mention routing/honesty/pause",
         seventeenth.description,
     );
 }
@@ -345,6 +345,7 @@ async fn request_log_insert_round_trips_batch_columns() {
     let writer = PostgresRequestLogWriter::new(pool.clone());
 
     let marked = RequestLogRow {
+        route_paused: false,
         id: Uuid::now_v7(),
         org_id: Uuid::nil(),
         api_key_id: Uuid::nil(),

@@ -37,7 +37,7 @@ fn default_enabled() -> bool {
 /// Who initiated a route pause. `Auto` = the gateway's quality-regression
 /// evaluator ([`tt-core`]'s `AutoPauseJudgeSink`); `Manual` = an operator via
 /// `POST /v1/routes/:id/pause`. Lowercase on the wire, matching the
-/// `route_pauses.paused_by` CHECK constraint (migration 0017).
+/// `route_pauses.paused_by` CHECK constraint (migration 0019).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PausedBy {

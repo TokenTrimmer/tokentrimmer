@@ -29,7 +29,7 @@
 //! Everything derives 100% from `request_logs` × `quality_verdicts` — no new
 //! ledger. The join is a `route_id` GROUP BY (both tables persist it; #155
 //! stamps `quality_verdicts.route_id`), NOT the per-request `trace_id` join
-//! the 0014 comments originally anticipated — migration 0017 adds the
+//! the 0014 comments originally anticipated — migration 0019 adds the
 //! `(org_id, route_id, ts)` indexes this query needs. L2-hit judge tax
 //! (`route_id IS NULL`) is by definition not route attribution and is
 //! excluded here; its org-level reconciliation is the cloud half of Task #25.
@@ -150,7 +150,7 @@ pub fn assemble(
 /// $2 = window_start inclusive, $3 = window_end exclusive). NUMERIC sums are
 /// cast to FLOAT8 in each CTE for sqlx f64 decode; the FULL OUTER JOIN keeps a
 /// route visible when it has verdicts but no in-window traffic (or vice
-/// versa). Served by the migration-0017 `(org_id, route_id, ts)` indexes.
+/// versa). Served by the migration-0019 `(org_id, route_id, ts)` indexes.
 pub const ROUTE_SAVINGS_SQL: &str = r#"WITH gross AS (
   SELECT route_id,
          COUNT(*)::bigint AS requests,

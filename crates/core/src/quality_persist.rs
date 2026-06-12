@@ -8,7 +8,7 @@
 //! feeds the live `/v1/preview` enrichment AND lands durably for the
 //! Phase-2.3 attribution netting. That netting is
 //! [`crate::route_savings::ROUTE_SAVINGS_SQL`]: a `route_id` GROUP BY over
-//! `quality_verdicts` (served by migration 0017's
+//! `quality_verdicts` (served by migration 0019's
 //! `quality_verdicts_route_idx (org_id, route_id, ts)`), NOT the per-request
 //! `request_id::text = request_logs.trace_id` join earlier comments here
 //! anticipated — per-request figures stay GROSS (a single request doesn't

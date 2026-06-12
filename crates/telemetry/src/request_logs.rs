@@ -470,7 +470,7 @@ mod tests {
         assert!(!j.contains("traffic_split_arm"), "{j}");
     }
 
-    /// Legacy JSON (rows serialized before migration 0017) deserializes with
+    /// Legacy JSON (rows serialized before migration 0019) deserializes with
     /// `route_paused` defaulting to false, and a `route_paused = true` row
     /// round-trips through the in-memory writer (mirror of `truncated`).
     #[tokio::test]
@@ -490,7 +490,7 @@ mod tests {
         let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
         assert!(
             !row.route_paused,
-            "pre-0017 rows must deserialize route_paused = false"
+            "pre-0019 rows must deserialize route_paused = false"
         );
 
         let w = InMemoryRequestLogWriter::new();

@@ -81,7 +81,7 @@ pub trait VerdictWindowSource: Send + Sync {
 }
 
 /// SQL behind [`PgVerdictWindow`]: classified-only, recency-ordered, LIMITed
-/// — served by the migration-0017 `quality_verdicts_route_idx` — and bounded
+/// — served by the migration-0019 `quality_verdicts_route_idx` — and bounded
 /// below by the route's resume watermark (`route_pauses.resumed_at`): after a
 /// resume, only POST-resume verdicts count, so the frozen pre-pause window
 /// can never instantly re-pause a just-resumed route. No `route_pauses` row

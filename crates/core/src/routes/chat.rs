@@ -4327,6 +4327,7 @@ pub(crate) async fn apply_routing(
         // plumbing, so this counter is its only pause-visibility signal.
         crate::metrics::record_route_paused_passthrough(&m.name);
         return Ok(Some(RouteMatch {
+            batch: false,
             route_id: m.id,
             route_name: m.name.clone(),
             paused: true,

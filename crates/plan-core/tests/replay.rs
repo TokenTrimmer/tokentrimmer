@@ -395,6 +395,9 @@ fn batch_route(target: &str, model_in: &str) -> ProposedRoute {
             ..Default::default()
         },
         then: RouteAction {
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
             target_model: target.into(),
             fallbacks: Vec::new(),
             disable_cache: false,

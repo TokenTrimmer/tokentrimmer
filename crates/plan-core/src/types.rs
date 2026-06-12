@@ -841,6 +841,7 @@ mod tests {
     #[test]
     fn route_action_cross_type_lockstep_guard() {
         let gateway = tt_routing::RouteAction {
+            batch: false,
             target_model: "gpt-4o-mini".to_string(),
             fallbacks: vec!["claude-haiku-4-5".to_string()],
             disable_cache: true,
