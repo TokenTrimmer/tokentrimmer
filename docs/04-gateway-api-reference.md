@@ -540,6 +540,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Saved-Usd` | on dispatched/cached responses | `0.0184` |
 | `X-TokenTrimmer-Provider-Cache-Saved-Usd` | on dispatched/cached responses | `0.0009` |
 | `X-TokenTrimmer-Batch-Forgone-Usd` | on dispatched/cached responses — the **forgone** Batch-API discount for batch-eligible requests (advisory `then.batch` route action), priced from the served model's real catalog batch rate. An advisory projection for the future async Batch Lane: the request was dispatched synchronously and billed in full, so this figure is **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for all unmarked traffic. | `0.0125` |
+| `X-TokenTrimmer-Minify-Saved-Est-Usd` | on dispatched/cached responses — the **ESTIMATED** saving from minified-JSON output steering (`then.minify_json` route action): the emitted JSON re-rendered pretty and re-tokenized with the served model's tokenizer, minus the tokens actually emitted, priced at the billed output rate. An estimate of an unmeasurable counterfactual: **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for un-minified traffic, non-JSON responses, and streaming (v1 meters but does not estimate). | `0.000312` |
 | `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
 | `X-TokenTrimmer-Warnings` | on dispatched responses, when the gateway altered the request | `param_dropped:frequency_penalty,param_dropped:n` |
 
@@ -602,6 +603,38 @@ the action never changes the bill:
   declared `X-TokenTrimmer-Interactive` (a human is waiting).
 - `batch_not_available:<model>` — the served model carries no catalog batch
   tier (possible after failover); nothing is marked and no discount is claimed.
+
+The output-shaping route actions (`then.minify_json`,
+`then.reasoning_max_effort` / `then.reasoning_budget_tokens`) emit a token on
+every act **and** every refusal:
+
+- `output_minified` — the deterministic minify instruction was appended to the
+  system prompt; the per-response estimate (when the response parses as JSON)
+  rides `X-TokenTrimmer-Minify-Saved-Est-Usd`.
+- `minify_skipped:structured_output` — the request's `response_format:
+  json_schema` is honored natively by the served provider (grammar-locked
+  structured output already controls whitespace): no instruction, no claim.
+- `reasoning_capped:reasoning_effort:<cap>` / `reasoning_capped:thinking_budget:<cap>`
+  — the cap was applied (lower-only). Books `$0`: the event is metered and the
+  route-level netted savings report carries the truth over the window.
+- `reasoning_cap_skipped:class:<math|code|legal|medical>` — the HARD class
+  gate refused: this request's content is reasoning-is-the-work and is never
+  capped.
+- `reasoning_cap_skipped:unknown_effort:<value>` — the request carried a
+  `reasoning_effort` the gateway cannot rank; nothing was rewritten.
+- `reasoning_cap_skipped:not_reasoning:<model>` — no `reasoning_effort` on the
+  request and the served model is not catalog-Reasoning-capable; the gateway
+  never injects `reasoning_effort` into a model that may reject it.
+- `reasoning_cap_skipped:unsupported:<provider>` — a cap is configured but the
+  served surface carries no lever (the provider drops `reasoning_effort` and
+  the request has no enabled `thinking` config).
+
+Both actions are judge-gateable: an output-shaped request is eligible for the
+sampled paired judge even when the route's `target_model` equals the requested
+model (no price downgrade), because the pre-routing capture re-dispatches the
+**un-shaped** request as the baseline reference. With `auto_pause: true`, a
+shaped route whose paired pass-rate regresses below its floor sticky-pauses
+itself, and a paused route suppresses both actions (§10.7).
 
 ### 6.3 Cache control semantics
 

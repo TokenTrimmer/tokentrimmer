@@ -1279,8 +1279,6 @@ pub async fn handler(
         route_matched_name.as_deref().unwrap_or("none"),
         &mut warnings,
     );
-    // Consumed by the judge-eligibility widening (`output_shaped`) below.
-    let _ = reasoning_capped;
 
     // ── Request-pass stage ───────────────────────────────────────────────────
     //
@@ -2421,6 +2419,10 @@ pub async fn handler(
             &response,
             requested_pricing.as_ref(),
             pricing.as_ref(),
+            // Output-shaped requests are judge-eligible even without a price
+            // downgrade — the un-shaped pre-routing capture is the paired
+            // counterfactual.
+            minify_applied || reasoning_capped,
             trace_id,
             ctx.org_id,
             &raw_bearer,
@@ -4075,9 +4077,22 @@ fn response_assistant_text(resp: &ChatCompletionResponse) -> String {
 /// - the matched route did NOT opt into redaction (`redact` routes clear the
 ///   judge captures at the handler — the pre-redaction request must never
 ///   ride the measurement path to any vendor),
-/// - a route rewrote the model (`matched_route_id.is_some()`),
+/// - a route matched (`matched_route_id.is_some()`),
 /// - the served model is cheaper than the originally-requested one (a true
-///   downgrade priced on realized usage — [`crate::quality_sample::is_downgrade`]),
+///   downgrade priced on realized usage — [`crate::quality_sample::is_downgrade`])
+///   OR the request was output-shaped (`output_shaped`: minify-JSON steering
+///   or a reasoning cap actually applied). The pre-routing capture
+///   (`judge_original_req`, taken BEFORE all pre-dispatch shaping) means the
+///   baseline reference re-dispatch is the UN-shaped request on the original
+///   model — exactly the paired counterfactual for an action-only shaped
+///   route whose `target_model` equals the requested model (where
+///   `is_downgrade` is false because pricing is identical). Verdicts are
+///   keyed by `route_id`, so `RouteAction::auto_pause` (#163) composes with
+///   zero new code: a capped/minified route whose paired pass-rate regresses
+///   below its floor sticky-pauses itself, and the paused arm suppresses
+///   both new actions — fail-safe in the expensive direction. The judge tax
+///   on a same-model shaped route can make #163's netted saving negative —
+///   that is the honest answer, itemized as `judge_tax_usd`,
 /// - the served answer is non-empty (tool-call-only responses are skipped),
 /// - the trace falls in the deterministic ~2% sample
 ///   ([`crate::quality_sample::should_sample`]),
@@ -4104,6 +4119,7 @@ fn maybe_spawn_quality_judge(
     response: &ChatCompletionResponse,
     requested_pricing: Option<&ModelPricing>,
     served_pricing: Option<&ModelPricing>,
+    output_shaped: bool,
     trace_id: Uuid,
     org_id: Uuid,
     raw_bearer: &str,
@@ -4129,11 +4145,15 @@ fn maybe_spawn_quality_judge(
     if !qs::JudgeTaskClass::ChatCompletions.is_sampled() {
         return;
     }
-    // Reroute-DOWN only: a route fired AND the served model is cheaper.
+    // A route fired AND (the served model is cheaper — reroute-DOWN — OR the
+    // request was output-shaped). See the doc comment: the pre-routing
+    // capture already provides the un-shaped baseline counterfactual, so an
+    // action-only shaped route (same target model, identical pricing) is
+    // judge-gateable too.
     if matched_route_id.is_none() {
         return;
     }
-    if !qs::is_downgrade(requested_pricing, served_pricing, &response.usage) {
+    if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage) || output_shaped) {
         return;
     }
     // Deterministic ~2% sample keyed on the trace id.
