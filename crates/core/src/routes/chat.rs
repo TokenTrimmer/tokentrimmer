@@ -42,7 +42,7 @@ use crate::{
     retry::{with_retry, RetryPolicy},
     routes::sse::{self, CacheInsertContext, StreamLogContext, StreamSpanContext},
     single_flight::wait_for_leader,
-    state::{L1Config, L2Config},
+    state::{L1Config, L2Config, L2VerifyConfig},
     ApiError, ApiResult, AppState,
 };
 
@@ -607,6 +607,57 @@ fn l2_task_class_for_chat() -> Option<tt_cache::TaskClass> {
     Some(tt_cache::TaskClass::ChatCompletions)
 }
 
+/// What the L2 false-positive verify gate decided about a candidate hit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum L2VerifyDecision {
+    /// `similarity >= t_eff + epsilon`, or the gate is disabled — serve as
+    /// today.
+    Confident,
+    /// In the ambiguous band with lexical agreement `>= min_agreement` —
+    /// serve (carries the agreement for telemetry).
+    Verified(f32),
+    /// In the ambiguous band but the entry predates migration 0018 (no
+    /// signature) — fail-open serve, counted distinctly.
+    Unverifiable,
+    /// In the ambiguous band with agreement `< min_agreement` — treat as a
+    /// MISS (fall through to a normal provider dispatch; no hit bump, no
+    /// judge, no cache savings booked).
+    Rejected(f32),
+}
+
+/// Pure decision function for the L2 verify gate (unit-test target).
+///
+/// `verify == None` (the gate off — today's default) is ALWAYS `Confident`:
+/// behavior is byte-identical to the pre-gate gateway. With the gate on, a hit
+/// at `similarity >= effective_threshold + epsilon` is confident; an
+/// in-band hit (`effective_threshold <= similarity < + epsilon`) is checked
+/// for lexical agreement between the entry's one-way signature and the
+/// incoming query text. Entries without a signature (pre-0018 rows) fail
+/// OPEN — the gate must never turn legacy rows into an outage.
+pub(crate) fn l2_verify_decision(
+    verify: Option<&L2VerifyConfig>,
+    similarity: f32,
+    effective_threshold: f32,
+    entry_sig: Option<i64>,
+    query_text: &str,
+) -> L2VerifyDecision {
+    let Some(verify) = verify else {
+        return L2VerifyDecision::Confident;
+    };
+    if similarity >= effective_threshold + verify.epsilon {
+        return L2VerifyDecision::Confident;
+    }
+    let Some(entry_sig) = entry_sig else {
+        return L2VerifyDecision::Unverifiable;
+    };
+    let agreement = tt_cache::lexical_agreement(entry_sig, tt_cache::lexical_sig(query_text));
+    if agreement >= verify.min_agreement {
+        L2VerifyDecision::Verified(agreement)
+    } else {
+        L2VerifyDecision::Rejected(agreement)
+    }
+}
+
 /// L2 semantic-cache lookup (step 3b). `None` falls through to dispatch.
 /// `Some(Err(_))` preserves the original `build_hit_l2_response(...)?` error
 /// propagation (a hit whose body fails to deserialize). Best-effort on the
@@ -639,22 +690,75 @@ async fn try_l2_hit(
     };
     // Derive the L2 task class for this request. `/chat/completions` is the only
     // v1 class; the helper is the single, extensible derivation point. The
-    // per-class threshold is floored at `l2.threshold` inside `lookup_classed`,
-    // so a classed lookup can never serve a hit below today's global bar.
+    // effective threshold is resolved through the adaptive gate when the verify
+    // gate is wired (its ratchet is floored by the same `class_thresholds`
+    // base, so `effective >= 0.92` holds by construction), and through the
+    // static per-class config otherwise — identical to `lookup_classed`.
     let task_class = l2_task_class_for_chat();
+    let effective_threshold = match l2.verify.as_ref() {
+        Some(v) => v.gate.effective_threshold(task_class),
+        None => l2.class_thresholds.threshold_for(task_class),
+    };
     match l2
         .cache
-        .lookup_classed(
+        .lookup(
             ctx.org_id,
             &query_vec,
-            &l2.class_thresholds,
-            task_class,
+            effective_threshold,
             &req.model,
             l2.embedder.model(),
         )
         .await
     {
         Ok(Some((entry, similarity))) => {
+            // FP verify gate (research Phase 2.2): a hit in the ambiguous band
+            // just above the threshold is checked for lexical agreement before
+            // it is served — an unguarded near-miss hit is a silent wrong
+            // answer. Gate off (`l2.verify == None`, the default) is always
+            // Confident — byte-identical to today.
+            let decision = l2_verify_decision(
+                l2.verify.as_ref(),
+                similarity,
+                effective_threshold,
+                entry.lexical_sig,
+                &query_text,
+            );
+            // Metric only when the gate is wired: a gate-off deployment's
+            // telemetry stream stays identical to pre-gate builds, and the
+            // counter cleanly distinguishes "gate off" (absent) from "gate
+            // on, hit confident" (`result="confident"`).
+            if l2.verify.is_some() {
+                let verify_result = match decision {
+                    L2VerifyDecision::Confident => "confident",
+                    L2VerifyDecision::Verified(_) => "verified",
+                    L2VerifyDecision::Unverifiable => "unverifiable",
+                    L2VerifyDecision::Rejected(_) => "rejected",
+                };
+                metrics::counter!("cache_l2_verify_total", "result" => verify_result).increment(1);
+            }
+            if let L2VerifyDecision::Rejected(agreement) = decision {
+                // Treated as a MISS: fall through to a normal provider
+                // dispatch. No hit-count bump, no L2-hit judge, no cache log
+                // row, no savings booked — automatically honest.
+                tracing::debug!(
+                    entry_id = %entry.id,
+                    similarity,
+                    agreement,
+                    "L2 verify gate rejected an ambiguous-band hit — treating as miss"
+                );
+                metrics::counter!(
+                    "cache_lookups_total", "tier" => "l2", "result" => "verify_reject"
+                )
+                .increment(1);
+                return None;
+            }
+            // Whether the served hit fell in the ambiguous band (gate on,
+            // t_eff <= sim < t_eff + epsilon): its judged verdict is the FP
+            // estimator's signal.
+            let in_band = matches!(
+                decision,
+                L2VerifyDecision::Verified(_) | L2VerifyDecision::Unverifiable
+            );
             metrics::counter!("cache_lookups_total", "tier" => "l2", "result" => "hit")
                 .increment(1);
             // Cache hit — best-effort bump and return.
@@ -674,6 +778,9 @@ async fn try_l2_hit(
                 state,
                 l2,
                 &entry,
+                similarity,
+                in_band,
+                task_class,
                 trace_id,
                 ctx.org_id,
                 raw_bearer,
@@ -1530,12 +1637,25 @@ pub async fn handler(
                         .map(|l| l.ttl_secs)
                         .unwrap_or(L2_DEFAULT_TTL.as_secs()),
                 );
+                // Volatility-class TTL for the L2 insert only (opt-in,
+                // shorten-only). `ttl_secs` keeps governing L1 unchanged —
+                // L1 is an exact-byte match, not a near-miss risk.
+                let l2_ttl_secs = match (l2_for_insert.as_ref(), l2_query_text.as_deref()) {
+                    (Some(l2cfg), Some(qt)) => crate::cache_volatility::l2_ttl_with_volatility(
+                        ttl,
+                        cache_behavior.ttl_secs.is_some(),
+                        qt,
+                        l2cfg.volatility_ttl.as_ref(),
+                    ),
+                    _ => ttl,
+                };
                 Some(CacheInsertContext {
                     l1: state.l1.clone(),
                     l2: l2_for_insert,
                     l1_key: l1_key.clone().unwrap_or_default(),
                     l2_query_text,
                     ttl_secs: ttl,
+                    l2_ttl_secs,
                     model: served_model.clone(),
                     provider_id: provider.id().to_string(),
                     org_id: ctx.org_id,
@@ -2071,6 +2191,16 @@ pub async fn handler(
                         cache_behavior.ttl_secs,
                         caller_tier,
                         L2_DEFAULT_TTL.as_secs(),
+                    );
+                    // Volatility-class TTL (opt-in, shorten-only, L2-scoped):
+                    // a volatile query's entry expires sooner so a stale
+                    // realtime answer can't be re-served for the full base
+                    // TTL. An explicit tt_extras override always wins.
+                    let l2_ttl_secs = crate::cache_volatility::l2_ttl_with_volatility(
+                        l2_ttl_secs,
+                        cache_behavior.ttl_secs.is_some(),
+                        &query_text,
+                        l2.volatility_ttl.as_ref(),
                     );
                     // Store the catalog-derived baseline on the row so later
                     // hits report honest savings. None (→ NULL) when the model
@@ -2711,6 +2841,11 @@ async fn insert_into_l2(
         judge_verdict: None,
         created_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
+        // One-way lexical signature of the embedded context text (never the
+        // text itself), stored unconditionally so the verify gate has data on
+        // every entry before an operator opts in. Harmless when the gate is
+        // off.
+        lexical_sig: Some(tt_cache::lexical_sig(query_text)),
     };
     if let Err(e) = l2.cache.insert(entry).await {
         tracing::warn!(error = %e, "l2 cache insert failed");
@@ -3638,8 +3773,10 @@ fn maybe_spawn_quality_judge(
             // entry to attribute the verdict to here. The L2 judge join
             // (`L2EvictionTarget`) is exercised by `maybe_spawn_l2_hit_judge`
             // on the served-from-L2 path; this dispatch path carries no
-            // eviction target.
+            // eviction target, no hit similarity, and no FP feed.
             l2_eviction: None,
+            hit_similarity: None,
+            l2_fp_feed: None,
         });
     });
 }
@@ -3678,6 +3815,9 @@ fn maybe_spawn_l2_hit_judge(
     state: &AppState,
     l2: &L2Config,
     entry: &CacheEntry,
+    similarity: f32,
+    in_band: bool,
+    task_class: Option<tt_cache::TaskClass>,
     trace_id: Uuid,
     org_id: Uuid,
     raw_bearer: &str,
@@ -3703,10 +3843,19 @@ fn maybe_spawn_l2_hit_judge(
     if !qs::JudgeTaskClass::ChatCompletions.is_sampled() {
         return;
     }
-    // Deterministic sample keyed on the trace id. Shares the dispatch-path
-    // sample rate so the combined judge spend stays within the configured
-    // budget.
-    if !qs::should_sample(trace_id, state.judge_config.sample_rate) {
+    // Deterministic sample keyed on the trace id. Rate precedence: an
+    // ambiguous-band hit prefers the dedicated band rate (so the FP estimator
+    // converges without judging every confident hit), then the dedicated
+    // L2-hit rate, then the shared dispatch-path rate (today's behavior).
+    let cfg = &state.judge_config;
+    let rate = if in_band {
+        cfg.l2_band_sample_rate
+            .or(cfg.l2_hit_sample_rate)
+            .unwrap_or(cfg.sample_rate)
+    } else {
+        cfg.l2_hit_sample_rate.unwrap_or(cfg.sample_rate)
+    };
+    if !qs::should_sample(trace_id, rate) {
         return;
     }
     // The served answer is the cached response body. A body that fails to
@@ -3728,6 +3877,15 @@ fn maybe_spawn_l2_hit_judge(
         );
         return;
     };
+    // Hourly per-instance spend cap — consumed LAST, after every cheap
+    // skip (deserialize / empty-answer / judge-model resolution), so each
+    // consumed token corresponds to a real would-be judge dispatch and a
+    // skipped sample never burns judge budget. Dispatch-path judging is
+    // unaffected.
+    if !state.l2_hit_judge_limiter.try_acquire() {
+        metrics::counter!("cache_l2_judge_capped_total").increment(1);
+        return;
+    }
     let input_text = tt_shared::message_text_for_estimation(original_req);
 
     // Per-provider judge credentials, resolved off-path inside a detached task
@@ -3742,6 +3900,18 @@ fn maybe_spawn_l2_hit_judge(
     let entry_model = entry.model.clone();
     let entry_id = entry.id;
     let l2_cache = l2.cache.clone();
+    // FP-estimator feed: only an AMBIGUOUS-BAND hit's verdict measures the
+    // gate's false-positive rate (a confident hit says nothing about the
+    // band). Carries the shared adaptive gate + the effective tolerance.
+    let l2_fp_feed = if in_band {
+        l2.verify.as_ref().map(|v| qs::L2FpFeed {
+            gate: v.gate.clone(),
+            task_class,
+            tolerance_pct: v.tolerance_pct,
+        })
+    } else {
+        None
+    };
     tokio::spawn(async move {
         let judge_ctx = if judge_provider.id() == source_provider.id() {
             // Same provider — the captured source credentials are the right ones.
@@ -3811,6 +3981,10 @@ fn maybe_spawn_l2_hit_judge(
                 cache: l2_cache,
                 entry_id,
             }),
+            // Durable attribution (migration 0018) + the FP-estimator feed for
+            // ambiguous-band hits.
+            hit_similarity: Some(similarity),
+            l2_fp_feed,
         });
     });
 }
@@ -4609,6 +4783,7 @@ mod l2_baseline_tests {
             judge_verdict: None,
             created_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::hours(1),
+            lexical_sig: None,
         }
     }
 
@@ -5441,5 +5616,107 @@ mod tier_ttl_tests {
             effective_ttl_secs(Some(override_secs), None, SECS_24H),
             override_secs
         );
+    }
+}
+
+#[cfg(test)]
+mod l2_verify_gate_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn verify_cfg(epsilon: f32, min_agreement: f32) -> L2VerifyConfig {
+        L2VerifyConfig {
+            epsilon,
+            min_agreement,
+            tolerance_pct: 1.0,
+            gate: Arc::new(tt_cache::AdaptiveClassThresholds::new(
+                tt_cache::ClassThresholds::new(),
+                tt_cache::FpGateTuning::default(),
+            )),
+        }
+    }
+
+    /// Gate off (`verify == None`) is ALWAYS Confident — today's behavior,
+    /// regardless of similarity, signature presence, or text.
+    #[test]
+    fn l2_verify_decision_gate_disabled_is_always_confident() {
+        for sim in [0.92_f32, 0.925, 0.99, 1.0] {
+            for sig in [None, Some(0_i64), Some(tt_cache::lexical_sig("anything"))] {
+                assert_eq!(
+                    l2_verify_decision(None, sim, 0.92, sig, "whatever"),
+                    L2VerifyDecision::Confident,
+                    "gate off must always be Confident (sim {sim}, sig {sig:?})"
+                );
+            }
+        }
+    }
+
+    /// A hit at or above `t_eff + epsilon` is confident — the lexical check
+    /// never runs (a mismatching signature must not matter).
+    #[test]
+    fn l2_verify_decision_above_band_is_confident() {
+        let v = verify_cfg(0.02, 0.75);
+        let mismatching_sig = Some(tt_cache::lexical_sig("a completely different topic"));
+        assert_eq!(
+            l2_verify_decision(Some(&v), 0.94, 0.92, mismatching_sig, "[user] hello there"),
+            L2VerifyDecision::Confident,
+            "sim == t_eff + epsilon is confident"
+        );
+        assert_eq!(
+            l2_verify_decision(Some(&v), 0.99, 0.92, mismatching_sig, "[user] hello there"),
+            L2VerifyDecision::Confident
+        );
+    }
+
+    /// In-band hits split on lexical agreement: a matching signature verifies,
+    /// a topically-shifted one rejects.
+    #[test]
+    fn l2_verify_decision_in_band_splits_on_agreement() {
+        let v = verify_cfg(0.02, 0.75);
+        let query = "[user] how do i configure the retry policy for the payments api client";
+        let same_sig = Some(tt_cache::lexical_sig(query));
+        match l2_verify_decision(Some(&v), 0.93, 0.92, same_sig, query) {
+            L2VerifyDecision::Verified(agreement) => {
+                assert!(
+                    agreement >= 0.75,
+                    "identical text agrees fully: {agreement}"
+                );
+            }
+            other => panic!("in-band + agreeing sig must be Verified, got {other:?}"),
+        }
+        let shifted_sig = Some(tt_cache::lexical_sig(
+            "[user] please summarize the quarterly marketing report for the board",
+        ));
+        match l2_verify_decision(Some(&v), 0.93, 0.92, shifted_sig, query) {
+            L2VerifyDecision::Rejected(agreement) => {
+                assert!(agreement < 0.75, "topic shift agrees low: {agreement}");
+            }
+            other => panic!("in-band + shifted sig must be Rejected, got {other:?}"),
+        }
+    }
+
+    /// An in-band hit on a pre-0018 row (no signature) fails OPEN.
+    #[test]
+    fn l2_verify_decision_in_band_missing_sig_is_unverifiable_fail_open() {
+        let v = verify_cfg(0.02, 0.75);
+        assert_eq!(
+            l2_verify_decision(Some(&v), 0.93, 0.92, None, "[user] hello there"),
+            L2VerifyDecision::Unverifiable,
+            "legacy rows must fail open (serve), never reject"
+        );
+    }
+
+    /// Below-threshold similarities never reach the decision in production
+    /// (the lookup filters them), but the band boundary itself is in-band:
+    /// sim == t_eff with an agreeing sig verifies.
+    #[test]
+    fn l2_verify_decision_band_lower_bound_is_in_band() {
+        let v = verify_cfg(0.02, 0.75);
+        let query = "[user] hello there";
+        let sig = Some(tt_cache::lexical_sig(query));
+        assert!(matches!(
+            l2_verify_decision(Some(&v), 0.92, 0.92, sig, query),
+            L2VerifyDecision::Verified(_)
+        ));
     }
 }

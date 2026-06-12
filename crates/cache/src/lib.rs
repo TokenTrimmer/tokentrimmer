@@ -24,6 +24,7 @@ pub mod embed;
 pub mod key;
 pub mod l1_entry;
 pub mod l2;
+pub mod lexical;
 pub mod memory;
 pub mod redis_impl;
 
@@ -31,10 +32,11 @@ pub mod redis_impl;
 pub use embed::{EmbedError, EmbeddingProvider, MockEmbedder, OpenAIEmbedder};
 pub use l1_entry::L1Entry;
 pub use l2::{
-    class_threshold_for, l2_context_text, CacheEntry, ClassThresholds, DedupCluster, DedupReport,
-    InMemoryL2Cache, JudgeBand, JudgeRecordOutcome, L2Cache, PostgresL2Cache, TaskClass,
-    DEFAULT_THRESHOLD,
+    class_threshold_for, l2_context_text, AdaptiveClassThresholds, CacheEntry, ClassThresholds,
+    DedupCluster, DedupReport, FpGateTuning, InMemoryL2Cache, JudgeBand, JudgeRecordOutcome,
+    L2Cache, PostgresL2Cache, TaskClass, ADAPTIVE_THRESHOLD_CEILING, DEFAULT_THRESHOLD,
 };
+pub use lexical::{lexical_agreement, lexical_sig, DEFAULT_LEXICAL_MIN_AGREEMENT};
 
 use async_trait::async_trait;
 use thiserror::Error;

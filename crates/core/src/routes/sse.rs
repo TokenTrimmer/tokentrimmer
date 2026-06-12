@@ -327,8 +327,13 @@ pub struct CacheInsertContext {
     pub l1_key: String,
     /// L2 query text for embedding (the context text extracted from the request).
     pub l2_query_text: Option<String>,
-    /// TTL seconds for both L1 and L2 inserts.
+    /// TTL seconds for the L1 insert.
     pub ttl_secs: u64,
+    /// TTL seconds for the L2 insert. Equals `ttl_secs` unless the
+    /// volatility-class TTL (opt-in, shorten-only) shortened it for a
+    /// volatile query — L1 TTLs are deliberately never shortened (the
+    /// near-miss-paraphrase risk is an L2 phenomenon; L1 is exact-byte).
+    pub l2_ttl_secs: u64,
     /// The served model name (e.g. `"gpt-4o"`).
     pub model: String,
     /// The provider id (e.g. `"openai"`).
@@ -932,7 +937,7 @@ pub fn stream_response(
                         });
                     }
                     if let (Some(l2), Some(query_text)) = (ins.l2, ins.l2_query_text) {
-                        let ttl_secs = ins.ttl_secs;
+                        let ttl_secs = ins.l2_ttl_secs;
                         let org_id_l2 = ins.org_id;
                         let provider_id_l2 = ins.provider_id.clone();
                         let model_l2 = ins.model.clone();
@@ -1076,6 +1081,8 @@ async fn stream_insert_into_l2(
         judge_verdict: None,
         created_at: now,
         expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
+        // One-way lexical signature (never the text) — see `insert_into_l2`.
+        lexical_sig: Some(tt_cache::lexical_sig(query_text)),
     };
     if let Err(e) = l2.cache.insert(entry).await {
         tracing::warn!(error = %e, "streaming l2 cache insert failed");

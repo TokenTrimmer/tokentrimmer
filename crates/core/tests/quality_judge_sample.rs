@@ -607,6 +607,8 @@ async fn preview_enriches_quality_band_from_recorded_judge_outcome() {
             optimized_position: tt_core::AbOrder::OptimizedA,
             orders_judged: 1,
             orders_agreed: None,
+            cache_entry_id: None,
+            hit_similarity: None,
         })
         .await;
 

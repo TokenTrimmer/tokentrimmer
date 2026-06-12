@@ -56,6 +56,8 @@ fn metered_outcome(org_id: Uuid, route_id: Uuid, request_id: Uuid) -> JudgeOutco
         optimized_position: AbOrder::OptimizedB,
         orders_judged: 2,
         orders_agreed: Some(true),
+        cache_entry_id: None,
+        hit_similarity: None,
     }
 }
 
@@ -129,6 +131,38 @@ async fn pg_judge_sink_round_trips_verdict() {
     assert_eq!(row.7, None, "unmetered judge tax must be NULL, never 0");
     assert_eq!(row.8, None, "unmetered baseline must be NULL, never 0");
     assert!(row.9, "baseline_dispatched still marks the billed dispatch");
+
+    // L2-hit attribution (migration 0017): cache_entry_id + hit_similarity
+    // round-trip on an L2-path outcome, and stay NULL on the dispatch-path
+    // outcome recorded above.
+    let l2_request = Uuid::now_v7();
+    let served_entry = Uuid::now_v7();
+    let mut l2_outcome = metered_outcome(org_id, route_id, l2_request);
+    l2_outcome.cache_entry_id = Some(served_entry);
+    l2_outcome.hit_similarity = Some(0.93_f32);
+    sink.record(l2_outcome).await;
+    let (entry_id, similarity): (Option<Uuid>, Option<f32>) = sqlx::query_as(
+        "SELECT cache_entry_id, hit_similarity FROM quality_verdicts WHERE request_id = $1",
+    )
+    .bind(l2_request)
+    .fetch_one(&pool)
+    .await
+    .expect("the L2-attributed verdict row must exist");
+    assert_eq!(entry_id, Some(served_entry), "cache_entry_id round-trips");
+    let sim = similarity.expect("hit_similarity persisted");
+    assert!((sim - 0.93).abs() < 1e-6, "hit_similarity: {sim}");
+    let (entry_id, similarity): (Option<Uuid>, Option<f32>) = sqlx::query_as(
+        "SELECT cache_entry_id, hit_similarity FROM quality_verdicts WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the dispatch-path row still exists");
+    assert_eq!(entry_id, None, "dispatch-path verdicts carry NULL entry id");
+    assert_eq!(
+        similarity, None,
+        "dispatch-path verdicts carry NULL similarity"
+    );
 
     // The CHECK constraint rejects a verdict outside the closed vocabulary —
     // a raw INSERT (bypassing the typed sink) must fail.

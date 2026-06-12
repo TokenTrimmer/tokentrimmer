@@ -27,6 +27,50 @@ pub const DEFAULT_L2_THRESHOLD: f32 = 0.92;
 /// default is conservative until tier resolution lands with auth.
 pub const DEFAULT_L1_TTL_SECS: u64 = 24 * 60 * 60;
 
+/// The L2 false-positive verify gate (research Phase 2.2). Wired via
+/// [`AppState::with_l2_verify`]; absent (`L2Config::verify == None`, the
+/// default) the L2 hit path behaves byte-identically to today.
+#[derive(Clone)]
+pub struct L2VerifyConfig {
+    /// Ambiguous band width above the effective threshold. A hit with
+    /// `similarity >= t_eff + epsilon` is confident (no verify step). Default
+    /// 0.02, clamped to `[0.0, 0.05]` at construction.
+    pub epsilon: f32,
+    /// Minimum lexical agreement ([`tt_cache::lexical_agreement`]) for an
+    /// ambiguous-band hit to be served. Default
+    /// [`tt_cache::DEFAULT_LEXICAL_MIN_AGREEMENT`], clamped to `[0.5, 1.0]`.
+    pub min_agreement: f32,
+    /// Effective FP tolerance pct fed to the adaptive estimator. Default 1.0,
+    /// clamped to the research route-tolerance band `[0.5, 2.0]`.
+    pub tolerance_pct: f64,
+    /// Shared adaptive per-class thresholds (base = this `L2Config`'s
+    /// `class_thresholds`). Read on the hit path; fed by judged
+    /// ambiguous-band verdicts inside the detached judge task.
+    pub gate: Arc<tt_cache::AdaptiveClassThresholds>,
+}
+
+/// Volatility-class TTL for L2 inserts: volatile queries (news/realtime/
+/// version-ish — see [`crate::cache_volatility::classify_volatility`]) get a
+/// SHORTENED L2 TTL. Shorten-only by construction: the ceiling is the base TTL
+/// itself, and an explicit per-request `tt_extras` TTL override always wins.
+#[derive(Clone, Copy, Debug)]
+pub struct L2VolatilityTtl {
+    /// Multiplier applied to a volatile entry's L2 TTL. Clamped to `(0.0, 1.0]`
+    /// (shorten-only). Default 0.25.
+    pub volatile_multiplier: f64,
+    /// The shortened TTL never drops below `min(floor_secs, base)`. Default 300.
+    pub floor_secs: u64,
+}
+
+impl Default for L2VolatilityTtl {
+    fn default() -> Self {
+        Self {
+            volatile_multiplier: 0.25,
+            floor_secs: 300,
+        }
+    }
+}
+
 /// L2 lookup wiring. Both fields are `Some` to enable semantic caching;
 /// otherwise the gateway skips the L2 branch and goes straight to the provider.
 #[derive(Clone)]
@@ -42,6 +86,14 @@ pub struct L2Config {
     /// identical to the single-threshold gateway until a class is explicitly
     /// raised. Never loosens a class below the global floor.
     pub class_thresholds: tt_cache::ClassThresholds,
+    /// FP verify gate. `None` (default) = today's behavior exactly.
+    /// **OFF BY DEFAULT** — opt in via `TT_L2_VERIFY` /
+    /// [`AppState::with_l2_verify`].
+    pub verify: Option<L2VerifyConfig>,
+    /// Volatility-class TTL. `None` (default) = today's behavior.
+    /// **OFF BY DEFAULT** — opt in via `TT_L2_VOLATILITY_TTL` /
+    /// [`AppState::with_l2_volatility_ttl`].
+    pub volatility_ttl: Option<L2VolatilityTtl>,
 }
 
 /// L1 exact-match lookup wiring. Cache hits short-circuit the provider call.
@@ -170,6 +222,12 @@ pub struct AppState {
     /// long the request handler will wait on the shadow before giving up and
     /// recording a shadow error (the primary response is already returned).
     pub shadow_timeout: std::time::Duration,
+    /// Hourly in-process cap on L2-hit judge spawns (per gateway instance).
+    /// Always present (like `verify_cache`); built from
+    /// `judge_config.l2_hit_max_per_hour` and rebuilt whenever a judge config
+    /// is attached. Consumed only by L2-hit samples that would otherwise spawn
+    /// a judge — the dispatch-path judge is unaffected.
+    pub l2_hit_judge_limiter: Arc<crate::quality_sample::L2HitJudgeLimiter>,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -181,6 +239,10 @@ impl AppState {
     /// L1, L2, key store, and credential store are disabled by default — wire
     /// them via the corresponding builder methods.
     pub fn new(registry: ProviderRegistry) -> Self {
+        let judge_config = crate::quality_sample::JudgeConfig::from_env();
+        let l2_hit_judge_limiter = Arc::new(crate::quality_sample::L2HitJudgeLimiter::new(
+            judge_config.l2_hit_max_per_hour,
+        ));
         Self {
             registry: Arc::new(registry),
             l1: None,
@@ -197,11 +259,12 @@ impl AppState {
             dynamic_budget: Arc::new(DynamicBudgetEnforcer::new()),
             breaker: Arc::new(CircuitBreaker::default()),
             single_flight: Arc::new(SingleFlight::new()),
-            judge_config: crate::quality_sample::JudgeConfig::from_env(),
+            judge_config,
             judge_sink: None,
             judge_band_store: None,
             latency_tracker: Arc::new(tt_routing::LatencyTracker::new()),
             shadow_timeout: DEFAULT_SHADOW_TIMEOUT,
+            l2_hit_judge_limiter,
         }
     }
 
@@ -241,7 +304,66 @@ impl AppState {
             // up to `DEFAULT_L2_THRESHOLD`, so a class can only ever raise the bar,
             // never lower it below today's value.
             class_thresholds: tt_cache::ClassThresholds::with_global_floor(threshold),
+            // Both gates OFF by default — wire via with_l2_verify /
+            // with_l2_volatility_ttl. None = byte-identical behavior to today.
+            verify: None,
+            volatility_ttl: None,
         });
+        self
+    }
+
+    /// Builder-style attach (post-`with_l2`): enable the L2 false-positive
+    /// verify gate. Ambiguous-band hits (`t_eff <= sim < t_eff + epsilon`) are
+    /// lexically verified against the entry's one-way signature and rejected
+    /// (treated as a miss) below `min_agreement`; judged in-band verdicts feed
+    /// an adaptive per-class threshold ratchet targeting `tolerance_pct` FP
+    /// (the research route-tolerance band 0.5–2%).
+    ///
+    /// All inputs are clamped to their documented safe ranges. No-op when L2
+    /// itself is not attached.
+    #[must_use]
+    pub fn with_l2_verify(
+        mut self,
+        epsilon: f32,
+        min_agreement: f32,
+        tolerance_pct: f64,
+        tuning: tt_cache::FpGateTuning,
+    ) -> Self {
+        if let Some(l2) = self.l2.as_mut() {
+            l2.verify = Some(L2VerifyConfig {
+                epsilon: epsilon.clamp(0.0, 0.05),
+                min_agreement: min_agreement.clamp(0.5, 1.0),
+                tolerance_pct: tolerance_pct.clamp(0.5, 2.0),
+                gate: Arc::new(tt_cache::AdaptiveClassThresholds::new(
+                    l2.class_thresholds.clone(),
+                    tuning,
+                )),
+            });
+        }
+        self
+    }
+
+    /// Builder-style attach (post-`with_l2`): enable volatility-class TTLs for
+    /// L2 inserts. Volatile queries (time-sensitive / realtime-data /
+    /// code-version-ish — [`crate::cache_volatility::classify_volatility`])
+    /// get `base_ttl * volatile_multiplier`, floor/ceiling-bounded; stable
+    /// queries and explicit per-request TTL overrides are untouched. No-op
+    /// when L2 itself is not attached.
+    #[must_use]
+    pub fn with_l2_volatility_ttl(mut self, cfg: L2VolatilityTtl) -> Self {
+        if let Some(l2) = self.l2.as_mut() {
+            l2.volatility_ttl = Some(L2VolatilityTtl {
+                // Shorten-only: a multiplier above 1.0 would EXTEND volatile
+                // TTLs; clamp into (0, 1]. A non-positive value falls back to
+                // the default rather than zeroing every volatile TTL.
+                volatile_multiplier: if cfg.volatile_multiplier > 0.0 {
+                    cfg.volatile_multiplier.min(1.0)
+                } else {
+                    L2VolatilityTtl::default().volatile_multiplier
+                },
+                floor_secs: cfg.floor_secs,
+            });
+        }
         self
     }
 
@@ -282,8 +404,18 @@ impl AppState {
         config: crate::quality_sample::JudgeConfig,
     ) -> Self {
         self.judge_sink = Some(sink);
-        self.judge_config = config;
+        self.set_judge_config(config);
         self
+    }
+
+    /// Install `config` and rebuild the L2-hit judge limiter from its hourly
+    /// cap, so a hand-built config (tests, embedded uses) caps exactly as an
+    /// env-built one would.
+    fn set_judge_config(&mut self, config: crate::quality_sample::JudgeConfig) {
+        self.l2_hit_judge_limiter = Arc::new(crate::quality_sample::L2HitJudgeLimiter::new(
+            config.l2_hit_max_per_hour,
+        ));
+        self.judge_config = config;
     }
 
     /// Builder-style attach: wire the sampled judge to an in-process
@@ -303,7 +435,7 @@ impl AppState {
     ) -> Self {
         self.judge_sink = Some(store.clone() as Arc<dyn crate::quality_sample::JudgeSink>);
         self.judge_band_store = Some(store);
-        self.judge_config = config;
+        self.set_judge_config(config);
         self
     }
 
@@ -329,7 +461,7 @@ impl AppState {
             persistent,
         ])));
         self.judge_band_store = Some(store);
-        self.judge_config = config;
+        self.set_judge_config(config);
         self
     }
 

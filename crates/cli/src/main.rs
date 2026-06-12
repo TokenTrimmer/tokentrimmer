@@ -1431,6 +1431,84 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         }
     }
 
+    // L2 false-positive verify gate — opt-in via TT_L2_VERIFY=1 (research
+    // Phase 2.2). Ambiguous-band hits are lexically verified before serving,
+    // and judged in-band verdicts adapt the per-class threshold upward (never
+    // below the 0.92 floor) to hold the FP rate at the route tolerance.
+    // No-op (warn) when L2 itself is off. All knobs clamp to their documented
+    // safe ranges inside `with_l2_verify`; malformed values fall back to the
+    // defaults rather than failing boot (mirrors the TT_L2_SEMANTIC_CACHE
+    // degradation pattern).
+    if std::env::var("TT_L2_VERIFY").as_deref() == Ok("1") {
+        if state.l2.is_some() {
+            let parse_f32 = |key: &str, default: f32| {
+                std::env::var(key)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .unwrap_or(default)
+            };
+            let parse_f64 = |key: &str, default: f64| {
+                std::env::var(key)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .unwrap_or(default)
+            };
+            let epsilon = parse_f32("TT_L2_VERIFY_EPSILON", 0.02);
+            let min_agreement = parse_f32(
+                "TT_L2_VERIFY_MIN_AGREEMENT",
+                tt_cache::DEFAULT_LEXICAL_MIN_AGREEMENT,
+            );
+            let tolerance_pct = parse_f64("TT_L2_FP_TOLERANCE_PCT", 1.0);
+            let min_samples = std::env::var("TT_L2_FP_MIN_SAMPLES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(20);
+            let tuning = tt_cache::FpGateTuning::new(min_samples, 0.005);
+            state = state.with_l2_verify(epsilon, min_agreement, tolerance_pct, tuning);
+            tracing::info!(
+                epsilon,
+                min_agreement,
+                tolerance_pct,
+                min_samples,
+                "L2 verify gate enabled (FP gate on ambiguous-band hits)"
+            );
+        } else {
+            tracing::warn!(
+                "TT_L2_VERIFY=1 but the L2 semantic cache is off — verify gate disabled"
+            );
+        }
+    }
+
+    // L2 volatility-class TTL — opt-in via TT_L2_VOLATILITY_TTL=1. Volatile
+    // queries (news/realtime/version-ish) get a shortened L2 TTL
+    // (shorten-only, floor-bounded; explicit per-request TTLs always win).
+    if std::env::var("TT_L2_VOLATILITY_TTL").as_deref() == Ok("1") {
+        if state.l2.is_some() {
+            let default_cfg = tt_core::state::L2VolatilityTtl::default();
+            let volatile_multiplier = std::env::var("TT_L2_VOLATILE_TTL_MULTIPLIER")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(default_cfg.volatile_multiplier);
+            let floor_secs = std::env::var("TT_L2_VOLATILE_TTL_FLOOR_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default_cfg.floor_secs);
+            state = state.with_l2_volatility_ttl(tt_core::state::L2VolatilityTtl {
+                volatile_multiplier,
+                floor_secs,
+            });
+            tracing::info!(
+                volatile_multiplier,
+                floor_secs,
+                "L2 volatility-class TTL enabled (volatile entries expire sooner)"
+            );
+        } else {
+            tracing::warn!(
+                "TT_L2_VOLATILITY_TTL=1 but the L2 semantic cache is off — volatility TTL disabled"
+            );
+        }
+    }
+
     // Routing store: Postgres when available. Reads the `routes` table that
     // the cloud dashboard writes (cloud schema migration 0002). Wrapped in
     // the 60s per-org cache so the chat hot path doesn't hit the DB on

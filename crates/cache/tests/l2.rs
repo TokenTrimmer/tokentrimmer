@@ -51,6 +51,7 @@ fn make_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
+        lexical_sig: None,
     }
 }
 
@@ -70,6 +71,7 @@ fn make_expired_entry(org_id: Uuid, embedding: Vec<f32>) -> CacheEntry {
         judge_verdict: None,
         created_at: Utc::now() - Duration::seconds(7200),
         expires_at: Utc::now() - Duration::seconds(1),
+        lexical_sig: None,
     }
 }
 
@@ -414,6 +416,7 @@ async fn l2_different_embedding_model_is_not_returned() {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
+        lexical_sig: None,
     };
     cache.insert(entry).await.expect("insert should succeed");
 
@@ -542,6 +545,7 @@ async fn postgres_l2_round_trip() {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
+        lexical_sig: None,
     };
     let entry_id = entry.id;
 
@@ -594,6 +598,7 @@ async fn postgres_l2_round_trip() {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
+        lexical_sig: None,
     };
     let null_entry_id = null_entry.id;
     cache
@@ -673,6 +678,7 @@ async fn postgres_l2_org_isolation_org_b_miss() {
         judge_verdict: None,
         created_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(3600),
+        lexical_sig: None,
     };
     let entry_id = entry.id;
 
@@ -707,6 +713,141 @@ async fn postgres_l2_org_isolation_org_b_miss() {
     sqlx::query("DELETE FROM cache_entries WHERE id = $1")
         .bind(entry_id)
         .execute(&cleanup_pool)
+        .await
+        .ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 11 — lexical_sig round-trips through the in-memory store (verify gate)
+// ---------------------------------------------------------------------------
+
+/// The verify gate reads `CacheEntry.lexical_sig` off the looked-up entry; the
+/// in-memory store must carry it through insert → lookup unchanged.
+#[tokio::test]
+async fn in_memory_roundtrips_lexical_sig() {
+    let cache = InMemoryL2Cache::new();
+    let org_id = Uuid::new_v4();
+    let vec = unit_vec(0, 3);
+
+    let sig = tt_cache::lexical_sig("[user] hello there");
+    let mut entry = make_entry(org_id, vec.clone());
+    entry.lexical_sig = Some(sig);
+    cache.insert(entry).await.expect("insert should succeed");
+
+    let (found, _) = cache
+        .lookup(org_id, &vec, THRESHOLD, "gpt-4o", "mock-v1")
+        .await
+        .expect("lookup ok")
+        .expect("entry present");
+    assert_eq!(
+        found.lexical_sig,
+        Some(sig),
+        "lexical_sig must round-trip through the in-memory store"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12 — PostgresL2Cache lexical_sig round-trip + pre-0017 NULL rows
+//           (requires DATABASE_URL; ignored by default)
+// ---------------------------------------------------------------------------
+
+/// The BIGINT `lexical_sig` column (migration 0017) round-trips through the
+/// production Postgres path, and a row inserted WITHOUT the column (the
+/// pre-0017 shape) reads back as `None` so the verify gate fails open.
+#[tokio::test]
+#[ignore = "requires a live Postgres instance with pgvector + migrations applied (set DATABASE_URL env var)"]
+async fn pg_lexical_sig_roundtrip_and_pre_0017_rows_read_none() {
+    let db_url = match env::var("DATABASE_URL") {
+        Ok(u) => u,
+        Err(_) => return, // skip cleanly when env unset
+    };
+
+    let pool = sqlx::PgPool::connect(&db_url)
+        .await
+        .expect("should connect to Postgres");
+
+    let cache = PostgresL2Cache::new(pool.clone());
+    let org_id = Uuid::new_v4();
+    let mut embedding = vec![0.0_f32; 1536];
+    embedding[0] = 1.0;
+
+    // A signed value with the high bit set exercises the i64 bit-cast space.
+    let sig = tt_cache::lexical_sig("[user] how do i rotate the api key for production");
+    let entry = CacheEntry {
+        id: Uuid::new_v4(),
+        org_id,
+        embedding: embedding.clone(),
+        response: serde_json::to_vec(&serde_json::json!({"object": "chat.completion"}))
+            .expect("serialize ok"),
+        model: "gpt-4o".to_string(),
+        embedding_model: "text-embedding-3-small".to_string(),
+        input_tokens: 10,
+        output_tokens: 5,
+        baseline_cost_usd: None,
+        hit_count: 0,
+        quality_score: None,
+        judge_verdict: None,
+        created_at: Utc::now(),
+        expires_at: Utc::now() + Duration::seconds(3600),
+        lexical_sig: Some(sig),
+    };
+    let entry_id = entry.id;
+    cache.insert(entry).await.expect("insert should succeed");
+
+    let (found, _) = cache
+        .lookup(org_id, &embedding, 0.99, "gpt-4o", "text-embedding-3-small")
+        .await
+        .expect("lookup ok")
+        .expect("entry present");
+    assert_eq!(
+        found.lexical_sig,
+        Some(sig),
+        "lexical_sig must round-trip through the BIGINT column"
+    );
+
+    // Pre-0017 shape: a raw INSERT that names no lexical_sig column. The
+    // column default is NULL, and the decode path must surface None.
+    let org_legacy = Uuid::new_v4();
+    let legacy_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO cache_entries \
+         (id, org_id, embedding, response, model, embedding_model, \
+          input_tokens, output_tokens, hit_count, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now() + interval '1 hour')",
+    )
+    .bind(legacy_id)
+    .bind(org_legacy)
+    .bind(pgvector::Vector::from(embedding.clone()))
+    .bind(serde_json::json!({"object": "chat.completion"}))
+    .bind("gpt-4o")
+    .bind("text-embedding-3-small")
+    .bind(10_i32)
+    .bind(5_i32)
+    .bind(0_i64)
+    .execute(&pool)
+    .await
+    .expect("legacy-shape insert should succeed");
+
+    let (legacy, _) = cache
+        .lookup(
+            org_legacy,
+            &embedding,
+            0.99,
+            "gpt-4o",
+            "text-embedding-3-small",
+        )
+        .await
+        .expect("legacy lookup ok")
+        .expect("legacy entry present");
+    assert_eq!(
+        legacy.lexical_sig, None,
+        "a pre-0017 row must read lexical_sig as None (verify gate fails open)"
+    );
+
+    sqlx::query("DELETE FROM cache_entries WHERE id = $1 OR id = $2")
+        .bind(entry_id)
+        .bind(legacy_id)
+        .execute(&pool)
         .await
         .ok();
 }

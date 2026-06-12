@@ -82,8 +82,10 @@ pub struct CacheClassifierPass;
 
 /// A literal ISO-8601 *date-time* (date plus a time component). The time part
 /// is required so a bare date in prose does not fire — ported verbatim from
-/// `prompt_volatile_in_system_prompt.rs`.
-fn literal_iso_timestamp_regex() -> &'static Regex {
+/// `prompt_volatile_in_system_prompt.rs`. `pub(crate)` so the L2
+/// volatility-class TTL ([`crate::cache_volatility`]) reuses the exact same
+/// detector instead of forking it.
+pub(crate) fn literal_iso_timestamp_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}").expect("iso-timestamp regex is valid")
