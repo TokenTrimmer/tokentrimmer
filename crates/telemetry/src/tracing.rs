@@ -7,10 +7,10 @@
 //! The OTLP exporter uses **HTTP/protobuf** (`application/x-protobuf`, the
 //! OTLP spec default) over the existing `reqwest`/`rustls` stack, so the export
 //! path reuses the gateway's existing rustls TLS stack rather than standing up
-//! a second TLS stack for a gRPC/`tonic` transport. (`tonic`/`prost` are still
-//! pulled in transitively by `opentelemetry-proto` for the generated wire
-//! types; this is not a tonic-free build.) Spans are exported in the background
-//! via a batch span processor (tokio runtime).
+//! a second TLS stack for a gRPC/`tonic` transport. (`opentelemetry-proto`
+//! pulls in only `prost` for the generated wire types; `tonic` is not in the
+//! dependency tree at all.) Spans are exported in the background
+//! via a batch span processor running on its own dedicated thread.
 //!
 //! ## Scope: export + inbound ingest (not outbound propagation)
 //!
@@ -34,8 +34,8 @@ use std::time::Duration;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::{Config, TracerProvider};
-use opentelemetry_sdk::{runtime, Resource};
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::Resource;
 use thiserror::Error;
 use tracing_subscriber::{filter::EnvFilter, prelude::*};
 
@@ -59,9 +59,9 @@ pub enum TracingError {
 /// buffered spans are flushed before the program exits. When OTLP is not
 /// configured the guard holds nothing and dropping it is a no-op.
 pub struct TracingGuard {
-    /// The OTLP `TracerProvider`, kept alive so its batch processor keeps
+    /// The OTLP `SdkTracerProvider`, kept alive so its batch processor keeps
     /// exporting. `None` in local/dev mode (no OTLP endpoint configured).
-    provider: Option<TracerProvider>,
+    provider: Option<SdkTracerProvider>,
 }
 
 impl Drop for TracingGuard {
@@ -75,15 +75,14 @@ impl Drop for TracingGuard {
 /// Flush + shut down the OTLP batch processor without blocking the caller's
 /// thread.
 ///
-/// `TracerProvider::shutdown` blocks the calling thread on
-/// `futures_executor::block_on` while it waits for the background batch worker
-/// (running on the tokio runtime) to acknowledge. If that blocking call runs on
-/// a tokio runtime **worker** thread it can deadlock — the worker is busy
-/// blocking and so cannot also drive the export future. Since the guard is
-/// commonly dropped from inside `#[tokio::main]` (a runtime thread), we move the
-/// blocking shutdown onto a dedicated OS thread and join it with a bounded
-/// timeout so `Drop` can never hang the process.
-fn shutdown_provider(provider: TracerProvider) {
+/// `SdkTracerProvider::shutdown` blocks the calling thread while it waits for
+/// the background batch worker (a dedicated OS thread since opentelemetry_sdk
+/// 0.30) to flush and acknowledge. Blocking a tokio runtime **worker** thread
+/// for that long stalls the runtime, and the guard is commonly dropped from
+/// inside `#[tokio::main]` (a runtime thread) — so we move the blocking
+/// shutdown onto a dedicated OS thread and join it with a bounded timeout so
+/// `Drop` can never hang the process.
+fn shutdown_provider(provider: SdkTracerProvider) {
     let handle = std::thread::spawn(move || {
         // Best-effort: errors here are non-fatal (we're shutting down anyway).
         if let Err(err) = provider.shutdown() {
@@ -105,28 +104,37 @@ fn shutdown_provider(provider: TracerProvider) {
     }
 }
 
-/// Build an OTLP `TracerProvider` exporting over HTTP/protobuf to `endpoint`.
+/// Build an OTLP `SdkTracerProvider` exporting over HTTP/protobuf to
+/// `endpoint`.
 ///
-/// Spans are flushed in the background by a batch processor on the tokio
-/// runtime, so this must be called from within a tokio runtime (the gateway's
-/// `#[tokio::main]`). Returns an error if the exporter cannot be constructed
-/// (e.g. a malformed endpoint URL).
+/// Spans are flushed in the background by a batch processor running on its own
+/// dedicated thread (the opentelemetry_sdk 0.30+ default), so this is safe to
+/// call from within the gateway's `#[tokio::main]`. Returns an error if the
+/// exporter cannot be constructed (e.g. a malformed endpoint URL).
 ///
 /// This does **not** require the collector to be reachable at construction
 /// time — exporting is asynchronous and failures are logged, not fatal.
-fn build_otlp_provider(endpoint: &str, service_name: &str) -> Result<TracerProvider, TracingError> {
-    let exporter = opentelemetry_otlp::new_exporter()
-        .http()
+fn build_otlp_provider(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<SdkTracerProvider, TracingError> {
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
         .with_endpoint(endpoint)
         .with_timeout(Duration::from_secs(3))
-        .build_span_exporter()
+        .build()
         .map_err(|e| TracingError::Otlp(e.to_string()))?;
 
-    let resource = Resource::new(vec![KeyValue::new("service.name", service_name.to_owned())]);
+    // `builder_empty()` (not `builder()`) so the resource carries exactly the
+    // attributes we set — matching the previous `Resource::new(..)` semantics
+    // rather than pulling in the SDK's default attribute set.
+    let resource = Resource::builder_empty()
+        .with_attributes(vec![KeyValue::new("service.name", service_name.to_owned())])
+        .build();
 
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, runtime::Tokio)
-        .with_config(Config::default().with_resource(resource))
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
         .build();
 
     Ok(provider)
@@ -207,10 +215,10 @@ mod tests {
     // is performed at construction time — export is asynchronous — so this is
     // hermetic.
     //
-    // Multi-thread flavour so the batch worker (spawned on `runtime::Tokio`)
-    // can run on a separate worker thread while `shutdown_provider`'s blocking
-    // flush waits — mirroring the gateway's production runtime and letting the
-    // unreachable-collector export error out promptly instead of timing out.
+    // Multi-thread flavour mirrors the gateway's production runtime: the batch
+    // worker runs on its own dedicated thread while `shutdown_provider`'s
+    // blocking flush waits, letting the unreachable-collector export error out
+    // promptly instead of timing out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_otlp_provider_constructs_against_dummy_endpoint() {
         let provider = build_otlp_provider("http://127.0.0.1:4318", "tt-test")

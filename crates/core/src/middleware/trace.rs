@@ -78,10 +78,15 @@ pub async fn middleware(mut req: Request, next: Next) -> Response {
     // trace by parenting this span on the extracted remote context. No-op when
     // absent or malformed (fresh root). Reads headers only — does not consume
     // or strip them, so downstream handlers/providers are unaffected.
+    //
+    // `set_parent` returns `Err` when no `tracing-opentelemetry` layer is
+    // attached (e.g. OTLP export disabled) — discard it to keep the pre-0.33
+    // silent-no-op semantics; parenting correctness is covered by the
+    // traceparent_ingest test, which runs with a layer attached.
     if let Some(parent_cx) =
         tt_telemetry::propagation::extract_remote_parent(&HeaderExtractor(req.headers()))
     {
-        span.set_parent(parent_cx);
+        let _ = span.set_parent(parent_cx);
     }
 
     let mut response = next.run(req).instrument(span).await;

@@ -61,25 +61,30 @@ thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = "0.27"
-opentelemetry = "0.26"
-opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
 # OTLP span exporter. HTTP/protobuf transport over reqwest-rustls so the export
-# path reuses the existing rustls TLS stack (no separate native-TLS or
-# tonic-transport TLS stack). Note: opentelemetry-proto still pulls tonic/prost
-# transitively for its generated types regardless of these features, so this is
-# not a tonic-free build — the rationale is TLS-stack reuse, not gRPC avoidance.
-opentelemetry-otlp = { version = "0.26", default-features = false, features = [
+# path stays on a rustls TLS stack (no native-TLS or tonic-transport TLS
+# stack; reqwest 0.13's `default-tls` is rustls). Note: with 0.32's default
+# features opentelemetry-proto pulls in only prost for its generated wire
+# types — tonic is not in the dependency tree at all.
+#
+# `reqwest-blocking-client` (the 0.32 default HTTP client) rather than the
+# async `reqwest-client`: since opentelemetry_sdk 0.30 the batch span
+# processor runs on its own dedicated thread (the tokio-runtime processor is
+# now experimental), and the async client cannot be driven from that thread.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "http-proto",
-    "reqwest-client",
+    "reqwest-blocking-client",
     "reqwest-rustls",
 ] }
 # `HeaderExtractor` adapter so the gateway can extract an inbound W3C
 # `traceparent` from request headers (crates/core/src/middleware/trace.rs).
 # Already in the tree transitively via opentelemetry-otlp; pinned here so the
 # direct use is explicit.
-opentelemetry-http = "0.26"
+opentelemetry-http = "0.32"
 
 # Crypto + auth
 argon2 = "0.5"

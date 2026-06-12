@@ -41,8 +41,8 @@ use uuid::Uuid;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::Value;
-use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::InMemorySpanExporter;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::prelude::*;
 
 use tt_auth::ApiKeyContext;
@@ -203,7 +203,7 @@ fn chat_request(stream: bool) -> Request<Body> {
 /// the per-request cost is known), which only fires when the body is consumed.
 fn run_request_capturing_attrs(stream: bool) -> HashMap<String, Value> {
     let exporter = InMemorySpanExporter::default();
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
     let tracer = provider.tracer("gen-ai-span-test");
@@ -225,7 +225,7 @@ fn run_request_capturing_attrs(stream: bool) -> HashMap<String, Value> {
         });
     });
 
-    provider.force_flush();
+    provider.force_flush().expect("force_flush should succeed");
     let spans = exporter.get_finished_spans().expect("finished spans");
     let span = spans
         .into_iter()
@@ -638,7 +638,7 @@ fn cache_hit_span_attrs(
 #[test]
 fn l1_hit_span_carries_gen_ai_and_cost_attributes() {
     let exporter = InMemorySpanExporter::default();
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
     let tracer = provider.tracer("l1-hit-span-test");
@@ -688,7 +688,7 @@ fn l1_hit_span_carries_gen_ai_and_cost_attributes() {
         "provider must NOT be called on the L1 hit"
     );
 
-    provider.force_flush();
+    provider.force_flush().expect("force_flush should succeed");
     let attrs = cache_hit_span_attrs(&exporter, "hit-l1");
     // Envelope baseline = CountingProvider catalog ($3/M input + $6/M output)
     // over the cached 100/50 usage.
@@ -708,7 +708,7 @@ fn l1_hit_span_carries_gen_ai_and_cost_attributes() {
 #[test]
 fn streaming_l1_hit_span_carries_gen_ai_and_cost_attributes() {
     let exporter = InMemorySpanExporter::default();
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
     let tracer = provider.tracer("streaming-l1-hit-span-test");
@@ -762,7 +762,7 @@ fn streaming_l1_hit_span_carries_gen_ai_and_cost_attributes() {
         "provider must NOT be re-dispatched on the streaming L1 hit"
     );
 
-    provider.force_flush();
+    provider.force_flush().expect("force_flush should succeed");
     let attrs = cache_hit_span_attrs(&exporter, "hit-l1");
     // Same envelope baseline as the non-streaming L1-hit test.
     let expected_baseline = (100.0 * 3.0 + 50.0 * 6.0) / 1_000_000.0;
@@ -776,7 +776,7 @@ fn streaming_l1_hit_span_carries_gen_ai_and_cost_attributes() {
 #[test]
 fn l2_hit_span_carries_gen_ai_and_cost_attributes() {
     let exporter = InMemorySpanExporter::default();
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
     let tracer = provider.tracer("l2-hit-span-test");
@@ -866,7 +866,7 @@ fn l2_hit_span_carries_gen_ai_and_cost_attributes() {
         "provider must NOT be called on the L2 hit"
     );
 
-    provider.force_flush();
+    provider.force_flush().expect("force_flush should succeed");
     let attrs = cache_hit_span_attrs(&exporter, "hit-l2");
     assert_cache_hit_attrs(&attrs, "hit-l2", stored_baseline);
     // Prove the baseline is NOT the legacy $1/M·$2/M placeholder.
@@ -980,7 +980,7 @@ fn embeddings_request() -> Request<Body> {
 #[test]
 fn embeddings_request_span_carries_gen_ai_and_cost_attributes() {
     let exporter = InMemorySpanExporter::default();
-    let provider = TracerProvider::builder()
+    let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
     let tracer = provider.tracer("embeddings-span-test");
@@ -1002,7 +1002,7 @@ fn embeddings_request_span_carries_gen_ai_and_cost_attributes() {
             let _ = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
         });
 
-        provider.force_flush();
+        provider.force_flush().expect("force_flush should succeed");
         exporter
             .get_finished_spans()
             .expect("finished spans")
