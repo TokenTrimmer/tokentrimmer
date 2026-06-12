@@ -256,13 +256,11 @@ struct HarnessOpts {
     /// Override `JudgeConfig::baseline_timeout` (also the per-judge-call
     /// timeout the production spawn wires via `with_call_timeout`).
     baseline_timeout: Option<std::time::Duration>,
-<<<<<<< HEAD
     /// Plant a SAME-MODEL, action-less route (`target_model == "gpt-4o"`,
     /// every action off) instead of the downgrade route — matched traffic is
     /// neither a downgrade nor output-shaped, so the judge must NOT spawn
     /// (guards the #3.x eligibility widening against over-widening).
     same_model_route: bool,
-=======
     /// Plant a SAME-MODEL route (gpt-4o-mini → gpt-4o-mini; never a
     /// downgrade) instead of the downgrade route — the output-shaping judge
     /// tests use it to isolate the `response_shaped` gate arm.
@@ -274,7 +272,6 @@ struct HarnessOpts {
     /// and the reference re-dispatch); `None` keeps the default
     /// `answer from <model>`.
     served_body: Option<&'static str>,
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
 }
 
 impl Default for HarnessOpts {
@@ -288,13 +285,10 @@ impl Default for HarnessOpts {
             both_orders: false,
             redact_route: false,
             baseline_timeout: None,
-<<<<<<< HEAD
             same_model_route: false,
-=======
             plant_same_model_route: false,
             same_model_route_diff: false,
             served_body: None,
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
         }
     }
 }
@@ -373,6 +367,9 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     batch: false,
                     compress: false,
                     redact: false,
+                    minify_json: false,
+                    reasoning_max_effort: None,
+                    reasoning_budget_tokens: None,
                     format_switch: None,
                     diff: opts.same_model_route_diff,
                     traffic_pct: None,
@@ -571,7 +568,6 @@ async fn non_rerouted_request_never_triggers_judge() {
     assert_eq!(h.served_calls.load(Ordering::SeqCst), 1);
 }
 
-<<<<<<< HEAD
 /// A route that MATCHES but neither downgrades nor output-shapes (same
 /// target model, every action off) never judges — the output-shaping
 /// eligibility widening is shaped-only, not matched-only.
@@ -579,7 +575,36 @@ async fn non_rerouted_request_never_triggers_judge() {
 async fn matched_unshaped_same_model_route_never_triggers_judge() {
     let h = build_harness_opts(HarnessOpts {
         same_model_route: true,
-=======
+        ..Default::default()
+    })
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["x-tokentrimmer-model-used"]
+            .to_str()
+            .unwrap(),
+        "gpt-4o",
+        "same-model route → model unchanged"
+    );
+
+    // Give any (erroneously) spawned judge task a chance to run.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        h.judge_calls.load(Ordering::SeqCst),
+        0,
+        "matched-but-unshaped same-model route must never call the judge"
+    );
+    assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
+    assert_eq!(h.served_calls.load(Ordering::SeqCst), 1);
+}
+
 /// The prior document for the output-shaping judge tests (> 200 chars so the
 /// diff planner accepts it) and a patch whose anchor is unique within it.
 const SHAPING_PRIOR_LINE: &str =
@@ -623,7 +648,6 @@ async fn shaped_response_on_non_downgrade_route_samples_judge() {
         plant_same_model_route: true,
         same_model_route_diff: true,
         served_body: Some(SHAPING_PATCH),
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
         ..Default::default()
     })
     .await;
@@ -631,21 +655,6 @@ async fn shaped_response_on_non_downgrade_route_samples_judge() {
     let resp = h
         .app
         .clone()
-<<<<<<< HEAD
-        .oneshot(chat_request("gpt-4o", &h.plaintext))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers()["x-tokentrimmer-model-used"]
-            .to_str()
-            .unwrap(),
-        "gpt-4o",
-        "same-model route → model unchanged"
-    );
-
-    // Give any (erroneously) spawned judge task a chance to run.
-=======
         .oneshot(shaping_edit_request(&h.plaintext))
         .await
         .unwrap();
@@ -691,21 +700,13 @@ async fn unshaped_non_downgrade_route_still_never_samples_judge() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(
         h.judge_calls.load(Ordering::SeqCst),
         0,
-<<<<<<< HEAD
-        "matched-but-unshaped same-model route must never call the judge"
-    );
-    assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
-    assert_eq!(h.served_calls.load(Ordering::SeqCst), 1);
-=======
         "an unshaped non-downgrade route must not sample"
     );
     assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
 }
 
 /// (c) At rate 0.0 a rerouted-down request is never judged.

@@ -247,6 +247,8 @@ pub fn record_reasoning_capped(route: &str, lever: &'static str, cap: &str) {
 /// bounded.
 pub fn record_reasoning_cap_skipped(reason: &'static str) {
     metrics::counter!("reasoning_cap_skipped_total", "reason" => reason).increment(1);
+}
+
 /// Record a format-switch outcome (research Phase 3.3). `format` ∈
 /// `csv|bare`; `outcome` ∈ `applied|failed` (a failed strip-validation fails
 /// OPEN — the untouched body is served). Bounded label sets.

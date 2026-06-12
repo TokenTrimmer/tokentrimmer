@@ -462,31 +462,6 @@ async fn request_log_insert_round_trips_batch_columns() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
 async fn request_logs_insert_round_trips_against_postgres() {
-#[test]
-fn migrator_includes_output_shaping_migration() {
-    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
-    let twentieth = migrations
-        .iter()
-        .find(|m| m.version == 20)
-        .expect("migration version 20 not found");
-    let desc = twentieth.description.to_lowercase();
-    assert!(
-        desc.contains("output") || desc.contains("shaping"),
-        "migration 0020 description is '{}', expected to mention output shaping",
-        twentieth.description,
-    );
-}
-
-/// DB-gated: a real `PostgresRequestLogWriter` INSERT against the migrated
-/// schema round-trips the output-shaping columns (migration 0020). A shaped
-/// row (`format_switched='csv'` + estimate; `diff_applied` + measured saving;
-/// `diff_failed` + realized retry cost) survives write→read, and the NOT NULL
-/// DEFAULTs cover unshaped rows. Also exercises the `format_switched` CHECK
-/// (csv|bare) implicitly. Catches column-order/type drift in INSERT_SQL that
-/// the parser-based bind-count guard cannot.
-#[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
-async fn request_log_insert_round_trips_output_shaping_columns() {
     use tt_telemetry::request_logs::{
         postgres::PostgresRequestLogWriter, RequestLogRow, RequestLogWriter,
     };
@@ -498,7 +473,6 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
     let writer = PostgresRequestLogWriter::new(pool.clone());
 
     let row = RequestLogRow {
-    let shaped = RequestLogRow {
         id: Uuid::now_v7(),
         org_id: Uuid::nil(),
         api_key_id: Uuid::nil(),
@@ -510,12 +484,6 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         cached_tokens: 0,
         cost_usd: 0.0045,
         baseline_cost_usd: 0.0045,
-        model: "shaped".into(),
-        input_tokens: 1000,
-        output_tokens: 50,
-        cached_tokens: 0,
-        cost_usd: 0.01,
-        baseline_cost_usd: 0.02,
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
         cached: false,
@@ -527,12 +495,6 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         tag: Some("db-t0-bind-chain".into()),
         error_class: None,
         trace_id: Some("trace-t0".into()),
-        latency_ms: 5,
-        upstream_latency_ms: None,
-        status: 200,
-        tag: Some("db-output-shaping".into()),
-        error_class: None,
-        trace_id: None,
         truncated: false,
         shadow_model: None,
         shadow_cost_usd: None,
@@ -545,6 +507,12 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         // Nonzero on purpose: pins the f64 → NUMERIC(12,6) encode of the NEW
         // 0020 column against real Postgres, not just the bind position.
         minify_saved_est_usd: 0.000412,
+        format_switched: None,
+        format_switch_saved_est_usd: 0.0,
+        diff_applied: false,
+        diff_saved_usd: 0.0,
+        diff_failed: false,
+        diff_failed_cost_usd: 0.0,
     };
     let id = row.id;
     writer
@@ -568,6 +536,63 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
     );
 
     sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}
+
+/// DB-gated: a real `PostgresRequestLogWriter` INSERT against the migrated
+/// schema round-trips the output-shaping columns (migration 0021). A shaped
+/// row (`format_switched='csv'` + estimate; `diff_applied` + measured saving;
+/// `diff_failed` + realized retry cost) survives write→read, and the NOT NULL
+/// DEFAULTs cover unshaped rows. Also exercises the `format_switched` CHECK
+/// (csv|bare) implicitly. Catches column-order/type drift in INSERT_SQL that
+/// the parser-based bind-count guard cannot.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn request_log_insert_round_trips_output_shaping_columns() {
+    use tt_telemetry::request_logs::{
+        postgres::PostgresRequestLogWriter, RequestLogRow, RequestLogWriter,
+    };
+    use uuid::Uuid;
+
+    let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+    tt_core::migrate_only(&url).await.expect("migrate");
+    let pool = tt_core::connect(&url, 2).await.expect("connect");
+    let writer = PostgresRequestLogWriter::new(pool.clone());
+
+    let shaped = RequestLogRow {
+        id: Uuid::now_v7(),
+        org_id: Uuid::nil(),
+        api_key_id: Uuid::nil(),
+        ts: chrono::Utc::now(),
+        provider: "test-provider".into(),
+        model: "shaped".into(),
+        input_tokens: 1000,
+        output_tokens: 50,
+        cached_tokens: 0,
+        cost_usd: 0.01,
+        baseline_cost_usd: 0.02,
+        provider_cache_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
+        cached: false,
+        cache_layer: None,
+        route_id: None,
+        latency_ms: 5,
+        upstream_latency_ms: None,
+        status: 200,
+        tag: Some("db-output-shaping".into()),
+        error_class: None,
+        trace_id: None,
+        truncated: false,
+        shadow_model: None,
+        shadow_cost_usd: None,
+        traffic_split_arm: None,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+        minify_saved_est_usd: 0.0,
+        batch_eligible: false,
+        batch_forgone_usd: 0.0,
         route_paused: false,
         format_switched: Some("csv".into()),
         format_switch_saved_est_usd: 0.0042,

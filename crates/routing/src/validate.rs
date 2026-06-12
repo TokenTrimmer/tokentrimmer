@@ -326,6 +326,8 @@ mod tests {
         let mut c = action("m");
         c.minify_json = true;
         assert!(validate_output_shaping(&c).is_ok());
+    }
+
     /// Output-shaping config: `format_switch` accepts only `"csv"` / `"bare"`
     /// (or `None`), an unknown value is rejected at creation time, and
     /// `format_switch` + `diff` together are a conflict (mutually exclusive

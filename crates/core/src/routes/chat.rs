@@ -4181,6 +4181,7 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-minify-saved-est-usd",
             format!("{:.6}", cost.minify_saved_est_usd),
+        ),
         // MEASURED diff-lane saving (reconstructed artifact tokens − billed
         // patch tokens, output-rate-priced) — included in `saved-usd` via the
         // baseline fold, isolated here for the methodology breakdown.
@@ -4619,13 +4620,10 @@ fn maybe_spawn_quality_judge(
     if matched_route_id.is_none() {
         return;
     }
-    if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage) || output_shaped) {
-    // A route fired AND (the served model is cheaper OR the response was
-    // shaped) — shaping samples the judge even without a model downgrade.
-    if matched_route_id.is_none() {
-        return;
-    }
-    if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage) || response_shaped) {
+    if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage)
+        || output_shaped
+        || response_shaped)
+    {
         return;
     }
     // Deterministic ~2% sample keyed on the trace id.
@@ -6111,6 +6109,7 @@ mod shape_cost_tests {
             false,
             false,
             PassEffects::default(),
+            0,
             shape,
         );
         let no_shape = compute_cost_full(
@@ -6121,6 +6120,7 @@ mod shape_cost_tests {
             false,
             false,
             PassEffects::default(),
+            0,
             ShapeEffects::default(),
         );
         // diff_saved = 99k × $2/M × 1.05 fee.
@@ -6154,6 +6154,7 @@ mod shape_cost_tests {
             false,
             false,
             PassEffects::default(),
+            0,
             shape,
         );
         let control = compute_cost_full(
@@ -6164,6 +6165,7 @@ mod shape_cost_tests {
             false,
             false,
             PassEffects::default(),
+            0,
             ShapeEffects::default(),
         );
         assert!((bd.format_switch_saved_est_usd - 0.5 * 1.05).abs() < 1e-12);
@@ -6196,6 +6198,7 @@ mod shape_cost_tests {
             false,
             false,
             PassEffects::default(),
+            0,
             shape,
         );
         let control = compute_cost_full(
@@ -6206,6 +6209,7 @@ mod shape_cost_tests {
             false,
             false,
             PassEffects::default(),
+            0,
             ShapeEffects::default(),
         );
         assert!((bd.diff_failed_cost_usd - 0.02 * 1.05).abs() < 1e-12);
@@ -7414,6 +7418,7 @@ mod output_shaping_tests {
             false,
             PassEffects::default(),
             0,
+            crate::shaping::ShapeEffects::default(),
         );
         assert_eq!(base.minify_saved_est_usd, 0.0);
 
@@ -7426,6 +7431,7 @@ mod output_shaping_tests {
             false,
             PassEffects::default(),
             500,
+            crate::shaping::ShapeEffects::default(),
         );
         // 500 tokens × $2/M = $0.001 at the standard output rate.
         assert!((bd.minify_saved_est_usd - 0.001).abs() < 1e-12);
@@ -7452,6 +7458,7 @@ mod output_shaping_tests {
             false,
             PassEffects::default(),
             500,
+            crate::shaping::ShapeEffects::default(),
         );
         assert!((bd_fee.minify_saved_est_usd - 0.001 * 1.05).abs() < 1e-12);
 
@@ -7471,6 +7478,7 @@ mod output_shaping_tests {
             false,
             PassEffects::default(),
             500,
+            crate::shaping::ShapeEffects::default(),
         );
         assert!((bd_flex.minify_saved_est_usd - 0.0005).abs() < 1e-12);
     }

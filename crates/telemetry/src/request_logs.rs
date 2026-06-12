@@ -140,7 +140,6 @@ pub struct RequestLogRow {
     /// rows from before migration 0019 (mirror of `truncated`).
     #[serde(default)]
     pub route_paused: bool,
-<<<<<<< HEAD
     /// ESTIMATED saving from minified-JSON output steering
     /// (`RouteAction::minify_json`, research Phase 3.1, migration 0020): the
     /// pretty-printed re-rendering of the emitted JSON re-tokenized with the
@@ -154,14 +153,6 @@ pub struct RequestLogRow {
     /// serialize so legacy row JSON stays byte-identical).
     #[serde(default, skip_serializing_if = "f64_is_zero")]
     pub minify_saved_est_usd: f64,
-}
-
-/// `skip_serializing_if` helper: the minify estimate column is omitted from
-/// serialized rows when zero, keeping pre-0020 row JSON byte-identical.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn f64_is_zero(v: &f64) -> bool {
-    *v == 0.0
-=======
     /// `Some("csv")` / `Some("bare")` when a route's `format_switch` action
     /// VALIDATED on this response — the caller received the switched (CSV /
     /// bare-value) body instead of verbose JSON, advertised via the
@@ -208,7 +199,13 @@ fn f64_is_zero(v: &f64) -> bool {
     /// `0.0` when no diff failed and for rows from before migration 0020.
     #[serde(default)]
     pub diff_failed_cost_usd: f64,
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
+}
+
+/// `skip_serializing_if` helper: the minify estimate column is omitted from
+/// serialized rows when zero, keeping pre-0020 row JSON byte-identical.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn f64_is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Errors returned by [`RequestLogWriter`].
@@ -302,13 +299,10 @@ pub mod postgres {
                       cache_read_input_tokens, cache_creation_input_tokens,
                       batch_eligible, batch_forgone_usd,
                       route_paused,
-<<<<<<< HEAD
-                      minify_saved_est_usd)
-=======
+                      minify_saved_est_usd,
                       format_switched, format_switch_saved_est_usd,
                       diff_applied, diff_saved_usd,
                       diff_failed, diff_failed_cost_usd)
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -322,21 +316,14 @@ pub mod postgres {
                       $27, $28,
                       $29, $30,
                       $31,
-<<<<<<< HEAD
-                      $32)"#;
+                      $32,
+                      $33, $34,
+                      $35, $36,
+                      $37, $38)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 32;
-=======
-                      $32, $33,
-                      $34, $35,
-                      $36, $37)"#;
-
-    /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
-    /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 37;
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
+    pub const INSERT_BIND_COUNT: usize = 38;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -373,16 +360,13 @@ pub mod postgres {
                 .bind(row.batch_eligible) // $29
                 .bind(row.batch_forgone_usd) // $30
                 .bind(row.route_paused) // $31
-<<<<<<< HEAD
                 .bind(row.minify_saved_est_usd) // $32
-=======
-                .bind(row.format_switched.as_deref()) // $32
-                .bind(row.format_switch_saved_est_usd) // $33
-                .bind(row.diff_applied) // $34
-                .bind(row.diff_saved_usd) // $35
-                .bind(row.diff_failed) // $36
-                .bind(row.diff_failed_cost_usd) // $37
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
+                .bind(row.format_switched.as_deref()) // $33
+                .bind(row.format_switch_saved_est_usd) // $34
+                .bind(row.diff_applied) // $35
+                .bind(row.diff_saved_usd) // $36
+                .bind(row.diff_failed) // $37
+                .bind(row.diff_failed_cost_usd) // $38
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -428,16 +412,13 @@ mod tests {
             batch_eligible: false,
             batch_forgone_usd: 0.0,
             route_paused: false,
-<<<<<<< HEAD
             minify_saved_est_usd: 0.0,
-=======
             format_switched: None,
             format_switch_saved_est_usd: 0.0,
             diff_applied: false,
             diff_saved_usd: 0.0,
             diff_failed: false,
             diff_failed_cost_usd: 0.0,
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
         }
     }
 
@@ -663,7 +644,6 @@ mod tests {
         assert_eq!(row.batch_forgone_usd, 0.0, "pre-0017 rows forgo nothing");
     }
 
-<<<<<<< HEAD
     /// The minify estimate column (migration 0020) round-trips through the
     /// writer in its OWN field — an ESTIMATE of an unmeasurable counterfactual,
     /// never folded into `cost_usd`.
@@ -679,12 +659,6 @@ mod tests {
         assert!((got.cost_usd - 0.02).abs() < 1e-12, "cost untouched");
     }
 
-    /// Legacy JSON (rows serialized before migration 0020) deserializes with
-    /// `minify_saved_est_usd = 0.0`, and a zero estimate is omitted on
-    /// re-serialize — pre-0020 row JSON stays byte-identical.
-    #[test]
-    fn minify_column_serde_backward_compat() {
-=======
     /// The output-shaping columns (migration 0020) round-trip through the
     /// writer in their OWN fields. `format_switch_saved_est_usd` is a LABELED
     /// ESTIMATE and `diff_failed_cost_usd` duplicates real spend already in
@@ -716,7 +690,6 @@ mod tests {
     /// a default-valued row omits `format_switched` on re-serialize.
     #[test]
     fn output_shaping_columns_serde_backward_compat() {
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
         let legacy = r#"{
             "id":"00000000-0000-0000-0000-000000000000",
             "org_id":"00000000-0000-0000-0000-000000000000",
@@ -730,7 +703,6 @@ mod tests {
             "tag":null,"error_class":null,"trace_id":null
         }"#;
         let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
-<<<<<<< HEAD
         assert_eq!(
             row.minify_saved_est_usd, 0.0,
             "pre-0020 rows must default to 0.0 (nothing estimated)"
@@ -745,7 +717,6 @@ mod tests {
         row2.minify_saved_est_usd = 0.001;
         let j2 = serde_json::to_string(&row2).unwrap();
         assert!(j2.contains("minify_saved_est_usd"), "{j2}");
-=======
         assert_eq!(row.format_switched, None);
         assert_eq!(row.format_switch_saved_est_usd, 0.0);
         assert!(!row.diff_applied);
@@ -754,7 +725,6 @@ mod tests {
         assert_eq!(row.diff_failed_cost_usd, 0.0);
         let j = serde_json::to_string(&row).unwrap();
         assert!(!j.contains("format_switched"), "{j}");
->>>>>>> d9f635e (feat(core): contract-changing output shaping — format-switch (CSV/bare) + delta/diff responses with fail-closed re-emit)
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the
