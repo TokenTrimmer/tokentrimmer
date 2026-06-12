@@ -32,26 +32,6 @@ pub enum ValidationError {
     OutputShapingConflict,
 }
 
-/// Reject malformed output-shaping config at route-creation time (research
-/// Phase 3.3 + 3.4): `format_switch` must be `"csv"` or `"bare"` when set
-/// (an unknown value persisted anyway would silently no-op at dispatch — a
-/// pure mistake, like an out-of-range pause floor), and a route may not
-/// declare BOTH `format_switch` and `diff` (the two levers issue conflicting
-/// emission instructions; the gateway would have to pick one arbitrarily).
-pub fn validate_output_shaping(then: &RouteAction) -> Result<(), ValidationError> {
-    if let Some(fmt) = then.format_switch.as_deref() {
-        if fmt != "csv" && fmt != "bare" {
-            return Err(ValidationError::InvalidFormatSwitch {
-                got: fmt.to_string(),
-            });
-        }
-        if then.diff {
-            return Err(ValidationError::OutputShapingConflict);
-        }
-    }
-    Ok(())
-}
-
 /// Reject malformed auto-pause config at route-creation time: a
 /// `pause_floor_pass_rate` outside `(0, 1]` (or NaN) and a
 /// `pause_min_verdicts` of 0 are pure mistakes. Validated even when
@@ -89,6 +69,21 @@ pub fn validate_output_shaping(then: &RouteAction) -> Result<(), ValidationError
     if let Some(budget) = then.reasoning_budget_tokens {
         if budget < 1024 {
             return Err(ValidationError::InvalidThinkingBudgetCap { got: budget });
+        }
+    }
+    // Phase 3.3/3.4 (contract-changing levers): `format_switch` must be
+    // `"csv"` or `"bare"` when set (an unknown value persisted anyway would
+    // silently no-op at dispatch), and a route may not declare BOTH
+    // `format_switch` and `diff` — the two levers issue conflicting emission
+    // instructions; the gateway would have to pick one arbitrarily.
+    if let Some(fmt) = then.format_switch.as_deref() {
+        if fmt != "csv" && fmt != "bare" {
+            return Err(ValidationError::InvalidFormatSwitch {
+                got: fmt.to_string(),
+            });
+        }
+        if then.diff {
+            return Err(ValidationError::OutputShapingConflict);
         }
     }
     Ok(())

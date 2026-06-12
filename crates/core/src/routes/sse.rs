@@ -532,6 +532,9 @@ impl TrackedEventStream {
             self.pass_effects,
             // Streaming books $0 for the minify ESTIMATE in v1 (metered only).
             0,
+            // Output shaping never streams — both planners skip streaming
+            // requests, so the streaming path carries zero shape effects.
+            crate::shaping::ShapeEffects::default(),
         );
         // `saved_usd` is strictly TT-attributed; the provider's automatic
         // cache discount rides in its own field (mirrors the response-header
@@ -750,6 +753,9 @@ pub fn stream_response(
                     // Streaming books $0 for the minify ESTIMATE in v1
                     // (metered only — see `record_minify_estimate`).
                     0,
+                    // Output shaping never streams — both planners skip
+                    // streaming requests (zero shape effects here).
+                    crate::shaping::ShapeEffects::default(),
                 );
                 let cost_usd = breakdown.cost_usd;
                 let baseline_cost_usd = breakdown.baseline_cost_usd;
@@ -839,6 +845,15 @@ pub fn stream_response(
                     route_paused,
                     // Streaming books $0 for the minify estimate in v1.
                     minify_saved_est_usd: 0.0,
+                    // Output shaping never streams either — both planners
+                    // skip streaming requests (`*_skipped:streaming`), so a
+                    // streamed row carries the defaults.
+                    format_switched: None,
+                    format_switch_saved_est_usd: 0.0,
+                    diff_applied: false,
+                    diff_saved_usd: 0.0,
+                    diff_failed: false,
+                    diff_failed_cost_usd: 0.0,
                 };
 
                 // Per-route provider-cache counters on cleanly completed

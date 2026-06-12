@@ -247,6 +247,34 @@ pub fn record_reasoning_capped(route: &str, lever: &'static str, cap: &str) {
 /// bounded.
 pub fn record_reasoning_cap_skipped(reason: &'static str) {
     metrics::counter!("reasoning_cap_skipped_total", "reason" => reason).increment(1);
+/// Record a format-switch outcome (research Phase 3.3). `format` ∈
+/// `csv|bare`; `outcome` ∈ `applied|failed` (a failed strip-validation fails
+/// OPEN — the untouched body is served). Bounded label sets.
+pub fn record_format_switch(format: &'static str, outcome: &'static str) {
+    metrics::counter!("tt_format_switch_total", "format" => format, "outcome" => outcome)
+        .increment(1);
+}
+
+/// Count a format-switch request that NO-OP'd at the eligibility gate.
+/// `reason` is the bounded skip set (`unknown_format|streaming|tools|n|
+/// no_schema|strict_schema|nested_schema|not_single_value|conflict`).
+pub fn record_format_switch_skip(reason: &'static str) {
+    metrics::counter!("tt_format_switch_skipped_total", "reason" => reason).increment(1);
+}
+
+/// Count a VALIDATED format switch whose JSON-equivalent reconstruction was
+/// not computable — the saving is booked $0 (never invented) and this counter
+/// is the only trace of the unestimated win.
+pub fn record_format_switch_unestimated() {
+    metrics::counter!("tt_format_switch_unestimated_total").increment(1);
+}
+
+/// Record a diff-lane outcome (research Phase 3.4). `outcome` ∈
+/// `applied|failed|degraded|skipped`; `reason` carries the bounded skip
+/// reason / `DiffError::reason()` / re-emit error class (empty for
+/// `applied`). Bounded label sets.
+pub fn record_diff(outcome: &'static str, reason: &'static str) {
+    metrics::counter!("tt_diff_total", "outcome" => outcome, "reason" => reason).increment(1);
 }
 
 #[cfg(test)]

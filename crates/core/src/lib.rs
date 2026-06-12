@@ -20,6 +20,7 @@ pub mod route_autopause;
 pub mod route_savings;
 pub mod routes;
 pub mod server;
+pub(crate) mod shaping;
 pub mod single_flight;
 pub mod state;
 pub mod tier_resolver;

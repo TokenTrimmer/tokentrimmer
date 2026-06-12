@@ -290,6 +290,12 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         batch_forgone_usd: 0.0,
         route_paused: false,
         minify_saved_est_usd: 0.0,
+        format_switched: None,
+        format_switch_saved_est_usd: 0.0,
+        diff_applied: false,
+        diff_saved_usd: 0.0,
+        diff_failed: false,
+        diff_failed_cost_usd: 0.0,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");
@@ -393,6 +399,12 @@ async fn request_log_insert_round_trips_batch_columns() {
         batch_eligible: true,
         batch_forgone_usd: 0.0125,
         minify_saved_est_usd: 0.0,
+        format_switched: None,
+        format_switch_saved_est_usd: 0.0,
+        diff_applied: false,
+        diff_saved_usd: 0.0,
+        diff_failed: false,
+        diff_failed_cost_usd: 0.0,
     };
     let marked_id = marked.id;
     writer.write(marked.clone()).await.expect("insert marked");
@@ -450,6 +462,31 @@ async fn request_log_insert_round_trips_batch_columns() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
 async fn request_logs_insert_round_trips_against_postgres() {
+#[test]
+fn migrator_includes_output_shaping_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let twentieth = migrations
+        .iter()
+        .find(|m| m.version == 20)
+        .expect("migration version 20 not found");
+    let desc = twentieth.description.to_lowercase();
+    assert!(
+        desc.contains("output") || desc.contains("shaping"),
+        "migration 0020 description is '{}', expected to mention output shaping",
+        twentieth.description,
+    );
+}
+
+/// DB-gated: a real `PostgresRequestLogWriter` INSERT against the migrated
+/// schema round-trips the output-shaping columns (migration 0020). A shaped
+/// row (`format_switched='csv'` + estimate; `diff_applied` + measured saving;
+/// `diff_failed` + realized retry cost) survives write→read, and the NOT NULL
+/// DEFAULTs cover unshaped rows. Also exercises the `format_switched` CHECK
+/// (csv|bare) implicitly. Catches column-order/type drift in INSERT_SQL that
+/// the parser-based bind-count guard cannot.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn request_log_insert_round_trips_output_shaping_columns() {
     use tt_telemetry::request_logs::{
         postgres::PostgresRequestLogWriter, RequestLogRow, RequestLogWriter,
     };
@@ -461,6 +498,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
     let writer = PostgresRequestLogWriter::new(pool.clone());
 
     let row = RequestLogRow {
+    let shaped = RequestLogRow {
         id: Uuid::now_v7(),
         org_id: Uuid::nil(),
         api_key_id: Uuid::nil(),
@@ -472,6 +510,12 @@ async fn request_logs_insert_round_trips_against_postgres() {
         cached_tokens: 0,
         cost_usd: 0.0045,
         baseline_cost_usd: 0.0045,
+        model: "shaped".into(),
+        input_tokens: 1000,
+        output_tokens: 50,
+        cached_tokens: 0,
+        cost_usd: 0.01,
+        baseline_cost_usd: 0.02,
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
         cached: false,
@@ -483,6 +527,12 @@ async fn request_logs_insert_round_trips_against_postgres() {
         tag: Some("db-t0-bind-chain".into()),
         error_class: None,
         trace_id: Some("trace-t0".into()),
+        latency_ms: 5,
+        upstream_latency_ms: None,
+        status: 200,
+        tag: Some("db-output-shaping".into()),
+        error_class: None,
+        trace_id: None,
         truncated: false,
         shadow_model: None,
         shadow_cost_usd: None,
@@ -518,6 +568,61 @@ async fn request_logs_insert_round_trips_against_postgres() {
     );
 
     sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
+        route_paused: false,
+        format_switched: Some("csv".into()),
+        format_switch_saved_est_usd: 0.0042,
+        diff_applied: true,
+        diff_saved_usd: 0.0123,
+        diff_failed: true,
+        diff_failed_cost_usd: 0.0007,
+    };
+    let shaped_id = shaped.id;
+    writer.write(shaped.clone()).await.expect("insert shaped");
+
+    let mut unshaped = shaped;
+    unshaped.id = Uuid::now_v7();
+    unshaped.format_switched = None;
+    unshaped.format_switch_saved_est_usd = 0.0;
+    unshaped.diff_applied = false;
+    unshaped.diff_saved_usd = 0.0;
+    unshaped.diff_failed = false;
+    unshaped.diff_failed_cost_usd = 0.0;
+    let unshaped_id = unshaped.id;
+    writer.write(unshaped).await.expect("insert unshaped");
+
+    let fetch = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>, f64, bool, f64, bool, f64)>(
+                "SELECT format_switched, format_switch_saved_est_usd::FLOAT8, \
+                        diff_applied, diff_saved_usd::FLOAT8, \
+                        diff_failed, diff_failed_cost_usd::FLOAT8 \
+                 FROM request_logs WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch row")
+        }
+    };
+
+    let (fmt, est, applied, saved, failed, failed_cost) = fetch(shaped_id).await;
+    assert_eq!(fmt.as_deref(), Some("csv"));
+    assert!((est - 0.0042).abs() < 1e-9);
+    assert!(applied);
+    assert!((saved - 0.0123).abs() < 1e-9);
+    assert!(failed);
+    assert!((failed_cost - 0.0007).abs() < 1e-9);
+
+    let (fmt, est, applied, saved, failed, failed_cost) = fetch(unshaped_id).await;
+    assert_eq!(fmt, None, "unswitched persists as SQL NULL");
+    assert_eq!(
+        (est, applied, saved, failed, failed_cost),
+        (0.0, false, 0.0, false, 0.0)
+    );
+
+    // Cleanup so reruns / other DB tests see a stable table.
+    sqlx::query("DELETE FROM request_logs WHERE tag = 'db-output-shaping'")
         .execute(&pool)
         .await
         .expect("cleanup");

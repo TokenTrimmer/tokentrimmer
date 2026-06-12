@@ -70,6 +70,8 @@ pub async fn create(
     // Phase 3.1/3.2: malformed output-shaping caps (effort outside low/medium,
     // thinking budget below Anthropic's 1024 floor) are rejected at config
     // time — validated even on disabled routes.
+    // Phase 3.3/3.4: an unknown `format_switch` wire value or a route
+    // declaring BOTH output-shaping levers is rejected at config time.
     validate_output_shaping(&spec.then).map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
     let created = store(&state)?
         .create_route(org, spec)

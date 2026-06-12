@@ -1016,6 +1016,13 @@ pub async fn handler(
     // provider) on streaming / interactive / catalog batch rate — see
     // `maybe_mark_batch_eligible`. Advisory: dispatch is never detoured.
     let route_batch = route_match.as_ref().is_some_and(|m| m.batch);
+    // Opt-in contract-changing output shaping (research Phase 3.3 + 3.4),
+    // captured before `route_match` is consumed below. Both default
+    // off/None — the planners do ZERO work for every unrouted request and
+    // every route that did not opt in. Eligibility is enforced in code at
+    // the request-build step (`shaping::*::plan_*`).
+    let route_format_switch = route_match.as_ref().and_then(|m| m.format_switch.clone());
+    let route_diff = route_match.as_ref().is_some_and(|m| m.diff);
     // Hard interactive-ineligibility signal for the batch marker: a client that
     // declares "a human is waiting" via `X-TokenTrimmer-Interactive: 1` (set by
     // `tt chat` and the /tools loop) is never marked batch-eligible. Read
@@ -1233,6 +1240,63 @@ pub async fn handler(
         let name = route_matched_name.as_deref().unwrap_or("unknown");
         warnings.push(format!("route_paused:{name}"));
     }
+
+    // ── Request-side output shaping (research Phase 3.3 + 3.4) ──────────────
+    //
+    // MUST run BEFORE `maybe_downgrade_response_format` (the downgrade would
+    // erase the json_schema shape the csv planner reads; once a switch/diff
+    // applies, response_format is None and the downgrade no-ops) and before
+    // cache-key derivation (the mutated request hashes to its own L1 key).
+    // Both planners gate on `req.stream` internally, so the streaming branch
+    // below is untouched by construction. format_switch × diff is
+    // config-rejected at route creation (`validate_output_shaping`);
+    // defensively, if both somehow apply, diff wins and the switch is skipped
+    // with the `conflict` token.
+    let diff_decision = crate::shaping::diff::plan_diff(&req, route_diff);
+    let format_switch_requested =
+        if matches!(diff_decision, Some(crate::shaping::ShapeDecision::Apply(_)))
+            && route_format_switch.is_some()
+        {
+            warnings.push("format_switch_skipped:conflict".to_string());
+            crate::metrics::record_format_switch_skip("conflict");
+            None
+        } else {
+            route_format_switch.as_deref()
+        };
+    let mut format_switch_plan: Option<crate::shaping::format_switch::FormatSwitchPlan> = None;
+    match crate::shaping::format_switch::plan_format_switch(&req, format_switch_requested) {
+        Some(crate::shaping::ShapeDecision::Apply(p)) => {
+            crate::shaping::format_switch::apply_format_switch_request(&mut req, &p);
+            format_switch_plan = Some(p);
+        }
+        Some(crate::shaping::ShapeDecision::Skip(r)) => {
+            warnings.push(format!("format_switch_skipped:{r}"));
+            crate::metrics::record_format_switch_skip(r);
+        }
+        None => {}
+    }
+    let mut diff_plan: Option<crate::shaping::diff::DiffPlan> = None;
+    let mut pre_diff_req: Option<ChatCompletionRequest> = None;
+    match diff_decision {
+        Some(crate::shaping::ShapeDecision::Apply(p)) => {
+            // Clone the caller's EXACT original FIRST (retains
+            // response_format) — the fail-closed re-emit dispatches it
+            // verbatim. Only the consumed TT-internal echo is dropped.
+            let mut original = req.clone();
+            original
+                .tt_extras
+                .remove(crate::shaping::diff::TT_EXTRA_DIFF_PRIOR);
+            pre_diff_req = Some(original);
+            crate::shaping::diff::apply_diff_request(&mut req, &p);
+            diff_plan = Some(p);
+        }
+        Some(crate::shaping::ShapeDecision::Skip(r)) => {
+            warnings.push(format!("diff_skipped:{r}"));
+            crate::metrics::record_diff("skipped", r);
+        }
+        None => {}
+    }
+
     maybe_downgrade_response_format(&mut req, provider.as_ref(), &mut warnings);
     maybe_clamp_temperature(&mut req, provider.as_ref(), &mut warnings);
 
@@ -1541,6 +1605,20 @@ pub async fn handler(
         cache_behavior.do_lookup = false;
         cache_behavior.do_insert = false;
     }
+    // Diff requests skip the cache ENTIRELY (correctness over cache):
+    // `cache_key` ignores `tt_extras`, so a request carrying a tt_extras
+    // prior would share an L1 key with a different-prior request, and the
+    // reconstructed body depends on the prior.
+    if diff_plan.is_some() {
+        cache_behavior.do_lookup = false;
+        cache_behavior.do_insert = false;
+    }
+    // Format-switch keeps L1 (the mutated request — instruction + no
+    // response_format — hashes to its own exact, per-org key) but disables L2
+    // for switched requests (lookup AND insert): similarity matching could
+    // cross the instruction boundary and serve a verbose JSON answer under a
+    // `format_switch` advertisement, or vice versa.
+    let skip_l2 = format_switch_plan.is_some();
 
     // 3. Branch: streaming vs non-streaming.
     if req.stream {
@@ -1593,6 +1671,9 @@ pub async fn handler(
                             cache_bust_penalty_usd: 0.0,
                             batch_forgone_usd: 0.0,
                             minify_saved_est_usd: 0.0,
+                            diff_saved_usd: 0.0,
+                            format_switch_saved_est_usd: 0.0,
+                            diff_failed_cost_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -1612,10 +1693,14 @@ pub async fn handler(
                         );
                         let fake = sse::fake_stream_from_response(entry.response);
                         // L1 hit already logged above; no need for a second row.
-                        return Ok(with_route_matched(
+                        let mut resp = with_route_matched(
                             sse::stream_response(fake, &provider, trace_id, None),
                             route_matched_name.as_deref(),
-                        ));
+                        );
+                        // Pre-dispatch tokens (route_paused / redacted /
+                        // shaping skips) must survive on hit responses too.
+                        attach_warning_tokens(resp.headers_mut(), &warnings);
+                        return Ok(resp);
                     }
                 }
             }
@@ -1873,7 +1958,7 @@ pub async fn handler(
                 {
                     return Ok(resp);
                 }
-                if let Some(resp) = try_l1_hit(
+                if let Some(mut resp) = try_l1_hit(
                     l1,
                     key,
                     &ctx,
@@ -1886,13 +1971,25 @@ pub async fn handler(
                 )
                 .await
                 {
+                    // A validated switch is the ONLY thing ever inserted
+                    // under a switched key (3e suppresses fail-open bodies),
+                    // so a hit here is genuinely switched — advertise it
+                    // exactly like the dispatch path. Other pre-dispatch
+                    // tokens (route_paused / redacted / shaping skips)
+                    // survive on hit responses too.
+                    if let Some(plan) = format_switch_plan.as_ref() {
+                        warnings.push(format!("format_switch:{}", plan.label));
+                    }
+                    attach_warning_tokens(resp.headers_mut(), &warnings);
                     return Ok(resp);
                 }
             }
         }
 
-        // 3b. L2 semantic cache. Gated additionally on l2_allowed.
-        if cache_behavior.do_lookup && l2_allowed {
+        // 3b. L2 semantic cache. Gated additionally on l2_allowed, and OFF
+        // for format-switched requests (`skip_l2` — similarity matching could
+        // cross the instruction boundary).
+        if cache_behavior.do_lookup && l2_allowed && !skip_l2 {
             if let Some(l2) = state.l2.as_ref() {
                 // Current catalog rate for the (post-routing) request model —
                 // the legacy-row fallback in `l2_entry_baseline`. The entry's
@@ -1917,7 +2014,12 @@ pub async fn handler(
                 )
                 .await
                 {
-                    return result;
+                    // No format_switch token here: switched requests skip L2
+                    // entirely (`skip_l2`), so an L2 hit is never switched.
+                    return result.map(|mut resp| {
+                        attach_warning_tokens(resp.headers_mut(), &warnings);
+                        resp
+                    });
                 }
             }
         }
@@ -1969,10 +2071,18 @@ pub async fn handler(
                                                     route_paused,
                                                 ),
                                             );
-                                            return Ok(with_route_matched(
+                                            let mut resp = with_route_matched(
                                                 build_hit_l1_response(entry, trace_id),
                                                 route_matched_name.as_deref(),
-                                            ));
+                                            );
+                                            // Same advertisement contract as
+                                            // the direct L1-hit return above.
+                                            if let Some(plan) = format_switch_plan.as_ref() {
+                                                warnings
+                                                    .push(format!("format_switch:{}", plan.label));
+                                            }
+                                            attach_warning_tokens(resp.headers_mut(), &warnings);
+                                            return Ok(resp);
                                         }
                                         Err(e) => {
                                             tracing::warn!(
@@ -2146,6 +2256,130 @@ pub async fn handler(
         }
 
         let (provider, response) = dispatch_result?;
+        let mut response = response;
+
+        // ── Response-side output shaping (research Phase 3.3 + 3.4) ─────────
+        //
+        // Runs BEFORE pricing/caching/telemetry so every downstream consumer
+        // (cost math, L1 envelope, request_logs, judge) sees the response the
+        // CALLER receives. Neither arm can 5xx: format-switch fails OPEN
+        // (untouched body), diff fails CLOSED to a full re-emit — and if even
+        // the re-emit dispatch errors, the raw patch passes through marked
+        // `diff_degraded` (a 5xx after a successful upstream call is the
+        // worst outcome).
+        let mut shape_effects = crate::shaping::ShapeEffects::default();
+        let mut format_switch_outcome: Option<&'static str> = None;
+        let mut format_switch_failed = false;
+        let mut diff_applied = false;
+        let mut diff_failed = false;
+        if let Some(plan) = format_switch_plan.as_ref() {
+            // Tool-call-only responses yield empty assistant text → the
+            // validator rejects → fail-open, same arm as a prose mismatch.
+            let body = response_assistant_text(&response);
+            match crate::shaping::format_switch::validate_switched_body(&body, &plan.format) {
+                Ok(stripped) => {
+                    // Tokenizer-grounded ESTIMATE only (labeled "Est"
+                    // everywhere): not computable ⇒ book $0 + meter.
+                    match crate::shaping::format_switch::estimate_saved_tokens(
+                        provider.id(),
+                        &response.model,
+                        &stripped,
+                        &plan.format,
+                    ) {
+                        Some(saved_tokens) => {
+                            if let Some(p) = provider.pricing(&response.model) {
+                                shape_effects.format_switch_saved_est_usd =
+                                    f64::from(saved_tokens) * p.output_per_million / 1_000_000.0;
+                            }
+                        }
+                        None => crate::metrics::record_format_switch_unestimated(),
+                    }
+                    set_assistant_text(&mut response, stripped);
+                    warnings.push(format!("format_switch:{}", plan.label));
+                    format_switch_outcome = Some(plan.label);
+                    crate::metrics::record_format_switch(plan.label, "applied");
+                }
+                Err(_reason) => {
+                    // Fail OPEN: the body passes through untouched, $0
+                    // booked, and 3e below never caches an unswitched body
+                    // under the switched key.
+                    warnings.push(format!("format_switch_failed:{}", plan.label));
+                    format_switch_failed = true;
+                    crate::metrics::record_format_switch(plan.label, "failed");
+                }
+            }
+        }
+        if let (Some(plan), Some(original_req)) = (diff_plan.as_ref(), pre_diff_req.as_ref()) {
+            let patch_text = response_assistant_text(&response);
+            match crate::shaping::diff::reconstruct(plan, &patch_text) {
+                Ok(artifact) => {
+                    // MEASURED saving: both sides are real tokenizer counts
+                    // on real strings — the reconstructed artifact the caller
+                    // receives vs the patch tokens the provider billed.
+                    let artifact_tokens = tt_tokenize::estimate_tokens_for_model(
+                        provider.id(),
+                        &response.model,
+                        &artifact,
+                    );
+                    let billed =
+                        u32::try_from(response.usage.completion_tokens).unwrap_or(u32::MAX);
+                    shape_effects.diff_output_tokens_saved = artifact_tokens.saturating_sub(billed);
+                    set_assistant_text(&mut response, artifact);
+                    // `usage` deliberately STAYS the provider-billed patch
+                    // usage — the invoice shows the short patch; the savings
+                    // being real is the point (documented contract).
+                    warnings.push("diff_applied".to_string());
+                    diff_applied = true;
+                    crate::metrics::record_diff("applied", "");
+                }
+                Err(e) => {
+                    // FAIL CLOSED → full re-emit of the caller's EXACT
+                    // original request. Book the failed attempt's realized
+                    // (pre-fee) cost first — it is real invoice spend.
+                    let patch_pricing = provider.pricing(&response.model);
+                    shape_effects.diff_failed_cost_usd = compute_cost(
+                        &response.usage,
+                        patch_pricing.as_ref(),
+                        patch_pricing.as_ref(),
+                        1.0,
+                    )
+                    .cost_usd;
+                    warnings.push(format!("diff_failed:{}", e.reason()));
+                    diff_failed = true;
+                    crate::metrics::record_diff("failed", e.reason());
+                    // Single provider, no failover chain — the chain already
+                    // chose this provider for the patch dispatch.
+                    let reemit = with_request_timeout(request_timeout, async {
+                        with_retry(&RetryPolicy::default(), || {
+                            provider.chat_completion(original_req.clone(), &ctx)
+                        })
+                        .await
+                        .map_err(ApiError::from)
+                    })
+                    .await;
+                    match reemit {
+                        Ok(full) => response = full,
+                        Err(err) => {
+                            // Last resort: never 5xx after a successful
+                            // upstream call — serve the raw patch response
+                            // marked degraded. The trace billed exactly ONE
+                            // dispatch (the failed re-emit errored, nothing
+                            // billed), and that dispatch IS the response
+                            // being metered below — so the separate
+                            // failed-attempt booking must be zeroed or
+                            // cost_usd would double-count the patch call.
+                            shape_effects.diff_failed_cost_usd = 0.0;
+                            tracing::warn!(
+                                error = %err,
+                                "diff fail-closed re-emit dispatch failed — serving raw patch marked diff_degraded"
+                            );
+                            warnings.push("diff_degraded".to_string());
+                            crate::metrics::record_diff("degraded", "reemit_error");
+                        }
+                    }
+                }
+            }
+        }
 
         // 3d. Compute cost via provider pricing table BEFORE caching — the L1
         //     envelope carries baseline_cost_usd so hit responses can report
@@ -2200,6 +2434,7 @@ pub async fn handler(
             batch_marked,
             pass_effects,
             minify_saved_tokens,
+            shape_effects,
         );
         if minify_applied {
             crate::metrics::record_minify_estimate(
@@ -2236,7 +2471,11 @@ pub async fn handler(
         //     then call guard.complete().  When no guard is held the normal
         //     fire-and-forget spawn is used so the non-coalesced path is unchanged.
         let response_has_tools = response_has_tool_calls(&response);
-        if cache_behavior.do_insert && !response_has_tools {
+        // `!format_switch_failed`: a fail-open (unswitched) body must never
+        // be cached under the switched request's key — every hit under a
+        // switched key must be genuinely switched (the hit-path
+        // advertisement above depends on this invariant).
+        if cache_behavior.do_insert && !response_has_tools && !format_switch_failed {
             if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key) {
                 let entry = L1Entry::new(
                     response.clone(),
@@ -2292,8 +2531,10 @@ pub async fn handler(
             drop(single_flight_guard.take());
         }
 
-        // 3f. Best-effort L2 insert. Same gate as L1.
-        if cache_behavior.do_insert && !response_has_tools && l2_allowed {
+        // 3f. Best-effort L2 insert. Same gate as L1, plus the format-switch
+        // L2 opt-out (`skip_l2`): a switched body must never become a
+        // similarity-served answer for an unswitched near-duplicate.
+        if cache_behavior.do_insert && !response_has_tools && l2_allowed && !skip_l2 {
             if let Some(l2) = state.l2.as_ref() {
                 if let Some(query_text) = l2_context_text(&req) {
                     let l2_provider_id = provider_id.clone();
@@ -2407,6 +2648,15 @@ pub async fn handler(
                 // ESTIMATED minify saving — own column (migration 0020),
                 // never folded into cost/baseline/saved.
                 minify_saved_est_usd: cost_breakdown.minify_saved_est_usd,
+                // Output shaping (research Phase 3.3 + 3.4). `format_switched`
+                // is set ONLY on a VALIDATED switch; the est/saved/failed-cost
+                // figures come from the same breakdown the headers carry.
+                format_switched: format_switch_outcome.map(str::to_string),
+                format_switch_saved_est_usd: cost_breakdown.format_switch_saved_est_usd,
+                diff_applied,
+                diff_saved_usd: cost_breakdown.diff_saved_usd,
+                diff_failed,
+                diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
             },
         );
 
@@ -2444,6 +2694,10 @@ pub async fn handler(
             judge_source_provider,
             judge_source_ctx,
             judge_original_req,
+            // A shaped response (validated format-switch or applied diff)
+            // samples the judge even without a model downgrade — shaping is
+            // exactly what the #155 gate exists to police.
+            format_switch_outcome.is_some() || diff_applied,
         );
 
         // 5. Serialize body and attach TokenTrimmer extension headers.
@@ -2997,6 +3251,21 @@ fn attach_warnings(
     }
 }
 
+/// Attach ONLY the pre-dispatch warning tokens (`route_paused:*`,
+/// `redacted:*`, `format_switch*`, `*_skipped:*`, …) to a NON-dispatch
+/// (cache-hit) response — no `param_dropped:*` evaluation because no dispatch
+/// happened. Closes the pre-existing gap where hit responses silently lost
+/// every pre-dispatch token. Comma-joined; no-op when empty (mirrors
+/// [`attach_warnings`]).
+fn attach_warning_tokens(headers: &mut axum::http::HeaderMap, tokens: &[String]) {
+    if tokens.is_empty() {
+        return;
+    }
+    if let Ok(v) = tokens.join(",").parse() {
+        headers.insert("x-tokentrimmer-warnings", v);
+    }
+}
+
 /// Build the response for an L1 cache hit.
 ///
 /// Cost is always 0 on a hit. Baseline is taken from the envelope (set at
@@ -3027,6 +3296,9 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         cache_bust_penalty_usd: 0.0,
         batch_forgone_usd: 0.0,
         minify_saved_est_usd: 0.0,
+        diff_saved_usd: 0.0,
+        format_switch_saved_est_usd: 0.0,
+        diff_failed_cost_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -3095,6 +3367,9 @@ fn build_hit_l2_response(
         cache_bust_penalty_usd: 0.0,
         batch_forgone_usd: 0.0,
         minify_saved_est_usd: 0.0,
+        diff_saved_usd: 0.0,
+        format_switch_saved_est_usd: 0.0,
+        diff_failed_cost_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -3371,6 +3646,30 @@ pub(crate) struct CostBreakdown {
     /// response is not valid JSON, and on streaming (estimate not computed in
     /// v1 — metered only).
     pub minify_saved_est_usd: f64,
+    /// MEASURED diff-lane saving (research Phase 3.4): the output tokens the
+    /// applied patch avoided billing (tokenized reconstructed artifact −
+    /// billed patch completion tokens) priced at the served model's output
+    /// rate, fee-applied. Both sides are real tokenizer counts on real
+    /// strings — the brief's "genuinely measurable" case — so it rides the
+    /// [`tt_saved_usd`](Self::tt_saved_usd) headline via the baseline fold
+    /// (the compression precedent) AND is isolated here for the methodology
+    /// breakdown. Zero when no diff applied.
+    pub diff_saved_usd: f64,
+    /// ESTIMATED format-switch saving (research Phase 3.3): tokens of a
+    /// JSON-equivalent reconstruction minus tokens of the emitted body, at
+    /// the served output rate, fee-applied. A LABELED ESTIMATE ("Est" in the
+    /// header name) — NEVER folded into baseline / [`tt_saved_usd`]
+    /// (Self::tt_saved_usd): a reconstruction is not an invoice figure (the
+    /// batch_forgone precedent). Zero when no switch validated or the
+    /// reconstruction was not computable ($0 + meter).
+    pub format_switch_saved_est_usd: f64,
+    /// Realized cost of a FAILED diff patch attempt on a fail-closed double
+    /// dispatch, fee-applied. FOLDED into `cost_usd` (real invoice spend for
+    /// this trace — budget/spend-sink must see it) AND duplicated here so a
+    /// CFO can unpick the retry tax. The baseline stays re-emit-only, so a
+    /// pure-failure trace's headline clamps to 0 — the honest outcome. Zero
+    /// when no diff failed.
+    pub diff_failed_cost_usd: f64,
 }
 
 impl CostBreakdown {
@@ -3468,6 +3767,7 @@ pub(crate) fn compute_cost_with_flex(
         false,
         PassEffects::default(),
         0,
+        crate::shaping::ShapeEffects::default(),
     )
 }
 
@@ -3518,6 +3818,23 @@ pub(crate) fn compute_cost_with_flex(
 /// else the standard rate — fee-applied, into
 /// [`CostBreakdown::minify_saved_est_usd`] ONLY. Like `batch_forgone_usd`, it
 /// changes NO realized or headline figure.
+/// `shape` carries the response-side output-shaping effects
+/// ([`crate::shaping::ShapeEffects`], research Phase 3.3 + 3.4), attributed
+/// per the measured-vs-estimated line:
+///
+/// - `diff_output_tokens_saved` (MEASURED — real tokenizer counts on both
+///   sides) is valued at the served output rate into
+///   [`CostBreakdown::diff_saved_usd`] and the SAME token count raises
+///   `baseline_cost_usd` at the baseline output rate, so the saving rides
+///   [`CostBreakdown::tt_saved_usd`] exactly like compression.
+/// - `format_switch_saved_est_usd` (ESTIMATE — a JSON-equivalent
+///   reconstruction) lands fee-applied in its OWN field and is NEVER folded
+///   into baseline / the headline (the batch_forgone precedent).
+/// - `diff_failed_cost_usd` (REALIZED spend of a failed patch attempt) is
+///   FOLDED into `cost_usd` — the trace's cost must reconcile against the
+///   invoice, which billed both dispatches — and duplicated into its own
+///   field so it can be unpicked. Baseline stays re-emit-only ⇒ a
+///   pure-failure trace's headline clamps to 0.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_cost_full(
     usage: &Usage,
@@ -3528,6 +3845,7 @@ pub(crate) fn compute_cost_full(
     batch_marked: bool,
     effects: PassEffects,
     minify_saved_tokens_est: u32,
+    shape: crate::shaping::ShapeEffects,
 ) -> CostBreakdown {
     let Some(pricing) = pricing else {
         return CostBreakdown::default();
@@ -3671,15 +3989,29 @@ pub(crate) fn compute_cost_full(
         _ => pricing.output_per_million,
     };
     let minify_saved_est_usd = (minify_saved_tokens_est as f64) * billed_output_rate / 1_000_000.0;
+    // Diff saving (research Phase 3.4, MEASURED): the output tokens the
+    // applied patch avoided billing, valued at the served output rate, with
+    // the SAME token count folded into the baseline at the baseline model's
+    // output rate (what the customer would have paid receiving the full
+    // re-emission without TokenTrimmer) — the compression precedent, so the
+    // saving rides the `baseline − cost` headline. Zero when no diff applied.
+    let diff_saved_usd =
+        f64::from(shape.diff_output_tokens_saved) * pricing.output_per_million / 1_000_000.0;
+    let baseline_diff_usd = f64::from(shape.diff_output_tokens_saved)
+        * baseline_pricing.output_per_million
+        / 1_000_000.0;
 
     // Apply the provider surcharge (e.g. OpenRouter's 5% BYOK fee) to all
     // figures so the saved splits stay consistent (same scale factor). The
     // provider-cache discount is metered against the STANDARD cost (not the
     // flex cost) so flex and cache savings stay independent and don't
-    // double-count.
+    // double-count. The failed-patch cost (`shape.diff_failed_cost_usd`,
+    // pre-fee) folds into `cost_usd` BEFORE the fee — both dispatches carry
+    // the same provider surcharge on the real invoice.
     CostBreakdown {
-        cost_usd: cost_usd * fee_multiplier,
-        baseline_cost_usd: (baseline_cost_usd + baseline_compression_usd) * fee_multiplier,
+        cost_usd: (cost_usd + shape.diff_failed_cost_usd) * fee_multiplier,
+        baseline_cost_usd: (baseline_cost_usd + baseline_compression_usd + baseline_diff_usd)
+            * fee_multiplier,
         provider_cache_saved_usd: ((no_cache_cost_usd - standard_cost_usd) * fee_multiplier)
             .max(0.0),
         flex_saved_usd: flex_saved_usd * fee_multiplier,
@@ -3687,6 +4019,9 @@ pub(crate) fn compute_cost_full(
         cache_bust_penalty_usd: effects.cache_bust_penalty_usd * fee_multiplier,
         batch_forgone_usd: batch_forgone_usd * fee_multiplier,
         minify_saved_est_usd: minify_saved_est_usd * fee_multiplier,
+        diff_saved_usd: diff_saved_usd * fee_multiplier,
+        format_switch_saved_est_usd: shape.format_switch_saved_est_usd * fee_multiplier,
+        diff_failed_cost_usd: shape.diff_failed_cost_usd * fee_multiplier,
     }
 }
 
@@ -3791,6 +4126,29 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-minify-saved-est-usd",
             format!("{:.6}", cost.minify_saved_est_usd),
+        // MEASURED diff-lane saving (reconstructed artifact tokens − billed
+        // patch tokens, output-rate-priced) — included in `saved-usd` via the
+        // baseline fold, isolated here for the methodology breakdown.
+        // 0.000000 for all undiffed traffic.
+        (
+            "x-tokentrimmer-diff-saved-usd",
+            format!("{:.6}", cost.diff_saved_usd),
+        ),
+        // ESTIMATED format-switch saving ("Est" = the estimated label): a
+        // JSON-equivalent reconstruction, NEVER included in `saved-usd` /
+        // baseline (those reconcile against the provider invoice).
+        // 0.000000 for all unswitched traffic.
+        (
+            "x-tokentrimmer-format-switch-saved-est-usd",
+            format!("{:.6}", cost.format_switch_saved_est_usd),
+        ),
+        // Realized cost of a FAILED diff patch attempt (fail-closed double
+        // dispatch) — already folded into `cost-usd` (real invoice spend),
+        // duplicated here so the retry tax is unpickable. 0.000000 unless a
+        // patch failed on this trace.
+        (
+            "x-tokentrimmer-diff-failed-cost-usd",
+            format!("{:.6}", cost.diff_failed_cost_usd),
         ),
     ];
 
@@ -4119,6 +4477,15 @@ fn response_assistant_text(resp: &ChatCompletionResponse) -> String {
 ///   both new actions — fail-safe in the expensive direction. The judge tax
 ///   on a same-model shaped route can make #163's netted saving negative —
 ///   that is the honest answer, itemized as `judge_tax_usd`,
+///   OR the response was SHAPED (`response_shaped` — a validated
+///   format-switch or an applied diff, research Phase 3.3 + 3.4): shaping
+///   changes what the model emits, which is exactly what this gate exists to
+///   police. `judge_original_req` is the pre-routing, PRE-INSTRUCTION
+///   request, so the reference re-dispatch produces the verbose/full answer
+///   and the served (stripped/reconstructed) answer is scored against it.
+///   Note the judge may penalize the CSV/bare format itself — conservative
+///   in the quality-safe direction. With `auto_pause: true` on the route,
+///   shaped regressions trip the sticky circuit breaker for free,
 /// - the served answer is non-empty (tool-call-only responses are skipped),
 /// - the trace falls in the deterministic ~2% sample
 ///   ([`crate::quality_sample::should_sample`]),
@@ -4152,6 +4519,7 @@ fn maybe_spawn_quality_judge(
     judge_source_provider: Option<std::sync::Arc<dyn tt_shared::Provider>>,
     judge_source_ctx: Option<RequestContext>,
     judge_original_req: Option<ChatCompletionRequest>,
+    response_shaped: bool,
 ) {
     use crate::quality_sample as qs;
 
@@ -4180,6 +4548,12 @@ fn maybe_spawn_quality_judge(
         return;
     }
     if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage) || output_shaped) {
+    // A route fired AND (the served model is cheaper OR the response was
+    // shaped) — shaping samples the judge even without a model downgrade.
+    if matched_route_id.is_none() {
+        return;
+    }
+    if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage) || response_shaped) {
         return;
     }
     // Deterministic ~2% sample keyed on the trace id.
@@ -4282,6 +4656,21 @@ fn maybe_spawn_quality_judge(
             l2_fp_feed: None,
         });
     });
+}
+
+/// Replace the FIRST choice's assistant text with `text` — the single seam
+/// the output-shaping arms use to hand the caller the stripped (format
+/// switch) or fully reconstructed (diff) body. Shaping is n==1-gated at the
+/// planners, so the first choice is the only choice; a non-assistant first
+/// choice is left untouched (the shaping arms never reach here for
+/// tool-call-only responses — their empty assistant text fails validation
+/// first).
+fn set_assistant_text(resp: &mut ChatCompletionResponse, text: String) {
+    if let Some(choice) = resp.choices.first_mut() {
+        if let Message::Assistant { content, .. } = &mut choice.message {
+            *content = Some(MessageContent::Text(text));
+        }
+    }
 }
 
 /// Gate + spawn the sampled async quality judge for a response **served from
@@ -4562,6 +4951,14 @@ fn request_log_for_l1_hit(
         route_paused,
         // TT cache hit — nothing dispatched, nothing minify-estimated.
         minify_saved_est_usd: 0.0,
+        // TT cache hit — the serve performed no shaping dispatch; the
+        // original miss row carries any shaping markers/figures.
+        format_switched: None,
+        format_switch_saved_est_usd: 0.0,
+        diff_applied: false,
+        diff_saved_usd: 0.0,
+        diff_failed: false,
+        diff_failed_cost_usd: 0.0,
     }
 }
 
@@ -4617,6 +5014,14 @@ fn request_log_for_l2_hit(
         route_paused,
         // TT cache hit — nothing dispatched, nothing minify-estimated.
         minify_saved_est_usd: 0.0,
+        // TT cache hit — the serve performed no shaping dispatch; the
+        // original miss row carries any shaping markers/figures.
+        format_switched: None,
+        format_switch_saved_est_usd: 0.0,
+        diff_applied: false,
+        diff_saved_usd: 0.0,
+        diff_failed: false,
+        diff_failed_cost_usd: 0.0,
     }
 }
 
@@ -4669,6 +5074,18 @@ pub(crate) struct RouteMatch {
     /// the outbound request before dispatch (a SAFETY transform, not a saving);
     /// off by default (no redaction runs otherwise).
     pub(crate) redact: bool,
+    /// The matched route requested the opt-in **format switch**
+    /// (`RouteAction::format_switch`, research Phase 3.3): `Some("csv")` /
+    /// `Some("bare")`. Eligibility (schema shape, streaming, tools, n>1,
+    /// strict structured output) is enforced at the request-build step — see
+    /// `shaping::format_switch::plan_format_switch`. A COST lever: suppressed
+    /// on a paused route.
+    pub(crate) format_switch: Option<String>,
+    /// The matched route requested opt-in **delta/diff responses**
+    /// (`RouteAction::diff`, research Phase 3.4). The prior seam + gates are
+    /// enforced at the request-build step — see `shaping::diff::plan_diff`.
+    /// A COST lever: suppressed on a paused route.
+    pub(crate) diff: bool,
     /// The matched route's canary `traffic_pct` (0-100), or `None` for an
     /// unconditional rewrite. When `Some(pct)`, the handler evaluates the sticky
     /// split (`tt_routing::sticky_traffic_split`) AFTER the rewrite to decide
@@ -4831,6 +5248,8 @@ pub(crate) async fn apply_routing(
             max_cost_usd: None,
             flex: false,
             compress: false,
+            format_switch: None,
+            diff: false,
             traffic_pct: None,
             shadow_model: None,
             minify_json: false,
@@ -4854,6 +5273,8 @@ pub(crate) async fn apply_routing(
     let batch = m.then.batch;
     let compress = m.then.compress;
     let redact = m.then.redact;
+    let format_switch = m.then.format_switch.clone();
+    let diff = m.then.diff;
     let traffic_pct = m.then.traffic_pct;
     let shadow_model = m.then.shadow_model.clone();
     let target_model_for_split = m.then.target_model.clone();
@@ -4904,6 +5325,8 @@ pub(crate) async fn apply_routing(
         batch,
         compress,
         redact,
+        format_switch,
+        diff,
         traffic_pct,
         shadow_model,
         target_model: target_model_for_split,
@@ -5478,6 +5901,7 @@ mod cache_bust_tests {
             false,
             PassEffects::default(),
             0,
+            crate::shaping::ShapeEffects::default(),
         );
         assert!((no_bust.tt_saved_usd() - 4.0).abs() < 1e-9);
         assert_eq!(no_bust.cache_bust_penalty_usd, 0.0);
@@ -5496,6 +5920,7 @@ mod cache_bust_tests {
             false,
             effects,
             0,
+            crate::shaping::ShapeEffects::default(),
         );
         assert!((bd.cache_bust_penalty_usd - 1.5).abs() < 1e-9);
         assert!((bd.tt_saved_usd() - 2.5).abs() < 1e-9);
@@ -5518,6 +5943,7 @@ mod cache_bust_tests {
             false,
             effects,
             0,
+            crate::shaping::ShapeEffects::default(),
         );
         assert!((bd_fee.cache_bust_penalty_usd - 1.5 * 1.05).abs() < 1e-9);
 
@@ -5536,6 +5962,7 @@ mod cache_bust_tests {
             false,
             big,
             0,
+            crate::shaping::ShapeEffects::default(),
         );
         assert_eq!(clamped.tt_saved_usd(), 0.0);
         assert!(
@@ -5558,6 +5985,257 @@ mod cache_bust_tests {
             compute_cost_with_flex(&usage, Some(&p), Some(&p), 1.0, false).cache_bust_penalty_usd,
             0.0
         );
+    }
+}
+
+#[cfg(test)]
+mod shape_cost_tests {
+    use super::*;
+    use crate::shaping::ShapeEffects;
+
+    fn pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing {
+            input_per_million: input,
+            output_per_million: output,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    fn usage(prompt: u64, completion: u64) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cached_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }
+    }
+
+    /// The MEASURED diff saving raises the baseline at the baseline output
+    /// rate and lands fee-applied in `diff_saved_usd`, so `tt_saved_usd()`
+    /// includes it (the compression precedent).
+    #[test]
+    fn diff_saving_folds_into_baseline_and_headline() {
+        let p = pricing(1.0, 2.0);
+        // Billed: 1000-token patch. Avoided: 99_000 more output tokens.
+        let u = usage(10_000, 1_000);
+        let shape = ShapeEffects {
+            diff_output_tokens_saved: 99_000,
+            ..Default::default()
+        };
+        let bd = compute_cost_full(
+            &u,
+            Some(&p),
+            Some(&p),
+            1.05,
+            false,
+            false,
+            PassEffects::default(),
+            shape,
+        );
+        let no_shape = compute_cost_full(
+            &u,
+            Some(&p),
+            Some(&p),
+            1.05,
+            false,
+            false,
+            PassEffects::default(),
+            ShapeEffects::default(),
+        );
+        // diff_saved = 99k × $2/M × 1.05 fee.
+        let expected_saved = 99_000.0 * 2.0 / 1e6 * 1.05;
+        assert!((bd.diff_saved_usd - expected_saved).abs() < 1e-9);
+        // Baseline raised by exactly the saved-token value; cost unchanged.
+        assert!(
+            (bd.baseline_cost_usd - (no_shape.baseline_cost_usd + expected_saved)).abs() < 1e-9
+        );
+        assert!((bd.cost_usd - no_shape.cost_usd).abs() < 1e-12);
+        // The headline picks the diff saving up via baseline − cost.
+        assert!((bd.tt_saved_usd() - (no_shape.tt_saved_usd() + expected_saved)).abs() < 1e-9);
+    }
+
+    /// The format-switch ESTIMATE lands fee-applied in its OWN field and is
+    /// EXCLUDED from baseline / `tt_saved_usd()` (the batch_forgone
+    /// precedent: estimates never contaminate invoice-reconciled figures).
+    #[test]
+    fn format_switch_estimate_excluded_from_headline() {
+        let p = pricing(1.0, 2.0);
+        let u = usage(10_000, 500);
+        let shape = ShapeEffects {
+            format_switch_saved_est_usd: 0.5,
+            ..Default::default()
+        };
+        let bd = compute_cost_full(
+            &u,
+            Some(&p),
+            Some(&p),
+            1.05,
+            false,
+            false,
+            PassEffects::default(),
+            shape,
+        );
+        let control = compute_cost_full(
+            &u,
+            Some(&p),
+            Some(&p),
+            1.05,
+            false,
+            false,
+            PassEffects::default(),
+            ShapeEffects::default(),
+        );
+        assert!((bd.format_switch_saved_est_usd - 0.5 * 1.05).abs() < 1e-12);
+        assert!((bd.cost_usd - control.cost_usd).abs() < 1e-12);
+        assert!((bd.baseline_cost_usd - control.baseline_cost_usd).abs() < 1e-12);
+        assert!(
+            (bd.tt_saved_usd() - control.tt_saved_usd()).abs() < 1e-12,
+            "the estimate must never ride the headline"
+        );
+    }
+
+    /// The failed-patch cost FOLDS into `cost_usd` (real invoice spend for
+    /// the trace) AND its own field; on a pure-failure trace (no model
+    /// downgrade — baseline == re-emit cost) the headline clamps to 0: the
+    /// double dispatch can never fabricate a saving.
+    #[test]
+    fn diff_failed_cost_folds_into_cost_and_headline_clamps() {
+        let p = pricing(1.0, 2.0);
+        // The re-emit's usage (what the caller's row meters).
+        let u = usage(10_000, 50_000);
+        let shape = ShapeEffects {
+            diff_failed_cost_usd: 0.02, // pre-fee patch-attempt spend
+            ..Default::default()
+        };
+        let bd = compute_cost_full(
+            &u,
+            Some(&p),
+            Some(&p),
+            1.05,
+            false,
+            false,
+            PassEffects::default(),
+            shape,
+        );
+        let control = compute_cost_full(
+            &u,
+            Some(&p),
+            Some(&p),
+            1.05,
+            false,
+            false,
+            PassEffects::default(),
+            ShapeEffects::default(),
+        );
+        assert!((bd.diff_failed_cost_usd - 0.02 * 1.05).abs() < 1e-12);
+        assert!(
+            (bd.cost_usd - (control.cost_usd + 0.02 * 1.05)).abs() < 1e-12,
+            "the failed attempt is real invoice spend — cost_usd must carry it"
+        );
+        // Baseline is re-emit-only ⇒ baseline < cost ⇒ headline clamps to 0.
+        assert!((bd.baseline_cost_usd - control.baseline_cost_usd).abs() < 1e-12);
+        assert_eq!(
+            bd.tt_saved_usd(),
+            0.0,
+            "never a fabricated saving on failure"
+        );
+    }
+
+    /// attach_cost_headers emits the three new always-present headers with
+    /// 0.000000 defaults on unshaped traffic and the breakdown figures
+    /// otherwise.
+    #[test]
+    fn cost_headers_carry_shaping_figures() {
+        let mut headers = axum::http::HeaderMap::new();
+        attach_cost_headers(
+            &mut headers,
+            Uuid::nil(),
+            "openai",
+            "gpt-4o",
+            &CostBreakdown::default(),
+        );
+        for name in [
+            "x-tokentrimmer-diff-saved-usd",
+            "x-tokentrimmer-format-switch-saved-est-usd",
+            "x-tokentrimmer-diff-failed-cost-usd",
+        ] {
+            assert_eq!(
+                headers.get(name).and_then(|v| v.to_str().ok()),
+                Some("0.000000"),
+                "{name} must be always-present with a zero default"
+            );
+        }
+
+        let mut headers = axum::http::HeaderMap::new();
+        attach_cost_headers(
+            &mut headers,
+            Uuid::nil(),
+            "openai",
+            "gpt-4o",
+            &CostBreakdown {
+                diff_saved_usd: 0.123456,
+                format_switch_saved_est_usd: 0.000042,
+                diff_failed_cost_usd: 0.0021,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-diff-saved-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.123456")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-format-switch-saved-est-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.000042")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-diff-failed-cost-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.002100")
+        );
+    }
+
+    /// `set_assistant_text` swaps the first choice's assistant text in place.
+    #[test]
+    fn set_assistant_text_replaces_first_choice() {
+        let mut resp = ChatCompletionResponse {
+            id: "x".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "m".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("patch".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        set_assistant_text(&mut resp, "full artifact".into());
+        assert_eq!(response_assistant_text(&resp), "full artifact");
     }
 }
 
