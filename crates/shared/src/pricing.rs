@@ -274,6 +274,29 @@ impl PricingCatalog {
         self.by_model.is_empty()
     }
 
+    /// The provider's prompt-cache minimum prefix length, in tokens, for
+    /// `(provider, model)` — `prompt_cache_min_tokens` from the latest catalog
+    /// entry. Returns `None` when the model is unknown or carries no documented
+    /// minimum.
+    ///
+    /// Model ids sent on the wire may carry a date suffix (e.g.
+    /// `claude-sonnet-4-6-20260101`) while the catalog keys on the bare id, so
+    /// after an exact-id miss this falls back to the **longest catalog id that
+    /// is a prefix of `model`** before giving up. Shared by the Anthropic
+    /// adapter's `cache_control` injection gate and the request-pass
+    /// stable-prefix split (`tt-core::passes`), so the two can never disagree
+    /// about which prefix length a model needs to cache.
+    pub fn prompt_cache_min_tokens(&self, provider: &str, model: &str) -> Option<u32> {
+        let lookup = self.latest(provider, model).or_else(|| {
+            self.pairs()
+                .into_iter()
+                .filter(|(p, id)| p == provider && model.starts_with(id.as_str()))
+                .max_by_key(|(_, id)| id.len())
+                .and_then(|(_, id)| self.latest(provider, &id))
+        });
+        lookup.and_then(|p| p.prompt_cache_min_tokens)
+    }
+
     /// The newest `effective_at` across every entry in the catalog — i.e. the
     /// date of the most recent manual rate snapshot. Returns `None` only when
     /// the catalog is empty (a build-time error in practice, because the
@@ -579,6 +602,45 @@ mod catalog_tests {
         let c = catalog();
         assert!(c.latest("openai", "no-such-model").is_none());
         assert!(c.latest("no-such-provider", "gpt-4o").is_none());
+    }
+
+    /// `prompt_cache_min_tokens` resolves an exact id, longest-prefix-resolves a
+    /// dated Anthropic id to the bare catalog id, and returns None for an
+    /// unknown model — parity with the Anthropic adapter's historical lookup.
+    #[test]
+    fn prompt_cache_min_tokens_prefix_match() {
+        let c = catalog();
+
+        // Exact ids resolve to their documented minimums.
+        assert_eq!(
+            c.prompt_cache_min_tokens("anthropic", "claude-sonnet-4-6"),
+            Some(2048)
+        );
+        assert_eq!(
+            c.prompt_cache_min_tokens("anthropic", "claude-opus-4-8"),
+            Some(4096)
+        );
+        assert_eq!(c.prompt_cache_min_tokens("openai", "gpt-5.5"), Some(1024));
+
+        // A dated wire id longest-prefix-resolves to the bare catalog id.
+        assert_eq!(
+            c.prompt_cache_min_tokens("anthropic", "claude-sonnet-4-6-20260101"),
+            Some(2048)
+        );
+
+        // Unknown model / provider → None (caller decides the fallback).
+        assert_eq!(
+            c.prompt_cache_min_tokens("anthropic", "no-such-model"),
+            None
+        );
+        assert_eq!(
+            c.prompt_cache_min_tokens("no-such-provider", "gpt-5.5"),
+            None
+        );
+
+        // A known model with no documented minimum → None, even though the
+        // pricing row exists (gemini intentionally carries no minimum).
+        assert_eq!(c.prompt_cache_min_tokens("gemini", "gemini-3.1-pro"), None);
     }
 
     #[test]

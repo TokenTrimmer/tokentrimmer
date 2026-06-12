@@ -51,10 +51,18 @@ use uuid::Uuid;
 /// cache-hit test can assert the provider was hit exactly once.
 struct RecordingProvider {
     seen_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+    /// `Some(min)` makes the model cache-capable: the request-pass split then
+    /// computes a stable prefix. Redaction is DETERMINISTIC on the ingress
+    /// bytes, so even a hit inside that prefix books NO cache-bust penalty
+    /// (the dispatched prefix is byte-identical every turn — the provider
+    /// cache keeps hitting). `None` (the default everywhere below) keeps the
+    /// pre-lane all-volatile behavior.
+    cache_min_tokens: Option<u32>,
 }
 
 const INPUT_PER_M: f64 = 10.0;
 const OUTPUT_PER_M: f64 = 30.0;
+const CACHED_INPUT_PER_M: f64 = 1.0;
 const PROMPT_TOKENS: u64 = 1000;
 const COMPLETION_TOKENS: u64 = 200;
 
@@ -76,13 +84,13 @@ impl Provider for RecordingProvider {
         Some(ModelPricing {
             input_per_million: INPUT_PER_M,
             output_per_million: OUTPUT_PER_M,
-            cached_input_per_million: None,
+            cached_input_per_million: Some(CACHED_INPUT_PER_M),
             cache_write_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
             flex_input_per_million: None,
             flex_output_per_million: None,
-            prompt_cache_min_tokens: None,
+            prompt_cache_min_tokens: self.cache_min_tokens,
             effective_at: Utc::now(),
         })
     }
@@ -115,6 +123,7 @@ impl Provider for RecordingProvider {
                 total_tokens: PROMPT_TOKENS + COMPLETION_TOKENS,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -151,14 +160,25 @@ async fn issue_key_for(store: &InMemoryKeyStore, org_id: Uuid) -> String {
 
 /// Build a gateway whose org has a single route matching `rec-model` with
 /// `redact` set to `redact_flag`, returning the app, key, and the recorded
-/// upstream-messages handle.
+/// upstream-messages handle. `None` cache minimum — the pre-lane shape.
 async fn app_with_redact_route(
     redact_flag: bool,
+) -> (axum::Router, String, Arc<Mutex<Vec<Vec<Message>>>>) {
+    app_with_redact_route_and_cache_min(redact_flag, None).await
+}
+
+/// Like [`app_with_redact_route`] but with a configurable
+/// `prompt_cache_min_tokens` so the bust-booking tests can make the model
+/// cache-capable.
+async fn app_with_redact_route_and_cache_min(
+    redact_flag: bool,
+    cache_min_tokens: Option<u32>,
 ) -> (axum::Router, String, Arc<Mutex<Vec<Vec<Message>>>>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(RecordingProvider {
         seen_messages: Arc::clone(&seen),
+        cache_min_tokens,
     }));
 
     let raw_store = InMemoryKeyStore::new();
@@ -414,6 +434,7 @@ async fn no_redact_flag_means_no_redaction() {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(RecordingProvider {
         seen_messages: Arc::clone(&seen),
+        cache_min_tokens: None,
     }));
     let raw_store = InMemoryKeyStore::new();
     let org_id = Uuid::now_v7();
@@ -492,4 +513,109 @@ async fn cache_hit_does_not_re_run_redaction() {
         1,
         "redaction must not re-run on a cache hit (provider hit once)"
     );
+}
+
+/// NO PHANTOM BUST: on a cache-capable model (min present) the pii_request is
+/// multi-turn (assistant present) and comfortably over the tiny minimum, so
+/// the WHOLE message list is the cache-stable prefix — and the system secret
+/// redaction fires INSIDE it. But redaction is DETERMINISTIC on the ingress
+/// bytes (fixed regexes, fixed `[REDACTED]` placeholder): the dispatched
+/// prefix is byte-identical on every request/turn, the provider's
+/// exact-prefix cache keeps hitting, and NO bust occurs. Booking one anyway
+/// would wipe the savings headline of every redact+cache-capable customer on
+/// every turn for a cost no provider invoice would ever show (the phantom
+/// recurring penalty this lane's review caught). So:
+/// `x-tokentrimmer-cache-bust-usd` reads 0.000000, no `cache_bust:` token is
+/// emitted, and the redaction itself still proceeds — safety beats cost.
+#[tokio::test]
+async fn deterministic_redaction_in_stable_prefix_books_no_bust() {
+    let (app, key, seen) = app_with_redact_route_and_cache_min(true, Some(8)).await;
+
+    let resp = app.oneshot(request_with_key(false, &key)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The redaction still fired — the secret never reaches the upstream.
+    let msgs = seen.lock().unwrap();
+    let all_upstream_text: String = msgs[0].iter().filter_map(text_of).collect();
+    assert!(!all_upstream_text.contains(SECRET_KEY));
+
+    // No bust is booked: deterministic egress ⇒ the provider cache still hits.
+    assert_eq!(
+        resp.headers()["x-tokentrimmer-cache-bust-usd"]
+            .to_str()
+            .unwrap(),
+        "0.000000",
+        "deterministic redaction must never book a cache bust"
+    );
+
+    let warnings = resp
+        .headers()
+        .get("x-tokentrimmer-warnings")
+        .expect("warnings header present")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !warnings.contains("cache_bust:"),
+        "no bust token for a deterministic mutation: {warnings}"
+    );
+    assert!(
+        warnings.contains("redacted:system"),
+        "the redaction class tokens are unchanged: {warnings}"
+    );
+
+    // The headline is NOT suppressed by a phantom penalty: with baseline ==
+    // cost (same model, no cache, no compression) it is exactly 0 because
+    // there is nothing saved — not because a penalty wiped it.
+    let saved: f64 = resp.headers()["x-tokentrimmer-saved-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(saved, 0.0);
+
+    // And the realized cost figure is untouched (estimates are never folded
+    // into the invoice-reconcilable cost).
+    let cost: f64 = resp.headers()["x-tokentrimmer-cost-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expected_cost = (PROMPT_TOKENS as f64) * INPUT_PER_M / 1e6
+        + (COMPLETION_TOKENS as f64) * OUTPUT_PER_M / 1e6;
+    assert!(
+        (cost - expected_cost).abs() < 1e-9,
+        "cost ({cost}) must stay the realized usage cost ({expected_cost})"
+    );
+}
+
+/// Outside the cache regime (no `prompt_cache_min_tokens`) the same redaction
+/// books NOTHING: the bust header reads 0.000000 and no `cache_bust:` token
+/// appears — there was no warm prefix to bust.
+#[tokio::test]
+async fn redaction_outside_cache_regime_books_zero() {
+    let (app, key, _seen) = app_with_redact_route(true).await;
+
+    let resp = app.oneshot(request_with_key(false, &key)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(
+        resp.headers()["x-tokentrimmer-cache-bust-usd"]
+            .to_str()
+            .unwrap(),
+        "0.000000",
+        "no cache regime, no bust"
+    );
+
+    let warnings = resp
+        .headers()
+        .get("x-tokentrimmer-warnings")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    assert!(
+        !warnings.contains("cache_bust:"),
+        "no bust token outside the cache regime: {warnings}"
+    );
+    // The redaction class tokens still fire as before.
+    assert!(warnings.contains("redacted:system"), "{warnings}");
 }

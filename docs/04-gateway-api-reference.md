@@ -224,6 +224,25 @@ upstreams unchanged rather than being dropped. (TokenTrimmer-internal
 
 **TokenTrimmer additions:**
 - `usage.cached_tokens` is always present (0 if no caching applied)
+- `usage.cache_read_input_tokens` / `usage.cache_creation_input_tokens` — raw
+  provider-reported prompt-cache token counts (Anthropic cache fields, OpenAI
+  `prompt_tokens_details.cached_tokens`, Gemini `cachedContentTokenCount`).
+  Present **only when the provider reported the field** — omitted means
+  "unreported", `0` means the provider explicitly reported zero. This is
+  distinct from the always-present folded `cached_tokens`. The same additive
+  fields appear on streamed usage chunks (final/`include_usage`); the
+  `tokentrimmer.usage` cost frame keeps its exact 7-key shape unchanged.
+  Two caveats: (1) on streams, if the upstream reported only a folded
+  `cached_tokens > 0` without the raw field (an older TokenTrimmer hop or
+  pre-fix adapter), the gateway reconstructs `cache_read_input_tokens` from
+  that fold — the value still reflects provider-reported cache reads, never a
+  fabrication; (2) TokenTrimmer L1/L2 cache hits replay the original miss's
+  stored usage verbatim (like every other usage field), so on a hit these
+  fields describe the provider call that produced the cached response — no
+  provider call happened on the hit itself, and the telemetry ledger logs
+  NULL for hit rows. Clients reconciling per-request provider cache reads
+  from response bodies should exclude replayed responses
+  (`x-tokentrimmer-cache: hit-l1` / `hit-l2`).
 - `model` reflects the *actually used* model, which may differ from the requested model if a route rewrote it
 
 ### 3.4 Response (streaming)
@@ -240,7 +259,7 @@ data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1716598234
 data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1716598234,"model":"claude-3-5-sonnet-20241022","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":23,"completion_tokens":8,"total_tokens":31,"cached_tokens":0}}
 
 event: tokentrimmer.usage
-data: {"cost_usd":0.000123,"baseline_cost_usd":0.000456,"saved_usd":0.000333,"provider_cache_saved_usd":0.0,"input_tokens":23,"output_tokens":8,"cached_tokens":0}
+data: {"cost_usd":0.000123,"baseline_cost_usd":0.000456,"saved_usd":0.000333,"provider_cache_saved_usd":0.0,"cache_bust_usd":0.0,"input_tokens":23,"output_tokens":8,"cached_tokens":0}
 
 data: [DONE]
 ```
@@ -264,7 +283,10 @@ emits a non-OpenAI `tokentrimmer.usage` SSE frame carrying per-request cost,
 baseline, and savings — so streaming clients can surface savings that response
 headers cannot. Its shape is **stable** (TokenTrimmer SDKs parse it): exactly the
 keys `cost_usd`, `baseline_cost_usd`, `saved_usd`, `provider_cache_saved_usd`,
-`input_tokens`, `output_tokens`, `cached_tokens`. The `include_usage` chunk (when
+`cache_bust_usd`, `input_tokens`, `output_tokens`, `cached_tokens`.
+(`cache_bust_usd` is the explicit negative-savings entry for a deliberate
+stable-prefix mutation, already subtracted from `saved_usd` pre-clamp —
+`0.0` on every request whose cache-stable prefix was untouched.) The `include_usage` chunk (when
 requested) is emitted *before* this frame; this frame does not replace it.
 
 **Unknown / newer provider chunk fields** (e.g. `system_fingerprint`,

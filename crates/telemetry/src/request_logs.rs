@@ -38,10 +38,21 @@ pub struct RequestLogRow {
     /// Provider-side automatic prompt-cache discount (USD) — savings the
     /// provider grants with or without TokenTrimmer. Kept separate so the
     /// TT-attributed saving (`baseline_cost_usd - cost_usd -
-    /// provider_cache_saved_usd`) survives invoice reconciliation. `0.0` for
-    /// TT cache hits (no provider call) and rows from before migration 0011.
+    /// provider_cache_saved_usd - cache_bust_penalty_usd`) survives invoice
+    /// reconciliation. `0.0` for TT cache hits (no provider call) and rows
+    /// from before migration 0011.
     #[serde(default)]
     pub provider_cache_saved_usd: f64,
+    /// Estimated USD penalty of a deliberate, non-deterministic stable-prefix
+    /// mutation (a booked `CacheBustEstimate`) — the NEGATIVE savings entry.
+    /// Persisted so the row-derived TT headline (see `provider_cache_saved_usd`
+    /// formula above) matches the `x-tokentrimmer-saved-usd` header / span on
+    /// every request. An estimate of induced future cost: NEVER folded into
+    /// `cost_usd` / `baseline_cost_usd`. `0.0` when no bust booked (all
+    /// current traffic — redaction is ingress-deterministic and busts
+    /// nothing), for TT cache hits, and for rows before migration 0016.
+    #[serde(default)]
+    pub cache_bust_penalty_usd: f64,
     /// `true` when ANY cache layer served the response (L1 or L2).
     pub cached: bool,
     /// `Some("l1")` / `Some("l2")` / `None`. Matches the SQL CHECK constraint.
@@ -80,6 +91,24 @@ pub struct RequestLogRow {
     /// two arms' cost/quality without re-deriving the sticky hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_split_arm: Option<String>,
+    /// Raw provider-reported cache-read input tokens. `None` (-> SQL NULL) when
+    /// the provider did not report the field OR no provider call was made (TT
+    /// L1/L2 hits, truncated streams with no terminal usage). `Some(0)` means
+    /// the provider explicitly reported zero. Rows from before migration 0015
+    /// are NULL. The NOT NULL `cached_tokens` above keeps its folded
+    /// (absent => 0) semantics for back-compat.
+    ///
+    /// One deliberate exception (streamed fold-rescue): a terminal usage chunk
+    /// with folded `cached_tokens > 0` but the raw field absent (pre-fix
+    /// adapter / older TT hop) is recorded as `Some(fold)` — a nonzero fold
+    /// proves real provider cache reads and must not regress to NULL. A folded
+    /// 0 without the raw field stays `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<i32>,
+    /// Raw provider-reported cache-write (creation) input tokens. Same NULL
+    /// semantics; Anthropic-only in practice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<i32>,
 }
 
 /// Errors returned by [`RequestLogWriter`].
@@ -164,24 +193,28 @@ pub mod postgres {
                      (id, org_id, api_key_id, ts, provider, model,
                       input_tokens, output_tokens, cached_tokens,
                       cost_usd, baseline_cost_usd, provider_cache_saved_usd,
+                      cache_bust_penalty_usd,
                       cached, cache_layer,
                       route_id, latency_ms, upstream_latency_ms, status,
                       tag, error_class, trace_id,
                       truncated,
-                      shadow_model, shadow_cost_usd, traffic_split_arm)
+                      shadow_model, shadow_cost_usd, traffic_split_arm,
+                      cache_read_input_tokens, cache_creation_input_tokens)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
                       $10, $11, $12,
-                      $13, $14,
-                      $15, $16, $17, $18,
-                      $19, $20, $21,
-                      $22,
-                      $23, $24, $25)"#;
+                      $13,
+                      $14, $15,
+                      $16, $17, $18, $19,
+                      $20, $21, $22,
+                      $23,
+                      $24, $25, $26,
+                      $27, $28)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 25;
+    pub const INSERT_BIND_COUNT: usize = 28;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -199,19 +232,22 @@ pub mod postgres {
                 .bind(row.cost_usd) // $10
                 .bind(row.baseline_cost_usd) // $11
                 .bind(row.provider_cache_saved_usd) // $12
-                .bind(row.cached) // $13
-                .bind(row.cache_layer.as_deref()) // $14
-                .bind(row.route_id) // $15
-                .bind(row.latency_ms) // $16
-                .bind(row.upstream_latency_ms) // $17
-                .bind(row.status) // $18
-                .bind(row.tag.as_deref()) // $19
-                .bind(row.error_class.as_deref()) // $20
-                .bind(row.trace_id.as_deref()) // $21
-                .bind(row.truncated) // $22
-                .bind(row.shadow_model.as_deref()) // $23
-                .bind(row.shadow_cost_usd) // $24
-                .bind(row.traffic_split_arm.as_deref()) // $25
+                .bind(row.cache_bust_penalty_usd) // $13
+                .bind(row.cached) // $14
+                .bind(row.cache_layer.as_deref()) // $15
+                .bind(row.route_id) // $16
+                .bind(row.latency_ms) // $17
+                .bind(row.upstream_latency_ms) // $18
+                .bind(row.status) // $19
+                .bind(row.tag.as_deref()) // $20
+                .bind(row.error_class.as_deref()) // $21
+                .bind(row.trace_id.as_deref()) // $22
+                .bind(row.truncated) // $23
+                .bind(row.shadow_model.as_deref()) // $24
+                .bind(row.shadow_cost_usd) // $25
+                .bind(row.traffic_split_arm.as_deref()) // $26
+                .bind(row.cache_read_input_tokens) // $27
+                .bind(row.cache_creation_input_tokens) // $28
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -238,6 +274,7 @@ mod tests {
             cost_usd: 0.0045,
             baseline_cost_usd: 0.0045,
             provider_cache_saved_usd: 0.0,
+            cache_bust_penalty_usd: 0.0,
             cached: false,
             cache_layer: None,
             route_id: None,
@@ -251,6 +288,8 @@ mod tests {
             shadow_model: None,
             shadow_cost_usd: None,
             traffic_split_arm: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         }
     }
 
@@ -310,6 +349,55 @@ mod tests {
         assert!((got.cost_usd - 0.01).abs() < 1e-9);
     }
 
+    /// A row carrying the provider prompt-cache token columns round-trips, and
+    /// `Some(0)` ("provider explicitly reported zero") stays distinct from
+    /// `None` ("provider did not report" / "no provider call").
+    #[tokio::test]
+    async fn in_memory_round_trips_provider_cache_token_columns() {
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cache_read_input_tokens = Some(80);
+        row.cache_creation_input_tokens = Some(20);
+        w.write(row).await.unwrap();
+
+        let mut zero = sample_row();
+        zero.cache_read_input_tokens = Some(0);
+        zero.cache_creation_input_tokens = None;
+        w.write(zero).await.unwrap();
+
+        let rows = w.rows();
+        assert_eq!(rows[0].cache_read_input_tokens, Some(80));
+        assert_eq!(rows[0].cache_creation_input_tokens, Some(20));
+        // NULL-vs-0: a reported zero survives as Some(0), not None.
+        assert_eq!(rows[1].cache_read_input_tokens, Some(0));
+        assert_eq!(rows[1].cache_creation_input_tokens, None);
+    }
+
+    /// Legacy JSON (rows serialized before migration 0015) deserializes with
+    /// both provider cache token fields defaulting to `None`, and `None`
+    /// fields are omitted on re-serialize.
+    #[test]
+    fn provider_cache_token_columns_serde_backward_compat() {
+        let legacy = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "org_id":"00000000-0000-0000-0000-000000000000",
+            "api_key_id":"00000000-0000-0000-0000-000000000000",
+            "ts":"2026-06-09T00:00:00Z",
+            "provider":"openai","model":"gpt-4o",
+            "input_tokens":1,"output_tokens":1,"cached_tokens":0,
+            "cost_usd":0.0,"baseline_cost_usd":0.0,
+            "cached":false,"cache_layer":null,"route_id":null,
+            "latency_ms":1,"upstream_latency_ms":null,"status":200,
+            "tag":null,"error_class":null,"trace_id":null
+        }"#;
+        let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
+        assert_eq!(row.cache_read_input_tokens, None);
+        assert_eq!(row.cache_creation_input_tokens, None);
+        let j = serde_json::to_string(&row).unwrap();
+        assert!(!j.contains("cache_read_input_tokens"), "{j}");
+        assert!(!j.contains("cache_creation_input_tokens"), "{j}");
+    }
+
     /// Legacy JSON (rows serialized before the canary columns existed)
     /// deserializes with all three new fields defaulting to `None`, and a
     /// `None`-valued row omits them on re-serialize (back-compat with old
@@ -332,10 +420,27 @@ mod tests {
         assert_eq!(row.shadow_model, None);
         assert_eq!(row.shadow_cost_usd, None);
         assert_eq!(row.traffic_split_arm, None);
+        // Pre-0016 rows default the bust penalty to 0 (no bust booked).
+        assert_eq!(row.cache_bust_penalty_usd, 0.0);
         let j = serde_json::to_string(&row).unwrap();
         assert!(!j.contains("shadow_model"), "{j}");
         assert!(!j.contains("shadow_cost_usd"), "{j}");
         assert!(!j.contains("traffic_split_arm"), "{j}");
+    }
+
+    /// The cache-bust penalty column (migration 0016) round-trips through the
+    /// writer in its OWN field — never folded into `cost_usd` (it is an
+    /// estimate of induced future cost, not a realized invoice figure).
+    #[tokio::test]
+    async fn in_memory_round_trips_cache_bust_penalty() {
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.01;
+        row.cache_bust_penalty_usd = 0.0025;
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert!((got.cache_bust_penalty_usd - 0.0025).abs() < 1e-12);
+        assert!((got.cost_usd - 0.01).abs() < 1e-12, "cost untouched");
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the

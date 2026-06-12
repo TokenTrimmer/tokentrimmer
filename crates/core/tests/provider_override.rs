@@ -95,6 +95,7 @@ impl Provider for FakeProvider {
                 total_tokens: 10,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -125,6 +126,7 @@ impl Provider for FakeProvider {
                 total_tokens: 3,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }

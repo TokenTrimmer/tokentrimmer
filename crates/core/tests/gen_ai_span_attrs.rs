@@ -118,6 +118,7 @@ impl Provider for CostMock {
                 total_tokens: PROMPT_TOKENS + COMPLETION_TOKENS,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -166,6 +167,7 @@ impl Provider for CostMock {
                 total_tokens: PROMPT_TOKENS + COMPLETION_TOKENS,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             }),
             extra: Default::default(),
         };
@@ -466,6 +468,7 @@ impl Provider for CountingProvider {
                 total_tokens: 150,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -816,6 +819,7 @@ fn l2_hit_span_carries_gen_ai_and_cost_attributes() {
                     total_tokens: 150,
                     cached_tokens: 0,
                     cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 },
             };
             let entry_vec = vec![1.0; 1536];
@@ -950,6 +954,7 @@ impl Provider for EmbeddingMock {
                 total_tokens: EMB_PROMPT_TOKENS,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }

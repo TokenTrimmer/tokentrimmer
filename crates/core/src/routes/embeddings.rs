@@ -65,6 +65,7 @@ fn sandbox_embeddings_response(req: &EmbeddingsRequest, trace_id: Uuid) -> Respo
             total_tokens: 0,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     };
     let mut http = Json(response).into_response();

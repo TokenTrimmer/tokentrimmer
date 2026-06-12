@@ -1040,6 +1040,7 @@ mod tests {
                 total_tokens: 120,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         };
         let v = chat_response_to_messages(&resp);
@@ -1082,6 +1083,7 @@ mod tests {
                 total_tokens: 55,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         };
         let v = chat_response_to_messages(&resp);
@@ -1107,6 +1109,7 @@ mod tests {
                 total_tokens: 152,
                 cached_tokens: 80,
                 cache_creation_input_tokens: Some(20),
+                cache_read_input_tokens: None,
             },
         };
         let v = chat_response_to_messages(&resp);
@@ -1282,6 +1285,7 @@ mod tests {
             total_tokens: 152,
             cached_tokens: 80,
             cache_creation_input_tokens: Some(20),
+            cache_read_input_tokens: None,
         });
         let _ = enc.push_chunk(&chunk);
         let tail: String = enc.finish().concat();

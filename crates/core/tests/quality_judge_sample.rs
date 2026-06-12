@@ -188,6 +188,7 @@ impl Provider for JudgeAwareProvider {
                 completion_tokens: 100,
                 total_tokens: 200,
                 cached_tokens: 0,
+                cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
             },
         })
@@ -1091,6 +1092,7 @@ impl Provider for RemoteJudgeProvider {
                 completion_tokens: 100,
                 total_tokens: 200,
                 cached_tokens: 0,
+                cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
             },
         })

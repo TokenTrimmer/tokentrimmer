@@ -88,6 +88,7 @@ impl Provider for MultiModelProvider {
                 total_tokens: 10,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }

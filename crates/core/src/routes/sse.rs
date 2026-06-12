@@ -48,6 +48,7 @@ use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
 use tt_tokenize;
 
 use crate::budget::SpendSink;
+use crate::passes::PassEffects;
 use crate::state::{L1Config, L2Config};
 
 // ─── PartialUsage ─────────────────────────────────────────────────────────────
@@ -57,8 +58,25 @@ use crate::state::{L1Config, L2Config};
 pub struct PartialUsage {
     pub input_tokens: i32,
     pub output_tokens: i32,
+    /// Folded cache-read count (absent => 0) — what the cost math consumes.
     pub cached_tokens: i32,
-    pub cache_creation_tokens: i32,
+    /// Raw provider-reported cache-read count. `None` = the provider reported
+    /// no cache-read figure (or the stream was truncated before terminal
+    /// usage); `Some(0)` = the provider explicitly reported zero.
+    pub cache_read_tokens: Option<i32>,
+    /// Raw provider-reported cache-write count. Same NULL semantics.
+    pub cache_creation_tokens: Option<i32>,
+}
+
+/// Authoritative usage captured from the provider's terminal chunk.
+#[derive(Debug, Clone, Copy)]
+struct AuthoritativeUsage {
+    prompt: i32,
+    completion: i32,
+    /// Raw cache-read Option (see [`PartialUsage::cache_read_tokens`]).
+    cache_read: Option<i32>,
+    /// Raw cache-write Option.
+    cache_creation: Option<i32>,
 }
 
 // ─── UsageTrackingStream ──────────────────────────────────────────────────────
@@ -80,9 +98,8 @@ pub(crate) struct UsageTrackingStream {
     cached_tokens: i32,
     /// Provider id for tokenizer selection (e.g. "openai", "anthropic").
     provider_id: String,
-    /// Authoritative usage from the provider's terminal chunk:
-    /// (prompt, completion, cached, cache_creation).
-    authoritative: Option<(i32, i32, i32, i32)>,
+    /// Authoritative usage from the provider's terminal chunk.
+    authoritative: Option<AuthoritativeUsage>,
     /// True once any `finish_reason` chunk has been observed.
     pub(crate) finished: bool,
     /// The `finish_reason` string from the terminal chunk (e.g. `"stop"`).
@@ -130,7 +147,8 @@ impl UsageTrackingStream {
     /// stream's id/model/created. Returns `None` when no authoritative usage
     /// arrived (a truncated stream — nothing trustworthy to report).
     fn synthesized_usage_chunk(&self) -> Option<ChatCompletionChunk> {
-        let (prompt, completion, cached, cache_creation) = self.authoritative?;
+        let auth = self.authoritative?;
+        let cache_creation = auth.cache_creation.unwrap_or(0);
         let (id, model, created) = self
             .last_chunk_meta
             .clone()
@@ -142,11 +160,14 @@ impl UsageTrackingStream {
             model,
             choices: Vec::new(),
             usage: Some(Usage {
-                prompt_tokens: prompt as u64,
-                completion_tokens: completion as u64,
-                total_tokens: (prompt + completion) as u64,
-                cached_tokens: cached as u64,
+                prompt_tokens: auth.prompt as u64,
+                completion_tokens: auth.completion as u64,
+                total_tokens: (auth.prompt + auth.completion) as u64,
+                cached_tokens: auth.cache_read.unwrap_or(0) as u64,
+                // Egress shape kept stable: cache_creation only when > 0, as
+                // before; the raw cache-read rides additively when reported.
                 cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation as u64),
+                cache_read_input_tokens: auth.cache_read.map(|v| v as u64),
             }),
             extra: Default::default(),
         })
@@ -157,39 +178,49 @@ impl UsageTrackingStream {
     /// (i.e. stream was truncated / no terminal usage chunk), ensuring only cleanly
     /// completed streams with known token counts are cached.
     pub(crate) fn cache_completion_data(&self) -> Option<(String, String, Usage)> {
-        let (prompt_tokens, completion_tokens, cached_tokens, cache_creation) =
-            self.authoritative?;
+        let auth = self.authoritative?;
+        let cache_creation = auth.cache_creation.unwrap_or(0);
         let finish_reason = self.finish_reason.clone().unwrap_or_else(|| "stop".into());
         let text = self.output_text.clone();
         let usage = Usage {
-            prompt_tokens: prompt_tokens as u64,
-            completion_tokens: completion_tokens as u64,
-            total_tokens: (prompt_tokens + completion_tokens) as u64,
-            cached_tokens: cached_tokens as u64,
+            prompt_tokens: auth.prompt as u64,
+            completion_tokens: auth.completion as u64,
+            total_tokens: (auth.prompt + auth.completion) as u64,
+            cached_tokens: auth.cache_read.unwrap_or(0) as u64,
             cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation as u64),
+            cache_read_input_tokens: auth.cache_read.map(|v| v as u64),
         };
         Some((text, finish_reason, usage))
     }
 
+    /// Whether a terminal usage block arrived (i.e. the snapshot's counts are
+    /// provider-authoritative rather than tokenizer estimates).
+    pub(crate) fn has_authoritative_usage(&self) -> bool {
+        self.authoritative.is_some()
+    }
+
     pub(crate) fn snapshot(&self) -> PartialUsage {
-        if let Some((input, output, cached, cache_creation)) = self.authoritative {
+        if let Some(auth) = self.authoritative {
             PartialUsage {
-                input_tokens: input,
-                output_tokens: output,
-                cached_tokens: cached,
-                cache_creation_tokens: cache_creation,
+                input_tokens: auth.prompt,
+                output_tokens: auth.completion,
+                cached_tokens: auth.cache_read.unwrap_or(0),
+                cache_read_tokens: auth.cache_read,
+                cache_creation_tokens: auth.cache_creation,
             }
         } else {
             // Fallback: estimate output tokens from accumulated text via
             // tt_tokenize rather than raw byte length (§2.12). No authoritative
-            // block → no known cache-creation count.
+            // block → no known cache counts; the raw Options stay None (NULL)
+            // — never fabricated from estimates.
             let output_tokens =
                 tt_tokenize::estimate_tokens(&self.provider_id, &self.output_text) as i32;
             PartialUsage {
                 input_tokens: self.input_tokens,
                 output_tokens,
                 cached_tokens: self.cached_tokens,
-                cache_creation_tokens: 0,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
             }
         }
     }
@@ -222,12 +253,23 @@ impl Stream for UsageTrackingStream {
             }
             // Authoritative usage from terminal chunk overrides byte count.
             if let Some(ref usage) = chunk.usage {
-                self.authoritative = Some((
-                    usage.prompt_tokens as i32,
-                    usage.completion_tokens as i32,
-                    usage.cached_tokens as i32,
-                    usage.cache_creation_input_tokens.unwrap_or(0) as i32,
-                ));
+                self.authoritative = Some(AuthoritativeUsage {
+                    prompt: usage.prompt_tokens as i32,
+                    completion: usage.completion_tokens as i32,
+                    // Raw cache-read Option, with a fold-rescue: a pre-fix
+                    // folded chunk (cached_tokens > 0, raw field absent) still
+                    // proves real cache reads — map it to Some so it never
+                    // regresses to NULL. A folded 0 with no raw field is
+                    // indistinguishable from "unreported" → None (NULL).
+                    cache_read: crate::routes::chat::opt_tokens_i32(usage.cache_read_input_tokens)
+                        .or_else(|| {
+                            (usage.cached_tokens > 0)
+                                .then(|| usage.cached_tokens.min(i32::MAX as u64) as i32)
+                        }),
+                    cache_creation: crate::routes::chat::opt_tokens_i32(
+                        usage.cache_creation_input_tokens,
+                    ),
+                });
                 // A standalone usage chunk (no choices) is the OpenAI-native
                 // include_usage shape — record it so we don't synthesize a
                 // duplicate at the egress.
@@ -366,13 +408,16 @@ pub struct StreamLogContext {
     /// standard-vs-flex saving to the `flex` source (FLEX-REWRITE requirement
     /// (2)). When `false`, cost math is unchanged (standard rates).
     pub flex_applied: bool,
-    /// Estimated input tokens the conservative compression pass removed before
-    /// dispatch (0 when the route did not opt in). Threaded into the streaming
-    /// cost math so the standard-vs-compressed saving is attributed to the
-    /// `compression` source on the terminal `tokentrimmer.usage` event — parity
-    /// with the non-streaming path (the pass runs before the stream/non-stream
-    /// branch, so a compressed streaming request must attribute its saving too).
-    pub compression_tokens_removed: u32,
+    /// Request-pass effects: the (pipeline-measured) input tokens the
+    /// conservative compression pass removed before dispatch, plus any booked
+    /// cache-bust penalty (a redaction inside the stable prefix). Threaded
+    /// into the streaming cost math so the standard-vs-compressed saving is
+    /// attributed to the `compression` source AND the negative cache-bust
+    /// entry reduces the headline on the terminal `tokentrimmer.usage` event —
+    /// parity with the non-streaming path (the passes run before the
+    /// stream/non-stream branch, so a streaming request must carry their
+    /// effects too).
+    pub pass_effects: PassEffects,
     /// Optional cache insertion context. When `Some`, a cleanly-completed
     /// stream writes its reconstructed response into L1 (and L2 if configured)
     /// after the final chunk is sent.
@@ -427,9 +472,9 @@ struct TrackedEventStream {
     /// Whether the request was served via OpenAI Flex — meters the terminal
     /// `tokentrimmer.usage` cost at flex rates and attributes the flex saving.
     flex_applied: bool,
-    /// Estimated input tokens the compression pass removed — attributes the
-    /// `compression` saving on the terminal `tokentrimmer.usage` event.
-    compression_tokens_removed: u32,
+    /// Request-pass effects — attributes the `compression` saving and carries
+    /// the cache-bust penalty on the terminal `tokentrimmer.usage` event.
+    pass_effects: PassEffects,
     /// Honor `stream_options.include_usage`: emit an OpenAI-native final usage
     /// chunk before the `tokentrimmer.usage` frame when the client asked for it.
     include_usage: bool,
@@ -471,16 +516,20 @@ impl TrackedEventStream {
             self.baseline_pricing.as_ref(),
             self.fee_multiplier,
             self.flex_applied,
-            self.compression_tokens_removed,
+            self.pass_effects,
         );
         // `saved_usd` is strictly TT-attributed; the provider's automatic
         // cache discount rides in its own field (mirrors the response-header
-        // split on the non-streaming path).
+        // split on the non-streaming path). `cache_bust_usd` is the explicit
+        // negative-savings entry already subtracted from `saved_usd` pre-clamp
+        // — surfaced so streaming clients see the bust MAGNITUDE, not just the
+        // reduced headline (parity with `x-tokentrimmer-cache-bust-usd`).
         let json = serde_json::json!({
             "cost_usd": breakdown.cost_usd,
             "baseline_cost_usd": breakdown.baseline_cost_usd,
             "saved_usd": breakdown.tt_saved_usd(),
             "provider_cache_saved_usd": breakdown.provider_cache_saved_usd,
+            "cache_bust_usd": breakdown.cache_bust_penalty_usd,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_tokens": usage.cached_tokens,
@@ -621,9 +670,9 @@ pub fn stream_response(
             // Whether the request was served via OpenAI Flex — drives both the
             // terminal usage event and the request_logs row cost math.
             let flex_applied = ctx.flex_applied;
-            // Input tokens the compression pass removed — drives the
-            // `compression` saving on the terminal usage event + the row.
-            let compression_tokens_removed = ctx.compression_tokens_removed;
+            // Request-pass effects — drive the `compression` saving + the
+            // cache-bust penalty on the terminal usage event + the row.
+            let pass_effects = ctx.pass_effects;
             // Honor stream_options.include_usage on the egress.
             let include_usage = ctx.include_usage;
 
@@ -633,7 +682,7 @@ pub fn stream_response(
                 baseline_pricing: baseline_pricing.clone(),
                 fee_multiplier,
                 flex_applied,
-                compression_tokens_removed,
+                pass_effects,
                 include_usage,
                 phase: Phase::Streaming,
             };
@@ -659,6 +708,7 @@ pub fn stream_response(
                     .expect("tracking stream mutex poisoned");
                 let usage = inner.snapshot();
                 let truncated = !inner.finished;
+                let authoritative = inner.has_authoritative_usage();
                 // Extract cache data before dropping the lock.
                 let cache_data = if !truncated {
                     inner.cache_completion_data()
@@ -677,7 +727,7 @@ pub fn stream_response(
                     baseline_pricing.as_ref(),
                     fee_multiplier,
                     flex_applied,
-                    compression_tokens_removed,
+                    pass_effects,
                 );
                 let cost_usd = breakdown.cost_usd;
                 let baseline_cost_usd = breakdown.baseline_cost_usd;
@@ -736,6 +786,9 @@ pub fn stream_response(
                     cost_usd,
                     baseline_cost_usd,
                     provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+                    // Fee-applied, matching the usage-event/span figure — keeps
+                    // the row-derived TT headline equal to `tt_saved_usd()`.
+                    cache_bust_penalty_usd: breakdown.cache_bust_penalty_usd,
                     cached: false,
                     cache_layer: None,
                     route_id,
@@ -752,7 +805,35 @@ pub fn stream_response(
                     shadow_model: None,
                     shadow_cost_usd: None,
                     traffic_split_arm: traffic_split_arm.clone(),
+                    // Raw provider cache counts from the terminal usage block;
+                    // None (NULL) on truncated streams — never estimated.
+                    cache_read_input_tokens: usage.cache_read_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_tokens,
                 };
+
+                // Per-route provider-cache counters on cleanly completed
+                // streams. Token counters only from authoritative provider
+                // usage (never tokenizer estimates); a clean stream whose
+                // provider sent no terminal usage block still counts as
+                // result="unreported" — that's a fact, not an estimate — so
+                // the hit/(hit+miss+unreported) denominator matches the
+                // non-streaming path. Truncated streams count nothing.
+                if !truncated {
+                    let (cache_read, cache_creation) = if authoritative {
+                        (
+                            usage.cache_read_tokens.map(|v| v.max(0) as u64),
+                            usage.cache_creation_tokens.map(|v| v.max(0) as u64),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    crate::metrics::record_provider_cache_usage(
+                        &row.provider,
+                        span_ctx.as_ref().and_then(|s| s.route.as_deref()),
+                        cache_read,
+                        cache_creation,
+                    );
+                }
 
                 if let Some(w) = writer {
                     let writer_clone = w.clone();
@@ -919,13 +1000,16 @@ fn attach_sse_headers(mut response: Response, trace_id_str: &str, provider_id: &
 fn partial_to_usage(u: &PartialUsage) -> Usage {
     let prompt = u.input_tokens.max(0) as u64;
     let completion = u.output_tokens.max(0) as u64;
-    let cache_creation = u.cache_creation_tokens.max(0) as u64;
+    let cache_creation = u.cache_creation_tokens.unwrap_or(0).max(0) as u64;
     Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: prompt + completion,
         cached_tokens: u.cached_tokens.max(0) as u64,
         cache_creation_input_tokens: (cache_creation > 0).then_some(cache_creation),
+        // The cost math consumes only the folds above; the raw Option is not
+        // threaded here (the request_logs row takes it from the snapshot).
+        cache_read_input_tokens: None,
     }
 }
 
@@ -1121,6 +1205,7 @@ mod tests {
                 total_tokens: 9,
                 cached_tokens: 5,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         }
     }
@@ -1200,6 +1285,7 @@ mod tests {
                     total_tokens: 15,
                     cached_tokens: 2,
                     cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 }),
                 extra: Default::default(),
             }),
@@ -1288,7 +1374,8 @@ mod tests {
             input_tokens: 1_000,
             output_tokens: 500,
             cached_tokens: 0,
-            cache_creation_tokens: 0,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
         };
         let u = partial_to_usage(&usage);
 
@@ -1354,6 +1441,7 @@ mod tests {
                 total_tokens: 110,
                 cached_tokens: 20,
                 cache_creation_input_tokens: Some(30),
+                cache_read_input_tokens: None,
             }),
             extra: Default::default(),
         })];
@@ -1362,7 +1450,10 @@ mod tests {
         let _ = tracker.next().await;
 
         let usage = tracker.snapshot();
-        assert_eq!(usage.cache_creation_tokens, 30);
+        assert_eq!(usage.cache_creation_tokens, Some(30));
+        // Folded-nonzero rescue: cached_tokens 20 with no raw field still
+        // proves real cache reads -> Some(20), never NULL.
+        assert_eq!(usage.cache_read_tokens, Some(20));
 
         let (_text, _fr, reconstructed) = tracker.cache_completion_data().unwrap();
         assert_eq!(reconstructed.cache_creation_input_tokens, Some(30));
@@ -1377,7 +1468,8 @@ mod tests {
             input_tokens: 800,
             output_tokens: 200,
             cached_tokens: 0,
-            cache_creation_tokens: 0,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
         };
         let pricing = ModelPricing {
             input_per_million: 3.0,
@@ -1408,7 +1500,8 @@ mod tests {
             input_tokens: 100,
             output_tokens: 10,
             cached_tokens: 20,
-            cache_creation_tokens: 30,
+            cache_read_tokens: Some(20),
+            cache_creation_tokens: Some(30),
         };
         let pricing = ModelPricing {
             input_per_million: 1.0,

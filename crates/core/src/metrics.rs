@@ -68,3 +68,134 @@ pub fn record_provider_timeout(provider: &'static str, operation: &'static str) 
     )
     .increment(1);
 }
+
+/// Record provider prompt-cache usage counters once authoritative provider
+/// usage lands (research Phase 0.2). `route` is the matched route NAME
+/// (bounded cardinality), `"none"` when no route matched.
+///
+/// Emits:
+/// - `provider_cache_read_tokens_total{provider,route}` += read when reported,
+/// - `provider_cache_write_tokens_total{provider,route}` += write when reported,
+/// - `provider_cache_requests_total{provider,route,result}` += 1, where
+///   `result` is `"hit"` (reported read > 0), `"miss"` (reported read == 0, or
+///   read absent but a NONZERO write was reported — the provider clearly
+///   supports caching and read nothing), or `"unreported"` (neither field
+///   reported, or only a zero write — a reported write of 0 with no read
+///   field is too weak to assert a miss, so it must not deflate the route's
+///   hit rate).
+///
+/// Owned-String labels follow the `catalog_zero_price_total` precedent.
+pub fn record_provider_cache_usage(
+    provider: &str,
+    route: Option<&str>,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+) {
+    let provider = provider.to_string();
+    let route = route.unwrap_or("none").to_string();
+    if let Some(read) = cache_read {
+        metrics::counter!(
+            "provider_cache_read_tokens_total",
+            "provider" => provider.clone(),
+            "route" => route.clone(),
+        )
+        .increment(read);
+    }
+    if let Some(write) = cache_creation {
+        metrics::counter!(
+            "provider_cache_write_tokens_total",
+            "provider" => provider.clone(),
+            "route" => route.clone(),
+        )
+        .increment(write);
+    }
+    metrics::counter!(
+        "provider_cache_requests_total",
+        "provider" => provider,
+        "route" => route,
+        "result" => cache_result(cache_read, cache_creation),
+    )
+    .increment(1);
+}
+
+/// Classify a request's provider prompt-cache outcome for the
+/// `provider_cache_requests_total{result}` label. See
+/// [`record_provider_cache_usage`] for the semantics.
+fn cache_result(cache_read: Option<u64>, cache_creation: Option<u64>) -> &'static str {
+    match (cache_read, cache_creation) {
+        (Some(r), _) if r > 0 => "hit",
+        (Some(_), _) => "miss",
+        (None, Some(w)) if w > 0 => "miss",
+        _ => "unreported",
+    }
+}
+
+/// Count a request pass discarded by the token-true gate (its transform ADDED
+/// tokens and was rolled back, booking zero savings). Labelled by pass name so
+/// a misbehaving pass is attributable.
+pub fn record_request_pass_rejected(pass: &'static str) {
+    metrics::counter!("request_pass_rejected_total", "pass" => pass).increment(1);
+}
+
+/// Convert a non-negative USD amount to integer micro-USD for a true
+/// Prometheus counter (the `metrics` counter API is integer-only; a gauge
+/// "used as a counter" breaks `rate()`/`increase()` across process restarts).
+fn usd_to_microusd(usd: f64) -> u64 {
+    if usd.is_finite() && usd > 0.0 {
+        (usd * 1_000_000.0).round() as u64
+    } else {
+        0
+    }
+}
+
+/// Record a deliberate stable-prefix mutation (a booked
+/// [`CacheBustEstimate`](crate::passes::CacheBustEstimate)): one count per
+/// bust by source, plus the estimated penalty accumulated as integer
+/// micro-USD into a true counter (divide by 1e6 in dashboards).
+///
+/// Basis notes:
+/// - the penalty here is **pre-fee** (provider-invoice basis); the
+///   `x-tokentrimmer-cache-bust-usd` header / `CostBreakdown` figure is
+///   fee-applied — the two differ by the provider fee multiplier.
+/// - this meters in the PASS stage, BEFORE the L1/L2 cache lookups: a request
+///   later served from TokenTrimmer's own cache (no upstream dispatch) still
+///   counts here while its response header reads 0. Series consumers should
+///   treat these as "busts computed at ingress", not "busts dispatched".
+pub fn record_cache_bust(source: &'static str, penalty_usd: f64) {
+    metrics::counter!("cache_bust_total", "source" => source).increment(1);
+    metrics::counter!("cache_bust_penalty_microusd_total").increment(usd_to_microusd(penalty_usd));
+}
+
+/// Record a cache-classifier finding: a volatile marker (timestamp / uuid /
+/// hex-token) inside a would-be-stable cached prefix. One count per kind, plus
+/// the estimated per-request waste accumulated as integer micro-USD into a
+/// true counter (the caller books the waste exactly once per request — pass
+/// 0.0 for additional kinds on the same request). Monthly cost = a 30d
+/// aggregation over the waste series in the dashboard (÷ 1e6 for USD); the
+/// handler cannot know per-route volume. Same basis caveats as
+/// [`record_cache_bust`]: pre-fee, metered before the L1/L2 lookups.
+pub fn record_cache_dynamic_prefix(kind: &'static str, est_wasted_usd: f64) {
+    metrics::counter!("cache_dynamic_prefix_total", "kind" => kind).increment(1);
+    metrics::counter!("cache_dynamic_prefix_waste_microusd_total")
+        .increment(usd_to_microusd(est_wasted_usd));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_result;
+
+    /// Pins the `result` label semantics the cloud dashboard's hit-rate
+    /// denominator depends on. In particular: a reported write of ZERO with
+    /// no read field is "unreported", not "miss" — weak evidence must not
+    /// deflate a route's hit rate.
+    #[test]
+    fn cache_result_classification() {
+        assert_eq!(cache_result(Some(80), Some(20)), "hit");
+        assert_eq!(cache_result(Some(80), None), "hit");
+        assert_eq!(cache_result(Some(0), Some(20)), "miss");
+        assert_eq!(cache_result(Some(0), None), "miss");
+        assert_eq!(cache_result(None, Some(20)), "miss");
+        assert_eq!(cache_result(None, Some(0)), "unreported");
+        assert_eq!(cache_result(None, None), "unreported");
+    }
+}

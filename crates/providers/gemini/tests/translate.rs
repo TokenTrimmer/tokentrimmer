@@ -648,7 +648,7 @@ fn usage_round_trip_with_cached_content_token_count() {
         prompt_token_count: 200,
         candidates_token_count: 80,
         total_token_count: 280,
-        cached_content_token_count: 50,
+        cached_content_token_count: Some(50),
     };
 
     let usage = translate_usage(u);
@@ -658,6 +658,24 @@ fn usage_round_trip_with_cached_content_token_count() {
     assert_eq!(usage.total_tokens, 280);
     assert_eq!(usage.cached_tokens, 50);
     assert!(usage.cache_creation_input_tokens.is_none());
+    // Raw cache-read preserved unfolded (telemetry NULL-vs-0).
+    assert_eq!(usage.cache_read_input_tokens, Some(50));
+}
+
+#[test]
+fn usage_without_cached_content_token_count_keeps_raw_none() {
+    // Gemini omitted cachedContentTokenCount entirely → folded 0, raw None.
+    let u = GeminiUsageMetadata {
+        prompt_token_count: 200,
+        candidates_token_count: 80,
+        total_token_count: 280,
+        cached_content_token_count: None,
+    };
+
+    let usage = translate_usage(u);
+
+    assert_eq!(usage.cached_tokens, 0);
+    assert_eq!(usage.cache_read_input_tokens, None);
 }
 
 // ---------------------------------------------------------------------------

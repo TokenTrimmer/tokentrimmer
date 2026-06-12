@@ -403,27 +403,15 @@ const FALLBACK_CACHE_MIN_TOKENS: u32 = 4096;
 
 /// The Anthropic prompt-cache minimum prefix length, in tokens, for `model`.
 ///
-/// Reads `prompt_cache_min_tokens` from the pricing catalog for
-/// `("anthropic", model)`. Anthropic model ids sent to the wire may carry a
-/// date suffix (e.g. `claude-sonnet-4-6-20260101`) while the catalog keys on the
-/// bare id, so we fall back to a longest-prefix match before giving up. When the
-/// model is unknown or has no documented minimum, returns
+/// Delegates to the shared
+/// [`tt_shared::pricing::PricingCatalog::prompt_cache_min_tokens`] lookup
+/// (exact `("anthropic", model)` match, then longest-prefix match for dated
+/// wire ids like `claude-sonnet-4-6-20260101`) so this gate and the request-pass
+/// stable-prefix split in `tt-core::passes` can never disagree. When the model
+/// is unknown or has no documented minimum, returns
 /// [`FALLBACK_CACHE_MIN_TOKENS`] and logs at debug so the skip is observable.
 fn cache_min_tokens_for_model(model: &str) -> u32 {
-    let catalog = tt_shared::pricing::catalog();
-
-    // Exact match first; then longest catalog id that is a prefix of `model`
-    // (handles dated aliases like `claude-sonnet-4-6-20260101`).
-    let lookup = catalog.latest("anthropic", model).or_else(|| {
-        catalog
-            .pairs()
-            .into_iter()
-            .filter(|(provider, id)| provider == "anthropic" && model.starts_with(id.as_str()))
-            .max_by_key(|(_, id)| id.len())
-            .and_then(|(_, id)| catalog.latest("anthropic", &id))
-    });
-
-    match lookup.and_then(|p| p.prompt_cache_min_tokens) {
+    match tt_shared::pricing::catalog().prompt_cache_min_tokens("anthropic", model) {
         Some(min) => min,
         None => {
             tracing::debug!(
@@ -450,6 +438,15 @@ fn cache_min_tokens_for_model(model: &str) -> u32 {
 /// Anthropic proxy), which *undercounts* Anthropic tokens by ~15–20%; combined
 /// with the catalog minimum this keeps us on the safe side of the gate — a
 /// breakpoint we inject is comfortably above the real minimum, never below it.
+///
+/// Breadcrumb (cache-aware pass lane): `tt-core`'s `CacheClassifierPass` flags
+/// volatile markers (timestamp/uuid/hex token) inside this very prefix as
+/// `cache_dynamic_prefix:<kind>` diagnostics. We deliberately do NOT suppress
+/// this injection on a volatile-looking system prompt: a single-request
+/// heuristic cannot distinguish a per-call UUID from a STABLE one, and wrongly
+/// skipping the breakpoint forfeits the ~0.1x read rate (worth far more than
+/// the 1.25x write premium suppression would save). Wiring suppression would
+/// need cross-request prefix-hash evidence — see the classifier's module docs.
 fn maybe_inject_cache_control(system_blocks: &mut [AnthropicSystemBlock], model: &str) {
     if system_blocks.is_empty() {
         return;
@@ -729,6 +726,9 @@ pub fn translate_usage(u: AnthropicUsage) -> Usage {
         total_tokens: prompt_tokens + u.output_tokens,
         cached_tokens: cached,
         cache_creation_input_tokens: u.cache_creation_input_tokens,
+        // Raw cache-read count: preserve the provider's Option-ness so
+        // telemetry can distinguish "reported zero" from "didn't report".
+        cache_read_input_tokens: u.cache_read_input_tokens,
     }
 }
 
@@ -1109,6 +1109,24 @@ mod tests {
         assert_eq!(usage.total_tokens, 250);
         assert_eq!(usage.cached_tokens, 80);
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
+        // Raw cache-read count threads through unfolded (telemetry NULL-vs-0).
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+    }
+
+    /// When Anthropic reports no cache fields at all, the raw Options stay
+    /// `None` (provider didn't report) while the folded `cached_tokens` is 0.
+    #[test]
+    fn usage_translation_without_cache_fields_keeps_raw_none() {
+        let u = AnthropicUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let usage = translate_usage(u);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
     }
 
     /// Estimation goes through the shared tiktoken-based estimator, not a raw
