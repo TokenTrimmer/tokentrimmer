@@ -16,7 +16,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 reqwest.workspace = true
-tiktoken-rs = "0.5"
+tiktoken-rs = "0.12"
 regex = "1.12"
 uuid.workspace = true
 async-trait = "0.1"
