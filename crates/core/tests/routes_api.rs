@@ -239,6 +239,329 @@ async fn has_images_non_vision_target_rejected() {
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 }
 
+/// POST /v1/routes/:id/pause → paused:true; GET /v1/routes shows paused;
+/// POST resume → was_paused:true and the list drops the paused key (false is
+/// serde-omitted); unknown id → 404; other org's key → 404; anonymous → 401.
+#[tokio::test]
+async fn pause_resume_endpoints_round_trip() {
+    let (app, key, _served) = app_with_key().await;
+    let spec = json!({ "name": "downgrade", "when": {"model_in":["gpt-4o"]}, "then": {"target_model":"gpt-4o-mini"} });
+    let r = app
+        .clone()
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let id = body_json(r).await["id"].as_str().unwrap().to_string();
+
+    // Pause.
+    let r = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/v1/routes/{id}/pause"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = body_json(r).await;
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["paused"], json!(true));
+
+    // The list + get surfaces paused: true.
+    let r = app
+        .clone()
+        .oneshot(req("GET", "/v1/routes", Some(&key), None))
+        .await
+        .unwrap();
+    let list = body_json(r).await;
+    assert_eq!(list[0]["paused"], json!(true), "{list}");
+
+    // Idempotent: a second pause is still 200 + paused:true.
+    let r = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/v1/routes/{id}/pause"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(body_json(r).await["paused"], json!(true));
+
+    // Resume: was_paused = true, then the list omits the paused key entirely
+    // (false-omitted serde — fixture stability).
+    let r = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/v1/routes/{id}/resume"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = body_json(r).await;
+    assert_eq!(body["paused"], json!(false));
+    assert_eq!(body["was_paused"], json!(true));
+    let r = app
+        .clone()
+        .oneshot(req("GET", "/v1/routes", Some(&key), None))
+        .await
+        .unwrap();
+    let list = body_json(r).await;
+    assert!(
+        list[0].get("paused").is_none(),
+        "unpaused route must omit the paused key: {list}"
+    );
+
+    // Resume of an unpaused route: 200, was_paused = false.
+    let r = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/v1/routes/{id}/resume"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(body_json(r).await["was_paused"], json!(false));
+
+    // Unknown id → 404.
+    let bogus = Uuid::now_v7();
+    for verb in ["pause", "resume"] {
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/v1/routes/{bogus}/{verb}"),
+                Some(&key),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{verb} unknown id");
+    }
+
+    // Another org's key → 404 (no cross-org pause control).
+    let (other_app, other_key, _) = app_with_key().await;
+    drop(other_app); // key from a different org against OUR app:
+    let r = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/v1/routes/{id}/pause"),
+            Some(&other_key),
+            None,
+        ))
+        .await
+        .unwrap();
+    // The foreign key fails verification against this app's key store → 401;
+    // a same-store foreign org would 404 via the get_route guard. Both deny.
+    assert!(
+        r.status() == StatusCode::NOT_FOUND || r.status() == StatusCode::UNAUTHORIZED,
+        "foreign org must be denied, got {}",
+        r.status()
+    );
+
+    // Anonymous → 401.
+    let r = app
+        .oneshot(req("POST", &format!("/v1/routes/{id}/pause"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// POST /v1/routes with pause_floor_pass_rate out of (0, 1] → 400.
+#[tokio::test]
+async fn create_rejects_invalid_auto_pause_config() {
+    let (app, key, _) = app_with_key().await;
+    let spec = json!({
+        "name": "bad-floor",
+        "when": {"model_in":["gpt-4o"]},
+        "then": {"target_model":"gpt-4o-mini", "auto_pause": true, "pause_floor_pass_rate": 1.5}
+    });
+    let r = app
+        .clone()
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    let spec = json!({
+        "name": "bad-min",
+        "when": {"model_in":["gpt-4o"]},
+        "then": {"target_model":"gpt-4o-mini", "pause_min_verdicts": 0}
+    });
+    let r = app
+        .clone()
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // Valid auto-pause config is accepted.
+    let spec = json!({
+        "name": "good",
+        "when": {"model_in":["gpt-4o"]},
+        "then": {"target_model":"gpt-4o-mini", "auto_pause": true,
+                  "pause_floor_pass_rate": 0.85, "pause_min_verdicts": 10}
+    });
+    let r = app
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+}
+
+/// GET /v1/routes/:id/savings returns every tax line as its own field (the
+/// tax is never silently subtracted), plus the paused flag; an unconfigured
+/// source → 503; a route with no in-window traffic → an honest all-zero body
+/// (not 404); anonymous → 401; unknown route → 404.
+#[tokio::test]
+async fn savings_endpoint_shape() {
+    use tt_core::route_savings::{assemble, InMemoryRouteSavingsSource, RouteSavingsSource};
+
+    // Unconfigured source → 503.
+    let (app, key, _) = app_with_key().await;
+    let spec = json!({ "name": "downgrade", "when": {"model_in":["gpt-4o"]}, "then": {"target_model":"gpt-4o-mini"} });
+    let r = app
+        .clone()
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec.clone())))
+        .await
+        .unwrap();
+    let id = body_json(r).await["id"].as_str().unwrap().to_string();
+    let r = app
+        .oneshot(req(
+            "GET",
+            &format!("/v1/routes/{id}/savings"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no source wired → 503"
+    );
+
+    // Configured source: seed a NEGATIVE-net row for the route.
+    let served = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        served: Arc::clone(&served),
+    }));
+    let raw = InMemoryKeyStore::new();
+    let org = Uuid::now_v7();
+    let key = issue_key(&raw, org).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw);
+    let routing = Arc::new(CachingRoutingStore::new(
+        Arc::new(InMemoryRoutingStore::new()) as Arc<dyn RoutingStore>,
+    ));
+    let source = InMemoryRouteSavingsSource::new();
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_routing_store(routing)
+            .with_route_savings(Arc::new(source.clone()) as Arc<dyn RouteSavingsSource>),
+    );
+    let r = app
+        .clone()
+        .oneshot(req("POST", "/v1/routes", Some(&key), Some(spec)))
+        .await
+        .unwrap();
+    let created = body_json(r).await;
+    let id = created["id"].as_str().unwrap().to_string();
+    let route_id: Uuid = id.parse().unwrap();
+    source.set_for_org(
+        org,
+        vec![assemble(route_id, 42, 0.10, 0.25, 0.05, 3, 30, 20, 8, 2)],
+    );
+
+    let r = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/v1/routes/{id}/savings?hours=24"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = body_json(r).await;
+    assert_eq!(body["route_id"].as_str().unwrap(), id);
+    assert_eq!(body["paused"], json!(false));
+    assert_eq!(body["requests"], json!(42));
+    // Every tax line is its OWN field — never silently subtracted.
+    assert!((body["gross_saved_usd"].as_f64().unwrap() - 0.10).abs() < 1e-12);
+    assert!((body["judge_tax_usd"].as_f64().unwrap() - 0.25).abs() < 1e-12);
+    assert!((body["shadow_tax_usd"].as_f64().unwrap() - 0.05).abs() < 1e-12);
+    // Net may be NEGATIVE at the aggregate level (a regressing route must show it).
+    assert!(
+        (body["net_saved_usd"].as_f64().unwrap() - (-0.20)).abs() < 1e-12,
+        "negative net must survive: {body}"
+    );
+    assert_eq!(body["unmetered_tax_rows"], json!(3));
+    assert!((body["verdicts"]["pass_rate"].as_f64().unwrap() - (20.0 / 28.0)).abs() < 1e-12);
+    assert!(body["window_start"].is_string() && body["window_end"].is_string());
+
+    // A route with NO in-window rows → honest all-zero body, not 404.
+    let r = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/v1/routes",
+            Some(&key),
+            Some(json!({ "name": "idle", "when": {}, "then": {"target_model":"gpt-4o-mini"} })),
+        ))
+        .await
+        .unwrap();
+    let idle_id = body_json(r).await["id"].as_str().unwrap().to_string();
+    let r = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/v1/routes/{idle_id}/savings"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = body_json(r).await;
+    assert_eq!(body["requests"], json!(0));
+    assert_eq!(body["net_saved_usd"].as_f64().unwrap(), 0.0);
+    assert!(body["verdicts"]["pass_rate"].is_null());
+
+    // Unknown route id → 404; anonymous → 401.
+    let bogus = Uuid::now_v7();
+    let r = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/v1/routes/{bogus}/savings"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let r = app
+        .oneshot(req("GET", &format!("/v1/routes/{id}/savings"), None, None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn created_route_applies_immediately_without_ttl_wait() {
     let (app, key, served) = app_with_key().await;
