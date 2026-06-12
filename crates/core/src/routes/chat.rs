@@ -1036,6 +1036,15 @@ pub async fn handler(
     // response_format, and before the request-pass stage / cache-key
     // derivation so the injected bytes are what gets cached and dispatched).
     let route_minify = route_match.as_ref().is_some_and(|m| m.minify_json);
+    // A matched route capping reasoning spend (`RouteAction::reasoning_max_effort`
+    // / `reasoning_budget_tokens`). Applied below by `maybe_cap_reasoning`
+    // against the FINAL served provider/model (class-gated HARD, lower-only,
+    // books $0 — metered only).
+    let route_reasoning_max_effort = route_match
+        .as_ref()
+        .and_then(|m| m.reasoning_max_effort.clone());
+    let route_reasoning_budget_tokens =
+        route_match.as_ref().and_then(|m| m.reasoning_budget_tokens);
     // A matched route opting into the conservative compression pass
     // (`RouteAction::compress`). When false (the default — no route or a route
     // that did not enable it) the request-pass pipeline never runs and the
@@ -1253,6 +1262,25 @@ pub async fn handler(
     // ESTIMATE (non-streaming only), the metric, and judge eligibility.
     let minify_applied =
         maybe_minify_json(&mut req, route_minify, provider.as_ref(), &mut warnings);
+
+    // Class-gated reasoning-token cap (route action, research Phase 3.2):
+    // lowers OpenAI-style `reasoning_effort` / Anthropic-style thinking
+    // budgets on over-provisioned routes. Evaluated against the FINAL served
+    // provider/model (post-routing/pin). Books $0 — the unspent thinking
+    // tokens are only statistically visible; `reasoning_capped` feeds the
+    // metric and judge eligibility (`output_shaped`).
+    let served_model_info = state.registry.model_info(&req.model).cloned();
+    let reasoning_capped = maybe_cap_reasoning(
+        &mut req,
+        route_reasoning_max_effort.as_deref(),
+        route_reasoning_budget_tokens,
+        provider.as_ref(),
+        served_model_info.as_ref(),
+        route_matched_name.as_deref().unwrap_or("none"),
+        &mut warnings,
+    );
+    // Consumed by the judge-eligibility widening (`output_shaped`) below.
+    let _ = reasoning_capped;
 
     // ── Request-pass stage ───────────────────────────────────────────────────
     //
@@ -2686,6 +2714,174 @@ fn maybe_minify_json(
     }
     warnings.push("output_minified".to_string());
     true
+}
+
+/// Apply the class-gated reasoning-token cap (`RouteAction::reasoning_max_effort`
+/// / `reasoning_budget_tokens`, research Phase 3.2). Returns whether a cap was
+/// actually applied — drives metering and (via `output_shaped`) judge
+/// eligibility. Fail-open: mutates ONLY the reasoning params / warnings; never
+/// errors; NEVER touches `max_tokens` / `max_completion_tokens` (Anthropic's
+/// max_tokens INCLUDES thinking — bounding it would truncate the answer).
+///
+/// Decision order (first refusal wins; every act/refusal pushes its warnings
+/// token and meters):
+/// 1. Both caps `None` → silent no-op (the off-by-default path).
+/// 2. HARD class gate: a request classified math/code/legal/medical
+///    (`crate::reasoning_class`) is NEVER capped — capping where reasoning IS
+///    the work yields confidently-wrong answers
+///    (`reasoning_cap_skipped:class:<c>`).
+/// 3. Effort arm (OpenAI-style `reasoning_effort`, only when the served
+///    surface carries the lever — i.e. the provider does not drop it):
+///    lower-only on the `minimal < low < medium < high` ladder. An absent
+///    effort on a catalog-Reasoning-capable model is treated as the provider
+///    default ("medium" — documented assumption) and lowered when the cap is
+///    "low"; an absent effort on an unknown/non-Reasoning model refuses
+///    (`reasoning_cap_skipped:not_reasoning:<model>`) — never inject
+///    `reasoning_effort` into a model that may reject it. An unrecognized
+///    requester value refuses (`reasoning_cap_skipped:unknown_effort:<v>`).
+/// 4. Thinking arm (Anthropic-style `extra["thinking"]`): an ENABLED config
+///    whose `budget_tokens` exceeds the cap is lowered in place
+///    (`reasoning_capped:thinking_budget:<cap>`). Absent / disabled /
+///    at-or-below configs are untouched — the cap NEVER enables thinking.
+/// 5. When neither lever exists for this request (effort dropped by the
+///    provider AND no enabled thinking config) while a cap is configured, one
+///    honest `reasoning_cap_skipped:unsupported:<provider>` token is pushed.
+///
+/// Books $0 ALWAYS: `Usage` carries no reasoning-token field, so the unspent
+/// thinking tokens are only statistically visible — the event is metered
+/// (`reasoning_capped_total{route,lever,cap}`) and the judge-tax-netted route
+/// savings (#163) tell the truth over the window.
+fn maybe_cap_reasoning(
+    req: &mut ChatCompletionRequest,
+    max_effort: Option<&str>,
+    budget_tokens: Option<u32>,
+    provider: &dyn tt_shared::Provider,
+    model_info: Option<&tt_shared::ModelInfo>,
+    route_name: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if max_effort.is_none() && budget_tokens.is_none() {
+        return false;
+    }
+    // HARD class gate, first: refuse where reasoning IS the work.
+    let text = tt_shared::message_text_for_estimation(req).to_lowercase();
+    if let Some(class) = crate::reasoning_class::classify(&text) {
+        warnings.push(format!("reasoning_cap_skipped:class:{}", class.as_str()));
+        crate::metrics::record_reasoning_cap_skipped("class");
+        return false;
+    }
+
+    /// `minimal(0) < low(1) < medium(2) < high(3)`; `None` = unrecognized.
+    fn effort_rank(e: &str) -> Option<u8> {
+        match e {
+            "minimal" => Some(0),
+            "low" => Some(1),
+            "medium" => Some(2),
+            "high" => Some(3),
+            _ => None,
+        }
+    }
+
+    let mut applied = false;
+    let effort_lever = !provider
+        .dropped_params(req)
+        .iter()
+        .any(|p| p == "reasoning_effort");
+
+    // Effort arm.
+    if let (Some(cap), true) = (max_effort, effort_lever) {
+        match effort_rank(cap) {
+            None => {
+                // Defensive only: validation rejects this at route-create
+                // time, but route JSON is schemaless JSONB — never act on a
+                // cap we cannot rank.
+                tracing::warn!(cap, "unrecognized reasoning_max_effort cap — skipping");
+            }
+            Some(cap_rank) => match req.reasoning_effort.as_deref() {
+                Some(current) => match effort_rank(current) {
+                    Some(cur_rank) if cur_rank > cap_rank => {
+                        req.reasoning_effort = Some(cap.to_string());
+                        warnings.push(format!("reasoning_capped:reasoning_effort:{cap}"));
+                        crate::metrics::record_reasoning_capped(
+                            route_name,
+                            "reasoning_effort",
+                            cap,
+                        );
+                        applied = true;
+                    }
+                    Some(_) => {} // at-or-below the cap: silent no-op.
+                    None => {
+                        let current = current.to_string();
+                        warnings.push(format!("reasoning_cap_skipped:unknown_effort:{current}"));
+                        crate::metrics::record_reasoning_cap_skipped("unknown_effort");
+                    }
+                },
+                None => {
+                    let reasoning_capable = model_info.is_some_and(|i| {
+                        i.capabilities
+                            .contains(&tt_shared::pricing::Capability::Reasoning)
+                    });
+                    if reasoning_capable {
+                        // Documented assumption: the provider default for an
+                        // absent effort on a reasoning model is "medium".
+                        if 2 > cap_rank {
+                            req.reasoning_effort = Some(cap.to_string());
+                            warnings.push(format!("reasoning_capped:reasoning_effort:{cap}"));
+                            crate::metrics::record_reasoning_capped(
+                                route_name,
+                                "reasoning_effort",
+                                cap,
+                            );
+                            applied = true;
+                        }
+                    } else {
+                        warnings.push(format!("reasoning_cap_skipped:not_reasoning:{}", req.model));
+                        crate::metrics::record_reasoning_cap_skipped("not_reasoning");
+                    }
+                }
+            },
+        }
+    }
+
+    // Thinking arm. A lever exists only for an ENABLED config — the cap never
+    // enables thinking on a request that didn't ask for it.
+    let thinking_enabled = req
+        .extra
+        .get("thinking")
+        .and_then(|v| v.as_object())
+        .is_some_and(|o| o.get("type").and_then(|t| t.as_str()) == Some("enabled"));
+    if let (Some(cap), true) = (budget_tokens, thinking_enabled) {
+        if let Some(obj) = req
+            .extra
+            .get_mut("thinking")
+            .and_then(|v| v.as_object_mut())
+        {
+            if let Some(budget) = obj.get("budget_tokens").and_then(serde_json::Value::as_u64) {
+                if budget > u64::from(cap) {
+                    obj.insert("budget_tokens".to_string(), serde_json::json!(cap));
+                    warnings.push(format!("reasoning_capped:thinking_budget:{cap}"));
+                    crate::metrics::record_reasoning_capped(
+                        route_name,
+                        "thinking_budget",
+                        &cap.to_string(),
+                    );
+                    applied = true;
+                }
+            }
+        }
+    }
+
+    // Honest unsupported-surface token: a cap is configured but this request
+    // carries NO lever (effort dropped by the provider AND no enabled
+    // thinking config).
+    if !applied && !effort_lever && !thinking_enabled {
+        warnings.push(format!(
+            "reasoning_cap_skipped:unsupported:{}",
+            provider.id()
+        ));
+        crate::metrics::record_reasoning_cap_skipped("unsupported");
+    }
+    applied
 }
 
 /// ESTIMATED output tokens saved by minification: for each choice whose
@@ -4450,6 +4646,15 @@ pub(crate) struct RouteMatch {
     /// output skips with a warning). A COST lever: forced off on a paused
     /// route.
     pub(crate) minify_json: bool,
+    /// The matched route's `reasoning_effort` cap
+    /// (`RouteAction::reasoning_max_effort`, research Phase 3.2). Applied at
+    /// the request-build step via `maybe_cap_reasoning` (class-gated HARD;
+    /// lower-only). A COST lever: forced to `None` on a paused route.
+    pub(crate) reasoning_max_effort: Option<String>,
+    /// The matched route's thinking-budget cap
+    /// (`RouteAction::reasoning_budget_tokens`). Same gating as
+    /// `reasoning_max_effort`; never expressed via `max_tokens`.
+    pub(crate) reasoning_budget_tokens: Option<u32>,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -4583,6 +4788,8 @@ pub(crate) async fn apply_routing(
             traffic_pct: None,
             shadow_model: None,
             minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
             // SAFETY/privacy levers stay ON (pausing a quality gate must never
             // disable a privacy guardrail):
             disable_cache: m.then.disable_cache,
@@ -4605,6 +4812,8 @@ pub(crate) async fn apply_routing(
     let shadow_model = m.then.shadow_model.clone();
     let target_model_for_split = m.then.target_model.clone();
     let minify_json = m.then.minify_json;
+    let reasoning_max_effort = m.then.reasoning_max_effort.clone();
+    let reasoning_budget_tokens = m.then.reasoning_budget_tokens;
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -4653,6 +4862,8 @@ pub(crate) async fn apply_routing(
         shadow_model,
         target_model: target_model_for_split,
         minify_json,
+        reasoning_max_effort,
+        reasoning_budget_tokens,
     }))
 }
 
@@ -6466,5 +6677,238 @@ mod output_shaping_tests {
             500,
         );
         assert!((bd_flex.minify_saved_est_usd - 0.0005).abs() < 1e-12);
+    }
+    // --- Feature B: class-gated reasoning-token cap ---
+
+    fn reasoning_model_info(caps: Vec<tt_shared::pricing::Capability>) -> tt_shared::ModelInfo {
+        tt_shared::ModelInfo {
+            id: "o3-mini".into(),
+            provider: "shape-test".into(),
+            capabilities: caps,
+            max_input_tokens: 100_000,
+            max_output_tokens: 100_000,
+        }
+    }
+
+    /// Effort-arm matrix: lower-only semantics, the provider-default
+    /// assumption on Reasoning-capable models, never-raise, unknown-value and
+    /// non-reasoning-model refusals.
+    #[test]
+    fn maybe_cap_reasoning_effort_matrix() {
+        use tt_shared::pricing::Capability;
+        let p = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+        let info = reasoning_model_info(vec![Capability::Text, Capability::Reasoning]);
+
+        // high → low: capped + token.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.reasoning_effort = Some("high".into());
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("low"), None, &p, Some(&info), "r", &mut w);
+        assert!(applied);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(w, vec!["reasoning_capped:reasoning_effort:low".to_string()]);
+
+        // Absent effort + Reasoning-capable model + cap low: provider default
+        // ("medium") is assumed and lowered.
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("low"), None, &p, Some(&info), "r", &mut w);
+        assert!(applied);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(w, vec!["reasoning_capped:reasoning_effort:low".to_string()]);
+
+        // Absent effort + cap medium: default medium is AT the cap → silent no-op.
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("medium"), None, &p, Some(&info), "r", &mut w);
+        assert!(!applied);
+        assert_eq!(req.reasoning_effort, None, "no injection at-or-below cap");
+        assert!(w.is_empty(), "{w:?}");
+
+        // low + cap medium: NEVER raise.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.reasoning_effort = Some("low".into());
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("medium"), None, &p, Some(&info), "r", &mut w);
+        assert!(!applied);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("low"));
+        assert!(w.is_empty(), "{w:?}");
+
+        // Unknown requester effort value: refuse with a token, never rewrite.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.reasoning_effort = Some("turbo".into());
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("low"), None, &p, Some(&info), "r", &mut w);
+        assert!(!applied);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("turbo"));
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:unknown_effort:turbo".to_string()]
+        );
+
+        // Non-Reasoning model + absent effort: never inject reasoning_effort
+        // into a model that may reject it.
+        let text_info = reasoning_model_info(vec![Capability::Text]);
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(
+            &mut req,
+            Some("low"),
+            None,
+            &p,
+            Some(&text_info),
+            "r",
+            &mut w,
+        );
+        assert!(!applied);
+        assert_eq!(req.reasoning_effort, None);
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:not_reasoning:gpt-4o".to_string()]
+        );
+
+        // Unknown model (no catalog info) + absent effort: same refusal.
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, Some("low"), None, &p, None, "r", &mut w);
+        assert!(!applied);
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:not_reasoning:gpt-4o".to_string()]
+        );
+    }
+
+    /// The HARD class gate wins first: a code-classified request with BOTH
+    /// caps configured is untouched and carries ONLY the class token.
+    #[test]
+    fn maybe_cap_reasoning_class_gate_wins() {
+        use tt_shared::pricing::Capability;
+        let p = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+        let info = reasoning_model_info(vec![Capability::Reasoning]);
+        let mut req = req_with_messages(vec![user("Refactor this module and debug the crash.")]);
+        req.reasoning_effort = Some("high".into());
+        req.extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"enabled","budget_tokens":30000}),
+        );
+        let before = serde_json::to_string(&req).unwrap();
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(
+            &mut req,
+            Some("low"),
+            Some(8192),
+            &p,
+            Some(&info),
+            "r",
+            &mut w,
+        );
+        assert!(!applied);
+        assert_eq!(serde_json::to_string(&req).unwrap(), before, "untouched");
+        assert_eq!(w, vec!["reasoning_cap_skipped:class:code".to_string()]);
+    }
+
+    /// Thinking-budget arm: an enabled config above the cap is lowered in
+    /// place; below-cap / disabled configs are untouched; thinking is NEVER
+    /// enabled; `max_tokens` / `max_completion_tokens` are NEVER mutated.
+    #[test]
+    fn maybe_cap_reasoning_thinking_budget() {
+        let p = ShapeProvider {
+            schema: true,
+            // Anthropic-like surface: no reasoning_effort lever.
+            drops: &["reasoning_effort"],
+        };
+
+        // Above-cap budget → rewritten to the cap.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.max_tokens = Some(50_000);
+        req.max_completion_tokens = Some(40_000);
+        req.extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"enabled","budget_tokens":30000}),
+        );
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, None, Some(8192), &p, None, "r", &mut w);
+        assert!(applied);
+        assert_eq!(
+            req.extra["thinking"],
+            serde_json::json!({"type":"enabled","budget_tokens":8192})
+        );
+        assert_eq!(w, vec!["reasoning_capped:thinking_budget:8192".to_string()]);
+        assert_eq!(req.max_tokens, Some(50_000), "max_tokens NEVER mutated");
+        assert_eq!(req.max_completion_tokens, Some(40_000));
+
+        // Below-cap budget → untouched, silent.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.max_tokens = Some(50_000);
+        req.extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"enabled","budget_tokens":2048}),
+        );
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, None, Some(8192), &p, None, "r", &mut w);
+        assert!(!applied);
+        assert_eq!(
+            req.extra["thinking"],
+            serde_json::json!({"type":"enabled","budget_tokens":2048})
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(req.max_tokens, Some(50_000));
+
+        // Disabled thinking → untouched (NEVER enable thinking).
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.extra
+            .insert("thinking".into(), serde_json::json!({"type":"disabled"}));
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, None, Some(8192), &p, None, "r", &mut w);
+        assert!(!applied);
+        assert_eq!(
+            req.extra["thinking"],
+            serde_json::json!({"type":"disabled"})
+        );
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:unsupported:shape-test".to_string()],
+            "a disabled config is no lever — the surface is honestly unsupported"
+        );
+        assert_eq!(req.max_tokens, None, "max_tokens NEVER mutated");
+    }
+
+    /// Neither lever exists (provider drops reasoning_effort AND no thinking
+    /// config) while a cap is configured → one honest unsupported token.
+    #[test]
+    fn maybe_cap_reasoning_unsupported_surface() {
+        let p = ShapeProvider {
+            schema: true,
+            drops: &["reasoning_effort"],
+        };
+        let mut req = req_with_messages(vec![user("hi")]);
+        let before = serde_json::to_string(&req).unwrap();
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, Some("low"), Some(8192), &p, None, "r", &mut w);
+        assert!(!applied);
+        assert_eq!(serde_json::to_string(&req).unwrap(), before, "untouched");
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:unsupported:shape-test".to_string()]
+        );
+
+        // Both caps None → fully silent.
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        assert!(!maybe_cap_reasoning(
+            &mut req, None, None, &p, None, "r", &mut w
+        ));
+        assert!(w.is_empty());
     }
 }

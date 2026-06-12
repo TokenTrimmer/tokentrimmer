@@ -224,6 +224,31 @@ pub fn record_minify_estimate(route: &str, est_tokens: u32, est_usd: f64) {
         .increment(usd_to_microusd(est_usd));
 }
 
+/// Record one applied reasoning cap (`RouteAction::reasoning_max_effort` /
+/// `reasoning_budget_tokens`): `reasoning_capped_total{route,lever,cap}` += 1.
+/// `lever` ∈ {`reasoning_effort`, `thinking_budget`}; `cap` is "low"/"medium"
+/// or the configured budget as a string — bounded cardinality (one value per
+/// route config). NO savings are booked anywhere for this event — the counter
+/// plus the #163 netted route savings are the truth channel.
+pub fn record_reasoning_capped(route: &str, lever: &'static str, cap: &str) {
+    metrics::counter!(
+        "reasoning_capped_total",
+        "route" => route.to_string(),
+        "lever" => lever,
+        "cap" => cap.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record one reasoning-cap refusal: `reasoning_cap_skipped_total{reason}` += 1.
+/// `reason` is the refusal KIND only (`class` / `unknown_effort` /
+/// `not_reasoning` / `unsupported`) — the warnings-header token carries the
+/// unbounded detail (class name / model / provider), the metric label stays
+/// bounded.
+pub fn record_reasoning_cap_skipped(reason: &'static str) {
+    metrics::counter!("reasoning_cap_skipped_total", "reason" => reason).increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::cache_result;

@@ -13,6 +13,7 @@ pub mod middleware;
 pub mod passes;
 pub mod quality_persist;
 pub mod quality_sample;
+pub mod reasoning_class;
 pub mod registry;
 pub mod retry;
 pub mod route_autopause;
