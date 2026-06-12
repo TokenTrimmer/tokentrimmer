@@ -351,6 +351,7 @@ async fn privacy_route_disable_cache_beats_force_write() {
     backing.set_routes(
         org,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "privacy".into(),
             priority: 100,
@@ -360,6 +361,9 @@ async fn privacy_route_disable_cache_beats_force_write() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "counting-1".into(),
                 fallbacks: vec![],
                 disable_cache: true,

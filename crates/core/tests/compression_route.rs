@@ -172,6 +172,7 @@ async fn app_with_compress_route(
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "compress-route".into(),
             priority: 100,
@@ -182,6 +183,9 @@ async fn app_with_compress_route(
             },
             // No model rewrite — compression is a pure request-pass action.
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "rec-model".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -398,6 +402,7 @@ async fn no_route_means_no_compression() {
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "plain".into(),
             priority: 100,

@@ -131,6 +131,15 @@ pub struct RequestLogRow {
     /// no claim), and for rows from before migration 0017.
     #[serde(default)]
     pub batch_forgone_usd: f64,
+    /// `true` when a matched route's rewrite was suppressed by a sticky pause
+    /// (research Phase 2.3 auto-pause / `POST /v1/routes/:id/pause`): the
+    /// request flowed to the ORIGINALLY-requested model with every cost lever
+    /// off. The route still attributes (`route_id` is stamped) so paused
+    /// traffic is auditable per route; cost == baseline on these rows (no
+    /// fabricated saving). `false` for every unrouted/unpaused request and
+    /// rows from before migration 0019 (mirror of `truncated`).
+    #[serde(default)]
+    pub route_paused: bool,
 }
 
 /// Errors returned by [`RequestLogWriter`].
@@ -222,7 +231,8 @@ pub mod postgres {
                       truncated,
                       shadow_model, shadow_cost_usd, traffic_split_arm,
                       cache_read_input_tokens, cache_creation_input_tokens,
-                      batch_eligible, batch_forgone_usd)
+                      batch_eligible, batch_forgone_usd,
+                      route_paused)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -234,11 +244,12 @@ pub mod postgres {
                       $23,
                       $24, $25, $26,
                       $27, $28,
-                      $29, $30)"#;
+                      $29, $30,
+                      $31)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 30;
+    pub const INSERT_BIND_COUNT: usize = 31;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -274,6 +285,8 @@ pub mod postgres {
                 .bind(row.cache_creation_input_tokens) // $28
                 .bind(row.batch_eligible) // $29
                 .bind(row.batch_forgone_usd) // $30
+                .bind(row.route_paused) // $31
+                .bind(row.route_paused) // $29
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -318,6 +331,7 @@ mod tests {
             cache_creation_input_tokens: None,
             batch_eligible: false,
             batch_forgone_usd: 0.0,
+            route_paused: false,
         }
     }
 
@@ -454,6 +468,39 @@ mod tests {
         assert!(!j.contains("shadow_model"), "{j}");
         assert!(!j.contains("shadow_cost_usd"), "{j}");
         assert!(!j.contains("traffic_split_arm"), "{j}");
+    }
+
+    /// Legacy JSON (rows serialized before migration 0019) deserializes with
+    /// `route_paused` defaulting to false, and a `route_paused = true` row
+    /// round-trips through the in-memory writer (mirror of `truncated`).
+    #[tokio::test]
+    async fn route_paused_serde_backward_compat() {
+        let legacy = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "org_id":"00000000-0000-0000-0000-000000000000",
+            "api_key_id":"00000000-0000-0000-0000-000000000000",
+            "ts":"2026-06-09T00:00:00Z",
+            "provider":"openai","model":"gpt-4o",
+            "input_tokens":1,"output_tokens":1,"cached_tokens":0,
+            "cost_usd":0.0,"baseline_cost_usd":0.0,
+            "cached":false,"cache_layer":null,"route_id":null,
+            "latency_ms":1,"upstream_latency_ms":null,"status":200,
+            "tag":null,"error_class":null,"trace_id":null
+        }"#;
+        let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
+        assert!(
+            !row.route_paused,
+            "pre-0019 rows must deserialize route_paused = false"
+        );
+
+        let w = InMemoryRequestLogWriter::new();
+        let mut paused_row = sample_row();
+        paused_row.route_paused = true;
+        w.write(paused_row).await.unwrap();
+        assert!(
+            w.rows()[0].route_paused,
+            "route_paused=true must survive write→read"
+        );
     }
 
     /// The cache-bust penalty column (migration 0016) round-trips through the

@@ -195,6 +195,21 @@ async fn migrate_only_applies_schema() {
 }
 
 #[test]
+fn migrator_includes_routing_honesty_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let seventeenth = migrations
+        .iter()
+        .find(|m| m.version == 19)
+        .expect("migration version 19 not found");
+    let desc = seventeenth.description.to_lowercase();
+    assert!(
+        desc.contains("routing") || desc.contains("honesty") || desc.contains("pause"),
+        "migration 0019 description is '{}', expected to mention routing/honesty/pause",
+        seventeenth.description,
+    );
+}
+
+#[test]
 fn migrator_includes_quality_verdicts_migration() {
     let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
     let fourteenth = migrations
@@ -258,6 +273,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         cache_creation_input_tokens: Some(20),
         batch_eligible: false,
         batch_forgone_usd: 0.0,
+        route_paused: false,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");
@@ -329,6 +345,7 @@ async fn request_log_insert_round_trips_batch_columns() {
     let writer = PostgresRequestLogWriter::new(pool.clone());
 
     let marked = RequestLogRow {
+        route_paused: false,
         id: Uuid::now_v7(),
         org_id: Uuid::nil(),
         api_key_id: Uuid::nil(),

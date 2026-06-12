@@ -427,6 +427,7 @@ async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential
     backing.set_routes(
         org,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "cross".into(),
             priority: 100,
@@ -436,6 +437,9 @@ async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: vec!["gpt-4o".into()],
                 disable_cache: false,

@@ -137,6 +137,7 @@ async fn app_with_routes(routes: Vec<Route>) -> (axum::Router, String) {
 
 fn route(name: &str, priority: u32, tag: Option<&str>, target: &str) -> Route {
     Route {
+        paused: false,
         id: Uuid::now_v7(),
         name: name.into(),
         priority,
@@ -146,6 +147,9 @@ fn route(name: &str, priority: u32, tag: Option<&str>, target: &str) -> Route {
             ..Default::default()
         },
         then: RouteAction {
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
             target_model: target.into(),
             fallbacks: vec![],
             disable_cache: false,

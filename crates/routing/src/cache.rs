@@ -122,6 +122,32 @@ impl RoutingStore for CachingRoutingStore {
         }
         Ok(removed)
     }
+
+    async fn pause_route(
+        &self,
+        org_id: Uuid,
+        route_id: Uuid,
+        pause: crate::store::NewRoutePause,
+    ) -> Result<bool, RoutingStoreError> {
+        let paused = self.inner.pause_route(org_id, route_id, pause).await?;
+        if paused {
+            // Invalidate so the pause takes effect immediately on THIS replica;
+            // other replicas converge within the TTL (≤ 60s by default) — same
+            // contract as create/delete above.
+            self.invalidate(org_id).await;
+        }
+        Ok(paused)
+    }
+
+    async fn resume_route(&self, org_id: Uuid, route_id: Uuid) -> Result<bool, RoutingStoreError> {
+        let resumed = self.inner.resume_route(org_id, route_id).await?;
+        if resumed {
+            // Same immediate-on-this-replica / ≤TTL-elsewhere convergence as
+            // pause_route.
+            self.invalidate(org_id).await;
+        }
+        Ok(resumed)
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +174,11 @@ mod tests {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
             },
+            paused: false,
         }
     }
 
@@ -222,6 +252,63 @@ mod tests {
         assert!(e.routes().is_empty());
     }
 
+    /// A pause/resume through the caching store invalidates the org's cached
+    /// engine, so the change takes effect immediately on this replica (no TTL
+    /// wait) — mirrors `created_route_applies_immediately_without_ttl_wait`.
+    #[tokio::test]
+    async fn caching_store_pause_invalidates_engine() {
+        let backing = Arc::new(InMemoryRoutingStore::new());
+        let org = Uuid::now_v7();
+        let cache = CachingRoutingStore::with_ttl(
+            backing as Arc<dyn RoutingStore>,
+            Duration::from_secs(3600), // long TTL: only invalidation can refresh
+        );
+        let created = cache
+            .create_route(
+                org,
+                crate::store::NewRoute {
+                    name: "down".into(),
+                    priority: 10,
+                    enabled: true,
+                    when: RouteConditions::default(),
+                    then: RouteAction {
+                        target_model: "m".into(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        // Warm the cache with the rewrite-active engine.
+        assert!(!cache.engine_for(org).await.unwrap().routes()[0].paused);
+
+        // Pause via the caching store → immediately reflected (no TTL wait).
+        assert!(cache
+            .pause_route(
+                org,
+                created.id,
+                crate::store::NewRoutePause {
+                    paused_by: crate::store::PausedBy::Auto,
+                    reason: "auto: test".into(),
+                    pass_rate: Some(0.5),
+                    verdicts_in_window: Some(20),
+                },
+            )
+            .await
+            .unwrap());
+        assert!(
+            cache.engine_for(org).await.unwrap().routes()[0].paused,
+            "pause must invalidate the cached engine"
+        );
+
+        // Resume → immediately reflected again.
+        assert!(cache.resume_route(org, created.id).await.unwrap());
+        assert!(
+            !cache.engine_for(org).await.unwrap().routes()[0].paused,
+            "resume must invalidate the cached engine"
+        );
+    }
+
     #[tokio::test]
     async fn create_invalidates_so_engine_sees_it() {
         let backing = Arc::new(InMemoryRoutingStore::new());
@@ -252,6 +339,9 @@ mod tests {
                         redact: false,
                         traffic_pct: None,
                         shadow_model: None,
+                        auto_pause: false,
+                        pause_floor_pass_rate: None,
+                        pause_min_verdicts: None,
                     },
                 },
             )

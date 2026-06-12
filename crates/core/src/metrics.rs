@@ -137,6 +137,24 @@ pub fn record_request_pass_rejected(pass: &'static str) {
     metrics::counter!("request_pass_rejected_total", "pass" => pass).increment(1);
 }
 
+/// Count one request that matched a PAUSED route and was passed through on
+/// its originally-requested model (rewrite suppressed — the fail-safe
+/// expensive direction). `route` is the matched route NAME (bounded
+/// cardinality); owned-String label per the `record_provider_cache_usage`
+/// precedent.
+pub fn record_route_paused_passthrough(route: &str) {
+    metrics::counter!("route_paused_passthrough_total", "route" => route.to_string()).increment(1);
+}
+
+/// Count one auto-pause TRIGGER: the quality evaluator
+/// (`crate::route_autopause::AutoPauseJudgeSink`) sticky-paused a route whose
+/// windowed paired pass-rate fell below its floor. One increment per newly
+/// created pause (a raced `Ok(false)` does not count). `route` is the route
+/// NAME (bounded cardinality), owned-String label as above.
+pub fn record_route_auto_paused(route: &str) {
+    metrics::counter!("route_auto_paused_total", "route" => route.to_string()).increment(1);
+}
+
 /// Convert a non-negative USD amount to integer micro-USD for a true
 /// Prometheus counter (the `metrics` counter API is integer-only; a gauge
 /// "used as a counter" breaks `rate()`/`increase()` across process restarts).

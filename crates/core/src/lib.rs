@@ -15,6 +15,8 @@ pub mod quality_persist;
 pub mod quality_sample;
 pub mod registry;
 pub mod retry;
+pub mod route_autopause;
+pub mod route_savings;
 pub mod routes;
 pub mod server;
 pub mod single_flight;

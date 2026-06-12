@@ -446,6 +446,11 @@ pub struct StreamLogContext {
     /// matched). Shadow mode is non-streaming, so the streaming row never carries
     /// a `shadow_model` / `shadow_cost_usd`.
     pub traffic_split_arm: Option<String>,
+    /// The matched route was sticky-PAUSED (rewrite suppressed; the stream was
+    /// served on the originally-requested model). Recorded on the
+    /// `request_logs.route_paused` marker; `false` for unrouted/unpaused
+    /// requests.
+    pub route_paused: bool,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -709,6 +714,7 @@ pub fn stream_response(
             let cache_insert = ctx.cache_insert;
             let span_ctx = ctx.span_ctx;
             let traffic_split_arm = ctx.traffic_split_arm.clone();
+            let route_paused = ctx.route_paused;
 
             let guard = DropGuard::new(move || {
                 let inner = shared_for_guard
@@ -825,6 +831,7 @@ pub fn stream_response(
                     // never batch-eligible and forgoes nothing.
                     batch_eligible: false,
                     batch_forgone_usd: 0.0,
+                    route_paused,
                 };
 
                 // Per-route provider-cache counters on cleanly completed

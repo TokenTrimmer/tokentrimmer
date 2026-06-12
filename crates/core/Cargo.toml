@@ -83,6 +83,10 @@ tt-retrieval.workspace = true
 # against the migrated schema (catches column-order/type drift that the
 # parser-based bind-count guard cannot).
 tt-telemetry = { workspace = true, features = ["postgres"] }
+# DB-gated route_pauses test: drive the real PostgresRoutingStore
+# pause/resume SQL against the migrated schema (the test creates the minimal
+# cloud-shaped `routes` table itself — public migrations don't own it).
+tt-routing = { workspace = true, features = ["postgres"] }
 reqwest.workspace = true
 # Traceparent-ingest test: in-memory span exporter + a scoped tracing-opentelemetry
 # subscriber to capture the gateway request span's trace_id/parent_span_id.

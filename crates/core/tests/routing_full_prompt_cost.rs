@@ -183,6 +183,7 @@ async fn cost_condition_counts_full_prompt() {
     backing.set_routes(
         org,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "cost-downgrade".into(),
             priority: 100,
@@ -192,6 +193,9 @@ async fn cost_condition_counts_full_prompt() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

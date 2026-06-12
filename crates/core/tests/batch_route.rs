@@ -295,6 +295,7 @@ async fn app_with_batch_route(model_in: &str, batch: bool) -> Harness {
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "batch-route".into(),
             priority: 100,
@@ -304,6 +305,9 @@ async fn app_with_batch_route(model_in: &str, batch: bool) -> Harness {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: model_in.into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

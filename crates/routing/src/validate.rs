@@ -7,7 +7,9 @@ use tt_shared::pricing::{Capability, ModelInfo};
 
 use crate::{RouteAction, RouteConditions};
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+// `Eq` dropped (not just `PartialEq`) because `InvalidPauseFloor` carries the
+// rejected f64; no caller relied on `Eq`.
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ValidationError {
     #[error("target_model `{target}` is missing the `{capability}` capability required by this route's content-type condition")]
     MissingCapability {
@@ -16,6 +18,27 @@ pub enum ValidationError {
     },
     #[error("shadow_model `{shadow}` does not resolve to any registered provider")]
     UnresolvableShadowModel { shadow: String },
+    #[error("pause_floor_pass_rate must be a fraction in (0, 1], got {got}")]
+    InvalidPauseFloor { got: f64 },
+    #[error("pause_min_verdicts must be >= 1")]
+    InvalidPauseMinVerdicts,
+}
+
+/// Reject malformed auto-pause config at route-creation time: a
+/// `pause_floor_pass_rate` outside `(0, 1]` (or NaN) and a
+/// `pause_min_verdicts` of 0 are pure mistakes. Validated even when
+/// `auto_pause` is false — bad config is bad config, and silently accepting
+/// it would bite the moment the flag flips on.
+pub fn validate_auto_pause(then: &RouteAction) -> Result<(), ValidationError> {
+    if let Some(floor) = then.pause_floor_pass_rate {
+        if floor.is_nan() || floor <= 0.0 || floor > 1.0 {
+            return Err(ValidationError::InvalidPauseFloor { got: floor });
+        }
+    }
+    if then.pause_min_verdicts == Some(0) {
+        return Err(ValidationError::InvalidPauseMinVerdicts);
+    }
+    Ok(())
 }
 
 /// Reject a route whose `shadow_model` cannot resolve to a registered provider —
@@ -83,6 +106,9 @@ mod tests {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
         }
     }
     fn vision_model(id: &str) -> ModelInfo {
@@ -149,6 +175,49 @@ mod tests {
                 shadow: "does-not-exist".into()
             })
         );
+    }
+
+    /// Auto-pause config bounds: the floor must be a fraction in (0, 1] (NaN
+    /// rejected), `pause_min_verdicts` must be >= 1 — validated even when
+    /// `auto_pause` is false (bad config is bad config).
+    #[test]
+    fn validate_auto_pause_bounds() {
+        // No auto-pause config at all → OK.
+        assert!(validate_auto_pause(&action("m")).is_ok());
+
+        let mut a = action("m");
+        a.pause_floor_pass_rate = Some(0.9);
+        assert!(validate_auto_pause(&a).is_ok());
+        a.pause_floor_pass_rate = Some(1.0);
+        assert!(validate_auto_pause(&a).is_ok(), "1.0 is an allowed floor");
+        for bad in [0.0, -0.1, 1.5, f64::NAN] {
+            a.pause_floor_pass_rate = Some(bad);
+            assert!(
+                matches!(
+                    validate_auto_pause(&a),
+                    Err(ValidationError::InvalidPauseFloor { .. })
+                ),
+                "floor {bad} must be rejected"
+            );
+        }
+
+        let mut b = action("m");
+        b.pause_min_verdicts = Some(0);
+        assert!(
+            matches!(
+                validate_auto_pause(&b),
+                Err(ValidationError::InvalidPauseMinVerdicts)
+            ),
+            "min == 0 must be rejected"
+        );
+        b.pause_min_verdicts = Some(1);
+        assert!(validate_auto_pause(&b).is_ok());
+        b.pause_min_verdicts = None;
+        assert!(validate_auto_pause(&b).is_ok());
+        // Validated even when auto_pause itself is off.
+        b.auto_pause = false;
+        b.pause_floor_pass_rate = Some(2.0);
+        assert!(validate_auto_pause(&b).is_err());
     }
 
     /// A `shadow_model` with no `traffic_pct` (100% shadow, primary still serves)

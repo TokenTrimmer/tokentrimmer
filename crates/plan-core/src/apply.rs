@@ -303,6 +303,9 @@ mod tests {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
             },
         }]
     }

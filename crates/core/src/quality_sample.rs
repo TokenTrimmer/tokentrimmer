@@ -27,17 +27,24 @@
 //!    id to a uniform `[0, 1)` fraction and compares it to the rate. Same trace +
 //!    rate → same decision; across traces the keep-set is uniform. Rate `1.0`
 //!    judges every eligible request, `0.0` judges none.
-//! 5. **Record only.** The judge records a score + risk band. It never pauses a
-//!    route — auto-pause is a deliberate follow-up.
+//! 5. **Record only.** The recording sinks here score + band; they never pause
+//!    a route. The ONE sanctioned pause path is the opt-in
+//!    [`crate::route_autopause::AutoPauseJudgeSink`] (the Phase-2.3 follow-up
+//!    this invariant anticipated), appended to the fanout via
+//!    [`crate::AppState::with_route_auto_pause`] and gated per-route by
+//!    `RouteAction::auto_pause`.
 //! 6. **Measurement tax is ledgered, not budgeted (MVP).** The baseline
 //!    reference dispatch and judge call(s) bill the org on its own provider
 //!    credentials, but they are deliberately NOT counted toward the
 //!    `monthly_cap_usd` enforcer and never appear in `request_logs` — they
 //!    live only in `quality_verdicts` (+ the `tokentrimmer.quality.*` span
-//!    attributes) so Phase-2 netting can reconcile them. At the default ~2%
-//!    sample this budget blind spot is bounded; raising
-//!    `TT_JUDGE_SAMPLE_RATE` (or enabling `TT_JUDGE_BOTH_ORDERS`) raises the
-//!    uncapped measurement spend proportionally.
+//!    attributes). The Phase-2.3 netting reconciles them per route via
+//!    [`crate::route_savings::ROUTE_SAVINGS_SQL`] (a `route_id` GROUP BY over
+//!    `quality_verdicts`, itemized as `judge_tax_usd` — never silently
+//!    subtracted). At the default ~2% sample this budget blind spot is
+//!    bounded; raising `TT_JUDGE_SAMPLE_RATE` (or enabling
+//!    `TT_JUDGE_BOTH_ORDERS`) raises the uncapped measurement spend
+//!    proportionally.
 
 use std::sync::Arc;
 
@@ -289,8 +296,10 @@ pub struct JudgeOutcome {
     /// whose billed cost we cannot state — no catalog pricing for the judge
     /// model, OR the call failed/timed out after dispatch (the provider may
     /// have billed it anyway). Never persisted as `0`, so downstream can
-    /// distinguish "genuinely ~$0" from "unknown". Phase 2 nets this into
-    /// routing attribution.
+    /// distinguish "genuinely ~$0" from "unknown". The Phase-2.3 netting
+    /// ([`crate::route_savings::ROUTE_SAVINGS_SQL`]) sums this into the
+    /// route's itemized `judge_tax_usd` and counts NULLs as
+    /// `unmetered_tax_rows` (the tax becomes a lower bound).
     pub judge_cost_usd: Option<f64>,
     /// Cost (USD) of the baseline reference dispatch, when the reference was
     /// produced by re-dispatching the baseline model inside the detached task
@@ -437,11 +446,16 @@ impl JudgeSink for InMemoryJudgeBandStore {
     }
 }
 
-/// A [`JudgeSink`] that clones each outcome to every wired sink. Production
-/// wires `[InMemoryJudgeBandStore, PostgresJudgeSink]` so one recorded verdict
-/// both feeds the live `/v1/preview` enrichment AND lands durably in the
-/// `quality_verdicts` table (Phase 2 attribution netting). Record-only, like
-/// every sink: it never pauses routes.
+/// A [`JudgeSink`] that clones each outcome to every wired sink, awaiting them
+/// SEQUENTIALLY in order. Production wires `[InMemoryJudgeBandStore,
+/// PostgresJudgeSink]` so one recorded verdict both feeds the live
+/// `/v1/preview` enrichment AND lands durably in the `quality_verdicts` table
+/// (the Phase-2.3 netting reads it via
+/// [`crate::route_savings::ROUTE_SAVINGS_SQL`]). The in-order await is what
+/// lets [`crate::AppState::with_route_auto_pause`] append the opt-in
+/// [`crate::route_autopause::AutoPauseJudgeSink`] AFTER the persistent sink —
+/// the just-recorded verdict is already in the DB window when the evaluator
+/// consults it. The recording sinks themselves never pause routes.
 pub struct FanoutJudgeSink {
     sinks: Vec<Arc<dyn JudgeSink>>,
 }

@@ -195,6 +195,7 @@ async fn route_to_local_dispatches_to_ollama_provider() {
     backing.set_routes(
         org,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "to-local".into(),
             priority: 100,
@@ -204,6 +205,9 @@ async fn route_to_local_dispatches_to_ollama_provider() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "ollama/llama3.1:8b".into(),
                 fallbacks: vec![],
                 disable_cache: false,

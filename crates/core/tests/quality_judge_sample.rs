@@ -319,6 +319,7 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
         routes_backing.set_routes(
             org_id,
             vec![Route {
+                paused: false,
                 id: Uuid::now_v7(),
                 name: "downgrade-4o".into(),
                 priority: 100,
@@ -328,6 +329,9 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     ..Default::default()
                 },
                 then: RouteAction {
+                    auto_pause: false,
+                    pause_floor_pass_rate: None,
+                    pause_min_verdicts: None,
                     target_model: "gpt-4o-mini".into(),
                     fallbacks: Vec::new(),
                     disable_cache: false,
@@ -1182,6 +1186,7 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "downgrade-4o".into(),
             priority: 100,
@@ -1191,6 +1196,9 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

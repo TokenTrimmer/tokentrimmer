@@ -22,8 +22,12 @@ pub use cache::CachingRoutingStore;
 pub use latency::{LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
 #[cfg(feature = "postgres")]
 pub use store::PostgresRoutingStore;
-pub use store::{InMemoryRoutingStore, NewRoute, RoutingStore, RoutingStoreError};
-pub use validate::{validate_capability, validate_shadow_model, ValidationError};
+pub use store::{
+    InMemoryRoutingStore, NewRoute, NewRoutePause, PausedBy, RoutingStore, RoutingStoreError,
+};
+pub use validate::{
+    validate_auto_pause, validate_capability, validate_shadow_model, ValidationError,
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -47,6 +51,16 @@ pub struct Route {
     pub when: RouteConditions,
     /// What to do when matched.
     pub then: RouteAction,
+    /// Whether a sticky pause currently suppresses this route's rewrite. A
+    /// paused route still MATCHES (attribution + telemetry marker) but every
+    /// cost lever is disabled — requests flow to the originally-requested
+    /// model (the EXPENSIVE, quality-safe direction) until an explicit
+    /// resume (`POST /v1/routes/:id/resume`). Populated by the store
+    /// (`route_pauses` LEFT JOIN / in-memory pause map), never written by
+    /// callers; false-omitted keeps `/v1/routes` JSON + any fixtures
+    /// byte-stable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
 }
 
 /// Match conditions for a [`Route`]. v1 supports four predicates — extend
@@ -210,6 +224,26 @@ pub struct RouteAction {
     /// from JSON when `None` (back-compat with existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_model: Option<String>,
+    /// OPT-IN auto-pause: when true AND the paired-judge pass-rate over the
+    /// recent verdict window drops below the floor (with at least
+    /// `pause_min_verdicts` classified verdicts), the gateway pauses this
+    /// route's rewrite (sticky; resume via `POST /v1/routes/:id/resume`).
+    /// Default false — no behavior change unless a route enables it; omitted
+    /// from JSON when false (back-compat with existing rows).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_pause: bool,
+    /// Pass-rate floor as a fraction in (0, 1]. The route auto-pauses when
+    /// its windowed paired pass rate drops STRICTLY below this. `None` =
+    /// the gateway default (`DEFAULT_PAUSE_FLOOR_PASS_RATE` = 0.90 in
+    /// tt-core). Omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_floor_pass_rate: Option<f64>,
+    /// Minimum classified verdicts (acceptable + degraded) in-window before
+    /// the floor can trigger. `None` = the gateway default
+    /// (`DEFAULT_PAUSE_MIN_VERDICTS` = 20 in tt-core). Omitted from JSON
+    /// when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_min_verdicts: Option<u32>,
 }
 
 /// Deterministic, replica-independent canary arm selection.
@@ -480,7 +514,11 @@ mod tests {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
             },
+            paused: false,
         }
     }
 
@@ -788,6 +826,9 @@ mod tests {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -821,6 +862,9 @@ mod tests {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -846,6 +890,9 @@ mod tests {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -1371,6 +1418,47 @@ mod tests {
                 "pct={pct}: observed canary share {observed:.2}% off target by >3pp"
             );
         }
+    }
+
+    /// `Route.paused` is false-omitted on serialize (fixture/snapshot
+    /// stability), absent-defaults-false on deserialize, and the
+    /// `RouteAction` auto-pause fields default false/None and are omitted
+    /// when default — existing JSON rows/fixtures stay byte-stable.
+    #[test]
+    fn route_paused_false_omitted_on_serialize() {
+        let route = make_route("r", 10, vec!["gpt-4o"], "gpt-4o-mini");
+        let j = serde_json::to_string(&route).unwrap();
+        assert!(
+            !j.contains("\"paused\""),
+            "paused=false must be omitted: {j}"
+        );
+        let back: Route = serde_json::from_str(&j).unwrap();
+        assert!(!back.paused, "absent key must deserialize to false");
+
+        // RouteAction auto-pause fields: default + omitted when default.
+        let a = route.then.clone();
+        let ja = serde_json::to_string(&a).unwrap();
+        assert!(!ja.contains("auto_pause"), "{ja}");
+        assert!(!ja.contains("pause_floor_pass_rate"), "{ja}");
+        assert!(!ja.contains("pause_min_verdicts"), "{ja}");
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.auto_pause, "auto_pause must default false (OFF)");
+        assert_eq!(parsed.pause_floor_pass_rate, None);
+        assert_eq!(parsed.pause_min_verdicts, None);
+
+        // Round-trip when set.
+        let mut b = a;
+        b.auto_pause = true;
+        b.pause_floor_pass_rate = Some(0.85);
+        b.pause_min_verdicts = Some(10);
+        let jb = serde_json::to_string(&b).unwrap();
+        assert!(jb.contains("\"auto_pause\":true"), "{jb}");
+        assert!(jb.contains("\"pause_floor_pass_rate\":0.85"), "{jb}");
+        assert!(jb.contains("\"pause_min_verdicts\":10"), "{jb}");
+        let back: RouteAction = serde_json::from_str(&jb).unwrap();
+        assert!(back.auto_pause);
+        assert_eq!(back.pause_floor_pass_rate, Some(0.85));
+        assert_eq!(back.pause_min_verdicts, Some(10));
     }
 
     /// Two different orgs reusing the SAME idempotency-key string get

@@ -262,6 +262,7 @@ async fn fallback_header_overrides_route_chain() {
     backing.set_routes(
         DOGFOOD_ORG_ID,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "r".into(),
             priority: 100,
@@ -271,6 +272,9 @@ async fn fallback_header_overrides_route_chain() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "primary-model".into(),
                 fallbacks: vec!["route-fb".into()],
                 disable_cache: false,
