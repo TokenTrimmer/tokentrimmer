@@ -492,7 +492,9 @@ async fn request_logs_insert_round_trips_against_postgres() {
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused: true,
-        minify_saved_est_usd: 0.0,
+        // Nonzero on purpose: pins the f64 → NUMERIC(12,6) encode of the NEW
+        // 0020 column against real Postgres, not just the bind position.
+        minify_saved_est_usd: 0.000412,
     };
     let id = row.id;
     writer
@@ -500,8 +502,9 @@ async fn request_logs_insert_round_trips_against_postgres() {
         .await
         .expect("PostgresRequestLogWriter::write must succeed (bind chain == placeholders)");
 
-    let (provider, route_paused) = sqlx::query_as::<_, (String, bool)>(
-        "SELECT provider, route_paused FROM request_logs WHERE id = $1",
+    let (provider, route_paused, minify_est) = sqlx::query_as::<_, (String, bool, f64)>(
+        "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8 \
+         FROM request_logs WHERE id = $1",
     )
     .bind(id)
     .fetch_one(&pool)
@@ -509,6 +512,10 @@ async fn request_logs_insert_round_trips_against_postgres() {
     .expect("fetch row");
     assert_eq!(provider, "test-provider");
     assert!(route_paused, "route_paused=true must survive write→read");
+    assert!(
+        (minify_est - 0.000412).abs() < 1e-9,
+        "minify_saved_est_usd must round-trip nonzero through NUMERIC(12,6), got {minify_est}"
+    );
 
     sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
         .execute(&pool)

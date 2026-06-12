@@ -1117,7 +1117,14 @@ pub async fn handler(
             // req.model already holds the canary target (apply_routing rewrote it).
         } else {
             traffic_split_arm = Some("control");
-            // Revert to the originally-requested model — serve unchanged.
+            // Revert to the originally-requested model. NOTE: only the MODEL
+            // is reverted — route ACTIONS captured above (compress, and now
+            // minify_json / reasoning caps) still apply on the control arm,
+            // matching the long-standing compress precedent. A traffic split
+            // therefore does not A/B the shaping actions themselves (an
+            // action-only same-model route splits nothing); arm-level
+            // shaped-vs-unshaped comparison comes from the paired-judge
+            // channel, whose baseline is captured pre-shaping.
             if let Some(target) = route_target_model.as_deref() {
                 if req.model == target {
                     req.model = requested_model.clone();
@@ -1269,6 +1276,14 @@ pub async fn handler(
     // provider/model (post-routing/pin). Books $0 — the unspent thinking
     // tokens are only statistically visible; `reasoning_capped` feeds the
     // metric and judge eligibility (`output_shaped`).
+    //
+    // ORDERING COUPLING: this runs after `maybe_minify_json`, so when both
+    // actions are configured on one route the class-gate classifier sees the
+    // injected `MINIFY_JSON_INSTRUCTION` text too. Today no word in that
+    // instruction matches any `reasoning_class` keyword set (verified), but a
+    // rewording that introduces one (e.g. "function") would silently
+    // class-gate every minify+cap request — if you edit either the
+    // instruction or the keyword tables, re-check the intersection.
     let served_model_info = state.registry.model_info(&req.model).cloned();
     let reasoning_capped = maybe_cap_reasoning(
         &mut req,
@@ -2643,6 +2658,12 @@ fn maybe_mark_batch_eligible(
 /// phrased ("When responding with JSON") so it is inert for non-JSON answers —
 /// the booking below is additionally gated on the response actually parsing
 /// as JSON.
+///
+/// EDITING THIS TEXT: `maybe_cap_reasoning` classifies the request AFTER this
+/// suffix is injected, so the instruction must never contain a
+/// `crate::reasoning_class` keyword (e.g. "function", "theorem") or every
+/// minify+cap request would silently class-gate. Re-check the keyword tables
+/// when rewording.
 pub(crate) const MINIFY_JSON_INSTRUCTION: &str =
     "\n\nWhen responding with JSON, emit it minified: no indentation, no newlines, and no spaces between JSON tokens.";
 
@@ -2748,6 +2769,11 @@ fn maybe_minify_json(
 /// 5. When neither lever exists for this request (effort dropped by the
 ///    provider AND no enabled thinking config) while a cap is configured, one
 ///    honest `reasoning_cap_skipped:unsupported:<provider>` token is pushed.
+///    Known corner: a route configuring ONLY `reasoning_budget_tokens`, hit
+///    by a request on an effort-capable surface with no thinking config,
+///    no-ops silently — the surface DOES carry a lever (so `unsupported`
+///    would be a lie), there was just nothing for the configured cap to
+///    lower. Zero cost impact ($0 is booked regardless).
 ///
 /// Books $0 ALWAYS: `Usage` carries no reasoning-token field, so the unspent
 /// thinking tokens are only statistically visible — the event is metered

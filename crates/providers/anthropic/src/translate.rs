@@ -273,6 +273,15 @@ fn resolved_max_tokens(req: &tt_shared::ChatCompletionRequest) -> u32 {
 /// pre-passthrough behavior), and `dropped_params` reports `thinking` so the
 /// drop is no longer silent. The mirror rule: `dropped_params` and
 /// `translate_request` both consult THIS function, like every other entry.
+///
+/// Interaction with `reasoning_budget_tokens` (gateway route action): the cap
+/// runs upstream of this gate and checks only `type == "enabled"`, not
+/// forwardability — so a config that would have been dropped here for
+/// `budget_tokens >= max_tokens` can be lowered under the cap and become
+/// FORWARDED (with the consequent temperature/top_p suppression). Deliberate:
+/// the caller explicitly requested thinking, so honoring it at the capped
+/// budget is more faithful than the old silent drop, and the cap's `>= 1024`
+/// create-time validation means the floor here still holds.
 pub(crate) fn forwardable_thinking(
     req: &tt_shared::ChatCompletionRequest,
 ) -> Option<serde_json::Value> {
