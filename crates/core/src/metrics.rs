@@ -130,6 +130,56 @@ fn cache_result(cache_read: Option<u64>, cache_creation: Option<u64>) -> &'stati
     }
 }
 
+/// Count a request pass discarded by the token-true gate (its transform ADDED
+/// tokens and was rolled back, booking zero savings). Labelled by pass name so
+/// a misbehaving pass is attributable.
+pub fn record_request_pass_rejected(pass: &'static str) {
+    metrics::counter!("request_pass_rejected_total", "pass" => pass).increment(1);
+}
+
+/// Convert a non-negative USD amount to integer micro-USD for a true
+/// Prometheus counter (the `metrics` counter API is integer-only; a gauge
+/// "used as a counter" breaks `rate()`/`increase()` across process restarts).
+fn usd_to_microusd(usd: f64) -> u64 {
+    if usd.is_finite() && usd > 0.0 {
+        (usd * 1_000_000.0).round() as u64
+    } else {
+        0
+    }
+}
+
+/// Record a deliberate stable-prefix mutation (a booked
+/// [`CacheBustEstimate`](crate::passes::CacheBustEstimate)): one count per
+/// bust by source, plus the estimated penalty accumulated as integer
+/// micro-USD into a true counter (divide by 1e6 in dashboards).
+///
+/// Basis notes:
+/// - the penalty here is **pre-fee** (provider-invoice basis); the
+///   `x-tokentrimmer-cache-bust-usd` header / `CostBreakdown` figure is
+///   fee-applied — the two differ by the provider fee multiplier.
+/// - this meters in the PASS stage, BEFORE the L1/L2 cache lookups: a request
+///   later served from TokenTrimmer's own cache (no upstream dispatch) still
+///   counts here while its response header reads 0. Series consumers should
+///   treat these as "busts computed at ingress", not "busts dispatched".
+pub fn record_cache_bust(source: &'static str, penalty_usd: f64) {
+    metrics::counter!("cache_bust_total", "source" => source).increment(1);
+    metrics::counter!("cache_bust_penalty_microusd_total").increment(usd_to_microusd(penalty_usd));
+}
+
+/// Record a cache-classifier finding: a volatile marker (timestamp / uuid /
+/// hex-token) inside a would-be-stable cached prefix. One count per kind, plus
+/// the estimated per-request waste accumulated as integer micro-USD into a
+/// true counter (the caller books the waste exactly once per request — pass
+/// 0.0 for additional kinds on the same request). Monthly cost = a 30d
+/// aggregation over the waste series in the dashboard (÷ 1e6 for USD); the
+/// handler cannot know per-route volume. Same basis caveats as
+/// [`record_cache_bust`]: pre-fee, metered before the L1/L2 lookups.
+pub fn record_cache_dynamic_prefix(kind: &'static str, est_wasted_usd: f64) {
+    metrics::counter!("cache_dynamic_prefix_total", "kind" => kind).increment(1);
+    metrics::counter!("cache_dynamic_prefix_waste_microusd_total")
+        .increment(usd_to_microusd(est_wasted_usd));
+}
+
 #[cfg(test)]
 mod tests {
     use super::cache_result;

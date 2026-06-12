@@ -38,6 +38,7 @@ use tt_shared::{
 
 use crate::{
     middleware::trace::TraceId,
+    passes::PassEffects,
     retry::{with_retry, RetryPolicy},
     routes::sse::{self, CacheInsertContext, StreamLogContext, StreamSpanContext},
     single_flight::wait_for_leader,
@@ -1075,6 +1076,35 @@ pub async fn handler(
     // against the FINAL served provider/model (post-routing/pin/failover-primary).
     let flex_applied = maybe_apply_flex(&mut req, route_flex, provider.as_ref(), &mut warnings);
 
+    // ── Request-pass stage ───────────────────────────────────────────────────
+    //
+    // Order: redaction (escape hatch) → compression pipeline (cache-aware
+    // split + token-true gate) → cache classifier (always-on diagnostics).
+    // The stage works on a cache-aware SPLIT of the request:
+    // `SplitRequest::compute` derives the cache-stable prefix (everything the
+    // provider's prompt cache keys on — Anthropic: the system prefix the
+    // adapter marks per #126/#150 on a single-shot, the entire message list
+    // on a cache-qualified multi-turn conversation; OpenAI-style positional
+    // auto-cache: the entire message list whenever the prompt clears the
+    // model's minimum) and passes only the volatile tail to the pipeline
+    // mutably. The stable prefix is read-only BY TYPE — see the
+    // `crate::passes` module docs. Busting a cache-warm prefix reprices ~0.1x
+    // cache reads back to 1.0x, so a NON-deterministic transform that
+    // deliberately mutates it must book the estimated cost as a NEGATIVE
+    // savings entry (`CacheBustEstimate`) — never hide a cache bust.
+    //
+    // The model/pricing snapshot is taken AFTER routing/pin (the FINAL served
+    // provider) so token counts and penalties price what the upstream bills.
+    // Test/local providers carry no `prompt_cache_min_tokens`, which keeps
+    // them on the all-volatile (pre-split) path.
+    let pass_model = req.model.clone();
+    let pass_pricing = provider.pricing(&pass_model);
+    let pass_cx = crate::passes::PassContext {
+        provider_id: provider.id(),
+        model: &pass_model,
+        pricing: pass_pricing.as_ref(),
+    };
+
     // Request-redaction guardrail (`RouteAction::redact`): when the matched
     // route opted in, strip PII/secrets from the OUTBOUND request (user prose,
     // system blocks, tool-result content) BEFORE deriving cache keys /
@@ -1088,46 +1118,126 @@ pub async fn handler(
     // `req` is byte-for-byte unchanged on the default path. Runs before
     // compression so secrets are removed first; the `[REDACTED]` placeholder is
     // inert to the compression trims.
+    //
+    // Redaction needs whole-request reach — a secret inside the cache-stable
+    // prefix MUST still be stripped (safety beats cost) — so it is the
+    // escape-hatch user, not a pipeline pass: the handler consumes the split
+    // via `mutate_whole_request`. Redaction is DETERMINISTIC on the ingress
+    // bytes (fixed regexes, fixed `[REDACTED]` placeholder), so the dispatched
+    // prefix is byte-identical on every request/turn of a conversation and
+    // the provider's exact-prefix cache keeps hitting: NO bust occurs and the
+    // returned `CacheBustEstimate` is zero by construction (see
+    // `MutationDeterminism::DeterministicOnIngress`). A future
+    // NON-deterministic escape-hatch user (e.g. periodic history compaction)
+    // gets a real estimate from the same call and the booking below fires.
+    let mut cache_bust = crate::passes::CacheBustEstimate::NONE;
     if route_redact {
-        let fired = crate::passes::RedactionPass::new().redact(&mut req);
-        if !fired.is_empty() {
+        // Boundary + prefix token estimate are computed BEFORE the mutation:
+        // the warm prefix the provider cached is the pre-mutation bytes.
+        let split = crate::passes::SplitRequest::compute(&mut req, &pass_cx);
+        let stable_len = split.stable().messages.len();
+        let (req_mut, bust_token) = split.mutate_whole_request(
+            "redaction-1",
+            crate::passes::MutationDeterminism::DeterministicOnIngress,
+        );
+        let hits = crate::passes::RedactionPass::new().redact_indexed(req_mut);
+        if hits.is_empty() {
+            // Nothing fired — the prefix bytes are untouched, nothing to book.
+            bust_token.discard_unused();
+        } else {
+            let mut classes: Vec<crate::passes::RedactedField> =
+                hits.iter().map(|h| h.field).collect();
+            classes.sort_unstable();
+            classes.dedup();
             // Do NOT log the redacted values — only the field classes that fired.
             tracing::debug!(
                 org_id = %ctx.org_id,
-                redacted_classes = ?fired,
+                redacted_classes = ?classes,
                 "redaction guardrail stripped PII/secrets from the outbound request"
             );
-            for field in fired {
+            for field in classes {
                 warnings.push(field.warning_token().to_string());
+            }
+            if bust_token.busted_prefix_tokens > 0
+                && stable_len > 0
+                && hits.iter().any(|h| h.msg_index < stable_len)
+            {
+                // A NON-deterministic mutation fired INSIDE the cache-stable
+                // prefix: the dispatched bytes diverge from the warm prefix,
+                // the provider's exact-prefix match misses, and the prefix
+                // re-bills at the full input rate instead of ~0.1x. Book the
+                // negative entry — never hide a cache bust. (Unreachable for
+                // redaction, whose deterministic estimate is zero; kept live
+                // so the next escape-hatch user books automatically.)
+                warnings.push(format!("cache_bust:{}", bust_token.source));
+                crate::metrics::record_cache_bust(
+                    bust_token.source,
+                    bust_token.penalty_usd(pass_cx.pricing),
+                );
+                cache_bust = bust_token;
+            } else {
+                // Deterministic mutation (no bust by construction), hits only
+                // in the volatile tail, or nothing cache-qualified — nothing
+                // to book.
+                bust_token.discard_unused();
             }
         }
     }
 
     // Request-pass pipeline (compression pass #1): when the matched route opted
     // in (`RouteAction::compress`), run the conservative, content-lossless trim
-    // of non-prose blocks BEFORE deriving cache keys / dispatching. Off by
-    // default — `route_compress` is false for every unrouted request and every
-    // route that did not enable it, so `req` is byte-for-byte unchanged on the
-    // default path. Running it here (against the FINAL served provider's
-    // tokenizer) means the trimmed prompt is what gets cached AND dispatched, so
-    // the upstream meters the reduced prompt-token count. The returned delta is
-    // the estimated input tokens removed; it drives the `compression` savings
-    // attribution in the cost path below (and is recorded for telemetry). A
-    // future, more-aggressive pass would attach a Wave-B2 judge gate inside
-    // `PassPipeline::run`; this conservative pass is lossless by construction.
+    // of non-prose VOLATILE-TAIL blocks BEFORE deriving cache keys /
+    // dispatching. Off by default — `route_compress` is false for every
+    // unrouted request and every route that did not enable it, so `req` is
+    // byte-for-byte unchanged on the default path. Running it here (against the
+    // FINAL served provider's tokenizer) means the trimmed prompt is what gets
+    // cached AND dispatched, so the upstream meters the reduced prompt-token
+    // count.
+    //
+    // The split is recomputed post-redaction (redaction may have changed the
+    // bytes the boundary estimate keys on). `PassPipeline::run` applies the
+    // TOKEN-TRUE GATE per pass: a transform that net-ADDS tokens is discarded
+    // (fail-open to the original bytes), metered, surfaced as
+    // `pass_rejected:<name>`, and books zero; the returned `tokens_removed` is
+    // the pipeline-MEASURED tokenizer delta of committed passes (never a
+    // pass's self-report), which drives the `compression` savings attribution
+    // in the cost path below. A future, more-aggressive pass would attach a
+    // Wave-B2 judge gate inside `PassPipeline::run`.
     let compression_tokens_removed: u32 = if route_compress {
-        let removed =
-            crate::passes::PassPipeline::conservative_compression().run(&mut req, provider.id());
-        if removed > 0 {
+        let out = {
+            let mut split = crate::passes::SplitRequest::compute(&mut req, &pass_cx);
+            crate::passes::PassPipeline::conservative_compression().run(&mut split, &pass_cx)
+        };
+        for name in &out.rejected {
+            warnings.push(format!("pass_rejected:{name}"));
+        }
+        warnings.extend(out.warnings);
+        if out.tokens_removed > 0 {
             tracing::debug!(
                 org_id = %ctx.org_id,
-                tokens_removed = removed,
+                tokens_removed = out.tokens_removed,
                 "compression pass removed input tokens"
             );
         }
-        removed
+        out.tokens_removed
     } else {
         0
+    };
+
+    // Stable/volatile cache classifier — ALWAYS ON (observability-only, no
+    // semantic change, so default-on is allowed): flags volatile markers
+    // (timestamp / uuid / hex token) inside a would-be-stable cached prefix
+    // via `cache_dynamic_prefix:<kind>` warning tokens + metrics, quantifying
+    // the estimated per-request waste of the busted provider cache. Read-only;
+    // it never injects `cache_control` (adapter-owned per #126/#150).
+    warnings.extend(crate::passes::CacheClassifierPass::classify(&req, &pass_cx));
+
+    // Aggregated pass effects for the cost path (threaded into both the
+    // non-streaming and streaming `compute_cost_full` calls): the measured
+    // compression delta plus the (pre-fee) cache-bust penalty booked above.
+    let pass_effects = crate::passes::PassEffects {
+        compression_tokens_removed,
+        cache_bust_penalty_usd: cache_bust.penalty_usd(pass_cx.pricing),
     };
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
@@ -1260,6 +1370,7 @@ pub async fn handler(
                             provider_cache_saved_usd: 0.0,
                             flex_saved_usd: 0.0,
                             compression_saved_usd: 0.0,
+                            cache_bust_penalty_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -1466,10 +1577,11 @@ pub async fn handler(
                 // at flex rates and attributes the standard-vs-flex saving to the
                 // `flex` source, matching the non-streaming path (FLEX-REWRITE (2)).
                 flex_applied,
-                // Thread the compression-pass token delta through so the streaming
-                // cost math attributes the standard-vs-compressed saving to the
-                // `compression` source, matching the non-streaming path.
-                compression_tokens_removed,
+                // Thread the request-pass effects through so the streaming cost
+                // math attributes the standard-vs-compressed saving to the
+                // `compression` source AND carries any cache-bust penalty,
+                // matching the non-streaming path.
+                pass_effects,
                 cache_insert: stream_cache_insert,
                 // Honor stream_options.include_usage end-to-end: emit an
                 // OpenAI-native final usage chunk when the client asked for it.
@@ -1824,7 +1936,7 @@ pub async fn handler(
             baseline_pricing.as_ref(),
             provider.fee_multiplier(),
             flex_applied,
-            compression_tokens_removed,
+            pass_effects,
         );
         let cost_usd = cost_breakdown.cost_usd;
         let baseline_cost_usd = cost_breakdown.baseline_cost_usd;
@@ -1978,6 +2090,9 @@ pub async fn handler(
                 cost_usd,
                 baseline_cost_usd,
                 provider_cache_saved_usd,
+                // Fee-applied, matching the header/span figure — keeps the
+                // row-derived TT headline equal to `tt_saved_usd()`.
+                cache_bust_penalty_usd: cost_breakdown.cache_bust_penalty_usd,
                 cached: false,
                 cache_layer: None,
                 route_id: matched_route_id,
@@ -2258,6 +2373,7 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         provider_cache_saved_usd: 0.0,
         flex_saved_usd: 0.0,
         compression_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -2323,6 +2439,7 @@ fn build_hit_l2_response(
         provider_cache_saved_usd: 0.0,
         flex_saved_usd: 0.0,
         compression_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -2554,21 +2671,43 @@ pub(crate) struct CostBreakdown {
     /// is a genuine TT-caused reduction in billed input tokens, not a provider
     /// discount, so it belongs in the TT headline).
     pub compression_saved_usd: f64,
+    /// NEGATIVE savings entry: the estimated cost induced by a deliberate
+    /// NON-deterministic stable-prefix mutation (a booked
+    /// `CacheBustEstimate`; no shipped transform books one today — redaction
+    /// is ingress-deterministic and busts nothing) — the prefix tokens
+    /// repriced from the ~0.1x cache-read rate back to the full input rate,
+    /// fee-applied. Zero on every request whose stable prefix was untouched.
+    /// It REDUCES [`tt_saved_usd`](Self::tt_saved_usd) pre-clamp
+    /// (conservative in TT's disfavor, same precedent as the cache-write
+    /// premium) but is NEVER folded into `cost_usd` / `baseline_cost_usd`:
+    /// it is an estimate of induced FUTURE cost, and those two fields must
+    /// reconcile against the realized provider invoice. Persisted on the
+    /// `request_logs` row (migration 0016) so the row-derived ledger agrees
+    /// with the header/span headline.
+    pub cache_bust_penalty_usd: f64,
 }
 
 impl CostBreakdown {
     /// TokenTrimmer-attributed savings: baseline minus actual cost, minus the
-    /// provider-side cache discount (which TokenTrimmer did not cause).
+    /// provider-side cache discount (which TokenTrimmer did not cause), minus
+    /// any booked cache-bust penalty (a cost TokenTrimmer DID cause).
     ///
     /// With no routing/caching by TT this is exactly 0 even when the provider
     /// reports cached tokens. When a cache-write premium exceeds the read
     /// discount (`provider_cache_saved_usd` clamped to 0), the premium reduces
-    /// the TT claim instead — conservative in TT's disfavor. Flex savings are
-    /// included here automatically: serving via flex lowers `cost_usd`, so the
-    /// baseline − cost delta picks the flex saving up (and `flex_saved_usd`
-    /// isolates the flex component for the methodology breakdown).
+    /// the TT claim instead — conservative in TT's disfavor; the cache-bust
+    /// penalty follows the same precedent (it subtracts pre-clamp, so a bust
+    /// can wipe the headline to 0 but never report a negative saving). Flex
+    /// savings are included here automatically: serving via flex lowers
+    /// `cost_usd`, so the baseline − cost delta picks the flex saving up (and
+    /// `flex_saved_usd` isolates the flex component for the methodology
+    /// breakdown).
     pub fn tt_saved_usd(&self) -> f64 {
-        (self.baseline_cost_usd - self.cost_usd - self.provider_cache_saved_usd).max(0.0)
+        (self.baseline_cost_usd
+            - self.cost_usd
+            - self.provider_cache_saved_usd
+            - self.cache_bust_penalty_usd)
+            .max(0.0)
     }
 }
 
@@ -2640,17 +2779,19 @@ pub(crate) fn compute_cost_with_flex(
         baseline_pricing,
         fee_multiplier,
         flex_applied,
-        0,
+        PassEffects::default(),
     )
 }
 
-/// Like [`compute_cost_with_flex`] but additionally attributes the savings from
-/// the conservative **compression pass**.
+/// Like [`compute_cost_with_flex`] but additionally attributes the
+/// request-pass [`PassEffects`]: the conservative **compression pass** saving
+/// and any **cache-bust penalty** (negative savings entry).
 ///
-/// `compression_tokens_removed` is the estimated input-token count the
-/// request-pass pipeline trimmed before dispatch (0 when the pass did not run).
-/// Those tokens are no longer in `usage.prompt_tokens` (the upstream metered the
-/// reduced prompt), so the realized `cost_usd` already excludes them. To
+/// `effects.compression_tokens_removed` is the pipeline-MEASURED input-token
+/// count the request-pass pipeline trimmed before dispatch (0 when the pass
+/// did not run; the token-true gate guarantees it is never an inflation).
+/// Those tokens are no longer in `usage.prompt_tokens` (the upstream metered
+/// the reduced prompt), so the realized `cost_usd` already excludes them. To
 /// attribute the saving we:
 ///
 /// - value the removed tokens at the served model's **standard input rate**
@@ -2665,13 +2806,21 @@ pub(crate) fn compute_cost_with_flex(
 /// Compression is a genuine TT-caused reduction in the input the customer sends
 /// upstream (not a provider discount), so it belongs in the TT headline —
 /// consistent with the provider-cache-vs-TT attribution rules.
+///
+/// `effects.cache_bust_penalty_usd` is the (pre-fee) estimated cost of a
+/// deliberate stable-prefix mutation booked via
+/// [`CacheBustEstimate`](crate::passes::CacheBustEstimate). It lands
+/// fee-applied in [`CostBreakdown::cache_bust_penalty_usd`] and reduces
+/// [`CostBreakdown::tt_saved_usd`] pre-clamp — but is NEVER folded into
+/// `cost_usd` / `baseline_cost_usd` (an estimate of induced future cost must
+/// not contaminate fields that reconcile against the realized invoice).
 pub(crate) fn compute_cost_full(
     usage: &Usage,
     pricing: Option<&ModelPricing>,
     baseline_pricing: Option<&ModelPricing>,
     fee_multiplier: f64,
     flex_applied: bool,
-    compression_tokens_removed: u32,
+    effects: PassEffects,
 ) -> CostBreakdown {
     let Some(pricing) = pricing else {
         return CostBreakdown::default();
@@ -2773,12 +2922,13 @@ pub(crate) fn compute_cost_full(
     // `baseline − cost` headline then includes the compression saving. Zero when
     // the pass did not run.
     let compression_saved_usd =
-        (compression_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
+        (effects.compression_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
     // Fold the removed-token value into the baseline at the baseline model's
     // input rate (what the customer would have paid sending the uncompressed
     // prompt to the baseline model).
-    let baseline_compression_usd =
-        (compression_tokens_removed as f64) * baseline_pricing.input_per_million / 1_000_000.0;
+    let baseline_compression_usd = (effects.compression_tokens_removed as f64)
+        * baseline_pricing.input_per_million
+        / 1_000_000.0;
 
     // Apply the provider surcharge (e.g. OpenRouter's 5% BYOK fee) to all
     // figures so the saved splits stay consistent (same scale factor). The
@@ -2792,6 +2942,7 @@ pub(crate) fn compute_cost_full(
             .max(0.0),
         flex_saved_usd: flex_saved_usd * fee_multiplier,
         compression_saved_usd: compression_saved_usd * fee_multiplier,
+        cache_bust_penalty_usd: effects.cache_bust_penalty_usd * fee_multiplier,
     }
 }
 
@@ -2866,6 +3017,17 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-compression-saved-usd",
             format!("{:.6}", cost.compression_saved_usd),
+        ),
+        // NEGATIVE savings entry: estimated cost of a deliberate
+        // NON-deterministic stable-prefix mutation — already subtracted from
+        // `saved_usd` pre-clamp. 0.000000 on every request whose stable
+        // prefix was untouched (and for all redaction traffic: an
+        // ingress-deterministic mutation dispatches byte-identical prefixes
+        // every turn, so it busts nothing). Never folded into cost/baseline
+        // (those reconcile against the realized invoice).
+        (
+            "x-tokentrimmer-cache-bust-usd",
+            format!("{:.6}", cost.cache_bust_penalty_usd),
         ),
     ];
 
@@ -3545,8 +3707,10 @@ fn request_log_for_l1_hit(
         cached_tokens: entry.response.usage.cached_tokens as i32,
         cost_usd: 0.0,
         baseline_cost_usd: baseline,
-        // TT cache hit — no provider call, no provider-side discount.
+        // TT cache hit — no provider call, no provider-side discount, and no
+        // upstream prompt cache exists to bust.
         provider_cache_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
         cached: true,
         cache_layer: Some("l1".into()),
         route_id,
@@ -3595,8 +3759,10 @@ fn request_log_for_l2_hit(
         cached_tokens: 0,
         cost_usd: 0.0,
         baseline_cost_usd,
-        // TT cache hit — no provider call, no provider-side discount.
+        // TT cache hit — no provider call, no provider-side discount, and no
+        // upstream prompt cache exists to bust.
         provider_cache_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
         cached: true,
         cache_layer: Some("l2".into()),
         route_id,
@@ -4337,6 +4503,117 @@ mod l2_baseline_tests {
     fn null_baseline_without_catalog_pricing_reports_zero() {
         let e = entry(None);
         assert_eq!(l2_entry_baseline(&e, None), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod cache_bust_tests {
+    use super::*;
+
+    fn pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing {
+            input_per_million: input,
+            output_per_million: output,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        }
+    }
+
+    fn usage_1m_input() -> Usage {
+        Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            cached_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }
+    }
+
+    /// The booked cache-bust penalty lands fee-applied in
+    /// `cache_bust_penalty_usd`, reduces `tt_saved_usd` PRE-clamp (and clamps
+    /// at 0 when it exceeds the savings), and never contaminates
+    /// `cost_usd` / `baseline_cost_usd` (invoice-reconcilable fields).
+    #[test]
+    fn cache_bust_penalty_reduces_tt_saved_pre_clamp() {
+        let served = pricing(1.0, 2.0);
+        let requested = pricing(5.0, 10.0); // routed-down: baseline 5x cost
+        let usage = usage_1m_input();
+
+        // No bust: headline = baseline − cost = 5.0 − 1.0 = 4.0.
+        let no_bust = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            PassEffects::default(),
+        );
+        assert!((no_bust.tt_saved_usd() - 4.0).abs() < 1e-9);
+        assert_eq!(no_bust.cache_bust_penalty_usd, 0.0);
+
+        // A $1.50 bust reduces the headline to 2.5 — cost/baseline unchanged.
+        let effects = PassEffects {
+            compression_tokens_removed: 0,
+            cache_bust_penalty_usd: 1.5,
+        };
+        let bd = compute_cost_full(&usage, Some(&served), Some(&requested), 1.0, false, effects);
+        assert!((bd.cache_bust_penalty_usd - 1.5).abs() < 1e-9);
+        assert!((bd.tt_saved_usd() - 2.5).abs() < 1e-9);
+        assert!(
+            (bd.cost_usd - no_bust.cost_usd).abs() < 1e-12,
+            "the penalty must never be folded into cost_usd"
+        );
+        assert!(
+            (bd.baseline_cost_usd - no_bust.baseline_cost_usd).abs() < 1e-12,
+            "the penalty must never be folded into baseline_cost_usd"
+        );
+
+        // The fee multiplier scales the penalty like every other figure.
+        let bd_fee = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.05,
+            false,
+            effects,
+        );
+        assert!((bd_fee.cache_bust_penalty_usd - 1.5 * 1.05).abs() < 1e-9);
+
+        // A penalty larger than the savings clamps the headline at 0 — never
+        // a negative saving.
+        let big = PassEffects {
+            compression_tokens_removed: 0,
+            cache_bust_penalty_usd: 100.0,
+        };
+        let clamped = compute_cost_full(&usage, Some(&served), Some(&requested), 1.0, false, big);
+        assert_eq!(clamped.tt_saved_usd(), 0.0);
+        assert!(
+            (clamped.cost_usd - 1.0).abs() < 1e-9,
+            "clamping happens in the headline only"
+        );
+    }
+
+    /// `compute_cost` / `compute_cost_with_flex` (the legacy entry points)
+    /// carry zero pass effects — no phantom penalty on any existing path.
+    #[test]
+    fn legacy_entry_points_have_zero_bust_penalty() {
+        let p = pricing(1.0, 2.0);
+        let usage = usage_1m_input();
+        assert_eq!(
+            compute_cost(&usage, Some(&p), Some(&p), 1.0).cache_bust_penalty_usd,
+            0.0
+        );
+        assert_eq!(
+            compute_cost_with_flex(&usage, Some(&p), Some(&p), 1.0, false).cache_bust_penalty_usd,
+            0.0
+        );
     }
 }
 

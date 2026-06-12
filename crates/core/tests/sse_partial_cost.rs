@@ -179,7 +179,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         spend_sink: tt_core::budget::SpendSink::None,
         fee_multiplier: 1.0,
         flex_applied: false,
-        compression_tokens_removed: 0,
+        pass_effects: tt_core::passes::PassEffects::default(),
         cache_insert: None,
         include_usage: false,
         span_ctx: None,
@@ -514,11 +514,15 @@ async fn tokentrimmer_usage_frame_shape_unchanged_with_include_usage() {
     }
     let v = data_json.expect("tokentrimmer.usage frame present");
     // Documented golden keys — the parallel SDK depends on these EXACTLY.
+    // (`cache_bust_usd` added by the cache-aware pass lane: the explicit
+    // negative-savings entry, so streaming clients see the bust MAGNITUDE and
+    // not just the penalty-reduced `saved_usd` headline.)
     for key in [
         "cost_usd",
         "baseline_cost_usd",
         "saved_usd",
         "provider_cache_saved_usd",
+        "cache_bust_usd",
         "input_tokens",
         "output_tokens",
         "cached_tokens",
@@ -531,8 +535,8 @@ async fn tokentrimmer_usage_frame_shape_unchanged_with_include_usage() {
     let obj = v.as_object().unwrap();
     assert_eq!(
         obj.len(),
-        7,
-        "tokentrimmer.usage frame must carry exactly the 7 documented keys; got {obj:?}"
+        8,
+        "tokentrimmer.usage frame must carry exactly the 8 documented keys; got {obj:?}"
     );
     assert_eq!(v["input_tokens"], 20);
     assert_eq!(v["output_tokens"], 5);

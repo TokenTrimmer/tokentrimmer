@@ -48,6 +48,7 @@ use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
 use tt_tokenize;
 
 use crate::budget::SpendSink;
+use crate::passes::PassEffects;
 use crate::state::{L1Config, L2Config};
 
 // ─── PartialUsage ─────────────────────────────────────────────────────────────
@@ -407,13 +408,16 @@ pub struct StreamLogContext {
     /// standard-vs-flex saving to the `flex` source (FLEX-REWRITE requirement
     /// (2)). When `false`, cost math is unchanged (standard rates).
     pub flex_applied: bool,
-    /// Estimated input tokens the conservative compression pass removed before
-    /// dispatch (0 when the route did not opt in). Threaded into the streaming
-    /// cost math so the standard-vs-compressed saving is attributed to the
-    /// `compression` source on the terminal `tokentrimmer.usage` event — parity
-    /// with the non-streaming path (the pass runs before the stream/non-stream
-    /// branch, so a compressed streaming request must attribute its saving too).
-    pub compression_tokens_removed: u32,
+    /// Request-pass effects: the (pipeline-measured) input tokens the
+    /// conservative compression pass removed before dispatch, plus any booked
+    /// cache-bust penalty (a redaction inside the stable prefix). Threaded
+    /// into the streaming cost math so the standard-vs-compressed saving is
+    /// attributed to the `compression` source AND the negative cache-bust
+    /// entry reduces the headline on the terminal `tokentrimmer.usage` event —
+    /// parity with the non-streaming path (the passes run before the
+    /// stream/non-stream branch, so a streaming request must carry their
+    /// effects too).
+    pub pass_effects: PassEffects,
     /// Optional cache insertion context. When `Some`, a cleanly-completed
     /// stream writes its reconstructed response into L1 (and L2 if configured)
     /// after the final chunk is sent.
@@ -468,9 +472,9 @@ struct TrackedEventStream {
     /// Whether the request was served via OpenAI Flex — meters the terminal
     /// `tokentrimmer.usage` cost at flex rates and attributes the flex saving.
     flex_applied: bool,
-    /// Estimated input tokens the compression pass removed — attributes the
-    /// `compression` saving on the terminal `tokentrimmer.usage` event.
-    compression_tokens_removed: u32,
+    /// Request-pass effects — attributes the `compression` saving and carries
+    /// the cache-bust penalty on the terminal `tokentrimmer.usage` event.
+    pass_effects: PassEffects,
     /// Honor `stream_options.include_usage`: emit an OpenAI-native final usage
     /// chunk before the `tokentrimmer.usage` frame when the client asked for it.
     include_usage: bool,
@@ -512,16 +516,20 @@ impl TrackedEventStream {
             self.baseline_pricing.as_ref(),
             self.fee_multiplier,
             self.flex_applied,
-            self.compression_tokens_removed,
+            self.pass_effects,
         );
         // `saved_usd` is strictly TT-attributed; the provider's automatic
         // cache discount rides in its own field (mirrors the response-header
-        // split on the non-streaming path).
+        // split on the non-streaming path). `cache_bust_usd` is the explicit
+        // negative-savings entry already subtracted from `saved_usd` pre-clamp
+        // — surfaced so streaming clients see the bust MAGNITUDE, not just the
+        // reduced headline (parity with `x-tokentrimmer-cache-bust-usd`).
         let json = serde_json::json!({
             "cost_usd": breakdown.cost_usd,
             "baseline_cost_usd": breakdown.baseline_cost_usd,
             "saved_usd": breakdown.tt_saved_usd(),
             "provider_cache_saved_usd": breakdown.provider_cache_saved_usd,
+            "cache_bust_usd": breakdown.cache_bust_penalty_usd,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_tokens": usage.cached_tokens,
@@ -662,9 +670,9 @@ pub fn stream_response(
             // Whether the request was served via OpenAI Flex — drives both the
             // terminal usage event and the request_logs row cost math.
             let flex_applied = ctx.flex_applied;
-            // Input tokens the compression pass removed — drives the
-            // `compression` saving on the terminal usage event + the row.
-            let compression_tokens_removed = ctx.compression_tokens_removed;
+            // Request-pass effects — drive the `compression` saving + the
+            // cache-bust penalty on the terminal usage event + the row.
+            let pass_effects = ctx.pass_effects;
             // Honor stream_options.include_usage on the egress.
             let include_usage = ctx.include_usage;
 
@@ -674,7 +682,7 @@ pub fn stream_response(
                 baseline_pricing: baseline_pricing.clone(),
                 fee_multiplier,
                 flex_applied,
-                compression_tokens_removed,
+                pass_effects,
                 include_usage,
                 phase: Phase::Streaming,
             };
@@ -719,7 +727,7 @@ pub fn stream_response(
                     baseline_pricing.as_ref(),
                     fee_multiplier,
                     flex_applied,
-                    compression_tokens_removed,
+                    pass_effects,
                 );
                 let cost_usd = breakdown.cost_usd;
                 let baseline_cost_usd = breakdown.baseline_cost_usd;
@@ -778,6 +786,9 @@ pub fn stream_response(
                     cost_usd,
                     baseline_cost_usd,
                     provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+                    // Fee-applied, matching the usage-event/span figure — keeps
+                    // the row-derived TT headline equal to `tt_saved_usd()`.
+                    cache_bust_penalty_usd: breakdown.cache_bust_penalty_usd,
                     cached: false,
                     cache_layer: None,
                     route_id,

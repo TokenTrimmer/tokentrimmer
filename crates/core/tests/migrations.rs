@@ -111,6 +111,21 @@ fn migrator_includes_provider_cache_tokens_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_cache_bust_penalty_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let sixteenth = migrations
+        .iter()
+        .find(|m| m.version == 16)
+        .expect("migration version 16 not found");
+    let desc = sixteenth.description.to_lowercase();
+    assert!(
+        desc.contains("cache") || desc.contains("bust"),
+        "migration 0016 description is '{}', expected to mention cache/bust",
+        sixteenth.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -134,6 +149,19 @@ async fn migrate_only_applies_schema() {
     .await
     .expect("query");
     assert!(exists, "request_logs table should exist after migrate_only");
+    // Migration 0014: the persisted negative-savings column is present.
+    let bust_col: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='request_logs' \
+         AND column_name='cache_bust_penalty_usd')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert!(
+        bust_col,
+        "request_logs.cache_bust_penalty_usd should exist after migration 0016"
+    );
 }
 
 #[test]
@@ -182,6 +210,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         cost_usd: 0.001,
         baseline_cost_usd: 0.001,
         provider_cache_saved_usd: 0.0002,
+        cache_bust_penalty_usd: 0.0,
         cached: false,
         cache_layer: None,
         route_id: None,
