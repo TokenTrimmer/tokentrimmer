@@ -46,6 +46,14 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 hyper = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
+# Direct dep ONLY so binaries can install an explicit process-default
+# CryptoProvider: the tree now links BOTH ring (reqwest 0.12 et al) and
+# aws-lc-rs (redis 1.x / opentelemetry-otlp 0.32), and rustls panics at first
+# default-provider use when more than one is linked (took prod down on the
+# 2026-06-12 deploy of #158 — the OTLP exporter's reqwest 0.13 client hit it
+# at boot). default-features = false so this declaration itself doesn't pull
+# aws-lc-rs a second way.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
