@@ -136,6 +136,27 @@ fn mcp_spawns_without_panic() {
 }
 
 #[test]
+fn mcp_allow_write_without_database_fails_closed() {
+    // --allow-write without DATABASE_URL must refuse to boot — write tools are
+    // org-scoped and need store-backed key verification. A clear error, not a
+    // silent fall-back to a read-only server the operator believes is writable.
+    let home = tempfile::tempdir().unwrap();
+    let args = &["mcp", "--tt-api-key", "tt_test_smoke", "--allow-write"];
+    let r = run_tt(home.path(), args, EXIT_WAIT);
+    assert!(
+        r.exited,
+        "`tt mcp --allow-write` did not exit; stderr:\n{}",
+        r.stderr
+    );
+    assert_no_panic(args, &r.stderr);
+    assert!(
+        r.stderr.contains("--allow-write requires DATABASE_URL"),
+        "expected the fail-closed message, got stderr:\n{}",
+        r.stderr
+    );
+}
+
+#[test]
 fn login_spawns_without_panic() {
     // --token path: no browser, writes only under the isolated $HOME.
     assert_exits_cleanly(&["login", "--token", "tt_test_smoke"]);

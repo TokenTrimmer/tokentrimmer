@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 60" width="60" height="60">
+  <!-- Original minimal TokenTrimmer "TT" mark: the second T's stem is trimmed. -->
+  <rect width="60" height="60" rx="12" fill="#0e7d61"/>
+  <rect x="9" y="15" width="20" height="6" rx="2" fill="#ffffff"/>
+  <rect x="16" y="15" width="6" height="30" rx="2" fill="#ffffff"/>
+  <rect x="31" y="15" width="20" height="6" rx="2" fill="#ffffff" opacity="0.85"/>
+  <rect x="38" y="15" width="6" height="20" rx="2" fill="#ffffff" opacity="0.85"/>
+</svg>

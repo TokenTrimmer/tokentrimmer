@@ -12,6 +12,7 @@ on:
       - 'docs/*.md'
       - 'sdk-python/README.md'
       - 'sdk-typescript/README.md'
+      - 'n8n-nodes-tokentrimmer/README.md'
       - 'examples/README.md'
       - 'lychee.toml'
       - '.github/workflows/link-check.yml'
@@ -22,6 +23,7 @@ on:
       - 'docs/*.md'
       - 'sdk-python/README.md'
       - 'sdk-typescript/README.md'
+      - 'n8n-nodes-tokentrimmer/README.md'
       - 'examples/README.md'
       - 'lychee.toml'
       - '.github/workflows/link-check.yml'
@@ -53,6 +55,7 @@ jobs:
             './docs/*.md'
             './sdk-python/README.md'
             './sdk-typescript/README.md'
+            './n8n-nodes-tokentrimmer/README.md'
             './examples/README.md'
           # Gate the job on broken links (this is the action default; set
           # explicitly so the intent is obvious).

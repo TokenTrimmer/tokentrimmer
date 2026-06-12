@@ -24,6 +24,25 @@ MCP server exposing TokenTrimmer intelligence to MCP-compatible clients.
 - `inspect_diff` — run Inspect rules on a proposed file diff
 - `lookup_semantic_cache` — check if a similar prompt was answered recently
 
+## Write tools (off by default)
+
+Two mutating tools ship in the MCP server, gated behind a write-enabled flag
+that is **off by default** — when disabled they are omitted from `tools/list`
+entirely and calling them returns `MethodNotFound` (-32601), so a read-only
+server stays read-only:
+
+- `add_route` — create a routing rule for your authenticated organization
+- `apply_plan` — apply a previously-simulated plan (a `plan_run` UUID from
+  `simulate_plan`)
+
+Enable them with `tt mcp --allow-write`. The flag requires `DATABASE_URL`:
+write tools are scoped to your verified org, so the CLI verifies the operator
+key against the key store at boot and **refuses to start** (a clear error, not
+a silent read-only fallback) when the database is unset/unreachable or the key
+fails verification. Without the flag, `tt mcp` boots read-only as before.
+Embedders of the `tt-mcp` crate opt in via `Server::with_write_enabled(true)`
++ `Server::register_write_tools(...)`.
+
 ## Day-0 resources
 
 - `mcp://tokentrimmer/cost-ledger/last-7d`
