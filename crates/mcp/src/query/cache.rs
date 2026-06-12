@@ -37,13 +37,14 @@ impl CacheKey {
     /// root-checked by the caller) through blake3.
     pub(crate) fn for_file(path: &Path, spec: &AggregationSpec) -> Result<Self, McpError> {
         let mut hasher = blake3::Hasher::new();
-        let mut f = std::fs::File::open(path)
-            .map_err(|e| McpError::Internal(format!("dataset file is unavailable ({})", e.kind())))?;
+        let mut f = std::fs::File::open(path).map_err(|e| {
+            McpError::Internal(format!("dataset file is unavailable ({})", e.kind()))
+        })?;
         let mut buf = [0u8; 64 * 1024];
         loop {
-            let n = f
-                .read(&mut buf)
-                .map_err(|e| McpError::Internal(format!("dataset file read failed ({})", e.kind())))?;
+            let n = f.read(&mut buf).map_err(|e| {
+                McpError::Internal(format!("dataset file read failed ({})", e.kind()))
+            })?;
             if n == 0 {
                 break;
             }

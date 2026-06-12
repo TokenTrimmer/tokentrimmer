@@ -120,11 +120,7 @@ pub struct DatasetHandle {
 impl DatasetHandle {
     /// Crate-private constructor: only the operator-config loader
     /// (`QueryConfig::build_registry`) and in-crate tests build handles.
-    pub(crate) fn new(
-        alias: HandleAlias,
-        description: Option<String>,
-        source: DataSource,
-    ) -> Self {
+    pub(crate) fn new(alias: HandleAlias, description: Option<String>, source: DataSource) -> Self {
         Self {
             alias,
             description,
@@ -182,10 +178,7 @@ impl HandleRegistry {
     /// `QueryConfig::build_registry` (and in-crate tests).
     pub(crate) fn from_handles(handles: Vec<DatasetHandle>) -> Self {
         Self {
-            handles: handles
-                .into_iter()
-                .map(|h| (h.alias.clone(), h))
-                .collect(),
+            handles: handles.into_iter().map(|h| (h.alias.clone(), h)).collect(),
         }
     }
 
@@ -222,13 +215,13 @@ mod tests {
     fn alias_rejects_bad_charset_empty_and_oversize() {
         for bad in [
             "",
-            "Orders",          // uppercase
-            "or ders",         // space
-            "../etc",          // traversal chars
-            "a.b",             // dot
-            "a/b",             // slash
-            "naïve",           // non-ascii
-            &"x".repeat(65),   // too long
+            "Orders",        // uppercase
+            "or ders",       // space
+            "../etc",        // traversal chars
+            "a.b",           // dot
+            "a/b",           // slash
+            "naïve",         // non-ascii
+            &"x".repeat(65), // too long
         ] {
             assert!(
                 HandleAlias::try_from(bad).is_err(),
@@ -258,8 +251,12 @@ mod tests {
     #[test]
     fn registry_resolves_known_and_rejects_unknown() {
         let reg = HandleRegistry::from_handles(vec![file_handle("orders")]);
-        assert!(reg.resolve(&HandleAlias::try_from("orders").unwrap()).is_some());
-        assert!(reg.resolve(&HandleAlias::try_from("nope").unwrap()).is_none());
+        assert!(reg
+            .resolve(&HandleAlias::try_from("orders").unwrap())
+            .is_some());
+        assert!(reg
+            .resolve(&HandleAlias::try_from("nope").unwrap())
+            .is_none());
     }
 
     /// Debug output must not leak the file path (it ends up in logs/errors).

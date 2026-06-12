@@ -379,7 +379,10 @@ mod tests {
         let sql = validate("SELECT 1 AS one, 'a' AS letter").unwrap();
         let out = run(&pool, &sql, &QueryLimits::default()).await.unwrap();
         assert_eq!(out.columns, vec!["one", "letter"]);
-        assert_eq!(out.rows, vec![vec![serde_json::json!(1), serde_json::json!("a")]]);
+        assert_eq!(
+            out.rows,
+            vec![vec![serde_json::json!(1), serde_json::json!("a")]]
+        );
         assert_eq!(out.rows_scanned, None, "no fabricated pg scan numbers");
     }
 
@@ -417,8 +420,14 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0, "nothing was committed");
 
-        sqlx::query("DROP TABLE tt_mcp_ro_probe").execute(&pool).await.unwrap();
-        sqlx::query("DROP SEQUENCE tt_mcp_ro_seq").execute(&pool).await.unwrap();
+        sqlx::query("DROP TABLE tt_mcp_ro_probe")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP SEQUENCE tt_mcp_ro_seq")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

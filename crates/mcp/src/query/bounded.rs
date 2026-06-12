@@ -172,6 +172,9 @@ mod tests {
         let over = serde_json::json!({ "items": [1, 2, 3, 4] });
         assert!(serde_json::from_value::<CapList>(over).is_err());
         let ok = serde_json::json!({ "items": [1, 2, 3] });
-        assert_eq!(serde_json::from_value::<CapList>(ok).unwrap().items.len(), 3);
+        assert_eq!(
+            serde_json::from_value::<CapList>(ok).unwrap().items.len(),
+            3
+        );
     }
 }

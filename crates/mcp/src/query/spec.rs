@@ -40,9 +40,11 @@ impl RunQueryArgs {
                 QuerySpec::Aggregate(a)
             }
             (Some(_), Some(_)) => {
-                return Err("provide exactly one of `query` (SQL, postgres datasets) or \
+                return Err(
+                    "provide exactly one of `query` (SQL, postgres datasets) or \
                             `aggregate` (file datasets), not both"
-                    .into())
+                        .into(),
+                )
             }
             (None, None) => {
                 return Err("provide one of `query` (SQL, postgres datasets) or \
@@ -126,10 +128,9 @@ impl AggregationSpec {
     pub fn validate(&self) -> Result<(), String> {
         match self.op {
             AggOp::Count => Ok(()),
-            _ if self.column.is_none() => Err(format!(
-                "aggregation op {:?} requires a `column`",
-                self.op
-            )),
+            _ if self.column.is_none() => {
+                Err(format!("aggregation op {:?} requires a `column`", self.op))
+            }
             _ => Ok(()),
         }
     }
@@ -217,8 +218,7 @@ mod tests {
     #[test]
     fn non_count_ops_require_column() {
         for op in ["sum", "avg", "min", "max", "count_distinct"] {
-            let spec =
-                serde_json::from_value::<AggregationSpec>(json!({ "op": op })).unwrap();
+            let spec = serde_json::from_value::<AggregationSpec>(json!({ "op": op })).unwrap();
             assert!(spec.validate().is_err(), "{op} without column must fail");
         }
         let count = serde_json::from_value::<AggregationSpec>(json!({ "op": "count" })).unwrap();

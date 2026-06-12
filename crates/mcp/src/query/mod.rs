@@ -475,10 +475,9 @@ pub(crate) async fn execute(
     limits: &QueryLimits,
 ) -> Result<QueryOutcome, McpError> {
     match (handle.source(), query) {
-        (
-            DataSource::File { root, path, format },
-            ValidatedQuery::Aggregate(spec),
-        ) => file_exec::run(root, path, *format, spec, limits),
+        (DataSource::File { root, path, format }, ValidatedQuery::Aggregate(spec)) => {
+            file_exec::run(root, path, *format, spec, limits)
+        }
         (DataSource::Postgres { pool }, ValidatedQuery::Sql(sql)) => {
             pg_exec::run(pool, sql, limits).await
         }

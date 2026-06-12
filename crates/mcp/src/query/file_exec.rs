@@ -184,17 +184,11 @@ fn agg_column_name(spec: &AggregationSpec) -> String {
     }
 }
 
-/// Run a bounded aggregation over the file at `path` (canonicalized at boot)
-/// under `root`. Re-canonicalizes and re-checks containment first.
-pub(crate) fn run(
-    root: &Path,
-    path: &Path,
-    format: FileFormat,
-    spec: &AggregationSpec,
-    limits: &QueryLimits,
-) -> Result<QueryOutcome, McpError> {
-    // Canonicalize-at-call: the boot-time path may have been swapped for a
-    // symlink since. Never echo the path in errors.
+/// Canonicalize-at-call + containment + regular-file check. The boot-time
+/// path may have been swapped for a symlink since (symlink-swap defense).
+/// Shared by the executor and the cache-key content-hash path so both read
+/// through the same gate. Never echoes the path in errors.
+pub(crate) fn checked_canonical(root: &Path, path: &Path) -> Result<std::path::PathBuf, McpError> {
     let canonical = path.canonicalize().map_err(|e| {
         McpError::Internal(format!(
             "dataset file is unavailable ({kind}); ask the operator to check the \
@@ -216,6 +210,19 @@ pub(crate) fn run(
             "dataset path is not a regular file; refusing to read it".into(),
         ));
     }
+    Ok(canonical)
+}
+
+/// Run a bounded aggregation over the file at `path` (canonicalized at boot)
+/// under `root`. Re-canonicalizes and re-checks containment first.
+pub(crate) fn run(
+    root: &Path,
+    path: &Path,
+    format: FileFormat,
+    spec: &AggregationSpec,
+    limits: &QueryLimits,
+) -> Result<QueryOutcome, McpError> {
+    let canonical = checked_canonical(root, path)?;
 
     let mut state = AggState::new(spec, limits);
     match format {
@@ -355,8 +362,11 @@ impl<'a> AggState<'a> {
             self.groups.insert(Vec::new(), Accum::new(spec.op));
         }
 
-        let mut columns: Vec<String> =
-            spec.group_by.iter().map(|g| g.as_str().to_owned()).collect();
+        let mut columns: Vec<String> = spec
+            .group_by
+            .iter()
+            .map(|g| g.as_str().to_owned())
+            .collect();
         columns.push(agg_column_name(spec));
 
         // BTreeMap iteration is key-sorted: deterministic output order.
@@ -364,8 +374,7 @@ impl<'a> AggState<'a> {
             .groups
             .iter()
             .map(|(key, acc)| {
-                let mut row: Vec<Value> =
-                    key.iter().map(|k| Value::from(k.as_str())).collect();
+                let mut row: Vec<Value> = key.iter().map(|k| Value::from(k.as_str())).collect();
                 row.push(acc.finish());
                 row
             })
@@ -403,7 +412,10 @@ mod tests {
     }
 
     /// Write `content` into a tempdir and return (dir, canonical root, path).
-    fn dataset(content: &str, name: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fn dataset(
+        content: &str,
+        name: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let path = root.join(name);
@@ -418,19 +430,32 @@ mod tests {
 {"region":"us","amount":1}
 "#;
 
-    fn run_csv(content: &str, s: AggregationSpec, limits: &QueryLimits) -> Result<QueryOutcome, McpError> {
+    fn run_csv(
+        content: &str,
+        s: AggregationSpec,
+        limits: &QueryLimits,
+    ) -> Result<QueryOutcome, McpError> {
         let (_dir, root, path) = dataset(content, "orders.csv");
         run(&root, &path, FileFormat::Csv, &s, limits)
     }
 
-    fn run_jsonl(content: &str, s: AggregationSpec, limits: &QueryLimits) -> Result<QueryOutcome, McpError> {
+    fn run_jsonl(
+        content: &str,
+        s: AggregationSpec,
+        limits: &QueryLimits,
+    ) -> Result<QueryOutcome, McpError> {
         let (_dir, root, path) = dataset(content, "orders.jsonl");
         run(&root, &path, FileFormat::Jsonl, &s, limits)
     }
 
     #[test]
     fn csv_count_all() {
-        let out = run_csv(ORDERS_CSV, spec(json!({"op":"count"})), &QueryLimits::default()).unwrap();
+        let out = run_csv(
+            ORDERS_CSV,
+            spec(json!({"op":"count"})),
+            &QueryLimits::default(),
+        )
+        .unwrap();
         assert_eq!(out.columns, vec!["count"]);
         assert_eq!(out.rows, vec![vec![json!(4)]]);
         assert_eq!(out.rows_scanned, Some(4));
@@ -439,7 +464,9 @@ mod tests {
 
     #[test]
     fn csv_sum_avg_min_max_with_where() {
-        let s = spec(json!({"op":"sum","column":"amount","where":[{"column":"region","op":"eq","value":"emea"}]}));
+        let s = spec(
+            json!({"op":"sum","column":"amount","where":[{"column":"region","op":"eq","value":"emea"}]}),
+        );
         let out = run_csv(ORDERS_CSV, s, &QueryLimits::default()).unwrap();
         assert_eq!(out.columns, vec!["sum_amount"]);
         assert_eq!(out.rows, vec![vec![json!(15.0)]]);
@@ -572,13 +599,21 @@ this is not json
 
     #[test]
     fn empty_match_still_emits_one_aggregate_row() {
-        let s = spec(json!({"op":"sum","column":"amount","where":[{"column":"region","op":"eq","value":"nowhere"}]}));
+        let s = spec(
+            json!({"op":"sum","column":"amount","where":[{"column":"region","op":"eq","value":"nowhere"}]}),
+        );
         let out = run_csv(ORDERS_CSV, s, &QueryLimits::default()).unwrap();
         assert_eq!(out.rows, vec![vec![json!(0.0)]]);
 
-        let s = spec(json!({"op":"avg","column":"amount","where":[{"column":"region","op":"eq","value":"nowhere"}]}));
+        let s = spec(
+            json!({"op":"avg","column":"amount","where":[{"column":"region","op":"eq","value":"nowhere"}]}),
+        );
         let out = run_csv(ORDERS_CSV, s, &QueryLimits::default()).unwrap();
-        assert_eq!(out.rows, vec![vec![json!(null)]], "avg of nothing is null, not a fabricated 0");
+        assert_eq!(
+            out.rows,
+            vec![vec![json!(null)]],
+            "avg of nothing is null, not a fabricated 0"
+        );
     }
 
     /// Symlink-swap defense: a symlink INSIDE the root pointing OUTSIDE it is
