@@ -1631,6 +1631,8 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 then: tt_routing::RouteAction {
+                    format_switch: None,
+                    diff: false,
                     auto_pause: false,
                     pause_floor_pass_rate: None,
                     pause_min_verdicts: None,

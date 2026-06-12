@@ -390,6 +390,8 @@ async fn replay_with_quality_attaches_quality_field() {
         enabled: true,
         when: RouteConditions::default(),
         then: RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-3-5-haiku".into(),
             fallbacks: Vec::new(),
             disable_cache: false,

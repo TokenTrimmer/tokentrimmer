@@ -612,6 +612,8 @@ mod tests {
             enabled: true,
             when: RouteConditions::default(),
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 target_model: target.into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -659,6 +661,8 @@ mod tests {
             enabled: true,
             when: RouteConditions::default(),
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 target_model: "m1".into(),
                 fallbacks: vec![],
                 disable_cache: false,
@@ -852,6 +856,8 @@ mod tests {
                     enabled: true,
                     when: RouteConditions::default(),
                     then: RouteAction {
+                        format_switch: None,
+                        diff: false,
                         target_model: "m".into(),
                         fallbacks: vec![],
                         disable_cache: false,

@@ -117,6 +117,8 @@ mod tests {
             enabled,
             when,
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 target_model: "x".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

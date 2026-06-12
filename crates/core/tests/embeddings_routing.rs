@@ -158,6 +158,8 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
                 ..Default::default()
             },
             then: RouteAction {
+                format_switch: None,
+                diff: false,
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,

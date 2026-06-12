@@ -264,6 +264,23 @@ pub struct RouteAction {
     /// from JSON when false (back-compat).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub redact: bool,
+    /// Mirror of `tt_routing::RouteAction::format_switch` (research Phase
+    /// 3.3 — opt-in CSV/bare emission instead of verbose JSON). Carried for
+    /// lossless wire round-trip; replay does not model output shaping (no
+    /// projection — savings for this lever are ESTIMATED at runtime only and
+    /// never fold into invoice-reconciled figures). Same serde gating as the
+    /// gateway side: omitted from JSON when `None` (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_switch: Option<String>,
+    /// Mirror of `tt_routing::RouteAction::diff` (research Phase 3.4 —
+    /// opt-in anchored search/replace patch responses with fail-closed full
+    /// re-emit). Carried for lossless wire round-trip; replay does not model
+    /// output shaping (no projection — savings for this lever are REALIZED
+    /// at runtime from real tokenizer counts, but a historical `RequestLog`
+    /// row carries no prior artifact to re-derive them from). Same serde
+    /// gating as the gateway side: omitted from JSON when false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub diff: bool,
     /// Mirror of `tt_routing::RouteAction::traffic_pct`. A canary split — when
     /// `Some(pct)`, only a deterministic `pct`% of matched requests take the
     /// rewrite at runtime (chosen by `tt_routing::sticky_traffic_split`); the
@@ -625,6 +642,8 @@ mod tests {
     #[test]
     fn route_action_minimal_serializes_without_new_fields() {
         let a = RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "x".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -662,6 +681,8 @@ mod tests {
     #[test]
     fn route_action_full_round_trip() {
         let original = RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "claude-3-5-haiku".into(),
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
@@ -692,6 +713,8 @@ mod tests {
         let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
         assert!(!parsed.disable_cache, "defaults false");
         let a = RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "m".into(),
             fallbacks: Vec::new(),
             disable_cache: true,
@@ -734,6 +757,8 @@ mod tests {
         let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
         assert!(!parsed.redact, "redact must default false");
         let a = RouteAction {
+            format_switch: None,
+            diff: false,
             target_model: "m".into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -858,6 +883,33 @@ mod tests {
         assert!(!j.contains("pause"), "{j}");
     }
 
+    /// Cross-crate wire-compat for the output-shaping levers (research Phase
+    /// 3.3 + 3.4): gateway-written JSON carrying `format_switch` or `diff`
+    /// deserializes into the plan-core type with the value set and re-emits
+    /// the same wire form byte-for-byte (same relative field order + same
+    /// skip_serializing_if gating). The fields default `None`/false and are
+    /// omitted when default, so every existing plan JSON/snapshot stays
+    /// byte-identical (zero replay drift).
+    #[test]
+    fn route_action_output_shaping_cross_type_wire_compat() {
+        let csv_json = r#"{"target_model":"m","format_switch":"csv"}"#;
+        let a: RouteAction = serde_json::from_str(csv_json).unwrap();
+        assert_eq!(a.format_switch.as_deref(), Some("csv"));
+        assert_eq!(serde_json::to_string(&a).unwrap(), csv_json);
+
+        let diff_json = r#"{"target_model":"m","diff":true}"#;
+        let d: RouteAction = serde_json::from_str(diff_json).unwrap();
+        assert!(d.diff);
+        assert_eq!(serde_json::to_string(&d).unwrap(), diff_json);
+
+        // Defaults: absent on read → None/false; defaults omitted on write.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert_eq!(parsed.format_switch, None);
+        assert!(!parsed.diff);
+        let j = serde_json::to_string(&parsed).unwrap();
+        assert!(!j.contains("format_switch") && !j.contains("diff"), "{j}");
+    }
+
     /// Cross-crate lockstep guard for `RouteAction`, the companion to
     /// `route_conditions_cross_type_wire_compat`. The
     /// `tt_routing::RouteAction` literal below sets EVERY field with NO
@@ -871,7 +923,9 @@ mod tests {
     /// `tt_plan_core::RouteAction` (they predate this guard); they are set to
     /// `false` here, where their skip_serializing_if gating omits them from
     /// the wire form, keeping the byte-identity assertion honest for every
-    /// mirrored field.
+    /// mirrored field. The output-shaping levers (`format_switch` / `diff`,
+    /// research Phase 3.3 + 3.4) ARE mirrored — round-trip-only, not
+    /// projected by replay.
     #[test]
     fn route_action_cross_type_lockstep_guard() {
         let gateway = tt_routing::RouteAction {
@@ -883,6 +937,8 @@ mod tests {
             flex: false,     // not mirrored (pre-existing) — omitted when false
             compress: false, // not mirrored (pre-existing) — omitted when false
             redact: true,
+            format_switch: Some("csv".to_string()),
+            diff: false, // mutually exclusive with format_switch on a real route
             traffic_pct: Some(30),
             shadow_model: Some("gemini-flash".to_string()),
             auto_pause: true,
@@ -902,6 +958,8 @@ mod tests {
         assert!(plan_action.disable_cache);
         assert_eq!(plan_action.max_cost_usd, Some(0.25));
         assert!(plan_action.redact);
+        assert_eq!(plan_action.format_switch.as_deref(), Some("csv"));
+        assert!(!plan_action.diff);
         assert_eq!(plan_action.traffic_pct, Some(30));
         assert_eq!(plan_action.shadow_model.as_deref(), Some("gemini-flash"));
         assert!(plan_action.auto_pause);
