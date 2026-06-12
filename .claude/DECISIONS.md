@@ -150,13 +150,13 @@ Format per entry: ID, date, status, context (what problem), decision (what we ch
 
 ## ADR-011 — File-size cap of 800 lines per .rs file (2026-05-25)
 
-**Status**: Adopted, hook-enforced
+**Status**: Adopted for new/full-file edits; legacy exceptions tracked
 
 **Context**: Large files are hard to context-load for subagents and tend to mix concerns. We want our own `prompt-bloated-system` analog at the source level.
 
-**Decision**: `.claude/hooks/pre-edit-guard.sh` blocks Write/Edit on `.rs` files that would exceed 800 lines. Same rule for AGENTS.md at 4000 tokens.
+**Decision**: `.claude/hooks/pre-edit-guard.sh` blocks full-content Write/Edit on `.rs` files that would exceed 800 lines. Same rule for AGENTS.md at 4000 tokens. Existing oversized files are legacy exceptions and must shrink over time rather than grow casually.
 
-**Consequences**: Forces module splitting earlier than typical. Occasional friction when refactoring requires multiple staged commits.
+**Consequences**: Forces module splitting earlier than typical for new code. Older monoliths still need incremental extraction; the hook is not a repository-wide size audit.
 
 **Pointers**: `.claude/hooks/pre-edit-guard.sh`, `AGENTS.md` § Conventions.
 

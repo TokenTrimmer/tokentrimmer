@@ -446,7 +446,7 @@ mod tests {
         let m = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/routes")
-                .json_body_partial(
+                .json_body_includes(
                     r#"{ "name": "recipe:vision-gate", "when": { "has_images": true }, "then": { "target_model": "gpt-4o" } }"#,
                 );
             then.status(201).body("{}");

@@ -273,7 +273,7 @@ mod tests {
                 when.method(POST)
                     .path("/v1/routes")
                     .header("authorization", "Bearer tt_live_operator")
-                    .json_body_partial(
+                    .json_body_includes(
                         r#"{ "name": "all->cheap", "then": { "target_model": "gpt-4o-mini" } }"#
                             .to_string(),
                     );

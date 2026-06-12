@@ -71,10 +71,10 @@ sqlparser = { version = "0.62", features = ["visitor"] }
 
 # Metrics
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 
 # Error handling + tracing
-thiserror = "1.0"
+thiserror = "2"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -136,7 +136,7 @@ url = "2"
 
 # Tests
 insta = { version = "1.40", features = ["json", "yaml", "redactions"] }
-httpmock = "0.7"
+httpmock = "0.8.3"
 tokio-test = "0.4"
 rstest = "0.26"
 tempfile = "3"
@@ -148,7 +148,7 @@ percent-encoding = "2"
 clap = { version = "4", features = ["derive", "env"] }
 
 # Observability — rustls transport so we match the workspace TLS choice.
-sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry = { version = "0.48.2", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 
 # Static analysis (Inspect)
 tree-sitter = "0.24"
@@ -162,7 +162,7 @@ tiktoken-rs = "0.12"
 # tt init installer
 tera = "1.20"
 include_dir = { version = "0.7", features = ["glob"] }
-dialoguer = "0.11"
+dialoguer = "0.12"
 toml = "0.8"
 
 # Internal crate refs.

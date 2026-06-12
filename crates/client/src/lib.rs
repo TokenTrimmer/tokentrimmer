@@ -916,10 +916,9 @@ mod tests {
             when.method(POST)
                 .path("/v1/chat/completions")
                 .matches(|req| {
-                    !req.headers.as_ref().is_some_and(|h| {
-                        h.iter()
-                            .any(|(k, _)| k.eq_ignore_ascii_case("x-tokentrimmer-interactive"))
-                    })
+                    !req.headers_vec()
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("x-tokentrimmer-interactive"))
                 });
             then.status(200)
                 .header("content-type", "application/json")
@@ -949,7 +948,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"stream\":true");
+                .body_includes("\"stream\":true");
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")
@@ -997,7 +996,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"stream\":true");
+                .body_includes("\"stream\":true");
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .body(sse);
@@ -1091,7 +1090,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"get_weather\"");
+                .body_includes("\"get_weather\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({

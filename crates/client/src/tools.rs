@@ -370,7 +370,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"role\":\"tool\"");
+                .body_includes("\"role\":\"tool\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .header("x-tokentrimmer-cost-usd", "0.0001")
@@ -420,7 +420,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"tool_choice\":\"none\"");
+                .body_includes("\"tool_choice\":\"none\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .header("x-tokentrimmer-cost-usd", "0.0001")
@@ -464,7 +464,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"role\":\"tool\"");
+                .body_includes("\"role\":\"tool\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(text_response("Recovered."));

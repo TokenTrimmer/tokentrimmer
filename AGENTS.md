@@ -50,7 +50,9 @@ Full local CI mirror:
 - TS bindings: emitted from Rust via `schemars` + `ts-rs`. Never hand-write bindings.
 - OpenAPI: emitted via `utoipa` on Axum routes.
 - Provider adapters: each in its own crate at `crates/providers/<name>/`. Stateless beyond HTTP client + pricing table.
-- File size cap: 800 lines per `.rs` file. Hook enforces. Split the module first.
+- File size target: keep new `.rs` modules under 800 lines. Legacy oversized
+  files are being split incrementally; do not make them larger unless the edit
+  is part of an active extraction.
 
 ## Do NOT
 

@@ -201,10 +201,9 @@ mod tests {
         let server = MockServer::start_async().await;
         server.mock(|when, then| {
             when.method(GET).path("/v1/models").matches(|req| {
-                !req.headers.as_ref().is_some_and(|h| {
-                    h.iter()
-                        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-                })
+                !req.headers_vec()
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
             });
             then.status(200).body(SAMPLE);
         });

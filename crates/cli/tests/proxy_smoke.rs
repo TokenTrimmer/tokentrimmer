@@ -75,9 +75,7 @@ async fn messages_bypass_to_anthropic_upstream_in_all_modes() {
                     // …and the proxy must NOT inject its TokenTrimmer key
                     // (that would leak it to Anthropic and clobber OAuth).
                     .matches(|req| {
-                        !req.headers
-                            .as_deref()
-                            .unwrap_or_default()
+                        !req.headers_vec()
                             .iter()
                             .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
                     });

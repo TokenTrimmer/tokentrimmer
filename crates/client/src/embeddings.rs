@@ -162,7 +162,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/embeddings")
-                .body_contains("text-embedding-3-small");
+                .body_includes("text-embedding-3-small");
             then.status(200)
                 .header("content-type", "application/json")
                 .header("x-tokentrimmer-cost-usd", "0.0002")
@@ -195,8 +195,8 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/embeddings")
-                .body_contains("\"dimensions\":256")
-                .body_contains("\"encoding_format\":\"float\"");
+                .body_includes("\"dimensions\":256")
+                .body_includes("\"encoding_format\":\"float\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(embeddings_body());

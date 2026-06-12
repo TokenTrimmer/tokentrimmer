@@ -371,7 +371,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"role\":\"tool\"")
+                .body_includes("\"role\":\"tool\"")
                 // Every /tools round declares interactivity (a human is
                 // waiting) — and `tt advise` inherits this via run_tool_turn:
                 // the CLI's own traffic is never batch-eligible, in code.
@@ -437,7 +437,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"tool_choice\":\"none\"");
+                .body_includes("\"tool_choice\":\"none\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")
@@ -507,7 +507,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"role\":\"tool\"");
+                .body_includes("\"role\":\"tool\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")
@@ -574,7 +574,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"role\":\"tool\"");
+                .body_includes("\"role\":\"tool\"");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
