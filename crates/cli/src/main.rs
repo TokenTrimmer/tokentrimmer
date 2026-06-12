@@ -149,6 +149,9 @@ enum Command {
         /// Token budget for context management (default: the per-model window).
         #[arg(long)]
         max_context: Option<u32>,
+        /// Disable lossless tool-result/arg trimming in the /tools loop.
+        #[arg(long)]
+        no_tool_trim: bool,
         #[arg(long, global = true)]
         tt_api_key: Option<String>,
         #[arg(long, global = true)]
@@ -737,6 +740,7 @@ async fn main() -> anyhow::Result<()> {
             resume,
             tools,
             max_context,
+            no_tool_trim,
             tt_api_key,
             tt_api_base,
         } => {
@@ -746,6 +750,7 @@ async fn main() -> anyhow::Result<()> {
                 resume,
                 tools,
                 max_context,
+                no_tool_trim,
                 flag_key: tt_api_key,
                 flag_base: tt_api_base,
             })

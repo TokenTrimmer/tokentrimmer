@@ -16,7 +16,9 @@ const TRIM_FRAC: f64 = 0.95;
 const TRIM_TARGET_FRAC: f64 = 0.70;
 /// cl100k is a high-quality general estimator; the chat doesn't reliably know
 /// the routed provider, so we estimate with the OpenAI tokenizer for all models.
-const ESTIMATE_PROVIDER: &str = "openai";
+/// Shared with `chat::shape`/`chat::compact` so every chat-side token estimate
+/// uses the same tokenizer.
+pub(crate) const ESTIMATE_PROVIDER: &str = "openai";
 
 /// Best-effort context window (input tokens) for a model id, by prefix. These
 /// are approximate defaults — overridable via `--max-context` / `/context <n>`;

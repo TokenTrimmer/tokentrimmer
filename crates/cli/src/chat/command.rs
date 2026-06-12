@@ -3,6 +3,19 @@
 
 use crate::ui;
 
+/// `/tools` argument: toggle/set tool-calling, or set tool-result trimming.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ToolsArg {
+    /// Bare `/tools` — flip tool-calling.
+    Toggle,
+    /// `/tools on|off` — set tool-calling.
+    Set(bool),
+    /// `/tools trim on|off` — set tool-result/arg trimming (`chat::shape`).
+    Trim(bool),
+    /// Unrecognized argument (carries the usage line).
+    Bad(String),
+}
+
 /// A REPL line, parsed.
 #[derive(Debug)]
 pub enum Command {
@@ -18,7 +31,7 @@ pub enum Command {
     Editor,
     Retry,
     Copy,
-    Tools(Option<bool>),
+    Tools(ToolsArg),
     Context(Option<u32>),
     Trim,
     Unknown(String),
@@ -55,9 +68,17 @@ impl Command {
             "retry" | "r" => Command::Retry,
             "copy" | "y" => Command::Copy,
             "tools" => Command::Tools(match arg.as_deref() {
-                Some("on") | Some("true") | Some("enable") => Some(true),
-                Some("off") | Some("false") | Some("disable") => Some(false),
-                _ => None,
+                None => ToolsArg::Toggle,
+                Some("on" | "true" | "enable") => ToolsArg::Set(true),
+                Some("off" | "false" | "disable") => ToolsArg::Set(false),
+                Some(rest) => {
+                    let mut words = rest.split_whitespace();
+                    match (words.next(), words.next(), words.next()) {
+                        (Some("trim"), Some("on"), None) => ToolsArg::Trim(true),
+                        (Some("trim"), Some("off"), None) => ToolsArg::Trim(false),
+                        _ => ToolsArg::Bad("usage: /tools [on|off|trim on|trim off]".to_string()),
+                    }
+                }
             }),
             "context" => Command::Context(arg.as_deref().and_then(|a| a.parse().ok())),
             "trim" => Command::Trim,
@@ -77,8 +98,8 @@ pub(super) fn print_help() {
         ("/retry", "re-run the last turn"),
         ("/copy", "copy the last reply to the clipboard"),
         (
-            "/tools [on|off]",
-            "toggle tool-calling (find_route_for, preview_cost, inspect_diff)",
+            "/tools [on|off|trim on|off]",
+            "toggle tool-calling / lossless tool-result trimming",
         ),
         ("/context [n]", "show or set the token budget"),
         ("/trim", "drop oldest turns to fit the budget"),
@@ -140,6 +161,34 @@ mod tests {
         assert!(matches!(Command::parse("/model"), Command::Model(None)));
         assert!(matches!(Command::parse("/nope"), Command::Unknown(c) if c == "nope"));
         assert!(matches!(Command::parse("hello there"), Command::Chat(t) if t == "hello there"));
+    }
+
+    #[test]
+    fn tools_arg_parses_set_toggle_and_trim() {
+        assert!(matches!(
+            Command::parse("/tools"),
+            Command::Tools(ToolsArg::Toggle)
+        ));
+        assert!(matches!(
+            Command::parse("/tools on"),
+            Command::Tools(ToolsArg::Set(true))
+        ));
+        assert!(matches!(
+            Command::parse("/tools off"),
+            Command::Tools(ToolsArg::Set(false))
+        ));
+        assert!(matches!(
+            Command::parse("/tools trim on"),
+            Command::Tools(ToolsArg::Trim(true))
+        ));
+        assert!(matches!(
+            Command::parse("/tools trim off"),
+            Command::Tools(ToolsArg::Trim(false))
+        ));
+        assert!(matches!(
+            Command::parse("/tools whatever"),
+            Command::Tools(ToolsArg::Bad(_))
+        ));
     }
 
     #[test]

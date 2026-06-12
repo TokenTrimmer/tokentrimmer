@@ -12,10 +12,11 @@ use crate::ui;
 pub mod budget;
 pub mod command;
 pub mod session;
+pub mod shape;
 pub mod tools;
 
 pub use command::Command;
-use command::{osc52_copy, print_help, wrap_osc52_for_mux, OSC52_MAX_BYTES};
+use command::{osc52_copy, print_help, wrap_osc52_for_mux, ToolsArg, OSC52_MAX_BYTES};
 
 const DEFAULT_CHAT_MODEL: &str = "gpt-4o-mini";
 
@@ -122,6 +123,10 @@ pub struct Ledger {
     pub cost_usd: f64,
     pub saved_usd: f64,
     pub baseline_usd: f64,
+    /// Estimated tokens removed from history by `chat::shape` tool-result/arg
+    /// trimming. Token counts only — never converted into a USD savings claim
+    /// (the gateway attributes no spend to these bytes).
+    pub tool_trim_tokens: u64,
 }
 
 impl Ledger {
@@ -138,10 +143,17 @@ impl Ledger {
         } else {
             0.0
         };
-        format!(
+        let mut s = format!(
             "session: {} turn(s) · ${:.4} spent · saved ${:.4} ({pct:.0}%)",
             self.turns, self.cost_usd, self.saved_usd
-        )
+        );
+        if self.tool_trim_tokens > 0 {
+            s.push_str(&format!(
+                " · tool-trim −{} tok (est.)",
+                self.tool_trim_tokens
+            ));
+        }
+        s
     }
 }
 
@@ -269,9 +281,10 @@ async fn dispatch_turn(
     ledger: &mut Ledger,
     reg: &tt_mcp::tools::Registry,
     tools_enabled: bool,
+    tool_trim: bool,
 ) -> bool {
     if tools_enabled {
-        tools::run_tool_turn(client, conv, reg, ledger).await
+        tools::run_tool_turn(client, conv, reg, ledger, tool_trim).await
     } else {
         do_turn(client, conv, ledger).await
     }
@@ -303,6 +316,18 @@ fn compose_in_editor() -> anyhow::Result<Option<String>> {
     Ok(if text.is_empty() { None } else { Some(text) })
 }
 
+/// One-line `/tools` status: tool-calling state + result-trim state.
+fn print_tools_status(tools_enabled: bool, tool_trim: bool) {
+    let trim = if tool_trim { "on" } else { "off" };
+    if tools_enabled {
+        ui::info(&format!(
+            "tools: on (find_route_for, preview_cost, inspect_diff) · result-trim {trim}"
+        ));
+    } else {
+        ui::info(&format!("tools: off · result-trim {trim}"));
+    }
+}
+
 /// Options for [`run`] — one struct instead of a long positional parameter
 /// list (clippy::too_many_arguments-clean and extensible).
 #[derive(Debug, Default)]
@@ -317,6 +342,9 @@ pub struct RunOpts {
     pub tools: bool,
     /// Token budget override for context management.
     pub max_context: Option<u32>,
+    /// Disable lossless tool-result/arg trimming in the `/tools` loop
+    /// (`chat::shape`; ON by default — lossless minify + class-safe drops).
+    pub no_tool_trim: bool,
     /// `--tt-api-key` flag.
     pub flag_key: Option<String>,
     /// `--tt-api-base` flag.
@@ -331,6 +359,7 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
         resume,
         tools,
         max_context,
+        no_tool_trim,
         flag_key,
         flag_base,
     } = opts;
@@ -354,6 +383,7 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
     let mut ledger = Ledger::default();
     let registry = tools::build_registry();
     let mut tools_enabled = tools;
+    let mut tool_trim = !no_tool_trim;
     // Best-effort: real per-model windows from the gateway catalog. On any
     // failure (offline / old gateway / pre-auth) fall back to the prefix table.
     let catalog_windows = match crate::catalog::fetch_catalog(&http, &base, Some(&key)).await {
@@ -379,8 +409,15 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                         let snapshot = conv.messages.clone();
                         conv.push_user(t);
                         ctx.manage(&mut conv);
-                        if !dispatch_turn(&client, &mut conv, &mut ledger, &registry, tools_enabled)
-                            .await
+                        if !dispatch_turn(
+                            &client,
+                            &mut conv,
+                            &mut ledger,
+                            &registry,
+                            tools_enabled,
+                            tool_trim,
+                        )
+                        .await
                         {
                             // failed turn → no-op on history: drop the user turn
                             // AND undo any trim manage() did before sending.
@@ -454,14 +491,20 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                         let dropped = budget::manual_trim(&mut conv, &ctx);
                         ui::info(&format!("trimmed {dropped} old message(s)"));
                     }
-                    Command::Tools(set) => {
-                        tools_enabled = set.unwrap_or(!tools_enabled);
-                        if tools_enabled {
-                            ui::info("tools: on (find_route_for, preview_cost, inspect_diff)");
-                        } else {
-                            ui::info("tools: off");
+                    Command::Tools(arg) => match arg {
+                        ToolsArg::Toggle | ToolsArg::Set(_) => {
+                            tools_enabled = match arg {
+                                ToolsArg::Set(b) => b,
+                                _ => !tools_enabled,
+                            };
+                            print_tools_status(tools_enabled, tool_trim);
                         }
-                    }
+                        ToolsArg::Trim(b) => {
+                            tool_trim = b;
+                            print_tools_status(tools_enabled, tool_trim);
+                        }
+                        ToolsArg::Bad(usage) => ui::warn(&usage),
+                    },
                     Command::Editor => match compose_in_editor() {
                         Ok(Some(t)) => {
                             let snapshot = conv.messages.clone();
@@ -473,6 +516,7 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                                 &mut ledger,
                                 &registry,
                                 tools_enabled,
+                                tool_trim,
                             )
                             .await
                             {
@@ -490,6 +534,7 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                                 &mut ledger,
                                 &registry,
                                 tools_enabled,
+                                tool_trim,
                             )
                             .await
                             {
