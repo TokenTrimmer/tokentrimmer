@@ -1020,9 +1020,11 @@ pub async fn handler(
     // captured before `route_match` is consumed below. Both default
     // off/None — the planners do ZERO work for every unrouted request and
     // every route that did not opt in. Eligibility is enforced in code at
-    // the request-build step (`shaping::*::plan_*`).
-    let route_format_switch = route_match.as_ref().and_then(|m| m.format_switch.clone());
-    let route_diff = route_match.as_ref().is_some_and(|m| m.diff);
+    // the request-build step (`shaping::*::plan_*`). Mutable: the canary
+    // CONTROL arm clears both below ("served unchanged" includes the parse
+    // contract).
+    let mut route_format_switch = route_match.as_ref().and_then(|m| m.format_switch.clone());
+    let mut route_diff = route_match.as_ref().is_some_and(|m| m.diff);
     // Hard interactive-ineligibility signal for the batch marker: a client that
     // declares "a human is waiting" via `X-TokenTrimmer-Interactive: 1` (set by
     // `tt chat` and the /tools loop) is never marked batch-eligible. Read
@@ -1141,6 +1143,16 @@ pub async fn handler(
             // priced against the served (== requested) model, no canary fallbacks.
             model_was_rewritten = false;
             route_fallbacks.clear();
+            // The control arm's contract is "the request is served
+            // UNCHANGED" — that must include the CONTRACT-CHANGING shaping
+            // levers, not just the model rewrite: a CSV/bare body or a
+            // patch-reconstructed artifact on the control arm would break
+            // the caller's parse expectations AND pollute the canary
+            // comparison with shaped responses. Non-contract levers
+            // (flex/compress/batch) stay precedent-consistent on both arms,
+            // and the redaction SAFETY guardrail is never arm-gated.
+            route_format_switch = None;
+            route_diff = false;
         }
     }
     let traffic_split_arm_owned = traffic_split_arm.map(str::to_string);
@@ -1276,17 +1288,16 @@ pub async fn handler(
         None => {}
     }
     let mut diff_plan: Option<crate::shaping::diff::DiffPlan> = None;
-    let mut pre_diff_req: Option<ChatCompletionRequest> = None;
     match diff_decision {
         Some(crate::shaping::ShapeDecision::Apply(p)) => {
-            // Clone the caller's EXACT original FIRST (retains
-            // response_format) — the fail-closed re-emit dispatches it
-            // verbatim. Only the consumed TT-internal echo is dropped.
-            let mut original = req.clone();
-            original
-                .tt_extras
-                .remove(crate::shaping::diff::TT_EXTRA_DIFF_PRIOR);
-            pre_diff_req = Some(original);
+            // No pre-mutation clone is kept: the fail-closed re-emit is
+            // derived from the DISPATCHED request at the failure site
+            // (`unapply_diff_request` — drop the instruction, restore the
+            // plan's response_format) so it inherits every dispatch-path
+            // normalization. A pre-pipeline clone would bypass the
+            // redaction guardrail on a redact+diff route and dispatch
+            // un-flexed bytes that `compute_cost_full` prices at flex
+            // rates.
             crate::shaping::diff::apply_diff_request(&mut req, &p);
             diff_plan = Some(p);
         }
@@ -2276,7 +2287,19 @@ pub async fn handler(
             // Tool-call-only responses yield empty assistant text → the
             // validator rejects → fail-open, same arm as a prose mismatch.
             let body = response_assistant_text(&response);
-            match crate::shaping::format_switch::validate_switched_body(&body, &plan.format) {
+            // Truncation gate FIRST: a max-token-cut emission can end
+            // exactly at a record-line boundary and pass the per-line arity
+            // check, silently serving a SHORTER record set than the model
+            // intended — whereas the JSON contract being replaced would
+            // have been detectably invalid on truncation. The switched
+            // contract must not be weaker, so a non-"stop" finish_reason
+            // fails OPEN like any other validation mismatch.
+            let validated = if response_emission_truncated(&response) {
+                Err("truncated")
+            } else {
+                crate::shaping::format_switch::validate_switched_body(&body, &plan.format)
+            };
+            match validated {
                 Ok(stripped) => {
                     // Tokenizer-grounded ESTIMATE only (labeled "Est"
                     // everywhere): not computable ⇒ book $0 + meter.
@@ -2309,9 +2332,21 @@ pub async fn handler(
                 }
             }
         }
-        if let (Some(plan), Some(original_req)) = (diff_plan.as_ref(), pre_diff_req.as_ref()) {
+        if let Some(plan) = diff_plan.as_ref() {
             let patch_text = response_assistant_text(&response);
-            match crate::shaping::diff::reconstruct(plan, &patch_text) {
+            // Truncation gate FIRST (fail closed): a patch cut by the
+            // provider's token limit exactly at a `>>>>>>> REPLACE`
+            // boundary parses as a valid-but-INCOMPLETE multi-block patch
+            // and would silently serve a PARTIALLY edited artifact — the
+            // unique-anchor and JSON-validity checks cannot detect a
+            // missing trailing block. Mid-block truncation already fails
+            // closed as Malformed; this closes the boundary case.
+            let reconstructed = if response_emission_truncated(&response) {
+                Err(crate::shaping::diff::DiffError::Truncated)
+            } else {
+                crate::shaping::diff::reconstruct(plan, &patch_text)
+            };
+            match reconstructed {
                 Ok(artifact) => {
                     // MEASURED saving: both sides are real tokenizer counts
                     // on real strings — the reconstructed artifact the caller
@@ -2333,9 +2368,9 @@ pub async fn handler(
                     crate::metrics::record_diff("applied", "");
                 }
                 Err(e) => {
-                    // FAIL CLOSED → full re-emit of the caller's EXACT
-                    // original request. Book the failed attempt's realized
-                    // (pre-fee) cost first — it is real invoice spend.
+                    // FAIL CLOSED → full re-emit. Book the failed attempt's
+                    // realized (pre-fee) cost first — it is real invoice
+                    // spend.
                     let patch_pricing = provider.pricing(&response.model);
                     shape_effects.diff_failed_cost_usd = compute_cost(
                         &response.usage,
@@ -2347,11 +2382,31 @@ pub async fn handler(
                     warnings.push(format!("diff_failed:{}", e.reason()));
                     diff_failed = true;
                     crate::metrics::record_diff("failed", e.reason());
+                    // The re-emit request is derived from the DISPATCHED
+                    // request — drop the patch instruction, restore the
+                    // caller's response_format — NOT from a pre-pipeline
+                    // clone, so it inherits every dispatch-path
+                    // normalization: the redaction guardrail (a
+                    // redact+diff route's re-emit must never out-leak the
+                    // dispatch path — same invariant that skips the judge
+                    // wholesale on redact routes), compression, the flex
+                    // tier (`compute_cost_full` prices the metered re-emit
+                    // usage with `flex_applied`), and the temperature
+                    // clamp. The restored response_format then needs the
+                    // provider-compat downgrade the patch dispatch never
+                    // needed (its response_format was None).
+                    let mut reemit_req = req.clone();
+                    crate::shaping::diff::unapply_diff_request(&mut reemit_req, plan);
+                    maybe_downgrade_response_format(
+                        &mut reemit_req,
+                        provider.as_ref(),
+                        &mut warnings,
+                    );
                     // Single provider, no failover chain — the chain already
                     // chose this provider for the patch dispatch.
                     let reemit = with_request_timeout(request_timeout, async {
                         with_retry(&RetryPolicy::default(), || {
-                            provider.chat_completion(original_req.clone(), &ctx)
+                            provider.chat_completion(reemit_req.clone(), &ctx)
                         })
                         .await
                         .map_err(ApiError::from)
@@ -4448,6 +4503,23 @@ fn response_assistant_text(resp: &ChatCompletionResponse) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// True when the first choice's `finish_reason` reports anything other than
+/// a clean `"stop"` — `"length"` (token-limit truncation) and
+/// `"content_filter"` being the realistic cases for a text emission. Both
+/// shaping arms check this BEFORE accepting an emission: a truncated patch
+/// or CSV body can pass every structural check while being silently
+/// incomplete. A MISSING `finish_reason` is treated as clean — truncation
+/// cannot be proven (some providers/mocks omit it), and the gate must fail
+/// in the accept direction or it would disable shaping wholesale on those
+/// providers. The served response keeps the provider's `finish_reason`
+/// either way, so callers retain the standard truncation signal.
+fn response_emission_truncated(resp: &ChatCompletionResponse) -> bool {
+    resp.choices
+        .first()
+        .and_then(|c| c.finish_reason.as_deref())
+        .is_some_and(|r| r != "stop")
 }
 
 /// Gate + spawn the sampled async quality judge for a rerouted-DOWN chat

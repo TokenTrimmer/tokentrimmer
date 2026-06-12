@@ -84,8 +84,12 @@ const FULL_REEMIT_BODY: &str = "the full re-emitted document the caller original
 
 /// One scripted upstream behavior.
 enum Script {
-    /// Respond with this assistant body and completion-token count.
+    /// Respond with this assistant body and completion-token count
+    /// (finish_reason "stop").
     Body(&'static str, u64),
+    /// Respond with this assistant body, completion-token count, and
+    /// finish_reason (e.g. "length" — a token-limit truncation).
+    BodyFinish(&'static str, u64, &'static str),
     /// Fail with a NON-retryable error (InvalidRequest is not retried).
     Fail,
 }
@@ -142,8 +146,9 @@ impl Provider for ScriptedProvider {
                 s.remove(0)
             }
         };
-        let (body, completion) = match next {
-            Script::Body(b, c) => (b.to_string(), c),
+        let (body, completion, finish) = match next {
+            Script::Body(b, c) => (b.to_string(), c, "stop"),
+            Script::BodyFinish(b, c, f) => (b.to_string(), c, f),
             Script::Fail => return Err(ProviderError::InvalidRequest("scripted failure".into())),
         };
         Ok(ChatCompletionResponse {
@@ -158,7 +163,7 @@ impl Provider for ScriptedProvider {
                     tool_calls: vec![],
                     name: None,
                 },
-                finish_reason: Some("stop".into()),
+                finish_reason: Some(finish.into()),
             }],
             usage: Usage {
                 prompt_tokens: PROMPT_TOKENS,
@@ -212,7 +217,32 @@ struct Harness {
     log_writer: Arc<InMemoryRequestLogWriter>,
 }
 
+/// The default diff-route action; tests tweak individual levers on top.
+fn diff_action() -> RouteAction {
+    RouteAction {
+        target_model: "diff-1".into(),
+        fallbacks: Vec::new(),
+        disable_cache: false,
+        max_cost_usd: None,
+        flex: false,
+        batch: false,
+        compress: false,
+        redact: false,
+        format_switch: None,
+        diff: true,
+        traffic_pct: None,
+        shadow_model: None,
+        auto_pause: false,
+        pause_floor_pass_rate: None,
+        pause_min_verdicts: None,
+    }
+}
+
 async fn app_with_diff_route(paused: bool) -> Harness {
+    app_with_route(paused, diff_action()).await
+}
+
+async fn app_with_route(paused: bool, then: RouteAction) -> Harness {
     let calls = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let script: Arc<Mutex<Vec<Script>>> = Arc::new(Mutex::new(Vec::new()));
@@ -241,23 +271,7 @@ async fn app_with_diff_route(paused: bool) -> Harness {
                 model_in: vec!["diff-1".into()],
                 ..Default::default()
             },
-            then: RouteAction {
-                target_model: "diff-1".into(),
-                fallbacks: Vec::new(),
-                disable_cache: false,
-                max_cost_usd: None,
-                flex: false,
-                batch: false,
-                compress: false,
-                redact: false,
-                format_switch: None,
-                diff: true,
-                traffic_pct: None,
-                shadow_model: None,
-                auto_pause: false,
-                pause_floor_pass_rate: None,
-                pause_min_verdicts: None,
-            },
+            then,
         }],
     );
     let routing = Arc::new(CachingRoutingStore::new(
@@ -655,6 +669,270 @@ async fn tt_extras_prior_wins_and_never_rides_upstream() {
         !recorded[0].contains("diff_prior"),
         "the consumed tt_extras echo must never ride upstream: {}",
         recorded[0]
+    );
+}
+
+/// (g) Truncation gate: a patch emission cut by the provider's token limit
+/// (`finish_reason: "length"`) fails CLOSED even when the truncated text
+/// parses as a structurally valid patch — a cut landing exactly on a
+/// `>>>>>>> REPLACE` boundary would otherwise silently serve a PARTIALLY
+/// edited artifact.
+#[tokio::test]
+async fn truncated_patch_fails_closed_to_full_reemit() {
+    let h = app_with_diff_route(false).await;
+    let prior = prior_doc();
+    {
+        let mut s = h.script.lock().unwrap();
+        // GOOD_PATCH is fully parseable — only the finish_reason says the
+        // emission was cut (the missing-trailing-block case is invisible to
+        // every structural check, which is the point of the gate).
+        s.push(Script::BodyFinish(
+            GOOD_PATCH,
+            PATCH_COMPLETION_TOKENS,
+            "length",
+        ));
+        s.push(Script::Body(FULL_REEMIT_BODY, FULL_COMPLETION_TOKENS));
+    }
+
+    let resp = h
+        .app
+        .oneshot(edit_request(&h.key, &prior, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        h.calls.load(Ordering::Relaxed),
+        2,
+        "truncated patch = failed attempt + full re-emit"
+    );
+
+    let warnings = warnings_of(&resp);
+    assert!(
+        warnings.iter().any(|w| w == "diff_failed:truncated"),
+        "expected diff_failed:truncated, got {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w == "diff_applied"),
+        "a truncated patch must never claim success: {warnings:?}"
+    );
+    // Both dispatches billed; headline clamps to 0 (no fabricated saving).
+    let cost = header_f64(&resp, "x-tokentrimmer-cost-usd");
+    let expected = patch_cost() + full_cost();
+    assert!(
+        (cost - expected).abs() < 1e-9,
+        "cost ({cost}) must carry BOTH dispatches ({expected})"
+    );
+    assert_eq!(header_str(&resp, "x-tokentrimmer-saved-usd"), "0.000000");
+
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["choices"][0]["message"]["content"].as_str(),
+        Some(FULL_REEMIT_BODY),
+        "the caller receives the full re-emit, never the truncated patch's partial apply"
+    );
+}
+
+/// (h) redact × diff: the fail-closed re-emit must dispatch the REDACTED
+/// bytes — it is derived from the dispatched request, never a pre-pipeline
+/// clone. A secret stripped from the patch dispatch must not reappear on
+/// the re-emit (the measurement/retry path must never out-leak the dispatch
+/// path).
+#[tokio::test]
+async fn redact_diff_reemit_never_leaks_unredacted_content() {
+    let h = app_with_route(
+        false,
+        RouteAction {
+            redact: true,
+            ..diff_action()
+        },
+    )
+    .await;
+    let prior = prior_doc();
+    let secret = format!("sk-ant-{}", "a".repeat(40));
+    {
+        let mut s = h.script.lock().unwrap();
+        s.push(Script::Body(PROSE_NO_PATCH, PATCH_COMPLETION_TOKENS));
+        s.push(Script::Body(FULL_REEMIT_BODY, FULL_COMPLETION_TOKENS));
+    }
+
+    // The edit ask leaks an API key in the user turn; the assistant prior is
+    // untouched by redaction (Assistant messages are skipped), so the diff
+    // planning itself is unaffected.
+    let body = json!({
+        "model": "diff-1",
+        "messages": [
+            { "role": "user", "content": "write the release notes" },
+            { "role": "assistant", "content": prior },
+            { "role": "user", "content": format!("punch up Item 3, auth with {secret}") }
+        ],
+        "stream": false,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", h.key))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = h.app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        h.calls.load(Ordering::Relaxed),
+        2,
+        "failed patch + fail-closed re-emit"
+    );
+
+    let warnings = warnings_of(&resp);
+    assert!(
+        warnings.iter().any(|w| w == "redacted:body"),
+        "the redaction guardrail must fire on the user turn: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w == "diff_failed:no_blocks"),
+        "expected diff_failed:no_blocks, got {warnings:?}"
+    );
+
+    let recorded = h.requests.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    // The patch dispatch was redacted (pre-existing guarantee)…
+    assert!(
+        !recorded[0].contains(&secret) && recorded[0].contains("[REDACTED]"),
+        "patch dispatch must carry redacted bytes: {}",
+        recorded[0]
+    );
+    // …and the RE-EMIT must be too: the regression under test is a
+    // pre-pipeline clone re-dispatching the raw secret upstream.
+    assert!(
+        !recorded[1].contains(&secret),
+        "the fail-closed re-emit must NEVER leak the unredacted secret upstream: {}",
+        recorded[1]
+    );
+    assert!(
+        recorded[1].contains("[REDACTED]"),
+        "the re-emit must carry the same redacted bytes the dispatch path carried: {}",
+        recorded[1]
+    );
+    // And it is still the instruction-free original ask.
+    assert!(
+        !recorded[1].contains("anchored search/replace patch"),
+        "the re-emit must not carry the patch instruction: {}",
+        recorded[1]
+    );
+}
+
+/// (i) Canary traffic split × shaping: the CONTROL arm's contract is "served
+/// unchanged" — the contract-changing diff lever must not fire there
+/// (traffic_pct: 0 ⇒ every request is control), while the canary arm
+/// (traffic_pct: 100) keeps the lever.
+#[tokio::test]
+async fn canary_control_arm_never_receives_shaping() {
+    // Control arm: pct=0 puts ALL traffic on control.
+    let h = app_with_route(
+        false,
+        RouteAction {
+            traffic_pct: Some(0),
+            ..diff_action()
+        },
+    )
+    .await;
+    let prior = prior_doc();
+    h.script
+        .lock()
+        .unwrap()
+        .push(Script::Body("a normal answer", FULL_COMPLETION_TOKENS));
+
+    let resp = h
+        .app
+        .oneshot(edit_request(&h.key, &prior, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.calls.load(Ordering::Relaxed), 1);
+
+    let warnings = warnings_of(&resp);
+    assert!(
+        !warnings.iter().any(|w| w.starts_with("diff")),
+        "the control arm must emit NO diff tokens (not even a skip): {warnings:?}"
+    );
+    {
+        let recorded = h.requests.lock().unwrap();
+        assert!(
+            !recorded[0].contains("anchored search/replace patch"),
+            "no instruction may be injected on the control arm: {}",
+            recorded[0]
+        );
+    }
+
+    // Canary arm: pct=100 puts ALL traffic on canary — the lever still fires.
+    let h = app_with_route(
+        false,
+        RouteAction {
+            traffic_pct: Some(100),
+            ..diff_action()
+        },
+    )
+    .await;
+    h.script
+        .lock()
+        .unwrap()
+        .push(Script::Body(GOOD_PATCH, PATCH_COMPLETION_TOKENS));
+    let resp = h
+        .app
+        .oneshot(edit_request(&h.key, &prior, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let warnings = warnings_of(&resp);
+    assert!(
+        warnings.iter().any(|w| w == "diff_applied"),
+        "the canary arm keeps the lever: {warnings:?}"
+    );
+}
+
+/// (j) Defense-in-depth conflict arm: a route carrying BOTH levers (only
+/// reachable by a writer that bypasses `validate_output_shaping` — the
+/// in-memory store here) lets diff win and skips the switch with the
+/// `conflict` token.
+#[tokio::test]
+async fn conflicting_levers_defend_diff_wins_switch_skipped() {
+    let h = app_with_route(
+        false,
+        RouteAction {
+            format_switch: Some("csv".into()),
+            ..diff_action()
+        },
+    )
+    .await;
+    let prior = prior_doc();
+    h.script
+        .lock()
+        .unwrap()
+        .push(Script::Body(GOOD_PATCH, PATCH_COMPLETION_TOKENS));
+
+    let resp = h
+        .app
+        .oneshot(edit_request(&h.key, &prior, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.calls.load(Ordering::Relaxed), 1);
+
+    let warnings = warnings_of(&resp);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w == "format_switch_skipped:conflict"),
+        "the switch must be skipped with the conflict token: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w == "diff_applied"),
+        "diff wins the conflict: {warnings:?}"
+    );
+    let body = body_json(resp).await;
+    let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(
+        content.contains("SWIFT brown fox"),
+        "the diff lever must still reconstruct the artifact: {content}"
     );
 }
 

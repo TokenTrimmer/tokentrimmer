@@ -34,15 +34,27 @@
 //! they are text and [`reconstruct`] additionally requires the result to
 //! parse as JSON whenever the caller set a JSON `response_format`.
 //!
+//! KNOWN GRAMMAR LIMIT (v1, fails SAFE): the markers are matched on the
+//! trimmed content of every line, including lines inside a block body, so a
+//! document whose anchor region itself contains a line trimming to
+//! `=======` (e.g. a 7-char markdown setext underline) cannot be quoted in
+//! any valid patch — every edit touching such a region fails CLOSED and
+//! pays the honest re-emit retry tax. Routes serving such documents should
+//! not enable `diff`; a marker-escaping scheme is a documented follow-up.
+//!
 //! ## Fail-closed
 //!
-//! ANY validation failure (no blocks / malformed / missing or ambiguous
-//! anchor / result not JSON when required) ⇒ the handler re-dispatches the
-//! caller's EXACT original request for a full re-emit and books the failed
-//! patch attempt's realized cost honestly (`diff_failed` +
-//! `diff_failed_cost_usd`). OpenAI Predicted Outputs is deliberately NOT used
-//! anywhere (latency-only, no billing discount), and `max_tokens` is never
-//! set or modified (Anthropic counts thinking inside it).
+//! ANY validation failure (truncated emission / no blocks / malformed /
+//! missing or ambiguous anchor / result not JSON when required) ⇒ the
+//! handler re-dispatches a full re-emit and books the failed patch
+//! attempt's realized cost honestly (`diff_failed` +
+//! `diff_failed_cost_usd`). The re-emit request is the DISPATCHED request
+//! with this module's mutation inverted ([`unapply_diff_request`]) so it
+//! inherits redaction/compression/flex — never a pre-pipeline clone, which
+//! would leak unredacted content upstream on a `redact`+`diff` route.
+//! OpenAI Predicted Outputs is deliberately NOT used anywhere
+//! (latency-only, no billing discount), and `max_tokens` is never set or
+//! modified (Anthropic counts thinking inside it).
 
 use tt_shared::messages::{Message, MessageContent, ResponseFormat};
 use tt_shared::ChatCompletionRequest;
@@ -82,7 +94,8 @@ pub(crate) struct DiffPlan {
     pub prior: String,
     #[allow(dead_code)] // telemetry/debug seam; read by tests
     pub source: PriorSource,
-    /// Caller's `response_format`, retained for post-apply validation; the
+    /// Caller's `response_format`, retained for post-apply validation and
+    /// restored onto the fail-closed re-emit ([`unapply_diff_request`]); the
     /// upstream patch request drops it (the patch is not the artifact).
     pub response_format: Option<ResponseFormat>,
 }
@@ -111,6 +124,17 @@ pub(crate) fn plan_diff(
     if is_strict_json_schema(req.response_format.as_ref()) {
         return Some(ShapeDecision::Skip("strict_schema"));
     }
+    // An explicit echo of the WRONG TYPE (e.g. the caller sent the JSON
+    // artifact itself instead of a string) gets its own skip — falling back
+    // to the assistant history would silently anchor the patch against a
+    // different document than the one the caller explicitly supplied.
+    if req
+        .tt_extras
+        .get(TT_EXTRA_DIFF_PRIOR)
+        .is_some_and(|v| !v.is_string())
+    {
+        return Some(ShapeDecision::Skip("bad_prior_type"));
+    }
     let Some((prior, source)) = identify_prior(req) else {
         return Some(ShapeDecision::Skip("no_prior"));
     };
@@ -137,7 +161,10 @@ fn is_strict_json_schema(rf: Option<&ResponseFormat>) -> bool {
 }
 
 /// The prior seam: explicit `tt_extras["diff_prior"]` echo beats the last
-/// assistant message in the history. `None` when neither exists.
+/// assistant message in the history. `None` when neither exists. A PRESENT
+/// but non-string echo never reaches here — `plan_diff` skips it with
+/// `bad_prior_type` instead of silently inferring a different prior than the
+/// one the caller explicitly supplied.
 fn identify_prior(req: &ChatCompletionRequest) -> Option<(String, PriorSource)> {
     if let Some(v) = req.tt_extras.get(TT_EXTRA_DIFF_PRIOR) {
         if let Some(s) = v.as_str() {
@@ -175,15 +202,43 @@ fn identify_prior(req: &ChatCompletionRequest) -> Option<(String, PriorSource)> 
 /// patch is not the artifact — a JSON grammar would fight the patch wire
 /// form), remove the consumed `tt_extras` echo (defense in depth — adapters
 /// strip `tt_extras` anyway), and append [`DIFF_INSTRUCTION`] as a trailing
-/// System message. `max_tokens` is NEVER set or modified. The caller MUST
-/// clone the original request BEFORE this mutation — the fail-closed re-emit
-/// dispatches that exact original.
+/// System message. `max_tokens` is NEVER set or modified. The fail-closed
+/// re-emit inverts this mutation on the dispatched request via
+/// [`unapply_diff_request`] — never a pre-pipeline clone (see there).
 pub(crate) fn apply_diff_request(req: &mut ChatCompletionRequest, _plan: &DiffPlan) {
     req.response_format = None;
     req.tt_extras.remove(TT_EXTRA_DIFF_PRIOR);
     req.messages.push(Message::System {
         content: MessageContent::Text(DIFF_INSTRUCTION.to_string()),
     });
+}
+
+/// Invert [`apply_diff_request`] on a clone of the DISPATCHED request to
+/// build the fail-closed re-emit: remove the trailing patch-instruction
+/// System message (matched byte-exactly from the end — the constant is never
+/// touched by the request passes) and restore the caller's `response_format`
+/// from the plan (the re-emit IS the artifact, so the caller's contract
+/// applies again).
+///
+/// The re-emit is derived from the dispatched request — NOT from a
+/// pre-pipeline clone — so it inherits every dispatch-path normalization the
+/// patch dispatch carried: the redaction guardrail (a `redact`+`diff` route's
+/// re-emit must never out-leak the dispatch path), compression, the flex
+/// tier (`compute_cost_full` prices the metered re-emit with `flex_applied`),
+/// and the temperature clamp. The caller re-runs the provider
+/// `response_format` downgrade on the restored value before dispatching.
+pub(crate) fn unapply_diff_request(req: &mut ChatCompletionRequest, plan: &DiffPlan) {
+    if let Some(pos) = req.messages.iter().rposition(|m| {
+        matches!(
+            m,
+            Message::System {
+                content: MessageContent::Text(t),
+            } if t == DIFF_INSTRUCTION
+        )
+    }) {
+        req.messages.remove(pos);
+    }
+    req.response_format = plan.response_format.clone();
 }
 
 /// One anchored search/replace block.
@@ -211,6 +266,13 @@ pub(crate) enum DiffError {
     /// The reconstructed artifact must parse as JSON (caller set a JSON
     /// `response_format`) but does not.
     InvalidJson,
+    /// The patch emission was cut off by the provider (`finish_reason` other
+    /// than `"stop"`, e.g. a `max_tokens`/`length` truncation). Checked
+    /// BEFORE parsing: a truncation that happens to land exactly on a
+    /// `>>>>>>> REPLACE` boundary parses as a valid-but-incomplete
+    /// multi-block patch and would silently serve a PARTIALLY edited
+    /// artifact — the one corruption the structural checks cannot see.
+    Truncated,
 }
 
 impl DiffError {
@@ -222,6 +284,7 @@ impl DiffError {
             DiffError::AnchorMissing => "anchor_missing",
             DiffError::AnchorAmbiguous => "anchor_ambiguous",
             DiffError::InvalidJson => "invalid_json",
+            DiffError::Truncated => "truncated",
         }
     }
 }
@@ -300,15 +363,26 @@ pub(crate) fn parse_search_replace(patch: &str) -> Result<Vec<SrBlock>, DiffErro
 /// occur EXACTLY ONCE in the current text (zero matches ⇒
 /// [`DiffError::AnchorMissing`], more than one ⇒
 /// [`DiffError::AnchorAmbiguous`]) — anything else would be a silent guess
-/// about the caller's document.
+/// about the caller's document. The second-occurrence scan is
+/// OVERLAP-AWARE: `str::matches` counts only disjoint occurrences, so a
+/// self-overlapping anchor (`"aa"` in `"aaa"` — repeated-pattern text such
+/// as separator runs or duplicated lines) would otherwise count 1 and apply
+/// as a silent guess at the first position.
 pub(crate) fn apply_patch(prior: &str, blocks: &[SrBlock]) -> Result<String, DiffError> {
     let mut current = prior.to_string();
     for block in blocks {
-        match current.matches(block.search.as_str()).count() {
-            0 => return Err(DiffError::AnchorMissing),
-            1 => current = current.replacen(block.search.as_str(), &block.replace, 1),
-            _ => return Err(DiffError::AnchorAmbiguous),
+        let search = block.search.as_str();
+        let Some(first) = current.find(search) else {
+            return Err(DiffError::AnchorMissing);
+        };
+        // Rescan from one character past the first match start (the anchor
+        // is non-empty, so this is a char boundary inside/at the end of the
+        // match) — catches overlapping AND disjoint second occurrences.
+        let step = search.chars().next().map_or(1, char::len_utf8);
+        if current[first + step..].contains(search) {
+            return Err(DiffError::AnchorAmbiguous);
         }
+        current.replace_range(first..first + search.len(), &block.replace);
     }
     Ok(current)
 }
@@ -419,6 +493,16 @@ mod tests {
         };
         assert_eq!(skip_reason(plan_diff(&bare, true)), "no_prior");
 
+        // An explicit echo of the WRONG TYPE (object/array instead of a
+        // string) skips with its own reason — never a silent fallback to the
+        // assistant history (a different document than the caller supplied).
+        let mut typed = edit_loop_req(&doc);
+        typed.tt_extras.insert(
+            TT_EXTRA_DIFF_PRIOR.into(),
+            serde_json::json!({"title": "doc"}),
+        );
+        assert_eq!(skip_reason(plan_diff(&typed, true)), "bad_prior_type");
+
         // Prior under the floor.
         let small = edit_loop_req("tiny doc");
         assert_eq!(skip_reason(plan_diff(&small, true)), "prior_too_small");
@@ -446,8 +530,9 @@ mod tests {
     }
 
     /// Mutation: response_format removed + instruction appended + the
-    /// consumed tt_extras echo dropped; a pre-mutation clone retains the
-    /// original response_format (the fail-closed re-emit contract).
+    /// consumed tt_extras echo dropped; the PLAN retains the caller's
+    /// response_format (used by `reconstruct`'s JSON gate and restored onto
+    /// the re-emit by `unapply_diff_request`).
     #[test]
     fn apply_mutation_and_pre_diff_clone() {
         let doc = long_doc();
@@ -478,7 +563,7 @@ mod tests {
             } => assert_eq!(t, DIFF_INSTRUCTION),
             other => panic!("expected trailing System instruction, got {other:?}"),
         }
-        // The pre-mutation clone is the exact original (re-emit contract).
+        // A pre-mutation clone is untouched by the apply (no aliasing).
         assert_eq!(
             pre_diff
                 .response_format
@@ -490,6 +575,55 @@ mod tests {
         // max_tokens is NEVER set or modified (Anthropic counts thinking
         // inside it).
         assert_eq!(req.max_tokens, None);
+    }
+
+    /// unapply_diff_request inverts the mutation on the DISPATCHED request:
+    /// the trailing instruction is removed and the caller's response_format
+    /// restored — while every OTHER dispatch-path mutation (e.g. redaction
+    /// of message content) survives on the re-emit.
+    #[test]
+    fn unapply_inverts_on_dispatched_request_preserving_pipeline_mutations() {
+        let doc = long_doc();
+        let mut req = edit_loop_req(&doc);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_object".into(),
+            json_schema: None,
+        });
+        let plan = applied(plan_diff(&req, true));
+        apply_diff_request(&mut req, &plan);
+
+        // Simulate a post-instruction pipeline mutation (what the redaction
+        // guardrail does to the dispatched bytes).
+        if let Message::User { content, .. } = &mut req.messages[2] {
+            *content = MessageContent::Text("rename [REDACTED]".into());
+        }
+
+        let mut reemit = req.clone();
+        unapply_diff_request(&mut reemit, &plan);
+
+        // Instruction gone, response_format restored.
+        assert_eq!(reemit.messages.len(), req.messages.len() - 1);
+        assert!(!reemit.messages.iter().any(|m| matches!(
+            m,
+            Message::System { content: MessageContent::Text(t) } if t == DIFF_INSTRUCTION
+        )));
+        assert_eq!(
+            reemit.response_format.as_ref().map(|rf| rf.r#type.as_str()),
+            Some("json_object")
+        );
+        // The pipeline mutation SURVIVES — the re-emit inherits the
+        // dispatched (redacted) bytes, never the pre-pipeline original.
+        match &reemit.messages[2] {
+            Message::User {
+                content: MessageContent::Text(t),
+                ..
+            } => assert_eq!(t, "rename [REDACTED]"),
+            other => panic!("unexpected message shape: {other:?}"),
+        }
+        // Idempotent when no instruction is present (theoretical safety).
+        let before = serde_json::to_string(&reemit).unwrap();
+        unapply_diff_request(&mut reemit, &plan);
+        assert_eq!(serde_json::to_string(&reemit).unwrap(), before);
     }
 
     /// Parser: single block, multiple blocks, whole-patch fences tolerated,
@@ -574,6 +708,44 @@ mod tests {
                 }]
             ),
             Err(DiffError::AnchorAmbiguous)
+        );
+
+        // OVERLAPPING occurrences are ambiguous too: "aa" occurs twice in
+        // "aaa" (positions 0 and 1) even though str::matches counts only 1
+        // disjoint occurrence — applying would be a silent guess.
+        assert_eq!(
+            apply_patch(
+                "aaa",
+                &[SrBlock {
+                    search: "aa".into(),
+                    replace: "X".into()
+                }]
+            ),
+            Err(DiffError::AnchorAmbiguous)
+        );
+        // Same with a multi-byte leading char (char-boundary safety of the
+        // overlap rescan).
+        assert_eq!(
+            apply_patch(
+                "ééé",
+                &[SrBlock {
+                    search: "éé".into(),
+                    replace: "X".into()
+                }]
+            ),
+            Err(DiffError::AnchorAmbiguous)
+        );
+        // A genuinely unique multi-byte anchor still applies cleanly.
+        assert_eq!(
+            apply_patch(
+                "héllo wörld",
+                &[SrBlock {
+                    search: "wörld".into(),
+                    replace: "world".into()
+                }]
+            )
+            .unwrap(),
+            "héllo world"
         );
 
         // Sequential semantics: block 2's anchor exists only AFTER block 1

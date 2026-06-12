@@ -59,6 +59,9 @@ struct FsRecordingProvider {
     requests: Arc<Mutex<Vec<String>>>,
     calls: Arc<AtomicUsize>,
     body: Arc<Mutex<String>>,
+    /// finish_reason for the non-streaming response ("stop" unless a test
+    /// simulates a token-limit truncation with "length").
+    finish: Arc<Mutex<String>>,
 }
 
 #[async_trait]
@@ -114,7 +117,7 @@ impl Provider for FsRecordingProvider {
                     tool_calls: vec![],
                     name: None,
                 },
-                finish_reason: Some("stop".into()),
+                finish_reason: Some(self.finish.lock().unwrap().clone()),
             }],
             usage: Usage {
                 prompt_tokens: 1000,
@@ -185,6 +188,7 @@ struct Harness {
     requests: Arc<Mutex<Vec<String>>>,
     calls: Arc<AtomicUsize>,
     body: Arc<Mutex<String>>,
+    finish: Arc<Mutex<String>>,
     log_writer: Arc<InMemoryRequestLogWriter>,
 }
 
@@ -194,11 +198,13 @@ async fn app_with_format_switch_route(format_switch: Option<&str>) -> Harness {
     let calls = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let body = Arc::new(Mutex::new(CLEAN_CSV.to_string()));
+    let finish = Arc::new(Mutex::new("stop".to_string()));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(FsRecordingProvider {
         requests: Arc::clone(&requests),
         calls: Arc::clone(&calls),
         body: Arc::clone(&body),
+        finish: Arc::clone(&finish),
     }));
 
     let raw_store = InMemoryKeyStore::new();
@@ -256,6 +262,7 @@ async fn app_with_format_switch_route(format_switch: Option<&str>) -> Harness {
         requests,
         calls,
         body,
+        finish,
         log_writer,
     }
 }
@@ -438,6 +445,64 @@ async fn failed_validation_fails_open_and_is_never_cached() {
     );
 }
 
+/// (b2) Truncation gate: a token-limit-cut emission (`finish_reason:
+/// "length"`) fails OPEN even when the truncated text validates as clean
+/// CSV — a cut landing exactly on a record-line boundary passes the
+/// per-line arity check while silently dropping trailing records, whereas
+/// the JSON contract being replaced would have been detectably invalid.
+#[tokio::test]
+async fn truncated_emission_fails_open_untouched() {
+    let h = app_with_format_switch_route(Some("csv")).await;
+    // A fenced-but-valid CSV body: if validation (wrongly) ran, the served
+    // body would be the STRIPPED form — asserting the fenced bytes proves
+    // the fail-open arm served the body untouched.
+    let fenced = format!("```csv\n{CLEAN_CSV}\n```");
+    *h.body.lock().unwrap() = fenced.clone();
+    *h.finish.lock().unwrap() = "length".to_string();
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request(&h.key, false, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "fail-open: never a 5xx");
+    let warnings = warnings_of(&resp);
+    assert!(
+        warnings.iter().any(|w| w == "format_switch_failed:csv"),
+        "expected format_switch_failed:csv on a truncated emission, got {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w == "format_switch:csv"),
+        "a truncated emission must never advertise a validated switch: {warnings:?}"
+    );
+    assert_eq!(
+        header_str(&resp, "x-tokentrimmer-format-switch-saved-est-usd"),
+        "0.000000",
+        "no estimate may be booked for a truncated emission"
+    );
+    assert_eq!(
+        body_content(resp).await,
+        fenced,
+        "the truncated body passes through UNTOUCHED (not stripped)"
+    );
+
+    // Same non-caching contract as every other fail-open: the second
+    // identical request must dispatch again.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let resp2 = h
+        .app
+        .oneshot(chat_request(&h.key, false, false))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert_eq!(
+        h.calls.load(Ordering::Relaxed),
+        2,
+        "truncated fail-open bodies must never be cached under the switched key"
+    );
+}
+
 /// (c) Streaming request through the route: untouched (response_format rides
 /// upstream, no instruction) + `format_switch_skipped:streaming`.
 #[tokio::test]
@@ -569,6 +634,7 @@ async fn control_route_without_action_is_byte_identical_upstream() {
         requests: Arc::clone(&requests),
         calls,
         body,
+        finish: Arc::new(Mutex::new("stop".to_string())),
     }));
     let unrouted = build_router(AppState::new(registry));
     let r = unrouted

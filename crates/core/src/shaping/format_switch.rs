@@ -33,10 +33,19 @@ use super::ShapeDecision;
 /// Instruction prefix for the CSV switch; the full instruction appends the
 /// expected header (`columns.join(",")`). Byte-exact contract — tests assert
 /// on it and the strip-validator's header detection pairs with it.
+///
+/// Deliberately does NOT invite RFC-4180 embedded newlines: the
+/// strip-validator ([`validate_csv`]) and the estimate reconstruction are
+/// line-based, so a quoted field spanning physical lines would always
+/// fail-open (safe, but the lever forfeits its saving on exactly the data
+/// the instruction invited). The instruction and the validator must accept
+/// the same grammar: one record per physical line, newlines in field values
+/// replaced.
 pub(crate) const CSV_INSTRUCTION_PREFIX: &str = "Respond ONLY with CSV data. \
 Output the header line below exactly, then one line per record. Quote any \
-field containing a comma, double quote, or newline with double quotes \
-(RFC 4180). No prose, no markdown fences, no JSON. Header: ";
+field containing a comma or double quote with double quotes (RFC 4180 \
+quoting). Keep every record on a single line — replace any newline inside a \
+field value with a space. No prose, no markdown fences, no JSON. Header: ";
 
 /// Instruction for the bare-value switch. Byte-exact contract.
 pub(crate) const BARE_INSTRUCTION: &str = "Respond ONLY with the answer value \
@@ -283,13 +292,11 @@ fn validate_csv(body: &str, columns: &[String]) -> Result<String, &'static str> 
         return Err("header");
     }
     let mut out = vec![expected_header.clone()];
-    let mut pending_blanks = 0usize;
     for line in lines {
         if line.trim().is_empty() {
-            // Blank lines are tolerated only as trailing padding; interior
-            // blanks before another record are fine too (they separate
-            // nothing) — they are simply dropped from the stripped body.
-            pending_blanks += 1;
+            // Blank lines ANYWHERE (interior or trailing) can never become
+            // records or change arity — they are simply dropped from the
+            // stripped body.
             continue;
         }
         let Some(fields) = csv_field_count(line) else {
@@ -298,8 +305,6 @@ fn validate_csv(body: &str, columns: &[String]) -> Result<String, &'static str> 
         if fields != columns.len() {
             return Err("body");
         }
-        let _ = pending_blanks;
-        pending_blanks = 0;
         out.push(line.to_string());
     }
     Ok(out.join("\n"))
