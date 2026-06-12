@@ -207,6 +207,7 @@ async fn app_with_route(
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "canary-route".into(),
             priority: 100,
@@ -254,6 +255,9 @@ async fn rows_after(
 #[tokio::test]
 async fn shadow_mode_dispatches_candidate_and_records_cost_separately() {
     let then = RouteAction {
+        auto_pause: false,
+        pause_floor_pass_rate: None,
+        pause_min_verdicts: None,
         // No model rewrite: serve the primary, shadow the candidate.
         target_model: PRIMARY_MODEL.into(),
         fallbacks: Vec::new(),
@@ -341,6 +345,9 @@ async fn shadow_mode_dispatches_candidate_and_records_cost_separately() {
 #[tokio::test]
 async fn no_shadow_when_route_does_not_opt_in() {
     let then = RouteAction {
+        auto_pause: false,
+        pause_floor_pass_rate: None,
+        pause_min_verdicts: None,
         target_model: PRIMARY_MODEL.into(),
         fallbacks: Vec::new(),
         disable_cache: false,
@@ -378,6 +385,9 @@ async fn no_shadow_when_route_does_not_opt_in() {
 #[tokio::test]
 async fn canary_split_records_arm() {
     let then = RouteAction {
+        auto_pause: false,
+        pause_floor_pass_rate: None,
+        pause_min_verdicts: None,
         target_model: PRIMARY_MODEL.into(),
         fallbacks: Vec::new(),
         disable_cache: false,
@@ -414,6 +424,9 @@ async fn zero_pct_split_serves_control_arm() {
     // Rewrite to the SHADOW_MODEL as the canary target so a control-arm revert is
     // observable (the served model differs between arms).
     let then = RouteAction {
+        auto_pause: false,
+        pause_floor_pass_rate: None,
+        pause_min_verdicts: None,
         target_model: SHADOW_MODEL.into(),
         fallbacks: Vec::new(),
         disable_cache: false,

@@ -183,6 +183,7 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: route_id,
             name: "downgrade-4o".into(),
             priority: 100,
@@ -192,6 +193,9 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -264,6 +268,7 @@ async fn routed_request_reports_savings_against_original_model() {
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "downgrade-4o".into(),
             priority: 100,
@@ -273,6 +278,9 @@ async fn routed_request_reports_savings_against_original_model() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -377,6 +385,7 @@ async fn route_for_other_org_does_not_match() {
     routes_backing.set_routes(
         other_org,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "wrong-org".into(),
             priority: 100,
@@ -386,6 +395,9 @@ async fn route_for_other_org_does_not_match() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -438,12 +450,16 @@ async fn route_skipped_when_no_resolvable_org() {
     routes_backing.set_routes(
         Uuid::nil(),
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "anonymous-route".into(),
             priority: 100,
             enabled: true,
             when: RouteConditions::default(),
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -523,6 +539,7 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "downgrade-4o-combined".into(),
             priority: 100,
@@ -532,6 +549,9 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

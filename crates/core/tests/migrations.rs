@@ -273,6 +273,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         cache_creation_input_tokens: Some(20),
         batch_eligible: false,
         batch_forgone_usd: 0.0,
+        route_paused: false,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");

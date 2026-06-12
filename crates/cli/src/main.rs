@@ -1526,6 +1526,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         backing.set_routes(
             tt_core::DOGFOOD_ORG_ID,
             vec![tt_routing::Route {
+                paused: false,
                 id: uuid::Uuid::now_v7(),
                 name: "dogfood-short-prompts-to-groq".into(),
                 priority: 100,
@@ -1541,6 +1542,9 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 then: tt_routing::RouteAction {
+                    auto_pause: false,
+                    pause_floor_pass_rate: None,
+                    pause_min_verdicts: None,
                     target_model: "llama-3.1-8b-instant".into(),
                     fallbacks: Vec::new(),
                     disable_cache: false,

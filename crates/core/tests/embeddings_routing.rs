@@ -148,6 +148,7 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
     backing.set_routes(
         org,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "embed-downgrade".into(),
             priority: 100,
@@ -157,6 +158,9 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "text-embedding-3-small".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

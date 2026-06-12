@@ -190,6 +190,7 @@ async fn app_with_redact_route_and_cache_min(
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "redact-route".into(),
             priority: 100,
@@ -200,6 +201,9 @@ async fn app_with_redact_route_and_cache_min(
             },
             // No model rewrite — redaction is a pure request-pass guardrail.
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "rec-model".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -445,6 +449,7 @@ async fn no_redact_flag_means_no_redaction() {
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "plain".into(),
             priority: 100,

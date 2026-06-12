@@ -156,6 +156,7 @@ async fn issue_key_for(store: &InMemoryKeyStore, org_id: Uuid) -> String {
 
 fn route(target: &str, fallbacks: Vec<String>) -> Route {
     Route {
+        paused: false,
         id: Uuid::now_v7(),
         name: "x-provider".into(),
         priority: 100,
@@ -165,6 +166,9 @@ fn route(target: &str, fallbacks: Vec<String>) -> Route {
             ..Default::default()
         },
         then: RouteAction {
+            auto_pause: false,
+            pause_floor_pass_rate: None,
+            pause_min_verdicts: None,
             target_model: target.into(),
             fallbacks,
             disable_cache: false,

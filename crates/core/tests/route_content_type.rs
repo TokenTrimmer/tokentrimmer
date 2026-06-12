@@ -198,6 +198,7 @@ async fn setup(target_model: &str) -> (Arc<Mutex<Vec<String>>>, String, axum::Ro
     routes_backing.set_routes(
         org_id,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "image-route".into(),
             priority: 100,
@@ -208,6 +209,9 @@ async fn setup(target_model: &str) -> (Arc<Mutex<Vec<String>>>, String, axum::Ro
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: target_model.into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

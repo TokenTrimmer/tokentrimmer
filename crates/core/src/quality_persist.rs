@@ -5,12 +5,16 @@
 //! the in-memory band store via
 //! [`crate::AppState::with_quality_judge_persistent`] (a
 //! [`crate::quality_sample::FanoutJudgeSink`]), so one recorded verdict both
-//! feeds the live `/v1/preview` enrichment AND lands durably for Phase 2
-//! attribution netting. `quality_verdicts.request_id` is the request's trace
-//! id; the Phase-2 join against `request_logs.trace_id` (a NULLABLE TEXT
-//! column) needs `request_id::text = trace_id` — casting `trace_id::uuid`
-//! would throw on non-UUID values — and `request_logs.trace_id` is unindexed
-//! today, so Phase 2 should add an index alongside its netting query.
+//! feeds the live `/v1/preview` enrichment AND lands durably for the
+//! Phase-2.3 attribution netting. That netting is
+//! [`crate::route_savings::ROUTE_SAVINGS_SQL`]: a `route_id` GROUP BY over
+//! `quality_verdicts` (served by migration 0017's
+//! `quality_verdicts_route_idx (org_id, route_id, ts)`), NOT the per-request
+//! `request_id::text = request_logs.trace_id` join earlier comments here
+//! anticipated — per-request figures stay GROSS (a single request doesn't
+//! carry the amortized tax); only the route-level aggregate nets, with the
+//! tax itemized. `quality_verdicts.request_id` remains the request's trace
+//! id for ad-hoc forensic joins.
 //!
 //! # Invariants
 //!

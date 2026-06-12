@@ -54,7 +54,10 @@ pub fn build_router_with_retrieval(
         .route(
             "/v1/routes/:id",
             get(routes::routes_api::get).delete(routes::routes_api::delete),
-        );
+        )
+        .route("/v1/routes/:id/pause", post(routes::routes_api::pause))
+        .route("/v1/routes/:id/resume", post(routes::routes_api::resume))
+        .route("/v1/routes/:id/savings", get(routes::routes_api::savings));
 
     let base = match retrieval {
         Some(rs) => base.layer(axum::middleware::from_fn_with_state(

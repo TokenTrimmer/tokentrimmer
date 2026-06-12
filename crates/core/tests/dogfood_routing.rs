@@ -139,6 +139,7 @@ fn dogfood_routing_store() -> Arc<CachingRoutingStore> {
     backing.set_routes(
         DOGFOOD_ORG_ID,
         vec![Route {
+            paused: false,
             id: route_id,
             name: "dogfood-short-prompts-to-groq".into(),
             priority: 100,
@@ -154,6 +155,9 @@ fn dogfood_routing_store() -> Arc<CachingRoutingStore> {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "llama-3.1-8b-instant".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

@@ -555,6 +555,7 @@ async fn try_l1_hit(
     trace_id: Uuid,
     request_started: Instant,
     matched_route_id: Option<Uuid>,
+    route_paused: bool,
     route_matched_name: Option<&str>,
 ) -> Option<Response> {
     match l1.cache.get(l1_key).await {
@@ -573,6 +574,7 @@ async fn try_l1_hit(
                         trace_id,
                         request_started,
                         matched_route_id,
+                        route_paused,
                     ),
                 );
                 Some(with_route_matched(
@@ -677,6 +679,7 @@ async fn try_l2_hit(
     trace_id: Uuid,
     request_started: Instant,
     matched_route_id: Option<Uuid>,
+    route_paused: bool,
     route_matched_name: Option<&str>,
     raw_bearer: &str,
     judge_source_provider: Option<&std::sync::Arc<dyn tt_shared::Provider>>,
@@ -799,6 +802,7 @@ async fn try_l2_hit(
                     trace_id,
                     request_started,
                     matched_route_id,
+                    route_paused,
                     baseline_cost_usd,
                 ),
             );
@@ -993,6 +997,11 @@ pub async fn handler(
     };
     let route_match = apply_routing(&state, &ctx, &mut req, forced_route.as_deref()).await?;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
+    // The matched route is sticky-PAUSED: apply_routing suppressed the rewrite
+    // and every cost lever (req.model is untouched). Captured before
+    // `route_match` is consumed; drives the warnings token + metric +
+    // request_logs marker below.
+    let route_paused = route_match.as_ref().is_some_and(|m| m.paused);
     // The applied route's name (forced or condition-matched) for the
     // `X-TokenTrimmer-Route-Matched` response header, captured before
     // `route_match` is consumed below.
@@ -1083,7 +1092,9 @@ pub async fn handler(
     //
     // No `traffic_pct` (the common case) → unconditional rewrite, arm = None.
     let mut traffic_split_arm: Option<&'static str> = None;
-    let mut model_was_rewritten = matched_route_id.is_some();
+    // A paused match is NOT a rewrite: baseline is priced against the served
+    // (== requested) model, so the routing saving honestly books 0.
+    let mut model_was_rewritten = matched_route_id.is_some() && !route_paused;
     if let Some(pct) = route_traffic_pct {
         let in_canary = tt_routing::sticky_traffic_split(ctx.org_id, &idempotency_key, pct);
         if in_canary {
@@ -1191,6 +1202,14 @@ pub async fn handler(
     // Normalize the request for the routed provider and collect any pre-dispatch
     // warnings (B2: response_format_downgrade; B3 will add temperature_clamped).
     let mut warnings: Vec<String> = Vec::new();
+    // Surface a paused-route passthrough on the warnings header (the
+    // request_logs row carries the durable `route_paused` marker; this is the
+    // caller-visible signal) + the per-request metric.
+    if route_paused {
+        let name = route_matched_name.as_deref().unwrap_or("unknown");
+        warnings.push(format!("route_paused:{name}"));
+        crate::metrics::record_route_paused_passthrough(name);
+    }
     maybe_downgrade_response_format(&mut req, provider.as_ref(), &mut warnings);
     maybe_clamp_temperature(&mut req, provider.as_ref(), &mut warnings);
 
@@ -1488,6 +1507,7 @@ pub async fn handler(
                                 trace_id,
                                 request_started,
                                 matched_route_id,
+                                route_paused,
                             ),
                         );
                         // Record OTel GenAI semconv + cost span attributes for the
@@ -1743,6 +1763,8 @@ pub async fn handler(
                 // Canary arm for the streamed request_logs row (None when no
                 // split). Shadow mode never fires on the streaming path.
                 traffic_split_arm: traffic_split_arm_owned.clone(),
+                // Paused-route passthrough marker for the streamed row.
+                route_paused,
             })
         } else {
             None
@@ -1786,6 +1808,7 @@ pub async fn handler(
                     trace_id,
                     request_started,
                     matched_route_id,
+                    route_paused,
                     route_matched_name.as_deref(),
                 )
                 .await
@@ -1812,6 +1835,7 @@ pub async fn handler(
                     trace_id,
                     request_started,
                     matched_route_id,
+                    route_paused,
                     route_matched_name.as_deref(),
                     &raw_bearer,
                     judge_source_provider.as_ref(),
@@ -1869,6 +1893,7 @@ pub async fn handler(
                                                     trace_id,
                                                     request_started,
                                                     matched_route_id,
+                                                    route_paused,
                                                 ),
                                             );
                                             return Ok(with_route_matched(
@@ -2287,6 +2312,7 @@ pub async fn handler(
                 // route's intent remains auditable.
                 batch_eligible: batch_marked,
                 batch_forgone_usd: cost_breakdown.batch_forgone_usd,
+                route_paused,
             },
         );
 
@@ -3999,6 +4025,7 @@ fn request_log_for_l1_hit(
     trace_id: Uuid,
     request_started: Instant,
     route_id: Option<Uuid>,
+    route_paused: bool,
 ) -> RequestLogRow {
     let baseline = if entry.is_legacy_format() {
         // Pre-envelope row — fall back to the conservative synthetic
@@ -4055,6 +4082,7 @@ fn request_log_for_l1_hit(
         // could not have saved anything on a request that never billed.
         batch_eligible: false,
         batch_forgone_usd: 0.0,
+        route_paused,
     }
 }
 
@@ -4066,6 +4094,7 @@ fn request_log_for_l2_hit(
     trace_id: Uuid,
     request_started: Instant,
     route_id: Option<Uuid>,
+    route_paused: bool,
     baseline_cost_usd: f64,
 ) -> RequestLogRow {
     RequestLogRow {
@@ -4106,6 +4135,7 @@ fn request_log_for_l2_hit(
         // Cache hit = no dispatch cost, nothing forgone (see the L1 builder).
         batch_eligible: false,
         batch_forgone_usd: 0.0,
+        route_paused,
     }
 }
 
@@ -4127,6 +4157,14 @@ pub(crate) fn opt_tokens_i32(v: Option<u64>) -> Option<i32> {
 pub(crate) struct RouteMatch {
     pub(crate) route_id: Uuid,
     pub(crate) route_name: String,
+    /// The matched route is sticky-PAUSED (quality regression / manual pause):
+    /// the rewrite was suppressed and every cost lever below is disabled —
+    /// `target_model` echoes the originally-requested model, `fallbacks` is
+    /// empty, flex/compress/traffic_pct/shadow/max_cost are all off. SAFETY
+    /// levers (`redact`, `disable_cache`) stay live: pausing a quality gate
+    /// must never disable a privacy guardrail. The route still attributes
+    /// (`route_id` stamped, `route_paused` marker on the request_logs row).
+    pub(crate) paused: bool,
     pub(crate) fallbacks: Vec<String>,
     pub(crate) disable_cache: bool,
     pub(crate) max_cost_usd: Option<f64>,
@@ -4263,6 +4301,45 @@ pub(crate) async fn apply_routing(
             None => return Ok(None),
         },
     };
+    // Sticky pause (research Phase 2.3): a paused route still MATCHES — the
+    // request attributes to it (route_id stamped, warnings token, request_logs
+    // marker) — but the rewrite and every other COST lever are suppressed, so
+    // the request flows to the originally-requested model (the EXPENSIVE,
+    // quality-safe direction). SAFETY/privacy levers stay ON: pausing a
+    // quality gate must never disable a privacy guardrail. This single seam
+    // covers chat (incl. streaming), embeddings, and the messages ingress; a
+    // forced `X-TokenTrimmer-Route` header does NOT bypass a pause (the
+    // quality gate wins). `req.model` is untouched → `is_downgrade` is false →
+    // no judge samples on a paused route → its verdict window freezes → the
+    // pause is naturally sticky (plus the durable route_pauses row) until an
+    // explicit POST /v1/routes/:id/resume.
+    if m.paused {
+        tracing::info!(
+            org_id = %ctx.org_id,
+            route_id = %m.id,
+            route = %m.name,
+            "route_paused: rewrite suppressed — passing through on the requested model"
+        );
+        return Ok(Some(RouteMatch {
+            route_id: m.id,
+            route_name: m.name.clone(),
+            paused: true,
+            // ALL cost levers off (fail-safe expensive direction):
+            fallbacks: vec![],
+            max_cost_usd: None,
+            flex: false,
+            compress: false,
+            traffic_pct: None,
+            shadow_model: None,
+            // SAFETY/privacy levers stay ON (pausing a quality gate must never
+            // disable a privacy guardrail):
+            disable_cache: m.then.disable_cache,
+            redact: m.then.redact,
+            input_tokens_estimate: input_tokens,
+            target_model: req.model.clone(), // no rewrite
+        }));
+    }
+
     let route_id = m.id;
     let route_name = m.name.clone();
     let fallbacks = m.then.fallbacks.clone();
@@ -4310,6 +4387,7 @@ pub(crate) async fn apply_routing(
     Ok(Some(RouteMatch {
         route_id,
         route_name,
+        paused: false,
         fallbacks,
         disable_cache,
         max_cost_usd,

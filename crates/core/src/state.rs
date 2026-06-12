@@ -196,7 +196,10 @@ pub struct AppState {
     pub judge_config: crate::quality_sample::JudgeConfig,
     /// Optional sink the sampled judge records its [`crate::JudgeOutcome`] into.
     /// `None` (default) disables the judge entirely regardless of `judge_config`
-    /// — there's nowhere to record. Record-only: the sink never pauses routes.
+    /// — there's nowhere to record. Recording sinks never pause routes; the ONE
+    /// sanctioned pause path is the opt-in
+    /// [`crate::route_autopause::AutoPauseJudgeSink`] appended via
+    /// [`AppState::with_route_auto_pause`].
     pub judge_sink: Option<Arc<dyn crate::quality_sample::JudgeSink>>,
     /// Optional typed judge-band store read by the `/v1/preview` handler to
     /// enrich route suggestions with the live judge's aggregate
@@ -228,6 +231,12 @@ pub struct AppState {
     /// is attached. Consumed only by L2-hit samples that would otherwise spawn
     /// a judge — the dispatch-path judge is unaffected.
     pub l2_hit_judge_limiter: Arc<crate::quality_sample::L2HitJudgeLimiter>,
+    /// Optional route-level netted-savings read-side backing
+    /// `GET /v1/routes/:id/savings` (research Phase 2.3 judge-tax netting).
+    /// `None` (default) → the endpoint answers 503 until
+    /// [`AppState::with_route_savings`] wires a source (a
+    /// [`crate::route_savings::PostgresRouteSavingsSource`] in production).
+    pub route_savings: Option<Arc<dyn crate::route_savings::RouteSavingsSource>>,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -265,6 +274,7 @@ impl AppState {
             latency_tracker: Arc::new(tt_routing::LatencyTracker::new()),
             shadow_timeout: DEFAULT_SHADOW_TIMEOUT,
             l2_hit_judge_limiter,
+            route_savings: None,
         }
     }
 
@@ -397,7 +407,10 @@ impl AppState {
     /// is returned (zero added latency) and records the outcome into `sink`.
     ///
     /// Pass [`crate::quality_sample::JudgeConfig::from_env`] to honor `TT_JUDGE_*`,
-    /// or a hand-built config (tests). Record-only — the sink never pauses routes.
+    /// or a hand-built config (tests). Recording sinks never pause routes —
+    /// the one sanctioned pause path is the opt-in
+    /// [`crate::route_autopause::AutoPauseJudgeSink`] appended via
+    /// [`AppState::with_route_auto_pause`].
     pub fn with_quality_judge(
         mut self,
         sink: Arc<dyn crate::quality_sample::JudgeSink>,
@@ -427,7 +440,10 @@ impl AppState {
     ///
     /// The judge still only fires for the deterministic ~2% sample of
     /// rerouted-DOWN chat completions, AFTER the user response is returned
-    /// (zero added latency). Record-only — the store never pauses routes.
+    /// (zero added latency). The band store never pauses routes — the one
+    /// sanctioned pause path is the opt-in
+    /// [`crate::route_autopause::AutoPauseJudgeSink`] appended via
+    /// [`AppState::with_route_auto_pause`].
     pub fn with_quality_judge_band_store(
         mut self,
         store: Arc<crate::quality_sample::InMemoryJudgeBandStore>,
@@ -443,13 +459,19 @@ impl AppState {
     /// band store (the `/v1/preview` enrichment read-side, exactly as
     /// [`AppState::with_quality_judge_band_store`]) AND a durable sink — in
     /// production a [`crate::quality_persist::PostgresJudgeSink`] writing one
-    /// `quality_verdicts` row per judged sample, which Phase 2 joins against
-    /// `request_logs.trace_id` for attribution netting.
+    /// `quality_verdicts` row per judged sample, which the Phase-2.3 netting
+    /// aggregates per route via
+    /// [`crate::route_savings::ROUTE_SAVINGS_SQL`] (a `route_id` GROUP BY,
+    /// not a per-request trace join).
     ///
     /// Outcomes fan out through a [`crate::quality_sample::FanoutJudgeSink`]:
-    /// band store first, then the persistent sink. Record-only — neither sink
-    /// ever pauses routes; the judge still fires only for the deterministic
-    /// sample of eligible requests, after the user response is returned.
+    /// band store first, then the persistent sink. Neither recording sink
+    /// ever pauses routes — the one sanctioned pause path is the opt-in
+    /// [`crate::route_autopause::AutoPauseJudgeSink`] appended via
+    /// [`AppState::with_route_auto_pause`] (call it AFTER this builder so the
+    /// durable row precedes the window read); the judge still fires only for
+    /// the deterministic sample of eligible requests, after the user response
+    /// is returned.
     pub fn with_quality_judge_persistent(
         mut self,
         store: Arc<crate::quality_sample::InMemoryJudgeBandStore>,
@@ -462,6 +484,53 @@ impl AppState {
         ])));
         self.judge_band_store = Some(store);
         self.set_judge_config(config);
+        self
+    }
+
+    /// Builder-style attach: enable the route-level netted-savings read-side
+    /// behind `GET /v1/routes/:id/savings`. Production wires a
+    /// [`crate::route_savings::PostgresRouteSavingsSource`]; tests seed a
+    /// [`crate::route_savings::InMemoryRouteSavingsSource`]. Until called,
+    /// the endpoint answers 503 (aggregation not configured) — wiring this
+    /// changes no request-path behavior.
+    pub fn with_route_savings(
+        mut self,
+        src: Arc<dyn crate::route_savings::RouteSavingsSource>,
+    ) -> Self {
+        self.route_savings = Some(src);
+        self
+    }
+
+    /// Append the auto-pause evaluator to the configured judge sink (wraps the
+    /// existing sink in a [`crate::quality_sample::FanoutJudgeSink`]
+    /// `[existing, auto_pause]`). MUST be called AFTER
+    /// [`AppState::with_quality_judge_persistent`] (or another judge builder)
+    /// so verdicts are durably recorded before the evaluator consults the
+    /// window — `FanoutJudgeSink` awaits sinks sequentially in order. A no-op
+    /// (debug_assert + warn) when no judge sink is configured: with no judge
+    /// there are no verdicts, so there is nothing to evaluate.
+    ///
+    /// This is the ONE sanctioned route-pause path, and it is doubly opt-in:
+    /// the operator must wire this builder AND each route must set
+    /// `auto_pause: true`.
+    pub fn with_route_auto_pause(
+        mut self,
+        evaluator: Arc<crate::route_autopause::AutoPauseJudgeSink>,
+    ) -> Self {
+        let Some(existing) = self.judge_sink.take() else {
+            debug_assert!(
+                false,
+                "with_route_auto_pause called before any with_quality_judge* builder"
+            );
+            tracing::warn!(
+                "with_route_auto_pause: no judge sink configured — auto-pause evaluator not wired"
+            );
+            return self;
+        };
+        self.judge_sink = Some(Arc::new(crate::quality_sample::FanoutJudgeSink::new(vec![
+            existing,
+            evaluator as Arc<dyn crate::quality_sample::JudgeSink>,
+        ])));
         self
     }
 

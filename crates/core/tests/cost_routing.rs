@@ -161,6 +161,7 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
     backing.set_routes(
         org,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "cost-downgrade".into(),
             priority: 100,
@@ -170,6 +171,9 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
@@ -231,6 +235,7 @@ async fn reroute_then_block_on_ceiling() {
     backing.set_routes(
         org,
         vec![Route {
+            paused: false,
             id: Uuid::now_v7(),
             name: "downgrade-and-cap".into(),
             priority: 100,
@@ -240,6 +245,9 @@ async fn reroute_then_block_on_ceiling() {
                 ..Default::default()
             },
             then: RouteAction {
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,
