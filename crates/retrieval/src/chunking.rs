@@ -36,7 +36,7 @@ pub fn chunk(text: &str) -> Vec<Chunk> {
     while start < tokens.len() {
         let end = (start + CHUNK_SIZE).min(tokens.len());
         let slice = &tokens[start..end];
-        let chunk_text = bpe.decode(slice.to_vec()).unwrap_or_default();
+        let chunk_text = bpe.decode(slice).unwrap_or_default();
         out.push(Chunk {
             text: chunk_text,
             start_token: start,
