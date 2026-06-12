@@ -251,6 +251,11 @@ struct HarnessOpts {
     /// Override `JudgeConfig::baseline_timeout` (also the per-judge-call
     /// timeout the production spawn wires via `with_call_timeout`).
     baseline_timeout: Option<std::time::Duration>,
+    /// Plant a SAME-MODEL, action-less route (`target_model == "gpt-4o"`,
+    /// every action off) instead of the downgrade route — matched traffic is
+    /// neither a downgrade nor output-shaped, so the judge must NOT spawn
+    /// (guards the #3.x eligibility widening against over-widening).
+    same_model_route: bool,
 }
 
 impl Default for HarnessOpts {
@@ -264,6 +269,7 @@ impl Default for HarnessOpts {
             both_orders: false,
             redact_route: false,
             baseline_timeout: None,
+            same_model_route: false,
         }
     }
 }
@@ -335,7 +341,11 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     minify_json: false,
                     reasoning_max_effort: None,
                     reasoning_budget_tokens: None,
-                    target_model: "gpt-4o-mini".into(),
+                    target_model: if opts.same_model_route {
+                        "gpt-4o".into()
+                    } else {
+                        "gpt-4o-mini".into()
+                    },
                     fallbacks: Vec::new(),
                     disable_cache: false,
                     max_cost_usd: None,
@@ -494,6 +504,43 @@ async fn non_rerouted_request_never_triggers_judge() {
     );
     assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
     // The served model WAS dispatched once (the actual user request).
+    assert_eq!(h.served_calls.load(Ordering::SeqCst), 1);
+}
+
+/// A route that MATCHES but neither downgrades nor output-shapes (same
+/// target model, every action off) never judges — the output-shaping
+/// eligibility widening is shaped-only, not matched-only.
+#[tokio::test]
+async fn matched_unshaped_same_model_route_never_triggers_judge() {
+    let h = build_harness_opts(HarnessOpts {
+        same_model_route: true,
+        ..Default::default()
+    })
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request("gpt-4o", &h.plaintext))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["x-tokentrimmer-model-used"]
+            .to_str()
+            .unwrap(),
+        "gpt-4o",
+        "same-model route → model unchanged"
+    );
+
+    // Give any (erroneously) spawned judge task a chance to run.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        h.judge_calls.load(Ordering::SeqCst),
+        0,
+        "matched-but-unshaped same-model route must never call the judge"
+    );
+    assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
     assert_eq!(h.served_calls.load(Ordering::SeqCst), 1);
 }
 
