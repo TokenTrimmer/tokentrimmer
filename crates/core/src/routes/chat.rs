@@ -25,7 +25,10 @@ use axum::{
 };
 use chrono::Utc;
 use tt_cache::{key::cache_key, l2_context_text, CacheEntry, L1Entry};
-use tt_telemetry::request_logs::{RequestLogRow, RequestLogWriter};
+use tt_telemetry::{
+    body_capture::{BodyCaptureRecord, BodyCaptureWriter},
+    request_logs::{RequestLogRow, RequestLogWriter},
+};
 use uuid::Uuid;
 
 use tt_auth::ApiKeyContext;
@@ -1631,6 +1634,18 @@ pub async fn handler(
     // `format_switch` advertisement, or vice versa.
     let skip_l2 = format_switch_plan.is_some();
 
+    let capture_request_json = if state.body_capture_writer.is_some() && ctx.org_id != Uuid::nil() {
+        match serde_json::to_vec(&req) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(error = %e, "request body capture serialization failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 3. Branch: streaming vs non-streaming.
     if req.stream {
         // 3α. L1 fake-stream — when a streaming request has a cached
@@ -1784,6 +1799,23 @@ pub async fn handler(
             crate::metrics::record_provider_timeout(__primary, "chat_stream");
         }
         let (provider, served_model, stream) = __stream_outcome?;
+
+        if let Some(request_json) = capture_request_json {
+            spawn_body_capture(
+                state.body_capture_writer.as_ref(),
+                BodyCaptureRecord {
+                    org_id: ctx.org_id,
+                    api_key_id: ctx.api_key_id,
+                    trace_id: trace_id.to_string(),
+                    endpoint: "/v1/chat/completions".into(),
+                    provider: provider.id().to_string(),
+                    model: served_model.clone(),
+                    request_json,
+                    response_json: None,
+                    ts: Utc::now(),
+                },
+            );
+        }
 
         // Build the cache-insert context for the streaming miss path
         // (§rv-l2-streaming-cache-write). On clean completion the DropGuard
@@ -2714,6 +2746,30 @@ pub async fn handler(
                 diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
             },
         );
+
+        if let Some(request_json) = capture_request_json {
+            let response_json = match serde_json::to_vec(&response) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    tracing::warn!(error = %e, "response body capture serialization failed");
+                    None
+                }
+            };
+            spawn_body_capture(
+                state.body_capture_writer.as_ref(),
+                BodyCaptureRecord {
+                    org_id: ctx.org_id,
+                    api_key_id: ctx.api_key_id,
+                    trace_id: trace_id.to_string(),
+                    endpoint: "/v1/chat/completions".into(),
+                    provider: provider_id.clone(),
+                    model: model_used.clone(),
+                    request_json,
+                    response_json,
+                    ts: Utc::now(),
+                },
+            );
+        }
 
         // Per-route provider-cache counters from the same authoritative usage
         // the row records.
@@ -4356,6 +4412,21 @@ fn spawn_request_log(writer: Option<&std::sync::Arc<dyn RequestLogWriter>>, row:
     tokio::spawn(async move {
         if let Err(e) = writer.write(row).await {
             tracing::warn!(error = %e, "request_logs write failed");
+        }
+    });
+}
+
+/// Fire-and-forget encrypted body capture. The writer itself enforces per-org
+/// opt-in and retention; handler latency should not depend on storage.
+fn spawn_body_capture(
+    writer: Option<&std::sync::Arc<dyn BodyCaptureWriter>>,
+    record: BodyCaptureRecord,
+) {
+    let Some(writer) = writer else { return };
+    let writer = writer.clone();
+    tokio::spawn(async move {
+        if let Err(e) = writer.record(record).await {
+            tracing::warn!(error = %e, "request body capture write failed");
         }
     });
 }

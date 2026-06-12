@@ -171,6 +171,21 @@ fn migrator_includes_request_logs_minify_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_request_body_capture_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let twenty_second = migrations
+        .iter()
+        .find(|m| m.version == 22)
+        .expect("migration version 22 not found");
+    let desc = twenty_second.description.to_lowercase();
+    assert!(
+        desc.contains("body") || desc.contains("capture"),
+        "migration 0022 description is '{}', expected to mention body/capture",
+        twenty_second.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]

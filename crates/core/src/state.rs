@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tt_auth::{KeyStore, ProviderCredentialStore};
 use tt_cache::{EmbeddingProvider, L1Cache, L2Cache};
 use tt_routing::CachingRoutingStore;
-use tt_telemetry::request_logs::RequestLogWriter;
+use tt_telemetry::{body_capture::BodyCaptureWriter, request_logs::RequestLogWriter};
 
 use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
 use crate::failover::CircuitBreaker;
@@ -125,6 +125,10 @@ pub struct AppState {
     /// fire-and-forget INSERT after every response. `None` skips the
     /// telemetry write (tests, dev mode without a DB).
     pub request_log_writer: Option<Arc<dyn RequestLogWriter>>,
+    /// Optional encrypted request/response body-capture writer. Capture is
+    /// still controlled per org by `request_body_capture_settings`; wiring this
+    /// writer only arms the best-effort sink.
+    pub body_capture_writer: Option<Arc<dyn BodyCaptureWriter>>,
     /// Optional per-org routing engine source. The chat handler asks for the
     /// org's [`tt_routing::RoutingEngine`] before dispatch; on a match it
     /// rewrites `req.model` and stamps `request_logs.route_id`. `None`
@@ -259,6 +263,7 @@ impl AppState {
             key_store: None,
             credential_store: None,
             request_log_writer: None,
+            body_capture_writer: None,
             routing_store: None,
             verify_cache: Arc::new(KeyVerifyCache::new()),
             argon2_cap: Argon2VerifyCap::new(Argon2CapConfig::from_env()),
@@ -392,6 +397,12 @@ impl AppState {
     /// Builder-style attach: enable per-request telemetry rows.
     pub fn with_request_log_writer(mut self, writer: Arc<dyn RequestLogWriter>) -> Self {
         self.request_log_writer = Some(writer);
+        self
+    }
+
+    /// Builder-style attach: enable encrypted body capture for opted-in orgs.
+    pub fn with_body_capture_writer(mut self, writer: Arc<dyn BodyCaptureWriter>) -> Self {
+        self.body_capture_writer = Some(writer);
         self
     }
 

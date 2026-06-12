@@ -1433,6 +1433,28 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         tracing::warn!("no DB pool; request_logs writes disabled");
     }
 
+    // Encrypted body capture: DB + TT_MASTER_KEY arms the sink, but writes
+    // remain per-org opt-in via request_body_capture_settings.
+    if let Some(pool) = db_pool.as_ref() {
+        match tt_telemetry::body_capture::postgres::PostgresBodyCaptureWriter::from_env(
+            pool.clone(),
+        ) {
+            Ok(Some(writer)) => {
+                state = state.with_body_capture_writer(Arc::new(writer));
+                tracing::info!("request body capture writer: Postgres-backed (per-org opt-in)");
+            }
+            Ok(None) => tracing::warn!(
+                "TT_MASTER_KEY unset; encrypted request body capture writes disabled"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "TT_MASTER_KEY invalid; encrypted request body capture writes disabled"
+            ),
+        }
+    } else {
+        tracing::warn!("no DB pool; encrypted request body capture writes disabled");
+    }
+
     // Sampled paired A/B quality judge — opt-in via TT_JUDGE_ENABLED (off by
     // default; request/response semantics change for nobody who hasn't opted
     // in). When enabled, verdicts feed the in-memory band store (live
