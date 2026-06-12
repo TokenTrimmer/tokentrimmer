@@ -116,7 +116,7 @@ url = "2"
 insta = { version = "1.40", features = ["json", "yaml", "redactions"] }
 httpmock = "0.7"
 tokio-test = "0.4"
-rstest = "0.23"
+rstest = "0.26"
 tempfile = "3"
 criterion = { version = "0.8", default-features = false }
 
