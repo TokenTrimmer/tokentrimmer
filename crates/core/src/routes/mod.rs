@@ -8,5 +8,6 @@ pub mod messages;
 pub mod metrics;
 pub mod models;
 pub mod preview;
+pub mod responses;
 pub mod routes_api;
 pub mod sse;

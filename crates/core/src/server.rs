@@ -42,6 +42,7 @@ pub fn build_router_with_retrieval(
         .route("/v1/models", get(routes::models::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
         .route("/v1/messages", post(routes::messages::handler))
+        .route("/v1/responses", post(routes::responses::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))
         .route(
             "/v1/preview",
