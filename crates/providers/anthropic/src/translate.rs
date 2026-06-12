@@ -67,6 +67,13 @@ pub struct AnthropicRequest {
     /// Optional metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<AnthropicMetadata>,
+    /// Extended-thinking config, forwarded VERBATIM from the canonical
+    /// request's `extra["thinking"]` when shape-valid and billing-safe (see
+    /// [`forwardable_thinking`]). `None` (omitted) when the caller sent no
+    /// config or an invalid one — the historical silent-drop semantics, now
+    /// reported via `dropped_params("thinking")`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
 }
 
 /// A single conversation turn sent to Anthropic.
@@ -244,6 +251,58 @@ pub struct AnthropicUsage {
 // Request translation: canonical → Anthropic
 // ---------------------------------------------------------------------------
 
+/// The Anthropic output cap this request resolves to: `max_completion_tokens`
+/// wins over `max_tokens` (matching the body translation below), defaulting
+/// to 4096 when neither is set. Shared by [`translate_request`] and
+/// [`forwardable_thinking`] so the billing-safety gate and the wire body can
+/// never disagree.
+fn resolved_max_tokens(req: &tt_shared::ChatCompletionRequest) -> u32 {
+    req.max_completion_tokens.or(req.max_tokens).unwrap_or(4096)
+}
+
+/// The request's `extra["thinking"]` config, returned for VERBATIM forwarding
+/// ONLY when shape-valid AND billing-safe:
+///
+/// - an object with `type` ∈ {"enabled", "disabled"};
+/// - when enabled: `budget_tokens` is an integer `>= 1024` (Anthropic's
+///   documented floor) AND `<` the resolved Anthropic `max_tokens` (which
+///   INCLUDES thinking — Anthropic 400s a budget at/above it; forwarding an
+///   invalid config would turn today's silent drop into a new failure mode).
+///
+/// Anything else returns `None`: translation keeps dropping it (the
+/// pre-passthrough behavior), and `dropped_params` reports `thinking` so the
+/// drop is no longer silent. The mirror rule: `dropped_params` and
+/// `translate_request` both consult THIS function, like every other entry.
+pub(crate) fn forwardable_thinking(
+    req: &tt_shared::ChatCompletionRequest,
+) -> Option<serde_json::Value> {
+    let v = req.extra.get("thinking")?;
+    let obj = v.as_object()?;
+    match obj.get("type").and_then(serde_json::Value::as_str)? {
+        "disabled" => Some(v.clone()),
+        "enabled" => {
+            let budget = obj
+                .get("budget_tokens")
+                .and_then(serde_json::Value::as_u64)?;
+            let max_tokens = u64::from(resolved_max_tokens(req));
+            (budget >= 1024 && budget < max_tokens).then(|| v.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Whether [`forwardable_thinking`] forwards an ENABLED config for `req` —
+/// the condition under which Anthropic rejects `temperature` / `top_p`
+/// modifications, so translation must omit them and `dropped_params` must
+/// report them.
+pub(crate) fn forwards_enabled_thinking(req: &tt_shared::ChatCompletionRequest) -> bool {
+    forwardable_thinking(req)
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("enabled")
+}
+
 /// Translate a [`tt_shared::ChatCompletionRequest`] into an
 /// [`AnthropicRequest`] ready to serialize and POST.
 ///
@@ -257,6 +316,20 @@ pub struct AnthropicUsage {
 pub fn translate_request(
     req: tt_shared::ChatCompletionRequest,
 ) -> Result<AnthropicRequest, ProviderError> {
+    // Extended-thinking passthrough: resolved BEFORE the move-heavy message
+    // translation below (it reads `extra` + the max_tokens fields). An
+    // ENABLED forwarded config makes Anthropic reject temperature/top_p
+    // modifications, so both are omitted in that case (and reported via
+    // `dropped_params` — the mirror rule).
+    let thinking = forwardable_thinking(&req);
+    let suppress_sampling_params = forwards_enabled_thinking(&req);
+    // `max_tokens` is required by Anthropic and is its output cap. Honor the
+    // caller's spend cap from either `max_tokens` or the newer
+    // `max_completion_tokens` (the latter takes precedence when both are set)
+    // so the ceiling is never silently dropped; default to 4096 when neither.
+    // Resolved up here, before `req.messages` is moved by the loop below.
+    let max_tokens = resolved_max_tokens(&req);
+
     let mut system_blocks: Vec<AnthropicSystemBlock> = Vec::new();
     let mut messages: Vec<AnthropicMessage> = Vec::new();
 
@@ -337,20 +410,6 @@ pub fn translate_request(
     // without this the entire growing history is billed at 1.0x every turn.
     maybe_inject_message_cache_control(&mut messages, &system_blocks, &req.model);
 
-    // `max_tokens` is required by Anthropic and is its output cap. Honor the
-    // caller's spend cap from either `max_tokens` or the newer
-    // `max_completion_tokens` (the latter takes precedence when both are set)
-    // so the ceiling is never silently dropped; default to 4096 when neither.
-    let max_tokens = req
-        .max_completion_tokens
-        .or(req.max_tokens)
-        .unwrap_or_else(|| {
-            tracing::debug!(
-                "max_tokens/max_completion_tokens omitted — defaulting to 4096 for Anthropic"
-            );
-            4096
-        });
-
     // Translate tools.
     let tools: Vec<AnthropicTool> = req
         .tools
@@ -377,13 +436,24 @@ pub fn translate_request(
             Some(system_blocks)
         },
         max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
+        // Anthropic rejects temperature/top_p modifications alongside
+        // extended thinking — omitted when an enabled config is forwarded.
+        temperature: if suppress_sampling_params {
+            None
+        } else {
+            req.temperature
+        },
+        top_p: if suppress_sampling_params {
+            None
+        } else {
+            req.top_p
+        },
         stop_sequences: req.stop,
         tools,
         tool_choice,
         stream: req.stream,
         metadata,
+        thinking,
         // Intentionally dropped (Anthropic rejects them):
         // n, seed, response_format, presence_penalty, frequency_penalty,
         // logit_bias, tt_extras
@@ -1147,5 +1217,134 @@ mod tests {
             sys.last().unwrap().cache_control.is_none(),
             "1400-token CJK prefix is below Sonnet's 2048 minimum — must not cache"
         );
+    }
+
+    // --- extended-thinking passthrough (research Phase 3.2 prerequisite) ---
+
+    /// A shape-valid, billing-safe `extra["thinking"]` config is forwarded
+    /// VERBATIM on the typed `thinking` field.
+    #[test]
+    fn thinking_forwarded_verbatim_when_valid() {
+        let mut req = base_request("claude-sonnet-4-6");
+        req.max_tokens = Some(16_000);
+        req.temperature = None;
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type":"enabled","budget_tokens":8192}),
+        );
+        let body = translate_request(req).expect("translate ok");
+        assert_eq!(
+            body.thinking,
+            Some(serde_json::json!({"type":"enabled","budget_tokens":8192}))
+        );
+        let wire = serde_json::to_string(&body).unwrap();
+        assert!(wire.contains("\"thinking\""), "{wire}");
+        assert!(wire.contains("\"budget_tokens\":8192"), "{wire}");
+    }
+
+    /// A `disabled` config is forwarded too (explicitly turning thinking off
+    /// is a valid client intent) — and does NOT suppress temperature.
+    #[test]
+    fn thinking_disabled_forwarded_and_temperature_kept() {
+        let mut req = base_request("claude-sonnet-4-6");
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type":"disabled"}),
+        );
+        let body = translate_request(req).expect("translate ok");
+        assert_eq!(body.thinking, Some(serde_json::json!({"type":"disabled"})));
+        assert_eq!(
+            body.temperature,
+            Some(0.7),
+            "disabled thinking keeps temperature"
+        );
+    }
+
+    /// `budget_tokens >= max_tokens` would 400 at Anthropic (max_tokens
+    /// INCLUDES thinking) — the config is NOT forwarded (kept-drop semantics)
+    /// and `dropped_params` reports it.
+    #[test]
+    fn thinking_budget_at_or_above_max_tokens_is_dropped() {
+        let mut req = base_request("claude-sonnet-4-6");
+        req.max_tokens = Some(4096);
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type":"enabled","budget_tokens":4096}),
+        );
+        let provider = crate::AnthropicProvider::new(crate::ClientConfig::default());
+        use tt_shared::Provider as _;
+        assert!(provider
+            .dropped_params(&req)
+            .contains(&"thinking".to_string()));
+        let body = translate_request(req).expect("translate ok");
+        assert_eq!(body.thinking, None, "unsafe budget must not be forwarded");
+    }
+
+    /// Budgets below Anthropic's 1024 floor and malformed shapes keep today's
+    /// drop semantics (now visible via `dropped_params`).
+    #[test]
+    fn thinking_invalid_shapes_are_dropped() {
+        use tt_shared::Provider as _;
+        let provider = crate::AnthropicProvider::new(crate::ClientConfig::default());
+        for bad in [
+            serde_json::json!({"type":"enabled","budget_tokens":512}),
+            serde_json::json!({"type":"enabled"}),
+            serde_json::json!({"type":"bogus","budget_tokens":8192}),
+            serde_json::json!("enabled"),
+            serde_json::json!(42),
+        ] {
+            let mut req = base_request("claude-sonnet-4-6");
+            req.max_tokens = Some(16_000);
+            req.extra.insert("thinking".to_string(), bad.clone());
+            assert!(
+                provider
+                    .dropped_params(&req)
+                    .contains(&"thinking".to_string()),
+                "config {bad} must be reported dropped"
+            );
+            let body = translate_request(req).expect("translate ok");
+            assert_eq!(body.thinking, None, "config {bad} must not be forwarded");
+        }
+    }
+
+    /// Anthropic rejects temperature/top_p modifications with extended
+    /// thinking: when an ENABLED config is forwarded, both are omitted from
+    /// the wire body and `dropped_params` reports them.
+    #[test]
+    fn thinking_forwarded_drops_temperature_and_top_p() {
+        use tt_shared::Provider as _;
+        let provider = crate::AnthropicProvider::new(crate::ClientConfig::default());
+        let mut req = base_request("claude-sonnet-4-6");
+        req.max_tokens = Some(16_000);
+        req.temperature = Some(0.7);
+        req.top_p = Some(0.9);
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type":"enabled","budget_tokens":8192}),
+        );
+        let dropped = provider.dropped_params(&req);
+        assert!(dropped.contains(&"temperature".to_string()), "{dropped:?}");
+        assert!(dropped.contains(&"top_p".to_string()), "{dropped:?}");
+        assert!(
+            !dropped.contains(&"thinking".to_string()),
+            "a FORWARDED config is not dropped: {dropped:?}"
+        );
+        let body = translate_request(req).expect("translate ok");
+        assert_eq!(body.temperature, None);
+        assert_eq!(body.top_p, None);
+        assert!(body.thinking.is_some());
+    }
+
+    /// No thinking config at all → nothing forwarded, nothing reported.
+    #[test]
+    fn no_thinking_extra_unchanged() {
+        use tt_shared::Provider as _;
+        let provider = crate::AnthropicProvider::new(crate::ClientConfig::default());
+        let req = base_request("claude-sonnet-4-6");
+        assert!(!provider
+            .dropped_params(&req)
+            .contains(&"thinking".to_string()));
+        let body = translate_request(req).expect("translate ok");
+        assert_eq!(body.thinking, None);
     }
 }

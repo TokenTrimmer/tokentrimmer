@@ -134,6 +134,23 @@ impl Provider for AnthropicProvider {
         if req.stream_options.is_some() {
             out.push("stream_options".to_string());
         }
+        // Extended-thinking passthrough (mirror of `translate::forwardable_thinking`):
+        // a `thinking` config translation will NOT forward (malformed shape,
+        // sub-1024 budget, or budget >= the resolved max_tokens — Anthropic
+        // 400s those) is dropped AND reported; a FORWARDED enabled config
+        // makes Anthropic reject temperature/top_p modifications, so those
+        // are omitted by translation and reported here instead.
+        if req.extra.contains_key("thinking") && translate::forwardable_thinking(req).is_none() {
+            out.push("thinking".to_string());
+        }
+        if translate::forwards_enabled_thinking(req) {
+            if req.temperature.is_some() {
+                out.push("temperature".to_string());
+            }
+            if req.top_p.is_some() {
+                out.push("top_p".to_string());
+            }
+        }
         out
     }
 
