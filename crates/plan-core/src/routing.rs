@@ -121,6 +121,7 @@ mod tests {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                batch: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

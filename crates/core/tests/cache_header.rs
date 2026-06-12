@@ -365,6 +365,7 @@ async fn privacy_route_disable_cache_beats_force_write() {
                 disable_cache: true,
                 max_cost_usd: None,
                 flex: false,
+                batch: false,
                 compress: false,
                 redact: false,
                 traffic_pct: None,

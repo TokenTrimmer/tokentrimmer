@@ -115,7 +115,9 @@ impl EmbedBuilder<'_> {
             .post(format!("{}/v1/embeddings", self.client.base))
             .bearer_auth(&self.client.key)
             .json(&req);
-        let http_req = crate::apply_tt_headers(http_req, None, self.cost_limit)?;
+        // Embeddings never carry the interactive marker — the batch-eligibility
+        // route action is chat-only (no embeddings-route support this phase).
+        let http_req = crate::apply_tt_headers(http_req, None, self.cost_limit, false)?;
         let resp = http_req.send().await.map_err(Error::Request)?;
         let cost = parse_cost(resp.headers());
         let status = resp.status();

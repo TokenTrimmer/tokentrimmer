@@ -188,6 +188,7 @@ async fn app_with_compress_route(
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                batch: false,
                 compress: true,
                 redact: false,
                 traffic_pct: None,

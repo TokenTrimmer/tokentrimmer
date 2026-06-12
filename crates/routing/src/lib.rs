@@ -142,6 +142,19 @@ pub struct RouteAction {
     /// omitted from JSON when false (back-compat with existing rows).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flex: bool,
+    /// Mark matched traffic **batch-eligible** (advisory, research Phase 2.1).
+    /// The provider Batch APIs price async (≤24h) traffic at ~50%; the gateway
+    /// is synchronous today, so this action does NOT detour dispatch and does
+    /// NOT change the bill. It: (1) tags the request_logs row batch-eligible,
+    /// (2) records the FORGONE batch discount (priced from the served model's
+    /// real catalog batch rate — never a hardcoded 0.5) in
+    /// `batch_forgone_usd` / the `X-TokenTrimmer-Batch-Forgone-Usd` header,
+    /// and (3) emits a `batch_deferred_unavailable` warning. NEVER applied to
+    /// streaming or interactive (`X-TokenTrimmer-Interactive`) requests — the
+    /// gateway clears the marker and warns `batch_ineligible:<reason>`.
+    /// Default false; omitted from JSON when false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub batch: bool,
     /// Opt the matched request into the **conservative compression pass**
     /// (request-pass pipeline, compression pass #1): a content-lossless trim of
     /// *non-prose* blocks (collapse redundant whitespace/blank lines in
@@ -462,6 +475,7 @@ mod tests {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                batch: false,
                 compress: false,
                 redact: false,
                 traffic_pct: None,
@@ -769,6 +783,7 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             flex: false,
+            batch: false,
             compress: false,
             redact: false,
             traffic_pct: None,
@@ -801,6 +816,7 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             flex: false,
+            batch: false,
             compress: false,
             redact: false,
             traffic_pct: None,
@@ -825,6 +841,7 @@ mod tests {
             disable_cache: false,
             max_cost_usd: None,
             flex: false,
+            batch: false,
             compress: false,
             redact: false,
             traffic_pct: None,
@@ -981,6 +998,46 @@ mod tests {
         assert!(j.contains("\"flex\":true"), "flex=true must serialize: {j}");
         let back: RouteAction = serde_json::from_str(&j).unwrap();
         assert!(back.flex);
+    }
+
+    /// The advisory batch-eligibility marker defaults false, is omitted from
+    /// JSON when false (back-compat: existing rows unchanged), and round-trips
+    /// when true — the same serde gating as `flex`/`compress`/`redact`.
+    #[test]
+    fn route_action_batch_defaults_false_and_omitted_when_false() {
+        // Omitted from JSON when false.
+        let mut a = make_route("x", 10, vec![], "gpt-5.5").then;
+        assert!(
+            !serde_json::to_string(&a).unwrap().contains("batch"),
+            "batch must be omitted when false"
+        );
+        // Defaults false when absent from legacy JSON.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.batch, "batch must default false");
+        // Present + round-trips when true.
+        a.batch = true;
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(
+            j.contains("\"batch\":true"),
+            "batch=true must serialize: {j}"
+        );
+        let back: RouteAction = serde_json::from_str(&j).unwrap();
+        assert!(back.batch);
+    }
+
+    /// Cross-type wire-compat for the batch-eligibility marker: JSON written by
+    /// the plan side carrying `"batch":true` deserializes into a
+    /// `tt_routing::RouteAction` with the flag set and re-emits the same wire
+    /// form (same field order + skip_serializing_if gating). Locks `batch` into
+    /// the shared wire format alongside `flex`/`compress`/`redact`.
+    #[test]
+    fn route_action_batch_cross_type_wire_compat() {
+        let plan_side_json = r#"{"target_model":"m","batch":true}"#;
+        let gateway_action: RouteAction = serde_json::from_str(plan_side_json).unwrap();
+        assert_eq!(gateway_action.target_model, "m");
+        assert!(gateway_action.batch, "batch must round-trip from plan JSON");
+        let reemitted = serde_json::to_string(&gateway_action).unwrap();
+        assert_eq!(reemitted, plan_side_json);
     }
 
     #[test]

@@ -895,6 +895,25 @@ pub async fn handler(
     // A matched route requesting OpenAI Flex (`service_tier="flex"`). Applied to
     // the upstream request below, gated on the served model's flex-eligibility.
     let route_flex = route_match.as_ref().is_some_and(|m| m.flex);
+    // A matched route requesting the advisory batch-eligibility marker
+    // (`RouteAction::batch`). Gated below (after routing/pin resolve the final
+    // provider) on streaming / interactive / catalog batch rate — see
+    // `maybe_mark_batch_eligible`. Advisory: dispatch is never detoured.
+    let route_batch = route_match.as_ref().is_some_and(|m| m.batch);
+    // Hard interactive-ineligibility signal for the batch marker: a client that
+    // declares "a human is waiting" via `X-TokenTrimmer-Interactive: 1` (set by
+    // `tt chat` and the /tools loop) is never marked batch-eligible. Read
+    // directly from the header map — deliberately NOT a RequestContext field.
+    // Fails in the interactive-SAFE direction: ANY non-empty value other than
+    // an explicit opt-out (`0` / `false`) counts as interactive, so a client
+    // sending an unrecognized truthy spelling (`yes`, `on`, …) is never
+    // silently treated as batch-markable. This gate becomes load-bearing when
+    // the async Batch Lane ships — misparsing must err toward "human waiting".
+    let interactive_client = headers
+        .get("x-tokentrimmer-interactive")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false"));
     // A matched route opting into the conservative compression pass
     // (`RouteAction::compress`). When false (the default — no route or a route
     // that did not enable it) the request-pass pipeline never runs and the
@@ -1075,6 +1094,19 @@ pub async fn handler(
     // cost computation below so savings attribute to the `flex` source. Evaluated
     // against the FINAL served provider/model (post-routing/pin/failover-primary).
     let flex_applied = maybe_apply_flex(&mut req, route_flex, provider.as_ref(), &mut warnings);
+
+    // Advisory batch-eligibility marker (route action, research Phase 2.1):
+    // never mutates the request or detours dispatch — the gateway is
+    // synchronous today. `batch_marked` drives the request_logs tagging and
+    // the forgone-discount attribution below. Hard ineligibility (streaming /
+    // interactive) and the catalog-batch-rate gate are enforced inside.
+    let batch_marked = maybe_mark_batch_eligible(
+        &req,
+        route_batch,
+        interactive_client,
+        provider.as_ref(),
+        &mut warnings,
+    );
 
     // ── Request-pass stage ───────────────────────────────────────────────────
     //
@@ -1371,6 +1403,7 @@ pub async fn handler(
                             flex_saved_usd: 0.0,
                             compression_saved_usd: 0.0,
                             cache_bust_penalty_usd: 0.0,
+                            batch_forgone_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -1936,6 +1969,7 @@ pub async fn handler(
             baseline_pricing.as_ref(),
             provider.fee_multiplier(),
             flex_applied,
+            batch_marked,
             pass_effects,
         );
         let cost_usd = cost_breakdown.cost_usd;
@@ -2115,6 +2149,14 @@ pub async fn handler(
                 cache_creation_input_tokens: opt_tokens_i32(
                     response.usage.cache_creation_input_tokens,
                 ),
+                // Advisory batch-eligibility marker (research Phase 2.1).
+                // `batch_eligible` records route INTENT (the marker survived
+                // the hard-ineligibility gate); `batch_forgone_usd` is the
+                // PRICED claim — 0.0 when failover served a model with no
+                // catalog batch tier, while `batch_eligible` stays true so the
+                // route's intent remains auditable.
+                batch_eligible: batch_marked,
+                batch_forgone_usd: cost_breakdown.batch_forgone_usd,
             },
         );
 
@@ -2310,6 +2352,50 @@ fn maybe_apply_flex(
     true
 }
 
+/// Advisory batch-eligibility gate (`RouteAction::batch`, research Phase 2.1).
+/// NEVER mutates `req` (the gateway is synchronous — there is no batch
+/// dispatch to opt into today, unlike flex's `service_tier` injection).
+/// Returns whether the request is marked batch-eligible for telemetry /
+/// forgone-savings attribution; a marked request still dispatches and bills
+/// normally, signalled by the `batch_deferred_unavailable` warning.
+///
+/// Hard ineligibility (enforced in code, not docs): streaming requests and
+/// interactive clients (`X-TokenTrimmer-Interactive`, set by `tt chat` and the
+/// /tools loop) are cleared with a `batch_ineligible:<reason>` warning — the
+/// provider Batch APIs run on a ≤24h window, which breaks any interactive UX.
+/// A served model with no catalog batch tier is not marked
+/// (`batch_not_available:<model>`) — no real rate, no claim. Check order is
+/// fixed: streaming > interactive > rate. Fail-open by construction: only
+/// pushes warnings and returns a bool — a marked request can never 5xx.
+fn maybe_mark_batch_eligible(
+    req: &ChatCompletionRequest,
+    requested: bool,
+    interactive_client: bool,
+    provider: &dyn tt_shared::Provider,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if !requested {
+        return false;
+    }
+    if req.stream {
+        warnings.push("batch_ineligible:streaming".into());
+        return false;
+    }
+    if interactive_client {
+        warnings.push("batch_ineligible:interactive".into());
+        return false;
+    }
+    let eligible = provider
+        .pricing(&req.model)
+        .is_some_and(|p| p.batch_eligible());
+    if !eligible {
+        warnings.push(format!("batch_not_available:{}", req.model));
+        return false;
+    }
+    warnings.push("batch_deferred_unavailable".into());
+    true
+}
+
 /// Attach `X-TokenTrimmer-Warnings`: the model-dependent `param_dropped:<name>`
 /// tokens (computed here against `served_model`) plus any pre-dispatch `extra`
 /// tokens (e.g. `response_format_downgrade`). Comma-joined; no-op when empty.
@@ -2374,6 +2460,7 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         flex_saved_usd: 0.0,
         compression_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        batch_forgone_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -2440,6 +2527,7 @@ fn build_hit_l2_response(
         flex_saved_usd: 0.0,
         compression_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        batch_forgone_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -2685,6 +2773,17 @@ pub(crate) struct CostBreakdown {
     /// `request_logs` row (migration 0016) so the row-derived ledger agrees
     /// with the header/span headline.
     pub cache_bust_penalty_usd: f64,
+    /// FORGONE batch discount (USD): what the async Batch Lane would have
+    /// saved on this request — realized cost minus the served model's
+    /// batch-rate cost on the full prompt+completion, floored at 0, fee-
+    /// applied. ADVISORY: the gateway dispatched synchronously and billed
+    /// `cost_usd`; this is NEVER included in `tt_saved_usd()` or `saved_usd`
+    /// (nothing was actually saved — the savings-ledger headline must stay
+    /// invoice-reconcilable). Surfaced on its own
+    /// `X-TokenTrimmer-Batch-Forgone-Usd` header and persisted on the
+    /// `request_logs` row (migration 0017). 0.0 unless the request was marked
+    /// batch-eligible AND the served model carries catalog batch rates.
+    pub batch_forgone_usd: f64,
 }
 
 impl CostBreakdown {
@@ -2779,6 +2878,7 @@ pub(crate) fn compute_cost_with_flex(
         baseline_pricing,
         fee_multiplier,
         flex_applied,
+        false,
         PassEffects::default(),
     )
 }
@@ -2814,12 +2914,21 @@ pub(crate) fn compute_cost_with_flex(
 /// [`CostBreakdown::tt_saved_usd`] pre-clamp — but is NEVER folded into
 /// `cost_usd` / `baseline_cost_usd` (an estimate of induced future cost must
 /// not contaminate fields that reconcile against the realized invoice).
+///
+/// `batch_marked` flags a request the advisory batch-eligibility route action
+/// marked (see `maybe_mark_batch_eligible`). It changes NO realized figure:
+/// it only populates [`CostBreakdown::batch_forgone_usd`] — the discount the
+/// async Batch Lane would have delivered, priced from the served model's REAL
+/// catalog batch rate against the realized (flex-or-standard, cache-metered)
+/// cost. A served model with no batch tier (possible after failover) forgoes
+/// 0.0 — never a fabricated 0.5×.
 pub(crate) fn compute_cost_full(
     usage: &Usage,
     pricing: Option<&ModelPricing>,
     baseline_pricing: Option<&ModelPricing>,
     fee_multiplier: f64,
     flex_applied: bool,
+    batch_marked: bool,
     effects: PassEffects,
 ) -> CostBreakdown {
     let Some(pricing) = pricing else {
@@ -2899,6 +3008,30 @@ pub(crate) fn compute_cost_full(
         None => 0.0,
     };
 
+    // Batch (advisory, research Phase 2.1): the FORGONE Batch-API discount —
+    // what the request would have saved had it gone through the (future) async
+    // Batch Lane. Priced from the served model's REAL catalog batch rate on
+    // the full prompt + completion (no cache-discount stacking — the same
+    // conservative basis as the flex cost and `tt_shared::batch_advisor`),
+    // compared against the realized pre-fee `cost_usd` so the figure is "50%
+    // off the actual dispatch cost". Floored at 0. NEVER added to any realized
+    // or saved figure: the gateway dispatched synchronously and billed
+    // `cost_usd` in full.
+    let batch_forgone_usd = if batch_marked {
+        match pricing.batch_rates_per_million() {
+            Some((batch_in, batch_out)) => {
+                let batch_cost = (usage.prompt_tokens as f64) * batch_in / 1_000_000.0
+                    + (usage.completion_tokens as f64) * batch_out / 1_000_000.0;
+                (cost_usd - batch_cost).max(0.0)
+            }
+            // Failover may serve a model with no batch tier — no real rate,
+            // no fabricated claim.
+            None => 0.0,
+        }
+    } else {
+        0.0
+    };
+
     // Served-model cost as if no provider caching had occurred: all prompt
     // tokens at the full input rate. The delta against the (standard) cost is the
     // provider's automatic cache discount (read discount net of any
@@ -2943,6 +3076,7 @@ pub(crate) fn compute_cost_full(
         flex_saved_usd: flex_saved_usd * fee_multiplier,
         compression_saved_usd: compression_saved_usd * fee_multiplier,
         cache_bust_penalty_usd: effects.cache_bust_penalty_usd * fee_multiplier,
+        batch_forgone_usd: batch_forgone_usd * fee_multiplier,
     }
 }
 
@@ -3028,6 +3162,15 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-cache-bust-usd",
             format!("{:.6}", cost.cache_bust_penalty_usd),
+        ),
+        // ADVISORY forgone Batch-API discount for batch-eligible requests —
+        // what the future async Batch Lane would have saved, priced from the
+        // served model's real catalog batch rate. NEVER included in
+        // `saved-usd` (the request was dispatched synchronously and billed
+        // `cost-usd` in full). 0.000000 for all unmarked traffic.
+        (
+            "x-tokentrimmer-batch-forgone-usd",
+            format!("{:.6}", cost.batch_forgone_usd),
         ),
     ];
 
@@ -3734,6 +3877,10 @@ fn request_log_for_l1_hit(
         // echo-the-miss behavior for back-compat.)
         cache_read_input_tokens: None,
         cache_creation_input_tokens: None,
+        // Cache hit = no dispatch cost, nothing forgone — the Batch Lane
+        // could not have saved anything on a request that never billed.
+        batch_eligible: false,
+        batch_forgone_usd: 0.0,
     }
 }
 
@@ -3782,6 +3929,9 @@ fn request_log_for_l2_hit(
         // never double-count provider cache reads.
         cache_read_input_tokens: None,
         cache_creation_input_tokens: None,
+        // Cache hit = no dispatch cost, nothing forgone (see the L1 builder).
+        batch_eligible: false,
+        batch_forgone_usd: 0.0,
     }
 }
 
@@ -3811,6 +3961,12 @@ pub(crate) struct RouteMatch {
     /// actual opt-in is gated on the served model's flex-eligibility at the
     /// request-build step (an ineligible model is left untouched + warned).
     pub(crate) flex: bool,
+    /// The matched route requested the advisory **batch-eligibility** marker
+    /// (`RouteAction::batch`). Gated at the request-build step on streaming /
+    /// interactive (`X-TokenTrimmer-Interactive`) / the served model's catalog
+    /// batch rate — see `maybe_mark_batch_eligible`. Advisory only: the
+    /// synchronous gateway never detours dispatch for it.
+    pub(crate) batch: bool,
     /// The matched route opted into the conservative compression pass
     /// (`RouteAction::compress`). When true the gateway runs the request-pass
     /// pipeline before dispatch; off by default (no pass runs otherwise).
@@ -3939,6 +4095,7 @@ pub(crate) async fn apply_routing(
     let disable_cache = m.then.disable_cache;
     let max_cost_usd = m.then.max_cost_usd;
     let flex = m.then.flex;
+    let batch = m.then.batch;
     let compress = m.then.compress;
     let redact = m.then.redact;
     let traffic_pct = m.then.traffic_pct;
@@ -3984,6 +4141,7 @@ pub(crate) async fn apply_routing(
         max_cost_usd,
         input_tokens_estimate: input_tokens,
         flex,
+        batch,
         compress,
         redact,
         traffic_pct,
@@ -4553,6 +4711,7 @@ mod cache_bust_tests {
             Some(&requested),
             1.0,
             false,
+            false,
             PassEffects::default(),
         );
         assert!((no_bust.tt_saved_usd() - 4.0).abs() < 1e-9);
@@ -4563,7 +4722,15 @@ mod cache_bust_tests {
             compression_tokens_removed: 0,
             cache_bust_penalty_usd: 1.5,
         };
-        let bd = compute_cost_full(&usage, Some(&served), Some(&requested), 1.0, false, effects);
+        let bd = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            false,
+            effects,
+        );
         assert!((bd.cache_bust_penalty_usd - 1.5).abs() < 1e-9);
         assert!((bd.tt_saved_usd() - 2.5).abs() < 1e-9);
         assert!(
@@ -4582,6 +4749,7 @@ mod cache_bust_tests {
             Some(&requested),
             1.05,
             false,
+            false,
             effects,
         );
         assert!((bd_fee.cache_bust_penalty_usd - 1.5 * 1.05).abs() < 1e-9);
@@ -4592,7 +4760,15 @@ mod cache_bust_tests {
             compression_tokens_removed: 0,
             cache_bust_penalty_usd: 100.0,
         };
-        let clamped = compute_cost_full(&usage, Some(&served), Some(&requested), 1.0, false, big);
+        let clamped = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            false,
+            big,
+        );
         assert_eq!(clamped.tt_saved_usd(), 0.0);
         assert!(
             (clamped.cost_usd - 1.0).abs() < 1e-9,

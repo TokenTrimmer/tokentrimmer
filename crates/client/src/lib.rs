@@ -281,10 +281,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// (control chars/CR/LF/DEL; high bytes pass as opaque octets) and a non-finite
 /// cost limit — surfaced at send time, before any network I/O. A finite negative
 /// cost limit is sent as-is; the gateway rejects it with 402.
+///
+/// When `interactive` is true, also attach `X-TokenTrimmer-Interactive: 1`
+/// (static value, no validation needed) — declaring that a human is waiting on
+/// this request, which hard-clears the gateway's advisory batch-eligibility
+/// route action (`batch_ineligible:interactive`).
 pub(crate) fn apply_tt_headers(
     mut req: reqwest::RequestBuilder,
     tag: Option<&str>,
     cost_limit: Option<f64>,
+    interactive: bool,
 ) -> Result<reqwest::RequestBuilder> {
     if let Some(tag) = tag {
         let value = reqwest::header::HeaderValue::from_str(tag)
@@ -296,6 +302,9 @@ pub(crate) fn apply_tt_headers(
             return Err(Error::InvalidCostLimit(limit));
         }
         req = req.header("X-TokenTrimmer-Cost-Limit-Usd", format!("{limit}"));
+    }
+    if interactive {
+        req = req.header("X-TokenTrimmer-Interactive", "1");
     }
     Ok(req)
 }
@@ -375,6 +384,7 @@ impl Client {
             temperature: None,
             tag: None,
             cost_limit: None,
+            interactive: false,
             tools: Vec::new(),
             tool_choice: None,
             max_tool_rounds: 8,
@@ -391,6 +401,7 @@ pub struct ChatBuilder<'a> {
     temperature: Option<f32>,
     tag: Option<String>,
     cost_limit: Option<f64>,
+    interactive: bool,
     tools: Vec<Tool>,
     tool_choice: Option<ToolChoice>,
     max_tool_rounds: usize,
@@ -433,6 +444,16 @@ impl ChatBuilder<'_> {
     #[must_use]
     pub fn cost_limit(mut self, usd: f64) -> Self {
         self.cost_limit = Some(usd);
+        self
+    }
+    /// Mark this request as **interactive** (a human is waiting). Sends
+    /// `X-TokenTrimmer-Interactive: 1`; the gateway hard-clears the advisory
+    /// batch-eligibility route action for interactive traffic
+    /// (`batch_ineligible:interactive` warning) — a ≤24h Batch-API window
+    /// must never be applied to a conversation someone is sitting in front of.
+    #[must_use]
+    pub fn interactive(mut self) -> Self {
+        self.interactive = true;
         self
     }
 
@@ -480,7 +501,7 @@ impl ChatBuilder<'_> {
             .post(format!("{}/v1/chat/completions", self.client.base))
             .bearer_auth(&self.client.key)
             .json(&body);
-        let req = apply_tt_headers(req, self.tag.as_deref(), self.cost_limit)?;
+        let req = apply_tt_headers(req, self.tag.as_deref(), self.cost_limit, self.interactive)?;
         let resp = req.send().await.map_err(Error::Request)?;
         let cost = parse_cost(resp.headers());
         let status = resp.status();
@@ -530,7 +551,7 @@ impl ChatBuilder<'_> {
             .post(format!("{}/v1/chat/completions", self.client.base))
             .bearer_auth(&self.client.key)
             .json(&body);
-        let req = apply_tt_headers(req, self.tag.as_deref(), self.cost_limit)?;
+        let req = apply_tt_headers(req, self.tag.as_deref(), self.cost_limit, self.interactive)?;
         let resp = req.send().await.map_err(Error::Request)?;
         let header_cost = parse_cost(resp.headers());
         let status = resp.status();
@@ -832,6 +853,87 @@ mod tests {
         assert_eq!(out.cost.cost_usd, Some(0.0001));
         assert!((out.savings_pct().unwrap() - 75.0).abs() < 1e-9);
         assert_eq!(out.response.model, "gpt-4o-mini");
+    }
+
+    /// `.interactive()` attaches `X-TokenTrimmer-Interactive: 1` on `send()` —
+    /// the in-code declaration that hard-clears the gateway's advisory
+    /// batch-eligibility route action for this traffic.
+    #[tokio::test]
+    async fn interactive_builder_sets_header_on_send() {
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("x-tokentrimmer-interactive", "1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(sample_response());
+        });
+        let client = Client::new(server.base_url(), "tt_live_test");
+        client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .interactive()
+            .send()
+            .await
+            .unwrap();
+        m.assert();
+    }
+
+    /// `.interactive()` attaches the header on `stream()` too (belt-and-braces:
+    /// the gateway already clears the batch marker for any streaming request).
+    #[tokio::test]
+    async fn interactive_builder_sets_header_on_stream() {
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("x-tokentrimmer-interactive", "1");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body("data: [DONE]\n\n");
+        });
+        let client = Client::new(server.base_url(), "tt_live_test");
+        let mut stream = client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .interactive()
+            .stream()
+            .await
+            .unwrap();
+        while stream.next().await.unwrap().is_some() {}
+        m.assert();
+    }
+
+    /// A default builder sends NO interactive header — non-interactive traffic
+    /// stays eligible for the advisory batch marker.
+    #[tokio::test]
+    async fn default_builder_sends_no_interactive_header() {
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    !req.headers.as_ref().is_some_and(|h| {
+                        h.iter()
+                            .any(|(k, _)| k.eq_ignore_ascii_case("x-tokentrimmer-interactive"))
+                    })
+                });
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(sample_response());
+        });
+        let client = Client::new(server.base_url(), "tt_live_test");
+        client
+            .chat()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .send()
+            .await
+            .unwrap();
+        m.assert();
     }
 
     #[tokio::test]
@@ -1281,13 +1383,16 @@ mod tests {
     fn apply_tt_headers_accepts_valid_and_rejects_invalid() {
         let http = reqwest::Client::new();
         let url = "http://127.0.0.1:0/x";
-        assert!(super::apply_tt_headers(http.get(url), Some("team-a"), Some(0.5)).is_ok());
-        assert!(super::apply_tt_headers(http.get(url), None, None).is_ok());
-        let e = super::apply_tt_headers(http.get(url), Some("bad\ntag"), None).unwrap_err();
+        assert!(super::apply_tt_headers(http.get(url), Some("team-a"), Some(0.5), false).is_ok());
+        assert!(super::apply_tt_headers(http.get(url), None, None, false).is_ok());
+        // `interactive` is a static "1" — valid alongside any other header set.
+        assert!(super::apply_tt_headers(http.get(url), Some("team-a"), None, true).is_ok());
+        let e = super::apply_tt_headers(http.get(url), Some("bad\ntag"), None, false).unwrap_err();
         assert!(matches!(e, Error::InvalidTag(_)), "{e:?}");
-        let nan = super::apply_tt_headers(http.get(url), None, Some(f64::NAN)).unwrap_err();
+        let nan = super::apply_tt_headers(http.get(url), None, Some(f64::NAN), false).unwrap_err();
         assert!(matches!(nan, Error::InvalidCostLimit(_)), "{nan:?}");
-        let inf = super::apply_tt_headers(http.get(url), None, Some(f64::INFINITY)).unwrap_err();
+        let inf =
+            super::apply_tt_headers(http.get(url), None, Some(f64::INFINITY), false).unwrap_err();
         assert!(matches!(inf, Error::InvalidCostLimit(_)), "{inf:?}");
     }
 

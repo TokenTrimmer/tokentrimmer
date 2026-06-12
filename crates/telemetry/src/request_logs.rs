@@ -109,6 +109,28 @@ pub struct RequestLogRow {
     /// semantics; Anthropic-only in practice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<i32>,
+    /// `true` when a matched route's advisory **batch-eligibility** marker
+    /// (`RouteAction::batch`, research Phase 2.1) survived the gateway's
+    /// hard-ineligibility gate (non-streaming, non-interactive, served model
+    /// carries a catalog batch tier check at mark time). The gateway is
+    /// synchronous today, so an eligible row was STILL dispatched and billed
+    /// normally — this marks route intent for the future async Batch Lane.
+    /// `false` for unmarked / streaming / interactive traffic, TT cache hits,
+    /// and rows from before migration 0017.
+    #[serde(default)]
+    pub batch_eligible: bool,
+    /// FORGONE Batch-API discount (USD) for a batch-eligible request: realized
+    /// `cost_usd` minus the served model's catalog batch-rate cost on the full
+    /// prompt+completion, floored at 0, fee-applied. A projection of what the
+    /// async Batch Lane would have saved — NEVER part of `cost_usd` /
+    /// `baseline_cost_usd` / the TT saved-usd headline (those reconcile against
+    /// the provider invoice). `/costs` + the digest may
+    /// `SUM(batch_forgone_usd) WHERE batch_eligible` to say "$X/mo would be
+    /// saved by the Batch Lane". `0.0` when not batch-eligible, when the served
+    /// model carries no catalog batch tier (e.g. post-failover — no real rate,
+    /// no claim), and for rows from before migration 0017.
+    #[serde(default)]
+    pub batch_forgone_usd: f64,
 }
 
 /// Errors returned by [`RequestLogWriter`].
@@ -199,7 +221,8 @@ pub mod postgres {
                       tag, error_class, trace_id,
                       truncated,
                       shadow_model, shadow_cost_usd, traffic_split_arm,
-                      cache_read_input_tokens, cache_creation_input_tokens)
+                      cache_read_input_tokens, cache_creation_input_tokens,
+                      batch_eligible, batch_forgone_usd)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -210,11 +233,12 @@ pub mod postgres {
                       $20, $21, $22,
                       $23,
                       $24, $25, $26,
-                      $27, $28)"#;
+                      $27, $28,
+                      $29, $30)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 28;
+    pub const INSERT_BIND_COUNT: usize = 30;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -248,6 +272,8 @@ pub mod postgres {
                 .bind(row.traffic_split_arm.as_deref()) // $26
                 .bind(row.cache_read_input_tokens) // $27
                 .bind(row.cache_creation_input_tokens) // $28
+                .bind(row.batch_eligible) // $29
+                .bind(row.batch_forgone_usd) // $30
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -290,6 +316,8 @@ mod tests {
             traffic_split_arm: None,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            batch_eligible: false,
+            batch_forgone_usd: 0.0,
         }
     }
 
@@ -441,6 +469,45 @@ mod tests {
         let got = &w.rows()[0];
         assert!((got.cache_bust_penalty_usd - 0.0025).abs() < 1e-12);
         assert!((got.cost_usd - 0.01).abs() < 1e-12, "cost untouched");
+    }
+
+    /// The batch-eligibility columns (migration 0017) round-trip through the
+    /// writer in their OWN fields — the forgone discount is a projection for
+    /// the future async Batch Lane and is never folded into `cost_usd`.
+    #[tokio::test]
+    async fn in_memory_round_trips_batch_columns() {
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.025;
+        row.batch_eligible = true;
+        row.batch_forgone_usd = 0.0125;
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert!(got.batch_eligible, "batch_eligible must survive write→read");
+        assert!((got.batch_forgone_usd - 0.0125).abs() < 1e-12);
+        assert!((got.cost_usd - 0.025).abs() < 1e-12, "cost untouched");
+    }
+
+    /// Legacy JSON (rows serialized before migration 0017) deserializes with
+    /// `batch_eligible = false` / `batch_forgone_usd = 0.0` — matching the SQL
+    /// `NOT NULL DEFAULT` semantics for pre-migration rows.
+    #[test]
+    fn batch_columns_serde_backward_compat() {
+        let legacy = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "org_id":"00000000-0000-0000-0000-000000000000",
+            "api_key_id":"00000000-0000-0000-0000-000000000000",
+            "ts":"2026-06-09T00:00:00Z",
+            "provider":"openai","model":"gpt-4o",
+            "input_tokens":1,"output_tokens":1,"cached_tokens":0,
+            "cost_usd":0.0,"baseline_cost_usd":0.0,
+            "cached":false,"cache_layer":null,"route_id":null,
+            "latency_ms":1,"upstream_latency_ms":null,"status":200,
+            "tag":null,"error_class":null,"trace_id":null
+        }"#;
+        let row: RequestLogRow = serde_json::from_str(legacy).unwrap();
+        assert!(!row.batch_eligible, "pre-0017 rows default to ineligible");
+        assert_eq!(row.batch_forgone_usd, 0.0, "pre-0017 rows forgo nothing");
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the

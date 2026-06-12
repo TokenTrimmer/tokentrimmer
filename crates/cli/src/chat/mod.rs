@@ -281,6 +281,11 @@ async fn stream_turn(
         .chat()
         .model(&conv.model)
         .messages(conv.wire_messages())
+        // A human is sitting in this REPL: declare interactivity so the
+        // gateway hard-clears the advisory batch-eligibility route action
+        // (belt-and-braces — streaming is already gateway-cleared, but the
+        // CLI states its intent explicitly).
+        .interactive()
         .stream()
         .await
         .context("request to gateway failed")?;
@@ -653,7 +658,11 @@ mod tests {
             "data: [DONE]\n\n",
         );
         server.mock(|when, then| {
-            when.method(POST).path("/v1/chat/completions");
+            when.method(POST)
+                .path("/v1/chat/completions")
+                // `tt chat` always declares interactivity — a human is waiting,
+                // so the gateway must never mark this traffic batch-eligible.
+                .header("x-tokentrimmer-interactive", "1");
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")

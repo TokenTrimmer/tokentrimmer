@@ -132,6 +132,7 @@ async fn send_round(
     temperature: Option<f32>,
     tag: Option<&str>,
     cost_limit: Option<f64>,
+    interactive: bool,
 ) -> Result<(ChatCompletionResponse, CostInfo)> {
     let mut body = build_body(model, messages, max_tokens, temperature, false);
     let none = ToolChoice::none();
@@ -146,7 +147,7 @@ async fn send_round(
         .post(format!("{}/v1/chat/completions", client.base))
         .bearer_auth(&client.key)
         .json(&body);
-    let req = crate::apply_tt_headers(req, tag, cost_limit)?;
+    let req = crate::apply_tt_headers(req, tag, cost_limit, interactive)?;
     let resp = req.send().await.map_err(Error::Request)?;
     let cost = parse_cost(resp.headers());
     let status = resp.status();
@@ -187,6 +188,7 @@ impl ChatBuilder<'_> {
             temperature,
             tag,
             cost_limit,
+            interactive,
             tools,
             tool_choice,
             max_tool_rounds,
@@ -207,6 +209,7 @@ impl ChatBuilder<'_> {
                 temperature,
                 tag,
                 cost_limit,
+                interactive,
             )
             .await?;
             rounds += 1;
@@ -256,6 +259,7 @@ impl ChatBuilder<'_> {
             temperature,
             tag,
             cost_limit,
+            interactive,
         )
         .await?;
         rounds += 1;
