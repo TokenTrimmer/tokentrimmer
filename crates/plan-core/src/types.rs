@@ -241,6 +241,15 @@ pub struct RouteAction {
     /// it unchanged (no savings) and surfaces a caveat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+    /// Mirror of `tt_routing::RouteAction::batch`. Replay PROJECTS the
+    /// discount the Batch Lane would deliver (target priced at its catalog
+    /// batch rate — see [`crate::cost::project_batch_cost`]) and surfaces a
+    /// per-run caveat counting the affected requests — the live gateway is
+    /// synchronous today and does NOT realize this discount (advisory marker;
+    /// the async Batch Lane is a later phase). Same serde gating as the
+    /// gateway side (omitted when false).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub batch: bool,
     /// Mirror of `tt_routing::RouteAction::redact`. The request-redaction
     /// guardrail is a runtime-only SAFETY transform (it strips PII/secrets from
     /// the outbound prompt); the replay engine does not model it (no cost/savings
@@ -289,6 +298,16 @@ pub struct ModelPricing {
     /// USD per 1M cached input tokens. `None` means "no cache discount on
     /// this model"; the replay then charges cached input at the full rate.
     pub cached_input_per_million: Option<f64>,
+    /// USD per 1M batch (async Batch API) input tokens. `None` = no batch
+    /// tier; a batch-eligibility route targeting such a model projects NO
+    /// discount (never a fabricated 0.5×). Skipped from JSON when `None` so
+    /// existing snapshots / persisted plan inputs stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_input_per_million: Option<f64>,
+    /// USD per 1M batch (async Batch API) output tokens. See
+    /// [`Self::batch_input_per_million`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_output_per_million: Option<f64>,
 }
 
 /// Configuration knobs that affect projection but aren't per-route. Today
@@ -562,6 +581,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -592,6 +612,7 @@ mod tests {
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -615,6 +636,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: true,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -650,6 +672,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: true,
             traffic_pct: None,
             shadow_model: None,
@@ -679,6 +702,29 @@ mod tests {
         );
         let reemitted = serde_json::to_string(&plan_action).unwrap();
         assert_eq!(reemitted, gateway_json);
+    }
+
+    /// Cross-crate wire-compat for the advisory batch-eligibility marker:
+    /// gateway-written JSON carrying `"batch":true` deserializes into the
+    /// plan-core type with the flag set and re-emits the same wire form (same
+    /// relative field order + skip_serializing_if gating), and the flag is
+    /// omitted when false. Mirrors the gateway-side
+    /// `route_action_batch_cross_type_wire_compat` so the two `RouteAction`
+    /// shapes stay in lockstep on `batch`.
+    #[test]
+    fn route_action_batch_wire_compat_with_gateway() {
+        let gateway_json = r#"{"target_model":"gpt-5.5","batch":true}"#;
+        let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
+        assert_eq!(plan_action.target_model, "gpt-5.5");
+        assert!(plan_action.batch, "batch must round-trip from gateway JSON");
+        let reemitted = serde_json::to_string(&plan_action).unwrap();
+        assert_eq!(reemitted, gateway_json);
+
+        // Defaults false + omitted when false (back-compat for persisted plans).
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.batch, "batch must default false");
+        let j = serde_json::to_string(&parsed).unwrap();
+        assert!(!j.contains("batch"), "batch=false must be omitted: {j}");
     }
 
     /// Cross-crate wire-compat for the canary fields (`traffic_pct` +

@@ -516,6 +516,9 @@ impl TrackedEventStream {
             self.baseline_pricing.as_ref(),
             self.fee_multiplier,
             self.flex_applied,
+            // Batch never streams — the gateway clears the advisory marker
+            // for streaming requests at the gate (`batch_ineligible:streaming`).
+            false,
             self.pass_effects,
         );
         // `saved_usd` is strictly TT-attributed; the provider's automatic
@@ -727,6 +730,9 @@ pub fn stream_response(
                     baseline_pricing.as_ref(),
                     fee_multiplier,
                     flex_applied,
+                    // Batch never streams — the gateway clears the advisory
+                    // marker at the gate (`batch_ineligible:streaming`).
+                    false,
                     pass_effects,
                 );
                 let cost_usd = breakdown.cost_usd;
@@ -809,6 +815,11 @@ pub fn stream_response(
                     // None (NULL) on truncated streams — never estimated.
                     cache_read_input_tokens: usage.cache_read_tokens,
                     cache_creation_input_tokens: usage.cache_creation_tokens,
+                    // Batch never streams — cleared at the gate
+                    // (`batch_ineligible:streaming`), so a streamed row is
+                    // never batch-eligible and forgoes nothing.
+                    batch_eligible: false,
+                    batch_forgone_usd: 0.0,
                 };
 
                 // Per-route provider-cache counters on cleanly completed

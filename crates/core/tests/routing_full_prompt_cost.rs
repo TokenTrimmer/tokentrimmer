@@ -197,6 +197,7 @@ async fn cost_condition_counts_full_prompt() {
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                batch: false,
                 compress: false,
                 redact: false,
                 traffic_pct: None,

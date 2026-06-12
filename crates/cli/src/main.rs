@@ -352,6 +352,10 @@ enum RouteAction {
         /// Make matched requests skip TokenTrimmer's cache entirely (privacy).
         #[arg(long)]
         disable_cache: bool,
+        /// Advisory batch-eligibility marker (Batch Lane forgone-savings
+        /// attribution; never applied to streaming/interactive requests).
+        #[arg(long)]
+        batch: bool,
         #[arg(long, default_value_t = 100)]
         priority: u32,
         #[arg(long)]
@@ -415,8 +419,37 @@ enum AuditAction {
     },
 }
 
+/// Install ring as the process-default rustls `CryptoProvider`.
+///
+/// The dependency tree links BOTH providers (ring via reqwest 0.12 and
+/// friends; aws-lc-rs via redis 1.x and opentelemetry-otlp 0.32's reqwest
+/// 0.13), and rustls 0.23 PANICS at the first default-provider use when more
+/// than one is linked and none was installed. That panic took the prod
+/// gateway down at boot (OTLP exporter init) on the first deploy after the
+/// #158 dependency bumps — staging missed it because only prod sets the OTLP
+/// env. Must run before ANY TLS-touching init (sentry, tracing/OTLP, sqlx,
+/// provider clients). Idempotent: a second call returns Err (a default
+/// already exists), which is fine.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod crypto_provider_tests {
+    /// Regression guard for the 2026-06-12 prod boot panic: with ring and
+    /// aws-lc-rs both linked, rustls has NO process default until one is
+    /// installed. This asserts our install runs, wins, and is idempotent.
+    #[test]
+    fn install_is_idempotent_and_sets_a_default() {
+        super::install_crypto_provider();
+        super::install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_crypto_provider();
     let config = tt_config::Config::from_env().map_err(|e| anyhow::anyhow!("config: {e}"))?;
 
     // Init Sentry before tracing. Guard is bound to the function's lifetime;
@@ -843,6 +876,7 @@ async fn main() -> anyhow::Result<()> {
                     when_p95_gt,
                     max_cost,
                     disable_cache,
+                    batch,
                     priority,
                     name,
                     fallback,
@@ -860,6 +894,7 @@ async fn main() -> anyhow::Result<()> {
                     when_p95_gt,
                     max_cost,
                     disable_cache,
+                    batch,
                     priority,
                     name,
                     fallback,
@@ -1433,6 +1468,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     disable_cache: false,
                     max_cost_usd: None,
                     flex: false,
+                    batch: false,
                     compress: false,
                     redact: false,
                     traffic_pct: None,

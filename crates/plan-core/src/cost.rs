@@ -47,6 +47,27 @@ pub fn compute_baseline_cost(req: &RequestLog, pricing: &ModelPricing) -> f64 {
     project_cost(req, &req.model, pricing).cost_usd
 }
 
+/// Price one request at the target's **Batch API** rates (full input at the
+/// batch-input rate — no cache-discount stacking, deliberately conservative,
+/// the same basis as the gateway's forgone-discount math — plus output at the
+/// batch-output rate). `None` when the entry has no batch tier: nothing real
+/// to project, never a fabricated 0.5×. Feeds the `RouteAction::batch`
+/// projection in [`crate::replay`].
+#[must_use]
+pub fn project_batch_cost(req: &RequestLog, pricing: &ModelPricing) -> Option<ProjectedCost> {
+    let (batch_in, batch_out) = match (
+        pricing.batch_input_per_million,
+        pricing.batch_output_per_million,
+    ) {
+        (Some(i), Some(o)) => (i, o),
+        _ => return None,
+    };
+    Some(ProjectedCost {
+        cost_usd: f64::from(req.input_tokens) * batch_in / 1_000_000.0
+            + f64::from(req.output_tokens) * batch_out / 1_000_000.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +107,8 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
         };
         let req = sample_request(1_000_000, 1_000_000, 0);
         let p = project_cost(&req, "x", &pricing);
@@ -99,6 +122,8 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
         };
         let req = sample_request(1_000_000, 0, 500_000);
         let p = project_cost(&req, "x", &pricing);
@@ -112,11 +137,41 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
         };
         let req = sample_request(1_000_000, 0, 500_000);
         let p = project_cost(&req, "x", &pricing);
         // All input charged at the full rate -> $3.00.
         assert!((p.cost_usd - 3.0).abs() < 1e-9, "got {}", p.cost_usd);
+    }
+
+    /// `project_batch_cost` prices at the entry's REAL catalog batch rates
+    /// (full input, no cache stacking) and returns `None` — never a fabricated
+    /// 0.5× — when the entry carries no batch tier.
+    #[test]
+    fn project_batch_cost_uses_catalog_rates_or_none() {
+        let with_batch = ModelPricing {
+            input_per_million: 5.0,
+            output_per_million: 30.0,
+            cached_input_per_million: Some(0.5),
+            batch_input_per_million: Some(2.50),
+            batch_output_per_million: Some(15.00),
+        };
+        let req = sample_request(1_000_000, 1_000_000, 0);
+        let p = project_batch_cost(&req, &with_batch).expect("batch tier present");
+        // 1M input @ $2.50 + 1M output @ $15.00 = $17.50.
+        assert!((p.cost_usd - 17.50).abs() < 1e-9, "got {}", p.cost_usd);
+
+        let without_batch = ModelPricing {
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            ..with_batch
+        };
+        assert!(
+            project_batch_cost(&req, &without_batch).is_none(),
+            "no batch tier → None, never a fabricated discount"
+        );
     }
 
     #[test]
@@ -125,6 +180,8 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
         };
         // cached_tokens > input_tokens — should clamp.
         let req = sample_request(1_000, 0, 5_000);

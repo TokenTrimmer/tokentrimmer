@@ -18,6 +18,10 @@ fn to_plan(p: &tt_shared::pricing::ModelPricing) -> ModelPricing {
         input_per_million: p.input_per_million,
         output_per_million: p.output_per_million,
         cached_input_per_million: p.cached_input_per_million,
+        // Real catalog Batch-API rates (None = no batch tier) — feed the
+        // batch-eligibility route projection; never a fabricated 0.5×.
+        batch_input_per_million: p.batch_input_per_million,
+        batch_output_per_million: p.batch_output_per_million,
     }
 }
 
@@ -65,6 +69,25 @@ mod tests {
         assert_eq!(p.input_per_million, 2.50);
         assert_eq!(p.output_per_million, 10.00);
         assert_eq!(p.cached_input_per_million, Some(1.25));
+    }
+
+    /// `to_plan` copies the catalog Batch-API rates so the batch-eligibility
+    /// route projection prices at the REAL tier — and maps a model without a
+    /// batch tier to `None`/`None` (no fabricated discount).
+    #[test]
+    fn to_plan_copies_batch_rates() {
+        let table = catalog_pricing_table();
+        let gpt = table
+            .get(&pricing_key("openai", "gpt-5.5"))
+            .expect("openai:gpt-5.5 in catalog table");
+        assert_eq!(gpt.batch_input_per_million, Some(2.50));
+        assert_eq!(gpt.batch_output_per_million, Some(15.00));
+
+        let groq = table
+            .get(&pricing_key("groq", "llama-3.1-8b-instant"))
+            .expect("groq:llama-3.1-8b-instant in catalog table");
+        assert_eq!(groq.batch_input_per_million, None);
+        assert_eq!(groq.batch_output_per_million, None);
     }
 
     #[test]

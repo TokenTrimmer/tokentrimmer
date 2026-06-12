@@ -5466,6 +5466,7 @@ dependencies = [
  "percent-encoding",
  "regex",
  "reqwest 0.12.28",
+ "rustls 0.23.40",
  "rustyline",
  "sentry",
  "serde",

@@ -90,6 +90,7 @@ Notes that change behavior in practice:
 | `fallbacks`    | `[string]`  | ordered fallback model ids, tried in order when the primary dispatch fails with a fallback-eligible error (provider down / 5xx / timeout). May cross providers. Empty = no failover. |
 | `disable_cache`| `bool`      | matched requests skip L1 + L2 entirely — no lookup, no insert — for privacy/sensitive traffic that must not persist in the shared cache. Omitted when false. |
 | `max_cost_usd` | `float` USD | a hard per-request ceiling. After the rewrite, if the rerouted model's estimated cost still exceeds this, the gateway rejects the request with `402` instead of dispatching. |
+| `batch`        | `bool`      | **ADVISORY** batch-eligibility marker. The gateway dispatches synchronously today (no async Batch Lane yet): the request is served and billed normally, the request-log row is tagged batch-eligible, the **forgone** Batch-API discount (priced from the served model's real catalog batch rate — never a hardcoded 0.5×) is reported on `X-TokenTrimmer-Batch-Forgone-Usd`, and a `batch_deferred_unavailable` warning is emitted. Hard-ineligible: streaming requests and interactive clients (`X-TokenTrimmer-Interactive`, set by `tt chat` / the `/tools` loop) are cleared with `batch_ineligible:<reason>`; a served model with no catalog batch tier gets `batch_not_available:<model>` and no claim. Omitted when false. |
 
 A vision-capable target is required whenever the `when` block gates on
 `has_images` / `has_audio` (see above).
@@ -138,6 +139,7 @@ required: pass `--always <model>` (match-all) **or** `--from <m> --to <m>`
 | `--when-p95-gt <ms>`          | `when.upstream_latency_ms_p95_gt`               |
 | `--max-cost <usd>`            | `then.max_cost_usd`                              |
 | `--disable-cache`             | `then.disable_cache = true`                      |
+| `--batch`                     | `then.batch = true` — advisory batch-eligibility marker (Batch Lane forgone-savings attribution; never applied to streaming/interactive requests) |
 | `--fallback <model>`          | appended to `then.fallbacks` (repeatable)        |
 | `--priority <n>`              | `priority` (default `100`)                       |
 | `--name <name>`               | `name` (default `<from>-><target>` or `all-><target>`) |

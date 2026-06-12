@@ -205,6 +205,7 @@ async fn app_with_redact_route_and_cache_min(
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: false,
+                batch: false,
                 compress: false,
                 redact: redact_flag,
                 traffic_pct: None,

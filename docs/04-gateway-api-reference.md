@@ -523,6 +523,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Provider` | Pin the upstream provider for this request (routing still sets the model). Requires that provider's stored credential for cross-provider pins (else `400`); disables route fallbacks. Unknown provider → `400`. | Honored | `anthropic` |
 | `X-TokenTrimmer-Fallback` | Comma-separated fallback chain (bare model ids) overriding the route's chain. Unresolvable or uncredentialed entries are skipped. Ignored when `X-TokenTrimmer-Provider` is set (a pin disables failover). | Honored | `gpt-4o-mini,claude-3-5-sonnet` |
 | `X-TokenTrimmer-Timeout-Ms` | Per-request upstream timeout in ms (1–600000); `408` on expiry. Invalid/over-max values are ignored (the global 600s limit still applies). | Honored | `30000` |
+| `X-TokenTrimmer-Interactive` | Declares a human is waiting on this request (send `1` or `true`). Hard-clears the advisory batch-eligibility route action (`then.batch`) — the gateway never marks interactive traffic batch-eligible (`batch_ineligible:interactive` warning). Parsing fails interactive-safe: **any** non-empty value other than an explicit `0`/`false` opt-out is treated as interactive, so an unrecognized spelling (`yes`, `on`, …) can never be silently batch-marked. Set automatically by `tt chat` and the `/tools` loop. | Honored | `1` |
 | `traceparent` | Standard [W3C TraceContext](https://www.w3.org/TR/trace-context/) header. When present and valid, the gateway **continues your trace**: its request span becomes a child of your inbound span (same `trace_id`), so gateway cost/latency appears on your existing distributed trace. An accompanying `tracestate` is preserved. Absent/malformed → a fresh root trace. | Honored | `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01` |
 
 ### 6.2 Response headers
@@ -538,6 +539,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Baseline-Cost-Usd` | on dispatched/cached responses | `0.0218` |
 | `X-TokenTrimmer-Saved-Usd` | on dispatched/cached responses | `0.0184` |
 | `X-TokenTrimmer-Provider-Cache-Saved-Usd` | on dispatched/cached responses | `0.0009` |
+| `X-TokenTrimmer-Batch-Forgone-Usd` | on dispatched/cached responses — the **forgone** Batch-API discount for batch-eligible requests (advisory `then.batch` route action), priced from the served model's real catalog batch rate. An advisory projection for the future async Batch Lane: the request was dispatched synchronously and billed in full, so this figure is **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for all unmarked traffic. | `0.0125` |
 | `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
 | `X-TokenTrimmer-Warnings` | on dispatched responses, when the gateway altered the request | `param_dropped:frequency_penalty,param_dropped:n` |
 
@@ -570,6 +572,26 @@ Gemini, the OpenAI-compatible providers) or drop `response_format` outright
 `temperature_clamped` token is emitted when the request's `temperature` is
 clamped to the routed provider's accepted range (e.g. a `1.5` request to
 Anthropic, whose max is `1.0`).
+
+The advisory batch-eligibility route action (`then.batch`) emits its own
+tokens — honest by design, since the gateway dispatches synchronously today and
+the action never changes the bill:
+
+- `batch_deferred_unavailable` — the marker was applied: the row is tagged
+  batch-eligible and the forgone discount is reported on
+  `X-TokenTrimmer-Batch-Forgone-Usd`, but there is no async Batch Lane yet, so
+  the request was served and billed normally. Corner case: eligibility is
+  assessed on the *planned* model, while the forgone discount is priced only
+  from the *served* model's real catalog batch rate — after a failover to a
+  model with no batch tier, this token can therefore accompany a `0.000000`
+  forgone figure (intent stays auditable; no rate, no claim).
+- `batch_ineligible:streaming` — the matched route requested the marker but the
+  request streams; the gateway cleared it (a ≤24h batch window cannot serve a
+  live stream).
+- `batch_ineligible:interactive` — the marker was cleared because the client
+  declared `X-TokenTrimmer-Interactive` (a human is waiting).
+- `batch_not_available:<model>` — the served model carries no catalog batch
+  tier (possible after failover); nothing is marked and no discount is claimed.
 
 ### 6.3 Cache control semantics
 

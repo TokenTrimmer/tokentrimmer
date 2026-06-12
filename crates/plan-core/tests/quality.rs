@@ -394,6 +394,7 @@ async fn replay_with_quality_attaches_quality_field() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -406,6 +407,8 @@ async fn replay_with_quality_attaches_quality_field() {
             input_per_million: 0.25,
             output_per_million: 1.25,
             cached_input_per_million: Some(0.025),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
         },
     );
     let input = PlanInput {

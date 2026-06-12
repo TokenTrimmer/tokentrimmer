@@ -292,6 +292,7 @@ async fn app_with_flex_route(
                 disable_cache: false,
                 max_cost_usd: None,
                 flex: true,
+                batch: false,
                 compress: false,
                 redact: false,
                 traffic_pct: None,

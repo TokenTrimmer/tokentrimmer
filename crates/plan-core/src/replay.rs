@@ -92,6 +92,8 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         aggregates.requests_unprice_able,
         projection.latency_unprojected,
         projection.would_block,
+        projection.batch_deferred,
+        projection.batch_unpriced,
     );
     caveats.extend(wide_ci_caveats(&aggregates, &confidence_intervals));
 
@@ -202,6 +204,22 @@ struct Projection {
     /// Requests a matched route's `max_cost_usd` ceiling would reject at runtime
     /// — projected unchanged (no fabricated savings) and surfaced as a caveat.
     would_block: u32,
+    /// Requests projected at the target's Batch API rate because the matched
+    /// route carries the `batch` action AND the target has a catalog batch
+    /// rate AND that rate actually lowers the projection (heavy provider-cache
+    /// traffic can be cheaper at the cache-discounted standard rate — those
+    /// requests keep the standard figure and are not counted). Surfaced ONLY
+    /// as a caveat string (#21 over-ceiling precedent — no new serialized
+    /// field): the discount is ADVISORY today, the synchronous gateway defers
+    /// it until the async Batch Lane ships. Known over-projection: `RequestLog`
+    /// carries no streamed/interactive marker, so this projection cannot
+    /// exclude traffic the runtime gate would hard-clear as batch-ineligible —
+    /// the caveat wording discloses that.
+    batch_deferred: u32,
+    /// Requests matched by a `batch` route whose target has NO catalog batch
+    /// rate — projected at the standard target cost (no fabricated 0.5×) and
+    /// surfaced as a caveat.
+    batch_unpriced: u32,
 }
 
 fn project_requests(
@@ -221,6 +239,8 @@ fn project_requests(
     let mut requests_unprice_able: u32 = 0;
     let mut latency_unprojected: u32 = 0;
     let mut would_block: u32 = 0;
+    let mut batch_deferred: u32 = 0;
+    let mut batch_unpriced: u32 = 0;
 
     // Median latency per model across the window — used to project a rerouted
     // request's latency from its TARGET model's history rather than echoing the
@@ -279,15 +299,42 @@ fn project_requests(
                     // Per-request ceiling: a projected cost over max_cost_usd would
                     // be rejected at runtime — count it unchanged (never a saving)
                     // and surface a caveat. Cache hits are served for free and are
-                    // never blocked.
-                    if !is_cache_hit
+                    // never blocked. Evaluated on the STANDARD projected cost —
+                    // the runtime ceiling check prices the synchronous dispatch,
+                    // never a batch discount that is not realized today.
+                    let blocked = !is_cache_hit
                         && route
                             .then
                             .max_cost_usd
-                            .is_some_and(|c| projected.cost_usd > c)
-                    {
+                            .is_some_and(|c| projected.cost_usd > c);
+                    if blocked {
                         projected_cost = req.cost_usd;
                         would_block += 1;
+                    }
+                    // Batch-eligibility action (research Phase 2.1): project the
+                    // Batch-API discount the marker would deliver — at the
+                    // target's REAL catalog batch rate, never a fabricated 0.5×
+                    // — and count it for the advisory caveat (#21 over-ceiling
+                    // precedent: caveat string only, no new serialized field).
+                    // A blocked or cache-hit request gets no batch discount, and
+                    // the counter only increments when the batch rate actually
+                    // LOWERS the projection: heavy provider-cache traffic can
+                    // price cheaper at the cache-discounted standard rate than
+                    // at the full-prompt batch rate, in which case the standard
+                    // figure stands and the request is not claimed as
+                    // batch-discounted (no negative "savings", no inflated
+                    // caveat count).
+                    if route.then.batch && !is_cache_hit && !blocked {
+                        match cost::project_batch_cost(req, p) {
+                            Some(b) if b.cost_usd < projected_cost => {
+                                projected_cost = b.cost_usd;
+                                batch_deferred += 1;
+                            }
+                            Some(_) => {} // batch rate delivers no discount — standard figure stands
+                            None => {
+                                batch_unpriced += 1;
+                            }
+                        }
                     }
                     per_request_projected.push(projected_cost);
                     // Project latency from the target model's window history;
@@ -338,6 +385,8 @@ fn project_requests(
         requests_unprice_able,
         latency_unprojected,
         would_block,
+        batch_deferred,
+        batch_unpriced,
     }
 }
 
@@ -503,6 +552,8 @@ fn build_caveats(
     requests_unprice_able: u32,
     latency_unprojected: u32,
     would_block: u32,
+    batch_deferred: u32,
+    batch_unpriced: u32,
 ) -> Vec<String> {
     let mut caveats = Vec::new();
     if sample_size < 1000 {
@@ -523,6 +574,16 @@ fn build_caveats(
     if would_block > 0 {
         caveats.push(format!(
             "{would_block} request(s) would be rejected by a max_cost_usd ceiling — counted unchanged, not as savings."
+        ));
+    }
+    if batch_deferred > 0 {
+        caveats.push(format!(
+            "{batch_deferred} request(s) projected at the target's Batch API rate via a batch-eligibility route — advisory today: the synchronous gateway defers this discount until the async Batch Lane ships, and logs carry no streamed/interactive marker, so this count can include traffic the runtime gate would clear as batch-ineligible."
+        ));
+    }
+    if batch_unpriced > 0 {
+        caveats.push(format!(
+            "{batch_unpriced} request(s) matched a batch-eligibility route whose target has no catalog batch rate — no batch discount projected."
         ));
     }
     caveats

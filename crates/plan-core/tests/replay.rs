@@ -64,6 +64,8 @@ fn pricing_with(provider: &str, model: &str, input: f64, output: f64) -> (String
             input_per_million: input,
             output_per_million: output,
             cached_input_per_million: Some(input * 0.1),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
         },
     )
 }
@@ -209,6 +211,7 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -242,6 +245,7 @@ fn conservative_when_pricing_missing() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -279,6 +283,7 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -313,6 +318,7 @@ fn cross_provider_target_absent_is_conservative() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -346,6 +352,7 @@ fn route_over_ceiling_is_blocked_not_saved() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: Some(0.01), // haiku on 1M/1M tokens still far exceeds $0.01
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -359,6 +366,204 @@ fn route_over_ceiling_is_blocked_not_saved() {
     // Blocked → projected unchanged (no savings), and a caveat names it.
     assert_eq!(result.aggregates.projected_savings_usd, 0.0);
     assert!(result.caveats.iter().any(|c| c.contains("rejected")));
+}
+
+/// Build a `batch: true` route from `model_in` → `target` (no other actions).
+fn batch_route(target: &str, model_in: &str) -> ProposedRoute {
+    ProposedRoute {
+        id: det_uuid(100),
+        name: "batch-lane".into(),
+        priority: 100,
+        enabled: true,
+        when: RouteConditions {
+            model_in: vec![model_in.into()],
+            ..Default::default()
+        },
+        then: RouteAction {
+            target_model: target.into(),
+            fallbacks: Vec::new(),
+            disable_cache: false,
+            max_cost_usd: None,
+            batch: true,
+            redact: false,
+            traffic_pct: None,
+            shadow_model: None,
+        },
+    }
+}
+
+/// A `batch: true` route whose target carries catalog batch rates projects the
+/// per-request cost at the BATCH rate (the discount the Batch Lane would
+/// deliver), folds the delta into projected savings, and surfaces the advisory
+/// caveat with the affected-request count — the EXACT honest wording.
+#[test]
+fn batch_route_projects_discount_and_caveats() {
+    // 1000 in / 100 out on sonnet, baseline $0.0045. Target haiku:
+    //   standard = 1000×$0.25/M + 100×$1.25/M = 0.00025 + 0.000125 = 0.000375
+    //   batch    = 1000×$0.125/M + 100×$0.625/M = 0.000125 + 0.0000625 = 0.0001875
+    let req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    let route = batch_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    let mut pricing = HashMap::new();
+    let (k, mut v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    v.batch_input_per_million = Some(0.125);
+    v.batch_output_per_million = Some(0.625);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    assert_eq!(result.aggregates.requests_rerouted, 1);
+    let batch_cost = 1000.0 * 0.125 / 1e6 + 100.0 * 0.625 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - batch_cost).abs() < 1e-12,
+        "projected ({}) must be the batch-rate cost ({batch_cost})",
+        result.aggregates.total_projected_cost_usd
+    );
+    assert!(
+        (result.aggregates.projected_savings_usd - (0.0045 - batch_cost)).abs() < 1e-12,
+        "savings must include the batch delta"
+    );
+    let expected_caveat = "1 request(s) projected at the target's Batch API rate via a \
+                           batch-eligibility route — advisory today: the synchronous gateway \
+                           defers this discount until the async Batch Lane ships, and logs \
+                           carry no streamed/interactive marker, so this count can include \
+                           traffic the runtime gate would clear as batch-ineligible.";
+    assert!(
+        result.caveats.iter().any(|c| c == expected_caveat),
+        "expected the advisory batch caveat, got: {:?}",
+        result.caveats
+    );
+}
+
+/// A `batch: true` route whose target has NO catalog batch rate projects the
+/// STANDARD target cost (no fabricated 0.5×) and surfaces the unpriced caveat.
+#[test]
+fn batch_route_without_rate_projects_standard_with_unpriced_caveat() {
+    let req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    let route = batch_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    let mut pricing = HashMap::new();
+    let (k, v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    // pricing_with carries no batch rates — the target is batch-unpriced.
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    let standard_cost = 1000.0 * 0.25 / 1e6 + 100.0 * 1.25 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - standard_cost).abs() < 1e-12,
+        "projected ({}) must be the STANDARD target cost ({standard_cost})",
+        result.aggregates.total_projected_cost_usd
+    );
+    assert!(
+        result.caveats.iter().any(|c| c
+            == "1 request(s) matched a batch-eligibility route whose target has no catalog \
+                batch rate — no batch discount projected."),
+        "expected the unpriced batch caveat, got: {:?}",
+        result.caveats
+    );
+}
+
+/// When the cache-discounted STANDARD projection is already cheaper than the
+/// full-prompt batch-rate cost (heavy provider-cache traffic: cached input is
+/// priced ~0.1×, while the batch rate prices the FULL prompt), the standard
+/// figure stands AND the batch-deferred counter does not increment — the
+/// caveat must never claim a request was projected at the batch rate when it
+/// was not.
+#[test]
+fn batch_route_with_cheaper_standard_projection_skips_counter() {
+    // 1M input fully provider-cached, 0 output. Target haiku:
+    //   standard = 1M × $0.025/M (cached rate)  = $0.025
+    //   batch    = 1M × $0.125/M (full prompt)  = $0.125  → no discount
+    let req = RequestLog {
+        cached_tokens: 1_000_000,
+        ..make_req(1, 0, "claude-3-5-sonnet", 1_000_000, 0, 3.0, false)
+    };
+    let route = batch_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    let mut pricing = HashMap::new();
+    let (k, mut v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    v.batch_input_per_million = Some(0.125);
+    v.batch_output_per_million = Some(0.625);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    assert_eq!(result.aggregates.requests_rerouted, 1);
+    let standard_cached_cost = 1_000_000.0 * 0.025 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - standard_cached_cost).abs() < 1e-12,
+        "projected ({}) must keep the cheaper cache-discounted standard cost ({standard_cached_cost})",
+        result.aggregates.total_projected_cost_usd
+    );
+    assert!(
+        !result.caveats.iter().any(|c| c.contains("Batch API rate")),
+        "a request the batch rate did not discount must not be counted in the batch caveat: {:?}",
+        result.caveats
+    );
+}
+
+/// The `max_cost_usd` ceiling is evaluated on the STANDARD projected cost
+/// (runtime dispatches synchronously — the unrealized batch discount can't
+/// rescue an over-ceiling request): a blocked request is counted unchanged
+/// with the would-block caveat and NO batch discount; a projected cache hit
+/// stays 0-projected with no batch counter increment.
+#[test]
+fn batch_respects_max_cost_ceiling() {
+    // Standard haiku cost on 1M/1M tokens = $1.50, over the $0.01 ceiling —
+    // even though the batch-rate cost ($0.75) would also exceed it, the point
+    // is the ceiling fires FIRST, on the standard figure.
+    let req = make_req(1, 0, "claude-3-5-sonnet", 1_000_000, 1_000_000, 18.0, false);
+    let mut route = batch_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    route.then.max_cost_usd = Some(0.01);
+    let mut pricing = HashMap::new();
+    let (k, mut v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    v.batch_input_per_million = Some(0.125);
+    v.batch_output_per_million = Some(0.625);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    // Blocked → projected unchanged (no savings), would-block caveat, and NO
+    // batch caveat (the discount must not be projected on a blocked request).
+    assert_eq!(result.aggregates.projected_savings_usd, 0.0);
+    assert!(result.caveats.iter().any(|c| c.contains("rejected")));
+    assert!(
+        !result.caveats.iter().any(|c| c.contains("Batch API rate")),
+        "a blocked request must not project a batch discount: {:?}",
+        result.caveats
+    );
+}
+
+/// A projected L1 cache hit on a batch route serves for free (projected 0)
+/// and does NOT increment the batch counter — only the live-dispatch request
+/// is counted in the advisory caveat.
+#[test]
+fn batch_cache_hit_stays_zero_projected_without_counter() {
+    // Two identical requests 10s apart with a 1h L1 TTL: the second projects
+    // as a cache hit. Both match the batch route.
+    let r1 = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    let r2 = make_req(2, 10, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    let route = batch_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    let mut pricing = HashMap::new();
+    let (k, mut v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    v.batch_input_per_million = Some(0.125);
+    v.batch_output_per_million = Some(0.625);
+    pricing.insert(k, v);
+
+    let mut input = input_with_routes(vec![r1, r2], vec![route], pricing, 100);
+    input.config.l1_ttl_seconds = Some(3600);
+    let result = replay(input).unwrap();
+
+    // Projected total = ONE batch-rate dispatch + one free cache hit.
+    let batch_cost = 1000.0 * 0.125 / 1e6 + 100.0 * 0.625 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - batch_cost).abs() < 1e-12,
+        "cache hit must project 0; got total {}",
+        result.aggregates.total_projected_cost_usd
+    );
+    // The caveat counts exactly 1 batch-deferred request — not the cache hit.
+    assert!(
+        result
+            .caveats
+            .iter()
+            .any(|c| c.starts_with("1 request(s) projected at the target's Batch API rate")),
+        "cache hits must not increment the batch counter: {:?}",
+        result.caveats
+    );
 }
 
 #[test]
@@ -401,6 +606,7 @@ fn rerouted_latency_projected_from_target_model_history() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -433,6 +639,8 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             input_per_million: 3.0,
             output_per_million: 15.0,
             cached_input_per_million: Some(0.3),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
         };
         let req_template = RequestLog {
             id: det_uuid(u128::from(i) + 1),
@@ -480,6 +688,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -600,6 +809,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -619,6 +829,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            batch: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
