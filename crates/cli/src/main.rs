@@ -740,15 +740,15 @@ async fn main() -> anyhow::Result<()> {
             tt_api_key,
             tt_api_base,
         } => {
-            tt_cli::chat::run(
+            tt_cli::chat::run(tt_cli::chat::RunOpts {
                 model,
                 system,
                 resume,
                 tools,
                 max_context,
-                tt_api_key,
-                tt_api_base,
-            )
+                flag_key: tt_api_key,
+                flag_base: tt_api_base,
+            })
             .await?;
         }
         Command::Models {

@@ -93,6 +93,41 @@ pub fn estimate_conversation_tokens(conv: &Conversation, provider: &str) -> u32 
     tt_tokenize::estimate_tokens(provider, &conversation_text(conv))
 }
 
+/// The start of the second turn: the index of the next `User` message after
+/// index 0, or `None` when only one turn remains. This is the single source of
+/// truth for turn boundaries — both the trimmer ([`trim_to_budget`]) and the
+/// compactor fold on these exact boundaries, so neither can orphan an
+/// `Assistant{tool_calls}` + `Tool` pair (a turn is a `User` message and
+/// everything up to, but not including, the next `User`).
+#[must_use]
+pub(crate) fn next_turn_start(messages: &[Message]) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, m)| matches!(m, Message::User { .. }))
+        .map(|(i, _)| i)
+}
+
+/// Indices where each whole turn starts (index 0 is always the first turn's
+/// start). Built on [`next_turn_start`] so the boundary definition cannot
+/// drift between the trimmer and the compactor.
+#[must_use]
+#[cfg_attr(not(test), allow(dead_code))] // consumed by chat::compact (next commit)
+pub(crate) fn turn_starts(messages: &[Message]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    if messages.is_empty() {
+        return starts;
+    }
+    starts.push(0);
+    let mut base = 0;
+    while let Some(next) = next_turn_start(&messages[base..]) {
+        base += next;
+        starts.push(base);
+    }
+    starts
+}
+
 /// Drop the oldest whole turns until the estimate is `<= target`, or only the
 /// most recent turn remains. A "turn" is a `User` message and everything up to
 /// (but not including) the next `User`, so removing whole turns keeps the system
@@ -103,15 +138,7 @@ pub fn estimate_conversation_tokens(conv: &Conversation, provider: &str) -> u32 
 pub fn trim_to_budget(conv: &mut Conversation, target: u32, provider: &str) -> usize {
     let original = conv.messages.len();
     while estimate_conversation_tokens(conv, provider) > target {
-        // The start of the second turn = the next `User` after index 0.
-        let next_turn = conv
-            .messages
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, m)| matches!(m, Message::User { .. }))
-            .map(|(i, _)| i);
-        match next_turn {
+        match next_turn_start(&conv.messages) {
             // Drop the first whole turn.
             Some(idx) => {
                 conv.messages.drain(0..idx);
@@ -327,6 +354,37 @@ mod tests {
             c.messages.first(),
             Some(Message::Assistant { tool_calls, .. }) if !tool_calls.is_empty()
         ));
+    }
+
+    #[test]
+    fn turn_starts_walks_user_boundaries() {
+        use tt_shared::messages::{ToolCall, ToolCallFunction};
+        let mut c = Conversation::new("m".into(), None);
+        assert!(turn_starts(&c.messages).is_empty());
+        c.push_user("q0".into()); // 0
+        c.messages.push(Message::Assistant {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: ToolCallFunction {
+                    name: "find_route_for".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+            name: None,
+        }); // 1 — same turn as 0
+        c.messages.push(Message::Tool {
+            content: MessageContent::Text("{}".into()),
+            tool_call_id: "c1".into(),
+        }); // 2 — same turn
+        c.push_assistant("a0".into()); // 3 — same turn
+        c.push_user("q1".into()); // 4 — new turn
+        c.push_assistant("a1".into()); // 5
+        c.push_user("q2".into()); // 6 — new turn
+        assert_eq!(turn_starts(&c.messages), vec![0, 4, 6]);
+        // and next_turn_start matches the second entry (shared boundary logic)
+        assert_eq!(next_turn_start(&c.messages), Some(4));
     }
 
     #[test]
