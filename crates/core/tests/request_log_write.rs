@@ -81,6 +81,7 @@ impl Provider for TestProvider {
                 total_tokens: 180,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -98,6 +99,171 @@ impl Provider for TestProvider {
     ) -> Result<EmbeddingsResponse, ProviderError> {
         Err(ProviderError::Unsupported("n/a".into()))
     }
+}
+
+/// Like [`TestProvider`] but returns a caller-supplied usage block, so tests
+/// can drive provider-cache telemetry through the dispatch path.
+struct UsageProvider {
+    usage: Usage,
+}
+
+#[async_trait]
+impl Provider for UsageProvider {
+    fn id(&self) -> &'static str {
+        "test-provider"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: "test-1".into(),
+            provider: "test-provider".into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 4096,
+            max_output_tokens: 4096,
+        }]
+    }
+    fn pricing(&self, _: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 6.0,
+            cached_input_per_million: Some(0.3),
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("hello back".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: self.usage.clone(),
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("n/a".into()))
+    }
+}
+
+/// Dispatch one non-streaming chat completion through a [`UsageProvider`]
+/// returning `usage`, and return the single request_logs row it wrote.
+async fn dispatch_with_usage(usage: Usage) -> tt_telemetry::request_logs::RequestLogRow {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(UsageProvider { usage }));
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let state = AppState::new(registry).with_request_log_writer(writer.clone());
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "test-1",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false,
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    for _ in 0..20 {
+        if !writer.rows().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1, "expected exactly one telemetry row");
+    rows[0].clone()
+}
+
+/// A provider that reports raw cache read/write counts must have them
+/// persisted verbatim on the request_logs row (research Phase 0.2).
+#[tokio::test]
+async fn chat_miss_logs_provider_cache_token_counts() {
+    let row = dispatch_with_usage(Usage {
+        prompt_tokens: 120,
+        completion_tokens: 60,
+        total_tokens: 180,
+        cached_tokens: 80,
+        cache_creation_input_tokens: Some(20),
+        cache_read_input_tokens: Some(80),
+    })
+    .await;
+    assert_eq!(row.cache_read_input_tokens, Some(80));
+    assert_eq!(row.cache_creation_input_tokens, Some(20));
+    // The folded column keeps its legacy semantics alongside.
+    assert_eq!(row.cached_tokens, 80);
+}
+
+/// A provider that does NOT report cache fields logs NULL (None) — never a
+/// fabricated zero — so "didn't report" stays distinguishable from
+/// "reported zero".
+#[tokio::test]
+async fn chat_miss_without_provider_cache_report_logs_null() {
+    let row = dispatch_with_usage(Usage {
+        prompt_tokens: 120,
+        completion_tokens: 60,
+        total_tokens: 180,
+        cached_tokens: 0,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    })
+    .await;
+    assert_eq!(row.cache_read_input_tokens, None, "absent must be NULL");
+    assert_eq!(row.cache_creation_input_tokens, None);
+}
+
+/// A provider that explicitly reports zero cache reads logs Some(0) — the
+/// NULL-vs-0 distinction this lane exists for.
+#[tokio::test]
+async fn provider_reported_zero_logs_zero_not_null() {
+    let row = dispatch_with_usage(Usage {
+        prompt_tokens: 120,
+        completion_tokens: 60,
+        total_tokens: 180,
+        cached_tokens: 0,
+        cache_creation_input_tokens: Some(0),
+        cache_read_input_tokens: Some(0),
+    })
+    .await;
+    assert_eq!(
+        row.cache_read_input_tokens,
+        Some(0),
+        "reported zero must be Some(0), not NULL"
+    );
+    assert_eq!(row.cache_creation_input_tokens, Some(0));
 }
 
 #[tokio::test]
@@ -237,6 +403,10 @@ async fn l1_hit_writes_request_log_with_cache_layer_l1() {
     );
     assert_eq!(hit.model, "test-1");
     assert_eq!(hit.status, 200);
+    // TT cache hit = no provider call at serve time → provider-cache token
+    // columns are NULL (the original miss row carries the telemetry).
+    assert_eq!(hit.cache_read_input_tokens, None);
+    assert_eq!(hit.cache_creation_input_tokens, None);
 }
 
 #[tokio::test]

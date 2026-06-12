@@ -244,8 +244,16 @@ struct RawChunk {
     model: String,
     #[serde(default)]
     choices: Vec<RawChoice>,
+    /// Streaming usage block — reuses [`crate::translate::OpenAiUsage`]
+    /// (lenient `prompt_tokens_details` + canonical-field passthrough) so the
+    /// streaming and non-streaming paths can never drift apart again.
+    /// OpenAI-wire providers report cache reads as
+    /// `prompt_tokens_details.cached_tokens`; deserializing chunk usage
+    /// directly into the canonical [`Usage`] (which has no such field)
+    /// silently dropped them, so streamed cached prompts were priced at the
+    /// full input rate and `provider_cache_saved_usd` was zeroed.
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<crate::translate::OpenAiUsage>,
     /// Unknown / newer top-level chunk fields preserved for round-trip passthrough.
     #[serde(flatten, default)]
     extra: std::collections::HashMap<String, serde_json::Value>,
@@ -321,7 +329,7 @@ impl RawChunk {
                     extra: c.extra,
                 })
                 .collect(),
-            usage: self.usage,
+            usage: self.usage.map(Usage::from),
             extra: self.extra,
         }
     }
@@ -518,13 +526,16 @@ fn handle_raw_chunk(acc: &mut ToolAccum, raw: RawChunk) -> Vec<ChatCompletionChu
         }
         acc.merge(&raw);
         if finish_reason.is_some() {
-            out.extend(acc.drain(finish_reason, raw.usage));
+            out.extend(acc.drain(finish_reason, raw.usage.map(Usage::from)));
         }
         return out;
     }
     // A finish_reason may arrive on a separate chunk after the fragments.
     if finish_reason.is_some() && !acc.is_empty() {
-        return acc.drain(finish_reason, raw.usage).into_iter().collect();
+        return acc
+            .drain(finish_reason, raw.usage.map(Usage::from))
+            .into_iter()
+            .collect();
     }
     vec![raw.into_canonical()]
 }
@@ -928,6 +939,155 @@ mod tests {
         assert_eq!(out[0].choices[0].delta.tool_calls[0].id, "call_0");
         assert_eq!(out[0].choices[1].index, 1);
         assert_eq!(out[0].choices[1].delta.tool_calls[0].id, "call_1");
+    }
+
+    // --- KEYSTONE: streamed provider cache reads must not be silently lost ---
+
+    /// OpenAI-wire STREAMING usage chunks report cache reads as
+    /// `prompt_tokens_details.cached_tokens` — the canonical `Usage` has no
+    /// such field, so deserializing chunk usage directly into `Usage` silently
+    /// dropped them (cached_tokens=0, raw None): streamed cached prompts were
+    /// priced at the full input rate and provider_cache_saved_usd was zeroed.
+    #[test]
+    fn streaming_usage_chunk_preserves_prompt_tokens_details_cached_tokens() {
+        let chunk_json = r#"{"id":"c9","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+        let event = format!("data: {chunk_json}\n\n");
+        let mut acc = ToolAccum::default();
+        let mut canonical = Vec::new();
+        for ev in parse_sse_event(event.as_bytes()) {
+            if let SseEvent::Chunk(raw) = ev {
+                canonical.extend(handle_raw_chunk(&mut acc, raw));
+            } else {
+                panic!("usage chunk must parse, got {ev:?}");
+            }
+        }
+        assert_eq!(canonical.len(), 1);
+        let usage = canonical[0].usage.as_ref().expect("usage present");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(
+            usage.cached_tokens, 80,
+            "streamed prompt_tokens_details.cached_tokens must fold into cached_tokens"
+        );
+        assert_eq!(
+            usage.cache_read_input_tokens,
+            Some(80),
+            "raw cache-read Option must be preserved for telemetry"
+        );
+    }
+
+    /// Already-canonical usage shapes (e.g. our own fake-stream or another
+    /// TokenTrimmer hop) keep working: top-level cached_tokens / cache fields
+    /// pass through unchanged.
+    #[test]
+    fn streaming_usage_chunk_passes_through_canonical_cache_fields() {
+        let chunk_json = r#"{"id":"c9","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"cached_tokens":40,"cache_read_input_tokens":40,"cache_creation_input_tokens":20}}"#;
+        let event = format!("data: {chunk_json}\n\n");
+        let mut acc = ToolAccum::default();
+        let mut canonical = Vec::new();
+        for ev in parse_sse_event(event.as_bytes()) {
+            if let SseEvent::Chunk(raw) = ev {
+                canonical.extend(handle_raw_chunk(&mut acc, raw));
+            }
+        }
+        let usage = canonical[0].usage.as_ref().expect("usage present");
+        assert_eq!(usage.cached_tokens, 40);
+        assert_eq!(usage.cache_read_input_tokens, Some(40));
+        assert_eq!(usage.cache_creation_input_tokens, Some(20));
+    }
+
+    /// A streamed usage block with NO cache report keeps raw None (NULL in
+    /// telemetry), distinct from a reported zero.
+    #[test]
+    fn streaming_usage_chunk_without_cache_report_keeps_raw_none() {
+        let chunk_json = r#"{"id":"c9","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}}"#;
+        let event = format!("data: {chunk_json}\n\n");
+        let mut acc = ToolAccum::default();
+        let mut canonical = Vec::new();
+        for ev in parse_sse_event(event.as_bytes()) {
+            if let SseEvent::Chunk(raw) = ev {
+                canonical.extend(handle_raw_chunk(&mut acc, raw));
+            }
+        }
+        let usage = canonical[0].usage.as_ref().expect("usage present");
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    /// A details object with an explicit `"cached_tokens": null` (or carrying
+    /// only other keys like audio_tokens) must NOT error the chunk parse —
+    /// the terminal usage frame still reaches the client, and the raw
+    /// cache-read stays None ("unreported"), not a fabricated Some(0).
+    #[test]
+    fn streaming_usage_chunk_with_null_or_missing_cached_tokens_is_lenient_none() {
+        for details in [r#"{"cached_tokens":null}"#, r#"{"audio_tokens":5}"#] {
+            assert_lenient_unreported(details);
+        }
+    }
+
+    /// A MALFORMED `prompt_tokens_details` (non-object value, or a
+    /// non-integer `cached_tokens` such as a string or fractional float from
+    /// a nonconforming compat shim) must not fail the chunk parse either — a
+    /// usage-block oddity must never inject an error frame into an
+    /// otherwise-healthy stream or lose the terminal usage. It degrades to
+    /// "unreported" (fold 0, raw None).
+    #[test]
+    fn streaming_usage_chunk_with_malformed_details_is_lenient_unreported() {
+        for details in [
+            r#""bogus""#,
+            "42",
+            "[1,2]",
+            r#"{"cached_tokens":"80"}"#,
+            r#"{"cached_tokens":80.5}"#,
+        ] {
+            assert_lenient_unreported(details);
+        }
+    }
+
+    /// Parse one usage chunk whose `prompt_tokens_details` is the given raw
+    /// JSON snippet; assert it parses as a Chunk (never an error frame) and
+    /// the cache read degrades to "unreported".
+    fn assert_lenient_unreported(details: &str) {
+        let chunk_json = format!(
+            r#"{{"id":"c9","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[],"usage":{{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{details}}}}}"#
+        );
+        let event = format!("data: {chunk_json}\n\n");
+        let mut acc = ToolAccum::default();
+        let mut canonical = Vec::new();
+        for ev in parse_sse_event(event.as_bytes()) {
+            if let SseEvent::Chunk(raw) = ev {
+                canonical.extend(handle_raw_chunk(&mut acc, raw));
+            } else {
+                panic!("usage chunk with details {details} must parse, got {ev:?}");
+            }
+        }
+        let usage = canonical[0].usage.as_ref().expect("usage present");
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    /// Usage riding on the tool-call drain path (finish chunk carries both the
+    /// final tool fragment/finish_reason AND the usage block) also preserves
+    /// the cache-read details.
+    #[test]
+    fn tool_call_drain_preserves_cached_tokens_from_usage() {
+        let mut acc = ToolAccum::default();
+        handle_raw_chunk(
+            &mut acc,
+            raw_chunk(vec![frag(0, Some("call_1"), Some("f"), "{}")], None),
+        );
+        let data = r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+        let event = format!("data: {data}\n\n");
+        let mut out = Vec::new();
+        for ev in parse_sse_event(event.as_bytes()) {
+            if let SseEvent::Chunk(raw) = ev {
+                out.extend(handle_raw_chunk(&mut acc, raw));
+            }
+        }
+        assert_eq!(out.len(), 1);
+        let usage = out[0].usage.as_ref().expect("usage rides the drain chunk");
+        assert_eq!(usage.cached_tokens, 80);
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
     }
 
     #[test]

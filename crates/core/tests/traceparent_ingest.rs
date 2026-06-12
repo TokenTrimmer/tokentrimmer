@@ -95,6 +95,7 @@ impl Provider for TraceMock {
                 total_tokens: 2,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }

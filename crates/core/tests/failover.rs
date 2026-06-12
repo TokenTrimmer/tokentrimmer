@@ -40,6 +40,9 @@ struct MockProvider {
     /// `true` → always 503 (fallback-eligible); `false` → 200.
     fails: bool,
     calls: Arc<AtomicUsize>,
+    /// Usage override for the 200 response; `None` → a plain 10/5/15 block
+    /// with no provider-cache report.
+    usage: Option<Usage>,
 }
 
 #[async_trait]
@@ -99,13 +102,14 @@ impl Provider for MockProvider {
                 },
                 finish_reason: Some("stop".into()),
             }],
-            usage: Usage {
+            usage: self.usage.clone().unwrap_or(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
-            },
+                cache_read_input_tokens: None,
+            }),
         })
     }
     async fn chat_completion_stream(
@@ -183,12 +187,14 @@ async fn fails_over_to_fallback_when_primary_returns_503() {
         models: &["gpt-4o", "primary-model"],
         fails: true,
         calls: Arc::clone(&primary_calls),
+        usage: None,
     }));
     registry.register(Arc::new(MockProvider {
         id: "fallback",
         models: &["fallback-model"],
         fails: false,
         calls: Arc::clone(&fallback_calls),
+        usage: None,
     }));
 
     let state = AppState::new(registry)
@@ -235,12 +241,14 @@ async fn uses_primary_and_skips_fallback_when_primary_healthy() {
         models: &["gpt-4o", "primary-model"],
         fails: false,
         calls: Arc::clone(&primary_calls),
+        usage: None,
     }));
     registry.register(Arc::new(MockProvider {
         id: "fallback",
         models: &["fallback-model"],
         fails: false,
         calls: Arc::clone(&fallback_calls),
+        usage: None,
     }));
 
     let state = AppState::new(registry)
@@ -267,4 +275,74 @@ async fn uses_primary_and_skips_fallback_when_primary_healthy() {
             .and_then(|v| v.to_str().ok()),
         Some("primary-model"),
     );
+}
+
+/// A request served by a FALLBACK provider must log THAT provider's raw
+/// prompt-cache token counts (research Phase 0.2): failover rebinds the
+/// served provider before the single request_logs write site, so the
+/// winning provider's usage — not the failed primary's — populates
+/// `cache_read_input_tokens` / `cache_creation_input_tokens`.
+#[tokio::test]
+async fn failover_logs_fallback_providers_cache_token_counts() {
+    use tt_telemetry::request_logs::InMemoryRequestLogWriter;
+
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockProvider {
+        id: "primary",
+        models: &["gpt-4o", "primary-model"],
+        fails: true,
+        calls: Arc::clone(&primary_calls),
+        usage: None,
+    }));
+    registry.register(Arc::new(MockProvider {
+        id: "fallback",
+        models: &["fallback-model"],
+        fails: false,
+        calls: Arc::clone(&fallback_calls),
+        usage: Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_tokens: 8,
+            cache_creation_input_tokens: Some(2),
+            cache_read_input_tokens: Some(8),
+        }),
+    }));
+
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let state = AppState::new(registry)
+        .with_routing_store(failover_routing_store())
+        .with_dogfood_enabled()
+        .with_request_log_writer(writer.clone());
+    let app = build_router(state);
+
+    let resp = app.oneshot(short_request()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "fallback should serve a 200");
+    assert_eq!(fallback_calls.load(Ordering::Relaxed), 1);
+
+    // Telemetry write is fire-and-forget — give the spawned task a beat.
+    for _ in 0..20 {
+        if !writer.rows().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1, "expected exactly one telemetry row");
+    let row = &rows[0];
+    assert_eq!(
+        row.provider, "fallback",
+        "row must carry the provider that actually served"
+    );
+    assert_eq!(row.model, "fallback-model");
+    assert_eq!(
+        row.cache_read_input_tokens,
+        Some(8),
+        "fallback provider's raw cache reads must be persisted"
+    );
+    assert_eq!(row.cache_creation_input_tokens, Some(2));
+    assert_eq!(row.cached_tokens, 8);
 }

@@ -570,6 +570,7 @@ async fn positive_cache_unaffected_by_negative_cache_logic() {
                     total_tokens: 15,
                     cached_tokens: 0,
                     cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 },
             })
         }

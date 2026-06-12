@@ -68,3 +68,84 @@ pub fn record_provider_timeout(provider: &'static str, operation: &'static str) 
     )
     .increment(1);
 }
+
+/// Record provider prompt-cache usage counters once authoritative provider
+/// usage lands (research Phase 0.2). `route` is the matched route NAME
+/// (bounded cardinality), `"none"` when no route matched.
+///
+/// Emits:
+/// - `provider_cache_read_tokens_total{provider,route}` += read when reported,
+/// - `provider_cache_write_tokens_total{provider,route}` += write when reported,
+/// - `provider_cache_requests_total{provider,route,result}` += 1, where
+///   `result` is `"hit"` (reported read > 0), `"miss"` (reported read == 0, or
+///   read absent but a NONZERO write was reported — the provider clearly
+///   supports caching and read nothing), or `"unreported"` (neither field
+///   reported, or only a zero write — a reported write of 0 with no read
+///   field is too weak to assert a miss, so it must not deflate the route's
+///   hit rate).
+///
+/// Owned-String labels follow the `catalog_zero_price_total` precedent.
+pub fn record_provider_cache_usage(
+    provider: &str,
+    route: Option<&str>,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+) {
+    let provider = provider.to_string();
+    let route = route.unwrap_or("none").to_string();
+    if let Some(read) = cache_read {
+        metrics::counter!(
+            "provider_cache_read_tokens_total",
+            "provider" => provider.clone(),
+            "route" => route.clone(),
+        )
+        .increment(read);
+    }
+    if let Some(write) = cache_creation {
+        metrics::counter!(
+            "provider_cache_write_tokens_total",
+            "provider" => provider.clone(),
+            "route" => route.clone(),
+        )
+        .increment(write);
+    }
+    metrics::counter!(
+        "provider_cache_requests_total",
+        "provider" => provider,
+        "route" => route,
+        "result" => cache_result(cache_read, cache_creation),
+    )
+    .increment(1);
+}
+
+/// Classify a request's provider prompt-cache outcome for the
+/// `provider_cache_requests_total{result}` label. See
+/// [`record_provider_cache_usage`] for the semantics.
+fn cache_result(cache_read: Option<u64>, cache_creation: Option<u64>) -> &'static str {
+    match (cache_read, cache_creation) {
+        (Some(r), _) if r > 0 => "hit",
+        (Some(_), _) => "miss",
+        (None, Some(w)) if w > 0 => "miss",
+        _ => "unreported",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_result;
+
+    /// Pins the `result` label semantics the cloud dashboard's hit-rate
+    /// denominator depends on. In particular: a reported write of ZERO with
+    /// no read field is "unreported", not "miss" — weak evidence must not
+    /// deflate a route's hit rate.
+    #[test]
+    fn cache_result_classification() {
+        assert_eq!(cache_result(Some(80), Some(20)), "hit");
+        assert_eq!(cache_result(Some(80), None), "hit");
+        assert_eq!(cache_result(Some(0), Some(20)), "miss");
+        assert_eq!(cache_result(Some(0), None), "miss");
+        assert_eq!(cache_result(None, Some(20)), "miss");
+        assert_eq!(cache_result(None, Some(0)), "unreported");
+        assert_eq!(cache_result(None, None), "unreported");
+    }
+}

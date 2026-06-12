@@ -31,6 +31,7 @@ expression: "&resp"
     "completion_tokens": 20,
     "total_tokens": 70,
     "cached_tokens": 0,
-    "cache_creation_input_tokens": 0
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
   }
 }

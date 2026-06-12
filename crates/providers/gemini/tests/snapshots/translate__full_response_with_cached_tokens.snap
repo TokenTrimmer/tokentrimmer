@@ -21,6 +21,7 @@ expression: "&resp"
     "prompt_tokens": 100,
     "completion_tokens": 10,
     "total_tokens": 110,
-    "cached_tokens": 80
+    "cached_tokens": 80,
+    "cache_read_input_tokens": 80
   }
 }

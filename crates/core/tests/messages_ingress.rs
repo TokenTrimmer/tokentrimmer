@@ -99,6 +99,7 @@ impl Provider for AnthropicMock {
                 total_tokens: 120,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -115,6 +116,7 @@ impl Provider for AnthropicMock {
             total_tokens: 120,
             cached_tokens: 0,
             cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let chunks = if req.tools.is_empty() {
             vec![

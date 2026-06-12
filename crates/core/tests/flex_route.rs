@@ -125,6 +125,7 @@ impl Provider for FlexRecordingProvider {
                 total_tokens: PROMPT_TOKENS + COMPLETION_TOKENS,
                 cached_tokens: 0,
                 cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         })
     }
@@ -197,6 +198,7 @@ impl Provider for FlexRecordingProvider {
                     total_tokens: PROMPT_TOKENS + COMPLETION_TOKENS,
                     cached_tokens: 0,
                     cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 }),
                 extra: Default::default(),
             }),
