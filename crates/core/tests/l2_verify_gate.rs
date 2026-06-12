@@ -441,7 +441,7 @@ async fn adapted_threshold_turns_former_band_hit_into_miss() {
     });
     let state = AppState::new(registry)
         .with_l2(cache.clone(), embedder, None)
-        .with_l2_verify(0.02, 0.75, 1.0, FpGateTuning::new(1.0, 20, 0.005));
+        .with_l2_verify(0.02, 0.75, 1.0, FpGateTuning::new(20, 0.005));
     let gate = state
         .l2
         .as_ref()

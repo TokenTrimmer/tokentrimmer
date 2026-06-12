@@ -110,8 +110,7 @@ fn literal_random_token_regex() -> &'static Regex {
 }
 
 /// Every volatile-marker kind present in `text`, deduped by construction.
-/// `pub(crate)` for reuse by [`crate::cache_volatility`].
-pub(crate) fn volatile_kinds(text: &str) -> Vec<&'static str> {
+fn volatile_kinds(text: &str) -> Vec<&'static str> {
     let mut kinds = Vec::new();
     if literal_iso_timestamp_regex().is_match(text) {
         kinds.push("timestamp");

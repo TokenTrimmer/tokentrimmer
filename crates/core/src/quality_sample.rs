@@ -3395,7 +3395,7 @@ mod tests {
         use tt_cache::{AdaptiveClassThresholds, ClassThresholds, FpGateTuning, TaskClass};
         let gate = Arc::new(AdaptiveClassThresholds::new(
             ClassThresholds::new(),
-            FpGateTuning::new(1.0, 1, 0.005),
+            FpGateTuning::new(1, 0.005),
         ));
         let class = Some(TaskClass::ChatCompletions);
         let before = gate.effective_threshold(class);
@@ -3418,7 +3418,7 @@ mod tests {
         // Unclear: excluded from the denominator — the gate does not move.
         let gate2 = Arc::new(AdaptiveClassThresholds::new(
             ClassThresholds::new(),
-            FpGateTuning::new(1.0, 1, 0.005),
+            FpGateTuning::new(1, 0.005),
         ));
         let mut job = job_with(ReferenceSource::Ready("reference".to_string()), "unclear");
         job.l2_fp_feed = Some(L2FpFeed {

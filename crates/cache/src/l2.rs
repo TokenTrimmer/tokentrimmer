@@ -151,13 +151,13 @@ pub fn class_threshold_for(class: Option<TaskClass>) -> f32 {
 pub const ADAPTIVE_THRESHOLD_CEILING: f32 = 0.99;
 
 /// Tuning for the FP-rate → threshold controller. All defaults conservative.
+///
+/// The FP *tolerance* is deliberately NOT a field here: it is supplied per
+/// recorded verdict ([`AdaptiveClassThresholds::record_judged_band_hit`]) from
+/// the verify-gate config, so the tolerance knob lives in exactly one place —
+/// a duplicate field would invite the two values to silently diverge.
 #[derive(Debug, Clone, Copy)]
 pub struct FpGateTuning {
-    /// Target false-positive tolerance in percent — the research band's route
-    /// tolerance (0.5–2%, default 1.0). Values outside `[0.5, 2.0]` are
-    /// clamped by [`FpGateTuning::new`] and defensively re-clamped wherever a
-    /// tolerance is consumed.
-    pub tolerance_pct: f64,
     /// Judged in-band classified samples per adaptation batch (default 20).
     /// A batch smaller than this never adapts — one unlucky degraded sample
     /// must not move the threshold.
@@ -170,7 +170,6 @@ pub struct FpGateTuning {
 impl Default for FpGateTuning {
     fn default() -> Self {
         Self {
-            tolerance_pct: 1.0,
             min_samples: 20,
             step: 0.005,
         }
@@ -178,13 +177,12 @@ impl Default for FpGateTuning {
 }
 
 impl FpGateTuning {
-    /// Construct with the documented clamps: tolerance to `[0.5, 2.0]`,
-    /// `min_samples` floored at 1, `step` floored at 0 (a zero step disables
-    /// adaptation without disabling measurement).
+    /// Construct with the documented clamps: `min_samples` floored at 1,
+    /// `step` floored at 0 (a zero step disables adaptation without disabling
+    /// measurement).
     #[must_use]
-    pub fn new(tolerance_pct: f64, min_samples: u32, step: f32) -> Self {
+    pub fn new(min_samples: u32, step: f32) -> Self {
         Self {
-            tolerance_pct: tolerance_pct.clamp(0.5, 2.0),
             min_samples: min_samples.max(1),
             step: step.max(0.0),
         }
@@ -1688,11 +1686,8 @@ mod tests {
 
     // ── Adaptive thresholds (FP gate ratchet — SAFETY: never below 0.92) ─────
 
-    fn gate(tolerance_pct: f64, min_samples: u32, step: f32) -> AdaptiveClassThresholds {
-        AdaptiveClassThresholds::new(
-            ClassThresholds::new(),
-            FpGateTuning::new(tolerance_pct, min_samples, step),
-        )
+    fn gate(min_samples: u32, step: f32) -> AdaptiveClassThresholds {
+        AdaptiveClassThresholds::new(ClassThresholds::new(), FpGateTuning::new(min_samples, step))
     }
 
     /// For every class (incl. unclassified `None`), the effective threshold is
@@ -1700,7 +1695,7 @@ mod tests {
     /// sequence, including adversarial all-clean batches.
     #[test]
     fn effective_threshold_never_below_class_floor() {
-        let g = gate(1.0, 5, 0.005);
+        let g = gate(5, 0.005);
         for class in [None, Some(TaskClass::ChatCompletions)] {
             assert!(g.effective_threshold(class) >= DEFAULT_THRESHOLD);
             assert_eq!(g.effective_threshold(class), class_threshold_for(class));
@@ -1725,7 +1720,7 @@ mod tests {
     #[test]
     fn fp_breach_raises_threshold_by_step_and_caps_at_ceiling() {
         let class = Some(TaskClass::ChatCompletions);
-        let g = gate(1.0, 20, 0.005);
+        let g = gate(20, 0.005);
         // 20 degraded samples → 100% FP > 1% tolerance → one step.
         for i in 0..20 {
             let raised = g.record_judged_band_hit(class, Some(true), 1.0);
@@ -1764,7 +1759,7 @@ mod tests {
     #[test]
     fn no_adaptation_below_min_samples() {
         let class = Some(TaskClass::ChatCompletions);
-        let g = gate(1.0, 20, 0.005);
+        let g = gate(20, 0.005);
         for _ in 0..19 {
             assert!(!g.record_judged_band_hit(class, Some(true), 1.0));
         }
@@ -1777,7 +1772,7 @@ mod tests {
     #[test]
     fn ratchet_never_lowers() {
         let class = Some(TaskClass::ChatCompletions);
-        let g = gate(1.0, 5, 0.005);
+        let g = gate(5, 0.005);
         for _ in 0..5 {
             g.record_judged_band_hit(class, Some(true), 1.0);
         }
@@ -1798,7 +1793,7 @@ mod tests {
     #[test]
     fn unclear_verdicts_excluded_from_denominator() {
         let class = Some(TaskClass::ChatCompletions);
-        let g = gate(1.0, 5, 0.005);
+        let g = gate(5, 0.005);
         for _ in 0..100 {
             assert!(!g.record_judged_band_hit(class, None, 1.0));
         }
@@ -1824,7 +1819,7 @@ mod tests {
     #[test]
     fn strictest_tolerance_in_batch_wins() {
         let class = Some(TaskClass::ChatCompletions);
-        let g = gate(1.0, 5, 0.005);
+        let g = gate(5, 0.005);
         // First sample carries the strict tolerance; the rest are loose.
         g.record_judged_band_hit(class, Some(true), 0.5);
         for _ in 0..3 {

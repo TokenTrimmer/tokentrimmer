@@ -1463,7 +1463,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .unwrap_or(20);
-            let tuning = tt_cache::FpGateTuning::new(tolerance_pct, min_samples, 0.005);
+            let tuning = tt_cache::FpGateTuning::new(min_samples, 0.005);
             state = state.with_l2_verify(epsilon, min_agreement, tolerance_pct, tuning);
             tracing::info!(
                 epsilon,

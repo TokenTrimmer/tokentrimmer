@@ -1034,7 +1034,10 @@ Exposed metric families:
 |--------|------|--------|
 | `http_requests_total` | counter | `method`, `endpoint`, `status` |
 | `http_request_duration_seconds` | histogram | `method`, `endpoint` |
-| `cache_lookups_total` | counter | `tier` (`l1`/`l2`), `result` (`hit`/`miss`) |
+| `cache_lookups_total` | counter | `tier` (`l1`/`l2`), `result` (`hit`/`miss`; `verify_reject` on `l2` when the verify gate rejects an ambiguous-band hit) |
+| `cache_l2_verify_total` | counter | `result` (`confident`/`verified`/`unverifiable`/`rejected`) — emitted per L2 hit only when the verify gate (`TT_L2_VERIFY`) is enabled |
+| `cache_l2_threshold_raised_total` | counter | `class` — adaptive FP-gate ratchet raised a per-class L2 threshold |
+| `cache_l2_judge_capped_total` | counter | — (an L2-hit judge sample was skipped by the hourly spend cap, `TT_JUDGE_L2_HIT_MAX_PER_HOUR`) |
 | `provider_failover_total` | counter | `from` |
 | `provider_request_duration_seconds` | histogram | `provider`, `operation` |
 | `catalog_zero_price_total` | counter | `provider`, `model` |

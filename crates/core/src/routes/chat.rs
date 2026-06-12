@@ -723,13 +723,19 @@ async fn try_l2_hit(
                 entry.lexical_sig,
                 &query_text,
             );
-            let verify_result = match decision {
-                L2VerifyDecision::Confident => "confident",
-                L2VerifyDecision::Verified(_) => "verified",
-                L2VerifyDecision::Unverifiable => "unverifiable",
-                L2VerifyDecision::Rejected(_) => "rejected",
-            };
-            metrics::counter!("cache_l2_verify_total", "result" => verify_result).increment(1);
+            // Metric only when the gate is wired: a gate-off deployment's
+            // telemetry stream stays identical to pre-gate builds, and the
+            // counter cleanly distinguishes "gate off" (absent) from "gate
+            // on, hit confident" (`result="confident"`).
+            if l2.verify.is_some() {
+                let verify_result = match decision {
+                    L2VerifyDecision::Confident => "confident",
+                    L2VerifyDecision::Verified(_) => "verified",
+                    L2VerifyDecision::Unverifiable => "unverifiable",
+                    L2VerifyDecision::Rejected(_) => "rejected",
+                };
+                metrics::counter!("cache_l2_verify_total", "result" => verify_result).increment(1);
+            }
             if let L2VerifyDecision::Rejected(agreement) = decision {
                 // Treated as a MISS: fall through to a normal provider
                 // dispatch. No hit-count bump, no L2-hit judge, no cache log
@@ -3852,14 +3858,6 @@ fn maybe_spawn_l2_hit_judge(
     if !qs::should_sample(trace_id, rate) {
         return;
     }
-    // Hourly per-instance spend cap — consumed only by samples that would
-    // otherwise spawn (the deterministic sample above already passed), so the
-    // cap meters real would-be judge dispatches. Dispatch-path judging is
-    // unaffected.
-    if !state.l2_hit_judge_limiter.try_acquire() {
-        metrics::counter!("cache_l2_judge_capped_total").increment(1);
-        return;
-    }
     // The served answer is the cached response body. A body that fails to
     // deserialize (or a tool-call-only response with no assistant text) carries
     // nothing textual to judge — skip rather than record a meaningless verdict.
@@ -3879,6 +3877,15 @@ fn maybe_spawn_l2_hit_judge(
         );
         return;
     };
+    // Hourly per-instance spend cap — consumed LAST, after every cheap
+    // skip (deserialize / empty-answer / judge-model resolution), so each
+    // consumed token corresponds to a real would-be judge dispatch and a
+    // skipped sample never burns judge budget. Dispatch-path judging is
+    // unaffected.
+    if !state.l2_hit_judge_limiter.try_acquire() {
+        metrics::counter!("cache_l2_judge_capped_total").increment(1);
+        return;
+    }
     let input_text = tt_shared::message_text_for_estimation(original_req);
 
     // Per-provider judge credentials, resolved off-path inside a detached task
