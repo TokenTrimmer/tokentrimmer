@@ -64,6 +64,12 @@ pub struct MessagesRequest {
     pub tool_choice: Option<InboundToolChoice>,
     #[serde(default)]
     pub metadata: Option<InboundMetadata>,
+    /// Extended-thinking config, carried verbatim into the canonical
+    /// request's `extra["thinking"]` so the gateway pipeline (reasoning-cap
+    /// route action) can see it and the outbound adapter can forward it —
+    /// previously it was silently lost at this ingress.
+    #[serde(default)]
+    pub thinking: Option<serde_json::Value>,
 }
 
 /// The `system` field is either a bare string or an array of text blocks.
@@ -214,6 +220,14 @@ impl MessagesRequest {
             },
         });
 
+        // Thinking config rides the canonical request's `extra` map so the
+        // gateway pipeline (reasoning-cap route action) and the outbound
+        // adapter both see it.
+        let mut extra = std::collections::HashMap::new();
+        if let Some(thinking) = self.thinking {
+            extra.insert("thinking".to_string(), thinking);
+        }
+
         Ok(ChatCompletionRequest {
             model: self.model,
             messages,
@@ -231,6 +245,7 @@ impl MessagesRequest {
             seed: None,
             user: self.metadata.and_then(|m| m.user_id),
             tt_extras: Default::default(),
+            extra,
             ..Default::default()
         })
     }
@@ -862,6 +877,38 @@ mod tests {
     use tt_shared::messages::{Choice, ChunkChoice, ChunkDelta, ToolCall, ToolCallFunction};
     use tt_shared::usage::Usage;
     use tt_shared::ChatCompletionChunk;
+
+    /// An inbound `thinking` config lands in `extra["thinking"]` so
+    /// Claude-Code-style /v1/messages clients' thinking budgets are cappable
+    /// and no longer silently lost.
+    #[test]
+    fn inbound_thinking_lands_in_extra() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+        });
+        let req = MessagesRequest::from_json(body.to_string().as_bytes())
+            .unwrap()
+            .into_chat_request()
+            .unwrap();
+        assert_eq!(
+            req.extra.get("thinking"),
+            Some(&json!({"type": "enabled", "budget_tokens": 8192}))
+        );
+        // Absent thinking → no extra entry.
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Hello"}],
+        });
+        let req = MessagesRequest::from_json(body.to_string().as_bytes())
+            .unwrap()
+            .into_chat_request()
+            .unwrap();
+        assert!(!req.extra.contains_key("thinking"));
+    }
 
     #[test]
     fn simple_text_request_round_trips() {

@@ -1030,6 +1030,21 @@ pub async fn handler(
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .is_some_and(|s| !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false"));
+    // A matched route opting into minified-JSON output steering
+    // (`RouteAction::minify_json`). Applied below by `maybe_minify_json` (after
+    // the response_format downgrade so the grammar-lock check sees the FINAL
+    // response_format, and before the request-pass stage / cache-key
+    // derivation so the injected bytes are what gets cached and dispatched).
+    let route_minify = route_match.as_ref().is_some_and(|m| m.minify_json);
+    // A matched route capping reasoning spend (`RouteAction::reasoning_max_effort`
+    // / `reasoning_budget_tokens`). Applied below by `maybe_cap_reasoning`
+    // against the FINAL served provider/model (class-gated HARD, lower-only,
+    // books $0 — metered only).
+    let route_reasoning_max_effort = route_match
+        .as_ref()
+        .and_then(|m| m.reasoning_max_effort.clone());
+    let route_reasoning_budget_tokens =
+        route_match.as_ref().and_then(|m| m.reasoning_budget_tokens);
     // A matched route opting into the conservative compression pass
     // (`RouteAction::compress`). When false (the default — no route or a route
     // that did not enable it) the request-pass pipeline never runs and the
@@ -1102,7 +1117,14 @@ pub async fn handler(
             // req.model already holds the canary target (apply_routing rewrote it).
         } else {
             traffic_split_arm = Some("control");
-            // Revert to the originally-requested model — serve unchanged.
+            // Revert to the originally-requested model. NOTE: only the MODEL
+            // is reverted — route ACTIONS captured above (compress, and now
+            // minify_json / reasoning caps) still apply on the control arm,
+            // matching the long-standing compress precedent. A traffic split
+            // therefore does not A/B the shaping actions themselves (an
+            // action-only same-model route splits nothing); arm-level
+            // shaped-vs-unshaped comparison comes from the paired-judge
+            // channel, whose baseline is captured pre-shaping.
             if let Some(target) = route_target_model.as_deref() {
                 if req.model == target {
                     req.model = requested_model.clone();
@@ -1232,6 +1254,44 @@ pub async fn handler(
         route_batch,
         interactive_client,
         provider.as_ref(),
+        &mut warnings,
+    );
+
+    // Minified-JSON output steering (route action, research Phase 3.1):
+    // appends the deterministic instruction suffix to the system prompt.
+    // Ordered AFTER `maybe_downgrade_response_format` (the grammar-lock check
+    // must see the FINAL response_format) and BEFORE the request-pass stage,
+    // so the injected bytes precede `SplitRequest::compute` and L1/L2 key
+    // derivation — minify-route traffic keys separately from non-minify
+    // traffic and the cached body is the minified-steered one. The constant
+    // suffix is deterministic-on-ingress, so no provider prompt-cache bust is
+    // booked (redaction precedent). `minify_applied` drives the per-response
+    // ESTIMATE (non-streaming only), the metric, and judge eligibility.
+    let minify_applied =
+        maybe_minify_json(&mut req, route_minify, provider.as_ref(), &mut warnings);
+
+    // Class-gated reasoning-token cap (route action, research Phase 3.2):
+    // lowers OpenAI-style `reasoning_effort` / Anthropic-style thinking
+    // budgets on over-provisioned routes. Evaluated against the FINAL served
+    // provider/model (post-routing/pin). Books $0 — the unspent thinking
+    // tokens are only statistically visible; `reasoning_capped` feeds the
+    // metric and judge eligibility (`output_shaped`).
+    //
+    // ORDERING COUPLING: this runs after `maybe_minify_json`, so when both
+    // actions are configured on one route the class-gate classifier sees the
+    // injected `MINIFY_JSON_INSTRUCTION` text too. Today no word in that
+    // instruction matches any `reasoning_class` keyword set (verified), but a
+    // rewording that introduces one (e.g. "function") would silently
+    // class-gate every minify+cap request — if you edit either the
+    // instruction or the keyword tables, re-check the intersection.
+    let served_model_info = state.registry.model_info(&req.model).cloned();
+    let reasoning_capped = maybe_cap_reasoning(
+        &mut req,
+        route_reasoning_max_effort.as_deref(),
+        route_reasoning_budget_tokens,
+        provider.as_ref(),
+        served_model_info.as_ref(),
+        route_matched_name.as_deref().unwrap_or("none"),
         &mut warnings,
     );
 
@@ -1532,6 +1592,7 @@ pub async fn handler(
                             compression_saved_usd: 0.0,
                             cache_bust_penalty_usd: 0.0,
                             batch_forgone_usd: 0.0,
+                            minify_saved_est_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -1771,6 +1832,17 @@ pub async fn handler(
             None
         };
 
+        // Minify on a streaming request: the instruction + warning applied
+        // pre-dispatch; v1 books $0 and only METERS the event (the estimate
+        // needs the full response text — a documented follow-up could
+        // re-tokenize at stream end via the cache-insert reconstruction).
+        if minify_applied {
+            crate::metrics::record_minify_estimate(
+                route_matched_name.as_deref().unwrap_or("none"),
+                0,
+                0.0,
+            );
+        }
         let mut resp = with_route_matched(
             sse::stream_response(stream, &provider, trace_id, log_ctx),
             route_matched_name.as_deref(),
@@ -2109,6 +2181,16 @@ pub async fn handler(
         } else {
             pricing.clone()
         };
+        // Minify ESTIMATE (research Phase 3.1): grounded in the actual
+        // emission — the pretty re-render of the emitted JSON re-tokenized
+        // with the served model's tokenizer, minus the tokens actually
+        // emitted. 0 when the instruction was not injected or the response is
+        // not valid JSON (no claim).
+        let minify_saved_tokens = if minify_applied {
+            minify_saved_tokens_est(provider.id(), &response.model, &response)
+        } else {
+            0
+        };
         let cost_breakdown = compute_cost_full(
             &response.usage,
             pricing.as_ref(),
@@ -2117,7 +2199,15 @@ pub async fn handler(
             flex_applied,
             batch_marked,
             pass_effects,
+            minify_saved_tokens,
         );
+        if minify_applied {
+            crate::metrics::record_minify_estimate(
+                route_matched_name.as_deref().unwrap_or("none"),
+                minify_saved_tokens,
+                cost_breakdown.minify_saved_est_usd,
+            );
+        }
         let cost_usd = cost_breakdown.cost_usd;
         let baseline_cost_usd = cost_breakdown.baseline_cost_usd;
         // headline saved_usd (header) is TT-attributed only — the provider's
@@ -2314,6 +2404,9 @@ pub async fn handler(
                 batch_eligible: batch_marked,
                 batch_forgone_usd: cost_breakdown.batch_forgone_usd,
                 route_paused,
+                // ESTIMATED minify saving — own column (migration 0020),
+                // never folded into cost/baseline/saved.
+                minify_saved_est_usd: cost_breakdown.minify_saved_est_usd,
             },
         );
 
@@ -2341,6 +2434,10 @@ pub async fn handler(
             &response,
             requested_pricing.as_ref(),
             pricing.as_ref(),
+            // Output-shaped requests are judge-eligible even without a price
+            // downgrade — the un-shaped pre-routing capture is the paired
+            // counterfactual.
+            minify_applied || reasoning_capped,
             trace_id,
             ctx.org_id,
             &raw_bearer,
@@ -2553,6 +2650,317 @@ fn maybe_mark_batch_eligible(
     true
 }
 
+/// Deterministic minified-JSON instruction suffix (`RouteAction::minify_json`,
+/// research Phase 3.1). A compile-time constant => the injection is
+/// DETERMINISTIC ON INGRESS (same route config + same request bytes -> same
+/// dispatched bytes), so per the redaction precedent it can never bust a
+/// provider prompt cache and books no `CacheBustEstimate`. Conditionally
+/// phrased ("When responding with JSON") so it is inert for non-JSON answers —
+/// the booking below is additionally gated on the response actually parsing
+/// as JSON.
+///
+/// EDITING THIS TEXT: `maybe_cap_reasoning` classifies the request AFTER this
+/// suffix is injected, so the instruction must never contain a
+/// `crate::reasoning_class` keyword (e.g. "function", "theorem") or every
+/// minify+cap request would silently class-gate. Re-check the keyword tables
+/// when rewording.
+pub(crate) const MINIFY_JSON_INSTRUCTION: &str =
+    "\n\nWhen responding with JSON, emit it minified: no indentation, no newlines, and no spaces between JSON tokens.";
+
+/// Apply the minify-JSON route action: append [`MINIFY_JSON_INSTRUCTION`] to
+/// the LAST system message (inserting one at index 0 when the request has
+/// none) and push the `output_minified` warnings token. Returns whether the
+/// instruction was injected — drives the per-response estimate, the metric,
+/// and (via `output_shaped`) judge eligibility.
+///
+/// Grammar-lock guard: when the request carries `response_format: json_schema`
+/// AND the served provider honors it natively (strict structured output — the
+/// provider already controls whitespace via the grammar) the instruction is a
+/// no-op upstream, so we skip with `minify_skipped:structured_output` and make
+/// NO claim. Evaluated AFTER `maybe_downgrade_response_format` so the check
+/// sees the FINAL response_format: a schema B2 downgraded to `json_object`,
+/// or one the provider drops outright (Anthropic), is NOT grammar-locked and
+/// still benefits from the instruction.
+///
+/// Why no request-side `response_format` requirement: the route opt-in IS the
+/// machine-consumer assertion, the instruction is conditionally phrased, and
+/// booking is gated on the response actually parsing as JSON — a non-JSON
+/// answer is unaffected and books $0.
+///
+/// Fail-open by construction: only mutates the system text / pushes warnings;
+/// can never error.
+fn maybe_minify_json(
+    req: &mut ChatCompletionRequest,
+    requested: bool,
+    provider: &dyn tt_shared::Provider,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if !requested {
+        return false;
+    }
+    let is_schema = req
+        .response_format
+        .as_ref()
+        .is_some_and(|rf| rf.r#type == "json_schema");
+    if is_schema
+        && provider.supports_response_schema()
+        && !provider
+            .dropped_params(req)
+            .iter()
+            .any(|p| p == "response_format")
+    {
+        warnings.push("minify_skipped:structured_output".to_string());
+        return false;
+    }
+    let last_system = req
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|m| matches!(m, Message::System { .. }));
+    match last_system {
+        Some(Message::System { content }) => match content {
+            MessageContent::Text(t) => t.push_str(MINIFY_JSON_INSTRUCTION),
+            MessageContent::Parts(parts) => {
+                parts.push(tt_shared::messages::ContentPart::Text {
+                    text: MINIFY_JSON_INSTRUCTION.to_string(),
+                });
+            }
+        },
+        _ => {
+            req.messages.insert(
+                0,
+                Message::System {
+                    content: MessageContent::Text(MINIFY_JSON_INSTRUCTION.trim_start().to_string()),
+                },
+            );
+        }
+    }
+    warnings.push("output_minified".to_string());
+    true
+}
+
+/// Apply the class-gated reasoning-token cap (`RouteAction::reasoning_max_effort`
+/// / `reasoning_budget_tokens`, research Phase 3.2). Returns whether a cap was
+/// actually applied — drives metering and (via `output_shaped`) judge
+/// eligibility. Fail-open: mutates ONLY the reasoning params / warnings; never
+/// errors; NEVER touches `max_tokens` / `max_completion_tokens` (Anthropic's
+/// max_tokens INCLUDES thinking — bounding it would truncate the answer).
+///
+/// Decision order (first refusal wins; every act/refusal pushes its warnings
+/// token and meters):
+/// 1. Both caps `None` → silent no-op (the off-by-default path).
+/// 2. HARD class gate: a request classified math/code/legal/medical
+///    (`crate::reasoning_class`) is NEVER capped — capping where reasoning IS
+///    the work yields confidently-wrong answers
+///    (`reasoning_cap_skipped:class:<c>`).
+/// 3. Effort arm (OpenAI-style `reasoning_effort`, only when the served
+///    surface carries the lever — i.e. the provider does not drop it):
+///    lower-only on the `minimal < low < medium < high` ladder. An absent
+///    effort on a catalog-Reasoning-capable model is treated as the provider
+///    default ("medium" — documented assumption) and lowered when the cap is
+///    "low"; an absent effort on an unknown/non-Reasoning model refuses
+///    (`reasoning_cap_skipped:not_reasoning:<model>`) — never inject
+///    `reasoning_effort` into a model that may reject it. An unrecognized
+///    requester value refuses (`reasoning_cap_skipped:unknown_effort:<v>`).
+/// 4. Thinking arm (Anthropic-style `extra["thinking"]`): an ENABLED config
+///    whose `budget_tokens` exceeds the cap is lowered in place
+///    (`reasoning_capped:thinking_budget:<cap>`). Absent / disabled /
+///    at-or-below configs are untouched — the cap NEVER enables thinking.
+/// 5. When neither lever exists for this request (effort dropped by the
+///    provider AND no enabled thinking config) while a cap is configured, one
+///    honest `reasoning_cap_skipped:unsupported:<provider>` token is pushed.
+///    Known corner: a route configuring ONLY `reasoning_budget_tokens`, hit
+///    by a request on an effort-capable surface with no thinking config,
+///    no-ops silently — the surface DOES carry a lever (so `unsupported`
+///    would be a lie), there was just nothing for the configured cap to
+///    lower. Zero cost impact ($0 is booked regardless).
+///
+/// Books $0 ALWAYS: `Usage` carries no reasoning-token field, so the unspent
+/// thinking tokens are only statistically visible — the event is metered
+/// (`reasoning_capped_total{route,lever,cap}`) and the judge-tax-netted route
+/// savings (#163) tell the truth over the window.
+fn maybe_cap_reasoning(
+    req: &mut ChatCompletionRequest,
+    max_effort: Option<&str>,
+    budget_tokens: Option<u32>,
+    provider: &dyn tt_shared::Provider,
+    model_info: Option<&tt_shared::ModelInfo>,
+    route_name: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if max_effort.is_none() && budget_tokens.is_none() {
+        return false;
+    }
+    // HARD class gate, first: refuse where reasoning IS the work.
+    let text = tt_shared::message_text_for_estimation(req).to_lowercase();
+    if let Some(class) = crate::reasoning_class::classify(&text) {
+        warnings.push(format!("reasoning_cap_skipped:class:{}", class.as_str()));
+        crate::metrics::record_reasoning_cap_skipped("class");
+        return false;
+    }
+
+    /// `minimal(0) < low(1) < medium(2) < high(3)`; `None` = unrecognized.
+    fn effort_rank(e: &str) -> Option<u8> {
+        match e {
+            "minimal" => Some(0),
+            "low" => Some(1),
+            "medium" => Some(2),
+            "high" => Some(3),
+            _ => None,
+        }
+    }
+
+    let mut applied = false;
+    let effort_lever = !provider
+        .dropped_params(req)
+        .iter()
+        .any(|p| p == "reasoning_effort");
+
+    // Effort arm.
+    if let (Some(cap), true) = (max_effort, effort_lever) {
+        match effort_rank(cap) {
+            None => {
+                // Defensive only: validation rejects this at route-create
+                // time, but route JSON is schemaless JSONB — never act on a
+                // cap we cannot rank.
+                tracing::warn!(cap, "unrecognized reasoning_max_effort cap — skipping");
+            }
+            Some(cap_rank) => match req.reasoning_effort.as_deref() {
+                Some(current) => match effort_rank(current) {
+                    Some(cur_rank) if cur_rank > cap_rank => {
+                        req.reasoning_effort = Some(cap.to_string());
+                        warnings.push(format!("reasoning_capped:reasoning_effort:{cap}"));
+                        crate::metrics::record_reasoning_capped(
+                            route_name,
+                            "reasoning_effort",
+                            cap,
+                        );
+                        applied = true;
+                    }
+                    Some(_) => {} // at-or-below the cap: silent no-op.
+                    None => {
+                        let current = current.to_string();
+                        warnings.push(format!("reasoning_cap_skipped:unknown_effort:{current}"));
+                        crate::metrics::record_reasoning_cap_skipped("unknown_effort");
+                    }
+                },
+                None => {
+                    let reasoning_capable = model_info.is_some_and(|i| {
+                        i.capabilities
+                            .contains(&tt_shared::pricing::Capability::Reasoning)
+                    });
+                    if reasoning_capable {
+                        // Documented assumption: the provider default for an
+                        // absent effort on a reasoning model is "medium".
+                        if 2 > cap_rank {
+                            req.reasoning_effort = Some(cap.to_string());
+                            warnings.push(format!("reasoning_capped:reasoning_effort:{cap}"));
+                            crate::metrics::record_reasoning_capped(
+                                route_name,
+                                "reasoning_effort",
+                                cap,
+                            );
+                            applied = true;
+                        }
+                    } else {
+                        warnings.push(format!("reasoning_cap_skipped:not_reasoning:{}", req.model));
+                        crate::metrics::record_reasoning_cap_skipped("not_reasoning");
+                    }
+                }
+            },
+        }
+    }
+
+    // Thinking arm. A lever exists only for an ENABLED config — the cap never
+    // enables thinking on a request that didn't ask for it.
+    let thinking_enabled = req
+        .extra
+        .get("thinking")
+        .and_then(|v| v.as_object())
+        .is_some_and(|o| o.get("type").and_then(|t| t.as_str()) == Some("enabled"));
+    if let (Some(cap), true) = (budget_tokens, thinking_enabled) {
+        if let Some(obj) = req
+            .extra
+            .get_mut("thinking")
+            .and_then(|v| v.as_object_mut())
+        {
+            if let Some(budget) = obj.get("budget_tokens").and_then(serde_json::Value::as_u64) {
+                if budget > u64::from(cap) {
+                    obj.insert("budget_tokens".to_string(), serde_json::json!(cap));
+                    warnings.push(format!("reasoning_capped:thinking_budget:{cap}"));
+                    crate::metrics::record_reasoning_capped(
+                        route_name,
+                        "thinking_budget",
+                        &cap.to_string(),
+                    );
+                    applied = true;
+                }
+            }
+        }
+    }
+
+    // Honest unsupported-surface token: a cap is configured but this request
+    // carries NO lever (effort dropped by the provider AND no enabled
+    // thinking config).
+    if !applied && !effort_lever && !thinking_enabled {
+        warnings.push(format!(
+            "reasoning_cap_skipped:unsupported:{}",
+            provider.id()
+        ));
+        crate::metrics::record_reasoning_cap_skipped("unsupported");
+    }
+    applied
+}
+
+/// ESTIMATED output tokens saved by minification: for each choice whose
+/// assistant text parses as JSON (`serde_json::Value`, after trim), the
+/// pretty-printed re-rendering (`serde_json::to_string_pretty` — 2-space
+/// indent, the documented counterfactual basis) is re-tokenized with the
+/// served model's tokenizer and the per-choice delta
+/// `pretty_tokens.saturating_sub(emitted_tokens)` is summed. Non-JSON /
+/// fence-wrapped / tool-call-only choices contribute 0 — if the response is
+/// not valid JSON we book ZERO (no claim). A model that ignored the
+/// instruction and emitted pretty JSON yields a ~0 delta by construction —
+/// the estimate is grounded in the actual emission, never a -40% constant.
+fn minify_saved_tokens_est(
+    provider_id: &str,
+    model: &str,
+    response: &ChatCompletionResponse,
+) -> u32 {
+    let mut total: u32 = 0;
+    for choice in &response.choices {
+        let Message::Assistant {
+            content: Some(content),
+            ..
+        } = &choice.message
+        else {
+            continue; // tool-call-only / non-assistant choices book nothing.
+        };
+        let text = match content {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    tt_shared::messages::ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        };
+        let trimmed = text.trim();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue; // not valid JSON → no claim for this choice.
+        };
+        let Ok(pretty) = serde_json::to_string_pretty(&value) else {
+            continue;
+        };
+        let emitted = tt_tokenize::estimate_tokens_for_model(provider_id, model, trimmed);
+        let pretty_tokens = tt_tokenize::estimate_tokens_for_model(provider_id, model, &pretty);
+        total = total.saturating_add(pretty_tokens.saturating_sub(emitted));
+    }
+    total
+}
+
 /// Attach `X-TokenTrimmer-Warnings`: the model-dependent `param_dropped:<name>`
 /// tokens (computed here against `served_model`) plus any pre-dispatch `extra`
 /// tokens (e.g. `response_format_downgrade`). Comma-joined; no-op when empty.
@@ -2618,6 +3026,7 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         compression_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
         batch_forgone_usd: 0.0,
+        minify_saved_est_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -2685,6 +3094,7 @@ fn build_hit_l2_response(
         compression_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
         batch_forgone_usd: 0.0,
+        minify_saved_est_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -2946,6 +3356,21 @@ pub(crate) struct CostBreakdown {
     /// `request_logs` row (migration 0017). 0.0 unless the request was marked
     /// batch-eligible AND the served model carries catalog batch rates.
     pub batch_forgone_usd: f64,
+    /// ESTIMATED saving from minified-JSON output steering
+    /// (`RouteAction::minify_json`, research Phase 3.1): the pretty-printed
+    /// re-rendering of the emitted JSON, re-tokenized with the served model's
+    /// tokenizer, minus the tokens actually emitted — priced at the output
+    /// rate the request was actually billed at (flex out-rate when flex
+    /// applied, else standard), fee-applied. An ESTIMATE of an unmeasurable
+    /// counterfactual (the model might have emitted minified JSON anyway):
+    /// NEVER included in [`tt_saved_usd`](Self::tt_saved_usd) / `saved-usd`
+    /// and never folded into `cost_usd` / `baseline_cost_usd` (those
+    /// reconcile against the invoice). Surfaced on its own
+    /// `X-TokenTrimmer-Minify-Saved-Est-Usd` header and `request_logs` column
+    /// (migration 0020). 0.0 when the instruction was not injected, when the
+    /// response is not valid JSON, and on streaming (estimate not computed in
+    /// v1 — metered only).
+    pub minify_saved_est_usd: f64,
 }
 
 impl CostBreakdown {
@@ -3042,6 +3467,7 @@ pub(crate) fn compute_cost_with_flex(
         flex_applied,
         false,
         PassEffects::default(),
+        0,
     )
 }
 
@@ -3084,6 +3510,15 @@ pub(crate) fn compute_cost_with_flex(
 /// catalog batch rate against the realized (flex-or-standard, cache-metered)
 /// cost. A served model with no batch tier (possible after failover) forgoes
 /// 0.0 — never a fabricated 0.5×.
+///
+/// `minify_saved_tokens_est` is the tokenizer-grounded minify estimate from
+/// [`minify_saved_tokens_est`] (0 when the instruction was not injected, the
+/// response was not valid JSON, or on streaming). Priced inside at the BILLED
+/// output rate — the flex out-rate when `flex_applied` and flex rates exist,
+/// else the standard rate — fee-applied, into
+/// [`CostBreakdown::minify_saved_est_usd`] ONLY. Like `batch_forgone_usd`, it
+/// changes NO realized or headline figure.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_cost_full(
     usage: &Usage,
     pricing: Option<&ModelPricing>,
@@ -3092,6 +3527,7 @@ pub(crate) fn compute_cost_full(
     flex_applied: bool,
     batch_marked: bool,
     effects: PassEffects,
+    minify_saved_tokens_est: u32,
 ) -> CostBreakdown {
     let Some(pricing) = pricing else {
         return CostBreakdown::default();
@@ -3225,6 +3661,17 @@ pub(crate) fn compute_cost_full(
         * baseline_pricing.input_per_million
         / 1_000_000.0;
 
+    // Minify estimate: the saved-output-token estimate priced at the rate the
+    // request's output was actually BILLED at — the flex out-rate when flex
+    // applied (and the model carries one), else the standard output rate.
+    // Lands in its own ESTIMATE field only; never touches cost/baseline/
+    // headline (those reconcile against the invoice).
+    let billed_output_rate = match (flex_applied, pricing.flex_rates_per_million()) {
+        (true, Some((_, flex_out))) => flex_out,
+        _ => pricing.output_per_million,
+    };
+    let minify_saved_est_usd = (minify_saved_tokens_est as f64) * billed_output_rate / 1_000_000.0;
+
     // Apply the provider surcharge (e.g. OpenRouter's 5% BYOK fee) to all
     // figures so the saved splits stay consistent (same scale factor). The
     // provider-cache discount is metered against the STANDARD cost (not the
@@ -3239,6 +3686,7 @@ pub(crate) fn compute_cost_full(
         compression_saved_usd: compression_saved_usd * fee_multiplier,
         cache_bust_penalty_usd: effects.cache_bust_penalty_usd * fee_multiplier,
         batch_forgone_usd: batch_forgone_usd * fee_multiplier,
+        minify_saved_est_usd: minify_saved_est_usd * fee_multiplier,
     }
 }
 
@@ -3333,6 +3781,16 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-batch-forgone-usd",
             format!("{:.6}", cost.batch_forgone_usd),
+        ),
+        // ESTIMATED minify saving (pretty re-render of the emitted JSON minus
+        // the tokens actually emitted, priced at the billed output rate) —
+        // NEVER included in `saved-usd` (an estimate of an unmeasurable
+        // counterfactual must not enter the invoice-reconciled headline).
+        // 0.000000 for all un-minified traffic, non-JSON responses, and
+        // streaming (v1 meters but does not estimate).
+        (
+            "x-tokentrimmer-minify-saved-est-usd",
+            format!("{:.6}", cost.minify_saved_est_usd),
         ),
     ];
 
@@ -3645,9 +4103,22 @@ fn response_assistant_text(resp: &ChatCompletionResponse) -> String {
 /// - the matched route did NOT opt into redaction (`redact` routes clear the
 ///   judge captures at the handler — the pre-redaction request must never
 ///   ride the measurement path to any vendor),
-/// - a route rewrote the model (`matched_route_id.is_some()`),
+/// - a route matched (`matched_route_id.is_some()`),
 /// - the served model is cheaper than the originally-requested one (a true
-///   downgrade priced on realized usage — [`crate::quality_sample::is_downgrade`]),
+///   downgrade priced on realized usage — [`crate::quality_sample::is_downgrade`])
+///   OR the request was output-shaped (`output_shaped`: minify-JSON steering
+///   or a reasoning cap actually applied). The pre-routing capture
+///   (`judge_original_req`, taken BEFORE all pre-dispatch shaping) means the
+///   baseline reference re-dispatch is the UN-shaped request on the original
+///   model — exactly the paired counterfactual for an action-only shaped
+///   route whose `target_model` equals the requested model (where
+///   `is_downgrade` is false because pricing is identical). Verdicts are
+///   keyed by `route_id`, so `RouteAction::auto_pause` (#163) composes with
+///   zero new code: a capped/minified route whose paired pass-rate regresses
+///   below its floor sticky-pauses itself, and the paused arm suppresses
+///   both new actions — fail-safe in the expensive direction. The judge tax
+///   on a same-model shaped route can make #163's netted saving negative —
+///   that is the honest answer, itemized as `judge_tax_usd`,
 /// - the served answer is non-empty (tool-call-only responses are skipped),
 /// - the trace falls in the deterministic ~2% sample
 ///   ([`crate::quality_sample::should_sample`]),
@@ -3674,6 +4145,7 @@ fn maybe_spawn_quality_judge(
     response: &ChatCompletionResponse,
     requested_pricing: Option<&ModelPricing>,
     served_pricing: Option<&ModelPricing>,
+    output_shaped: bool,
     trace_id: Uuid,
     org_id: Uuid,
     raw_bearer: &str,
@@ -3699,11 +4171,15 @@ fn maybe_spawn_quality_judge(
     if !qs::JudgeTaskClass::ChatCompletions.is_sampled() {
         return;
     }
-    // Reroute-DOWN only: a route fired AND the served model is cheaper.
+    // A route fired AND (the served model is cheaper — reroute-DOWN — OR the
+    // request was output-shaped). See the doc comment: the pre-routing
+    // capture already provides the un-shaped baseline counterfactual, so an
+    // action-only shaped route (same target model, identical pricing) is
+    // judge-gateable too.
     if matched_route_id.is_none() {
         return;
     }
-    if !qs::is_downgrade(requested_pricing, served_pricing, &response.usage) {
+    if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage) || output_shaped) {
         return;
     }
     // Deterministic ~2% sample keyed on the trace id.
@@ -4084,6 +4560,8 @@ fn request_log_for_l1_hit(
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused,
+        // TT cache hit — nothing dispatched, nothing minify-estimated.
+        minify_saved_est_usd: 0.0,
     }
 }
 
@@ -4137,6 +4615,8 @@ fn request_log_for_l2_hit(
         batch_eligible: false,
         batch_forgone_usd: 0.0,
         route_paused,
+        // TT cache hit — nothing dispatched, nothing minify-estimated.
+        minify_saved_est_usd: 0.0,
     }
 }
 
@@ -4206,6 +4686,21 @@ pub(crate) struct RouteMatch {
     /// handler can revert `req.model` to the originally-requested model when the
     /// sticky split assigns this request to the CONTROL arm.
     pub(crate) target_model: String,
+    /// The matched route opted into minified-JSON output steering
+    /// (`RouteAction::minify_json`, research Phase 3.1). Applied at the
+    /// request-build step via `maybe_minify_json` (grammar-locked structured
+    /// output skips with a warning). A COST lever: forced off on a paused
+    /// route.
+    pub(crate) minify_json: bool,
+    /// The matched route's `reasoning_effort` cap
+    /// (`RouteAction::reasoning_max_effort`, research Phase 3.2). Applied at
+    /// the request-build step via `maybe_cap_reasoning` (class-gated HARD;
+    /// lower-only). A COST lever: forced to `None` on a paused route.
+    pub(crate) reasoning_max_effort: Option<String>,
+    /// The matched route's thinking-budget cap
+    /// (`RouteAction::reasoning_budget_tokens`). Same gating as
+    /// `reasoning_max_effort`; never expressed via `max_tokens`.
+    pub(crate) reasoning_budget_tokens: Option<u32>,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -4338,6 +4833,9 @@ pub(crate) async fn apply_routing(
             compress: false,
             traffic_pct: None,
             shadow_model: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
             // SAFETY/privacy levers stay ON (pausing a quality gate must never
             // disable a privacy guardrail):
             disable_cache: m.then.disable_cache,
@@ -4359,6 +4857,9 @@ pub(crate) async fn apply_routing(
     let traffic_pct = m.then.traffic_pct;
     let shadow_model = m.then.shadow_model.clone();
     let target_model_for_split = m.then.target_model.clone();
+    let minify_json = m.then.minify_json;
+    let reasoning_max_effort = m.then.reasoning_max_effort.clone();
+    let reasoning_budget_tokens = m.then.reasoning_budget_tokens;
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -4406,6 +4907,9 @@ pub(crate) async fn apply_routing(
         traffic_pct,
         shadow_model,
         target_model: target_model_for_split,
+        minify_json,
+        reasoning_max_effort,
+        reasoning_budget_tokens,
     }))
 }
 
@@ -4973,6 +5477,7 @@ mod cache_bust_tests {
             false,
             false,
             PassEffects::default(),
+            0,
         );
         assert!((no_bust.tt_saved_usd() - 4.0).abs() < 1e-9);
         assert_eq!(no_bust.cache_bust_penalty_usd, 0.0);
@@ -4990,6 +5495,7 @@ mod cache_bust_tests {
             false,
             false,
             effects,
+            0,
         );
         assert!((bd.cache_bust_penalty_usd - 1.5).abs() < 1e-9);
         assert!((bd.tt_saved_usd() - 2.5).abs() < 1e-9);
@@ -5011,6 +5517,7 @@ mod cache_bust_tests {
             false,
             false,
             effects,
+            0,
         );
         assert!((bd_fee.cache_bust_penalty_usd - 1.5 * 1.05).abs() < 1e-9);
 
@@ -5028,6 +5535,7 @@ mod cache_bust_tests {
             false,
             false,
             big,
+            0,
         );
         assert_eq!(clamped.tt_saved_usd(), 0.0);
         assert!(
@@ -5803,5 +6311,650 @@ mod l2_verify_gate_tests {
             l2_verify_decision(Some(&v), 0.92, 0.92, sig, query),
             L2VerifyDecision::Verified(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod output_shaping_tests {
+    use super::*;
+    use futures::stream::BoxStream;
+    use tt_shared::messages::ResponseFormat;
+    use tt_shared::{ChatCompletionChunk, ProviderError};
+
+    /// Minimal provider stub with controllable structured-output support and
+    /// dropped-params — everything `maybe_minify_json` consults.
+    struct ShapeProvider {
+        schema: bool,
+        drops: &'static [&'static str],
+    }
+
+    #[async_trait::async_trait]
+    impl tt_shared::Provider for ShapeProvider {
+        fn id(&self) -> &'static str {
+            "shape-test"
+        }
+        fn models(&self) -> Vec<tt_shared::ModelInfo> {
+            vec![]
+        }
+        fn pricing(&self, _m: &str) -> Option<ModelPricing> {
+            None
+        }
+        fn dropped_params(&self, _req: &ChatCompletionRequest) -> Vec<String> {
+            self.drops.iter().map(|s| s.to_string()).collect()
+        }
+        fn supports_response_schema(&self) -> bool {
+            self.schema
+        }
+        async fn chat_completion(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            unreachable!("shapers never dispatch")
+        }
+        async fn chat_completion_stream(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
+            unreachable!("shapers never dispatch")
+        }
+    }
+
+    fn req_with_messages(messages: Vec<Message>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages,
+            ..serde_json::from_str(r#"{"model":"placeholder","messages":[]}"#).unwrap()
+        }
+    }
+
+    fn sys(text: &str) -> Message {
+        Message::System {
+            content: MessageContent::Text(text.into()),
+        }
+    }
+
+    fn user(text: &str) -> Message {
+        Message::User {
+            content: MessageContent::Text(text.into()),
+            name: None,
+        }
+    }
+
+    fn assistant_text_response(texts: &[&str]) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "r".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            choices: texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| Choice {
+                    index: i as u32,
+                    message: Message::Assistant {
+                        content: Some(MessageContent::Text((*t).into())),
+                        tool_calls: vec![],
+                        name: None,
+                    },
+                    finish_reason: Some("stop".into()),
+                })
+                .collect(),
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                total_tokens: 20,
+                cached_tokens: 0,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+        }
+    }
+
+    /// Route on: the deterministic instruction is appended to the LAST system
+    /// message (byte-exact), the `output_minified` token is pushed, and the
+    /// shaper reports it acted. Route off: the request is byte-identical and
+    /// no warning is pushed.
+    #[test]
+    fn maybe_minify_json_injects_suffix_and_warns() {
+        let p = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+        let mut req = req_with_messages(vec![sys("First."), sys("You are a bot."), user("hi")]);
+        let mut warnings = Vec::new();
+        let applied = maybe_minify_json(&mut req, true, &p, &mut warnings);
+        assert!(applied, "route opt-in must inject");
+        assert_eq!(warnings, vec!["output_minified".to_string()]);
+        match &req.messages[1] {
+            Message::System {
+                content: MessageContent::Text(t),
+            } => {
+                assert_eq!(t, &format!("You are a bot.{MINIFY_JSON_INSTRUCTION}"));
+            }
+            other => panic!("expected last system message text, got {other:?}"),
+        }
+        // The FIRST system message is untouched — only the last one grows.
+        match &req.messages[0] {
+            Message::System {
+                content: MessageContent::Text(t),
+            } => assert_eq!(t, "First."),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Route off → byte-identical request, no warning, returns false.
+        let mut req2 = req_with_messages(vec![sys("You are a bot."), user("hi")]);
+        let before = serde_json::to_string(&req2).unwrap();
+        let mut w2 = Vec::new();
+        assert!(!maybe_minify_json(&mut req2, false, &p, &mut w2));
+        assert_eq!(serde_json::to_string(&req2).unwrap(), before);
+        assert!(w2.is_empty());
+    }
+
+    /// No system message in the request → one is INSERTED at index 0 carrying
+    /// the (lead-trimmed) instruction.
+    #[test]
+    fn maybe_minify_json_creates_system_message_when_absent() {
+        let p = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut warnings = Vec::new();
+        assert!(maybe_minify_json(&mut req, true, &p, &mut warnings));
+        assert_eq!(req.messages.len(), 2);
+        match &req.messages[0] {
+            Message::System {
+                content: MessageContent::Text(t),
+            } => assert_eq!(t, MINIFY_JSON_INSTRUCTION.trim_start()),
+            other => panic!("expected inserted system message, got {other:?}"),
+        }
+        assert_eq!(warnings, vec!["output_minified".to_string()]);
+    }
+
+    /// A `Parts` system message gains a trailing text part (never corrupting
+    /// existing parts).
+    #[test]
+    fn maybe_minify_json_appends_part_to_parts_system_message() {
+        let p = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+        let mut req = req_with_messages(vec![
+            Message::System {
+                content: MessageContent::Parts(vec![tt_shared::messages::ContentPart::Text {
+                    text: "sys".into(),
+                }]),
+            },
+            user("hi"),
+        ]);
+        let mut warnings = Vec::new();
+        assert!(maybe_minify_json(&mut req, true, &p, &mut warnings));
+        match &req.messages[0] {
+            Message::System {
+                content: MessageContent::Parts(parts),
+            } => {
+                assert_eq!(parts.len(), 2);
+                match &parts[1] {
+                    tt_shared::messages::ContentPart::Text { text } => {
+                        assert_eq!(text, MINIFY_JSON_INSTRUCTION);
+                    }
+                    other => panic!("expected appended text part, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Grammar-locked structured output (json_schema honored natively by the
+    /// served provider) is a no-op + `minify_skipped:structured_output`; a
+    /// schema DOWNGRADED to json_object (B2) and a provider that drops
+    /// response_format outright (Anthropic) both still inject.
+    #[test]
+    fn maybe_minify_json_skips_grammar_locked_schema() {
+        // (a) json_schema + schema-supporting provider → grammar-locked: skip.
+        let locked = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+        let mut req = req_with_messages(vec![sys("s"), user("hi")]);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".into(),
+            json_schema: Some(serde_json::json!({"name":"x"})),
+        });
+        let before = serde_json::to_string(&req).unwrap();
+        let mut w = Vec::new();
+        assert!(!maybe_minify_json(&mut req, true, &locked, &mut w));
+        assert_eq!(serde_json::to_string(&req).unwrap(), before, "no mutation");
+        assert_eq!(w, vec!["minify_skipped:structured_output".to_string()]);
+
+        // (b) post-B2 state: schema already downgraded to json_object on a
+        // json_object-only provider → NOT grammar-locked: inject.
+        let downgrading = ShapeProvider {
+            schema: false,
+            drops: &[],
+        };
+        let mut req = req_with_messages(vec![sys("s"), user("hi")]);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_object".into(),
+            json_schema: None,
+        });
+        let mut w = Vec::new();
+        assert!(maybe_minify_json(&mut req, true, &downgrading, &mut w));
+        assert_eq!(w, vec!["output_minified".to_string()]);
+
+        // (c) Anthropic-like provider that DROPS response_format outright →
+        // nothing is grammar-locked upstream: inject.
+        let dropping = ShapeProvider {
+            schema: false,
+            drops: &["response_format"],
+        };
+        let mut req = req_with_messages(vec![sys("s"), user("hi")]);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".into(),
+            json_schema: Some(serde_json::json!({"name":"x"})),
+        });
+        let mut w = Vec::new();
+        assert!(maybe_minify_json(&mut req, true, &dropping, &mut w));
+        assert_eq!(w, vec!["output_minified".to_string()]);
+    }
+
+    /// The estimate is grounded in the actual emission: minified JSON yields a
+    /// positive pretty-minus-emitted delta; JSON the model emitted PRETTY
+    /// anyway yields ~0 (never a fabricated -40%); prose / fence-wrapped /
+    /// tool-call-only choices contribute 0; multiple choices sum.
+    #[test]
+    fn minify_saved_tokens_est_table() {
+        let value = serde_json::json!({
+            "name": "tokentrimmer",
+            "items": [1, 2, 3, 4, 5],
+            "nested": {"a": true, "b": null, "c": "text"}
+        });
+        let minified = serde_json::to_string(&value).unwrap();
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+
+        // Minified emission → positive delta.
+        let resp = assistant_text_response(&[&minified]);
+        let est = minify_saved_tokens_est("openai", "gpt-4o", &resp);
+        assert!(est > 0, "minified JSON must yield a positive estimate");
+
+        // Pretty emission of the SAME value → ~0 (the re-render IS the emission).
+        let resp = assistant_text_response(&[&pretty]);
+        let est_pretty = minify_saved_tokens_est("openai", "gpt-4o", &resp);
+        assert_eq!(
+            est_pretty, 0,
+            "a model that ignored the instruction books ~0, not -40%"
+        );
+
+        // Prose → 0.
+        let resp = assistant_text_response(&["The answer is 42, naturally."]);
+        assert_eq!(minify_saved_tokens_est("openai", "gpt-4o", &resp), 0);
+
+        // Fence-wrapped JSON → not valid JSON → 0 (no claim).
+        let fenced = format!("```json\n{minified}\n```");
+        let resp = assistant_text_response(&[&fenced]);
+        assert_eq!(minify_saved_tokens_est("openai", "gpt-4o", &resp), 0);
+
+        // Tool-call-only choice → 0.
+        let mut resp = assistant_text_response(&[]);
+        resp.choices.push(Choice {
+            index: 0,
+            message: Message::Assistant {
+                content: None,
+                tool_calls: vec![tt_shared::messages::ToolCall {
+                    id: "t1".into(),
+                    r#type: "function".into(),
+                    function: tt_shared::messages::ToolCallFunction {
+                        name: "f".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                name: None,
+            },
+            finish_reason: Some("tool_calls".into()),
+        });
+        assert_eq!(minify_saved_tokens_est("openai", "gpt-4o", &resp), 0);
+
+        // Multi-choice: two minified choices sum to twice one.
+        let one =
+            minify_saved_tokens_est("openai", "gpt-4o", &assistant_text_response(&[&minified]));
+        let two = minify_saved_tokens_est(
+            "openai",
+            "gpt-4o",
+            &assistant_text_response(&[&minified, &minified]),
+        );
+        assert_eq!(two, one * 2, "per-choice deltas must sum");
+    }
+
+    /// The estimate is priced at the BILLED output rate × fee into its own
+    /// field; `tt_saved_usd()` / `cost_usd` / `baseline_cost_usd` are
+    /// untouched (never folded into invoice-reconciled figures); the
+    /// flex-applied path prices at the flex out-rate.
+    #[test]
+    fn compute_cost_full_minify_estimate_isolated() {
+        let p = ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        };
+        let usage = Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 1000,
+            total_tokens: 2000,
+            cached_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+
+        let base = compute_cost_full(
+            &usage,
+            Some(&p),
+            Some(&p),
+            1.0,
+            false,
+            false,
+            PassEffects::default(),
+            0,
+        );
+        assert_eq!(base.minify_saved_est_usd, 0.0);
+
+        let bd = compute_cost_full(
+            &usage,
+            Some(&p),
+            Some(&p),
+            1.0,
+            false,
+            false,
+            PassEffects::default(),
+            500,
+        );
+        // 500 tokens × $2/M = $0.001 at the standard output rate.
+        assert!((bd.minify_saved_est_usd - 0.001).abs() < 1e-12);
+        assert!(
+            (bd.cost_usd - base.cost_usd).abs() < 1e-12,
+            "estimate never folds into cost_usd"
+        );
+        assert!(
+            (bd.baseline_cost_usd - base.baseline_cost_usd).abs() < 1e-12,
+            "estimate never folds into baseline_cost_usd"
+        );
+        assert!(
+            (bd.tt_saved_usd() - base.tt_saved_usd()).abs() < 1e-12,
+            "estimate never enters the invoice-reconciled headline"
+        );
+
+        // Fee-applied like every other figure.
+        let bd_fee = compute_cost_full(
+            &usage,
+            Some(&p),
+            Some(&p),
+            1.05,
+            false,
+            false,
+            PassEffects::default(),
+            500,
+        );
+        assert!((bd_fee.minify_saved_est_usd - 0.001 * 1.05).abs() < 1e-12);
+
+        // Flex-applied path prices the estimate at the FLEX out-rate (the rate
+        // the request was actually billed at).
+        let flex_p = ModelPricing {
+            flex_input_per_million: Some(0.5),
+            flex_output_per_million: Some(1.0),
+            ..p.clone()
+        };
+        let bd_flex = compute_cost_full(
+            &usage,
+            Some(&flex_p),
+            Some(&flex_p),
+            1.0,
+            true,
+            false,
+            PassEffects::default(),
+            500,
+        );
+        assert!((bd_flex.minify_saved_est_usd - 0.0005).abs() < 1e-12);
+    }
+    // --- Feature B: class-gated reasoning-token cap ---
+
+    fn reasoning_model_info(caps: Vec<tt_shared::pricing::Capability>) -> tt_shared::ModelInfo {
+        tt_shared::ModelInfo {
+            id: "o3-mini".into(),
+            provider: "shape-test".into(),
+            capabilities: caps,
+            max_input_tokens: 100_000,
+            max_output_tokens: 100_000,
+        }
+    }
+
+    /// Effort-arm matrix: lower-only semantics, the provider-default
+    /// assumption on Reasoning-capable models, never-raise, unknown-value and
+    /// non-reasoning-model refusals.
+    #[test]
+    fn maybe_cap_reasoning_effort_matrix() {
+        use tt_shared::pricing::Capability;
+        let p = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+        let info = reasoning_model_info(vec![Capability::Text, Capability::Reasoning]);
+
+        // high → low: capped + token.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.reasoning_effort = Some("high".into());
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("low"), None, &p, Some(&info), "r", &mut w);
+        assert!(applied);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(w, vec!["reasoning_capped:reasoning_effort:low".to_string()]);
+
+        // Absent effort + Reasoning-capable model + cap low: provider default
+        // ("medium") is assumed and lowered.
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("low"), None, &p, Some(&info), "r", &mut w);
+        assert!(applied);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(w, vec!["reasoning_capped:reasoning_effort:low".to_string()]);
+
+        // Absent effort + cap medium: default medium is AT the cap → silent no-op.
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("medium"), None, &p, Some(&info), "r", &mut w);
+        assert!(!applied);
+        assert_eq!(req.reasoning_effort, None, "no injection at-or-below cap");
+        assert!(w.is_empty(), "{w:?}");
+
+        // low + cap medium: NEVER raise.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.reasoning_effort = Some("low".into());
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("medium"), None, &p, Some(&info), "r", &mut w);
+        assert!(!applied);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("low"));
+        assert!(w.is_empty(), "{w:?}");
+
+        // Unknown requester effort value: refuse with a token, never rewrite.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.reasoning_effort = Some("turbo".into());
+        let mut w = Vec::new();
+        let applied =
+            maybe_cap_reasoning(&mut req, Some("low"), None, &p, Some(&info), "r", &mut w);
+        assert!(!applied);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("turbo"));
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:unknown_effort:turbo".to_string()]
+        );
+
+        // Non-Reasoning model + absent effort: never inject reasoning_effort
+        // into a model that may reject it.
+        let text_info = reasoning_model_info(vec![Capability::Text]);
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(
+            &mut req,
+            Some("low"),
+            None,
+            &p,
+            Some(&text_info),
+            "r",
+            &mut w,
+        );
+        assert!(!applied);
+        assert_eq!(req.reasoning_effort, None);
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:not_reasoning:gpt-4o".to_string()]
+        );
+
+        // Unknown model (no catalog info) + absent effort: same refusal.
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, Some("low"), None, &p, None, "r", &mut w);
+        assert!(!applied);
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:not_reasoning:gpt-4o".to_string()]
+        );
+    }
+
+    /// The HARD class gate wins first: a code-classified request with BOTH
+    /// caps configured is untouched and carries ONLY the class token.
+    #[test]
+    fn maybe_cap_reasoning_class_gate_wins() {
+        use tt_shared::pricing::Capability;
+        let p = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+        let info = reasoning_model_info(vec![Capability::Reasoning]);
+        let mut req = req_with_messages(vec![user("Refactor this module and debug the crash.")]);
+        req.reasoning_effort = Some("high".into());
+        req.extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"enabled","budget_tokens":30000}),
+        );
+        let before = serde_json::to_string(&req).unwrap();
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(
+            &mut req,
+            Some("low"),
+            Some(8192),
+            &p,
+            Some(&info),
+            "r",
+            &mut w,
+        );
+        assert!(!applied);
+        assert_eq!(serde_json::to_string(&req).unwrap(), before, "untouched");
+        assert_eq!(w, vec!["reasoning_cap_skipped:class:code".to_string()]);
+    }
+
+    /// Thinking-budget arm: an enabled config above the cap is lowered in
+    /// place; below-cap / disabled configs are untouched; thinking is NEVER
+    /// enabled; `max_tokens` / `max_completion_tokens` are NEVER mutated.
+    #[test]
+    fn maybe_cap_reasoning_thinking_budget() {
+        let p = ShapeProvider {
+            schema: true,
+            // Anthropic-like surface: no reasoning_effort lever.
+            drops: &["reasoning_effort"],
+        };
+
+        // Above-cap budget → rewritten to the cap.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.max_tokens = Some(50_000);
+        req.max_completion_tokens = Some(40_000);
+        req.extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"enabled","budget_tokens":30000}),
+        );
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, None, Some(8192), &p, None, "r", &mut w);
+        assert!(applied);
+        assert_eq!(
+            req.extra["thinking"],
+            serde_json::json!({"type":"enabled","budget_tokens":8192})
+        );
+        assert_eq!(w, vec!["reasoning_capped:thinking_budget:8192".to_string()]);
+        assert_eq!(req.max_tokens, Some(50_000), "max_tokens NEVER mutated");
+        assert_eq!(req.max_completion_tokens, Some(40_000));
+
+        // Below-cap budget → untouched, silent.
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.max_tokens = Some(50_000);
+        req.extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"enabled","budget_tokens":2048}),
+        );
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, None, Some(8192), &p, None, "r", &mut w);
+        assert!(!applied);
+        assert_eq!(
+            req.extra["thinking"],
+            serde_json::json!({"type":"enabled","budget_tokens":2048})
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(req.max_tokens, Some(50_000));
+
+        // Disabled thinking → untouched (NEVER enable thinking).
+        let mut req = req_with_messages(vec![user("hi")]);
+        req.extra
+            .insert("thinking".into(), serde_json::json!({"type":"disabled"}));
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, None, Some(8192), &p, None, "r", &mut w);
+        assert!(!applied);
+        assert_eq!(
+            req.extra["thinking"],
+            serde_json::json!({"type":"disabled"})
+        );
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:unsupported:shape-test".to_string()],
+            "a disabled config is no lever — the surface is honestly unsupported"
+        );
+        assert_eq!(req.max_tokens, None, "max_tokens NEVER mutated");
+    }
+
+    /// Neither lever exists (provider drops reasoning_effort AND no thinking
+    /// config) while a cap is configured → one honest unsupported token.
+    #[test]
+    fn maybe_cap_reasoning_unsupported_surface() {
+        let p = ShapeProvider {
+            schema: true,
+            drops: &["reasoning_effort"],
+        };
+        let mut req = req_with_messages(vec![user("hi")]);
+        let before = serde_json::to_string(&req).unwrap();
+        let mut w = Vec::new();
+        let applied = maybe_cap_reasoning(&mut req, Some("low"), Some(8192), &p, None, "r", &mut w);
+        assert!(!applied);
+        assert_eq!(serde_json::to_string(&req).unwrap(), before, "untouched");
+        assert_eq!(
+            w,
+            vec!["reasoning_cap_skipped:unsupported:shape-test".to_string()]
+        );
+
+        // Both caps None → fully silent.
+        let mut req = req_with_messages(vec![user("hi")]);
+        let mut w = Vec::new();
+        assert!(!maybe_cap_reasoning(
+            &mut req, None, None, &p, None, "r", &mut w
+        ));
+        assert!(w.is_empty());
     }
 }

@@ -35,7 +35,7 @@
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use tt_routing::{validate_capability, validate_shadow_model, NewRoute};
+use tt_routing::{validate_capability, validate_output_shaping, validate_shadow_model, NewRoute};
 use tt_shared::model_catalog::model_catalog;
 use uuid::Uuid;
 
@@ -158,6 +158,9 @@ impl Tool for AddRouteTool {
         .map_err(|e| McpError::InvalidParams(e.to_string()))?;
         validate_shadow_model(&spec.then, |m| catalog.all().iter().any(|x| x.id == m))
             .map_err(|e| McpError::InvalidParams(e.to_string()))?;
+        // Phase 3.1/3.2: reject malformed output-shaping caps locally (the
+        // gateway's POST /v1/routes re-validates as the final authority).
+        validate_output_shaping(&spec.then).map_err(|e| McpError::InvalidParams(e.to_string()))?;
 
         let url = format!("{}/v1/routes", self.gateway_base.trim_end_matches('/'));
         let resp = self

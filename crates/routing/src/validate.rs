@@ -22,6 +22,10 @@ pub enum ValidationError {
     InvalidPauseFloor { got: f64 },
     #[error("pause_min_verdicts must be >= 1")]
     InvalidPauseMinVerdicts,
+    #[error("reasoning_max_effort must be \"low\" or \"medium\", got {got:?}")]
+    InvalidReasoningEffortCap { got: String },
+    #[error("reasoning_budget_tokens must be >= 1024 (Anthropic's documented minimum), got {got}")]
+    InvalidThinkingBudgetCap { got: u32 },
 }
 
 /// Reject malformed auto-pause config at route-creation time: a
@@ -37,6 +41,31 @@ pub fn validate_auto_pause(then: &RouteAction) -> Result<(), ValidationError> {
     }
     if then.pause_min_verdicts == Some(0) {
         return Err(ValidationError::InvalidPauseMinVerdicts);
+    }
+    Ok(())
+}
+
+/// Validate the output-shaping cap fields at route-create time (bad config is
+/// bad config — validated even on disabled routes, the auto-pause precedent).
+/// `reasoning_max_effort` must be exactly `"low"` or `"medium"`: a `"high"`
+/// cap is a no-op lie (nothing ranks above high, so it could never lower
+/// anything), and an unknown/misspelled string would silently never act —
+/// reject both at config time instead. `reasoning_budget_tokens` must be at
+/// least 1024 (Anthropic's documented extended-thinking minimum; a smaller
+/// budget would be rejected upstream, so capping TO it could only break
+/// requests). `minify_json` is a plain flag with no bounds.
+pub fn validate_output_shaping(then: &RouteAction) -> Result<(), ValidationError> {
+    if let Some(cap) = then.reasoning_max_effort.as_deref() {
+        if cap != "low" && cap != "medium" {
+            return Err(ValidationError::InvalidReasoningEffortCap {
+                got: cap.to_string(),
+            });
+        }
+    }
+    if let Some(budget) = then.reasoning_budget_tokens {
+        if budget < 1024 {
+            return Err(ValidationError::InvalidThinkingBudgetCap { got: budget });
+        }
     }
     Ok(())
 }
@@ -109,6 +138,9 @@ mod tests {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         }
     }
     fn vision_model(id: &str) -> ModelInfo {
@@ -218,6 +250,61 @@ mod tests {
         b.auto_pause = false;
         b.pause_floor_pass_rate = Some(2.0);
         assert!(validate_auto_pause(&b).is_err());
+    }
+
+    /// Output-shaping cap bounds: `reasoning_max_effort` accepts only
+    /// `"low"`/`"medium"` (a `"high"` cap is a no-op lie; unknown strings would
+    /// silently never act); `reasoning_budget_tokens` must be >= 1024
+    /// (Anthropic's documented floor). Validated even on disabled routes —
+    /// bad config is bad config (the auto-pause precedent).
+    #[test]
+    fn validate_output_shaping_bounds() {
+        // No output-shaping config at all → OK.
+        assert!(validate_output_shaping(&action("m")).is_ok());
+
+        let mut a = action("m");
+        for ok in ["low", "medium"] {
+            a.reasoning_max_effort = Some(ok.into());
+            assert!(
+                validate_output_shaping(&a).is_ok(),
+                "cap {ok:?} must be accepted"
+            );
+        }
+        for bad in ["high", "", "bogus", "LOW "] {
+            a.reasoning_max_effort = Some(bad.into());
+            assert!(
+                matches!(
+                    validate_output_shaping(&a),
+                    Err(ValidationError::InvalidReasoningEffortCap { ref got }) if got == bad
+                ),
+                "cap {bad:?} must be rejected with InvalidReasoningEffortCap"
+            );
+        }
+        a.reasoning_max_effort = None;
+        assert!(validate_output_shaping(&a).is_ok());
+
+        let mut b = action("m");
+        b.reasoning_budget_tokens = Some(1024);
+        assert!(validate_output_shaping(&b).is_ok(), "1024 is the floor");
+        b.reasoning_budget_tokens = Some(8192);
+        assert!(validate_output_shaping(&b).is_ok());
+        for bad in [0u32, 1, 1023] {
+            b.reasoning_budget_tokens = Some(bad);
+            assert!(
+                matches!(
+                    validate_output_shaping(&b),
+                    Err(ValidationError::InvalidThinkingBudgetCap { got }) if got == bad
+                ),
+                "budget {bad} must be rejected with InvalidThinkingBudgetCap"
+            );
+        }
+        b.reasoning_budget_tokens = None;
+        assert!(validate_output_shaping(&b).is_ok());
+
+        // minify_json carries no bounds — always valid.
+        let mut c = action("m");
+        c.minify_json = true;
+        assert!(validate_output_shaping(&c).is_ok());
     }
 
     /// A `shadow_model` with no `traffic_pct` (100% shadow, primary still serves)

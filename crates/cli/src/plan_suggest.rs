@@ -63,6 +63,9 @@ pub fn suggestions_to_proposed_routes(
                 auto_pause: false,
                 pause_floor_pass_rate: None,
                 pause_min_verdicts: None,
+                minify_json: false,
+                reasoning_max_effort: None,
+                reasoning_budget_tokens: None,
             },
         })
         .collect()

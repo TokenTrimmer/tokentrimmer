@@ -218,6 +218,9 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -255,6 +258,9 @@ fn conservative_when_pricing_missing() {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
     let input = input_with_routes(vec![req], vec![route], HashMap::new(), 100);
@@ -296,6 +302,9 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -334,6 +343,9 @@ fn cross_provider_target_absent_is_conservative() {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
     let result = replay(input_with_routes(
@@ -371,6 +383,9 @@ fn route_over_ceiling_is_blocked_not_saved() {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -398,6 +413,9 @@ fn batch_route(target: &str, model_in: &str) -> ProposedRoute {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
             target_model: target.into(),
             fallbacks: Vec::new(),
             disable_cache: false,
@@ -631,6 +649,9 @@ fn rerouted_latency_projected_from_target_model_history() {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
     let mut pricing = HashMap::new();
@@ -716,6 +737,9 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
 
@@ -840,6 +864,9 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
     let route_b = ProposedRoute {
@@ -863,6 +890,9 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             auto_pause: false,
             pause_floor_pass_rate: None,
             pause_min_verdicts: None,
+            minify_json: false,
+            reasoning_max_effort: None,
+            reasoning_budget_tokens: None,
         },
     };
 
