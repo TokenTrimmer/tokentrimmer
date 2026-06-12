@@ -125,6 +125,22 @@ impl ModelPricing {
             .unwrap_or(self.output_per_million);
         Some((input, output))
     }
+
+    /// Whether this model has a Batch API tier in the catalog (presence of a
+    /// batch input rate). Drives the advisory batch-eligibility route action.
+    #[must_use]
+    pub fn batch_eligible(&self) -> bool {
+        self.batch_input_per_million.is_some()
+    }
+
+    /// `(batch_input_per_million, batch_output_per_million)` when the model is
+    /// batch-eligible, else `None`. Both must be present together — a
+    /// half-populated row prices nothing (no real rate, no claim).
+    #[must_use]
+    pub fn batch_rates_per_million(&self) -> Option<(f64, f64)> {
+        let input = self.batch_input_per_million?;
+        self.batch_output_per_million.map(|output| (input, output))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -505,6 +521,35 @@ mod catalog_tests {
         assert_eq!(groq.batch_input_per_million, None);
         assert_eq!(groq.batch_output_per_million, None);
         assert_eq!(groq.prompt_cache_min_tokens, None);
+    }
+
+    /// The batch helpers mirror the flex helpers: eligibility is catalog-driven
+    /// (presence of a batch input rate) and `batch_rates_per_million` returns
+    /// the real catalog pair — never a fabricated 0.5× of standard.
+    #[test]
+    fn batch_rates_and_eligibility_from_catalog() {
+        let c = catalog();
+
+        let gpt = c.latest("openai", "gpt-5.5").expect("present");
+        assert!(gpt.batch_eligible(), "gpt-5.5 carries a batch tier");
+        assert_eq!(
+            gpt.batch_rates_per_million(),
+            Some((2.50, 15.00)),
+            "gpt-5.5 batch = 50% of $5/$30"
+        );
+
+        let opus = c.latest("anthropic", "claude-opus-4-8").expect("present");
+        assert!(opus.batch_eligible());
+        assert_eq!(
+            opus.batch_rates_per_million(),
+            Some((2.50, 12.50)),
+            "opus batch = 50% of $5/$25"
+        );
+
+        // No batch tier in the catalog → ineligible, no rates, no claim.
+        let groq = c.latest("groq", "llama-3.1-8b-instant").expect("present");
+        assert!(!groq.batch_eligible(), "Groq has no batch tier");
+        assert_eq!(groq.batch_rates_per_million(), None);
     }
 
     /// `cache_write_rate_per_million` resolves the documented per-TTL premium:

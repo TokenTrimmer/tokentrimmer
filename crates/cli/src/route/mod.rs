@@ -23,6 +23,9 @@ pub struct AddArgs {
     pub when_p95_gt: Option<u32>,
     pub max_cost: Option<f64>,
     pub disable_cache: bool,
+    /// `--batch`: advisory batch-eligibility marker (Batch Lane forgone-savings
+    /// attribution; never applied to streaming/interactive requests).
+    pub batch: bool,
     pub priority: u32,
     pub name: Option<String>,
     pub fallback: Vec<String>,
@@ -80,6 +83,9 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     }
     if let Some(v) = args.max_cost {
         then.insert("max_cost_usd".into(), json!(v));
+    }
+    if args.batch {
+        then.insert("batch".into(), json!(true));
     }
     Ok(json!({
         "name": args.name.clone().unwrap_or_else(|| default_name(args, &target)),
@@ -264,6 +270,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -291,6 +298,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 50,
             name: Some("vis".into()),
             fallback: vec!["gpt-4o".into()],
@@ -320,6 +328,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -343,6 +352,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: true,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -351,6 +361,39 @@ mod tests {
         .unwrap();
         assert_eq!(body["when"]["tag_equals"], "sensitive");
         assert_eq!(body["then"]["disable_cache"], true);
+    }
+
+    /// `--batch` maps to `then.batch = true` (the advisory batch-eligibility
+    /// route action); without the flag the key is absent entirely — the wire
+    /// shape stays back-compat (`batch` is skip-serialized when false).
+    #[test]
+    fn route_add_batch_flag_maps_to_then_batch() {
+        let args = |batch: bool| AddArgs {
+            always: Some("gpt-4o-mini".into()),
+            from: None,
+            to: None,
+            when_has_images: false,
+            when_has_audio: false,
+            when_tag: None,
+            when_prompt_contains: vec![],
+            when_cost_gt: None,
+            when_cost_lt: None,
+            when_p95_gt: None,
+            max_cost: None,
+            disable_cache: false,
+            batch,
+            priority: 100,
+            name: None,
+            fallback: vec![],
+            disabled: false,
+        };
+        let body = build_new_route(&args(true)).unwrap();
+        assert_eq!(body["then"]["batch"], true, "--batch must set then.batch");
+        let body = build_new_route(&args(false)).unwrap();
+        assert!(
+            body["then"].get("batch").is_none(),
+            "without --batch the key must be absent"
+        );
     }
 
     #[test]
@@ -368,6 +411,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -393,6 +437,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -420,6 +465,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -444,6 +490,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -469,6 +516,7 @@ mod tests {
             when_p95_gt: Some(1500),
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -493,6 +541,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: None,
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],
@@ -517,6 +566,7 @@ mod tests {
             when_p95_gt: None,
             max_cost: Some(0.1),
             disable_cache: false,
+            batch: false,
             priority: 100,
             name: None,
             fallback: vec![],

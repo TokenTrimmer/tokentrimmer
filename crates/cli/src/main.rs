@@ -352,6 +352,10 @@ enum RouteAction {
         /// Make matched requests skip TokenTrimmer's cache entirely (privacy).
         #[arg(long)]
         disable_cache: bool,
+        /// Advisory batch-eligibility marker (Batch Lane forgone-savings
+        /// attribution; never applied to streaming/interactive requests).
+        #[arg(long)]
+        batch: bool,
         #[arg(long, default_value_t = 100)]
         priority: u32,
         #[arg(long)]
@@ -843,6 +847,7 @@ async fn main() -> anyhow::Result<()> {
                     when_p95_gt,
                     max_cost,
                     disable_cache,
+                    batch,
                     priority,
                     name,
                     fallback,
@@ -860,6 +865,7 @@ async fn main() -> anyhow::Result<()> {
                     when_p95_gt,
                     max_cost,
                     disable_cache,
+                    batch,
                     priority,
                     name,
                     fallback,
@@ -1433,6 +1439,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     disable_cache: false,
                     max_cost_usd: None,
                     flex: false,
+                    batch: false,
                     compress: false,
                     redact: false,
                     traffic_pct: None,

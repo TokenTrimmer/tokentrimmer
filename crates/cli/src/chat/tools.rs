@@ -137,6 +137,12 @@ async fn send_round(
         .chat()
         .model(&conv.model)
         .messages(conv.wire_messages())
+        // The /tools loop is non-streamed but a human is still waiting on it
+        // (and `tt advise` reuses run_tool_turn): declare interactivity so the
+        // gateway never marks the CLI's own traffic batch-eligible — a ≤24h
+        // Batch-API window breaks any interactive UX. Enforced in code here,
+        // not docs.
+        .interactive()
         .tools(tools.to_vec());
     if force_no_tools {
         builder = builder.tool_choice(tt_client::ToolChoice::Auto("none".to_string()));
@@ -326,7 +332,11 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .body_contains("\"role\":\"tool\"");
+                .body_contains("\"role\":\"tool\"")
+                // Every /tools round declares interactivity (a human is
+                // waiting) — and `tt advise` inherits this via run_tool_turn:
+                // the CLI's own traffic is never batch-eligible, in code.
+                .header("x-tokentrimmer-interactive", "1");
             then.status(200)
                 .header("content-type", "application/json")
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")
@@ -339,8 +349,11 @@ mod tests {
                 }));
         });
         // Round 1 (no tool result yet): the broad mock returns a tool_call.
+        // Also pinned on the interactive header — round 1 declares it too.
         server.mock(|when, then| {
-            when.method(POST).path("/v1/chat/completions");
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .header("x-tokentrimmer-interactive", "1");
             then.status(200)
                 .header("content-type", "application/json")
                 .header("x-tokentrimmer-model-used", "gpt-4o-mini")

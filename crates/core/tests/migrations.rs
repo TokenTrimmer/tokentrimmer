@@ -126,6 +126,21 @@ fn migrator_includes_cache_bust_penalty_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_request_logs_batch_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let seventeenth = migrations
+        .iter()
+        .find(|m| m.version == 17)
+        .expect("migration version 17 not found");
+    let desc = seventeenth.description.to_lowercase();
+    assert!(
+        desc.contains("batch"),
+        "migration 0017 description is '{}', expected to mention batch",
+        seventeenth.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -226,6 +241,8 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         traffic_split_arm: None,
         cache_read_input_tokens: Some(80),
         cache_creation_input_tokens: Some(20),
+        batch_eligible: false,
+        batch_forgone_usd: 0.0,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");
@@ -272,6 +289,100 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
 
     // Cleanup so reruns / other DB tests see a stable table.
     sqlx::query("DELETE FROM request_logs WHERE tag = 'db-cache-tokens'")
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}
+
+/// DB-gated: a real `PostgresRequestLogWriter` INSERT against the migrated
+/// schema round-trips the advisory batch-eligibility columns (migration
+/// 0017). `batch_eligible = true` + a nonzero forgone discount survive
+/// write→read; the NOT NULL DEFAULTs cover legacy/unmarked rows (a row
+/// written with `false`/`0.0` reads back exactly that). Catches column-order
+/// or type drift in INSERT_SQL that the parser-based bind-count guard cannot.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+async fn request_log_insert_round_trips_batch_columns() {
+    use tt_telemetry::request_logs::{
+        postgres::PostgresRequestLogWriter, RequestLogRow, RequestLogWriter,
+    };
+    use uuid::Uuid;
+
+    let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+    tt_core::migrate_only(&url).await.expect("migrate");
+    let pool = tt_core::connect(&url, 2).await.expect("connect");
+    let writer = PostgresRequestLogWriter::new(pool.clone());
+
+    let marked = RequestLogRow {
+        id: Uuid::now_v7(),
+        org_id: Uuid::nil(),
+        api_key_id: Uuid::nil(),
+        ts: chrono::Utc::now(),
+        provider: "test-provider".into(),
+        model: "batch-eligible".into(),
+        input_tokens: 1000,
+        output_tokens: 500,
+        cached_tokens: 0,
+        cost_usd: 0.025,
+        baseline_cost_usd: 0.025,
+        provider_cache_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
+        cached: false,
+        cache_layer: None,
+        route_id: None,
+        latency_ms: 5,
+        upstream_latency_ms: None,
+        status: 200,
+        tag: Some("db-batch-columns".into()),
+        error_class: None,
+        trace_id: None,
+        truncated: false,
+        shadow_model: None,
+        shadow_cost_usd: None,
+        traffic_split_arm: None,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+        batch_eligible: true,
+        batch_forgone_usd: 0.0125,
+    };
+    let marked_id = marked.id;
+    writer.write(marked.clone()).await.expect("insert marked");
+
+    let mut unmarked = marked;
+    unmarked.id = Uuid::now_v7();
+    unmarked.batch_eligible = false;
+    unmarked.batch_forgone_usd = 0.0;
+    let unmarked_id = unmarked.id;
+    writer.write(unmarked).await.expect("insert unmarked");
+
+    let fetch = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (bool, f64)>(
+                "SELECT batch_eligible, batch_forgone_usd::FLOAT8 \
+                 FROM request_logs WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch row")
+        }
+    };
+
+    let (eligible, forgone) = fetch(marked_id).await;
+    assert!(eligible, "batch_eligible=true must persist");
+    assert!(
+        (forgone - 0.0125).abs() < 1e-9,
+        "forgone discount must round-trip, got {forgone}"
+    );
+    assert_eq!(
+        fetch(unmarked_id).await,
+        (false, 0.0),
+        "unmarked traffic persists as false/0 (the NOT NULL DEFAULTs)"
+    );
+
+    // Cleanup so reruns / other DB tests see a stable table.
+    sqlx::query("DELETE FROM request_logs WHERE tag = 'db-batch-columns'")
         .execute(&pool)
         .await
         .expect("cleanup");
