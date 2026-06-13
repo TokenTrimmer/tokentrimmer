@@ -40,7 +40,13 @@ name: deploy (gateway)
 on:
   push:
     branches: [main]
-  workflow_dispatch: # allow a manual re-run of the pipeline (still gated at prod)
+  workflow_dispatch: # allow a manual re-run of the pipeline
+    inputs:
+      deploy_prod:
+        description: "Also deploy production after staging succeeds"
+        required: false
+        default: false
+        type: boolean
 
 # One deploy at a time; never cancel an in-flight deploy.
 concurrency:
@@ -122,6 +128,7 @@ jobs:
   prod:
     name: prod (migrate → deploy)
     needs: staging
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
