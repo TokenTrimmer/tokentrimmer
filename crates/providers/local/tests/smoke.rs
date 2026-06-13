@@ -83,7 +83,7 @@ async fn strips_backend_prefix_and_reaches_loopback() {
     let mock = server.mock(|when, then| {
         when.method(POST)
             .path("/chat/completions")
-            .json_body_partial(r#"{"model":"llama3.1:8b"}"#);
+            .json_body_includes(r#"{"model":"llama3.1:8b"}"#);
         then.status(200)
             .header("Content-Type", "application/json")
             .body(success_body());
@@ -110,7 +110,7 @@ async fn bare_model_is_forwarded_unchanged() {
     let mock = server.mock(|when, then| {
         when.method(POST)
             .path("/chat/completions")
-            .json_body_partial(r#"{"model":"llama3.1:8b"}"#);
+            .json_body_includes(r#"{"model":"llama3.1:8b"}"#);
         then.status(200)
             .header("Content-Type", "application/json")
             .body(success_body());

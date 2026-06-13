@@ -359,7 +359,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, McpError::Unauthorized(_)));
         assert_eq!(err.code(), -32001);
-        assert_eq!(m.hits_async().await, 0);
+        assert_eq!(m.calls_async().await, 0);
     }
 
     #[tokio::test]

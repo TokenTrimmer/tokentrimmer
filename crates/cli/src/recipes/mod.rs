@@ -435,7 +435,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, recipe.routes.len());
-        m.assert_hits(recipe.routes.len());
+        m.assert_calls(recipe.routes.len());
     }
 
     #[tokio::test]
