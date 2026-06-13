@@ -103,10 +103,8 @@ async fn does_not_send_authorization_bearer_header() {
     let mock = server.mock(|when, then| {
         when.method(POST)
             .path("/openai/deployments/dep/chat/completions")
-            .matches(|req| {
-                !req.headers
-                    .as_deref()
-                    .unwrap_or_default()
+            .is_true(|req| {
+                !req.headers_vec()
                     .iter()
                     .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
             });

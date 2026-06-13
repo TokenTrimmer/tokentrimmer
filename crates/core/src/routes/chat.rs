@@ -5169,6 +5169,9 @@ fn request_log_for_l1_hit(
 
 /// Build the `request_logs` row for an L2 cache hit. `baseline_cost_usd` is
 /// the catalog-derived baseline resolved by [`l2_entry_baseline`].
+// Row builder takes the L2-hit row's independent inputs directly; bundling
+// them into a param struct would add indirection without improving clarity.
+#[allow(clippy::too_many_arguments)]
 fn request_log_for_l2_hit(
     entry: &CacheEntry,
     ctx: &RequestContext,

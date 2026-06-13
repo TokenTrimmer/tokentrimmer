@@ -321,7 +321,7 @@ mod tests {
         assert!(matches!(err, McpError::InvalidParams(_)));
         assert_eq!(err.code(), -32602);
         // The gateway must NOT have been called.
-        assert_eq!(m.hits_async().await, 0);
+        assert_eq!(m.calls_async().await, 0);
     }
 
     #[tokio::test]
@@ -348,7 +348,7 @@ mod tests {
         assert!(matches!(err, McpError::InvalidParams(_)));
         assert_eq!(err.code(), -32602);
         // The gateway must NOT have been called.
-        assert_eq!(m.hits_async().await, 0);
+        assert_eq!(m.calls_async().await, 0);
     }
 
     #[tokio::test]
@@ -466,7 +466,7 @@ mod tests {
         assert!(matches!(err, McpError::Unauthorized(_)));
         assert_eq!(err.code(), -32001);
         // Must not have touched the gateway.
-        assert_eq!(m.hits_async().await, 0);
+        assert_eq!(m.calls_async().await, 0);
     }
 
     #[tokio::test]

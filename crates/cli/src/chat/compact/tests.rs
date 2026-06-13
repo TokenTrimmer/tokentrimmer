@@ -169,7 +169,7 @@ async fn compaction_fires_only_every_k_turns() {
         maybe_compact(&client, &mut conv, &mut cstate, &mut ctx, &mut ledger).await;
     }
     assert_eq!(
-        mock.hits_async().await,
+        mock.calls_async().await,
         2,
         "compaction must fire once per K, not per turn"
     );
@@ -213,7 +213,7 @@ async fn net_negative_compaction_is_skipped_with_warning_and_no_history_change()
     let out = compact_now(&client, &mut conv, &mut cstate, &mut ctx, &mut ledger).await;
     assert_eq!(out, CompactOutcome::SkippedNetNegative);
     assert_eq!(
-        mock.hits_async().await,
+        mock.calls_async().await,
         0,
         "skip must make zero gateway calls"
     );
@@ -305,7 +305,7 @@ async fn no_compact_call_when_disabled() {
         cstate.note_turn();
         maybe_compact(&client, &mut conv, &mut cstate, &mut ctx, &mut ledger).await;
     }
-    assert_eq!(mock.hits_async().await, 0);
+    assert_eq!(mock.calls_async().await, 0);
     assert!(conv.summary.is_none());
     assert_eq!(ledger.compaction_calls, 0);
 }
@@ -353,5 +353,5 @@ async fn compact_now_with_nothing_to_fold_is_noop() {
     let mut ledger = Ledger::default();
     let out = compact_now(&client, &mut conv, &mut cstate, &mut ctx, &mut ledger).await;
     assert_eq!(out, CompactOutcome::NothingToFold);
-    assert_eq!(mock.hits_async().await, 0);
+    assert_eq!(mock.calls_async().await, 0);
 }
