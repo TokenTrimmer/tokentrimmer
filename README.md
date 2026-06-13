@@ -79,7 +79,7 @@ One binary, every surface:
 | `tt route` | Manage routing rules on a gateway (list / show / add / rm) |
 | `tt models` | List a gateway's model catalog (context windows, capabilities, pricing) |
 | `tt embed` | Embeddings through a gateway, with a cost summary |
-| `tt retrieval` | RAG corpus management (doc-add, search) |
+| `tt retrieval` | RAG doc-add / search (EXPERIMENTAL, in-process — not persisted) |
 | `tt init` | Install TokenTrimmer best-practices config into a repo |
 | `tt mcp` | Run the MCP server (stdio or SSE transport) |
 | `tt login` / `logout` / `whoami` | Manage the locally stored API key |

@@ -320,8 +320,11 @@ Session log is JSONL at `~/.tokentrimmer/sessions/YYYY-MM-DD.jsonl`; on Ctrl-C t
 
 Ingest docs, retrieve relevant chunks, and (server-side) splice them into prompts via `<retrievable corpus="X" k="N">…</retrievable>` tags.
 
+> **EXPERIMENTAL.** `tt retrieval doc-add` and `tt retrieval search` run against an **in-process store**: the corpus lives only inside the running process and is **discarded when the command exits**. A `doc-add` does **not** persist, and a later `search` (a separate process) always starts from an empty store — so the two commands **cannot see each other's data**. The example below illustrates the chunking/embedding path, not a durable ingest→query workflow; persistent corpora require the Postgres-backed store + cloud endpoints (follow-up). Each invocation prints a one-line `note:` to stderr restating this.
+
 ```bash
-# In-process CLI (dev only; not yet persisted)
+# EXPERIMENTAL in-process CLI (dev only; NOT persisted — doc-add and search
+# run in separate processes and cannot see each other's data)
 export OPENAI_API_KEY=sk-...
 tt retrieval doc-add my-docs ./docs/architecture.md
 tt retrieval search my-docs "How does the gateway dispatch?" --k 5

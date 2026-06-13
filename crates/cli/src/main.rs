@@ -258,7 +258,7 @@ enum Command {
         #[arg(long)]
         tt_api_base: Option<String>,
     },
-    /// RAG corpus management.
+    /// RAG corpus management. EXPERIMENTAL: in-process only, not persisted.
     Retrieval {
         #[command(subcommand)]
         action: RetrievalAction,
@@ -308,14 +308,16 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RetrievalAction {
-    /// Add a doc to a corpus (in-process; not yet persisted).
+    /// EXPERIMENTAL: add a doc to a corpus. In-process only — the corpus lives
+    /// in this process's memory and is discarded on exit; nothing is persisted.
     DocAdd {
         corpus: String,
         path: String,
         #[arg(long, env = "OPENAI_API_KEY")]
         openai_key: String,
     },
-    /// Ad-hoc search.
+    /// EXPERIMENTAL: ad-hoc search over an in-process corpus. Each invocation
+    /// starts empty, so a separate `doc-add` run is never visible here.
     Search {
         corpus: String,
         query: String,
