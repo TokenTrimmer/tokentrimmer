@@ -546,6 +546,7 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Diff-Failed-Cost-Usd` | on dispatched/cached responses — the realized cost of a FAILED `then.diff` patch attempt on a fail-closed double dispatch. Already **folded into** `X-TokenTrimmer-Cost-Usd` (the retry is real invoice spend for this trace); duplicated here so the retry tax can be unpicked. `0.000000` unless a patch failed on this trace. | `0.0106` |
 | `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
 | `X-TokenTrimmer-Warnings` | on dispatched responses when the gateway altered the request, and on cache-hit responses carrying pre-dispatch tokens | `param_dropped:frequency_penalty,param_dropped:n` |
+| `X-TokenTrimmer-Captured` | present **only** when this trace's body was persisted to the per-org **opt-in encrypted body-capture** sink — i.e. the hosted feature is armed AND your org enabled capture in its settings (the gateway checks the per-org opt-in before stamping the header, so it never appears for orgs that have not opted in). Always `true` when present; **absent** on every default-path response (capture off by default) and on cache-hit replays (no live body to capture). Non-streaming traces persist request **and** response; streaming traces persist the **request** body only. See [§19 — does Gateway log my prompts?](#19-faq) and the [hosted privacy spec](tokentrimmer-architecture-spec-v1.md#161-customer-data). | `true` |
 
 `X-TokenTrimmer-Trace-Id` and `X-TokenTrimmer-Latency-Ms` are present on every
 response (success or error). The cost/provider/model/cache headers are attached on
@@ -1321,7 +1322,13 @@ If your route has a fallback chain configured, Gateway tries each fallback in or
 Tokens used × per-model pricing from our curated pricing table (a snapshot embedded at build time and refreshed on each release, not auto-refreshed). Reported in `X-TokenTrimmer-Cost-Usd` and reconciled against actual provider invoices monthly.
 
 **Q: Does Gateway log my prompts?**
-No, not by default. Only request metadata (token counts, model, route, latency). Opt-in per API key if you want raw body logging for Plan quality analysis.
+No, not by default. By default the gateway records only request **metadata** (token counts, model, route, latency) — never prompt or response bodies. There is one opt-in exception: hosted orgs can enable **encrypted body capture** (per org, off unless you turn it on) so the `/logs` replay tooling can show real request/response bodies. When enabled, the gateway:
+
+- applies your route's **redaction** pass (`then.redact`) *before* anything is stored, so masked secrets never reach the capture table;
+- **encrypts** the request and response bodies with XChaCha20-Poly1305 under a per-org key derived from the operator's `TT_MASTER_KEY` — the plaintext never lands in Postgres;
+- caps each stored body at a configurable size (`TT_BODY_CAPTURE_MAX_BYTES`, default 256 KiB): over-cap bodies are truncated and an explicit `[tt-body-capture:truncated original_bytes=…]` marker is appended inside the encrypted payload, while the original byte length is still recorded honestly;
+- enforces **retention** (1–30 days, per-org setting; default 7) after which rows expire;
+- stamps `X-TokenTrimmer-Captured: true` only on responses whose body was actually persisted — the gateway checks your org's per-org opt-in before stamping, so the header reflects a stored body, never merely an armed deployment. It is **absent** on every default-path response and for orgs that have not opted in. (Streaming traces persist the request body only; non-streaming traces persist request and response.)
 
 **Q: Latency overhead?**
 Sub-30ms p50 on cache miss, sub-10ms on cache hit. Streaming responses pass through chunk-by-chunk.

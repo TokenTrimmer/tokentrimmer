@@ -127,7 +127,10 @@ pub struct AppState {
     pub request_log_writer: Option<Arc<dyn RequestLogWriter>>,
     /// Optional encrypted request/response body-capture writer. Capture is
     /// still controlled per org by `request_body_capture_settings`; wiring this
-    /// writer only arms the best-effort sink.
+    /// writer only arms the best-effort sink. The chat handler consults the
+    /// writer's `is_capture_enabled(org_id)` opt-in probe before persisting a
+    /// body or stamping the `x-tokentrimmer-captured` header, so an armed-but-
+    /// not-opted-in org neither stores a body nor advertises capture.
     pub body_capture_writer: Option<Arc<dyn BodyCaptureWriter>>,
     /// Optional per-org routing engine source. The chat handler asks for the
     /// org's [`tt_routing::RoutingEngine`] before dispatch; on a match it
