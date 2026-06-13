@@ -9,8 +9,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use tt_auth::ApiKeyContext;
 use tt_routing::{
-    validate_auto_pause, validate_capability, validate_output_shaping, validate_shadow_model,
-    NewRoute, NewRoutePause, PausedBy, Route, RoutingStore,
+    validate_agentic_budget, validate_auto_pause, validate_capability, validate_output_shaping,
+    validate_shadow_model, NewRoute, NewRoutePause, PausedBy, Route, RoutingStore,
 };
 use uuid::Uuid;
 
@@ -63,6 +63,13 @@ pub async fn create(
     // #454: a route whose `shadow_model` cannot resolve to a registered provider
     // is rejected at config time (not silently no-op'd at dispatch).
     validate_shadow_model(&spec.then, |m| registry.resolve(m).is_some())
+        .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
+    // Task 2: an opt-in `agentic_budget` whose `route_mechanical_to` (Sub-lever
+    // 3 down-route target) cannot resolve, or whose `keep_recent_pairs` is 0, is
+    // rejected at config time — same fail-at-config discipline as shadow_model
+    // (resolve the target) + the C1 blast-radius bound (keep >= 1 recent
+    // verbatim). No-op when the route declares no `agentic_budget`.
+    validate_agentic_budget(&spec.then, |m| registry.resolve(m).is_some())
         .map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
     // Phase 2.3: malformed auto-pause config (floor outside (0,1], min == 0)
     // is rejected at config time — validated even when auto_pause is false.

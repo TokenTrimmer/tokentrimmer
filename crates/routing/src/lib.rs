@@ -26,8 +26,8 @@ pub use store::{
     InMemoryRoutingStore, NewRoute, NewRoutePause, PausedBy, RoutingStore, RoutingStoreError,
 };
 pub use validate::{
-    validate_auto_pause, validate_capability, validate_output_shaping, validate_shadow_model,
-    ValidationError,
+    validate_agentic_budget, validate_auto_pause, validate_capability, validate_output_shaping,
+    validate_shadow_model, ValidationError,
 };
 
 use serde::{Deserialize, Serialize};
