@@ -15,7 +15,10 @@ Format per entry: ID, date, status, context (what problem), decision (what we ch
 **Decision**: Two repos: `tokentrimmer/tokentrimmer` (public, Apache 2.0; Gateway + Inspect CLI + Plan engine + SDKs) and `tokentrimmer/cloud` (private; dashboard, billing, hosted Inspect tier 2/3, Plan hosted service).
 
 **Consequences**:
-- Type drift between Rust and TS is the biggest failure mode. Mitigated by `bindings-drift-check` CI job that regenerates and diffs.
+- Type drift between Rust and TS is the biggest failure mode. As of 2026-06-12,
+  `crates/ts-types` is only a placeholder and `bindings-drift-check` is not a
+  real regenerate+diff guard; it compiles the placeholder and emits a warning
+  until `ts-rs` generation lands.
 - Cross-repo PRs slow down when a change spans both. Acceptable cost.
 
 **Pointers**: `README.md`; plan file § "Repo Structure".

@@ -1,7 +1,11 @@
-name: bindings drift check
+name: TS bindings placeholder
 
-# Regenerates TS bindings from Rust types and fails if differs from committed.
-# Catches the most common failure mode of the two-language stack.
+# HONESTY NOTE: real TS binding generation is not wired yet. `tt-ts-types` is a
+# reserved placeholder crate with no `ts-rs` derives and no emitted bindings.
+#
+# Keep the historical job name below for branch-protection compatibility, but
+# this workflow is NOT a drift guard. Replace it with a real regenerate+diff job
+# when `crates/ts-types` actually emits files.
 
 on:
   pull_request:
@@ -22,12 +26,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Regenerate bindings
+      - name: Compile placeholder crate
         run: cargo test -p tt-ts-types
-      - name: Fail if bindings drifted
+      - name: Warn that no drift guard exists yet
         run: |
-          if ! git diff --quiet; then
-            echo "::error::TS bindings drifted. Run 'cargo test -p tt-ts-types' locally, commit the result."
-            git diff
-            exit 1
-          fi
+          echo "::warning title=TS bindings not generated::tt-ts-types is still a placeholder. This check does not regenerate or diff TypeScript bindings."

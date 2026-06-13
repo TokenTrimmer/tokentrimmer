@@ -2,10 +2,9 @@
 //!
 //! The intent: emit `.d.ts` files for the wire types (via `ts-rs` derives) into
 //! a `bindings/` dir, gated by a CI bindings-drift check. None of that exists
-//! yet — there are no `ts-rs` derives, no `bindings/` output, and no CI job.
-//! This crate is reserved as a workspace slot so the codegen has a home when the
-//! wire types are wired up; it ships nothing today. Do not depend on it expecting
-//! generated types.
+//! yet — there are no `ts-rs` derives and no `bindings/` output. CI only compiles
+//! this placeholder crate and emits a warning so the absence of a real drift
+//! guard stays visible. Do not depend on it expecting generated types.
 
 #[cfg(test)]
 mod tests {

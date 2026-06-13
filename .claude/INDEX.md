@@ -27,7 +27,7 @@ Editorial counterpart: `.claude/CONTEXT_MAP.md` (curated, hand-edited).
 | `tt-routing` | `crates/routing` | Rule-based routing engine — evaluates per-org routes in priority order to select target model/provider. |
 | `tt-shared` | `crates/shared` | Shared types, errors, and Provider trait for TokenTrimmer. |
 | `tt-telemetry` | `crates/telemetry` | OpenTelemetry setup + audit log primitives (hash-chain + Ed25519 signatures). |
-| `tt-ts-types` | `crates/ts-types` | Emits TypeScript bindings for shared wire types. Consumed by the cloud repo dashboard. |
+| `tt-ts-types` | `crates/ts-types` | Placeholder for future TypeScript bindings; no `ts-rs` output or real drift guard exists yet. |
 
 ## Public surface — top-level pub items per crate
 
@@ -196,4 +196,3 @@ _(no git history yet.)_
 - `./crates/shared/src/lib.rs`
 - `./crates/shared/src/pricing.rs`
 - `./crates/shared/src/provider.rs`
-

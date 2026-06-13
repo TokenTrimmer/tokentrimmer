@@ -47,7 +47,9 @@ Full local CI mirror:
 - Logging: `tracing` crate. NEVER `println!`/`eprintln!` in library code.
 - Async: `tokio`. Stream types: `futures::Stream`.
 - Wire types: live in `crates/shared/src/`. Use those, do not redefine.
-- TS bindings: emitted from Rust via `schemars` + `ts-rs`. Never hand-write bindings.
+- TS bindings: not implemented yet. `crates/ts-types` is a placeholder and the
+  CI check only compiles it with an explicit warning; do not claim generated
+  bindings exist until `ts-rs` output is actually wired.
 - OpenAPI: emitted via `utoipa` on Axum routes.
 - Provider adapters: each in its own crate at `crates/providers/<name>/`. Stateless beyond HTTP client + pricing table.
 - File size target: keep new `.rs` modules under 800 lines. Legacy oversized
