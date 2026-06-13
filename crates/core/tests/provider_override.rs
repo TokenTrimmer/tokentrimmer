@@ -445,6 +445,7 @@ async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                agentic_budget: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: vec!["gpt-4o".into()],
                 disable_cache: false,

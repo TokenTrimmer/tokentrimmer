@@ -233,6 +233,7 @@ fn diff_action() -> RouteAction {
         minify_json: false,
         reasoning_max_effort: None,
         reasoning_budget_tokens: None,
+        agentic_budget: None,
         traffic_pct: None,
         shadow_model: None,
         auto_pause: false,

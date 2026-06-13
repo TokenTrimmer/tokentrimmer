@@ -213,6 +213,7 @@ async fn route_to_local_dispatches_to_ollama_provider() {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                agentic_budget: None,
                 target_model: "ollama/llama3.1:8b".into(),
                 fallbacks: vec![],
                 disable_cache: false,
