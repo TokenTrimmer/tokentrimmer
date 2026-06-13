@@ -1808,6 +1808,13 @@ pub async fn handler(
         }
         let (provider, served_model, stream) = __stream_outcome?;
 
+        // Whether this trace's body was handed to the (per-org opt-in) capture
+        // sink: same gate as `capture_request_json` (writer present AND a
+        // resolved non-anonymous org). Captured before the Option is consumed
+        // so the streaming response can advertise it (§6.2). The streamed
+        // response body is not re-captured here (only the request is), but the
+        // header signals the trace's bodies were armed for capture.
+        let body_captured = capture_request_json.is_some();
         if let Some(request_json) = capture_request_json {
             spawn_body_capture(
                 state.body_capture_writer.as_ref(),
@@ -1991,6 +1998,14 @@ pub async fn handler(
             &served_model,
             &warnings,
         );
+        // Only present when the body was handed to the per-org opt-in
+        // encrypted capture sink — absent on the default (capture-off) path.
+        if body_captured {
+            resp.headers_mut().insert(
+                "x-tokentrimmer-captured",
+                axum::http::HeaderValue::from_static("true"),
+            );
+        }
         Ok(resp)
     } else {
         // 3a. L1 exact-match cache. Cheapest lookup — try first. Gated on
@@ -2760,6 +2775,11 @@ pub async fn handler(
             },
         );
 
+        // Whether this trace's body was actually handed to the (per-org
+        // opt-in) capture sink: the same gate as `capture_request_json`
+        // (writer present AND a resolved non-anonymous org), captured before
+        // the Option is consumed so the response can advertise it.
+        let body_captured = capture_request_json.is_some();
         if let Some(request_json) = capture_request_json {
             let response_json = match serde_json::to_vec(&response) {
                 Ok(bytes) => Some(bytes),
@@ -2851,6 +2871,15 @@ pub async fn handler(
                     .headers_mut()
                     .insert("x-tokentrimmer-route-matched", v);
             }
+        }
+        // Only present when the body was actually handed to the per-org
+        // opt-in encrypted capture sink — absent on the default (capture-off)
+        // path, which stays byte-identical.
+        if body_captured {
+            http_response.headers_mut().insert(
+                "x-tokentrimmer-captured",
+                axum::http::HeaderValue::from_static("true"),
+            );
         }
 
         // Record OTel GenAI semconv + TokenTrimmer cost attributes on the

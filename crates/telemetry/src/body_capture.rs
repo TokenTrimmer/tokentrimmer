@@ -19,6 +19,46 @@ const NONCE_LEN: usize = 24;
 const AAD_MAGIC: &[u8] = b"tt-body-capture:v1";
 const KDF_DOMAIN: &[u8] = b"|tt-body-capture:key:v1|";
 
+/// Default per-body size cap (bytes) before truncation. Stored payloads larger
+/// than this are cut to this many bytes and an explicit truncation marker is
+/// appended; the ORIGINAL length is still recorded honestly in the
+/// `request_bytes` / `response_bytes` columns.
+pub const DEFAULT_MAX_BYTES: usize = 256 * 1024;
+
+/// Leading bytes of the marker appended to a truncated stored payload. The full
+/// marker is `\n[tt-body-capture:truncated original_bytes=<N>]` where `<N>` is
+/// the byte length of the ORIGINAL (pre-truncation) plaintext. Lives INSIDE the
+/// encrypted payload so a `/logs` reader sees the truncation explicitly on
+/// decrypt without a schema change.
+pub const TRUNCATION_MARKER_PREFIX: &[u8] = b"\n[tt-body-capture:truncated original_bytes=";
+
+/// Build the full truncation marker for an original length of `original_len`.
+fn truncation_marker(original_len: usize) -> Vec<u8> {
+    let mut marker = Vec::with_capacity(TRUNCATION_MARKER_PREFIX.len() + 24);
+    marker.extend_from_slice(TRUNCATION_MARKER_PREFIX);
+    marker.extend_from_slice(original_len.to_string().as_bytes());
+    marker.push(b']');
+    marker
+}
+
+/// Cap `plain` to `max_bytes` for storage, appending an explicit truncation
+/// marker when it overflows. Returns the payload to encrypt/store and the
+/// ORIGINAL (pre-truncation) byte length to record honestly.
+///
+/// `max_bytes == 0` disables the cap (no truncation, no marker) — the same
+/// pass-through behaviour as a body at or under the cap.
+pub fn truncate_for_storage(plain: &[u8], max_bytes: usize) -> (Vec<u8>, usize) {
+    let original_len = plain.len();
+    if max_bytes == 0 || original_len <= max_bytes {
+        return (plain.to_vec(), original_len);
+    }
+    let marker = truncation_marker(original_len);
+    let mut out = Vec::with_capacity(max_bytes + marker.len());
+    out.extend_from_slice(&plain[..max_bytes]);
+    out.extend_from_slice(&marker);
+    (out, original_len)
+}
+
 #[derive(Debug, Error)]
 pub enum BodyCaptureError {
     #[error("invalid TT_MASTER_KEY: {0}")]
@@ -49,23 +89,41 @@ impl BodyCaptureKind {
 #[derive(Clone)]
 pub struct BodyCaptureCodec {
     master_key: [u8; 32],
+    max_bytes: usize,
 }
 
 impl std::fmt::Debug for BodyCaptureCodec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BodyCaptureCodec")
             .field("master_key", &"[REDACTED]")
+            .field("max_bytes", &self.max_bytes)
             .finish()
     }
 }
 
 impl BodyCaptureCodec {
     pub fn new(master_key: [u8; 32]) -> Self {
-        Self { master_key }
+        Self {
+            master_key,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+
+    /// Override the per-body size cap (bytes). `0` disables truncation.
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// The active per-body size cap (bytes); `0` means no cap.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Build from `TT_MASTER_KEY`. Missing means capture is disabled; malformed
     /// means an operator tried to enable encryption with an unusable root key.
+    /// The per-body cap is read from `TT_BODY_CAPTURE_MAX_BYTES` (default
+    /// [`DEFAULT_MAX_BYTES`]); an unparseable value falls back to the default.
     pub fn from_env() -> Result<Option<Self>, BodyCaptureError> {
         let Ok(hex_key) = std::env::var("TT_MASTER_KEY") else {
             return Ok(None);
@@ -75,7 +133,14 @@ impl BodyCaptureCodec {
         let master_key: [u8; 32] = bytes
             .try_into()
             .map_err(|_| BodyCaptureError::BadMasterKey("expected 32 hex-encoded bytes".into()))?;
-        Ok(Some(Self { master_key }))
+        let max_bytes = std::env::var("TT_BODY_CAPTURE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_BYTES);
+        Ok(Some(Self {
+            master_key,
+            max_bytes,
+        }))
     }
 
     pub fn encrypt(
@@ -228,26 +293,38 @@ pub mod postgres {
 
             let retention_days = setting.retention_days.clamp(1, 30);
             let expires_at = record.ts + chrono::Duration::days(i64::from(retention_days));
+
+            // Size cap: cut over-cap bodies and append an explicit truncation
+            // marker BEFORE encryption, but record the ORIGINAL length honestly
+            // in request_bytes/response_bytes (the marker lives inside the
+            // encrypted payload, so /logs replay sees the truncation on decrypt
+            // without a schema change).
+            let max_bytes = self.codec.max_bytes();
+            let (request_store, request_original_len) =
+                truncate_for_storage(&record.request_json, max_bytes);
             let request_enc = self.codec.encrypt(
                 record.org_id,
                 &record.trace_id,
                 BodyCaptureKind::Request,
-                &record.request_json,
+                &request_store,
             )?;
-            let response_enc = match record.response_json.as_ref() {
-                Some(bytes) => Some(self.codec.encrypt(
+            let response_store = record
+                .response_json
+                .as_ref()
+                .map(|bytes| truncate_for_storage(bytes, max_bytes));
+            let response_enc = match response_store.as_ref() {
+                Some((store, _)) => Some(self.codec.encrypt(
                     record.org_id,
                     &record.trace_id,
                     BodyCaptureKind::Response,
-                    bytes,
+                    store,
                 )?),
                 None => None,
             };
-            let request_bytes = i32::try_from(record.request_json.len()).unwrap_or(i32::MAX);
-            let response_bytes = record
-                .response_json
+            let request_bytes = i32::try_from(request_original_len).unwrap_or(i32::MAX);
+            let response_bytes = response_store
                 .as_ref()
-                .map(|bytes| i32::try_from(bytes.len()).unwrap_or(i32::MAX));
+                .map(|(_, original_len)| i32::try_from(*original_len).unwrap_or(i32::MAX));
 
             let result = sqlx::query(
                 r#"INSERT INTO request_body_captures
@@ -329,6 +406,77 @@ mod tests {
                 .unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn truncate_passes_through_under_cap() {
+        let plain = b"small body";
+        let (stored, original_len) = truncate_for_storage(plain, DEFAULT_MAX_BYTES);
+        assert_eq!(stored, plain, "under-cap body stored verbatim");
+        assert_eq!(original_len, plain.len());
+    }
+
+    #[test]
+    fn truncate_passes_through_at_exact_cap() {
+        let plain = vec![b'x'; 16];
+        let (stored, original_len) = truncate_for_storage(&plain, 16);
+        assert_eq!(stored, plain, "at-cap body is not truncated");
+        assert_eq!(original_len, 16);
+    }
+
+    #[test]
+    fn truncate_zero_cap_disables() {
+        let plain = vec![b'y'; 1024];
+        let (stored, original_len) = truncate_for_storage(&plain, 0);
+        assert_eq!(stored, plain, "max_bytes=0 disables the cap");
+        assert_eq!(original_len, 1024);
+    }
+
+    #[test]
+    fn truncate_over_cap_appends_marker_and_keeps_original_len() {
+        let plain = vec![b'z'; 1000];
+        let cap = 100;
+        let (stored, original_len) = truncate_for_storage(&plain, cap);
+        assert_eq!(original_len, 1000, "original length recorded honestly");
+        assert_eq!(&stored[..cap], &plain[..cap], "kept the first cap bytes");
+        let marker = &stored[cap..];
+        assert!(
+            marker.starts_with(TRUNCATION_MARKER_PREFIX),
+            "marker appended"
+        );
+        assert!(
+            marker.ends_with(b"1000]"),
+            "marker discloses the original length"
+        );
+    }
+
+    #[test]
+    fn truncated_body_round_trips_through_codec_with_marker() {
+        // Failing-first contract: an over-cap body, once stored and decrypted,
+        // yields the truncated prefix plus the explicit marker, while the
+        // original length is preserved out-of-band by the caller.
+        let codec = BodyCaptureCodec::new([3u8; 32]).with_max_bytes(64);
+        assert_eq!(codec.max_bytes(), 64);
+        let org_id = Uuid::from_u128(99);
+        let trace_id = "trace-trunc";
+        let plain = vec![b'A'; 500];
+
+        let (stored, original_len) = truncate_for_storage(&plain, codec.max_bytes());
+        assert_eq!(original_len, 500);
+
+        let blob = codec
+            .encrypt(org_id, trace_id, BodyCaptureKind::Request, &stored)
+            .unwrap();
+        let decrypted = codec
+            .decrypt(org_id, trace_id, BodyCaptureKind::Request, &blob)
+            .unwrap();
+
+        assert_eq!(&decrypted[..64], &plain[..64], "prefix intact on decrypt");
+        let marker = &decrypted[64..];
+        assert!(marker.starts_with(TRUNCATION_MARKER_PREFIX));
+        assert!(marker.ends_with(b"500]"));
+        // The stored payload is exactly cap + marker — never the full original.
+        assert!(decrypted.len() < plain.len());
     }
 
     #[test]
