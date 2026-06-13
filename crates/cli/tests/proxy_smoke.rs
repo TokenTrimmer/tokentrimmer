@@ -74,7 +74,7 @@ async fn messages_bypass_to_anthropic_upstream_in_all_modes() {
                     .header("x-api-key", "client-anthropic-key")
                     // …and the proxy must NOT inject its TokenTrimmer key
                     // (that would leak it to Anthropic and clobber OAuth).
-                    .matches(|req| {
+                    .is_true(|req| {
                         !req.headers_vec()
                             .iter()
                             .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
@@ -117,7 +117,7 @@ async fn messages_bypass_to_anthropic_upstream_in_all_modes() {
             200,
             "mode {mode:?}: /v1/messages must reach the Anthropic upstream"
         );
-        assert_eq!(mock.hits_async().await, 1, "mode {mode:?}");
+        assert_eq!(mock.calls_async().await, 1, "mode {mode:?}");
     }
 }
 

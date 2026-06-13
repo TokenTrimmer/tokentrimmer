@@ -200,7 +200,7 @@ mod tests {
         // /v1/models is public — a keyless fetch must still work (no Authorization).
         let server = MockServer::start_async().await;
         server.mock(|when, then| {
-            when.method(GET).path("/v1/models").matches(|req| {
+            when.method(GET).path("/v1/models").is_true(|req| {
                 !req.headers_vec()
                     .iter()
                     .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))

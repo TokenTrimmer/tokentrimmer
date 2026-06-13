@@ -178,7 +178,7 @@ async fn enabled_add_route_rejects_foreign_org() {
         v["error"]["code"], -32001,
         "a foreign-org add_route must be unauthorized"
     );
-    assert_eq!(m.hits_async().await, 0, "gateway must not be called");
+    assert_eq!(m.calls_async().await, 0, "gateway must not be called");
 }
 
 #[tokio::test]
@@ -204,5 +204,5 @@ async fn enabled_apply_plan_rejects_foreign_org() {
     )
     .unwrap();
     assert_eq!(v["error"]["code"], -32001);
-    assert_eq!(m.hits_async().await, 0, "cloud must not be called");
+    assert_eq!(m.calls_async().await, 0, "cloud must not be called");
 }

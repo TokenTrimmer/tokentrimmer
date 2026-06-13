@@ -915,7 +915,7 @@ mod tests {
         let m = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .matches(|req| {
+                .is_true(|req| {
                     !req.headers_vec()
                         .iter()
                         .any(|(k, _)| k.eq_ignore_ascii_case("x-tokentrimmer-interactive"))
@@ -1418,7 +1418,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidTag(_)), "{err:?}");
-        m.assert_hits_async(0).await;
+        m.assert_calls_async(0).await;
     }
 
     #[tokio::test]
