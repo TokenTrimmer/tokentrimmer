@@ -212,6 +212,21 @@ pub struct BodyCaptureRecord {
 #[async_trait]
 pub trait BodyCaptureWriter: Send + Sync {
     async fn record(&self, record: BodyCaptureRecord) -> Result<(), BodyCaptureError>;
+
+    /// Whether [`record`](Self::record) would actually PERSIST a body for this
+    /// org, i.e. the org has opted into capture. Callers consult this BEFORE
+    /// advertising capture (the `x-tokentrimmer-captured` response header) so
+    /// the signal reflects a body that was truly stored, not merely a writer
+    /// that happens to be armed for the deployment.
+    ///
+    /// Best-effort and side-effect free: on any backend error it MUST return
+    /// `false` (do not over-advertise capture). The default impl returns `true`
+    /// — appropriate only for sinks that persist everything they are handed
+    /// (e.g. in-memory test writers); persistence-gated backends (Postgres)
+    /// override this to consult the per-org opt-in row.
+    async fn is_capture_enabled(&self, _org_id: Uuid) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,27 +279,50 @@ pub mod postgres {
         pub fn from_env(pool: sqlx::PgPool) -> Result<Option<Self>, BodyCaptureError> {
             Ok(BodyCaptureCodec::from_env()?.map(|codec| Self { pool, codec }))
         }
-    }
 
-    #[async_trait]
-    impl BodyCaptureWriter for PostgresBodyCaptureWriter {
-        async fn record(&self, record: BodyCaptureRecord) -> Result<(), BodyCaptureError> {
-            let setting = match sqlx::query_as::<_, (bool, i32)>(
+        /// Fetch the per-org capture setting. `Ok(None)` means no opt-in row
+        /// (or the settings table is absent in this deployment) — capture is
+        /// off for the org. Errors other than a missing table propagate so the
+        /// caller can decide (record() surfaces them; the header check swallows
+        /// them as "not enabled").
+        async fn fetch_setting(
+            &self,
+            org_id: Uuid,
+        ) -> Result<Option<BodyCaptureSetting>, BodyCaptureError> {
+            match sqlx::query_as::<_, (bool, i32)>(
                 "SELECT enabled, retention_days \
                  FROM request_body_capture_settings \
                  WHERE org_id = $1",
             )
-            .bind(record.org_id)
+            .bind(org_id)
             .fetch_optional(&self.pool)
             .await
             {
-                Ok(Some((enabled, retention_days))) => BodyCaptureSetting {
+                Ok(Some((enabled, retention_days))) => Ok(Some(BodyCaptureSetting {
                     enabled,
                     retention_days,
-                },
-                Ok(None) => return Ok(()),
-                Err(err) if is_undefined_table(&err) => return Ok(()),
-                Err(err) => return Err(BodyCaptureError::Storage(err.to_string())),
+                })),
+                Ok(None) => Ok(None),
+                Err(err) if is_undefined_table(&err) => Ok(None),
+                Err(err) => Err(BodyCaptureError::Storage(err.to_string())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BodyCaptureWriter for PostgresBodyCaptureWriter {
+        /// Mirrors the exact gate inside [`record`](Self::record): the org has
+        /// an opt-in row AND `enabled = true`. Any backend error returns
+        /// `false` so a transient DB hiccup never causes the gateway to claim
+        /// capture for a body it did not store.
+        async fn is_capture_enabled(&self, org_id: Uuid) -> bool {
+            matches!(self.fetch_setting(org_id).await, Ok(Some(s)) if s.enabled)
+        }
+
+        async fn record(&self, record: BodyCaptureRecord) -> Result<(), BodyCaptureError> {
+            let setting = match self.fetch_setting(record.org_id).await? {
+                Some(setting) => setting,
+                None => return Ok(()),
             };
 
             if !setting.enabled {
@@ -493,5 +531,20 @@ mod tests {
         assert!(codec
             .decrypt(org_id, "trace-a", BodyCaptureKind::Response, &blob)
             .is_err());
+    }
+
+    /// A writer that persists everything it is handed inherits the trait
+    /// default `is_capture_enabled` → `true` (correct for an always-persisting
+    /// sink). Persistence-gated backends (Postgres) override it.
+    #[tokio::test]
+    async fn default_is_capture_enabled_is_true() {
+        struct AlwaysRecord;
+        #[async_trait]
+        impl BodyCaptureWriter for AlwaysRecord {
+            async fn record(&self, _record: BodyCaptureRecord) -> Result<(), BodyCaptureError> {
+                Ok(())
+            }
+        }
+        assert!(AlwaysRecord.is_capture_enabled(Uuid::from_u128(7)).await);
     }
 }

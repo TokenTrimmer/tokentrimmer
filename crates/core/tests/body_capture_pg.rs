@@ -146,6 +146,49 @@ async fn over_cap_body_is_stored_truncated_with_marker_and_original_len_recorded
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
+async fn is_capture_enabled_mirrors_the_per_org_opt_in() {
+    // The header gate (#451): the Postgres writer reports an org as capture-
+    // enabled ONLY when it has an opt-in row with enabled = true. No row, or a
+    // row with enabled = false, must report false — so the gateway never
+    // advertises capture for a body it would not persist.
+    let pool = pool().await;
+    let codec = BodyCaptureCodec::new([5u8; 32]);
+    let writer = PostgresBodyCaptureWriter::new(pool.clone(), codec);
+
+    // No opt-in row at all → not enabled.
+    let never_seen = Uuid::now_v7();
+    assert!(
+        !writer.is_capture_enabled(never_seen).await,
+        "an org with no settings row is NOT capture-enabled"
+    );
+
+    // Explicitly disabled row → not enabled, even though a row exists.
+    let disabled = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO request_body_capture_settings (org_id, enabled, retention_days) \
+         VALUES ($1, FALSE, 7) \
+         ON CONFLICT (org_id) DO UPDATE SET enabled = FALSE",
+    )
+    .bind(disabled)
+    .execute(&pool)
+    .await
+    .expect("insert disabled setting");
+    assert!(
+        !writer.is_capture_enabled(disabled).await,
+        "an org with enabled = false is NOT capture-enabled"
+    );
+
+    // Opted-in row → enabled.
+    let opted_in = Uuid::now_v7();
+    enable_capture(&pool, opted_in, 7).await;
+    assert!(
+        writer.is_capture_enabled(opted_in).await,
+        "an org with enabled = true IS capture-enabled"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
 async fn under_cap_body_round_trips_verbatim_no_marker() {
     let pool = pool().await;
     let org = Uuid::now_v7();

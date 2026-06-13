@@ -127,7 +127,7 @@ impl Provider for StubProvider {
 }
 
 /// In-memory capture sink that records everything it is handed (acts like an
-/// org that has opted in: it never no-ops on `enabled`).
+/// org that has opted in: `is_capture_enabled` is `true` and it never no-ops).
 #[derive(Default)]
 struct RecordingCaptureWriter {
     records: Arc<Mutex<Vec<BodyCaptureRecord>>>,
@@ -138,6 +138,28 @@ impl BodyCaptureWriter for RecordingCaptureWriter {
     async fn record(&self, record: BodyCaptureRecord) -> Result<(), BodyCaptureError> {
         self.records.lock().unwrap().push(record);
         Ok(())
+    }
+    // Inherit the trait default (`true`): this sink persists everything it is
+    // handed, modelling an opted-in org.
+}
+
+/// In-memory capture sink that is ARMED for the deployment but reports the org
+/// as NOT opted in (`is_capture_enabled` → false) — the realistic shape of a
+/// global `TT_MASTER_KEY` arming the writer while a given org left capture off.
+/// `record` would no-op for such an org, so it should never be called.
+#[derive(Default)]
+struct DisabledOrgCaptureWriter {
+    records: Arc<Mutex<Vec<BodyCaptureRecord>>>,
+}
+
+#[async_trait]
+impl BodyCaptureWriter for DisabledOrgCaptureWriter {
+    async fn record(&self, record: BodyCaptureRecord) -> Result<(), BodyCaptureError> {
+        self.records.lock().unwrap().push(record);
+        Ok(())
+    }
+    async fn is_capture_enabled(&self, _org_id: Uuid) -> bool {
+        false
     }
 }
 
@@ -271,5 +293,62 @@ async fn captured_header_absent_when_capture_off_streaming() {
     assert!(
         resp.headers().get("x-tokentrimmer-captured").is_none(),
         "header MUST be absent on the default streaming capture-off path"
+    );
+}
+
+#[tokio::test]
+async fn captured_header_absent_when_writer_armed_but_org_not_opted_in_nonstreaming() {
+    // The privacy contract (#451): with a writer armed for the deployment but
+    // the org NOT opted in, the header MUST be absent and NO body is handed to
+    // the sink — the gateway consults `is_capture_enabled` before stamping.
+    let (registry, _calls) = registry();
+    let raw_store = InMemoryKeyStore::new();
+    let org_id = Uuid::now_v7();
+    let plaintext = issue_key_for(&raw_store, org_id).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
+
+    let writer = Arc::new(DisabledOrgCaptureWriter::default());
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_body_capture_writer(writer.clone()),
+    );
+
+    let resp = app.oneshot(chat_request(false, &plaintext)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("x-tokentrimmer-captured").is_none(),
+        "header MUST be absent when the writer is armed but the org has not opted in"
+    );
+    assert!(
+        writer.records.lock().unwrap().is_empty(),
+        "no body is handed to the sink for an org that has not opted in"
+    );
+}
+
+#[tokio::test]
+async fn captured_header_absent_when_writer_armed_but_org_not_opted_in_streaming() {
+    let (registry, _calls) = registry();
+    let raw_store = InMemoryKeyStore::new();
+    let org_id = Uuid::now_v7();
+    let plaintext = issue_key_for(&raw_store, org_id).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
+
+    let writer = Arc::new(DisabledOrgCaptureWriter::default());
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_body_capture_writer(writer.clone()),
+    );
+
+    let resp = app.oneshot(chat_request(true, &plaintext)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("x-tokentrimmer-captured").is_none(),
+        "streaming header MUST be absent when the writer is armed but the org has not opted in"
+    );
+    assert!(
+        writer.records.lock().unwrap().is_empty(),
+        "no body is handed to the sink for an org that has not opted in"
     );
 }

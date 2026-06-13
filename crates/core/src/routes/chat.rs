@@ -1641,7 +1641,20 @@ pub async fn handler(
     // `format_switch` advertisement, or vice versa.
     let skip_l2 = format_switch_plan.is_some();
 
-    let capture_request_json = if state.body_capture_writer.is_some() && ctx.org_id != Uuid::nil() {
+    // Body capture is gated on THREE conditions, all checked here so the
+    // `x-tokentrimmer-captured` header is honest (present ONLY when a body is
+    // truly persisted): (1) a writer is armed for the deployment, (2) the
+    // caller resolved to a non-anonymous org, and (3) THAT org has opted in
+    // via `request_body_capture_settings.enabled`. The opt-in is per-org while
+    // a single `TT_MASTER_KEY` arms the writer for the whole deployment, so
+    // without (3) every resolved org's response would falsely advertise
+    // capture. The async opt-in probe runs at most once per request and only
+    // when a writer is armed, so the default (capture-off) path is unaffected.
+    let capture_enabled = match state.body_capture_writer.as_ref() {
+        Some(writer) if ctx.org_id != Uuid::nil() => writer.is_capture_enabled(ctx.org_id).await,
+        _ => false,
+    };
+    let capture_request_json = if capture_enabled {
         match serde_json::to_vec(&req) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
@@ -1808,12 +1821,14 @@ pub async fn handler(
         }
         let (provider, served_model, stream) = __stream_outcome?;
 
-        // Whether this trace's body was handed to the (per-org opt-in) capture
-        // sink: same gate as `capture_request_json` (writer present AND a
-        // resolved non-anonymous org). Captured before the Option is consumed
-        // so the streaming response can advertise it (§6.2). The streamed
-        // response body is not re-captured here (only the request is), but the
-        // header signals the trace's bodies were armed for capture.
+        // Whether this trace's body was actually handed to the capture sink for
+        // persistence: `capture_request_json` is `Some` only when a writer is
+        // armed, the org is non-anonymous, AND the org opted in
+        // (`is_capture_enabled` above), so the header is honest. Captured before
+        // the Option is consumed so the streaming response can advertise it
+        // (§6.2). On the streaming path only the REQUEST body is persisted (the
+        // streamed response is not re-captured); the header therefore signals
+        // request-body capture for opted-in orgs.
         let body_captured = capture_request_json.is_some();
         if let Some(request_json) = capture_request_json {
             spawn_body_capture(
@@ -1998,8 +2013,10 @@ pub async fn handler(
             &served_model,
             &warnings,
         );
-        // Only present when the body was handed to the per-org opt-in
-        // encrypted capture sink — absent on the default (capture-off) path.
+        // Present ONLY when the org opted in and the request body was persisted
+        // to the encrypted capture sink — absent on the default (capture-off)
+        // path AND for armed-but-not-opted-in orgs (the `is_capture_enabled`
+        // gate above), so the header never claims capture for an unstored body.
         if body_captured {
             resp.headers_mut().insert(
                 "x-tokentrimmer-captured",
@@ -2775,10 +2792,12 @@ pub async fn handler(
             },
         );
 
-        // Whether this trace's body was actually handed to the (per-org
-        // opt-in) capture sink: the same gate as `capture_request_json`
-        // (writer present AND a resolved non-anonymous org), captured before
-        // the Option is consumed so the response can advertise it.
+        // Whether this trace's body was actually handed to the capture sink for
+        // persistence: `capture_request_json` is `Some` only when a writer is
+        // armed, the org is non-anonymous, AND the org opted in
+        // (`is_capture_enabled` above), so the header reflects a body that was
+        // truly stored. Captured before the Option is consumed so the response
+        // can advertise it.
         let body_captured = capture_request_json.is_some();
         if let Some(request_json) = capture_request_json {
             let response_json = match serde_json::to_vec(&response) {
@@ -2872,9 +2891,10 @@ pub async fn handler(
                     .insert("x-tokentrimmer-route-matched", v);
             }
         }
-        // Only present when the body was actually handed to the per-org
-        // opt-in encrypted capture sink — absent on the default (capture-off)
-        // path, which stays byte-identical.
+        // Present ONLY when the org opted in and the request+response bodies
+        // were persisted to the encrypted capture sink — absent on the default
+        // (capture-off) path AND for armed-but-not-opted-in orgs (the
+        // `is_capture_enabled` gate above), which both stay byte-identical.
         if body_captured {
             http_response.headers_mut().insert(
                 "x-tokentrimmer-captured",
