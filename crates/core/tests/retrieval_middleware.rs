@@ -34,6 +34,7 @@ use tt_shared::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
+use tt_telemetry::request_logs::{InMemoryRequestLogWriter, RequestLogWriter};
 
 // ── Simple pass-through provider ───────────────────────────────────────────
 // Returns the first user message content as the assistant reply text.
@@ -134,6 +135,17 @@ fn app_with_echo(retrieval: Option<RetrievalState>) -> axum::Router {
     build_router_with_retrieval(AppState::new(registry), retrieval)
 }
 
+fn app_with_echo_and_logs(
+    retrieval: Option<RetrievalState>,
+) -> (axum::Router, Arc<InMemoryRequestLogWriter>) {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(EchoProvider));
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let state = AppState::new(registry)
+        .with_request_log_writer(writer.clone() as Arc<dyn RequestLogWriter>);
+    (build_router_with_retrieval(state, retrieval), writer)
+}
+
 // ── Test 1 ─────────────────────────────────────────────────────────────────
 
 /// When no retrieval state is provided (disabled path), the request is forwarded
@@ -215,7 +227,7 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
         embedder,
         audit: None,
     };
-    let app = app_with_echo(Some(retrieval));
+    let (app, log_writer) = app_with_echo_and_logs(Some(retrieval));
 
     let body = json!({
         "model": "echo-1",
@@ -303,6 +315,23 @@ async fn retrieval_enabled_substitutes_retrievable_tag() {
     assert!(
         !assistant_text.contains("verbose payload the LLM never sees"),
         "original tag payload should have been replaced; got: {assistant_text}"
+    );
+
+    for _ in 0..20 {
+        if !log_writer.rows().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let rows = log_writer.rows();
+    assert_eq!(rows.len(), 1, "expected exactly one request_logs row");
+    assert_eq!(
+        rows[0].retrieval_tokens_saved, tokens_saved,
+        "request_logs.retrieval_tokens_saved must match the retrieval header"
+    );
+    assert_eq!(
+        rows[0].cost_usd, rows[0].baseline_cost_usd,
+        "retrieval token metering is token-denominated and must not alter USD cost fields"
     );
 }
 

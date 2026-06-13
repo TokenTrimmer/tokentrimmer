@@ -149,6 +149,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         model: "test-model".into(),
         input_tokens: 20,
         cached_tokens: 0,
+        retrieval_tokens_saved: 0,
         pricing: Some(ModelPricing {
             input_per_million: 3.0,
             output_per_million: 6.0,

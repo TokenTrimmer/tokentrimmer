@@ -79,6 +79,7 @@ async fn handle(
         State(state),
         Extension(trace),
         auth_ctx,
+        None,
         headers,
         Json(chat_req),
     )

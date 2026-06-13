@@ -44,6 +44,7 @@ pub async fn handler(
         State(state),
         Extension(trace),
         auth_ctx,
+        None,
         headers,
         Json(chat_req),
     )

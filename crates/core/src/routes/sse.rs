@@ -423,6 +423,9 @@ pub struct StreamLogContext {
     /// stream/non-stream branch, so a streaming request must carry their
     /// effects too).
     pub pass_effects: PassEffects,
+    /// Net token delta from retrieval substitution before dispatch. Token-only
+    /// accounting; persisted to request_logs and never folded into USD cost.
+    pub retrieval_tokens_saved: i64,
     /// Optional cache insertion context. When `Some`, a cleanly-completed
     /// stream writes its reconstructed response into L1 (and L2 if configured)
     /// after the final chunk is sent.
@@ -720,6 +723,7 @@ pub fn stream_response(
             let span_ctx = ctx.span_ctx;
             let traffic_split_arm = ctx.traffic_split_arm.clone();
             let route_paused = ctx.route_paused;
+            let retrieval_tokens_saved = ctx.retrieval_tokens_saved;
 
             let guard = DropGuard::new(move || {
                 let inner = shared_for_guard
@@ -854,6 +858,7 @@ pub fn stream_response(
                     diff_saved_usd: 0.0,
                     diff_failed: false,
                     diff_failed_cost_usd: 0.0,
+                    retrieval_tokens_saved,
                 };
 
                 // Per-route provider-cache counters on cleanly completed

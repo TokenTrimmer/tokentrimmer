@@ -41,6 +41,14 @@ pub struct RetrievalState {
     pub audit: Option<Arc<RetrievalAuditLog>>,
 }
 
+/// Request-local retrieval accounting produced by this middleware and consumed
+/// by the chat handler when it writes `request_logs`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RetrievalTelemetry {
+    pub substitutions: u32,
+    pub tokens_saved: i64,
+}
+
 /// Build `RetrievalState` from environment variables.
 /// Returns `None` (with a log message) when env vars are missing or invalid.
 pub fn build_retrieval_state() -> Option<RetrievalState> {
@@ -266,7 +274,11 @@ pub async fn maybe_substitute(
                 }
             };
 
-            let req = Request::from_parts(parts, Body::from(new_bytes));
+            let mut req = Request::from_parts(parts, Body::from(new_bytes));
+            req.extensions_mut().insert(RetrievalTelemetry {
+                substitutions: report.substitutions,
+                tokens_saved: report.tokens_saved_estimate,
+            });
             let mut resp = next.run(req).await;
 
             resp.headers_mut().insert(

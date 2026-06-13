@@ -40,6 +40,7 @@ use tt_shared::{
 };
 
 use crate::{
+    middleware::retrieval::RetrievalTelemetry,
     middleware::trace::TraceId,
     passes::PassEffects,
     retry::{with_retry, RetryPolicy},
@@ -559,6 +560,7 @@ async fn try_l1_hit(
     request_started: Instant,
     matched_route_id: Option<Uuid>,
     route_paused: bool,
+    retrieval_tokens_saved: i64,
     route_matched_name: Option<&str>,
 ) -> Option<Response> {
     match l1.cache.get(l1_key).await {
@@ -578,6 +580,7 @@ async fn try_l1_hit(
                         request_started,
                         matched_route_id,
                         route_paused,
+                        retrieval_tokens_saved,
                     ),
                 );
                 Some(with_route_matched(
@@ -683,6 +686,7 @@ async fn try_l2_hit(
     request_started: Instant,
     matched_route_id: Option<Uuid>,
     route_paused: bool,
+    retrieval_tokens_saved: i64,
     route_matched_name: Option<&str>,
     raw_bearer: &str,
     judge_source_provider: Option<&std::sync::Arc<dyn tt_shared::Provider>>,
@@ -807,6 +811,7 @@ async fn try_l2_hit(
                     matched_route_id,
                     route_paused,
                     baseline_cost_usd,
+                    retrieval_tokens_saved,
                 ),
             );
             Some(
@@ -835,11 +840,13 @@ pub async fn handler(
     State(state): State<AppState>,
     Extension(trace): Extension<TraceId>,
     auth_ctx: Option<Extension<ApiKeyContext>>,
+    retrieval: Option<Extension<RetrievalTelemetry>>,
     headers: HeaderMap,
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> ApiResult<Response> {
     // Wall-clock start — fed into `request_logs.latency_ms`.
     let request_started = Instant::now();
+    let retrieval_telemetry = retrieval.map(|Extension(v)| v).unwrap_or_default();
 
     // 1. Resolve provider — 404 for unknown models. (May be re-resolved after
     //    routing rewrites req.model below.) `resolve` falls back to provider
@@ -1673,6 +1680,7 @@ pub async fn handler(
                                 request_started,
                                 matched_route_id,
                                 route_paused,
+                                retrieval_telemetry.tokens_saved,
                             ),
                         );
                         // Record OTel GenAI semconv + cost span attributes for the
@@ -1945,6 +1953,7 @@ pub async fn handler(
                 // `compression` source AND carries any cache-bust penalty,
                 // matching the non-streaming path.
                 pass_effects,
+                retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
                 cache_insert: stream_cache_insert,
                 // Honor stream_options.include_usage end-to-end: emit an
                 // OpenAI-native final usage chunk when the client asked for it.
@@ -2010,6 +2019,7 @@ pub async fn handler(
                     request_started,
                     matched_route_id,
                     route_paused,
+                    retrieval_telemetry.tokens_saved,
                     route_matched_name.as_deref(),
                 )
                 .await
@@ -2049,6 +2059,7 @@ pub async fn handler(
                     request_started,
                     matched_route_id,
                     route_paused,
+                    retrieval_telemetry.tokens_saved,
                     route_matched_name.as_deref(),
                     &raw_bearer,
                     judge_source_provider.as_ref(),
@@ -2112,6 +2123,7 @@ pub async fn handler(
                                                     request_started,
                                                     matched_route_id,
                                                     route_paused,
+                                                    retrieval_telemetry.tokens_saved,
                                                 ),
                                             );
                                             let mut resp = with_route_matched(
@@ -2744,6 +2756,7 @@ pub async fn handler(
                 diff_saved_usd: cost_breakdown.diff_saved_usd,
                 diff_failed,
                 diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
+                retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
             },
         );
 
@@ -5033,6 +5046,7 @@ fn request_log_for_l1_hit(
     request_started: Instant,
     route_id: Option<Uuid>,
     route_paused: bool,
+    retrieval_tokens_saved: i64,
 ) -> RequestLogRow {
     let baseline = if entry.is_legacy_format() {
         // Pre-envelope row — fall back to the conservative synthetic
@@ -5100,6 +5114,7 @@ fn request_log_for_l1_hit(
         diff_saved_usd: 0.0,
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
+        retrieval_tokens_saved,
     }
 }
 
@@ -5113,6 +5128,7 @@ fn request_log_for_l2_hit(
     route_id: Option<Uuid>,
     route_paused: bool,
     baseline_cost_usd: f64,
+    retrieval_tokens_saved: i64,
 ) -> RequestLogRow {
     RequestLogRow {
         id: Uuid::now_v7(),
@@ -5163,6 +5179,7 @@ fn request_log_for_l2_hit(
         diff_saved_usd: 0.0,
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
+        retrieval_tokens_saved,
     }
 }
 

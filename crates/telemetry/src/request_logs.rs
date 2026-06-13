@@ -199,6 +199,14 @@ pub struct RequestLogRow {
     /// `0.0` when no diff failed and for rows from before migration 0020.
     #[serde(default)]
     pub diff_failed_cost_usd: f64,
+    /// NET token delta from retrieval substitution (`<retrievable>` tags):
+    /// original tag payload tokens minus retrieved replacement tokens, minus
+    /// query-embedding token cost. This is token-denominated and may be
+    /// negative; it is deliberately NOT converted into USD or folded into the
+    /// invoice-reconciled saved-usd headline. `0` means retrieval did not run
+    /// for the request, and is the default for rows predating migration 0023.
+    #[serde(default)]
+    pub retrieval_tokens_saved: i64,
 }
 
 /// `skip_serializing_if` helper: the minify estimate column is omitted from
@@ -302,7 +310,8 @@ pub mod postgres {
                       minify_saved_est_usd,
                       format_switched, format_switch_saved_est_usd,
                       diff_applied, diff_saved_usd,
-                      diff_failed, diff_failed_cost_usd)
+                      diff_failed, diff_failed_cost_usd,
+                      retrieval_tokens_saved)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -319,11 +328,12 @@ pub mod postgres {
                       $32,
                       $33, $34,
                       $35, $36,
-                      $37, $38)"#;
+                      $37, $38,
+                      $39)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 38;
+    pub const INSERT_BIND_COUNT: usize = 39;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -367,6 +377,7 @@ pub mod postgres {
                 .bind(row.diff_saved_usd) // $36
                 .bind(row.diff_failed) // $37
                 .bind(row.diff_failed_cost_usd) // $38
+                .bind(row.retrieval_tokens_saved) // $39
                 .execute(&self.pool)
                 .await
                 .map_err(|e| RequestLogError::Storage(e.to_string()))?;
@@ -419,6 +430,7 @@ mod tests {
             diff_saved_usd: 0.0,
             diff_failed: false,
             diff_failed_cost_usd: 0.0,
+            retrieval_tokens_saved: 0,
         }
     }
 
@@ -725,6 +737,20 @@ mod tests {
         assert_eq!(row.diff_failed_cost_usd, 0.0);
         let j = serde_json::to_string(&row).unwrap();
         assert!(!j.contains("format_switched"), "{j}");
+    }
+
+    /// Retrieval substitution accounting is token-denominated and can be
+    /// negative. It round-trips independently from USD cost fields.
+    #[tokio::test]
+    async fn in_memory_round_trips_retrieval_tokens_saved() {
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.02;
+        row.retrieval_tokens_saved = -7;
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert_eq!(got.retrieval_tokens_saved, -7);
+        assert!((got.cost_usd - 0.02).abs() < 1e-12, "cost untouched");
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the

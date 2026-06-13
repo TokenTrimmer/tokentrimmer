@@ -186,6 +186,21 @@ fn migrator_includes_request_body_capture_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_request_logs_retrieval_tokens_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let twenty_third = migrations
+        .iter()
+        .find(|m| m.version == 23)
+        .expect("migration version 23 not found");
+    let desc = twenty_third.description.to_lowercase();
+    assert!(
+        desc.contains("retrieval") || desc.contains("tokens"),
+        "migration 0023 description is '{}', expected to mention retrieval/tokens",
+        twenty_third.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -311,6 +326,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         diff_saved_usd: 0.0,
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
+        retrieval_tokens_saved: 0,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");
@@ -420,6 +436,7 @@ async fn request_log_insert_round_trips_batch_columns() {
         diff_saved_usd: 0.0,
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
+        retrieval_tokens_saved: 0,
     };
     let marked_id = marked.id;
     writer.write(marked.clone()).await.expect("insert marked");
@@ -528,6 +545,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
         diff_saved_usd: 0.0,
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
+        retrieval_tokens_saved: 0,
     };
     let id = row.id;
     writer
@@ -615,6 +633,7 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         diff_saved_usd: 0.0123,
         diff_failed: true,
         diff_failed_cost_usd: 0.0007,
+        retrieval_tokens_saved: 0,
     };
     let shaped_id = shaped.id;
     writer.write(shaped.clone()).await.expect("insert shaped");
