@@ -407,7 +407,7 @@ impl ResponsesContentPart {
             "input_audio" => {
                 let input_audio = self
                     .input_audio
-                    .or_else(|| match (self.data, self.format) {
+                    .or(match (self.data, self.format) {
                         (Some(data), Some(format)) => Some(InputAudio { data, format }),
                         _ => None,
                     })
@@ -535,9 +535,9 @@ impl ResponsesToolChoice {
                 function,
             } => {
                 if r#type != "function" {
+                    let ty = r#type;
                     return Err(ApiError::InvalidRequest(format!(
-                        "unsupported /v1/responses tool_choice type: {}",
-                        r#type
+                        "unsupported /v1/responses tool_choice type: {ty}"
                     )));
                 }
                 let name = function
