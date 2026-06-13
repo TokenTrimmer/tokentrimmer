@@ -243,6 +243,39 @@ fn retrieval_spawns_without_panic() {
 }
 
 #[test]
+fn retrieval_help_labels_subcommands_experimental() {
+    // The CLI retrieval store is in-process only: nothing survives a fresh
+    // process. Until that's wired to a persistent store, both subcommands must
+    // be labelled EXPERIMENTAL in their help so users aren't misled into
+    // thinking `doc-add` builds a durable corpus. `--help` is fully offline.
+    let home = tempfile::tempdir().unwrap();
+
+    for sub in [
+        vec!["retrieval", "doc-add", "--help"],
+        vec!["retrieval", "search", "--help"],
+    ] {
+        let r = run_tt(home.path(), &sub, EXIT_WAIT);
+        assert!(r.exited, "`tt {}` did not exit", sub.join(" "));
+        assert_no_panic(&sub, &r.stderr);
+        // clap prints --help to stdout, but our harness only captures stderr;
+        // re-capture stdout here for the assertion.
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tt"))
+            .args(&sub)
+            .env("HOME", home.path())
+            .env_remove("OPENAI_API_KEY")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run tt --help");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("EXPERIMENTAL"),
+            "`tt {}` help is missing the EXPERIMENTAL label; stdout:\n{stdout}",
+            sub.join(" ")
+        );
+    }
+}
+
+#[test]
 fn proxy_spawns_without_panic() {
     // Long-running server on an ephemeral port; killed after the grace window.
     // This is the arm that used to die on a nested Runtime::block_on.
