@@ -35,8 +35,10 @@
 //!    the same `auto_pause` window the down-route judge does.
 //!
 //! The blind paired judge itself is the existing [`crate::quality_sample`]
-//! machinery, reused not re-derived: position-debiased via [`ab_order_for`],
-//! recall-of-baseline ([`map_summary_verdict`]), conservative-on-ambiguous
+//! machinery, reused not re-derived: position-debiased via
+//! [`crate::quality_sample::ab_order_for`], recall-of-baseline
+//! ([`map_summary_verdict`] aliasing the shared `map_pair_verdict`),
+//! conservative-on-ambiguous
 //! (`Unclear`, never an optimistic pass), detached post-response (zero added
 //! user latency).
 
@@ -44,12 +46,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde_json::Value;
-use uuid::Uuid;
 
 use tt_plan_core::JudgeVerdict;
 use tt_shared::messages::{Message, MessageContent};
 
-use crate::quality_sample::{ab_order_for, AbOrder, PairVerdict};
+use crate::quality_sample::{map_pair_verdict, AbOrder, PairVerdict};
 
 /// The synchronous trust authority that decides whether a summary CLASS may
 /// commit on a given request — the in-band projection of the blind paired
@@ -125,7 +126,11 @@ impl AdaptiveSummaryGate {
     /// write-side). `Degraded` ratchets the class shut; `Acceptable` accrues
     /// trust; `Unclear` is excluded (no valence — mirrors `VerdictTally`).
     pub fn record_verdict(&self, class: &str, verdict: JudgeVerdict) {
-        let mut tallies = self.tallies.lock().expect("summary gate poisoned");
+        // Recover a poisoned lock rather than panic: a panic on the commit/read
+        // path would contradict the module's fail-OPEN premise (never 5xx,
+        // never corrupt the request). A poisoned gate is treated as usable; the
+        // read side ([`Self::is_committable`]) is the one that fails CLOSED.
+        let mut tallies = self.tallies.lock().unwrap_or_else(|e| e.into_inner());
         let entry = tallies.entry(class.to_string()).or_insert((0, 0));
         match verdict {
             JudgeVerdict::Acceptable => entry.0 += 1,
@@ -137,7 +142,11 @@ impl AdaptiveSummaryGate {
 
 impl SummaryGate for AdaptiveSummaryGate {
     fn is_committable(&self, class: &str) -> bool {
-        let tallies = self.tallies.lock().expect("summary gate poisoned");
+        // Recover a poisoned lock instead of panicking on the commit path: a
+        // panic here would contradict the fail-OPEN premise. A poisoned gate is
+        // read as-is and still fails CLOSED on any unseen/regressed class —
+        // the conservative default (fail open to the un-summarized bytes).
+        let tallies = self.tallies.lock().unwrap_or_else(|e| e.into_inner());
         let Some(&(acceptable, degraded)) = tallies.get(class) else {
             return false; // unseen class → untrusted (closed)
         };
@@ -182,6 +191,18 @@ pub struct SummaryOutcome {
     /// or `None` when ANY call was unmetered (no catalog pricing / failed but
     /// possibly-billed) — a partial sum must never masquerade as the full tax
     /// (spec §4.4 item 3; mirrors `quality_sample::sum_metered`).
+    ///
+    /// **Unmetered → ledger policy (deferred wiring).** This `Option` is the
+    /// faithful sink: `None` means "real spend, price unknown", which is NOT
+    /// the same as `Some(0.0)` ("provably free"). The cost-path ledger field
+    /// [`crate::passes::PassEffects::summarizer_tax_usd`] is a bare `f64`, so the
+    /// wiring task (Task 8) MUST NOT silently coerce `None` to a phantom `0.0`
+    /// (which would masquerade as free, the exact thing spec §4.4 item 3
+    /// forbids). The documented policy is: an unmetered tax is surfaced as an
+    /// honest warning (the summary is committed but its tax is un-pricable) and
+    /// the conservative ledger choice is to treat the unknown spend as a
+    /// non-zero penalty proxy or hold the saving, NEVER to book it as `0.0`.
+    /// Until that wiring lands, this field carries the truthful `None`.
     pub summarizer_tax_usd: Option<f64>,
 }
 
@@ -224,45 +245,38 @@ pub fn sum_metered(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 /// Map a role-neutral blind paired [`PairVerdict`] onto the SUMMARY's
 /// [`JudgeVerdict`], given the slot the summary (optimized answer) occupied.
 ///
-/// **Recall-of-baseline** (identical contract to
-/// `quality_sample::map_pair_verdict`): the summary failing to preserve the
+/// **Recall-of-baseline.** This is a thin alias over the SHARED
+/// [`map_pair_verdict`] — the down-route judge's exact recall-of-baseline
+/// contract, reused not re-derived: the summary failing to preserve the
 /// original tool result's information (`*Missing` on the summary's slot) is
 /// `Degraded`; `Equivalent` — or the BASELINE side missing information (the
 /// summary added nothing it dropped) — passes as `Acceptable`; `Unclear`
 /// stays `Unclear` (conservative — never an optimistic pass on the gate every
-/// lossy lever depends on).
+/// lossy lever depends on). The summary IS the "optimized" answer, so the
+/// `summary_slot` is the optimized slot.
 #[must_use]
 pub fn map_summary_verdict(verdict: PairVerdict, summary_slot: AbOrder) -> JudgeVerdict {
-    match verdict {
-        PairVerdict::Equivalent => JudgeVerdict::Acceptable,
-        PairVerdict::AMissing => match summary_slot {
-            AbOrder::OptimizedA => JudgeVerdict::Degraded,
-            AbOrder::OptimizedB => JudgeVerdict::Acceptable,
-        },
-        PairVerdict::BMissing => match summary_slot {
-            AbOrder::OptimizedB => JudgeVerdict::Degraded,
-            AbOrder::OptimizedA => JudgeVerdict::Acceptable,
-        },
-        PairVerdict::Unclear => JudgeVerdict::Unclear,
-    }
-}
-
-/// The blind slot the SUMMARY (optimized answer) occupies in the paired judge
-/// prompt for `trace_id`, position-debiased via the shared
-/// [`ab_order_for`]. Same trace → same slot (reproducible); across traces the
-/// slots are uniform, so position bias averages out — the EXACT debiasing the
-/// down-route judge uses, reused not re-derived.
-#[must_use]
-pub fn summary_ab_order(trace_id: Uuid) -> AbOrder {
-    ab_order_for(trace_id)
+    map_pair_verdict(verdict, summary_slot)
 }
 
 /// Sub-lever 2b — the lossy summary step over OLDER stale tool results, behind
 /// the [`SummaryGate`]. Operates on the volatile tail only (the prefix is
 /// unreachable by type), keeps the last `keep_recent_pairs` blocks verbatim, and
 /// commits a summary ONLY for a gate-trusted class. A non-JSON / declined / gate-
-/// refused block is left byte-for-byte (fail OPEN). The summarizer tax is
-/// ledgered on the outcome.
+/// refused / `{"error":…}` block is left byte-for-byte (fail OPEN). The
+/// summarizer tax is ledgered on the outcome.
+///
+/// **Byte-length commit is a placeholder pending gate wiring.** Unlike
+/// [`ElidePass`](super::elide::ElidePass), which is a
+/// [`RequestPass`](crate::passes::RequestPass) committed ONLY via
+/// [`PassPipeline::run`](crate::passes::PassPipeline::run)'s token-true gate,
+/// this is a STANDALONE building block: its in-module commit is guarded only by
+/// a `summary.len() < original.len()` BYTE heuristic, and bytes are not tokens
+/// (a byte-shorter summary can be token-neutral or even token-inflating). The
+/// real token-true measurement happens when the deferred wiring task wraps this
+/// step inside the pipeline gate; until then the byte check is a conservative
+/// placeholder, weaker than the token-true guarantee the [`SummaryOutcome`] docs
+/// describe.
 pub struct SummarizeStep<'a> {
     /// Keep the last N tool-result blocks (`role:"tool"`) verbatim — the
     /// load-bearing recent context is never summarized (caveat C1 blast-radius
@@ -333,6 +347,15 @@ impl<'a> SummarizeStep<'a> {
             let MessageContent::Text(text) = content else {
                 continue; // non-text tool content (parts) → nothing to summarize
             };
+            // An `{"error":…}` blob is NEVER summarized (an error in history is
+            // load-bearing — summarizing it away corrupts the loop, risk R2 /
+            // forbidden mode F3). This mirrors the field-drop layer's guard
+            // (`elide::shape_tool_result` minify-onlys an error blob), but here
+            // the guard is STRONGER: even a gate-trusted class leaves an error
+            // verbatim. Fail OPEN to the un-summarized bytes.
+            if is_error_blob(text) {
+                continue;
+            }
             let original = text.clone();
             let call = self.summarizer.summarize(&class, &original);
             // Tax is ALWAYS ledgered — even a declined call may have been billed.
@@ -340,8 +363,12 @@ impl<'a> SummarizeStep<'a> {
             let Some(summary) = call.summary else {
                 continue; // summarizer declined → leave verbatim
             };
-            // Never commit a summary that is not actually shorter (it would only
-            // add tokens; the pipeline's token-true gate would discard it anyway).
+            // Never commit a summary that is not byte-shorter. NOTE: this is a
+            // PLACEHOLDER byte heuristic (bytes are not tokens) pending the
+            // deferred wiring that wraps this step in the pipeline's token-true
+            // gate; until then a byte-shorter-but-token-neutral summary could
+            // commit here. The real token-true gate would discard such a
+            // committed summary at recount anyway (it books the tokenizer delta).
             if summary.len() >= original.len() {
                 continue;
             }
@@ -383,8 +410,10 @@ fn resolve_summary_class(msgs: &[Message], tail_idx: usize) -> String {
 
 /// Whether a tool-result blob is an `{"error":…}` result — never summarized
 /// (an error in history is load-bearing; mirrors the field-drop layer's guard).
+/// Enforced in [`SummarizeStep::apply`]'s eligibility filter, even for a
+/// gate-trusted class.
 #[must_use]
-pub fn is_error_blob(content: &str) -> bool {
+fn is_error_blob(content: &str) -> bool {
     serde_json::from_str::<Value>(content)
         .ok()
         .and_then(|v| v.as_object().map(|o| o.contains_key("error")))
@@ -395,11 +424,14 @@ pub fn is_error_blob(content: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use uuid::Uuid;
+
     use tt_shared::messages::{Message, MessageContent, ToolCall, ToolCallFunction};
     use tt_shared::ChatCompletionRequest;
 
     use crate::passes::agentic_budget::elide::ElidePass;
     use crate::passes::{PassContext, PassPipeline, SplitRequest};
+    use crate::quality_sample::ab_order_for;
 
     fn user(text: &str) -> Message {
         Message::User {
@@ -672,9 +704,23 @@ mod tests {
             map_summary_verdict(PairVerdict::Unclear, AbOrder::OptimizedA),
             JudgeVerdict::Unclear
         );
-        // Position debias is the shared `ab_order_for` (deterministic per trace).
+        // The summary mapping IS the shared recall-of-baseline source of truth
+        // (`quality_sample::map_pair_verdict`), reused not re-derived — they
+        // cannot drift because they are the same function.
         let t = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
-        assert_eq!(summary_ab_order(t), ab_order_for(t));
+        let slot = ab_order_for(t);
+        for v in [
+            PairVerdict::Equivalent,
+            PairVerdict::AMissing,
+            PairVerdict::BMissing,
+            PairVerdict::Unclear,
+        ] {
+            assert_eq!(
+                map_summary_verdict(v, slot),
+                crate::quality_sample::map_pair_verdict(v, slot),
+                "the summary judge mapping must reuse the shared map_pair_verdict"
+            );
+        }
     }
 
     // ── confirmed-Degraded feeds the ratchet + auto-pause ──────────────────────
@@ -799,6 +845,43 @@ mod tests {
             out.summarizer_tax_usd, None,
             "any unmetered summarizer call makes the total unmetered (no partial sum)"
         );
+    }
+
+    /// An `{"error":…}` tool result is NEVER summarized, even when the gate
+    /// trusts the class — an error in history is load-bearing (risk R2 /
+    /// forbidden mode F3). The step fails OPEN to the verbatim error bytes.
+    #[test]
+    fn summary_never_touches_error_blob_even_with_open_gate() {
+        let summarizer = FixedSummarizer {
+            summary: "[s]",
+            cost_usd: Some(0.0),
+        };
+        let open = AlwaysCommitGate;
+        // A big error blob so a short summary WOULD be clearly shorter — the
+        // only reason it stays is the error guard, not the length check.
+        let err = json!({
+            "error": "invalid params: missing file_path",
+            "rows": (0..40).map(|i| format!("row-{i}-error-detail")).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let mut req = req_with(vec![
+            user("call"),
+            assistant_call("c1", "mystery_tool"),
+            tool_result_str("c1", &err),
+        ]);
+        let before = serde_json::to_string(&req).unwrap();
+        let step = SummarizeStep::new(0, &open, &summarizer);
+        let out = run_summary(&step, &mut req);
+        assert!(
+            out.committed.is_empty(),
+            "an error blob must NEVER be summarized, even behind an open gate"
+        );
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            before,
+            "an error blob must be left byte-identical (fail open, error is load-bearing)"
+        );
+        assert_eq!(tool_text(&req, 2), err);
     }
 
     /// A summary that is NOT shorter is never committed (it would only add

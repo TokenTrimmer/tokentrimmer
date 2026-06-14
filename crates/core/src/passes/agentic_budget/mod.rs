@@ -33,8 +33,8 @@ pub mod summarize_judge;
 pub use cache_prefix::{annotate_cache_prefix, CachePrefixPlan};
 pub use elide::ElidePass;
 pub use summarize_judge::{
-    map_summary_verdict, summary_ab_order, AdaptiveSummaryGate, AlwaysCommitGate, NeverCommitGate,
-    SummarizeCall, SummarizeStep, Summarizer, SummaryEdit, SummaryGate, SummaryOutcome,
+    map_summary_verdict, AdaptiveSummaryGate, AlwaysCommitGate, NeverCommitGate, SummarizeCall,
+    SummarizeStep, Summarizer, SummaryEdit, SummaryGate, SummaryOutcome,
 };
 
 use tt_routing::AgenticBudget;

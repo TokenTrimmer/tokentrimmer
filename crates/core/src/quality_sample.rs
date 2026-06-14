@@ -742,7 +742,12 @@ fn sum_metered(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 /// optimized answer added info) — passes the recall gate as `Acceptable`. A
 /// precision/hallucination gate (penalizing fabricated additions) is
 /// explicitly out of scope here and noted as future work.
-fn map_pair_verdict(verdict: PairVerdict, optimized: AbOrder) -> JudgeVerdict {
+///
+/// `pub(crate)` so the lossy summary lever
+/// ([`crate::passes::agentic_budget::summarize_judge`]) reuses this SINGLE
+/// recall-of-baseline source of truth rather than re-deriving the mapping (and
+/// risking drift on the gate every lossy lever depends on).
+pub(crate) fn map_pair_verdict(verdict: PairVerdict, optimized: AbOrder) -> JudgeVerdict {
     match verdict {
         PairVerdict::Equivalent => JudgeVerdict::Acceptable,
         PairVerdict::AMissing => match optimized {

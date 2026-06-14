@@ -47,8 +47,11 @@
 //! drop ONLY behind the blind paired equivalence judge's verdict projection
 //! ([`super::summarize_judge::SummaryGate`], caveat C1). The two halves share
 //! the SAME `keep_recent_pairs` blast-radius bound: neither ever touches the
-//! recent tail. The planner ([`super::AgenticBudgetPlanner`]) composes them in
-//! priority order — lossless field-drop first, then judge-gated summary.
+//! recent tail. The planner ([`super::AgenticBudgetPlanner`]) WILL compose them
+//! in priority order — lossless field-drop first, then judge-gated summary — but
+//! that wiring is deferred to a later task: today the planner runs field-drop
+//! (Sub-lever 2a) only, and [`super::summarize_judge::SummarizeStep`] is a
+//! standalone building block with no planner consumer yet.
 
 use serde_json::Value;
 

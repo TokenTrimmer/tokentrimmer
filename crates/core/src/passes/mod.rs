@@ -211,6 +211,15 @@ pub struct PassEffects {
     /// Auxiliary-LLM tax (USD) for the summarizer call — REAL spend, ledgered
     /// as tax, NEVER netted into cost_usd/baseline (spec §4.4 item 3). Reduces
     /// `tt_saved_usd` pre-clamp, exactly like `cache_bust_penalty_usd`.
+    ///
+    /// This is a bare `f64` (the cost path sums a concrete penalty), but the
+    /// upstream
+    /// [`SummaryOutcome::summarizer_tax_usd`](crate::passes::agentic_budget::SummaryOutcome::summarizer_tax_usd)
+    /// is an `Option<f64>`: `None` = real spend at an unknown price (NOT free).
+    /// The wiring (Task 8) MUST translate an unmetered (`None`) tax via the
+    /// documented unmetered→ledger policy — it must NOT coerce `None` to a
+    /// phantom `0.0`, which would masquerade unknown spend as free (the exact
+    /// thing spec §4.4 item 3 forbids).
     pub summarizer_tax_usd: f64,
 }
 
