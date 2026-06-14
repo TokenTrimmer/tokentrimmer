@@ -45,7 +45,11 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Collect coverage
-        run: cargo llvm-cov --workspace --lcov --output-path target/coverage/lcov.info
+        # `--output-path` does not create the parent dir; ensure it exists so
+        # the report write does not fail with ENOENT on a clean target/.
+        run: |
+          mkdir -p target/coverage
+          cargo llvm-cov --workspace --lcov --output-path target/coverage/lcov.info
       - name: Upload Rust coverage
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
