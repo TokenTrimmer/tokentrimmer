@@ -28,10 +28,14 @@
 
 pub mod cache_prefix;
 pub mod elide;
+pub mod substep_cache;
 pub mod summarize_judge;
 
 pub use cache_prefix::{annotate_cache_prefix, CachePrefixPlan};
 pub use elide::ElidePass;
+pub use substep_cache::{
+    classify_substep, SubstepCache, SubstepEntry, SubstepKind, SubstepLookup, SubstepSpace,
+};
 pub use summarize_judge::{
     map_summary_verdict, AdaptiveSummaryGate, AlwaysCommitGate, NeverCommitGate, SummarizeCall,
     SummarizeStep, Summarizer, SummaryEdit, SummaryGate, SummaryOutcome,

@@ -705,6 +705,86 @@ pub fn l2_context_text(req: &ChatCompletionRequest) -> Option<String> {
     }
 }
 
+/// Build the canonicalized text for the **tool-result embedding axis**
+/// (Sub-lever 4, closing gap G4).
+///
+/// The main embedding key ([`l2_context_text`]) deliberately omits
+/// `Message::Tool` content — opaque JSON with low semantic signal for the
+/// general chat class. Inside an agentic loop, though, two turns can differ
+/// ONLY by tool-result content (a re-fetched file, a re-run query), and the
+/// main key would collide them — the exact gap G4. This is a *separate*,
+/// parallel axis that DOES include tool-result content, so a semantic
+/// sub-step cache can differentiate those turns without changing the main
+/// key's behavior.
+///
+/// It mirrors [`l2_context_text`]'s framing (system first, then each
+/// non-system message in order with a role prefix) and ADDS each
+/// `Message::Tool` block as `"[tool] {content}"` in order. The two axes are
+/// intentionally distinct embedding spaces; a sub-step cache built on this
+/// axis must never be served against the main key, and vice versa.
+///
+/// Returns `None` only if `req.messages` is empty or contains no text at all.
+///
+/// `pub` so the test suite can verify it directly; callers inside `crates/core`
+/// import it from `tt_cache`.
+pub fn l2_tool_context_text(req: &ChatCompletionRequest) -> Option<String> {
+    fn message_text(content: &MessageContent) -> &str {
+        match content {
+            MessageContent::Text(s) => s.as_str(),
+            MessageContent::Parts(parts) => {
+                for p in parts {
+                    if let ContentPart::Text { text } = p {
+                        return text.as_str();
+                    }
+                }
+                ""
+            }
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+
+    for msg in &req.messages {
+        match msg {
+            Message::System { content } => {
+                let t = message_text(content);
+                if !t.is_empty() {
+                    parts.push(format!("[system] {t}"));
+                }
+            }
+            Message::User { content, .. } => {
+                let t = message_text(content);
+                if !t.is_empty() {
+                    parts.push(format!("[user] {t}"));
+                }
+            }
+            Message::Assistant { content, .. } => {
+                if let Some(c) = content {
+                    let t = message_text(c);
+                    if !t.is_empty() {
+                        parts.push(format!("[assistant] {t}"));
+                    }
+                }
+            }
+            // The differentiator vs. `l2_context_text`: tool-result content is
+            // INCLUDED on this axis so sub-step turns differing only by tool
+            // result are distinguished (gap G4).
+            Message::Tool { content, .. } => {
+                let t = message_text(content);
+                if !t.is_empty() {
+                    parts.push(format!("[tool] {t}"));
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InMemoryL2Cache
 // ---------------------------------------------------------------------------
@@ -1831,5 +1911,81 @@ mod tests {
             "20% FP must breach the strictest (0.5%) tolerance in the batch"
         );
         assert!(g.effective_threshold(class) > DEFAULT_THRESHOLD);
+    }
+
+    // ── Sub-lever 4: tool-result embedding axis (closes gap G4) ──────────────
+
+    /// A two-turn agent request: an assistant tool call + a `role:"tool"`
+    /// result. Built so the only varying axis under test is the tool-result
+    /// content.
+    fn agent_turn(tool_result_content: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![
+                Message::System {
+                    content: MessageContent::Text("you are a helpful assistant".into()),
+                },
+                Message::User {
+                    content: MessageContent::Text("look up the weather".into()),
+                    name: None,
+                },
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![],
+                    name: None,
+                },
+                Message::Tool {
+                    content: MessageContent::Text(tool_result_content.into()),
+                    tool_call_id: "call_1".into(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The NEW axis embeds `Message::Tool` content (the differentiator the
+    /// existing `l2_context_text` omits at `l2.rs:696-697`) so two agent turns
+    /// differing ONLY by tool-result content produce DIFFERENT embedding text.
+    /// This is what closes gap G4.
+    #[test]
+    fn l2_tool_context_text_includes_tool_messages() {
+        let a = agent_turn(r#"{"temp_c": 12}"#);
+        let b = agent_turn(r#"{"temp_c": 31}"#);
+
+        let ta = l2_tool_context_text(&a).expect("tool-context text for a");
+        let tb = l2_tool_context_text(&b).expect("tool-context text for b");
+
+        assert!(
+            ta.contains(r#"{"temp_c": 12}"#),
+            "the new axis must embed the tool-result content: {ta}"
+        );
+        assert_ne!(
+            ta, tb,
+            "two turns differing ONLY by tool-result content must embed differently \
+             (closing G4); got identical text: {ta}"
+        );
+    }
+
+    /// The EXISTING `l2_context_text` is UNCHANGED — the new axis is separate,
+    /// not a behavior change to L1/L2's main key. Two turns differing ONLY by
+    /// tool-result content still produce IDENTICAL main-key text (tool messages
+    /// remain omitted). Regression guard for the main embedding key.
+    #[test]
+    fn l2_context_text_still_omits_tool_messages() {
+        let a = agent_turn(r#"{"temp_c": 12}"#);
+        let b = agent_turn(r#"{"temp_c": 31}"#);
+
+        let ca = l2_context_text(&a).expect("main context text for a");
+        let cb = l2_context_text(&b).expect("main context text for b");
+
+        assert!(
+            !ca.contains("temp_c"),
+            "the main key must still omit tool-result content: {ca}"
+        );
+        assert_eq!(
+            ca, cb,
+            "the existing main key is unchanged by the tool axis — turns differing \
+             only by tool result must still key identically"
+        );
     }
 }
