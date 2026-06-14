@@ -37,6 +37,18 @@
 //! over is never shaped. This is the same bound Sub-lever 2b's summarization
 //! honors — the judge is only a ~2% statistical sample, so the recent tail must
 //! stay verbatim independent of any judge verdict.
+//!
+//! # Sub-lever 2b — the lossy summary half (Task 7)
+//!
+//! The lossy second tier of Sub-lever 2 lives in the sibling
+//! [`super::summarize_judge`] module: [`super::summarize_judge::SummarizeStep`]
+//! rewrites OLDER tool blocks to a short summary, but — unlike this lossless
+//! field-drop layer, which commits on the token-true gate alone — it commits a
+//! drop ONLY behind the blind paired equivalence judge's verdict projection
+//! ([`super::summarize_judge::SummaryGate`], caveat C1). The two halves share
+//! the SAME `keep_recent_pairs` blast-radius bound: neither ever touches the
+//! recent tail. The planner ([`super::AgenticBudgetPlanner`]) composes them in
+//! priority order — lossless field-drop first, then judge-gated summary.
 
 use serde_json::Value;
 
