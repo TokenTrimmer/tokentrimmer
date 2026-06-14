@@ -166,7 +166,7 @@ mod tests {
             then: RouteAction {
                 format_switch: None,
                 diff: false,
-                target_model: target.into(),
+                target_model: Some(target.into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
@@ -278,7 +278,7 @@ mod tests {
                     enabled: true,
                     when: RouteConditions::default(),
                     then: RouteAction {
-                        target_model: "m".into(),
+                        target_model: Some("m".into()),
                         ..Default::default()
                     },
                 },
@@ -337,7 +337,7 @@ mod tests {
                     then: RouteAction {
                         format_switch: None,
                         diff: false,
-                        target_model: "m".into(),
+                        target_model: Some("m".into()),
                         fallbacks: vec![],
                         disable_cache: false,
                         max_cost_usd: None,

@@ -38,6 +38,8 @@ pub enum ValidationError {
         "agentic_budget.keep_recent_pairs must be >= 1 (keeping zero verbatim defeats the C1 blast-radius bound)"
     )]
     InvalidKeepRecentPairs,
+    #[error("route has neither a target_model nor any then-effect (no-op route)")]
+    EmptyRoute,
 }
 
 /// Reject malformed auto-pause config at route-creation time: a
@@ -169,15 +171,56 @@ pub fn validate_capability(
     if !needs_vision {
         return Ok(());
     }
-    if let Some(info) = lookup(&then.target_model) {
+    // A modifier-only route (`target_model == None`) has no rewrite target to
+    // capability-check — skip, mirroring the "unknown target is permissive"
+    // stance (the caller's own model is what gets dispatched and it already
+    // satisfied the request, since it's the model the caller chose).
+    let Some(tm) = then.target_model.as_deref() else {
+        return Ok(());
+    };
+    if let Some(info) = lookup(tm) {
         if !info.capabilities.contains(&Capability::Vision) {
             return Err(ValidationError::MissingCapability {
-                target: then.target_model.clone(),
+                target: tm.to_string(),
                 capability: "vision",
             });
         }
     }
     Ok(())
+}
+
+/// Reject a no-op route at CONFIG time: a **modifier-only** route
+/// (`target_model == None`) MUST carry at least one then-effect — otherwise it
+/// matches traffic, rewrites nothing, and applies nothing, which is always a
+/// configuration mistake. When `target_model` is `Some`, the rewrite itself is
+/// the effect, so this check always passes (the existing behavior of every
+/// route that pins a model is unchanged).
+///
+/// "Has an effect" = ANY cost/shaping/safety lever, a non-empty `fallbacks`
+/// list, or an `agentic_budget`/`shadow_model`/cap being set.
+pub fn validate_route_has_effect(then: &RouteAction) -> Result<(), ValidationError> {
+    if then.target_model.is_some() {
+        return Ok(());
+    }
+    let has_effect = then.agentic_budget.is_some()
+        || then.disable_cache
+        || then.flex
+        || then.batch
+        || then.compress
+        || then.redact
+        || then.format_switch.is_some()
+        || then.diff
+        || then.minify_json
+        || then.max_cost_usd.is_some()
+        || then.shadow_model.is_some()
+        || then.reasoning_max_effort.is_some()
+        || then.reasoning_budget_tokens.is_some()
+        || !then.fallbacks.is_empty();
+    if has_effect {
+        Ok(())
+    } else {
+        Err(ValidationError::EmptyRoute)
+    }
 }
 
 #[cfg(test)]
@@ -188,7 +231,7 @@ mod tests {
 
     fn action(target: &str) -> RouteAction {
         RouteAction {
-            target_model: target.into(),
+            target_model: Some(target.into()),
             fallbacks: vec![],
             disable_cache: false,
             max_cost_usd: None,
@@ -500,5 +543,50 @@ mod tests {
     fn agentic_budget_none_validates_trivially() {
         let resolves = |_: &str| false;
         assert!(validate_agentic_budget(&action("gpt-4o"), resolves).is_ok());
+    }
+
+    /// A modifier-only route (`target_model: None`) has no rewrite target to
+    /// capability-check — the vision check is SKIPPED (Ok), mirroring the
+    /// "unknown target is permissive" stance.
+    #[test]
+    fn capability_check_skipped_when_target_model_none() {
+        let when = RouteConditions {
+            has_images: Some(true),
+            ..Default::default()
+        };
+        let lookup = |_: &str| -> Option<ModelInfo> { None };
+        let mut a = action("ignored");
+        a.target_model = None;
+        a.agentic_budget = Some(AgenticBudget::default());
+        assert!(validate_capability(&when, &a, lookup).is_ok());
+    }
+
+    /// `validate_route_has_effect`: a `None`-target route with no effect is an
+    /// `EmptyRoute` no-op; with an `agentic_budget` it's Ok; a `Some`-target
+    /// route always passes (the rewrite IS the effect).
+    #[test]
+    fn route_has_effect_rules() {
+        // None target + no effect → EmptyRoute.
+        let mut empty = action("ignored");
+        empty.target_model = None;
+        assert_eq!(
+            validate_route_has_effect(&empty),
+            Err(ValidationError::EmptyRoute)
+        );
+
+        // None target + agentic_budget → Ok.
+        let mut mod_only = action("ignored");
+        mod_only.target_model = None;
+        mod_only.agentic_budget = Some(AgenticBudget::default());
+        assert!(validate_route_has_effect(&mod_only).is_ok());
+
+        // None target + a non-agentic effect (compress) → Ok.
+        let mut compress = action("ignored");
+        compress.target_model = None;
+        compress.compress = true;
+        assert!(validate_route_has_effect(&compress).is_ok());
+
+        // Some target + nothing else → Ok (the rewrite is the effect).
+        assert!(validate_route_has_effect(&action("gpt-4o")).is_ok());
     }
 }
