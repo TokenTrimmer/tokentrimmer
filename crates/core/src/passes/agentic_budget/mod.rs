@@ -27,8 +27,10 @@
 //! no headers, and changes no behavior.
 
 pub mod cache_prefix;
+pub mod elide;
 
 pub use cache_prefix::{annotate_cache_prefix, CachePrefixPlan};
+pub use elide::ElidePass;
 
 /// Orchestrates the agentic-budget sub-levers for a request, netting their
 /// interactions before dispatch.
