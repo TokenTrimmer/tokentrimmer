@@ -313,6 +313,7 @@ async fn app_with_batch_route(model_in: &str, batch: bool) -> Harness {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                agentic_budget: None,
                 target_model: model_in.into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

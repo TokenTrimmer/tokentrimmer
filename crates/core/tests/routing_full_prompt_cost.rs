@@ -201,6 +201,7 @@ async fn cost_condition_counts_full_prompt() {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                agentic_budget: None,
                 target_model: "gpt-4o-mini".into(),
                 fallbacks: Vec::new(),
                 disable_cache: false,

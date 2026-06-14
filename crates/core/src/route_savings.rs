@@ -20,6 +20,12 @@
 //!   baseline reference dispatches).
 //! * `shadow_tax_usd` — Σ `COALESCE(shadow_cost_usd, 0)`: the #146 shadow
 //!   arm's discarded verification spend.
+//! * `cache_bust_usd` — Σ `cache_bust_penalty_usd`: the cache-bust NEGATIVE
+//!   entry (agentic budget Sub-levers 1-3 + any pass), ITEMIZED so it is
+//!   auditable. It is ALREADY netted inside `gross_saved_usd`'s
+//!   `GREATEST(...)`, so it is surfaced for transparency only and is NOT
+//!   re-subtracted in `net_saved_usd` (re-subtracting would double-count).
+//!   Same "never silently subtracted" discipline as `judge_tax_usd`.
 //! * `net_saved_usd = gross - judge_tax - shadow_tax`, and it MAY BE
 //!   NEGATIVE — a regressing route whose verification spend exceeds its swap
 //!   saving must show it. Only the per-request headline clamps at 0.
@@ -58,6 +64,16 @@ pub struct RouteSavingsNet {
     pub judge_tax_usd: f64,
     /// Verification tax of the #146 shadow arm: Σ COALESCE(shadow_cost_usd,0).
     pub shadow_tax_usd: f64,
+    /// Σ `cache_bust_penalty_usd` over the route's rows — the agentic budget's
+    /// (and any pass's) NEGATIVE cache-bust entry, ITEMIZED so it is auditable
+    /// rather than silently buried. It is ALREADY netted inside
+    /// `gross_saved_usd` (the row-level `GREATEST(... - cache_bust_penalty_usd,
+    /// 0)`), so it is reported here for transparency only and is NOT subtracted
+    /// again in `net_saved_usd` (re-subtracting would double-count). Mirrors the
+    /// `judge_tax_usd` "never silently subtracted" discipline (the C3-priced
+    /// estimate stays out of the invoice-reconciled `cost`/`baseline` columns
+    /// the gross figure derives from; see `CostBreakdown::cache_bust_penalty_usd`).
+    pub cache_bust_usd: f64,
     /// gross - judge_tax - shadow_tax. MAY BE NEGATIVE (a regressing route
     /// whose verification spend exceeds its swap saving must show it) — never
     /// clamped at this aggregate level; only the per-request headline clamps.
@@ -146,7 +162,9 @@ pub fn assemble(
 }
 
 /// [`assemble`] plus the format-switch ESTIMATE line (its own field, never
-/// netted — see [`RouteSavingsNet::format_switch_saved_est_usd`]).
+/// netted — see [`RouteSavingsNet::format_switch_saved_est_usd`]). The
+/// itemized cache-bust line defaults to 0 (use [`assemble_with_taxes`] to
+/// surface it).
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn assemble_with_estimates(
@@ -155,6 +173,44 @@ pub fn assemble_with_estimates(
     gross: f64,
     judge_tax: f64,
     shadow_tax: f64,
+    unmetered_rows: u64,
+    judged: u64,
+    acceptable: u64,
+    degraded: u64,
+    unclear: u64,
+    format_switch_saved_est: f64,
+) -> RouteSavingsNet {
+    assemble_with_taxes(
+        route_id,
+        requests,
+        gross,
+        judge_tax,
+        shadow_tax,
+        0.0,
+        unmetered_rows,
+        judged,
+        acceptable,
+        degraded,
+        unclear,
+        format_switch_saved_est,
+    )
+}
+
+/// [`assemble_with_estimates`] plus the ITEMIZED cache-bust line
+/// (`cache_bust` = Σ `cache_bust_penalty_usd`). The bust is ALREADY netted
+/// inside `gross` at the row level (`GREATEST(... - cache_bust_penalty_usd,
+/// 0)`), so it is surfaced here for transparency ONLY and is NOT subtracted
+/// again from `net_saved_usd` (re-subtracting would double-count). See
+/// [`RouteSavingsNet::cache_bust_usd`].
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn assemble_with_taxes(
+    route_id: Uuid,
+    requests: u64,
+    gross: f64,
+    judge_tax: f64,
+    shadow_tax: f64,
+    cache_bust: f64,
     unmetered_rows: u64,
     judged: u64,
     acceptable: u64,
@@ -174,6 +230,9 @@ pub fn assemble_with_estimates(
         gross_saved_usd: gross,
         judge_tax_usd: judge_tax,
         shadow_tax_usd: shadow_tax,
+        cache_bust_usd: cache_bust,
+        // gross already nets the bust at the row level — do NOT re-subtract it
+        // here (that would double-count the negative entry).
         net_saved_usd: gross - judge_tax - shadow_tax,
         unmetered_tax_rows: unmetered_rows,
         format_switch_saved_est_usd: format_switch_saved_est,
@@ -197,6 +256,7 @@ pub const ROUTE_SAVINGS_SQL: &str = r#"WITH gross AS (
          COUNT(*)::bigint AS requests,
          COALESCE(SUM(GREATEST(baseline_cost_usd - cost_usd - provider_cache_saved_usd - cache_bust_penalty_usd, 0)), 0)::float8 AS gross_saved_usd,
          COALESCE(SUM(COALESCE(shadow_cost_usd, 0)), 0)::float8 AS shadow_tax_usd,
+         COALESCE(SUM(cache_bust_penalty_usd), 0)::float8 AS cache_bust_usd,
          COALESCE(SUM(format_switch_saved_est_usd), 0)::float8 AS format_switch_saved_est_usd,
          COUNT(*) FILTER (WHERE shadow_model IS NOT NULL AND shadow_cost_usd IS NULL)::bigint AS unmetered_shadow_rows
   FROM request_logs
@@ -217,6 +277,7 @@ SELECT COALESCE(g.route_id, t.route_id) AS route_id,
        COALESCE(g.requests, 0) AS requests,
        COALESCE(g.gross_saved_usd, 0) AS gross_saved_usd,
        COALESCE(g.shadow_tax_usd, 0) AS shadow_tax_usd,
+       COALESCE(g.cache_bust_usd, 0) AS cache_bust_usd,
        COALESCE(g.format_switch_saved_est_usd, 0) AS format_switch_saved_est_usd,
        COALESCE(g.unmetered_shadow_rows, 0) + COALESCE(t.unmetered_verdict_rows, 0) AS unmetered_tax_rows,
        COALESCE(t.judged, 0) AS judged,
@@ -254,6 +315,7 @@ struct SavingsRow {
     requests: i64,
     gross_saved_usd: f64,
     shadow_tax_usd: f64,
+    cache_bust_usd: f64,
     format_switch_saved_est_usd: f64,
     unmetered_tax_rows: i64,
     judged: i64,
@@ -281,12 +343,13 @@ impl RouteSavingsSource for PostgresRouteSavingsSource {
         Ok(rows
             .into_iter()
             .map(|r| {
-                assemble_with_estimates(
+                assemble_with_taxes(
                     r.route_id,
                     r.requests.max(0) as u64,
                     r.gross_saved_usd,
                     r.judge_tax_usd,
                     r.shadow_tax_usd,
+                    r.cache_bust_usd,
                     r.unmetered_tax_rows.max(0) as u64,
                     r.judged.max(0) as u64,
                     r.acceptable.max(0) as u64,
@@ -370,6 +433,48 @@ mod tests {
         assert_eq!(
             unjudged.unmetered_tax_rows, 1,
             "unmetered rows must be flagged (taxes are lower bounds)"
+        );
+    }
+
+    /// The cache-bust penalty is ITEMIZED as its own line (never silently
+    /// buried inside the netted `gross_saved_usd`). It IS already netted into
+    /// `gross_saved_usd` (the row-level `GREATEST(... - cache_bust_penalty,
+    /// 0)`), so itemizing it here is purely informational — a CFO can see the
+    /// negative entry that reduced the headline. The assembler does NOT
+    /// re-subtract it (double-counting would understate the saving). Mirrors the
+    /// `judge_tax_usd` itemization-not-silent-subtraction discipline.
+    #[test]
+    fn cache_bust_itemized_not_silently_subtracted() {
+        let id = Uuid::now_v7();
+        // gross already reflects the bust net; the bust line is the SAME figure
+        // surfaced for transparency, not an extra subtraction.
+        let row = assemble_with_taxes(id, 10, 5.0, 1.0, 0.5, 0.25, 0, 2, 2, 0, 0, 0.0);
+        assert!((row.cache_bust_usd - 0.25).abs() < 1e-12);
+        // gross/net are NOT reduced again by the itemized bust (it was already
+        // netted at the row level inside gross).
+        assert!((row.gross_saved_usd - 5.0).abs() < 1e-12);
+        assert!((row.net_saved_usd - (5.0 - 1.0 - 0.5)).abs() < 1e-12);
+        // The thin wrappers default the bust line to 0.
+        let plain = assemble(id, 10, 5.0, 1.0, 0.5, 0, 2, 2, 0, 0);
+        assert_eq!(plain.cache_bust_usd, 0.0);
+        let with_est = assemble_with_estimates(id, 10, 5.0, 1.0, 0.5, 0, 2, 2, 0, 0, 7.25);
+        assert_eq!(with_est.cache_bust_usd, 0.0);
+    }
+
+    /// The canonical SQL itemizes the cache-bust as its OWN summed column
+    /// (`cache_bust_usd`) in addition to netting it inside `gross_saved_usd`'s
+    /// `GREATEST(...)` — so the negative entry is auditable, never silently
+    /// subtracted.
+    #[test]
+    fn route_savings_sql_itemizes_cache_bust() {
+        assert!(
+            ROUTE_SAVINGS_SQL.contains("AS cache_bust_usd"),
+            "cache-bust must be itemized as its own summed column"
+        );
+        // Still netted inside the gross GREATEST(...) (unchanged behavior).
+        assert!(
+            ROUTE_SAVINGS_SQL.contains("- cache_bust_penalty_usd, 0)"),
+            "cache-bust must stay netted in gross_saved_usd"
         );
     }
 

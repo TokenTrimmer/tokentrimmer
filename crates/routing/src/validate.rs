@@ -30,6 +30,14 @@ pub enum ValidationError {
     InvalidFormatSwitch { got: String },
     #[error("format_switch and diff are mutually exclusive on one route")]
     OutputShapingConflict,
+    #[error(
+        "agentic_budget.route_mechanical_to `{target}` does not resolve to any registered provider"
+    )]
+    UnresolvableMechanicalRoute { target: String },
+    #[error(
+        "agentic_budget.keep_recent_pairs must be >= 1 (keeping zero verbatim defeats the C1 blast-radius bound)"
+    )]
+    InvalidKeepRecentPairs,
 }
 
 /// Reject malformed auto-pause config at route-creation time: a
@@ -113,6 +121,42 @@ pub fn validate_shadow_model(
     Ok(())
 }
 
+/// Validate a route's [`AgenticBudget`] at CONFIG time (route creation) so a
+/// misconfigured opt-in fails the moment it's written, never silently at
+/// dispatch — the same fail-at-config discipline as `validate_shadow_model` /
+/// `validate_auto_pause`. When the route declares no `agentic_budget`,
+/// validation is a no-op (the off-by-default path stays untouched).
+///
+/// Two checks:
+/// - `route_mechanical_to` (Sub-lever 3 down-route target) must resolve to a
+///   registered provider — an unresolvable down-route is a pure mistake, never
+///   a passthrough, exactly like `shadow_model` (`resolves(model) -> bool` is
+///   the gateway's dispatch-resolution check). When unset, no resolution is
+///   required.
+/// - `keep_recent_pairs` must be >= 1: keeping ZERO recent tool-result pairs
+///   verbatim defeats caveat C1's blast-radius bound (it would expose the
+///   load-bearing recent context to the lossy summarizer, which the blind
+///   paired judge only samples at ~2%). The struct's default is 3.
+pub fn validate_agentic_budget(
+    then: &RouteAction,
+    resolves: impl Fn(&str) -> bool,
+) -> Result<(), ValidationError> {
+    let Some(ab) = then.agentic_budget.as_ref() else {
+        return Ok(());
+    };
+    if let Some(target) = ab.route_mechanical_to.as_deref() {
+        if !resolves(target) {
+            return Err(ValidationError::UnresolvableMechanicalRoute {
+                target: target.to_string(),
+            });
+        }
+    }
+    if ab.keep_recent_pairs < 1 {
+        return Err(ValidationError::InvalidKeepRecentPairs);
+    }
+    Ok(())
+}
+
 /// When the route requires image or audio input, the target must be
 /// `Vision`-capable (the runtime guard sets `vision=true` for both). An unknown
 /// target (`lookup` returns `None`) is permissive, matching the runtime guard.
@@ -139,7 +183,7 @@ pub fn validate_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RouteAction, RouteConditions};
+    use crate::{AgenticBudget, RouteAction, RouteConditions};
     use tt_shared::pricing::{Capability, ModelInfo};
 
     fn action(target: &str) -> RouteAction {
@@ -162,6 +206,7 @@ mod tests {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            agentic_budget: None,
         }
     }
     fn vision_model(id: &str) -> ModelInfo {
@@ -376,5 +421,84 @@ mod tests {
         a.shadow_model = Some("claude-haiku-4-5".into());
         a.traffic_pct = None;
         assert!(validate_shadow_model(&a, resolves).is_ok());
+    }
+
+    /// Sub-lever 3 (`route_mechanical_to`) must resolve to a registered provider
+    /// at CONFIG time — an unresolvable down-route target is a pure mistake that
+    /// would silently no-op at dispatch (mirrors `validate_shadow_model`'s
+    /// contract). When unset, validation is a no-op.
+    #[test]
+    fn agentic_budget_route_mechanical_must_resolve() {
+        let resolves = |m: &str| m == "claude-haiku-4-5";
+
+        // route_mechanical_to resolves → OK.
+        let mut ok = action("gpt-4o");
+        ok.agentic_budget = Some(AgenticBudget {
+            route_mechanical_to: Some("claude-haiku-4-5".into()),
+            ..Default::default()
+        });
+        assert!(validate_agentic_budget(&ok, resolves).is_ok());
+
+        // Unresolvable down-route target → hard error at config time.
+        let mut bad = action("gpt-4o");
+        bad.agentic_budget = Some(AgenticBudget {
+            route_mechanical_to: Some("nonexistent-model".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            validate_agentic_budget(&bad, resolves),
+            Err(ValidationError::UnresolvableMechanicalRoute {
+                target: "nonexistent-model".into()
+            })
+        );
+
+        // No route_mechanical_to → no resolution required.
+        let mut none = action("gpt-4o");
+        none.agentic_budget = Some(AgenticBudget {
+            route_mechanical_to: None,
+            ..Default::default()
+        });
+        assert!(validate_agentic_budget(&none, resolves).is_ok());
+    }
+
+    /// `keep_recent_pairs` must be at least 1: keeping zero recent tool-result
+    /// pairs verbatim defeats caveat C1's blast-radius bound (it would let the
+    /// lossy summarizer touch the load-bearing recent context, which the judge
+    /// only samples at ~2%). Rejected even though it carries no resolution.
+    #[test]
+    fn agentic_budget_keep_recent_pairs_bounded() {
+        let resolves = |_: &str| true;
+
+        // keep_recent_pairs == 0 → rejected.
+        let mut zero = action("gpt-4o");
+        zero.agentic_budget = Some(AgenticBudget {
+            keep_recent_pairs: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            validate_agentic_budget(&zero, resolves),
+            Err(ValidationError::InvalidKeepRecentPairs)
+        );
+
+        // keep_recent_pairs == 1 (the minimum) → OK.
+        let mut one = action("gpt-4o");
+        one.agentic_budget = Some(AgenticBudget {
+            keep_recent_pairs: 1,
+            ..Default::default()
+        });
+        assert!(validate_agentic_budget(&one, resolves).is_ok());
+
+        // The default (3) → OK.
+        let mut def = action("gpt-4o");
+        def.agentic_budget = Some(AgenticBudget::default());
+        assert!(validate_agentic_budget(&def, resolves).is_ok());
+    }
+
+    /// No `agentic_budget` on the route → validation is a trivial no-op (the
+    /// off-by-default path stays byte-identical, never gated).
+    #[test]
+    fn agentic_budget_none_validates_trivially() {
+        let resolves = |_: &str| false;
+        assert!(validate_agentic_budget(&action("gpt-4o"), resolves).is_ok());
     }
 }

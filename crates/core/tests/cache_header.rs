@@ -369,6 +369,7 @@ async fn privacy_route_disable_cache_beats_force_write() {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                agentic_budget: None,
                 target_model: "counting-1".into(),
                 fallbacks: vec![],
                 disable_cache: true,

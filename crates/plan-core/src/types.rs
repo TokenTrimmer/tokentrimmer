@@ -947,6 +947,9 @@ mod tests {
             minify_json: true,
             reasoning_max_effort: Some("low".to_string()),
             reasoning_budget_tokens: Some(8192),
+            // not mirrored (route-grained shaping mode, not a replay-projected
+            // effect) — `None` is omitted from the wire, keeping byte-identity.
+            agentic_budget: None,
         };
         let gateway_json = serde_json::to_string(&gateway).unwrap();
 

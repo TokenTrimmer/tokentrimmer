@@ -26,8 +26,8 @@ pub use store::{
     InMemoryRoutingStore, NewRoute, NewRoutePause, PausedBy, RoutingStore, RoutingStoreError,
 };
 pub use validate::{
-    validate_auto_pause, validate_capability, validate_output_shaping, validate_shadow_model,
-    ValidationError,
+    validate_agentic_budget, validate_auto_pause, validate_capability, validate_output_shaping,
+    validate_shadow_model, ValidationError,
 };
 
 use serde::{Deserialize, Serialize};
@@ -303,6 +303,66 @@ pub struct RouteAction {
     /// `reasoning_max_effort`. `None` = off (default); omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_budget_tokens: Option<u32>,
+    /// Opt the matched (loop) traffic into the agentic context budget — the
+    /// route-grained mode that brings the CLI's loop-aware levers server-side.
+    /// `None` = off (no-op; never alters semantics for non-opted traffic).
+    /// Composes with `target_model`/`fallbacks` + `auto_pause`. Levers do NOT
+    /// stack at face value — the planner nets them per request (see
+    /// `tt_core::passes::agentic_budget`). Default `None`; omitted from JSON
+    /// when `None` (back-compat with existing rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_budget: Option<AgenticBudget>,
+}
+
+/// Route-grained agentic context budget — the opt-in shaping mode that brings
+/// the CLI's loop-aware levers server-side. Every lever is OFF by default; the
+/// whole struct is `Option<AgenticBudget>` on [`RouteAction`], serde-omitted
+/// when `None`, so the default request path is byte-identical (no new tokens,
+/// no new headers, no behavior change). The levers do NOT stack at face value —
+/// the planner (`tt_core::passes::agentic_budget`) nets them per request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgenticBudget {
+    /// Sub-lever 1 (lossless): annotate cache_control breakpoints the caller
+    /// forgot + restructure static-first. Default true when the mode is set.
+    #[serde(default)]
+    pub cache_prefix: bool,
+    /// Sub-lever 2: field-drop (lossless, token-true-gated) + summarize
+    /// (lossy, judge-gated) stale tool results.
+    #[serde(default)]
+    pub elide_stale_tools: bool,
+    /// Keep the last N tool-result pairs VERBATIM (caveat C1 blast-radius
+    /// bound). Default 3 (mirrors Anthropic `keep=3`).
+    #[serde(default = "default_keep_recent_pairs")]
+    pub keep_recent_pairs: u32,
+    /// Each elision must free at least this many tokens to justify the
+    /// re-cache it forces (R1 cache-thrash guard). Default 0 = off.
+    #[serde(default)]
+    pub clear_at_least_tokens: u32,
+    /// Sub-lever 3: down-route mechanical sub-steps to this model in a
+    /// CACHE-ISOLATED subagent lane. `None` = no routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_mechanical_to: Option<String>,
+    /// Sub-lever 4 (expectation-value, caveat C2): semantic sub-step cache
+    /// for READ-ONLY/idempotent sub-steps only.
+    #[serde(default)]
+    pub semantic_substep_cache: bool,
+}
+
+fn default_keep_recent_pairs() -> u32 {
+    3
+}
+
+impl Default for AgenticBudget {
+    fn default() -> Self {
+        Self {
+            cache_prefix: false,
+            elide_stale_tools: false,
+            keep_recent_pairs: default_keep_recent_pairs(),
+            clear_at_least_tokens: 0,
+            route_mechanical_to: None,
+            semantic_substep_cache: false,
+        }
+    }
 }
 
 /// Deterministic, replica-independent canary arm selection.
@@ -581,6 +641,7 @@ mod tests {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                agentic_budget: None,
             },
             paused: false,
         }
@@ -898,6 +959,7 @@ mod tests {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            agentic_budget: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -939,6 +1001,7 @@ mod tests {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            agentic_budget: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -972,6 +1035,7 @@ mod tests {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            agentic_budget: None,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -1020,6 +1084,60 @@ mod tests {
         let a: RouteAction = serde_json::from_str(json).unwrap();
         assert!(a.diff);
         assert_eq!(serde_json::to_string(&a).unwrap(), json);
+    }
+
+    /// `agentic_budget` is OMITTED from JSON when `None` — the back-compat
+    /// invariant: the default request path is byte-identical (no new field on
+    /// the wire), mirroring how `format_switch`/`shadow_model` are tested.
+    #[test]
+    fn agentic_budget_omitted_from_json_when_none() {
+        let a = RouteAction::default();
+        assert_eq!(a.agentic_budget, None);
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(
+            !j.contains("agentic_budget"),
+            "agentic_budget must be omitted when None: {j}"
+        );
+    }
+
+    /// A `RouteAction` carrying `agentic_budget: Some(..)` serializes and
+    /// deserializes byte-stably (round-trip), and the nested `AgenticBudget`
+    /// preserves its non-default field values.
+    #[test]
+    fn agentic_budget_round_trips() {
+        let original = RouteAction {
+            target_model: "m".into(),
+            agentic_budget: Some(AgenticBudget {
+                cache_prefix: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: RouteAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.agentic_budget,
+            Some(AgenticBudget {
+                cache_prefix: true,
+                ..Default::default()
+            })
+        );
+        // Byte-stable re-emit.
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    /// `AgenticBudget::default()` is OFF: every lever disabled, the
+    /// blast-radius bound `keep_recent_pairs` defaults to 3 (Anthropic
+    /// `keep=3`), no forced re-cache threshold, no routing.
+    #[test]
+    fn agentic_budget_default_is_off() {
+        let ab = AgenticBudget::default();
+        assert!(!ab.cache_prefix);
+        assert!(!ab.elide_stale_tools);
+        assert_eq!(ab.keep_recent_pairs, 3);
+        assert_eq!(ab.clear_at_least_tokens, 0);
+        assert_eq!(ab.route_mechanical_to, None);
+        assert!(!ab.semantic_substep_cache);
     }
 
     /// Cross-crate lossless round-trip: JSON produced by `tt_routing::RouteAction`

@@ -238,6 +238,7 @@ async fn app_with_format_switch_route(format_switch: Option<&str>) -> Harness {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                agentic_budget: None,
                 diff: false,
                 traffic_pct: None,
                 shadow_model: None,
