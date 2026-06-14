@@ -1076,6 +1076,15 @@ pub async fn handler(
     // dispatch; it never attributes a saving and surfaces a `redacted:<class>`
     // warning when it fires.
     let route_redact = route_match.as_ref().is_some_and(|m| m.redact);
+    // A matched route opting into the agentic context budget
+    // (`RouteAction::agentic_budget`). `None` for every unrouted request and
+    // every route that did not opt in (the default), so the
+    // `AgenticBudgetPlanner` is never constructed on that path and `req` stays
+    // byte-for-byte unchanged. When `Some(_)`, the planner nets the
+    // cache-prefix / field-drop / summarize / route levers AFTER redaction +
+    // compression, just before dispatch (see the wiring point below). Off by
+    // default is LOAD-BEARING: the default request path must be byte-identical.
+    let route_agentic_budget = route_match.as_ref().and_then(|m| m.agentic_budget.clone());
     // Redaction × judge sampling: the judge captures above hold the
     // PRE-redaction request — the judge job re-dispatches it verbatim to the
     // source provider for the baseline reference AND embeds its text in the
@@ -1528,24 +1537,63 @@ pub async fn handler(
         0
     };
 
+    // Agentic context budget (`RouteAction::agentic_budget`): OFF BY DEFAULT —
+    // `route_agentic_budget` is `None` for every unrouted request (and every
+    // route that did not opt in), so the planner is never constructed and `req`
+    // is byte-identical on the default path. When a route opted in, the planner
+    // nets the cache-prefix / field-drop / summarize / route levers per request
+    // (they do NOT stack at face value — see `passes::agentic_budget`). It runs
+    // AFTER redaction (`req` is already redacted above) and AFTER compression,
+    // so every artifact it produces (any field-drop / summary) is built from the
+    // POST-redaction, post-compression DISPATCHED bytes — never a pre-pipeline
+    // clone (R5: the measurement path must never out-leak the dispatch path).
+    // The planner returns the honest three-bucket accounting (field-drop /
+    // summary tokens, summarizer tax, cache-bust penalty) plus any diagnostic
+    // warning tokens (`cache_bust:<source>`, the cache-isolated subagent lane).
+    let agentic_effects = if let Some(ab) = &route_agentic_budget {
+        let out = {
+            let mut split = crate::passes::SplitRequest::compute(&mut req, &pass_cx);
+            crate::passes::agentic_budget::AgenticBudgetPlanner::plan(ab, &mut split, &pass_cx)
+        };
+        warnings.extend(out.warnings);
+        if out.effects.elide_field_drop_tokens_removed > 0
+            || out.effects.elide_summary_tokens_removed > 0
+        {
+            tracing::debug!(
+                org_id = %ctx.org_id,
+                field_drop_tokens = out.effects.elide_field_drop_tokens_removed,
+                summary_tokens = out.effects.elide_summary_tokens_removed,
+                "agentic-budget planner removed input tokens"
+            );
+        }
+        out.effects
+    } else {
+        crate::passes::PassEffects::default()
+    };
+
     // Stable/volatile cache classifier — ALWAYS ON (observability-only, no
     // semantic change, so default-on is allowed): flags volatile markers
     // (timestamp / uuid / hex token) inside a would-be-stable cached prefix
     // via `cache_dynamic_prefix:<kind>` warning tokens + metrics, quantifying
     // the estimated per-request waste of the busted provider cache. Read-only;
-    // it never injects `cache_control` (adapter-owned per #126/#150).
+    // it never injects `cache_control` (adapter-owned per #126/#150). Runs after
+    // the agentic planner so it classifies the FINAL dispatched bytes.
     warnings.extend(crate::passes::CacheClassifierPass::classify(&req, &pass_cx));
 
     // Aggregated pass effects for the cost path (threaded into both the
     // non-streaming and streaming `compute_cost_full` calls): the measured
-    // compression delta plus the (pre-fee) cache-bust penalty booked above.
+    // compression delta, the (pre-fee) cache-bust penalty booked above, and the
+    // agentic-budget planner's three honest buckets (field-drop / summary
+    // tokens, summarizer tax, additional cache-bust). All buckets are zero on
+    // the default (un-opted) path, so it remains byte-identical and books no new
+    // spend.
     let pass_effects = crate::passes::PassEffects {
         compression_tokens_removed,
-        cache_bust_penalty_usd: cache_bust.penalty_usd(pass_cx.pricing),
-        // Agentic-budget buckets stay zero on this path; the planner folds its
-        // field-drop / summary / tax effects in at Task 9's wiring point. The
-        // default-path request remains byte-identical and books no new spend.
-        ..Default::default()
+        cache_bust_penalty_usd: cache_bust.penalty_usd(pass_cx.pricing)
+            + agentic_effects.cache_bust_penalty_usd,
+        elide_field_drop_tokens_removed: agentic_effects.elide_field_drop_tokens_removed,
+        elide_summary_tokens_removed: agentic_effects.elide_summary_tokens_removed,
+        summarizer_tax_usd: agentic_effects.summarizer_tax_usd,
     };
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
@@ -5395,6 +5443,15 @@ pub(crate) struct RouteMatch {
     /// (`RouteAction::reasoning_budget_tokens`). Same gating as
     /// `reasoning_max_effort`; never expressed via `max_tokens`.
     pub(crate) reasoning_budget_tokens: Option<u32>,
+    /// The matched route's opt-in **agentic context budget**
+    /// (`RouteAction::agentic_budget`, plan `2026-06-13-agentic-cost-context-budget`).
+    /// `Some(_)` opts the matched loop traffic into the route-grained planner
+    /// (`tt_core::passes::agentic_budget::AgenticBudgetPlanner`) that nets the
+    /// cache-prefix / field-drop / summarize / route levers per request. A COST
+    /// lever: forced to `None` on a paused route. `None` by default — the
+    /// planner is never constructed on the un-opted path, so that path is
+    /// byte-identical (off by default, load-bearing).
+    pub(crate) agentic_budget: Option<tt_routing::AgenticBudget>,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -5532,6 +5589,10 @@ pub(crate) async fn apply_routing(
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            // The agentic context budget is a COST lever (it nets caching /
+            // elision / routing for savings) — suppressed on a paused route,
+            // exactly like compress/flex/format_switch above.
+            agentic_budget: None,
             // SAFETY/privacy levers stay ON (pausing a quality gate must never
             // disable a privacy guardrail):
             disable_cache: m.then.disable_cache,
@@ -5558,6 +5619,7 @@ pub(crate) async fn apply_routing(
     let minify_json = m.then.minify_json;
     let reasoning_max_effort = m.then.reasoning_max_effort.clone();
     let reasoning_budget_tokens = m.then.reasoning_budget_tokens;
+    let agentic_budget = m.then.agentic_budget.clone();
 
     // Capability guard: before committing the rewrite, check that the
     // target model supports everything the request requires. When ModelInfo
@@ -5610,6 +5672,7 @@ pub(crate) async fn apply_routing(
         minify_json,
         reasoning_max_effort,
         reasoning_budget_tokens,
+        agentic_budget,
     }))
 }
 
