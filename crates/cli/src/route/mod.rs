@@ -336,7 +336,10 @@ mod tests {
             serde_json::from_value(body["then"].clone()).expect("then must parse as RouteAction");
         let ab = then.agentic_budget.expect("agentic_budget must be Some");
         assert!(ab.elide_stale_tools, "--elide-stale-tools sets the flag");
-        assert_eq!(ab.keep_recent_pairs, 3, "--keep-recent maps to keep_recent_pairs");
+        assert_eq!(
+            ab.keep_recent_pairs, 3,
+            "--keep-recent maps to keep_recent_pairs"
+        );
         assert_eq!(
             ab.route_mechanical_to.as_deref(),
             Some("haiku-4.5"),
@@ -344,7 +347,10 @@ mod tests {
         );
         // The opt-in turns the lossless FIRST lever on by default (the struct
         // documents `cache_prefix` as "default true when the mode is set").
-        assert!(ab.cache_prefix, "opting in enables the lossless cache-prefix lever");
+        assert!(
+            ab.cache_prefix,
+            "opting in enables the lossless cache-prefix lever"
+        );
     }
 
     /// Without `--agentic-budget`, `then.agentic_budget` is absent entirely (so
@@ -372,8 +378,7 @@ mod tests {
             ..base_args()
         })
         .unwrap();
-        let then: tt_routing::RouteAction =
-            serde_json::from_value(body["then"].clone()).unwrap();
+        let then: tt_routing::RouteAction = serde_json::from_value(body["then"].clone()).unwrap();
         let ab = then.agentic_budget.unwrap();
         assert_eq!(ab.keep_recent_pairs, 5);
         assert!(!ab.elide_stale_tools);
