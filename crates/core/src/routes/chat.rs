@@ -1720,6 +1720,7 @@ pub async fn handler(
                             flex_saved_usd: 0.0,
                             compression_saved_usd: 0.0,
                             cache_bust_penalty_usd: 0.0,
+                            summarizer_tax_usd: 0.0,
                             batch_forgone_usd: 0.0,
                             minify_saved_est_usd: 0.0,
                             diff_saved_usd: 0.0,
@@ -3471,6 +3472,7 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         flex_saved_usd: 0.0,
         compression_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         batch_forgone_usd: 0.0,
         minify_saved_est_usd: 0.0,
         diff_saved_usd: 0.0,
@@ -3542,6 +3544,7 @@ fn build_hit_l2_response(
         flex_saved_usd: 0.0,
         compression_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         batch_forgone_usd: 0.0,
         minify_saved_est_usd: 0.0,
         diff_saved_usd: 0.0,
@@ -3797,6 +3800,20 @@ pub(crate) struct CostBreakdown {
     /// `request_logs` row (migration 0016) so the row-derived ledger agrees
     /// with the header/span headline.
     pub cache_bust_penalty_usd: f64,
+    /// NEGATIVE savings entry: the REAL auxiliary-LLM spend of the agentic
+    /// budget's summarizer calls (Sub-lever 2b), fee-applied. Aux spend is
+    /// taxed, never free (spec §4.4 item 3) — so it REDUCES
+    /// [`tt_saved_usd`](Self::tt_saved_usd) pre-clamp (the loop win is honestly
+    /// net-of-tax, the cache-bust precedent) but is NEVER folded into
+    /// `cost_usd` / `baseline_cost_usd`: those reconcile against the realized
+    /// provider invoice, and the summarizer call bills the org on its OWN
+    /// credentials (it is not part of THIS request's served dispatch). Surfaced
+    /// on its own `X-TokenTrimmer-Summarizer-Tax-Usd` header. 0.0 on every
+    /// request that ran no summarizer (all default-path traffic). An UNMETERED
+    /// summarizer call (no catalog price / timed-out-but-possibly-billed) is
+    /// NEVER coerced to a phantom `0.0` here — the wiring (Task 9) surfaces it
+    /// as an honest warning rather than booking unknown spend as free.
+    pub summarizer_tax_usd: f64,
     /// FORGONE batch discount (USD): what the async Batch Lane would have
     /// saved on this request — realized cost minus the served model's
     /// batch-rate cost on the full prompt+completion, floored at 0, fee-
@@ -3859,7 +3876,10 @@ impl CostBreakdown {
     /// discount (`provider_cache_saved_usd` clamped to 0), the premium reduces
     /// the TT claim instead — conservative in TT's disfavor; the cache-bust
     /// penalty follows the same precedent (it subtracts pre-clamp, so a bust
-    /// can wipe the headline to 0 but never report a negative saving). Flex
+    /// can wipe the headline to 0 but never report a negative saving). The
+    /// summarizer-LLM tax (`summarizer_tax_usd`, REAL aux spend) follows the
+    /// SAME pre-clamp precedent — the loop win is reported net-of-tax — and is
+    /// likewise never folded into `cost_usd` / `baseline_cost_usd`. Flex
     /// savings are included here automatically: serving via flex lowers
     /// `cost_usd`, so the baseline − cost delta picks the flex saving up (and
     /// `flex_saved_usd` isolates the flex component for the methodology
@@ -3868,7 +3888,8 @@ impl CostBreakdown {
         (self.baseline_cost_usd
             - self.cost_usd
             - self.provider_cache_saved_usd
-            - self.cache_bust_penalty_usd)
+            - self.cache_bust_penalty_usd
+            - self.summarizer_tax_usd)
             .max(0.0)
     }
 }
@@ -3972,13 +3993,33 @@ pub(crate) fn compute_cost_with_flex(
 /// upstream (not a provider discount), so it belongs in the TT headline —
 /// consistent with the provider-cache-vs-TT attribution rules.
 ///
+/// `effects.elide_field_drop_tokens_removed` + `effects.elide_summary_tokens_removed`
+/// are the agentic budget's Sub-lever 2 input-token removals (field-drop is
+/// lossless + token-true-gated; summary tokens are counted only once the blind
+/// paired judge committed the rewrite, caveat C1). They are pipeline-MEASURED
+/// billed-input reductions identical in kind to compression, so they are summed
+/// WITH `compression_tokens_removed` and valued / baseline-folded exactly the
+/// same — riding [`CostBreakdown::tt_saved_usd`] via `baseline − cost`.
+///
 /// `effects.cache_bust_penalty_usd` is the (pre-fee) estimated cost of a
 /// deliberate stable-prefix mutation booked via
 /// [`CacheBustEstimate`](crate::passes::CacheBustEstimate). It lands
 /// fee-applied in [`CostBreakdown::cache_bust_penalty_usd`] and reduces
 /// [`CostBreakdown::tt_saved_usd`] pre-clamp — but is NEVER folded into
 /// `cost_usd` / `baseline_cost_usd` (an estimate of induced future cost must
-/// not contaminate fields that reconcile against the realized invoice).
+/// not contaminate fields that reconcile against the realized invoice). Caveat
+/// C3: when the estimate is priced from the Anthropic cl100k proxy it
+/// UNDER-counts (~15–20%), so the penalty is systematically LOW — acceptable
+/// ONLY because under-booking a negative favors TT and the figure never reaches
+/// the invoice fields.
+///
+/// `effects.summarizer_tax_usd` is the REAL auxiliary-LLM spend of the
+/// summarizer calls (Sub-lever 2b). Aux spend is taxed, never free (spec §4.4
+/// item 3): it lands fee-applied in [`CostBreakdown::summarizer_tax_usd`] and
+/// reduces [`CostBreakdown::tt_saved_usd`] pre-clamp (the loop win is reported
+/// net-of-tax) — but, like the cache-bust penalty, is NEVER folded into
+/// `cost_usd` / `baseline_cost_usd` (the summarizer call bills the org on its
+/// own credentials, not THIS request's served dispatch).
 ///
 /// `batch_marked` flags a request the advisory batch-eligibility route action
 /// marked (see `maybe_mark_batch_eligible`). It changes NO realized figure:
@@ -4147,14 +4188,26 @@ pub(crate) fn compute_cost_full(
     // so the no-TT baseline reflects the *uncompressed* prompt — the
     // `baseline − cost` headline then includes the compression saving. Zero when
     // the pass did not run.
+    //
+    // The agentic budget's Sub-lever 2 input-token removals ride the SAME
+    // bucket: `elide_field_drop_tokens_removed` (lossless, token-true-gated) and
+    // `elide_summary_tokens_removed` (lossy, but only counted AFTER the blind
+    // paired judge COMMITTED the rewrite) are both genuine, pipeline-MEASURED
+    // reductions in billed input tokens — identical in kind to compression — so
+    // they are valued at the served input rate and folded into the baseline the
+    // same way. (Caveat C1: summary tokens enter this sum only once judge-gated;
+    // the planner books the un-summarized count otherwise.) The summarizer TAX
+    // for those calls is a separate negative entry below — never netted here.
+    let input_tokens_removed = effects.compression_tokens_removed
+        + effects.elide_field_drop_tokens_removed
+        + effects.elide_summary_tokens_removed;
     let compression_saved_usd =
-        (effects.compression_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
+        (input_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
     // Fold the removed-token value into the baseline at the baseline model's
     // input rate (what the customer would have paid sending the uncompressed
     // prompt to the baseline model).
-    let baseline_compression_usd = (effects.compression_tokens_removed as f64)
-        * baseline_pricing.input_per_million
-        / 1_000_000.0;
+    let baseline_compression_usd =
+        (input_tokens_removed as f64) * baseline_pricing.input_per_million / 1_000_000.0;
 
     // Minify estimate: the saved-output-token estimate priced at the rate the
     // request's output was actually BILLED at — the flex out-rate when flex
@@ -4194,6 +4247,7 @@ pub(crate) fn compute_cost_full(
         flex_saved_usd: flex_saved_usd * fee_multiplier,
         compression_saved_usd: compression_saved_usd * fee_multiplier,
         cache_bust_penalty_usd: effects.cache_bust_penalty_usd * fee_multiplier,
+        summarizer_tax_usd: effects.summarizer_tax_usd * fee_multiplier,
         batch_forgone_usd: batch_forgone_usd * fee_multiplier,
         minify_saved_est_usd: minify_saved_est_usd * fee_multiplier,
         diff_saved_usd: diff_saved_usd * fee_multiplier,
@@ -4284,6 +4338,15 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-cache-bust-usd",
             format!("{:.6}", cost.cache_bust_penalty_usd),
+        ),
+        // NEGATIVE savings entry: REAL summarizer-LLM aux spend (Sub-lever 2b),
+        // already subtracted from `saved_usd` pre-clamp. Aux spend is taxed,
+        // never free (spec §4.4 item 3). 0.000000 on every request that ran no
+        // summarizer. Never folded into cost/baseline (the summarizer call bills
+        // the org on its own credentials, not this request's served dispatch).
+        (
+            "x-tokentrimmer-summarizer-tax-usd",
+            format!("{:.6}", cost.summarizer_tax_usd),
         ),
         // ADVISORY forgone Batch-API discount for batch-eligible requests —
         // what the future async Batch Lane would have saved, priced from the
@@ -6200,6 +6263,217 @@ mod cache_bust_tests {
         assert_eq!(
             compute_cost_with_flex(&usage, Some(&p), Some(&p), 1.0, false).cache_bust_penalty_usd,
             0.0
+        );
+    }
+
+    /// Sub-lever 2 field-drop + judge-passed summary input-token removals ride
+    /// `tt_saved_usd` EXACTLY like the compression pass: they are valued at the
+    /// served input rate (lossless / judge-gated reductions in billed input
+    /// tokens) and the SAME token count raises `baseline_cost_usd` at the
+    /// baseline input rate, so the `baseline − cost` headline picks them up.
+    /// (The realized `cost_usd` already excludes them — the upstream metered the
+    /// reduced prompt.) This is the agentic-budget extension of the compression
+    /// precedent (`chat.rs:4147-4151`).
+    #[test]
+    fn field_drop_and_summary_tokens_raise_baseline_like_compression() {
+        // Routed-down: served 1×, baseline 5× — so the baseline fold is at a
+        // different rate than the served valuation (each side priced honestly).
+        let served = pricing(1.0, 2.0);
+        let requested = pricing(5.0, 10.0);
+        let usage = usage_1m_input();
+
+        let control = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            false,
+            PassEffects::default(),
+            0,
+            crate::shaping::ShapeEffects::default(),
+        );
+
+        // 100k field-dropped + 50k summary-removed = 150k input tokens removed.
+        let effects = PassEffects {
+            elide_field_drop_tokens_removed: 100_000,
+            elide_summary_tokens_removed: 50_000,
+            ..Default::default()
+        };
+        let bd = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            false,
+            effects,
+            0,
+            crate::shaping::ShapeEffects::default(),
+        );
+
+        // Served-rate valuation rides `compression_saved_usd` (the same lossless
+        // billed-input-token reduction bucket): 150k × $1/M.
+        let served_saving = 150_000.0 * 1.0 / 1e6;
+        assert!(
+            (bd.compression_saved_usd - (control.compression_saved_usd + served_saving)).abs()
+                < 1e-12,
+            "elide tokens must be valued at the served input rate like compression"
+        );
+
+        // Baseline raised by the SAME token count at the BASELINE input rate:
+        // 150k × $5/M. Cost unchanged (the upstream already metered the reduced
+        // prompt — these tokens were never billed).
+        let baseline_fold = 150_000.0 * 5.0 / 1e6;
+        assert!(
+            (bd.baseline_cost_usd - (control.baseline_cost_usd + baseline_fold)).abs() < 1e-12,
+            "elide tokens must raise baseline at the baseline input rate"
+        );
+        assert!(
+            (bd.cost_usd - control.cost_usd).abs() < 1e-12,
+            "elide removals never touch the realized cost"
+        );
+
+        // The headline picks the elide saving up via `baseline − cost`.
+        assert!(
+            (bd.tt_saved_usd() - (control.tt_saved_usd() + baseline_fold)).abs() < 1e-9,
+            "elide saving must ride tt_saved_usd like compression"
+        );
+    }
+
+    /// The summarizer-LLM "tax" is REAL aux spend: it reduces `tt_saved_usd`
+    /// pre-clamp (the win is honestly net-of-tax) and surfaces in its OWN
+    /// field/header, but is NEVER folded into `cost_usd` / `baseline_cost_usd`
+    /// (caveat C3's sibling: aux-spend / estimate channels stay out of the
+    /// invoice-reconciled figures). Mirrors the cache-bust precedent.
+    #[test]
+    fn summarizer_tax_stays_out_of_invoice_fields() {
+        let served = pricing(1.0, 2.0);
+        let requested = pricing(5.0, 10.0); // baseline 5×: headline = 5 − 1 = 4.0
+        let usage = usage_1m_input();
+
+        let no_tax = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            false,
+            PassEffects::default(),
+            0,
+            crate::shaping::ShapeEffects::default(),
+        );
+        assert!((no_tax.tt_saved_usd() - 4.0).abs() < 1e-9);
+        assert_eq!(no_tax.summarizer_tax_usd, 0.0);
+
+        // A $0.30 summarizer tax reduces the headline to 3.7 — cost/baseline
+        // unchanged.
+        let effects = PassEffects {
+            summarizer_tax_usd: 0.30,
+            ..Default::default()
+        };
+        let bd = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            false,
+            effects,
+            0,
+            crate::shaping::ShapeEffects::default(),
+        );
+        assert!((bd.summarizer_tax_usd - 0.30).abs() < 1e-9);
+        assert!((bd.tt_saved_usd() - 3.7).abs() < 1e-9);
+        assert!(
+            (bd.cost_usd - no_tax.cost_usd).abs() < 1e-12,
+            "the summarizer tax must never be folded into cost_usd"
+        );
+        assert!(
+            (bd.baseline_cost_usd - no_tax.baseline_cost_usd).abs() < 1e-12,
+            "the summarizer tax must never be folded into baseline_cost_usd"
+        );
+
+        // The fee multiplier scales the tax like every other figure.
+        let bd_fee = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.05,
+            false,
+            false,
+            effects,
+            0,
+            crate::shaping::ShapeEffects::default(),
+        );
+        assert!((bd_fee.summarizer_tax_usd - 0.30 * 1.05).abs() < 1e-9);
+    }
+
+    /// Caveat C3: the Anthropic cl100k proxy undercounts by ~15–20%, so any
+    /// `CacheBustEstimate` priced from it is systematically LOW. Under-booking a
+    /// NEGATIVE entry favors TT — acceptable ONLY because the bust is an
+    /// estimate channel (its own field/header) and is NEVER copied into the
+    /// invoice-reconciled `cost_usd` / `baseline_cost_usd`. This extends the
+    /// `cache_bust_penalty_reduces_tt_saved_pre_clamp` precedent with the
+    /// explicit C3 contract.
+    #[test]
+    fn cache_bust_estimate_stays_out_of_invoice_fields() {
+        let served = pricing(1.0, 2.0);
+        let requested = pricing(5.0, 10.0); // headline = 5 − 1 = 4.0
+        let usage = usage_1m_input();
+
+        let no_bust = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            false,
+            PassEffects::default(),
+            0,
+            crate::shaping::ShapeEffects::default(),
+        );
+
+        // A $0.80 bust (priced from the systematically-LOW cl100k proxy — so the
+        // TRUE induced cost is HIGHER, but under-booking a negative favors TT and
+        // is acceptable here because the bust never reaches the invoice fields).
+        let effects = PassEffects {
+            cache_bust_penalty_usd: 0.80,
+            ..Default::default()
+        };
+        let bd = compute_cost_full(
+            &usage,
+            Some(&served),
+            Some(&requested),
+            1.0,
+            false,
+            false,
+            effects,
+            0,
+            crate::shaping::ShapeEffects::default(),
+        );
+        // Surfaces in its own field and reduces the headline pre-clamp.
+        assert!((bd.cache_bust_penalty_usd - 0.80).abs() < 1e-9);
+        assert!((bd.tt_saved_usd() - (4.0 - 0.80)).abs() < 1e-9);
+        // INVOICE fields are byte-identical to the no-bust path — the estimate
+        // never contaminates the realized-cost-reconcilable figures.
+        assert!(
+            (bd.cost_usd - no_bust.cost_usd).abs() < 1e-12,
+            "the cl100k-priced bust estimate must never enter cost_usd"
+        );
+        assert!(
+            (bd.baseline_cost_usd - no_bust.baseline_cost_usd).abs() < 1e-12,
+            "the cl100k-priced bust estimate must never enter baseline_cost_usd"
+        );
+
+        // The header carries the estimate so a CFO can unpick it.
+        let mut headers = axum::http::HeaderMap::new();
+        attach_cost_headers(&mut headers, Uuid::nil(), "anthropic", "claude", &bd);
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-cache-bust-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.800000")
         );
     }
 }
