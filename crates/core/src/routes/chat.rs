@@ -1542,6 +1542,10 @@ pub async fn handler(
     let pass_effects = crate::passes::PassEffects {
         compression_tokens_removed,
         cache_bust_penalty_usd: cache_bust.penalty_usd(pass_cx.pricing),
+        // Agentic-budget buckets stay zero on this path; the planner folds its
+        // field-drop / summary / tax effects in at Task 9's wiring point. The
+        // default-path request remains byte-identical and books no new spend.
+        ..Default::default()
     };
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
@@ -6120,6 +6124,7 @@ mod cache_bust_tests {
         let effects = PassEffects {
             compression_tokens_removed: 0,
             cache_bust_penalty_usd: 1.5,
+            ..Default::default()
         };
         let bd = compute_cost_full(
             &usage,
@@ -6162,6 +6167,7 @@ mod cache_bust_tests {
         let big = PassEffects {
             compression_tokens_removed: 0,
             cache_bust_penalty_usd: 100.0,
+            ..Default::default()
         };
         let clamped = compute_cost_full(
             &usage,

@@ -197,6 +197,17 @@ pub struct PassEffects {
     /// [`CacheBustEstimate`]), pre-fee. Drives
     /// `CostBreakdown::cache_bust_penalty_usd` — the negative savings entry.
     pub cache_bust_penalty_usd: f64,
+    /// Sub-lever 2 field-drop: pipeline-measured input tokens removed (lossless,
+    /// token-true-gated). Attributed to TT savings exactly like compression.
+    pub elide_field_drop_tokens_removed: u32,
+    /// Sub-lever 2 summarization: input tokens the COMMITTED (judge-passed)
+    /// summary removed, pipeline-measured. Attributed only when the judge gate
+    /// committed the rewrite (caveat C1).
+    pub elide_summary_tokens_removed: u32,
+    /// Auxiliary-LLM tax (USD) for the summarizer call — REAL spend, ledgered
+    /// as tax, NEVER netted into cost_usd/baseline (spec §4.4 item 3). Reduces
+    /// `tt_saved_usd` pre-clamp, exactly like `cache_bust_penalty_usd`.
+    pub summarizer_tax_usd: f64,
 }
 
 /// An ordered, composable collection of [`RequestPass`]es.
@@ -769,5 +780,34 @@ mod tests {
             panic!("expected text");
         };
         assert_eq!(s, "aaaa bbbb cccc\n\ndddd eeee");
+    }
+
+    /// The agentic-budget buckets are zero/None on the default path — the
+    /// off-by-default invariant at the cost-accounting layer: a request that
+    /// did not opt into `agentic_budget` books exactly `PassEffects::default()`.
+    #[test]
+    fn pass_effects_agentic_defaults_zero() {
+        let e = PassEffects::default();
+        assert_eq!(e.elide_field_drop_tokens_removed, 0);
+        assert_eq!(e.elide_summary_tokens_removed, 0);
+        assert_eq!(e.summarizer_tax_usd, 0.0);
+    }
+
+    /// The summarizer-LLM tax is a SEPARATE honest bucket — setting it must not
+    /// contaminate the compression bucket (caveat C3 / spec §4.4 item 3: aux-LLM
+    /// spend is ledgered as tax, never folded into the measured-saving channels).
+    #[test]
+    fn pass_effects_summarizer_tax_separate_from_compression() {
+        let e = PassEffects {
+            summarizer_tax_usd: 0.05,
+            ..Default::default()
+        };
+        assert_eq!(e.summarizer_tax_usd, 0.05);
+        assert_eq!(
+            e.compression_tokens_removed, 0,
+            "the summarizer tax must not bleed into the compression bucket"
+        );
+        assert_eq!(e.elide_field_drop_tokens_removed, 0);
+        assert_eq!(e.elide_summary_tokens_removed, 0);
     }
 }
