@@ -105,11 +105,13 @@
 //! [`PassPipeline::run`], wrapping the apply/recount step so a rewrite is only
 //! committed when the judge confirms semantic equivalence.
 
+pub mod agentic_budget;
 pub mod cache_classifier;
 pub mod compression;
 pub mod redaction;
 pub mod split;
 
+pub use agentic_budget::{annotate_cache_prefix, AgenticBudgetPlanner, CachePrefixPlan};
 pub use cache_classifier::CacheClassifierPass;
 pub use compression::CompressionPass;
 pub use redaction::{RedactedField, RedactedHit, RedactionPass};
