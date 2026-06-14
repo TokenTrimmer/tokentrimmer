@@ -26,6 +26,23 @@ pub struct AddArgs {
     /// `--batch`: advisory batch-eligibility marker (Batch Lane forgone-savings
     /// attribution; never applied to streaming/interactive requests).
     pub batch: bool,
+    /// `--agentic-budget`: opt the matched (loop) traffic into the route-grained
+    /// agentic context budget. Master switch — the other agentic levers below
+    /// are inert unless this is set. Off by default; when off, `then` carries no
+    /// `agentic_budget` key at all (byte-identical back-compat wire).
+    pub agentic_budget: bool,
+    /// `--keep-recent <N>`: keep the last N tool-result pairs VERBATIM (caveat
+    /// C1 blast-radius bound). Mirrors `AgenticBudget::keep_recent_pairs`
+    /// (default 3; server-validated to be >= 1).
+    pub keep_recent: u32,
+    /// `--elide-stale-tools`: field-drop (lossless, token-true-gated) + summarize
+    /// (lossy, judge-gated) stale tool results. Mirrors
+    /// `AgenticBudget::elide_stale_tools`.
+    pub elide_stale_tools: bool,
+    /// `--route-mechanical-to <model>`: down-route mechanical sub-steps to this
+    /// model in a cache-isolated subagent lane. Mirrors
+    /// `AgenticBudget::route_mechanical_to`.
+    pub route_mechanical_to: Option<String>,
     pub priority: u32,
     pub name: Option<String>,
     pub fallback: Vec<String>,
@@ -86,6 +103,23 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     }
     if args.batch {
         then.insert("batch".into(), json!(true));
+    }
+    // `--agentic-budget` is the master switch: when off, `then` carries NO
+    // `agentic_budget` key at all, so the wire body is byte-identical to the
+    // pre-feature shape (off-by-default back-compat). When on, emit the
+    // `AgenticBudget` object the gateway's serde mirrors. `cache_prefix` (the
+    // lossless FIRST lever) defaults on with the mode; the other levers reflect
+    // their flags.
+    if args.agentic_budget {
+        then.insert(
+            "agentic_budget".into(),
+            json!({
+                "cache_prefix": true,
+                "elide_stale_tools": args.elide_stale_tools,
+                "keep_recent_pairs": args.keep_recent,
+                "route_mechanical_to": args.route_mechanical_to,
+            }),
+        );
     }
     Ok(json!({
         "name": args.name.clone().unwrap_or_else(|| default_name(args, &target)),
@@ -255,9 +289,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn always_pins_all_traffic() {
-        let body = build_new_route(&AddArgs {
+    /// A minimal valid `AddArgs` (a match-all `--always` target, every other
+    /// flag off/default). Tests override only the field under test, so adding a
+    /// new flag never forces every literal to be rewritten.
+    fn base_args() -> AddArgs {
+        AddArgs {
             always: Some("gpt-4o-mini".into()),
             from: None,
             to: None,
@@ -271,12 +307,99 @@ mod tests {
             max_cost: None,
             disable_cache: false,
             batch: false,
+            agentic_budget: false,
+            keep_recent: 3,
+            elide_stale_tools: false,
+            route_mechanical_to: None,
             priority: 100,
             name: None,
             fallback: vec![],
             disabled: false,
+        }
+    }
+
+    /// `--agentic-budget --keep-recent 3 --elide-stale-tools --route-mechanical-to haiku-4.5`
+    /// must produce a `then.agentic_budget` object that deserializes into the
+    /// real [`tt_routing::RouteAction`] (the parity contract: the CLI surface is
+    /// a true mirror of the server-side knob bag, validated through serde).
+    #[test]
+    fn agentic_budget_flag_maps_to_route_action() {
+        let body = build_new_route(&AddArgs {
+            agentic_budget: true,
+            keep_recent: 3,
+            elide_stale_tools: true,
+            route_mechanical_to: Some("haiku-4.5".into()),
+            ..base_args()
         })
         .unwrap();
+        let then: tt_routing::RouteAction =
+            serde_json::from_value(body["then"].clone()).expect("then must parse as RouteAction");
+        let ab = then.agentic_budget.expect("agentic_budget must be Some");
+        assert!(ab.elide_stale_tools, "--elide-stale-tools sets the flag");
+        assert_eq!(ab.keep_recent_pairs, 3, "--keep-recent maps to keep_recent_pairs");
+        assert_eq!(
+            ab.route_mechanical_to.as_deref(),
+            Some("haiku-4.5"),
+            "--route-mechanical-to maps through"
+        );
+        // The opt-in turns the lossless FIRST lever on by default (the struct
+        // documents `cache_prefix` as "default true when the mode is set").
+        assert!(ab.cache_prefix, "opting in enables the lossless cache-prefix lever");
+    }
+
+    /// Without `--agentic-budget`, `then.agentic_budget` is absent entirely (so
+    /// the deserialized `RouteAction` carries `None`) — the off-by-default,
+    /// byte-identical-wire back-compat invariant the whole feature rests on.
+    #[test]
+    fn agentic_budget_absent_is_none() {
+        let body = build_new_route(&base_args()).unwrap();
+        assert!(
+            body["then"].get("agentic_budget").is_none(),
+            "without --agentic-budget the key must be absent from the wire body"
+        );
+        let then: tt_routing::RouteAction =
+            serde_json::from_value(body["then"].clone()).expect("then must parse as RouteAction");
+        assert_eq!(then.agentic_budget, None);
+    }
+
+    /// `--keep-recent` overrides the default and rides into `keep_recent_pairs`;
+    /// the other levers stay at their opt-in defaults.
+    #[test]
+    fn agentic_budget_keep_recent_overrides_default() {
+        let body = build_new_route(&AddArgs {
+            agentic_budget: true,
+            keep_recent: 5,
+            ..base_args()
+        })
+        .unwrap();
+        let then: tt_routing::RouteAction =
+            serde_json::from_value(body["then"].clone()).unwrap();
+        let ab = then.agentic_budget.unwrap();
+        assert_eq!(ab.keep_recent_pairs, 5);
+        assert!(!ab.elide_stale_tools);
+        assert_eq!(ab.route_mechanical_to, None);
+    }
+
+    /// `--route-mechanical-to` (and the other levers) are inert without the
+    /// `--agentic-budget` opt-in: the mode gate is the master switch.
+    #[test]
+    fn agentic_budget_levers_inert_without_optin() {
+        let body = build_new_route(&AddArgs {
+            agentic_budget: false,
+            elide_stale_tools: true,
+            route_mechanical_to: Some("haiku-4.5".into()),
+            ..base_args()
+        })
+        .unwrap();
+        assert!(
+            body["then"].get("agentic_budget").is_none(),
+            "lever flags do nothing unless --agentic-budget is passed"
+        );
+    }
+
+    #[test]
+    fn always_pins_all_traffic() {
+        let body = build_new_route(&base_args()).unwrap();
         assert_eq!(body["then"]["target_model"], "gpt-4o-mini");
         assert_eq!(body["when"], json!({}));
         assert_eq!(body["priority"], 100);
@@ -290,19 +413,11 @@ mod tests {
             from: Some("gpt-4o".into()),
             to: Some("gpt-4o-mini".into()),
             when_has_images: true,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
-            disable_cache: false,
-            batch: false,
             priority: 50,
             name: Some("vis".into()),
             fallback: vec!["gpt-4o".into()],
             disabled: true,
+            ..base_args()
         })
         .unwrap();
         assert_eq!(body["when"]["model_in"], json!(["gpt-4o"]));
@@ -318,21 +433,7 @@ mod tests {
         let err = build_new_route(&AddArgs {
             always: None,
             from: Some("gpt-4o".into()),
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
-            disable_cache: false,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         });
         assert!(err.is_err());
     }
@@ -341,22 +442,9 @@ mod tests {
     fn disable_cache_and_when_tag_map_through() {
         let body = build_new_route(&AddArgs {
             always: Some("gpt-4o".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
             when_tag: Some("sensitive".into()),
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
             disable_cache: true,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         })
         .unwrap();
         assert_eq!(body["when"]["tag_equals"], "sensitive");
@@ -369,23 +457,8 @@ mod tests {
     #[test]
     fn route_add_batch_flag_maps_to_then_batch() {
         let args = |batch: bool| AddArgs {
-            always: Some("gpt-4o-mini".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
-            disable_cache: false,
             batch,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         };
         let body = build_new_route(&args(true)).unwrap();
         assert_eq!(body["then"]["batch"], true, "--batch must set then.batch");
@@ -400,22 +473,7 @@ mod tests {
     fn disable_cache_omitted_when_false() {
         let body = build_new_route(&AddArgs {
             always: Some("gpt-4o".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
-            disable_cache: false,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         })
         .unwrap();
         assert!(body["then"].get("disable_cache").is_none());
@@ -426,22 +484,8 @@ mod tests {
     fn when_prompt_contains_maps_to_condition() {
         let body = build_new_route(&AddArgs {
             always: Some("ollama/llama3".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
             when_prompt_contains: vec!["confidential".into(), "salary".into()],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
-            disable_cache: false,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         })
         .unwrap();
         assert_eq!(
@@ -454,22 +498,7 @@ mod tests {
     fn when_prompt_contains_omitted_when_empty() {
         let body = build_new_route(&AddArgs {
             always: Some("gpt-4o".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
-            disable_cache: false,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         })
         .unwrap();
         assert!(body["when"].get("prompt_contains_any_of").is_none());
@@ -478,23 +507,8 @@ mod tests {
     #[test]
     fn cost_conditions_map_through() {
         let body = build_new_route(&AddArgs {
-            always: Some("gpt-4o-mini".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
             when_cost_gt: Some(0.05),
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
-            disable_cache: false,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         })
         .unwrap();
         assert_eq!(body["when"]["estimated_cost_gt"], 0.05);
@@ -504,23 +518,8 @@ mod tests {
     #[test]
     fn when_p95_gt_serializes_into_when_clause() {
         let body = build_new_route(&AddArgs {
-            always: Some("gpt-4o-mini".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
             when_p95_gt: Some(1500),
-            max_cost: None,
-            disable_cache: false,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         })
         .unwrap();
         assert_eq!(body["when"]["upstream_latency_ms_p95_gt"], 1500);
@@ -528,49 +527,15 @@ mod tests {
 
     #[test]
     fn when_p95_gt_omitted_when_absent() {
-        let body = build_new_route(&AddArgs {
-            always: Some("gpt-4o-mini".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
-            max_cost: None,
-            disable_cache: false,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
-        })
-        .unwrap();
+        let body = build_new_route(&base_args()).unwrap();
         assert!(body["when"].get("upstream_latency_ms_p95_gt").is_none());
     }
 
     #[test]
     fn max_cost_maps_to_then() {
         let body = build_new_route(&AddArgs {
-            always: Some("gpt-4o-mini".into()),
-            from: None,
-            to: None,
-            when_has_images: false,
-            when_has_audio: false,
-            when_tag: None,
-            when_prompt_contains: vec![],
-            when_cost_gt: None,
-            when_cost_lt: None,
-            when_p95_gt: None,
             max_cost: Some(0.1),
-            disable_cache: false,
-            batch: false,
-            priority: 100,
-            name: None,
-            fallback: vec![],
-            disabled: false,
+            ..base_args()
         })
         .unwrap();
         assert_eq!(body["then"]["max_cost_usd"], 0.1);

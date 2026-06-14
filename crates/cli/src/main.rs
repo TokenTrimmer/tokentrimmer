@@ -381,6 +381,25 @@ enum RouteAction {
         /// attribution; never applied to streaming/interactive requests).
         #[arg(long)]
         batch: bool,
+        /// Opt matched (loop) traffic into the agentic context budget — the
+        /// route-grained mode that brings the CLI's loop-aware levers
+        /// server-side. Master switch: the --keep-recent / --elide-stale-tools
+        /// / --route-mechanical-to flags below are inert unless this is set.
+        /// Off by default (no-op for non-opted traffic).
+        #[arg(long)]
+        agentic_budget: bool,
+        /// With --agentic-budget: keep the last N tool-result pairs VERBATIM
+        /// (caveat C1 blast-radius bound). Default 3; must be >= 1.
+        #[arg(long, default_value_t = 3)]
+        keep_recent: u32,
+        /// With --agentic-budget: field-drop (lossless) + summarize (lossy,
+        /// judge-gated) stale tool results.
+        #[arg(long)]
+        elide_stale_tools: bool,
+        /// With --agentic-budget: down-route mechanical sub-steps to this model
+        /// in a cache-isolated subagent lane (must resolve to a registered model).
+        #[arg(long)]
+        route_mechanical_to: Option<String>,
         #[arg(long, default_value_t = 100)]
         priority: u32,
         #[arg(long)]
@@ -908,6 +927,10 @@ async fn main() -> anyhow::Result<()> {
                     max_cost,
                     disable_cache,
                     batch,
+                    agentic_budget,
+                    keep_recent,
+                    elide_stale_tools,
+                    route_mechanical_to,
                     priority,
                     name,
                     fallback,
@@ -926,6 +949,10 @@ async fn main() -> anyhow::Result<()> {
                     max_cost,
                     disable_cache,
                     batch,
+                    agentic_budget,
+                    keep_recent,
+                    elide_stale_tools,
+                    route_mechanical_to,
                     priority,
                     name,
                     fallback,
