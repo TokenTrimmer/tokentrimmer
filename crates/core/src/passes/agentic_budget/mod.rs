@@ -31,6 +31,9 @@ pub mod elide;
 pub mod substep_cache;
 pub mod summarize_judge;
 
+#[cfg(test)]
+mod compose_test;
+
 pub use cache_prefix::{annotate_cache_prefix, CachePrefixPlan};
 pub use elide::ElidePass;
 pub use substep_cache::{
