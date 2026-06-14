@@ -111,7 +111,9 @@ pub mod compression;
 pub mod redaction;
 pub mod split;
 
-pub use agentic_budget::{annotate_cache_prefix, AgenticBudgetPlanner, CachePrefixPlan};
+pub use agentic_budget::{
+    annotate_cache_prefix, AgenticBudgetPlanner, CachePrefixPlan, PlanOutcome,
+};
 pub use cache_classifier::CacheClassifierPass;
 pub use compression::CompressionPass;
 pub use redaction::{RedactedField, RedactedHit, RedactionPass};

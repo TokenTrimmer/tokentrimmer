@@ -282,6 +282,17 @@ impl<'r> SplitRequest<'r> {
         }
     }
 
+    /// Read-only view of the WHOLE request (prefix + tail) — for levers that
+    /// only INSPECT the request (e.g. Sub-lever 1's cache-prefix annotation,
+    /// which reads the messages to locate the breakpoint but never mutates
+    /// content). Read access is unrestricted; the cache-span invariant gates
+    /// only MUTABLE access (via [`Self::run_pass`] for the tail or
+    /// [`Self::mutate_whole_request`] for the prefix).
+    #[must_use]
+    pub(crate) fn request(&self) -> &ChatCompletionRequest {
+        self.req
+    }
+
     /// Read-only view of the stable prefix.
     #[must_use]
     pub fn stable(&self) -> StablePrefix<'_> {
