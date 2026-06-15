@@ -2,9 +2,10 @@
 //! TTL (research Phase 2.2) and the L2-hit judge rate/cap knobs.
 //!
 //! Covers:
-//! 1. OFF BY DEFAULT: without `with_l2_verify`, an ambiguous-band hit with a
-//!    mismatching lexical signature still serves from cache (today's behavior,
-//!    byte-identical).
+//! 1. ON BY DEFAULT (COST-5(U)): `with_l2` alone now verifies ambiguous-band
+//!    hits — an in-band hit with a mismatching lexical signature is rejected
+//!    (→ miss), not served. (Legacy no-signature rows still fail open; see
+//!    test 3.)
 //! 2. Gate on: a rejected in-band hit falls through to a live provider
 //!    dispatch — no `hit-l2` header, no hit-count bump, no cache savings.
 //! 3. Gate on: an agreeing in-band hit serves from cache; a legacy (no-sig)
@@ -303,12 +304,17 @@ async fn in_band_gateway(entry_sig: Option<i64>) -> Gateway {
     }
 }
 
-// ─── 1. off by default ───────────────────────────────────────────────────────
+// ─── 1. ON by default (COST-5(U)) ────────────────────────────────────────────
 
-/// Without `with_l2_verify`, an in-band hit with a MISMATCHING signature
-/// still serves from cache — the gate changes nothing until opted into.
+/// COST-5(U): the verify gate is ON by default — `with_l2` alone (no
+/// `with_l2_verify`) now lexically verifies ambiguous-band hits. An in-band hit
+/// with a MISMATCHING signature is therefore REJECTED and falls through to a
+/// live dispatch (a miss), rather than serving a near-miss wrong answer. The
+/// pre-0018 (no-signature) fail-open path is covered by
+/// `unverifiable_legacy_entry_fails_open_and_serves`, so legacy data is never
+/// turned into a miss by this default.
 #[tokio::test]
-async fn verify_gate_off_by_default_no_behavior_change() {
+async fn verify_gate_on_by_default_rejects_mismatched_in_band_hit() {
     let mismatch = tt_cache::lexical_sig("[user] a completely different subject entirely");
     let g = in_band_gateway(Some(mismatch)).await;
     let app = build_router(g.state);
@@ -320,13 +326,13 @@ async fn verify_gate_off_by_default_no_behavior_change() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         cache_header(&resp),
-        "hit-l2",
-        "gate off must serve as today"
+        "miss",
+        "gate on by default: a mismatched in-band hit is rejected → miss"
     );
     assert_eq!(
         g.calls.load(Ordering::Relaxed),
-        0,
-        "gate off: provider must NOT be called on the hit"
+        1,
+        "gate on by default: a rejected hit falls through to ONE live dispatch"
     );
 }
 
