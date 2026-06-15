@@ -164,7 +164,7 @@ fn dogfood_routing_store() -> Arc<CachingRoutingStore> {
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
-                target_model: "llama-3.1-8b-instant".into(),
+                target_model: Some("llama-3.1-8b-instant".into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,

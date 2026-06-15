@@ -341,7 +341,8 @@ enum RouteAction {
     Show { id: String },
     /// Delete one route by id.
     Rm { id: String },
-    /// Add a route. Use --always <model>, or --from <m> --to <m>.
+    /// Add a route. Use --always <model>, or --from <m> --to <m>, or
+    /// --agentic-budget alone for a modifier-only route (keeps the caller's model).
     Add {
         #[arg(long)]
         always: Option<String>,
@@ -1658,7 +1659,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     reasoning_max_effort: None,
                     reasoning_budget_tokens: None,
                     agentic_budget: None,
-                    target_model: "llama-3.1-8b-instant".into(),
+                    target_model: Some("llama-3.1-8b-instant".into()),
                     fallbacks: Vec::new(),
                     disable_cache: false,
                     max_cost_usd: None,

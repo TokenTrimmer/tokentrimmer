@@ -218,7 +218,7 @@ async fn setup(target_model: &str) -> (Arc<Mutex<Vec<String>>>, String, axum::Ro
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
-                target_model: target_model.into(),
+                target_model: Some(target_model.into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,

@@ -176,7 +176,7 @@ impl Default for HarnessOpts {
     fn default() -> Self {
         Self {
             then: RouteAction {
-                target_model: "gpt-4o-mini".into(),
+                target_model: Some("gpt-4o-mini".into()),
                 ..Default::default()
             },
             paused: true,
@@ -330,7 +330,7 @@ async fn rows_after(writer: &Arc<InMemoryRequestLogWriter>, n: usize) -> Vec<Req
 async fn paused_route_passes_through() {
     let h = harness(HarnessOpts {
         then: RouteAction {
-            target_model: "gpt-4o-mini".into(),
+            target_model: Some("gpt-4o-mini".into()),
             shadow_model: Some("gpt-4o-mini".into()),
             ..Default::default()
         },
@@ -477,7 +477,7 @@ async fn paused_route_keeps_safety_levers() {
     // ── redact stays live ───────────────────────────────────────────────────
     let h = harness(HarnessOpts {
         then: RouteAction {
-            target_model: "gpt-4o-mini".into(),
+            target_model: Some("gpt-4o-mini".into()),
             redact: true,
             ..Default::default()
         },
@@ -533,7 +533,7 @@ async fn paused_route_keeps_safety_levers() {
     // ── disable_cache stays live ────────────────────────────────────────────
     let h = harness(HarnessOpts {
         then: RouteAction {
-            target_model: "gpt-4o-mini".into(),
+            target_model: Some("gpt-4o-mini".into()),
             disable_cache: true,
             ..Default::default()
         },

@@ -458,7 +458,7 @@ mod tests {
             enabled: true,
             when: RouteConditions::default(),
             then: RouteAction {
-                target_model: "gpt-4o-mini".into(),
+                target_model: Some("gpt-4o-mini".into()),
                 auto_pause,
                 pause_min_verdicts: min_verdicts,
                 ..Default::default()

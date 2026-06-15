@@ -62,15 +62,27 @@ impl Provider for RecordingProvider {
         "rec"
     }
     fn models(&self) -> Vec<ModelInfo> {
-        vec![ModelInfo {
-            id: "rec-model".into(),
-            provider: "rec".into(),
-            // The test request carries tool_calls + tool-result messages, so the
-            // routing capability guard skips a model that does not advertise Tools.
-            capabilities: vec![Capability::Text, Capability::Tools],
-            max_input_tokens: 100_000,
-            max_output_tokens: 8192,
-        }]
+        let caps = vec![Capability::Text, Capability::Tools];
+        vec![
+            ModelInfo {
+                id: "rec-model".into(),
+                provider: "rec".into(),
+                // The test request carries tool_calls + tool-result messages, so
+                // the routing capability guard skips a model lacking Tools.
+                capabilities: caps.clone(),
+                max_input_tokens: 100_000,
+                max_output_tokens: 8192,
+            },
+            // A second model so a `Some`-target route can rewrite FROM one model
+            // TO another (the regression guard needs requested != target).
+            ModelInfo {
+                id: "rec-source".into(),
+                provider: "rec".into(),
+                capabilities: caps,
+                max_input_tokens: 100_000,
+                max_output_tokens: 8192,
+            },
+        ]
     }
     fn pricing(&self, _model: &str) -> Option<ModelPricing> {
         Some(ModelPricing {
@@ -156,6 +168,16 @@ async fn issue_key_for(store: &InMemoryKeyStore, org_id: Uuid) -> String {
 async fn app_with_action(
     then: RouteAction,
 ) -> (axum::Router, String, Arc<Mutex<Vec<Vec<Message>>>>) {
+    app_with_route(vec!["rec-model".into()], then).await
+}
+
+/// Like [`app_with_action`] but lets the caller set the route's `when.model_in`
+/// (so a `Some`-target route can match a request for one model and rewrite it to
+/// another).
+async fn app_with_route(
+    model_in: Vec<String>,
+    then: RouteAction,
+) -> (axum::Router, String, Arc<Mutex<Vec<Vec<Message>>>>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(RecordingProvider {
@@ -177,7 +199,7 @@ async fn app_with_action(
             priority: 100,
             enabled: true,
             when: RouteConditions {
-                model_in: vec!["rec-model".into()],
+                model_in,
                 ..Default::default()
             },
             then,
@@ -286,7 +308,7 @@ fn text_of(m: &Message) -> Option<String> {
 #[tokio::test]
 async fn agentic_budget_off_by_default_is_byte_identical() {
     let (app, key, seen) = app_with_action(RouteAction {
-        target_model: "rec-model".into(),
+        target_model: Some("rec-model".into()),
         ..Default::default()
     })
     .await;
@@ -354,7 +376,7 @@ async fn agentic_budget_off_by_default_is_byte_identical() {
 #[tokio::test]
 async fn agentic_budget_none_is_byte_identical() {
     let (app, key, seen) = app_with_action(RouteAction {
-        target_model: "rec-model".into(),
+        target_model: Some("rec-model".into()),
         agentic_budget: None,
         ..Default::default()
     })
@@ -395,7 +417,7 @@ async fn agentic_budget_none_is_byte_identical() {
 #[tokio::test]
 async fn agentic_budget_runs_after_redaction() {
     let (app, key, seen) = app_with_action(RouteAction {
-        target_model: "rec-model".into(),
+        target_model: Some("rec-model".into()),
         redact: true,
         agentic_budget: Some(AgenticBudget {
             elide_stale_tools: true,
@@ -447,5 +469,98 @@ async fn agentic_budget_runs_after_redaction() {
     assert!(
         recent_tool.contains("/tmp/.tt-scan-RECENT.py"),
         "the most-recent tool block must be kept verbatim: {recent_tool}"
+    );
+}
+
+/// Read the upstream-dispatched model: the `RecordingProvider` records the model
+/// it received as the first dispatched request's response model (it echoes
+/// `req.model`), but the most direct signal is the dispatched messages plus the
+/// response body's `model` field, which the mock sets to `req.model`. We read it
+/// from the response JSON.
+async fn response_model(resp: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    v["model"].as_str().unwrap().to_string()
+}
+
+/// MODIFIER-ONLY ROUTE — a route with `target_model: None` (omitted) keeps the
+/// CALLER's chosen model (no rewrite) AND still applies its `agentic_budget`
+/// effects. The dispatched/echoed model equals the request model, and the
+/// planner runs (the older block's droppable tempfile path is elided) — proving
+/// a modifier-only route applies its effects without re-targeting the model.
+#[tokio::test]
+async fn modifier_only_route_keeps_caller_model_and_runs_planner() {
+    let (app, key, seen) = app_with_action(RouteAction {
+        // Modifier-only: NO rewrite target.
+        target_model: None,
+        agentic_budget: Some(AgenticBudget {
+            cache_prefix: true,
+            elide_stale_tools: true,
+            keep_recent_pairs: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await;
+
+    let resp = app
+        .oneshot(request_with_key(agent_request(), &key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The model is UNCHANGED — the modifier-only route echoes the caller's model.
+    assert_eq!(
+        response_model(resp).await,
+        "rec-model",
+        "a modifier-only route must NOT rewrite the model"
+    );
+
+    // The planner RAN: the older tool block's droppable tempfile path is elided
+    // (the same observable the redaction-ordering wiring test asserts).
+    let msgs = seen.lock().unwrap();
+    let upstream = &msgs[0];
+    let older_tool = text_of(&upstream[2]).expect("older tool block is text");
+    assert!(
+        !older_tool.contains(TMP_FILE),
+        "the planner's field-drop must run on a modifier-only route: {older_tool}"
+    );
+    // The recent block is kept verbatim (keep_recent_pairs=1) — proving the
+    // planner ran the keep-recent logic, not that all blocks were dropped.
+    let recent_tool = text_of(&upstream[4]).expect("recent tool block is text");
+    assert!(
+        recent_tool.contains("/tmp/.tt-scan-RECENT.py"),
+        "the most-recent tool block must be kept verbatim: {recent_tool}"
+    );
+}
+
+/// REGRESSION GUARD — a normal route (`target_model: Some(..)`) still rewrites
+/// `req.model` to the target exactly as before. A request for `rec-source`
+/// matches a route that rewrites to `rec-model`; the dispatched/echoed model is
+/// the TARGET, proving the optional-target change did NOT alter `Some`-route
+/// behavior.
+#[tokio::test]
+async fn some_target_route_still_rewrites_model() {
+    let (app, key, _seen) = app_with_route(
+        vec!["rec-source".into()],
+        RouteAction {
+            target_model: Some("rec-model".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut req = agent_request();
+    req["model"] = json!("rec-source");
+    let resp = app
+        .oneshot(request_with_key(req, &key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        response_model(resp).await,
+        "rec-model",
+        "a Some-target route must rewrite req.model from rec-source to the target rec-model"
     );
 }

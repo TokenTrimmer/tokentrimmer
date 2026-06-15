@@ -281,7 +281,7 @@ async fn fallback_header_overrides_route_chain() {
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
-                target_model: "primary-model".into(),
+                target_model: Some("primary-model".into()),
                 fallbacks: vec!["route-fb".into()],
                 disable_cache: false,
                 max_cost_usd: None,

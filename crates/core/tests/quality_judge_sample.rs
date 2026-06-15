@@ -359,7 +359,7 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     ..Default::default()
                 },
                 then: RouteAction {
-                    target_model: "gpt-4o-mini".into(),
+                    target_model: Some("gpt-4o-mini".into()),
                     fallbacks: Vec::new(),
                     disable_cache: false,
                     max_cost_usd: None,
@@ -404,11 +404,11 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     reasoning_max_effort: None,
                     reasoning_budget_tokens: None,
                     agentic_budget: None,
-                    target_model: if opts.same_model_route {
+                    target_model: Some(if opts.same_model_route {
                         "gpt-4o".into()
                     } else {
                         "gpt-4o-mini".into()
-                    },
+                    }),
                     fallbacks: Vec::new(),
                     disable_cache: false,
                     max_cost_usd: None,
@@ -1423,7 +1423,7 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
-                target_model: "gpt-4o-mini".into(),
+                target_model: Some("gpt-4o-mini".into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,

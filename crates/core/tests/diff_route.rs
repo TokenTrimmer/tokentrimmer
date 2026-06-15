@@ -220,7 +220,7 @@ struct Harness {
 /// The default diff-route action; tests tweak individual levers on top.
 fn diff_action() -> RouteAction {
     RouteAction {
-        target_model: "diff-1".into(),
+        target_model: Some("diff-1".into()),
         fallbacks: Vec::new(),
         disable_cache: false,
         max_cost_usd: None,
