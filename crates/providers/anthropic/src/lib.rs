@@ -13,6 +13,7 @@
 //! ```
 
 pub mod client;
+pub mod count_tokens;
 pub mod errors;
 pub mod messages;
 pub mod pricing;
@@ -47,6 +48,11 @@ pub struct AnthropicProvider {
     /// Always `false` in production; set to `true` only in tests that target
     /// a local mock server.
     allow_local: bool,
+    /// In-memory memo cache for [`AnthropicProvider::count_tokens`] keyed on a
+    /// content hash of the request body, so repeated counts of the same prompt
+    /// cost a single network round-trip. Bounded only by distinct prompts seen
+    /// in-process; the provider is constructed once and shared via `Arc`.
+    count_tokens_cache: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
 }
 
 impl AnthropicProvider {
@@ -62,6 +68,7 @@ impl AnthropicProvider {
         Self {
             client,
             allow_local: false,
+            count_tokens_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -73,11 +80,14 @@ impl AnthropicProvider {
     /// Do not use in production code. This bypasses the SSRF guard.
     #[doc(hidden)]
     pub fn new_allow_local(cfg: ClientConfig) -> Self {
-        let client = client::build_client(&cfg)
+        // Unguarded client: `allow_local` targets localhost/private mock
+        // servers that the connect-time SSRF guard would block.
+        let client = client::build_unguarded_client(&cfg)
             .expect("failed to build reqwest::Client for Anthropic adapter");
         Self {
             client,
             allow_local: true,
+            count_tokens_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -87,6 +97,118 @@ impl AnthropicProvider {
             .base_url
             .as_deref()
             .unwrap_or(DEFAULT_BASE_URL)
+    }
+
+    /// Authoritative input-token count via Anthropic `POST /v1/messages/count_tokens`.
+    ///
+    /// The `cl100k` tiktoken proxy [`tt_tokenize`] uses for Anthropic
+    /// systematically UNDERCOUNTS Anthropic input by ~15–20%; this returns
+    /// Anthropic's own count instead, for the `$`-bearing sites where the exact
+    /// prompt size matters. Results are memoized on a content hash of the
+    /// request body, so repeated counts of the same prompt cost one network
+    /// call.
+    ///
+    /// **Never errors:** on ANY failure (unsupported content during translation,
+    /// HTTP ≥ 400, network, deserialize) it falls back to the corrected
+    /// `tt_tokenize` proxy estimate ([`tt_tokenize::estimate_tokens_for_model`]),
+    /// which carries the `+18%` Anthropic correction — so the returned count is
+    /// directional whether served by the API or the proxy, and a transient
+    /// upstream failure never blocks the caller.
+    #[instrument(skip(self, ctx), fields(provider = "anthropic", model = %req.model))]
+    pub async fn count_tokens(&self, req: &ChatCompletionRequest, ctx: &RequestContext) -> u64 {
+        // Building the body can fail only on untranslatable content (e.g. audio);
+        // the fallback estimator ignores those parts, so degrade to it.
+        let body = match count_tokens::build_count_tokens_body(req.clone()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, "count_tokens body build failed — proxy estimate");
+                return self.count_tokens_fallback(req);
+            }
+        };
+        let key = count_tokens::content_hash(&body);
+        if let Some(&cached) = self
+            .count_tokens_cache
+            .lock()
+            .expect("count_tokens cache poisoned")
+            .get(&key)
+        {
+            return cached;
+        }
+
+        match self.count_tokens_remote(&body, ctx).await {
+            Ok(count) => {
+                self.count_tokens_cache
+                    .lock()
+                    .expect("count_tokens cache poisoned")
+                    .insert(key, count);
+                count
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "count_tokens request failed — proxy estimate");
+                self.count_tokens_fallback(req)
+            }
+        }
+    }
+
+    /// Corrected `tt_tokenize` proxy estimate used when `count_tokens` can't
+    /// reach the API. Uses the model-aware estimator (which applies the
+    /// documented `+18%` Anthropic correction), not a raw `cl100k` count.
+    fn count_tokens_fallback(&self, req: &ChatCompletionRequest) -> u64 {
+        let text = tt_shared::message_text_for_estimation(req);
+        u64::from(tt_tokenize::estimate_tokens_for_model(
+            "anthropic",
+            &req.model,
+            &text,
+        ))
+    }
+
+    /// Issue the actual `count_tokens` HTTP call (no caching, no fallback).
+    /// Mirrors [`chat_completion`](Self::chat_completion)'s URL/SSRF/header
+    /// handling.
+    async fn count_tokens_remote(
+        &self,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+    ) -> Result<u64, ProviderError> {
+        let base_url = self.base_url(ctx);
+        if ctx.credentials.base_url.is_some() {
+            validate_provider_url(base_url, self.allow_local)
+                .map_err(|e| ProviderError::InvalidRequest(format!("blocked provider URL: {e}")))?;
+        }
+
+        let url = format!("{base_url}/v1/messages/count_tokens");
+        let mut request_builder = self
+            .client
+            .post(&url)
+            .header("x-api-key", ctx.credentials.api_key.expose())
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("Content-Type", "application/json")
+            .json(body);
+        for (name, value) in &filter_extra_headers(&ctx.credentials.extra_headers) {
+            request_builder = request_builder.header(name, value);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(errors::map_reqwest_error)?;
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(std::string::ToString::to_string);
+        let response_text = response.text().await.map_err(errors::map_reqwest_error)?;
+        if status >= 400 {
+            return Err(errors::map_response_error(
+                status,
+                &response_text,
+                retry_after.as_deref(),
+            ));
+        }
+        let parsed: count_tokens::CountTokensResponse = serde_json::from_str(&response_text)
+            .map_err(|e| ProviderError::Deserialize(e.to_string()))?;
+        Ok(parsed.input_tokens)
     }
 }
 

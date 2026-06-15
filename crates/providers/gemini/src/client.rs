@@ -28,12 +28,8 @@ impl Default for ClientConfig {
     }
 }
 
-/// Build a [`reqwest::Client`] with the given configuration.
-///
-/// Uses rustls (no native TLS) and enables gzip decompression. The client is
-/// intended to be created once per [`crate::GeminiProvider`] and reused
-/// across all requests.
-pub fn build_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
+/// Shared base [`reqwest::ClientBuilder`]: timeouts, no redirects, rustls, gzip.
+fn base_builder(cfg: &ClientConfig) -> reqwest::ClientBuilder {
     Client::builder()
         .read_timeout(cfg.timeout)
         .connect_timeout(cfg.connect_timeout)
@@ -42,5 +38,28 @@ pub fn build_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
         // Use rustls (consistent with workspace default features).
         .use_rustls_tls()
         .gzip(true)
-        .build()
+}
+
+/// Build a [`reqwest::Client`] with the given configuration, with the
+/// connect-time SSRF guard ([`tt_shared::GuardedResolver`]) installed.
+///
+/// Uses rustls (no native TLS) and enables gzip decompression. The client is
+/// intended to be created once per [`crate::GeminiProvider`] and reused
+/// across all requests.
+///
+/// The DNS resolver filters out private/loopback/link-local/metadata addresses
+/// at connect time, so a customer-supplied `base_url` host can never be used to
+/// reach an internal address even if it rebinds after the validation-time
+/// `validate_provider_url` check (DNS-rebind TOCTOU). Use
+/// [`build_unguarded_client`] only for `allow_local` paths.
+pub fn build_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
+    tt_shared::with_guarded_dns(base_builder(cfg)).build()
+}
+
+/// Build a [`reqwest::Client`] **without** the connect-time SSRF guard.
+///
+/// Intended only for `allow_local` (tests against a local mock server), which
+/// the guard would otherwise block.
+pub fn build_unguarded_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
+    base_builder(cfg).build()
 }

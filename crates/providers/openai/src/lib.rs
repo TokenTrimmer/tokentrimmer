@@ -71,8 +71,11 @@ impl OpenAiProvider {
     /// Do not use in production code. This bypasses the SSRF guard.
     #[doc(hidden)]
     pub fn new_allow_local(cfg: ClientConfig) -> Self {
-        let client =
-            client::build_client(&cfg).expect("failed to build reqwest::Client for OpenAI adapter");
+        // Unguarded client: `allow_local` targets localhost/private mock
+        // servers that the connect-time SSRF guard (installed by the guarded
+        // `build_client`) would block.
+        let client = client::build_unguarded_client(&cfg)
+            .expect("failed to build reqwest::Client for OpenAI adapter");
         Self {
             client,
             allow_local: true,

@@ -94,6 +94,12 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         projection.would_block,
         projection.batch_deferred,
         projection.batch_unpriced,
+        projection.flex_applied,
+        projection.flex_inapplicable,
+        projection.diff_realized_count,
+        projection.diff_realized_usd,
+        projection.minify_estimated_count,
+        projection.minify_estimated_usd,
     );
     caveats.extend(wide_ci_caveats(&aggregates, &confidence_intervals));
 
@@ -220,6 +226,29 @@ struct Projection {
     /// rate — projected at the standard target cost (no fabricated 0.5×) and
     /// surfaced as a caveat.
     batch_unpriced: u32,
+    /// Requests projected at the served model's Flex service-tier rate via a
+    /// `flex` route (COST-7). UNLIKE batch this is a REALIZED discount — the
+    /// gateway applies Flex in-band — so the delta folds into projected
+    /// savings. Counted only when the served model carries a catalog Flex rate
+    /// AND that rate actually LOWERS the projection; a blocked/cache-hit
+    /// request is excluded (mirrors `batch_deferred`).
+    flex_applied: u32,
+    /// Requests matched by a `flex` route whose served model has NO catalog
+    /// Flex rate — projected at the standard cost (no fabricated 0.5×) and
+    /// surfaced as a caveat (mirrors the gateway's `flex_not_applied:<model>`).
+    flex_inapplicable: u32,
+    /// Requests matched by a `diff` route that carry a measured
+    /// `diff_saved_usd` — count + summed USD. ALREADY realized at runtime and
+    /// reflected in each row's baseline-vs-projected delta; surfaced for
+    /// per-lever ROI attribution, NEVER folded on top (double-count guard).
+    diff_realized_count: u32,
+    diff_realized_usd: f64,
+    /// Requests matched by a `minify_json` route that carry an estimated
+    /// `minify_saved_est_usd` — count + summed USD. A LABELED ESTIMATE, never
+    /// folded into the projected-savings headline (mirrors the runtime
+    /// contract).
+    minify_estimated_count: u32,
+    minify_estimated_usd: f64,
 }
 
 fn project_requests(
@@ -241,6 +270,12 @@ fn project_requests(
     let mut would_block: u32 = 0;
     let mut batch_deferred: u32 = 0;
     let mut batch_unpriced: u32 = 0;
+    let mut flex_applied: u32 = 0;
+    let mut flex_inapplicable: u32 = 0;
+    let mut diff_realized_count: u32 = 0;
+    let mut diff_realized_usd: f64 = 0.0;
+    let mut minify_estimated_count: u32 = 0;
+    let mut minify_estimated_usd: f64 = 0.0;
 
     // Median latency per model across the window — used to project a rerouted
     // request's latency from its TARGET model's history rather than echoing the
@@ -336,6 +371,57 @@ fn project_requests(
                             }
                         }
                     }
+                    // Flex service-tier action (COST-7): project the REALIZED
+                    // Flex discount the route would deliver — at the served
+                    // model's REAL catalog Flex rate, never a fabricated 0.5×.
+                    // Unlike the advisory batch lane the gateway applies Flex
+                    // synchronously, so the delta folds into projected savings
+                    // as a true figure. Same guards as batch (no discount on a
+                    // blocked/cache-hit request; counter increments only when
+                    // the flex rate actually LOWERS the projection — heavy
+                    // provider-cache traffic can price cheaper at the
+                    // cache-discounted standard rate). A served model with no
+                    // catalog Flex rate projects nothing and is counted
+                    // inapplicable (mirrors the gateway leaving an ineligible
+                    // model on the standard tier).
+                    if route.then.flex && !is_cache_hit && !blocked {
+                        match cost::project_flex_cost(req, p) {
+                            Some(f) if f.cost_usd < projected_cost => {
+                                projected_cost = f.cost_usd;
+                                flex_applied += 1;
+                            }
+                            Some(_) => {} // flex rate delivers no discount — standard figure stands
+                            None => {
+                                flex_inapplicable += 1;
+                            }
+                        }
+                    }
+                    // Per-lever ROI attribution (COST-7) for `diff` / `minify`:
+                    // surface the ALREADY-realized diff savings and the
+                    // ESTIMATED minify savings the matched requests carry,
+                    // WITHOUT folding them into the projected cost. Diff savings
+                    // are already reflected in this row's baseline-vs-projected
+                    // delta (the billed-patch token counts are what
+                    // `project_cost` priced), so re-folding would double-count;
+                    // minify is a labeled estimate the gateway never
+                    // invoice-reconciles. Gated like `batch` on the route
+                    // enabling the lever and the request actually being served.
+                    if route.then.diff && !is_cache_hit && !blocked {
+                        if let Some(saved) = req.diff_saved_usd {
+                            if saved > 0.0 {
+                                diff_realized_count += 1;
+                                diff_realized_usd += saved;
+                            }
+                        }
+                    }
+                    if route.then.minify_json && !is_cache_hit && !blocked {
+                        if let Some(est) = req.minify_saved_est_usd {
+                            if est > 0.0 {
+                                minify_estimated_count += 1;
+                                minify_estimated_usd += est;
+                            }
+                        }
+                    }
                     per_request_projected.push(projected_cost);
                     // Project latency from the target model's window history;
                     // fall back to the request's own latency (and flag it) when
@@ -387,6 +473,12 @@ fn project_requests(
         would_block,
         batch_deferred,
         batch_unpriced,
+        flex_applied,
+        flex_inapplicable,
+        diff_realized_count,
+        diff_realized_usd,
+        minify_estimated_count,
+        minify_estimated_usd,
     }
 }
 
@@ -547,6 +639,7 @@ fn build_per_route(buckets: HashMap<Uuid, PerRouteBucket>) -> Vec<PerRouteBreakd
     rows
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_caveats(
     sample_size: usize,
     requests_unprice_able: u32,
@@ -554,6 +647,12 @@ fn build_caveats(
     would_block: u32,
     batch_deferred: u32,
     batch_unpriced: u32,
+    flex_applied: u32,
+    flex_inapplicable: u32,
+    diff_realized_count: u32,
+    diff_realized_usd: f64,
+    minify_estimated_count: u32,
+    minify_estimated_usd: f64,
 ) -> Vec<String> {
     let mut caveats = Vec::new();
     if sample_size < 1000 {
@@ -584,6 +683,26 @@ fn build_caveats(
     if batch_unpriced > 0 {
         caveats.push(format!(
             "{batch_unpriced} request(s) matched a batch-eligibility route whose target has no catalog batch rate — no batch discount projected."
+        ));
+    }
+    if flex_applied > 0 {
+        caveats.push(format!(
+            "{flex_applied} request(s) projected at the served model's Flex service-tier rate via a flex route — OpenAI's Flex tier bills synchronous traffic at ~50% of standard and the gateway applies it in-band, so this is a REALIZED discount (unlike the advisory Batch Lane)."
+        ));
+    }
+    if flex_inapplicable > 0 {
+        caveats.push(format!(
+            "{flex_inapplicable} request(s) matched a flex route whose served model has no Flex service-tier rate — no flex discount projected (an ineligible model stays on the standard tier, as the gateway does at runtime)."
+        ));
+    }
+    if diff_realized_count > 0 {
+        caveats.push(format!(
+            "{diff_realized_count} request(s) matched a diff route and carry ${diff_realized_usd:.6} in measured output-diff savings (reconstructed-artifact minus billed-patch tokens). REALIZED at runtime and already reflected in the baseline-vs-projected delta — shown for per-lever attribution, not added on top."
+        ));
+    }
+    if minify_estimated_count > 0 {
+        caveats.push(format!(
+            "{minify_estimated_count} request(s) matched a minify-JSON route with ${minify_estimated_usd:.6} in ESTIMATED whitespace savings (the gateway's pretty-vs-emitted re-tokenize estimate). Labeled estimate — never invoice-reconciled and NOT folded into the projected-savings headline."
         ));
     }
     caveats

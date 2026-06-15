@@ -22,6 +22,10 @@ fn to_plan(p: &tt_shared::pricing::ModelPricing) -> ModelPricing {
         // batch-eligibility route projection; never a fabricated 0.5×.
         batch_input_per_million: p.batch_input_per_million,
         batch_output_per_million: p.batch_output_per_million,
+        // Real catalog Flex service-tier rates (None = no Flex tier) — feed the
+        // flex route projection (COST-7); never a fabricated 0.5×.
+        flex_input_per_million: p.flex_input_per_million,
+        flex_output_per_million: p.flex_output_per_million,
     }
 }
 

@@ -33,7 +33,15 @@
 //!   `o4*`, `chatgpt-4o*`) → `o200k_base` (the encoding those models are
 //!   billed in; `cl100k` overcounts them by ~5–15%). Older models keep
 //!   `cl100k_base`. High confidence.
-//! - `anthropic` → `cl100k_base` proxy, Medium (undercounts ~15–20%, see above).
+//! - `anthropic` → `cl100k_base` proxy, Medium, **with a documented `+18%`
+//!   correction** ([`ANTHROPIC_PROXY_CORRECTION`]). `cl100k` undercounts
+//!   Anthropic input ~15–20%; the model-aware ($-bearing) path scales the raw
+//!   count up so every Anthropic dollar ESTIMATE is directionally right rather
+//!   than systematically low. Still Medium / directional — the provider's
+//!   reported usage stays authoritative, and `AnthropicProvider::count_tokens`
+//!   gives the exact count when one is needed. (The provider-keyed
+//!   [`estimate_input_tokens`] path is left uncorrected — its routing / preview
+//!   / capability thresholds were tuned against the raw proxy.)
 //! - everything else → `o200k_base` as a *generic BPE proxy*, Medium. Not the
 //!   provider's real tokenizer, but a real BPE: it encodes whitespace runs /
 //!   punctuation the way real tokenizers do, where `chars / 4` books a quarter
@@ -110,6 +118,31 @@ pub fn char_count_estimate(text: &str) -> u32 {
     ((text.chars().count() as f64) / 4.0).ceil() as u32
 }
 
+/// Multiplicative correction applied to the Anthropic `cl100k` proxy count in
+/// the **model-aware** ($-bearing) estimator [`estimate_input_tokens_for_model`].
+///
+/// `cl100k` is not Anthropic's tokenizer; it undercounts Anthropic input by
+/// ~15–20% on typical text (more on code / non-English). `+18%` sits in the
+/// middle of that band, so the corrected count — and every Anthropic dollar
+/// ESTIMATE derived from it (cache-bust penalties, field-drop / compression
+/// savings, the agentic net-positive predicate) — is directionally right
+/// instead of systematically low.
+///
+/// This stays an ESTIMATE: the count remains [`Confidence::Medium`], the
+/// provider's reported usage is still authoritative for billing, and the
+/// authoritative pre-dispatch count is `AnthropicProvider::count_tokens`
+/// (Anthropic's own `/v1/messages/count_tokens`). The correction is applied
+/// ONLY on the model-aware path; the provider-keyed [`estimate_input_tokens`] /
+/// [`estimate_tokens`] are left uncorrected because the routing / preview /
+/// capability-check thresholds were tuned against their raw values.
+pub const ANTHROPIC_PROXY_CORRECTION: f64 = 1.18;
+
+/// Apply [`ANTHROPIC_PROXY_CORRECTION`] to a raw `cl100k` count, rounding UP so
+/// the corrected value never rounds an already-low count further down.
+fn apply_anthropic_correction(raw: u32) -> u32 {
+    (f64::from(raw) * ANTHROPIC_PROXY_CORRECTION).ceil() as u32
+}
+
 /// Whether `cl100k` produces an estimate for this provider — exactly for
 /// OpenAI (its own tokenizer), or as an undercounting proxy for Anthropic.
 fn uses_tiktoken(provider: &str) -> bool {
@@ -174,18 +207,29 @@ pub fn estimate_input_tokens_for_model(provider: &str, model: &str, text: &str) 
                 (cl100k(), Confidence::High)
             }
         }
-        // Documented proxy: undercounts Anthropic by ~15–20% (estimates keyed
-        // on it are systematically LOW — see the split/bust docs in tt-core).
+        // Documented proxy: `cl100k` undercounts Anthropic by ~15–20% (estimates
+        // keyed on it are systematically LOW — see the split/bust docs in
+        // tt-core). The raw count is corrected by [`ANTHROPIC_PROXY_CORRECTION`]
+        // below so $-bearing deltas are directionally right; still Medium.
         "anthropic" => (cl100k(), Confidence::Medium),
         // Generic BPE proxy: real-BPE whitespace/punctuation behavior, same
         // encoding on both sides of any delta.
         _ => (o200k(), Confidence::Medium),
     };
+    // The Anthropic-proxy undercount correction applies ONLY to the real-BPE
+    // count, never to the `chars / 4` fallback (which is already a different,
+    // Low-confidence heuristic and is unbookable anyway).
+    let correct_anthropic = provider == "anthropic";
     match bpe {
-        Some(bpe) => Estimate {
-            tokens: bpe.encode_with_special_tokens(text).len() as u32,
-            confidence,
-        },
+        Some(bpe) => {
+            let raw = bpe.encode_with_special_tokens(text).len() as u32;
+            let tokens = if correct_anthropic {
+                apply_anthropic_correction(raw)
+            } else {
+                raw
+            };
+            Estimate { tokens, confidence }
+        }
         None => Estimate {
             tokens: char_count_estimate(text),
             confidence: Confidence::Low,
@@ -309,12 +353,70 @@ mod tests {
         assert!(char_count_estimate(&ws_run) > 100);
     }
 
-    /// Anthropic keeps the documented cl100k proxy under the model-aware API.
+    /// Anthropic keeps the cl100k proxy under the model-aware API, but the
+    /// $-bearing count is corrected by [`ANTHROPIC_PROXY_CORRECTION`] (+18%) to
+    /// offset cl100k's ~15–20% undercount. Still Medium / directional.
     #[test]
-    fn model_aware_anthropic_keeps_cl100k_proxy() {
-        let text = "Hello, world.";
+    fn model_aware_anthropic_corrects_cl100k_proxy() {
+        // Use a longer text so the +18% scaling clears the rounding floor and
+        // the corrected count is strictly above the raw proxy count.
+        let text = "The quick brown fox jumps over the lazy dog, repeatedly, \
+                    across many tokens of representative English prose.";
+        let raw = estimate_tokens("anthropic", text); // provider-keyed = uncorrected cl100k
         let e = estimate_input_tokens_for_model("anthropic", "claude-sonnet-4-6", text);
-        assert_eq!(e.confidence, Confidence::Medium);
-        assert_eq!(e.tokens, estimate_tokens("anthropic", text));
+        assert_eq!(
+            e.confidence,
+            Confidence::Medium,
+            "still a directional proxy"
+        );
+        let expected = (f64::from(raw) * ANTHROPIC_PROXY_CORRECTION).ceil() as u32;
+        assert_eq!(
+            e.tokens, expected,
+            "model-aware count is the +18% corrected proxy"
+        );
+        assert!(
+            e.tokens > raw,
+            "corrected count ({}) must exceed the raw cl100k count ({raw})",
+            e.tokens
+        );
+    }
+
+    /// The correction is exactly `ceil(raw * 1.18)`.
+    #[test]
+    fn anthropic_correction_is_eighteen_percent_ceil() {
+        assert_eq!(apply_anthropic_correction(0), 0);
+        assert_eq!(apply_anthropic_correction(100), 118);
+        assert_eq!(apply_anthropic_correction(50), 59); // 50 * 1.18 = 59.0
+        assert_eq!(apply_anthropic_correction(7), 9); // 7 * 1.18 = 8.26 → 9
+    }
+
+    /// The correction is scoped to the MODEL-AWARE path. The provider-keyed
+    /// `estimate_input_tokens` / `estimate_tokens` Anthropic path stays raw
+    /// (routing / preview / capability thresholds were tuned against it).
+    #[test]
+    fn provider_keyed_anthropic_path_is_uncorrected() {
+        let text = "The quick brown fox jumps over the lazy dog.";
+        // Provider-keyed equals OpenAI's cl100k count, byte-for-byte (no +18%).
+        assert_eq!(
+            estimate_input_tokens("anthropic", text).tokens,
+            estimate_input_tokens("openai", text).tokens,
+            "provider-keyed Anthropic must remain the raw cl100k proxy"
+        );
+    }
+
+    /// Other providers' generic-BPE proxy is NOT scaled by the Anthropic
+    /// correction — only `provider == "anthropic"` triggers it.
+    #[test]
+    fn correction_does_not_leak_to_other_providers() {
+        let text = "The quick brown fox jumps over the lazy dog.";
+        let groq = estimate_input_tokens_for_model("groq", "llama-3.3-70b", text);
+        // o200k raw count, uncorrected: recompute the raw o200k count and match.
+        let raw_o200k = o200k()
+            .map(|b| b.encode_with_special_tokens(text).len() as u32)
+            .expect("o200k available in test env");
+        assert_eq!(
+            groq.tokens, raw_o200k,
+            "non-anthropic providers are uncorrected"
+        );
     }
 }

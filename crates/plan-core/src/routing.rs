@@ -106,6 +106,8 @@ mod tests {
             body: None,
             response_body: None,
             task_class: Default::default(),
+            diff_saved_usd: None,
+            minify_saved_est_usd: None,
         }
     }
 
@@ -123,6 +125,7 @@ mod tests {
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
+                flex: false,
                 batch: false,
                 redact: false,
                 traffic_pct: None,

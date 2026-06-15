@@ -54,6 +54,8 @@ fn make_req(
         body: None,
         response_body: None,
         task_class: Default::default(),
+        diff_saved_usd: None,
+        minify_saved_est_usd: None,
     }
 }
 
@@ -66,6 +68,8 @@ fn pricing_with(provider: &str, model: &str, input: f64, output: f64) -> (String
             cached_input_per_million: Some(input * 0.1),
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
         },
     )
 }
@@ -213,6 +217,7 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -255,6 +260,7 @@ fn conservative_when_pricing_missing() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -301,6 +307,7 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -344,6 +351,7 @@ fn cross_provider_target_absent_is_conservative() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -386,6 +394,7 @@ fn route_over_ceiling_is_blocked_not_saved() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: Some(0.01), // haiku on 1M/1M tokens still far exceeds $0.01
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -432,6 +441,7 @@ fn batch_route(target: &str, model_in: &str) -> ProposedRoute {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: true,
             redact: false,
             traffic_pct: None,
@@ -614,6 +624,145 @@ fn batch_cache_hit_stays_zero_projected_without_counter() {
     );
 }
 
+/// Build a `flex: true` route from `model_in` → `target` (no other actions).
+fn flex_route(target: &str, model_in: &str) -> ProposedRoute {
+    let mut r = batch_route(target, model_in);
+    r.name = "flex-lane".into();
+    r.then.batch = false;
+    r.then.flex = true;
+    r
+}
+
+/// A `flex: true` route whose served model carries catalog Flex rates projects
+/// the per-request cost at the FLEX rate (a REALIZED discount), folds the delta
+/// into projected savings, and surfaces the realized-flex caveat.
+#[test]
+fn flex_route_projects_discount_and_caveats() {
+    // 1000 in / 100 out on sonnet, baseline $0.0045. Target haiku:
+    //   standard = 1000×$0.25/M + 100×$1.25/M = 0.000375
+    //   flex     = 1000×$0.125/M + 100×$0.625/M = 0.0001875
+    let req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    let route = flex_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    let mut pricing = HashMap::new();
+    let (k, mut v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    v.flex_input_per_million = Some(0.125);
+    v.flex_output_per_million = Some(0.625);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    assert_eq!(result.aggregates.requests_rerouted, 1);
+    let flex_cost = 1000.0 * 0.125 / 1e6 + 100.0 * 0.625 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - flex_cost).abs() < 1e-12,
+        "projected ({}) must be the flex-rate cost ({flex_cost})",
+        result.aggregates.total_projected_cost_usd
+    );
+    assert!(
+        (result.aggregates.projected_savings_usd - (0.0045 - flex_cost)).abs() < 1e-12,
+        "savings must include the flex delta"
+    );
+    assert!(
+        result
+            .caveats
+            .iter()
+            .any(|c| c.contains("Flex service-tier rate") && c.contains("REALIZED")),
+        "expected the realized-flex caveat, got: {:?}",
+        result.caveats
+    );
+}
+
+/// A `flex: true` route whose served model has NO catalog Flex rate projects
+/// the STANDARD target cost (no fabricated 0.5×) and surfaces the inapplicable
+/// caveat.
+#[test]
+fn flex_route_without_rate_projects_standard_with_inapplicable_caveat() {
+    let req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    let route = flex_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    let mut pricing = HashMap::new();
+    let (k, v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    // pricing_with carries no flex rates — the served model is flex-inapplicable.
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    let standard_cost = 1000.0 * 0.25 / 1e6 + 100.0 * 1.25 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - standard_cost).abs() < 1e-12,
+        "projected ({}) must be the STANDARD target cost ({standard_cost})",
+        result.aggregates.total_projected_cost_usd
+    );
+    assert!(
+        result
+            .caveats
+            .iter()
+            .any(|c| c.contains("no Flex service-tier rate")),
+        "expected the flex-inapplicable caveat, got: {:?}",
+        result.caveats
+    );
+}
+
+/// A `diff: true` route surfaces the measured `diff_saved_usd` carried on its
+/// matched requests as a per-lever caveat — WITHOUT folding it into the
+/// projected cost (the realized saving is already in baseline−projected, so
+/// re-folding would double-count).
+#[test]
+fn diff_route_attributes_realized_savings_without_double_counting() {
+    let mut req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    req.diff_saved_usd = Some(0.0012);
+    let mut route = batch_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    route.then.batch = false;
+    route.then.diff = true;
+    let mut pricing = HashMap::new();
+    let (k, v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    // Projected cost is the plain model-swap cost — diff is NOT folded on top.
+    let standard_cost = 1000.0 * 0.25 / 1e6 + 100.0 * 1.25 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - standard_cost).abs() < 1e-12,
+        "diff savings must NOT be folded into the projected cost; got {}",
+        result.aggregates.total_projected_cost_usd
+    );
+    assert!(
+        result
+            .caveats
+            .iter()
+            .any(|c| c.contains("measured output-diff savings") && c.contains("0.001200")),
+        "expected the realized-diff attribution caveat, got: {:?}",
+        result.caveats
+    );
+}
+
+/// A `minify_json: true` route surfaces the estimated `minify_saved_est_usd` as
+/// a labeled-estimate caveat, never folded into the projected headline.
+#[test]
+fn minify_route_attributes_estimate_without_folding() {
+    let mut req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+    req.minify_saved_est_usd = Some(0.0003);
+    let mut route = batch_route("claude-3-5-haiku", "claude-3-5-sonnet");
+    route.then.batch = false;
+    route.then.minify_json = true;
+    let mut pricing = HashMap::new();
+    let (k, v) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    let standard_cost = 1000.0 * 0.25 / 1e6 + 100.0 * 1.25 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - standard_cost).abs() < 1e-12,
+        "minify estimate must NOT be folded into the projected cost; got {}",
+        result.aggregates.total_projected_cost_usd
+    );
+    assert!(
+        result
+            .caveats
+            .iter()
+            .any(|c| c.contains("ESTIMATED whitespace savings") && c.contains("0.000300")),
+        "expected the estimated-minify caveat, got: {:?}",
+        result.caveats
+    );
+}
+
 #[test]
 fn rerouted_latency_projected_from_target_model_history() {
     // 3 premium (900ms) + 3 cheap (100ms) requests; route premium -> cheap.
@@ -656,6 +805,7 @@ fn rerouted_latency_projected_from_target_model_history() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -697,6 +847,8 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             cached_input_per_million: Some(0.3),
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
         };
         let req_template = RequestLog {
             id: det_uuid(u128::from(i) + 1),
@@ -721,6 +873,8 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             body: None,
             response_body: None,
             task_class: Default::default(),
+            diff_saved_usd: None,
+            minify_saved_est_usd: None,
         };
         let baseline = cost::compute_baseline_cost(&req_template, &pricing);
         requests.push(RequestLog {
@@ -746,6 +900,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -875,6 +1030,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -903,6 +1059,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,

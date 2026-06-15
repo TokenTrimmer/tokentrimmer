@@ -14,7 +14,7 @@ use tt_telemetry::{body_capture::BodyCaptureWriter, request_logs::RequestLogWrit
 use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
 use crate::failover::CircuitBreaker;
 use crate::middleware::argon2_cap::{Argon2Cap, Argon2CapConfig, Argon2VerifyCap};
-use crate::middleware::key_cache::{KeyVerifyCache, VerifyCache};
+use crate::middleware::key_cache::{KeyVerifyCache, RevocationRegistry, VerifyCache};
 use crate::registry::{register_default_providers, ProviderRegistry};
 use crate::single_flight::SingleFlight;
 use crate::tier_resolver::TierResolver;
@@ -146,6 +146,16 @@ pub struct AppState {
     /// See [`crate::middleware::key_cache`] for TTL constants and the
     /// revocation-staleness tradeoff documentation.
     pub verify_cache: VerifyCache,
+    /// Optional cross-instance API-key revocation registry (SEC-4). Backed by
+    /// the same Redis the L1 cache uses; auto-wired by [`AppState::with_l1`].
+    ///
+    /// When `Some`, the auth middleware checks it on every positive
+    /// `verify_cache` hit and forces a re-verify for a key marked revoked on
+    /// any replica — closing the per-replica staleness window the local-only
+    /// [`KeyVerifyCache::evict_key_id`](crate::middleware::key_cache::KeyVerifyCache::evict_key_id)
+    /// leaves open. `None` (no Redis wired — tests, dev) degrades cleanly to
+    /// that per-replica behavior bounded by `POSITIVE_TTL_SECS`.
+    pub revocation: Option<Arc<RevocationRegistry>>,
     /// Pre-auth per-IP rate cap consulted by the auth middleware **immediately
     /// before** the (CPU-expensive) argon2 verify on the cold path — i.e. only
     /// when a `tt_live_*` token misses the verify cache. Past the per-IP
@@ -162,6 +172,20 @@ pub struct AppState {
     /// for unauthenticated requests so the dogfood routing route fires.
     /// Enabled by setting `TT_DOGFOOD_GROQ_ROUTING=1` at startup.
     pub dogfood_enabled: bool,
+    /// SEC-6 loopback guard for [`Self::dogfood_enabled`].
+    ///
+    /// Stamping a fixed org identity onto *anonymous* (tokenless) traffic is
+    /// only safe when the gateway cannot be reached by strangers — i.e. it is
+    /// bound to loopback. On a shared/public bind it would treat every
+    /// anonymous caller as the dogfood org (and, with a credential store wired,
+    /// could spend the dogfood org's upstream credentials). The dogfood stamp
+    /// therefore **fails closed**: it is applied only when this is `true`.
+    ///
+    /// Default `false` (fail closed). [`Self::with_dogfood_enabled`] sets it
+    /// `true` (the in-process/loopback dev + test path), while the
+    /// production-safe [`Self::with_dogfood_enabled_for_bind`] derives it from
+    /// the resolved bind address.
+    pub dogfood_bind_is_loopback: bool,
     /// Optional per-org spend cap + request-rate enforcer. The auth middleware
     /// checks it pre-flight (429 on deny) and the chat handler records realized
     /// spend. `None` disables budget enforcement (tests, dev, unmetered orgs).
@@ -244,6 +268,19 @@ pub struct AppState {
     /// [`AppState::with_route_savings`] wires a source (a
     /// [`crate::route_savings::PostgresRouteSavingsSource`] in production).
     pub route_savings: Option<Arc<dyn crate::route_savings::RouteSavingsSource>>,
+    /// Optional Postgres pool handle used by the `GET /ready` readiness probe
+    /// to issue a `SELECT 1` liveness check against the database.
+    ///
+    /// `None` (the default, and the intentional DB-less degraded mode) means
+    /// no DB was configured at boot — `/ready` then treats Postgres as a
+    /// non-dependency and does not 503 on it. When a DB URL *was* provided at
+    /// boot the wiring layer attaches the pool here via
+    /// [`with_db_pool`](Self::with_db_pool), and a dead pool makes `/ready`
+    /// answer 503 so an orchestrator (Fly) pulls the process out of rotation.
+    /// Other pool-backed handles (`request_log_writer`, `key_store`, …) keep
+    /// the pool wrapped behind their trait objects; this is the one raw handle
+    /// the probe needs.
+    pub db_pool: Option<sqlx::PgPool>,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -269,8 +306,10 @@ impl AppState {
             body_capture_writer: None,
             routing_store: None,
             verify_cache: Arc::new(KeyVerifyCache::new()),
+            revocation: None,
             argon2_cap: Argon2VerifyCap::new(Argon2CapConfig::from_env()),
             dogfood_enabled: false,
+            dogfood_bind_is_loopback: false,
             budget: None,
             tier_resolver: None,
             dynamic_budget: Arc::new(DynamicBudgetEnforcer::new()),
@@ -283,7 +322,19 @@ impl AppState {
             shadow_timeout: DEFAULT_SHADOW_TIMEOUT,
             l2_hit_judge_limiter,
             route_savings: None,
+            db_pool: None,
         }
+    }
+
+    /// Builder-style attach: register the Postgres pool with the readiness
+    /// probe (`GET /ready`). Pass the SAME pool the telemetry/auth/routing
+    /// stores were built from. Once attached, a dead pool makes `/ready`
+    /// return 503 (hard dependency); leaving it unset keeps the DB-less
+    /// degraded mode where `/ready` does not gate on Postgres.
+    #[must_use]
+    pub fn with_db_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.db_pool = Some(pool);
+        self
     }
 
     /// Construct the default production state: registry pre-seeded with all
@@ -297,12 +348,45 @@ impl AppState {
     }
 
     /// Builder-style attach: enable L1 exact-match cache with the given backend.
+    ///
+    /// Also wires the cross-instance API-key [`RevocationRegistry`] (SEC-4) from
+    /// the SAME backend — L1 *is* the shared Redis, so a revoke fanned out via
+    /// the registry reaches every replica that has L1 enabled. An explicit
+    /// [`with_revocation_registry`](Self::with_revocation_registry) called after
+    /// this overrides the auto-wired registry (e.g. to point it at a separate
+    /// backend).
     pub fn with_l1(mut self, cache: Arc<dyn L1Cache>, ttl_secs: Option<u64>) -> Self {
+        self.revocation = Some(Arc::new(RevocationRegistry::new(cache.clone())));
         self.l1 = Some(L1Config {
             cache,
             ttl_secs: ttl_secs.unwrap_or(DEFAULT_L1_TTL_SECS),
         });
         self
+    }
+
+    /// Builder-style attach: wire the cross-instance API-key revocation registry
+    /// (SEC-4) on a specific [`L1Cache`] backend, independent of the L1 request
+    /// cache. [`with_l1`](Self::with_l1) already auto-wires the registry from
+    /// the L1 backend; use this only to point revocation at a different backend
+    /// or to enable revocation without L1 request caching.
+    #[must_use]
+    pub fn with_revocation_registry(mut self, backend: Arc<dyn L1Cache>) -> Self {
+        self.revocation = Some(Arc::new(RevocationRegistry::new(backend)));
+        self
+    }
+
+    /// Revoke an API key everywhere: evict it from this replica's verify cache
+    /// (immediate, local) AND publish a cross-instance revocation marker so
+    /// peer replicas force a re-verify on their next positive hit (SEC-4). The
+    /// marker publish is a no-op when no [`revocation`](Self::revocation)
+    /// registry is wired — peers then fall back to the `POSITIVE_TTL_SECS`
+    /// window. Call this from the key-revocation path instead of a bare
+    /// `verify_cache.evict_key_id`.
+    pub async fn revoke_key(&self, key_id: uuid::Uuid) {
+        self.verify_cache.evict_key_id(key_id);
+        if let Some(reg) = self.revocation.as_ref() {
+            reg.mark_revoked(key_id).await;
+        }
     }
 
     /// Builder-style attach: enable L2 semantic cache with the given backend.
@@ -548,12 +632,53 @@ impl AppState {
         self
     }
 
-    /// Builder-style: enable dogfood routing mode. The auth middleware will
-    /// inject a [`crate::DOGFOOD_ORG_ID`] identity for unauthenticated
-    /// requests so the pre-seeded dogfood route fires.
+    /// Builder-style: enable dogfood routing mode on a **trusted (loopback)**
+    /// bind. The auth middleware will inject a [`crate::DOGFOOD_ORG_ID`]
+    /// identity for unauthenticated requests so the pre-seeded dogfood route
+    /// fires.
+    ///
+    /// This variant marks the bind as loopback (see
+    /// [`Self::dogfood_bind_is_loopback`]) and is the in-process/loopback dev +
+    /// test entry point. A production boot that may bind a shared address MUST
+    /// use [`Self::with_dogfood_enabled_for_bind`] instead so the dogfood stamp
+    /// fails closed off loopback (SEC-6).
     pub fn with_dogfood_enabled(mut self) -> Self {
         self.dogfood_enabled = true;
+        self.dogfood_bind_is_loopback = true;
         self
+    }
+
+    /// Builder-style: enable dogfood routing mode, deriving the SEC-6 loopback
+    /// guard from the gateway's resolved bind address.
+    ///
+    /// Pass `bind_ip.is_loopback()`. When the bind is **not** loopback the
+    /// dogfood stamp fails closed — `dogfood_enabled` is still recorded but the
+    /// auth middleware will not stamp anonymous traffic with the dogfood org
+    /// (and logs a loud warning on first use, louder still when a credential
+    /// store is wired). This is the production-safe wiring the gateway boot
+    /// path should use.
+    #[must_use]
+    pub fn with_dogfood_enabled_for_bind(mut self, bind_is_loopback: bool) -> Self {
+        self.dogfood_enabled = true;
+        self.dogfood_bind_is_loopback = bind_is_loopback;
+        if !bind_is_loopback {
+            tracing::warn!(
+                "SEC-6: TT_DOGFOOD_GROQ_ROUTING is enabled but the gateway is NOT bound to \
+                 loopback — anonymous-request dogfood-org stamping is DISABLED (fail closed). \
+                 Anonymous traffic will not be treated as the dogfood org on a shared bind. \
+                 Bind loopback (TT_BIND_ADDR=127.0.0.1) to use dogfood routing."
+            );
+        }
+        self
+    }
+
+    /// SEC-6: `true` only when dogfood routing is enabled AND the bind is
+    /// loopback. The auth middleware stamps the anonymous dogfood-org identity
+    /// exclusively when this holds, so a shared/public bind never grants the
+    /// fixed dogfood identity to strangers.
+    #[must_use]
+    pub fn dogfood_active(&self) -> bool {
+        self.dogfood_enabled && self.dogfood_bind_is_loopback
     }
 
     /// Start background catalogue refreshers (currently: OpenRouter's dynamic
@@ -642,6 +767,37 @@ mod tests {
         assert!(
             matches!(state.spend_sink(), SpendSink::None),
             "spend_sink must be None when no enforcer is wired"
+        );
+    }
+
+    /// SEC-6: `dogfood_active()` is the AND of `dogfood_enabled` and the
+    /// loopback guard, so dogfood org stamping fails closed off loopback.
+    #[test]
+    fn dogfood_active_requires_enabled_and_loopback() {
+        // Default: dogfood off → inactive.
+        let off = AppState::with_default_providers();
+        assert!(!off.dogfood_enabled);
+        assert!(!off.dogfood_bind_is_loopback);
+        assert!(!off.dogfood_active());
+
+        // Loopback dev/test path: enabled + loopback → active.
+        let loopback = AppState::with_default_providers().with_dogfood_enabled();
+        assert!(loopback.dogfood_enabled);
+        assert!(loopback.dogfood_bind_is_loopback);
+        assert!(loopback.dogfood_active());
+
+        // Production-safe builder with a loopback bind → active.
+        let bound_loopback = AppState::with_default_providers().with_dogfood_enabled_for_bind(true);
+        assert!(bound_loopback.dogfood_active());
+
+        // Production-safe builder with a NON-loopback bind → enabled but
+        // fails closed (inactive).
+        let bound_public = AppState::with_default_providers().with_dogfood_enabled_for_bind(false);
+        assert!(bound_public.dogfood_enabled);
+        assert!(!bound_public.dogfood_bind_is_loopback);
+        assert!(
+            !bound_public.dogfood_active(),
+            "dogfood must fail closed on a non-loopback bind"
         );
     }
 }

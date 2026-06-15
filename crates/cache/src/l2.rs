@@ -31,7 +31,7 @@
 //! it on a per-request basis by passing a different `threshold` value to
 //! [`L2Cache::lookup`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -39,7 +39,64 @@ use chrono::{DateTime, Utc};
 use tt_shared::{ChatCompletionRequest, ContentPart, Message, MessageContent};
 use uuid::Uuid;
 
+use crate::response_codec::{L2Open, ResponseCodec};
 use crate::CacheError;
+
+// ---------------------------------------------------------------------------
+// At-rest response encoding (SEC-2)
+// ---------------------------------------------------------------------------
+
+/// Encode a plaintext response payload into the `serde_json::Value` that goes
+/// into the L2 `response` column.
+///
+/// - With a wired [`ResponseCodec`], returns a self-describing **encrypted
+///   envelope** value bound to `org_id` + the row `id` (the embedding and all
+///   other columns stay plaintext).
+/// - Without a codec, parses the bytes into the plaintext JSON value exactly as
+///   the cache always has (fully back-compat).
+fn encode_response_value(
+    codec: Option<&ResponseCodec>,
+    org_id: Uuid,
+    id: Uuid,
+    response: &[u8],
+) -> Result<serde_json::Value, CacheError> {
+    match codec {
+        Some(codec) => Ok(codec.seal_response_json(org_id, id, response)?),
+        None => serde_json::from_slice::<serde_json::Value>(response).map_err(CacheError::Serde),
+    }
+}
+
+/// Decode the stored `response` value back into plaintext response bytes,
+/// honoring an optional at-rest codec.
+///
+/// Returns `None` to signal the entry must be **skipped** (treated as a cache
+/// miss): an encrypted envelope that does not authenticate (wrong key/org/row),
+/// or an encrypted row read by a cache with no codec wired. A legacy plaintext
+/// row is always readable (fail-open) whether or not a codec is wired.
+fn decode_response_value(
+    codec: Option<&ResponseCodec>,
+    org_id: Uuid,
+    id: Uuid,
+    stored: &serde_json::Value,
+) -> Option<Vec<u8>> {
+    match codec {
+        Some(codec) => match codec.open_response_json(org_id, id, stored) {
+            L2Open::Decrypted(plain) => Some(plain),
+            // Not an envelope → a pre-codec plaintext row: read it as-is.
+            L2Open::Plaintext => serde_json::to_vec(stored).ok(),
+            // Sealed but unreadable → skip rather than serve garbage.
+            L2Open::Undecryptable => None,
+        },
+        None => {
+            if ResponseCodec::is_encrypted_json(stored) {
+                // Encrypted at rest but no codec wired to open it → unservable.
+                None
+            } else {
+                serde_json::to_vec(stored).ok()
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-task-class thresholds
@@ -494,6 +551,75 @@ pub const DEDUP_MAX_ENTRIES: usize = 5_000;
 pub const DEDUP_TOP_CLUSTERS: usize = 20;
 
 // ---------------------------------------------------------------------------
+// Paraphrase-dedup ACTION (collapse duplicates) — COST-5
+// ---------------------------------------------------------------------------
+
+/// What [`dedup_collapse`] did (or, in dry-run, WOULD do) for one org: the
+/// read-only [`DedupReport`] it acted on plus the non-representative entry ids
+/// it collapsed away.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DedupActionReport {
+    /// The dedup analysis the action was computed from.
+    pub report: DedupReport,
+    /// Non-representative member ids collapsed (evicted) — or, when
+    /// [`Self::dry_run`] is true, the ids that WOULD be evicted. Sorted for a
+    /// deterministic result. The cluster representative (highest `hit_count`) is
+    /// always KEPT, so every cluster's cached answer survives.
+    pub collapsed_ids: Vec<Uuid>,
+    /// True when the action only reported the plan and evicted nothing.
+    pub dry_run: bool,
+}
+
+/// Collapse near-duplicate cache entries for `org_id` into one representative
+/// per cluster — the maintenance/admin action built on the read-only
+/// [`L2Cache::analyze_dedup`] machinery.
+///
+/// For every near-duplicate cluster the analysis surfaces, the highest-
+/// `hit_count` member is KEPT as the representative and the others are evicted
+/// (via [`L2Cache::evict`] — single-row, idempotent). The representative's
+/// cached answer remains servable, so collapsing never loses a cacheable
+/// response; it only removes redundant rows that fragment the cache.
+///
+/// # Safety
+///
+/// - **Dry-run friendly.** With `dry_run = true` NOTHING is evicted — the
+///   returned [`DedupActionReport::collapsed_ids`] is exactly the plan an
+///   operator can review before committing.
+/// - **Bounded + targeted.** It acts only on the clusters the report surfaces
+///   (the top opportunities by hit weight — see [`DEDUP_TOP_CLUSTERS`]); re-run
+///   to collapse further as remaining clusters re-rank. It only ever deletes
+///   non-representative members — never a bulk delete, never the representative.
+pub async fn dedup_collapse(
+    cache: &dyn L2Cache,
+    org_id: Uuid,
+    dry_run: bool,
+) -> Result<DedupActionReport, CacheError> {
+    let report = cache.analyze_dedup(org_id).await?;
+
+    let mut collapsed_ids: Vec<Uuid> = Vec::new();
+    for cluster in &report.top_clusters {
+        for &id in &cluster.member_ids {
+            if id != cluster.representative_id {
+                collapsed_ids.push(id);
+            }
+        }
+    }
+    collapsed_ids.sort_unstable();
+
+    if !dry_run {
+        for &id in &collapsed_ids {
+            cache.evict(id).await?;
+        }
+    }
+
+    Ok(DedupActionReport {
+        report,
+        collapsed_ids,
+        dry_run,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // L2Cache trait
 // ---------------------------------------------------------------------------
 
@@ -826,6 +952,10 @@ pub fn l2_tool_context_text(req: &ChatCompletionRequest) -> Option<String> {
 /// ```
 pub struct InMemoryL2Cache {
     entries: Arc<Mutex<Vec<CacheEntry>>>,
+    /// Optional at-rest response codec (SEC-2). `None` = plaintext (default).
+    response_codec: Option<ResponseCodec>,
+    /// Orgs whose inserts are dropped (the per-org "do not cache" hook).
+    no_cache_orgs: Arc<HashSet<Uuid>>,
 }
 
 impl InMemoryL2Cache {
@@ -833,7 +963,28 @@ impl InMemoryL2Cache {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(Vec::new())),
+            response_codec: None,
+            no_cache_orgs: Arc::new(HashSet::new()),
         }
+    }
+
+    /// Enable at-rest response encryption (SEC-2): cached responses are sealed
+    /// with `codec` on insert and opened on lookup. The embedding stays
+    /// plaintext (similarity is unaffected) and legacy plaintext rows stay
+    /// readable. Default (un-wired) is plaintext, identical to today.
+    #[must_use]
+    pub fn with_response_codec(mut self, codec: ResponseCodec) -> Self {
+        self.response_codec = Some(codec);
+        self
+    }
+
+    /// Skip caching entirely for `orgs` (the per-org "do not cache" control hook
+    /// for sensitive workloads): [`insert`](Self::insert) is a silent no-op for a
+    /// listed org, so nothing is ever stored and every lookup misses.
+    #[must_use]
+    pub fn with_no_cache_orgs(mut self, orgs: HashSet<Uuid>) -> Self {
+        self.no_cache_orgs = Arc::new(orgs);
+        self
     }
 }
 
@@ -846,9 +997,21 @@ impl Default for InMemoryL2Cache {
 #[async_trait]
 impl L2Cache for InMemoryL2Cache {
     /// Insert `entry` into the in-memory store.
-    async fn insert(&self, entry: CacheEntry) -> Result<(), CacheError> {
+    async fn insert(&self, mut entry: CacheEntry) -> Result<(), CacheError> {
         if !embedding_is_finite(&entry.embedding) {
             return Err(CacheError::InvalidEmbedding);
+        }
+        // Per-org "do not cache" hook: drop the insert entirely.
+        if self.no_cache_orgs.contains(&entry.org_id) {
+            return Ok(());
+        }
+        // At-rest encryption (SEC-2): seal the response, leaving the embedding
+        // and metadata plaintext. The stored `response` bytes hold the encrypted
+        // envelope value; lookup reverses it. (No codec → unchanged plaintext.)
+        if let Some(codec) = &self.response_codec {
+            let sealed =
+                encode_response_value(Some(codec), entry.org_id, entry.id, &entry.response)?;
+            entry.response = serde_json::to_vec(&sealed).map_err(CacheError::Serde)?;
         }
         let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         guard.push(entry);
@@ -884,7 +1047,28 @@ impl L2Cache for InMemoryL2Cache {
             .filter(|(_, sim)| sim.is_finite() && *sim >= threshold)
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(best.map(|(e, sim)| (e.clone(), sim)))
+        let Some((entry, sim)) = best else {
+            return Ok(None);
+        };
+        // No codec wired → today's behavior exactly: return the stored bytes
+        // unchanged (never round-trip through serde, never skip).
+        let Some(codec) = self.response_codec.as_ref() else {
+            return Ok(Some((entry.clone(), sim)));
+        };
+        // Reverse at-rest encryption (SEC-2). A sealed row that cannot be opened
+        // (wrong key/org) is skipped as a miss; a legacy plaintext row reads back
+        // as-is.
+        let stored: serde_json::Value = match serde_json::from_slice(&entry.response) {
+            Ok(v) => v,
+            // Non-JSON stored bytes can't be an envelope → treat as plaintext.
+            Err(_) => return Ok(Some((entry.clone(), sim))),
+        };
+        let Some(plain) = decode_response_value(Some(codec), org_id, entry.id, &stored) else {
+            return Ok(None);
+        };
+        let mut decoded = entry.clone();
+        decoded.response = plain;
+        Ok(Some((decoded, sim)))
     }
 
     /// Increment `hit_count` for the entry with the given `id`.
@@ -1060,20 +1244,60 @@ fn cluster_near_duplicates(entries: &[(Uuid, &[f32], u64)]) -> DedupReport {
 /// neighbour can fall outside it, producing a false cache miss (poor recall).
 /// Raising `ef_search` widens the candidate list so the org's vectors reliably
 /// make the cut. 100 restores high recall at a small latency cost; tune via
-/// [`PostgresL2Cache::with_ef_search`].
+/// [`PostgresL2Cache::with_ef_search`] or the [`EF_SEARCH_ENV`] env var.
+///
+/// The recall/cost/RAM tradeoff and a revisit budget (when the single shared
+/// HNSW index + org_id post-filter design needs per-org partial indexes) are
+/// documented in `docs/l2-hnsw-recall-budget.md`.
 pub const DEFAULT_EF_SEARCH: i64 = 100;
+
+/// Env var that overrides [`DEFAULT_EF_SEARCH`] at startup, so operators can tune
+/// the HNSW `ef_search` (recall vs. latency/RAM) without a recompile.
+/// [`PostgresL2Cache::new`] reads it; see `docs/l2-hnsw-recall-budget.md`.
+pub const EF_SEARCH_ENV: &str = "TT_L2_EF_SEARCH";
+
+/// Resolve the HNSW `ef_search` from [`EF_SEARCH_ENV`], falling back to
+/// [`DEFAULT_EF_SEARCH`]. An unset / empty / unparseable / `< 1` value uses the
+/// default (we never silently drop below pgvector's behaviour).
+pub fn ef_search_from_env() -> i64 {
+    parse_ef_search(std::env::var(EF_SEARCH_ENV).ok().as_deref())
+}
+
+/// Pure parser behind [`ef_search_from_env`], split out so it is testable
+/// without mutating process env: `None` / empty / unparseable / `< 1`
+/// → [`DEFAULT_EF_SEARCH`]; otherwise the parsed positive value.
+fn parse_ef_search(raw: Option<&str>) -> i64 {
+    match raw.map(str::trim) {
+        Some(s) if !s.is_empty() => s
+            .parse::<i64>()
+            .ok()
+            .filter(|&v| v >= 1)
+            .unwrap_or(DEFAULT_EF_SEARCH),
+        _ => DEFAULT_EF_SEARCH,
+    }
+}
 
 pub struct PostgresL2Cache {
     pool: sqlx::PgPool,
     ef_search: i64,
+    /// Optional at-rest response codec (SEC-2). `None` = the historical
+    /// plaintext JSONB behavior (fully back-compat).
+    response_codec: Option<ResponseCodec>,
+    /// Orgs whose inserts are dropped (the per-org "do not cache" hook).
+    no_cache_orgs: Arc<HashSet<Uuid>>,
 }
 
 impl PostgresL2Cache {
-    /// Wrap an existing connected pool, using [`DEFAULT_EF_SEARCH`].
+    /// Wrap an existing connected pool, resolving `ef_search` from
+    /// [`EF_SEARCH_ENV`] (falling back to [`DEFAULT_EF_SEARCH`]). This lets an
+    /// operator tune recall vs. latency/RAM without a recompile; an explicit
+    /// [`with_ef_search`](Self::with_ef_search) still overrides the env value.
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
             pool,
-            ef_search: DEFAULT_EF_SEARCH,
+            ef_search: ef_search_from_env(),
+            response_codec: None,
+            no_cache_orgs: Arc::new(HashSet::new()),
         }
     }
 
@@ -1083,6 +1307,33 @@ impl PostgresL2Cache {
     #[must_use]
     pub fn with_ef_search(mut self, ef_search: i64) -> Self {
         self.ef_search = ef_search.max(1);
+        self
+    }
+
+    /// Enable at-rest response encryption (SEC-2): the `cache_entries.response`
+    /// JSONB is sealed with `codec` (a self-describing per-org envelope) on
+    /// insert and opened on lookup. The embedding vector and every other column
+    /// stay plaintext, so pgvector similarity is unaffected. Pre-codec plaintext
+    /// rows stay readable (fail-open) and an undecryptable row is skipped as a
+    /// miss, so the codec can be turned on against a live cache.
+    ///
+    /// Default (un-wired) is the historical plaintext behavior. Wiring this ON
+    /// at the gateway cache-construction site is a one-line follow-up
+    /// (`tt-cli`'s gateway builder).
+    #[must_use]
+    pub fn with_response_codec(mut self, codec: ResponseCodec) -> Self {
+        self.response_codec = Some(codec);
+        self
+    }
+
+    /// Skip caching entirely for `orgs` (the per-org "do not cache" control hook
+    /// for sensitive workloads): [`insert`](L2Cache::insert) is a silent no-op
+    /// for a listed org. `CacheEntry` already carries `org_id`, so this is
+    /// honored without any change to the insert/lookup signatures the gateway
+    /// calls.
+    #[must_use]
+    pub fn with_no_cache_orgs(mut self, orgs: HashSet<Uuid>) -> Self {
+        self.no_cache_orgs = Arc::new(orgs);
         self
     }
 
@@ -1102,6 +1353,20 @@ impl L2Cache for PostgresL2Cache {
         if !embedding_is_finite(&entry.embedding) {
             return Err(CacheError::InvalidEmbedding);
         }
+        // Per-org "do not cache" hook: drop the insert before touching the DB.
+        if self.no_cache_orgs.contains(&entry.org_id) {
+            return Ok(());
+        }
+        // At-rest encryption (SEC-2): seal the response into a self-describing
+        // JSONB envelope bound to (org_id, row id). The embedding and every
+        // other column below stay plaintext. (No codec → plaintext JSONB, the
+        // historical behavior.)
+        let response_value = encode_response_value(
+            self.response_codec.as_ref(),
+            entry.org_id,
+            entry.id,
+            &entry.response,
+        )?;
         // Convert Vec<f32> to pgvector::Vector for the Postgres `vector` column.
         let vec = pgvector::Vector::from(entry.embedding);
 
@@ -1119,10 +1384,7 @@ impl L2Cache for PostgresL2Cache {
         .bind(entry.id)
         .bind(entry.org_id)
         .bind(vec)
-        .bind(
-            serde_json::from_slice::<serde_json::Value>(&entry.response)
-                .map_err(CacheError::Serde)?,
-        )
+        .bind(response_value)
         .bind(&entry.model)
         .bind(&entry.embedding_model)
         .bind(entry.input_tokens as i64)
@@ -1235,7 +1497,14 @@ impl L2Cache for PostgresL2Cache {
         let lexical_sig: Option<i64> = row.try_get("lexical_sig").map_err(CacheError::Sqlx)?;
         let similarity: f32 = row.try_get("similarity").map_err(CacheError::Sqlx)?;
 
-        let response_bytes = serde_json::to_vec(&response_json).map_err(CacheError::Serde)?;
+        // Reverse at-rest encryption (SEC-2). A sealed row that cannot be opened
+        // (wrong key/org, or encrypted with no codec wired) is skipped as a cache
+        // miss; a pre-codec plaintext row reads back as-is.
+        let Some(response_bytes) =
+            decode_response_value(self.response_codec.as_ref(), org_id, id, &response_json)
+        else {
+            return Ok(None);
+        };
 
         let entry = CacheEntry {
             id,
@@ -1399,6 +1668,31 @@ mod tests {
         }
     }
 
+    /// `TT_L2_EF_SEARCH` parsing: a valid positive value wins; everything else
+    /// (unset, empty, junk, zero, negative) falls back to the default. Tests the
+    /// pure parser so it never races on process env.
+    #[test]
+    fn parse_ef_search_handles_overrides_and_fallbacks() {
+        assert_eq!(parse_ef_search(Some("250")), 250);
+        assert_eq!(parse_ef_search(Some("  64  ")), 64, "trims whitespace");
+        assert_eq!(parse_ef_search(Some("1")), 1, "minimum valid value");
+        // Fallbacks to the default.
+        assert_eq!(parse_ef_search(None), DEFAULT_EF_SEARCH, "unset");
+        assert_eq!(parse_ef_search(Some("")), DEFAULT_EF_SEARCH, "empty");
+        assert_eq!(parse_ef_search(Some("   ")), DEFAULT_EF_SEARCH, "blank");
+        assert_eq!(
+            parse_ef_search(Some("abc")),
+            DEFAULT_EF_SEARCH,
+            "non-numeric"
+        );
+        assert_eq!(
+            parse_ef_search(Some("0")),
+            DEFAULT_EF_SEARCH,
+            "below minimum"
+        );
+        assert_eq!(parse_ef_search(Some("-5")), DEFAULT_EF_SEARCH, "negative");
+    }
+
     /// Recall regression under multi-tenant load: with N orgs each holding a
     /// planted near-duplicate of the query (plus noise), every org's lookup
     /// must recall ITS OWN planted entry — never another tenant's, even though
@@ -1498,6 +1792,142 @@ mod tests {
             .insert(entry_at(Uuid::new_v4(), org, vec![1.0, 0.0], now))
             .await
             .expect("finite embedding inserts");
+    }
+
+    // ── SEC-2: at-rest response encryption + per-org "do not cache" hook ────
+
+    /// Build an entry whose response is `response` (so we can prove the codec
+    /// hid it and restored it exactly).
+    fn entry_with_response(
+        id: Uuid,
+        org_id: Uuid,
+        embedding: Vec<f32>,
+        response: &[u8],
+        now: DateTime<Utc>,
+    ) -> CacheEntry {
+        CacheEntry {
+            response: response.to_vec(),
+            ..entry_at(id, org_id, embedding, now)
+        }
+    }
+
+    /// Encrypt-on-write / decrypt-on-read round-trip through the cache: a wired
+    /// codec seals the response on insert and a similarity lookup opens it,
+    /// returning the ORIGINAL response bytes. The embedding stays usable
+    /// (similarity still matches) because only the response is encrypted.
+    #[tokio::test]
+    async fn codec_round_trips_response_and_keeps_embedding_usable() {
+        let codec = ResponseCodec::new([1u8; 32]);
+        let cache = InMemoryL2Cache::new().with_response_codec(codec.clone());
+        let now = Utc::now();
+        let org = Uuid::from_u128(10);
+        let id = Uuid::from_u128(11);
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let secret = br#"{"choices":[{"message":{"content":"SSN 123-45-6789"}}]}"#;
+
+        cache
+            .insert(entry_with_response(id, org, q.clone(), secret, now))
+            .await
+            .unwrap();
+
+        // The raw stored bytes must NOT contain the plaintext (it is encrypted).
+        {
+            let guard = cache.entries.lock().unwrap();
+            let raw = &guard[0].response;
+            assert!(
+                !raw.windows(3).any(|w| w == b"SSN"),
+                "stored response must be encrypted at rest"
+            );
+            assert!(
+                crate::ResponseCodec::is_encrypted_json(
+                    &serde_json::from_slice::<serde_json::Value>(raw).unwrap()
+                ),
+                "stored response must be a codec envelope"
+            );
+        }
+
+        // Similarity lookup still finds the entry (embedding plaintext) and the
+        // returned response is the decrypted original.
+        let (hit, sim) = cache
+            .lookup(org, &q, 0.9, "gpt-4o", "mock-v1")
+            .await
+            .unwrap()
+            .expect("similarity match");
+        assert!((sim - 1.0).abs() < 1e-6);
+        assert_eq!(hit.response, secret, "response decrypted back to original");
+    }
+
+    /// The per-org "do not cache" hook: an insert for a listed org is a silent
+    /// no-op, so every lookup for that org misses.
+    #[tokio::test]
+    async fn no_cache_org_is_never_stored() {
+        let blocked = Uuid::from_u128(77);
+        let allowed = Uuid::from_u128(78);
+        let cache = InMemoryL2Cache::new().with_no_cache_orgs(HashSet::from([blocked]));
+        let now = Utc::now();
+        let q = vec![1.0_f32, 0.0];
+
+        cache
+            .insert(entry_at(Uuid::new_v4(), blocked, q.clone(), now))
+            .await
+            .unwrap();
+        cache
+            .insert(entry_at(Uuid::new_v4(), allowed, q.clone(), now))
+            .await
+            .unwrap();
+
+        assert!(
+            cache
+                .lookup(blocked, &q, 0.9, "gpt-4o", "mock-v1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a do-not-cache org must never have a stored entry"
+        );
+        assert!(
+            cache
+                .lookup(allowed, &q, 0.9, "gpt-4o", "mock-v1")
+                .await
+                .unwrap()
+                .is_some(),
+            "other orgs still cache normally"
+        );
+    }
+
+    /// `decode_response_value` reads a pre-codec plaintext row whether or not a
+    /// codec is wired (fail-open), decrypts a matching envelope, and SKIPS
+    /// (returns `None`) an envelope it cannot open (wrong org / no codec).
+    #[test]
+    fn decode_response_value_honors_legacy_and_skips_unreadable() {
+        let codec = ResponseCodec::new([2u8; 32]);
+        let org = Uuid::from_u128(1);
+        let id = Uuid::from_u128(2);
+        let plaintext: serde_json::Value =
+            serde_json::from_slice(br#"{"id":"chatcmpl","choices":[]}"#).unwrap();
+
+        // Legacy plaintext row: readable with or without a codec.
+        assert_eq!(
+            decode_response_value(Some(&codec), org, id, &plaintext),
+            Some(serde_json::to_vec(&plaintext).unwrap())
+        );
+        assert_eq!(
+            decode_response_value(None, org, id, &plaintext),
+            Some(serde_json::to_vec(&plaintext).unwrap())
+        );
+
+        // A matching envelope decrypts.
+        let envelope = codec.seal_response_json(org, id, b"payload").unwrap();
+        assert_eq!(
+            decode_response_value(Some(&codec), org, id, &envelope),
+            Some(b"payload".to_vec())
+        );
+        // Wrong org → skip.
+        assert_eq!(
+            decode_response_value(Some(&codec), Uuid::from_u128(999), id, &envelope),
+            None
+        );
+        // Encrypted row but no codec wired → unservable → skip.
+        assert_eq!(decode_response_value(None, org, id, &envelope), None);
     }
 
     // ── Per-class thresholds (SAFETY: never below today's 0.92) ─────────────
@@ -1762,6 +2192,94 @@ mod tests {
         let report = cache.analyze_dedup(org_a).await.unwrap();
         assert_eq!(report.total_entries, 1);
         assert_eq!(report.cluster_count, 0);
+    }
+
+    // ── Paraphrase-dedup ACTION (collapse duplicates, dry-run friendly) ──────
+
+    /// Build a 3-member near-duplicate cluster (a1 is the highest-hit_count rep)
+    /// plus an orthogonal singleton, for the dedup-action tests.
+    async fn seed_dedup_cluster(cache: &InMemoryL2Cache, org: Uuid) -> (Uuid, Uuid, Uuid) {
+        let now = Utc::now();
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let a3 = Uuid::new_v4();
+        for (id, v, hits) in [
+            (a1, vec![1.0_f32, 0.0, 0.0], 10_u64),
+            (a2, vec![0.999_f32, 0.01, 0.0], 3),
+            (a3, vec![0.998_f32, 0.02, 0.0], 1),
+        ] {
+            let mut e = entry_at(id, org, v, now);
+            e.hit_count = hits;
+            cache.insert(e).await.unwrap();
+        }
+        (a1, a2, a3)
+    }
+
+    #[tokio::test]
+    async fn dedup_collapse_dry_run_lists_but_evicts_nothing() {
+        let cache = InMemoryL2Cache::new();
+        let org = Uuid::new_v4();
+        let (a1, a2, a3) = seed_dedup_cluster(&cache, org).await;
+
+        let action = dedup_collapse(&cache, org, true).await.unwrap();
+        assert!(action.dry_run);
+        // a1 (highest hit_count) is the rep and is NEVER collapsed; a2,a3 planned.
+        assert_eq!(action.collapsed_ids.len(), 2);
+        assert!(
+            !action.collapsed_ids.contains(&a1),
+            "the representative is never collapsed"
+        );
+        assert!(action.collapsed_ids.contains(&a2));
+        assert!(action.collapsed_ids.contains(&a3));
+        // DRY RUN: nothing was actually evicted — all 3 cluster members survive.
+        assert_eq!(cache.analyze_dedup(org).await.unwrap().total_entries, 3);
+    }
+
+    #[tokio::test]
+    async fn dedup_collapse_evicts_non_representatives_and_keeps_rep() {
+        let cache = InMemoryL2Cache::new();
+        let org = Uuid::new_v4();
+        let (a1, _a2, _a3) = seed_dedup_cluster(&cache, org).await;
+
+        let action = dedup_collapse(&cache, org, false).await.unwrap();
+        assert!(!action.dry_run);
+        assert_eq!(action.collapsed_ids.len(), 2);
+
+        // The two non-reps are gone; the representative survives and is servable.
+        let report = cache.analyze_dedup(org).await.unwrap();
+        assert_eq!(report.total_entries, 1, "only the representative remains");
+        assert_eq!(report.cluster_count, 0, "no cluster remains after collapse");
+        let (hit, _) = cache
+            .lookup(org, &[1.0, 0.0, 0.0], 0.92, "gpt-4o", "mock-v1")
+            .await
+            .unwrap()
+            .expect("the representative must still be servable");
+        assert_eq!(
+            hit.id, a1,
+            "the kept entry is the highest-hit_count representative"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_collapse_no_clusters_is_noop() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let org = Uuid::new_v4();
+        // Two orthogonal singletons — no near-duplicate cluster.
+        cache
+            .insert(entry_at(Uuid::new_v4(), org, vec![1.0, 0.0], now))
+            .await
+            .unwrap();
+        cache
+            .insert(entry_at(Uuid::new_v4(), org, vec![0.0, 1.0], now))
+            .await
+            .unwrap();
+        let action = dedup_collapse(&cache, org, false).await.unwrap();
+        assert!(
+            action.collapsed_ids.is_empty(),
+            "no clusters → nothing collapsed"
+        );
+        assert_eq!(cache.analyze_dedup(org).await.unwrap().total_entries, 2);
     }
 
     // ── Adaptive thresholds (FP gate ratchet — SAFETY: never below 0.92) ─────

@@ -63,6 +63,8 @@ fn req(
         body: body.map(String::from),
         response_body: response_body.map(String::from),
         task_class: Default::default(),
+        diff_saved_usd: None,
+        minify_saved_est_usd: None,
     }
 }
 
@@ -396,6 +398,7 @@ async fn replay_with_quality_attaches_quality_field() {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -417,6 +420,8 @@ async fn replay_with_quality_attaches_quality_field() {
             cached_input_per_million: Some(0.025),
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
         },
     );
     let input = PlanInput {

@@ -40,10 +40,23 @@
 //! revoked store row then rejects.
 //!
 //! **Multi-instance:** an in-process evict only invalidates the instance that
-//! processed the revoke; other gateway instances remain bounded by
-//! `POSITIVE_TTL_SECS` until a cross-instance invalidation channel (e.g. a
-//! Redis pub/sub `keyrevoked` event) is added. That channel is the remaining
-//! future work and is out of scope for this crate.
+//! processed the revoke. The cross-instance invalidation channel is
+//! [`RevocationRegistry`] — a short-TTL "revoked key ids" marker kept in the
+//! same Redis the L1 cache uses. On revocation, `mark_revoked` SETs a marker
+//! keyed on the `key_id` (TTL [`REVOCATION_MARKER_TTL_SECS`], chosen to outlive
+//! any positive cache entry still live on a peer replica); the auth middleware
+//! consults `is_revoked` on every positive cache hit and, if marked, evicts the
+//! local entry and forces a fresh argon2 verify (which the revoked store row
+//! then rejects). This fans a revoke out across replicas within one marker
+//! round-trip instead of leaving the key usable for up to `POSITIVE_TTL_SECS`
+//! on every replica that didn't process the revoke.
+//!
+//! When no registry is wired (Redis absent — dev/tests) the middleware degrades
+//! cleanly to the per-replica behavior above: the revoking instance closes its
+//! window via `evict_key_id`, and peers remain bounded by `POSITIVE_TTL_SECS`.
+//! The check also fails open on a Redis error (honors the cached positive and
+//! falls back to the documented 60 s window) so a transient Redis blip can't
+//! 401 all authenticated traffic.
 //!
 //! ## Clock injection
 //!
@@ -74,6 +87,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tt_auth::ApiKeyContext;
+use tt_cache::L1Cache;
 use uuid::Uuid;
 
 /// TTL for a successfully-verified key (positive cache).
@@ -84,6 +98,18 @@ pub const POSITIVE_TTL_SECS: u64 = 60;
 /// Kept short so a newly-issued or rotated key is usable quickly after a stale
 /// failure entry expires.
 pub const NEGATIVE_TTL_SECS: u64 = 10;
+
+/// TTL for a cross-instance revocation marker ([`RevocationRegistry`]).
+///
+/// Must outlive any positive cache entry that could still be honoring the
+/// revoked key on a peer replica. A peer's positive entry survives at most
+/// [`POSITIVE_TTL_SECS`] after it was inserted, and in the worst case it is
+/// inserted at the very instant of revocation — so the marker must remain
+/// readable for at least `POSITIVE_TTL_SECS` from the revoke. The extra margin
+/// absorbs clock skew between replicas (the marker SET and the peer's entry
+/// insert are timed by different clocks), so the marker never expires a hair
+/// before the stale entry it is meant to shadow.
+pub const REVOCATION_MARKER_TTL_SECS: u64 = POSITIVE_TTL_SECS + 30;
 
 /// Soft upper bound on cache entries. Inserts beyond this limit are silently
 /// dropped (best-effort cache). At ~64 B/entry this is roughly a 6 MB ceiling.
@@ -342,6 +368,77 @@ impl<C: Clock> KeyVerifyCache<C> {
 
 /// Type alias for the production cache used by [`AppState`].
 pub type VerifyCache = Arc<KeyVerifyCache<SystemClock>>;
+
+/// Cross-instance API-key revocation registry, backed by the same Redis the L1
+/// cache uses (any [`L1Cache`] backend — production Redis, or an in-memory mock
+/// in tests).
+///
+/// The local [`KeyVerifyCache::evict_key_id`] only invalidates the replica that
+/// processed a revoke. This registry fans the revoke out: revocation
+/// [`mark_revoked`](Self::mark_revoked)s a short-TTL marker keyed on the
+/// `key_id`, and the auth middleware [`is_revoked`](Self::is_revoked)s it on
+/// every positive verify-cache hit before honoring the cached identity. A
+/// marked hit is evicted locally and forced back through a full argon2 verify,
+/// which the revoked store row then rejects.
+///
+/// All operations are **best-effort**: a backend error is logged and treated as
+/// "not revoked" (`is_revoked` fails open) or "fan-out skipped" (`mark_revoked`
+/// swallows the error), so a Redis blip degrades to the documented per-replica
+/// staleness window rather than failing authenticated traffic.
+pub struct RevocationRegistry {
+    backend: Arc<dyn L1Cache>,
+}
+
+impl RevocationRegistry {
+    /// Wrap an [`L1Cache`] backend (the shared Redis) as a revocation registry.
+    #[must_use]
+    pub fn new(backend: Arc<dyn L1Cache>) -> Self {
+        Self { backend }
+    }
+
+    /// The marker key for `key_id`. Namespaced under `revoked:key:` so it never
+    /// collides with the L1 cache's request-hash keys (which are hex digests).
+    fn marker_key(key_id: Uuid) -> String {
+        format!("revoked:key:{key_id}")
+    }
+
+    /// Publish a revocation: SET the marker so every replica's next positive
+    /// hit on this `key_id` is forced to re-verify. Best-effort — a backend
+    /// error is logged and the cross-instance fan-out is skipped (the revoking
+    /// replica's local `evict_key_id` still closes its own window).
+    pub async fn mark_revoked(&self, key_id: Uuid) {
+        if let Err(e) = self
+            .backend
+            .set(&Self::marker_key(key_id), b"1", REVOCATION_MARKER_TTL_SECS)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                key_id = %key_id,
+                "failed to publish revocation marker — cross-instance fan-out skipped"
+            );
+        }
+    }
+
+    /// Whether `key_id` is currently marked revoked. Fails open on a backend
+    /// error (returns `false`): a transient Redis failure must not 401 all
+    /// authenticated traffic — the worst case degrades to the per-replica
+    /// `POSITIVE_TTL_SECS` window.
+    pub async fn is_revoked(&self, key_id: Uuid) -> bool {
+        match self.backend.get(&Self::marker_key(key_id)).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    key_id = %key_id,
+                    "revocation marker lookup failed — failing open to per-replica TTL"
+                );
+                false
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -603,5 +700,54 @@ mod tests {
             "sweep should have reclaimed all expired entries; len = {}",
             cache.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // RevocationRegistry (cross-instance revocation marker)
+    // -----------------------------------------------------------------------
+
+    use tt_cache::memory::InMemoryL1Cache;
+
+    #[tokio::test]
+    async fn unmarked_key_is_not_revoked() {
+        let reg = RevocationRegistry::new(Arc::new(InMemoryL1Cache::new()));
+        assert!(
+            !reg.is_revoked(Uuid::new_v4()).await,
+            "a key with no marker must not read as revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_revoked_then_is_revoked() {
+        let reg = RevocationRegistry::new(Arc::new(InMemoryL1Cache::new()));
+        let key_id = Uuid::new_v4();
+        reg.mark_revoked(key_id).await;
+        assert!(
+            reg.is_revoked(key_id).await,
+            "a marked key must read as revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_revoked_is_targeted() {
+        let reg = RevocationRegistry::new(Arc::new(InMemoryL1Cache::new()));
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        reg.mark_revoked(a).await;
+        assert!(reg.is_revoked(a).await, "A should be revoked");
+        assert!(
+            !reg.is_revoked(b).await,
+            "B must be untouched by A's revocation"
+        );
+    }
+
+    /// A revocation marker shares the backend with the L1 request cache but uses
+    /// a `revoked:key:` namespace, so it never collides with a request-hash key.
+    #[tokio::test]
+    async fn marker_key_is_namespaced() {
+        let key_id = Uuid::new_v4();
+        let k = RevocationRegistry::marker_key(key_id);
+        assert!(k.starts_with("revoked:key:"));
+        assert!(k.contains(&key_id.to_string()));
     }
 }

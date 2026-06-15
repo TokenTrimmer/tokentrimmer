@@ -1,0 +1,81 @@
+import openai
+
+resp = openai.chat.completions.create(
+    model="gpt-4o",
+    max_tokens=120,
+    messages=[
+        {"role": "user", "content": """Diagnose these logs:
+2026-01-01T12:00:00 INFO handler processed request id=0 in 0ms
+2026-01-01T12:01:00 ERROR handler processed request id=1 in 3ms
+2026-01-01T12:02:00 WARN handler processed request id=2 in 6ms
+2026-01-01T12:03:00 DEBUG handler processed request id=3 in 9ms
+2026-01-01T12:04:00 INFO handler processed request id=4 in 12ms
+2026-01-01T12:05:00 ERROR handler processed request id=5 in 15ms
+2026-01-01T12:06:00 WARN handler processed request id=6 in 18ms
+2026-01-01T12:07:00 DEBUG handler processed request id=7 in 21ms
+2026-01-01T12:08:00 INFO handler processed request id=8 in 24ms
+2026-01-01T12:09:00 ERROR handler processed request id=9 in 27ms
+2026-01-01T12:10:00 WARN handler processed request id=10 in 30ms
+2026-01-01T12:11:00 DEBUG handler processed request id=11 in 33ms
+2026-01-01T12:12:00 INFO handler processed request id=12 in 36ms
+2026-01-01T12:13:00 ERROR handler processed request id=13 in 39ms
+2026-01-01T12:14:00 WARN handler processed request id=14 in 42ms
+2026-01-01T12:15:00 DEBUG handler processed request id=15 in 45ms
+2026-01-01T12:16:00 INFO handler processed request id=16 in 48ms
+2026-01-01T12:17:00 ERROR handler processed request id=17 in 51ms
+2026-01-01T12:18:00 WARN handler processed request id=18 in 54ms
+2026-01-01T12:19:00 DEBUG handler processed request id=19 in 57ms
+2026-01-01T12:20:00 INFO handler processed request id=20 in 60ms
+2026-01-01T12:21:00 ERROR handler processed request id=21 in 63ms
+2026-01-01T12:22:00 WARN handler processed request id=22 in 66ms
+2026-01-01T12:23:00 DEBUG handler processed request id=23 in 69ms
+2026-01-01T12:24:00 INFO handler processed request id=24 in 72ms
+2026-01-01T12:25:00 ERROR handler processed request id=25 in 75ms
+2026-01-01T12:26:00 WARN handler processed request id=26 in 78ms
+2026-01-01T12:27:00 DEBUG handler processed request id=27 in 81ms
+2026-01-01T12:28:00 INFO handler processed request id=28 in 84ms
+2026-01-01T12:29:00 ERROR handler processed request id=29 in 87ms
+2026-01-01T12:30:00 WARN handler processed request id=30 in 90ms
+2026-01-01T12:31:00 DEBUG handler processed request id=31 in 93ms
+2026-01-01T12:32:00 INFO handler processed request id=32 in 96ms
+2026-01-01T12:33:00 ERROR handler processed request id=33 in 99ms
+2026-01-01T12:34:00 WARN handler processed request id=34 in 102ms
+2026-01-01T12:35:00 DEBUG handler processed request id=35 in 105ms
+2026-01-01T12:36:00 INFO handler processed request id=36 in 108ms
+2026-01-01T12:37:00 ERROR handler processed request id=37 in 111ms
+2026-01-01T12:38:00 WARN handler processed request id=38 in 114ms
+2026-01-01T12:39:00 DEBUG handler processed request id=39 in 117ms
+2026-01-01T12:40:00 INFO handler processed request id=40 in 120ms
+2026-01-01T12:41:00 ERROR handler processed request id=41 in 123ms
+2026-01-01T12:42:00 WARN handler processed request id=42 in 126ms
+2026-01-01T12:43:00 DEBUG handler processed request id=43 in 129ms
+2026-01-01T12:44:00 INFO handler processed request id=44 in 132ms
+2026-01-01T12:45:00 ERROR handler processed request id=45 in 135ms
+2026-01-01T12:46:00 WARN handler processed request id=46 in 138ms
+2026-01-01T12:47:00 DEBUG handler processed request id=47 in 141ms
+2026-01-01T12:48:00 INFO handler processed request id=48 in 144ms
+2026-01-01T12:49:00 ERROR handler processed request id=49 in 147ms
+2026-01-01T12:50:00 WARN handler processed request id=50 in 150ms
+2026-01-01T12:51:00 DEBUG handler processed request id=51 in 153ms
+2026-01-01T12:52:00 INFO handler processed request id=52 in 156ms
+2026-01-01T12:53:00 ERROR handler processed request id=53 in 159ms
+2026-01-01T12:54:00 WARN handler processed request id=54 in 162ms
+2026-01-01T12:55:00 DEBUG handler processed request id=55 in 165ms
+2026-01-01T12:56:00 INFO handler processed request id=56 in 168ms
+2026-01-01T12:57:00 ERROR handler processed request id=57 in 171ms
+2026-01-01T12:58:00 WARN handler processed request id=58 in 174ms
+2026-01-01T12:59:00 DEBUG handler processed request id=59 in 177ms
+2026-01-01T12:00:00 INFO handler processed request id=60 in 180ms
+2026-01-01T12:01:00 ERROR handler processed request id=61 in 183ms
+2026-01-01T12:02:00 WARN handler processed request id=62 in 186ms
+2026-01-01T12:03:00 DEBUG handler processed request id=63 in 189ms
+2026-01-01T12:04:00 INFO handler processed request id=64 in 192ms
+2026-01-01T12:05:00 ERROR handler processed request id=65 in 195ms
+2026-01-01T12:06:00 WARN handler processed request id=66 in 198ms
+2026-01-01T12:07:00 DEBUG handler processed request id=67 in 201ms
+2026-01-01T12:08:00 INFO handler processed request id=68 in 204ms
+2026-01-01T12:09:00 ERROR handler processed request id=69 in 207ms
+"""},
+    ],
+)
+print(resp)

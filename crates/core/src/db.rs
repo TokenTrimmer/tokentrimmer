@@ -4,6 +4,8 @@
 //! at compile time via [`sqlx::migrate!`]. Call [`migrate`] once on startup
 //! after acquiring a pool to bring the schema up to date.
 
+use std::time::Duration;
+
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
@@ -24,6 +26,22 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// * `max_connections` — upper bound on pool size; keep below Postgres
 ///   `max_connections` (default 100) minus headroom for other clients.
 ///
+/// # Pool tuning
+///
+/// Beyond `max_connections` the builder sets explicit lifetimes/timeouts
+/// rather than relying on sqlx's defaults (which leave `max_lifetime` /
+/// `idle_timeout` unbounded and `acquire_timeout` at 30s):
+///
+/// * `min_connections(1)` — keep one connection warm so the request after an
+///   idle lull doesn't pay full TCP+TLS+auth latency.
+/// * `max_lifetime(30m)` — recycle connections well before common
+///   server/pooler idle cutoffs (PgBouncer, Neon) so we never hand out a
+///   half-dead socket.
+/// * `idle_timeout(5m)` — release surplus connections back to Postgres / the
+///   pooler during a traffic lull.
+/// * `acquire_timeout(5s)` — fail fast: a request should error promptly when
+///   the pool is exhausted, not block for 30s.
+///
 /// # Errors
 ///
 /// Returns [`sqlx::Error`] if the connection string is malformed or the
@@ -31,6 +49,10 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
         .max_connections(max_connections)
+        .min_connections(1)
+        .max_lifetime(Duration::from_secs(30 * 60))
+        .idle_timeout(Duration::from_secs(5 * 60))
+        .acquire_timeout(Duration::from_secs(5))
         .connect(url)
         .await
 }

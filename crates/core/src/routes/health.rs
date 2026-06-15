@@ -1,5 +1,6 @@
 //! `GET /health` — liveness probe. Returns 200 if the process is running.
-//! Real readiness (provider reachability, DB connectivity) goes to `/ready` later.
+//! Readiness (DB connectivity, configured hard deps) lives at `GET /ready`
+//! (see [`crate::routes::ready`]); keep this endpoint liveness-only.
 
 use axum::Json;
 use serde::Serialize;

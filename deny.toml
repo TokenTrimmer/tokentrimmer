@@ -36,28 +36,39 @@ highlight = "all"
 
 [advisories]
 yanked = "deny"
+# AUDIT POLICY: re-audit this entire ignore list every release. Each entry below
+# carries an inline annotation recording (a) why it's ignored, (b) the upstream
+# blocker preventing a fix, and (c) a re-check date. Next scheduled re-check for
+# all entries: 2026-09-15 (~3 months out). Do not add an entry without these.
 ignore = [
-    # rustls-webpki cert/CRL parsing panics. All are transitive via
-    # sentry -> rustls 0.22, which pins rustls-webpki to the 0.102.x line; the
-    # fixes only exist on >= 0.103.x, unreachable without a sentry/rustls major
-    # bump. Low impact for us (HTTPS client to a trusted Sentry endpoint, not a
-    # TLS server validating attacker-controlled certs/CRLs). Revisit on a
-    # dependency-hygiene pass that bumps sentry to a rustls 0.23 line.
-    "RUSTSEC-2026-0104",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0049",
-    # rsa "Marvin" timing side-channel (RUSTSEC-2023-0071). No patched version
-    # exists; pulled transitively (sqlx mysql auth — we use Postgres). Tracked.
-    "RUSTSEC-2023-0071",
+    # --- rustls-webpki cert/CRL parsing panics --------------------------------
+    # All four are transitive via sentry -> rustls 0.22, which pins
+    # rustls-webpki to the 0.102.x line; the fixes only exist on >= 0.103.x,
+    # unreachable without a sentry/rustls major bump (the separate, larger
+    # sentry -> rustls 0.23 task). Low impact for us: an HTTPS *client* to a
+    # trusted Sentry endpoint, not a TLS server validating attacker-controlled
+    # certs/CRLs.
+    "RUSTSEC-2026-0104", # rustls-webpki panic; blocker: sentry->rustls 0.22; re-check 2026-09-15
+    "RUSTSEC-2026-0099", # rustls-webpki panic; blocker: sentry->rustls 0.22; re-check 2026-09-15
+    "RUSTSEC-2026-0098", # rustls-webpki panic; blocker: sentry->rustls 0.22; re-check 2026-09-15
+    "RUSTSEC-2026-0049", # rustls-webpki panic; blocker: sentry->rustls 0.22; re-check 2026-09-15
+    # --- rsa "Marvin" timing side-channel -------------------------------------
+    # No patched version of `rsa` exists; pulled transitively only by sqlx's
+    # MySQL auth path, and we use Postgres exclusively (the vulnerable code is
+    # never reached). Blocker: upstream `rsa` has no fix; would otherwise need
+    # sqlx to drop the dependency.
+    "RUSTSEC-2023-0071", # rsa Marvin timing side-channel; blocker: no upstream fix (sqlx mysql, unused); re-check 2026-09-15
+    # --- async-std unmaintained -----------------------------------------------
     # Unmaintained transitive dep with no adopted replacement yet (newer
-    # cargo-deny flags these as errors): async-std.
-    "RUSTSEC-2025-0052",
-    # number_prefix (k/M/G number formatting) — unmaintained, NOT vulnerable.
-    # Tiny, stable, single-purpose crate pulled transitively by `indicatif`
-    # (the spinner/progress lib used by tt-cli's ui module). No adopted
-    # replacement; revisit when indicatif drops it.
-    "RUSTSEC-2025-0119",
+    # cargo-deny flags unmaintained crates as errors). Not a memory-safety
+    # advisory. Blocker: a transitive dep must migrate off async-std.
+    "RUSTSEC-2025-0052", # async-std unmaintained (not vuln); blocker: transitive dep migration; re-check 2026-09-15
+    # --- number_prefix unmaintained -------------------------------------------
+    # `number_prefix` (k/M/G number formatting) — unmaintained but NOT
+    # vulnerable. Tiny, stable, single-purpose crate pulled transitively by
+    # `indicatif` (tt-cli's spinner/progress UI). Blocker: revisit when
+    # indicatif drops it.
+    "RUSTSEC-2025-0119", # number_prefix unmaintained (not vuln); blocker: indicatif transitive; re-check 2026-09-15
 ]
 
 [sources]

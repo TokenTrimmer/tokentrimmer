@@ -49,7 +49,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use reqwest::Client;
-use tt_provider_compat::client::build_client;
+use tt_provider_compat::client::{build_client, build_unguarded_client};
 use tt_provider_compat::{ClientConfig, CompatConfig, OpenAICompatibleProvider};
 use tt_shared::{
     pricing::{ModelInfo, ModelPricing},
@@ -146,7 +146,14 @@ impl OpenRouterProvider {
             fee_multiplier: BYOK_FEE_MULTIPLIER,
             allow_local,
         };
-        let models_client = build_client(&client_cfg)
+        // Match the request client's SSRF posture: guarded for hosted
+        // OpenRouter, unguarded only for `allow_local` (local mock servers).
+        let models_build = if allow_local {
+            build_unguarded_client
+        } else {
+            build_client
+        };
+        let models_client = models_build(&client_cfg)
             .unwrap_or_else(|e| panic!("failed to build OpenRouter models HTTP client: {e}"));
         Self {
             inner: OpenAICompatibleProvider::new(client_cfg, cfg),

@@ -165,11 +165,15 @@ pub fn validate_provider_url(raw: &str, allow_local: bool) -> Result<(), UrlGuar
 /// - IPv4 private 192.168.0.0/16
 /// - IPv4 shared-address 100.64.0.0/10
 /// - IPv4 cloud-metadata 169.254.169.254 and 100.100.100.200 (covered by above)
+/// - IPv6 unspecified ::
 /// - IPv6 loopback ::1
 /// - IPv6 link-local fe80::/10
 /// - IPv6 ULA fc00::/7
 /// - IPv6 mapped / compatible IPv4 in blocked ranges
-fn is_blocked_ip(ip: IpAddr) -> bool {
+///
+/// Shared with [`crate::dns_guard`] so the connect-time DNS resolver filters
+/// the exact same ranges this validation-time check rejects.
+pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_v4(v4),
         IpAddr::V6(v6) => is_blocked_v6(v6),
@@ -213,6 +217,11 @@ fn is_blocked_v4(ip: Ipv4Addr) -> bool {
 fn is_blocked_v6(ip: Ipv6Addr) -> bool {
     let seg = ip.segments();
 
+    // :: — unspecified. Like IPv4 0.0.0.0/8, a connect(::) reaches loopback, so
+    // an `AAAA ::` rebind would otherwise defeat the guard.
+    if ip.is_unspecified() {
+        return true;
+    }
     // ::1 — loopback
     if ip == Ipv6Addr::LOCALHOST {
         return true;
@@ -573,5 +582,18 @@ mod tests {
     fn public_ipv6_not_blocked() {
         let ip: Ipv6Addr = "2001:4860:4860::8888".parse().unwrap(); // Google DNS
         assert!(!is_blocked_v6(ip));
+    }
+
+    #[test]
+    fn ipv6_unspecified_blocked() {
+        // :: (the unspecified address) reaches loopback when connected, just
+        // like IPv4 0.0.0.0, so it must be blocked to prevent an `AAAA ::`
+        // rebind from defeating the guard.
+        let ip: Ipv6Addr = "::".parse().unwrap();
+        assert!(is_blocked_v6(ip));
+        assert!(is_blocked_ip(IpAddr::V6(ip)));
+        // A normal public v6 must NOT be blocked.
+        let public: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap(); // Cloudflare DNS
+        assert!(!is_blocked_v6(public));
     }
 }

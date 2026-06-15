@@ -11,6 +11,7 @@ pub use rules::ConfigAgentsMdContainsSecretsRule;
 pub use rules::ConfigAgentsMdTooLongRule;
 pub use rules::ConfigNoAgentsMdRule;
 pub use rules::ConversationUnboundedHistoryRule;
+pub use rules::InlineDataOffloadCandidateRule;
 pub use rules::LibAnthropicSdkNoCacheControlRule;
 pub use rules::ModelDeprecatedRule;
 pub use rules::ModelFlagshipForClassificationRule;
@@ -54,6 +55,8 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(PromptDynamicPrefixBreaksCacheRule::new()),
         // Cache-maximizer: volatile token embedded anywhere in a system prompt.
         Box::new(PromptVolatileInSystemPromptRule::new()),
+        // Code-offload: large CSV/log/JSON dump pasted inline into a prompt.
+        Box::new(InlineDataOffloadCandidateRule::new()),
     ]
 }
 
