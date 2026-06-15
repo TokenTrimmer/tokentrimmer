@@ -148,6 +148,28 @@ impl CircuitBreaker {
         s.trial_in_flight = false;
     }
 
+    /// Release an admitted half-open trial *without* recording success or
+    /// failure.
+    ///
+    /// [`is_open`](CircuitBreaker::is_open) admits a single post-cooldown trial
+    /// by setting `trial_in_flight = true`. If the caller then abandons that
+    /// trial on a path that records neither a success nor a failure (e.g. it
+    /// skips the candidate for a missing credential, or surfaces a
+    /// non-retriable error that is *not* a breaker signal), the flag would stay
+    /// stuck `true` and every later `is_open` query would treat the provider as
+    /// open forever — bricking it replica-wide until restart.
+    ///
+    /// This clears `trial_in_flight` ONLY, leaving `opened_at` and
+    /// `consecutive_failures` untouched, so the breaker can admit a fresh trial
+    /// on the next query. It is idempotent / a no-op when no trial is in flight
+    /// (or the provider is unknown).
+    pub fn record_trial_abandoned(&self, provider_id: &str) {
+        let mut guard = self.state.lock().expect("breaker poisoned");
+        if let Some(s) = guard.get_mut(provider_id) {
+            s.trial_in_flight = false;
+        }
+    }
+
     /// Record a failure — opens the circuit once the threshold is reached.
     ///
     /// If a half-open trial was in flight, this failure is that trial failing:
@@ -232,13 +254,11 @@ pub async fn dispatch_with_failover(
         let Some(provider) = registry.resolve(model) else {
             continue;
         };
-        if breaker.is_open(provider.id(), now) {
-            continue;
-        }
         // Per-candidate upstream credentials: each candidate may live on a
         // different provider than the request (cross-provider failover). Skip a
         // candidate the org has no credential for rather than forwarding a
-        // wrong key.
+        // wrong key. This runs BEFORE `is_open` so skipping a credential-less
+        // candidate never admits (and then strands) a half-open trial.
         let Some(cand_creds) = credentials_by_provider.get(provider.id()) else {
             tracing::info!(
                 model = %model,
@@ -247,6 +267,9 @@ pub async fn dispatch_with_failover(
             );
             continue;
         };
+        if breaker.is_open(provider.id(), now) {
+            continue;
+        }
         let mut cand_ctx = ctx.clone();
         cand_ctx.credentials = cand_creds.clone();
         let mut attempt_req = req.clone();
@@ -280,8 +303,14 @@ pub async fn dispatch_with_failover(
                 return Err(e);
             }
             // Not fallback-eligible, not retriable (bad request, unsupported,
-            // …) — surface immediately without touching the breaker.
-            Err(e) => return Err(e),
+            // …) — surface immediately. The provider responded, so this is not
+            // a breaker failure, but if `is_open` admitted a half-open trial
+            // above we must release it so the breaker can re-trial later
+            // instead of staying stuck open forever.
+            Err(e) => {
+                breaker.record_trial_abandoned(provider.id());
+                return Err(e);
+            }
         }
     }
     Err(last_err.unwrap_or(ProviderError::ProviderUpstream {
@@ -351,13 +380,11 @@ pub async fn dispatch_stream_with_failover(
         let Some(provider) = registry.resolve(model) else {
             continue;
         };
-        if breaker.is_open(provider.id(), now) {
-            continue;
-        }
         // Per-candidate upstream credentials: each candidate may live on a
         // different provider than the request (cross-provider failover). Skip a
         // candidate the org has no credential for rather than forwarding a
-        // wrong key.
+        // wrong key. This runs BEFORE `is_open` so skipping a credential-less
+        // candidate never admits (and then strands) a half-open trial.
         let Some(cand_creds) = credentials_by_provider.get(provider.id()) else {
             tracing::info!(
                 model = %model,
@@ -366,6 +393,9 @@ pub async fn dispatch_stream_with_failover(
             );
             continue;
         };
+        if breaker.is_open(provider.id(), now) {
+            continue;
+        }
         let mut cand_ctx = ctx.clone();
         cand_ctx.credentials = cand_creds.clone();
         let mut attempt_req = req.clone();
@@ -390,7 +420,13 @@ pub async fn dispatch_stream_with_failover(
                 breaker.record_failure(provider.id(), now);
                 return Err(e);
             }
-            Err(e) => return Err(e),
+            // Not fallback-eligible, not retriable — surface immediately, but
+            // release any half-open trial `is_open` admitted above so the
+            // breaker can re-trial later instead of staying stuck open forever.
+            Err(e) => {
+                breaker.record_trial_abandoned(provider.id());
+                return Err(e);
+            }
         }
     }
     Err(last_err.unwrap_or(ProviderError::ProviderUpstream {
@@ -502,6 +538,49 @@ mod tests {
         assert!(
             !b.is_open("p", later2),
             "fresh trial admitted after the new cooldown"
+        );
+    }
+
+    /// `record_trial_abandoned` releases an admitted half-open trial WITHOUT
+    /// recording success or failure, so the breaker can admit a fresh trial
+    /// instead of staying stuck open forever.
+    #[test]
+    fn record_trial_abandoned_releases_stuck_trial() {
+        let b = CircuitBreaker::new(1, Duration::from_secs(30));
+        b.record_failure("p", now()); // opens
+        let later = now() + chrono::Duration::seconds(31);
+
+        // Admit the half-open trial; concurrent queries are then treated as open.
+        assert!(!b.is_open("p", later), "trial admitted");
+        assert!(b.is_open("p", later), "trial in flight → treated as open");
+
+        // Abandon the trial (e.g. non-breaker error / credential skip).
+        b.record_trial_abandoned("p");
+
+        // The breaker is no longer stuck: a fresh trial is admitted (cooldown
+        // already elapsed), and a success then fully closes the circuit.
+        assert!(!b.is_open("p", later), "fresh trial admitted after abandon");
+        b.record_success("p");
+        assert!(!b.is_open("p", later), "closed after success");
+        assert!(!b.is_open("p", later), "still closed");
+    }
+
+    /// `record_trial_abandoned` is a no-op for unknown providers and must not
+    /// close an already-open circuit (it only clears `trial_in_flight`).
+    #[test]
+    fn record_trial_abandoned_is_noop_when_unknown_or_no_trial() {
+        let b = CircuitBreaker::new(1, Duration::from_secs(30));
+        // Unknown provider — no panic, no state created.
+        b.record_trial_abandoned("never-seen");
+        assert!(!b.is_open("never-seen", now()));
+
+        // Known + open within cooldown, no trial in flight: abandoning must
+        // leave `opened_at` intact (circuit stays open).
+        b.record_failure("p", now()); // opens
+        b.record_trial_abandoned("p");
+        assert!(
+            b.is_open("p", now()),
+            "abandon must not close a still-open circuit"
         );
     }
 
@@ -1531,6 +1610,329 @@ mod tests {
         assert!(
             breaker.is_open("failing-prov", now()),
             "breaker must be open after retry exhaustion"
+        );
+    }
+
+    // ---- breaker recovery: half-open trial released on non-breaker paths ----
+
+    /// A provider whose response flips from a non-retriable error to success
+    /// once `healthy` is set. Used to prove the breaker recovers (is not
+    /// bricked) after a half-open trial resolves on a non-breaker path.
+    struct ToggleProvider {
+        id: &'static str,
+        model: &'static str,
+        healthy: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Provider for ToggleProvider {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                id: self.model.to_string(),
+                provider: self.id.to_string(),
+                capabilities: vec![Capability::Text],
+                max_input_tokens: 128_000,
+                max_output_tokens: 4096,
+            }]
+        }
+        fn pricing(&self, _: &str) -> Option<ModelPricing> {
+            None
+        }
+        async fn chat_completion(
+            &self,
+            req: ChatCompletionRequest,
+            _: &RequestContext,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            if !self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                // Non-retriable, non-fallback-eligible (bad request).
+                return Err(ProviderError::InvalidRequest("bad".into()));
+            }
+            Ok(ChatCompletionResponse {
+                id: "x".into(),
+                object: "chat.completion".into(),
+                created: 0,
+                model: req.model,
+                choices: vec![Choice {
+                    index: 0,
+                    message: Message::Assistant {
+                        content: Some(MessageContent::Text("ok".into())),
+                        tool_calls: vec![],
+                        name: None,
+                    },
+                    finish_reason: Some("stop".into()),
+                }],
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                    cached_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            })
+        }
+        async fn chat_completion_stream(
+            &self,
+            _: ChatCompletionRequest,
+            _: &RequestContext,
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
+            if !self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ProviderError::InvalidRequest("bad".into()));
+            }
+            Ok(Box::pin(futures::stream::iter(Vec::<
+                Result<ChatCompletionChunk, ProviderError>,
+            >::new())))
+        }
+        async fn embeddings(
+            &self,
+            _: EmbeddingsRequest,
+            _: &RequestContext,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+    }
+
+    /// REGRESSION (ARCH-1): a half-open trial that hits a NON-retriable error
+    /// (e.g. a 400 bad request) must RELEASE the admitted trial, not strand it.
+    /// Before the fix the `Err(e) => return Err(e)` arm left `trial_in_flight`
+    /// stuck `true`, so every later `is_open` query skipped the provider
+    /// forever. Here the recovered provider must be re-trialled and a success
+    /// must close the circuit.
+    #[tokio::test]
+    async fn half_open_trial_non_retriable_error_does_not_brick_breaker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let healthy = Arc::new(AtomicBool::new(false));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(ToggleProvider {
+            id: "pa",
+            model: "model-a",
+            healthy: healthy.clone(),
+        }));
+
+        let breaker = CircuitBreaker::new(1, Duration::from_secs(30));
+        breaker.record_failure("pa", now()); // opens pa
+        assert!(breaker.is_open("pa", now()), "open within cooldown");
+
+        let later = now() + chrono::Duration::seconds(31);
+        let candidates = vec!["model-a".to_string()];
+
+        // Half-open trial admitted, provider returns a non-retriable error.
+        let r = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &all_creds(),
+            later,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(r, Err(ProviderError::InvalidRequest(_))),
+            "non-retriable error must surface"
+        );
+
+        // Provider recovers; the breaker must NOT be bricked — a fresh trial is
+        // admitted and the success closes the circuit.
+        healthy.store(true, Ordering::SeqCst);
+        let (prov, _) = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &all_creds(),
+            later,
+            None,
+        )
+        .await
+        .expect("breaker must not be bricked — recovered provider should serve");
+        assert_eq!(prov.id(), "pa");
+        assert!(
+            !breaker.is_open("pa", later),
+            "successful request must close the breaker"
+        );
+    }
+
+    /// REGRESSION (ARCH-1): a candidate skipped for a MISSING credential after
+    /// cooldown must NOT admit (and then strand) a half-open trial. Before the
+    /// fix `is_open` ran first and set `trial_in_flight = true`, then the
+    /// credential lookup `continue`d without releasing it — bricking the
+    /// provider. The credential lookup now runs BEFORE `is_open`, so the
+    /// provider is still trial-able once a credential appears.
+    #[tokio::test]
+    async fn missing_credential_skip_after_cooldown_does_not_brick_breaker() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(MockProvider {
+            id: "pa",
+            model: "model-a",
+            behavior: Behavior::Ok,
+        }));
+
+        let breaker = CircuitBreaker::new(1, Duration::from_secs(30));
+        breaker.record_failure("pa", now()); // opens pa
+        let later = now() + chrono::Duration::seconds(31);
+        let candidates = vec!["model-a".to_string()];
+
+        // After cooldown, dispatch with NO credential for pa: the candidate is
+        // skipped at the credential check (now before `is_open`), so no
+        // half-open trial is admitted.
+        let empty_creds: std::collections::HashMap<
+            String,
+            tt_shared::context::ProviderCredentials,
+        > = std::collections::HashMap::new();
+        let r = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &empty_creds,
+            later,
+            None,
+        )
+        .await;
+        assert!(r.is_err(), "no credential → no candidate available");
+
+        // Credential now present and provider healthy: the breaker must admit a
+        // fresh trial (it was NOT stranded by the skip) and close on success.
+        let (prov, _) = dispatch_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &all_creds(),
+            later,
+            None,
+        )
+        .await
+        .expect("breaker must not be bricked by a credential skip");
+        assert_eq!(prov.id(), "pa");
+        assert!(
+            !breaker.is_open("pa", later),
+            "successful request must close the breaker"
+        );
+    }
+
+    /// Streaming sibling of `half_open_trial_non_retriable_error_does_not_brick_breaker`.
+    #[tokio::test]
+    async fn stream_half_open_trial_non_retriable_error_does_not_brick_breaker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let healthy = Arc::new(AtomicBool::new(false));
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(ToggleProvider {
+            id: "pa",
+            model: "model-a",
+            healthy: healthy.clone(),
+        }));
+
+        let breaker = CircuitBreaker::new(1, Duration::from_secs(30));
+        breaker.record_failure("pa", now()); // opens pa
+        let later = now() + chrono::Duration::seconds(31);
+        let candidates = vec!["model-a".to_string()];
+
+        let r = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &all_creds(),
+            later,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(r, Err(ProviderError::InvalidRequest(_))),
+            "non-retriable error must surface"
+        );
+
+        healthy.store(true, Ordering::SeqCst);
+        let (prov, served, _stream) = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &all_creds(),
+            later,
+            None,
+        )
+        .await
+        .expect("breaker must not be bricked — recovered provider should stream");
+        assert_eq!(prov.id(), "pa");
+        assert_eq!(served, "model-a");
+        assert!(
+            !breaker.is_open("pa", later),
+            "successful request must close the breaker"
+        );
+    }
+
+    /// Streaming sibling of `missing_credential_skip_after_cooldown_does_not_brick_breaker`.
+    #[tokio::test]
+    async fn stream_missing_credential_skip_after_cooldown_does_not_brick_breaker() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(MockProvider {
+            id: "pa",
+            model: "model-a",
+            behavior: Behavior::Ok,
+        }));
+
+        let breaker = CircuitBreaker::new(1, Duration::from_secs(30));
+        breaker.record_failure("pa", now()); // opens pa
+        let later = now() + chrono::Duration::seconds(31);
+        let candidates = vec!["model-a".to_string()];
+
+        let empty_creds: std::collections::HashMap<
+            String,
+            tt_shared::context::ProviderCredentials,
+        > = std::collections::HashMap::new();
+        let r = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &empty_creds,
+            later,
+            None,
+        )
+        .await;
+        assert!(r.is_err(), "no credential → no candidate available");
+
+        let (prov, served, _stream) = dispatch_stream_with_failover(
+            &reg,
+            &breaker,
+            &fast(),
+            &candidates,
+            &req("model-a"),
+            &ctx(),
+            &all_creds(),
+            later,
+            None,
+        )
+        .await
+        .expect("breaker must not be bricked by a credential skip");
+        assert_eq!(prov.id(), "pa");
+        assert_eq!(served, "model-a");
+        assert!(
+            !breaker.is_open("pa", later),
+            "successful request must close the breaker"
         );
     }
 }
