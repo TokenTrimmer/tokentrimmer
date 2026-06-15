@@ -2,10 +2,16 @@
 # Deploy: gateway (public) → staging → prod   (Phase 2 automation)
 #
 # Flow (per cloud/docs/superpowers/specs/2026-06-02-local-staging-prod-pipeline-design.md):
-#   push to main ─▶ job `staging` : migrate staging DB → flyctl deploy fly.staging.toml
-#                       │ (auto)
+#   CI passes on main ─▶ (workflow_run) job `staging` : migrate staging DB →
+#                       │ (auto, only on CI success)    flyctl deploy fly.staging.toml
 #                  job `prod`      : needs staging + MANUAL APPROVAL (GH Environment)
 #                                    migrate prod DB → flyctl deploy fly.toml
+#
+#   Staging is gated on a SUCCESSFUL CI run, NOT on a raw push to main: this
+#   workflow triggers via `workflow_run` on completion of the `CI` workflow and
+#   every deploy job carries `github.event.workflow_run.conclusion == 'success'`
+#   (a red/cancelled CI never reaches staging). Deploys check out + ship the exact
+#   commit CI validated (`github.event.workflow_run.head_sha`), not main's tip.
 #
 #   The gateway only owns the public.* schema, but it shares ONE Neon DB with the
 #   cloud surfaces, so migrations are applied via the strict `tt gateway
@@ -38,7 +44,13 @@
 name: deploy (gateway)
 
 on:
-  push:
+  # Gate staging on a SUCCESSFUL CI run instead of a raw push to main. This fires
+  # when the `CI` workflow (ci.yml) completes on the `main` branch; the deploy
+  # jobs then require `workflow_run.conclusion == 'success'`. (PR CI runs carry a
+  # non-main head branch, so the `branches: [main]` filter excludes them.)
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
   workflow_dispatch: # allow a manual re-run of the pipeline
     inputs:
@@ -66,6 +78,10 @@ jobs:
   # PROD_DATABASE_URL_DIRECT + the `production` Environment gate — see header).
   preflight:
     name: deploy configured?
+    # Only proceed when the triggering CI run passed (workflow_run) or on a manual
+    # dispatch. A failed/cancelled CI run skips this job, which cascade-skips
+    # staging + prod via `needs`. This is the CI-success gate for the pipeline.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
@@ -91,7 +107,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # Check out the exact commit CI validated (workflow_run.head_sha), not
+      # main's tip — for workflow_dispatch this falls back to the dispatched ref.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -115,7 +135,8 @@ jobs:
       - name: Deploy gateway → tokentrimmer-staging
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.staging.toml --build-arg TT_GIT_SHA=${{ github.sha }}
+          TT_GIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: flyctl deploy --remote-only --config fly.staging.toml --build-arg "TT_GIT_SHA=$TT_GIT_SHA"
 
       - name: Post-deploy staging smoke (wake scale-to-zero, check /health)
         run: |
@@ -133,7 +154,11 @@ jobs:
     timeout-minutes: 30
     environment: production
     steps:
+      # prod is workflow_dispatch-only, so head_sha is empty here and this falls
+      # back to the dispatched ref — kept symmetric with staging.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -153,7 +178,8 @@ jobs:
       - name: Deploy gateway → tokentrimmer
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.toml --build-arg TT_GIT_SHA=${{ github.sha }}
+          TT_GIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: flyctl deploy --remote-only --config fly.toml --build-arg "TT_GIT_SHA=$TT_GIT_SHA"
 
       - name: Post-deploy prod smoke
         run: |

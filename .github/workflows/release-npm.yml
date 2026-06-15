@@ -7,6 +7,12 @@
 # (granular access) token with publish rights to the @tokentrimmer scope.
 # Provenance attestation (`--provenance`) additionally needs `id-token: write`
 # and a public repository, both satisfied here.
+#
+# In addition to publishing, this workflow `npm pack`s the SDK and attaches the
+# tarball to the GitHub Release for the tag (via the auto-provided GITHUB_TOKEN
+# — no extra secret). That step runs BEFORE the npm publish, so adopters can
+# `npm install <release-asset-url>` straight from the GitHub Release even if the
+# NPM_TOKEN-gated registry publish is not configured.
 name: release-npm
 
 on:
@@ -21,7 +27,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # write: needed to create/update the GitHub Release + upload the tarball
+      # asset (the npm-pack attach step below).
+      contents: write
       # Required for npm provenance attestation (OIDC).
       id-token: write
     steps:
@@ -49,6 +57,33 @@ jobs:
       - name: Test
         run: npm test
         working-directory: sdk-typescript
+      # Pack the freshly-built dist/ into a tarball and attach it to the GitHub
+      # Release for this tag, so adopters can `npm install <release-asset-url>`
+      # without clone-and-build. Runs before publish so it works even without
+      # the NPM_TOKEN-gated registry publish. Uses the auto GITHUB_TOKEN only.
+      - name: Pack SDK tarball
+        id: pack
+        working-directory: sdk-typescript
+        run: |
+          set -euo pipefail
+          # `npm pack --json` reports the written tarball name on stdout; parse
+          # it with node (already set up) so we don't glob/ls the directory.
+          tarball="$(npm pack --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8")); process.stdout.write(d[0].filename)')"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "packed ${tarball}"
+      - name: Attach tarball to GitHub Release
+        working-directory: sdk-typescript
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$TARBALL" --clobber
+          else
+            gh release create "$TAG" "$TARBALL" --title "$TAG" --generate-notes
+          fi
       - name: Publish to npm
         run: npm publish --provenance --access public
         working-directory: sdk-typescript

@@ -1,11 +1,23 @@
 name: TS bindings placeholder
 
-# HONESTY NOTE: real TS binding generation is not wired yet. `tt-ts-types` is a
-# reserved placeholder crate with no `ts-rs` derives and no emitted bindings.
+# HONESTY NOTE: this workflow is NOT a drift guard. Real TS binding generation is
+# not wired yet — `tt-ts-types` (crates/ts-types) is a reserved placeholder crate
+# with no `ts-rs` derives and no emitted `bindings/` output. All this job can do
+# is compile that placeholder and emit a warning; it can never fail on drift,
+# because there is nothing to regenerate or diff. A real regenerate-and-`git
+# diff --exit-code` guard goes here once `crates/ts-types` actually emits files.
 #
-# Keep the historical job name below for branch-protection compatibility, but
-# this workflow is NOT a drift guard. Replace it with a real regenerate+diff job
-# when `crates/ts-types` actually emits files.
+# >>> OPERATOR ACTION REQUIRED (user-gated branch-protection settings change) <<<
+# The check formerly published as the required context "TS bindings drift" — a
+# no-op that nonetheless blocked merges and gave false drift assurance. The job
+# name below has been made honest ("TS bindings (placeholder)"), which CHANGES
+# the check-run name. You MUST update branch protection on `main` to match:
+#   PREFERRED: remove "TS bindings drift" from the required status checks
+#              entirely (there is no real guard to gate on yet); OR
+#   if you want the placeholder to keep reporting: replace the required context
+#              "TS bindings drift" with "TS bindings (placeholder)".
+# Until you do one of these, the old required context "TS bindings drift" will
+# never report and every PR will hang waiting on it.
 
 on:
   pull_request:
@@ -17,7 +29,10 @@ env:
 
 jobs:
   bindings:
-    name: TS bindings drift
+    # Honest name: this is a placeholder, not a drift guard (see header note).
+    # NOTE: renaming this from the old "TS bindings drift" changes the check-run
+    # name — coordinate the branch-protection update flagged in the header.
+    name: TS bindings (placeholder)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
