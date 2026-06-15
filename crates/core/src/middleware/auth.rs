@@ -78,7 +78,34 @@ pub async fn middleware(
             let token_hash = crate::middleware::key_cache::hash_token(&token);
             let cache = &state.verify_cache;
 
-            let ctx_opt = match cache.get(&token_hash) {
+            let mut lookup = cache.get(&token_hash);
+
+            // Cross-instance revocation (SEC-4): a positive verify-cache hit is
+            // honored only if the key is not marked revoked in the shared
+            // registry (the same Redis L1 uses). A revoke on ANY replica SETs
+            // the marker; here a marked hit is downgraded to a Miss so the cold
+            // path re-runs argon2 against the key store (which rejects the
+            // revoked row → 401). This closes the per-replica staleness window
+            // that the local-only `evict_key_id` leaves open on every replica
+            // that didn't process the revoke. Only positive hits are checked
+            // (one Redis GET on the fast path); Failure/Miss skip it. Fails
+            // open: no registry wired or a backend error honors the cached
+            // positive (degrading to the documented `POSITIVE_TTL_SECS` window).
+            if let CacheLookup::Hit(hit_ctx) = &lookup {
+                let key_id = hit_ctx.key_id;
+                if let Some(reg) = state.revocation.as_ref() {
+                    if reg.is_revoked(key_id).await {
+                        tracing::debug!(
+                            %key_id,
+                            "auth: positive cache hit on a revoked key — forcing re-verify"
+                        );
+                        cache.evict_key_id(key_id);
+                        lookup = CacheLookup::Miss;
+                    }
+                }
+            }
+
+            let ctx_opt = match lookup {
                 CacheLookup::Hit(cached_ctx) => {
                     tracing::trace!("auth: cache hit, skipping argon2");
                     Some(cached_ctx)
@@ -708,6 +735,129 @@ mod tests {
             "after evict_key_id, revoked key must be rejected"
         );
         assert_eq!(store.find_count.load(Ordering::SeqCst), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // (e2) SEC-4: a revoke fanned out via the cross-instance RevocationRegistry
+    //      forces a re-verify on a PEER replica that still has a warm positive
+    //      entry (and never processed the local evict).
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cross_instance_revocation_marker_forces_reverify() {
+        use tt_cache::memory::InMemoryL1Cache;
+
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_xinstance999";
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        // A revocation registry backed by a mock Redis (InMemoryL1Cache),
+        // shared with the peer that performs the revoke below.
+        let registry = Arc::new(crate::middleware::key_cache::RevocationRegistry::new(
+            Arc::new(InMemoryL1Cache::new()),
+        ));
+        let mut app = state_with_store(store.clone());
+        app.revocation = Some(registry.clone());
+        let router = build_router(app);
+
+        // r1 warms a positive verify-cache entry on THIS replica.
+        let r1 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r1");
+        assert_eq!(r1.status(), StatusCode::OK, "pre-revoke should succeed");
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+
+        // A PEER replica revokes the key: store row revoked + cross-instance
+        // marker SET. THIS replica did not process the revoke locally (no
+        // evict_key_id), so its positive entry is still warm — the marker is
+        // the only signal it has.
+        let (key_id, key_org) = {
+            let g = store.by_prefix.lock().unwrap();
+            let k = g.get(&plaintext[..12]).unwrap();
+            (k.id, k.org_id)
+        };
+        store
+            .revoke(key_id, key_org, Utc::now())
+            .await
+            .expect("revoke");
+        registry.mark_revoked(key_id).await;
+
+        // r2 hits the warm positive entry, but the marker downgrades it to a
+        // miss → argon2 re-runs against the now-revoked store row → 401.
+        let r2 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r2");
+        assert_eq!(
+            r2.status(),
+            StatusCode::UNAUTHORIZED,
+            "cross-instance marker must force a re-verify and reject the revoked key"
+        );
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            2,
+            "argon2 must re-run after the marker downgrades the hit to a miss"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (e3) SEC-4 control: WITHOUT a registry, a revoke on a peer leaves this
+    //      replica's warm positive entry stale (the documented per-replica
+    //      window the registry is designed to close).
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn without_registry_stale_positive_is_honored() {
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_noregistry00";
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        // state_with_store leaves `revocation` None — no cross-instance channel.
+        let state = state_with_store(store.clone());
+        let router = build_router(state);
+
+        let r1 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r1");
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+
+        // Peer revokes the store row, but there is no marker and no local evict.
+        let (key_id, key_org) = {
+            let g = store.by_prefix.lock().unwrap();
+            let k = g.get(&plaintext[..12]).unwrap();
+            (k.id, k.org_id)
+        };
+        store
+            .revoke(key_id, key_org, Utc::now())
+            .await
+            .expect("revoke");
+
+        // The warm positive entry is still served — bounded only by the TTL.
+        let r2 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r2");
+        assert_eq!(
+            r2.status(),
+            StatusCode::OK,
+            "without a registry the stale positive is honored within the TTL window"
+        );
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            1,
+            "no re-verify happens without the cross-instance marker"
+        );
     }
 
     // ------------------------------------------------------------------

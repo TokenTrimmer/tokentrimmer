@@ -14,7 +14,7 @@ use tt_telemetry::{body_capture::BodyCaptureWriter, request_logs::RequestLogWrit
 use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
 use crate::failover::CircuitBreaker;
 use crate::middleware::argon2_cap::{Argon2Cap, Argon2CapConfig, Argon2VerifyCap};
-use crate::middleware::key_cache::{KeyVerifyCache, VerifyCache};
+use crate::middleware::key_cache::{KeyVerifyCache, RevocationRegistry, VerifyCache};
 use crate::registry::{register_default_providers, ProviderRegistry};
 use crate::single_flight::SingleFlight;
 use crate::tier_resolver::TierResolver;
@@ -146,6 +146,16 @@ pub struct AppState {
     /// See [`crate::middleware::key_cache`] for TTL constants and the
     /// revocation-staleness tradeoff documentation.
     pub verify_cache: VerifyCache,
+    /// Optional cross-instance API-key revocation registry (SEC-4). Backed by
+    /// the same Redis the L1 cache uses; auto-wired by [`AppState::with_l1`].
+    ///
+    /// When `Some`, the auth middleware checks it on every positive
+    /// `verify_cache` hit and forces a re-verify for a key marked revoked on
+    /// any replica — closing the per-replica staleness window the local-only
+    /// [`KeyVerifyCache::evict_key_id`](crate::middleware::key_cache::KeyVerifyCache::evict_key_id)
+    /// leaves open. `None` (no Redis wired — tests, dev) degrades cleanly to
+    /// that per-replica behavior bounded by `POSITIVE_TTL_SECS`.
+    pub revocation: Option<Arc<RevocationRegistry>>,
     /// Pre-auth per-IP rate cap consulted by the auth middleware **immediately
     /// before** the (CPU-expensive) argon2 verify on the cold path — i.e. only
     /// when a `tt_live_*` token misses the verify cache. Past the per-IP
@@ -269,6 +279,7 @@ impl AppState {
             body_capture_writer: None,
             routing_store: None,
             verify_cache: Arc::new(KeyVerifyCache::new()),
+            revocation: None,
             argon2_cap: Argon2VerifyCap::new(Argon2CapConfig::from_env()),
             dogfood_enabled: false,
             budget: None,
@@ -297,12 +308,45 @@ impl AppState {
     }
 
     /// Builder-style attach: enable L1 exact-match cache with the given backend.
+    ///
+    /// Also wires the cross-instance API-key [`RevocationRegistry`] (SEC-4) from
+    /// the SAME backend — L1 *is* the shared Redis, so a revoke fanned out via
+    /// the registry reaches every replica that has L1 enabled. An explicit
+    /// [`with_revocation_registry`](Self::with_revocation_registry) called after
+    /// this overrides the auto-wired registry (e.g. to point it at a separate
+    /// backend).
     pub fn with_l1(mut self, cache: Arc<dyn L1Cache>, ttl_secs: Option<u64>) -> Self {
+        self.revocation = Some(Arc::new(RevocationRegistry::new(cache.clone())));
         self.l1 = Some(L1Config {
             cache,
             ttl_secs: ttl_secs.unwrap_or(DEFAULT_L1_TTL_SECS),
         });
         self
+    }
+
+    /// Builder-style attach: wire the cross-instance API-key revocation registry
+    /// (SEC-4) on a specific [`L1Cache`] backend, independent of the L1 request
+    /// cache. [`with_l1`](Self::with_l1) already auto-wires the registry from
+    /// the L1 backend; use this only to point revocation at a different backend
+    /// or to enable revocation without L1 request caching.
+    #[must_use]
+    pub fn with_revocation_registry(mut self, backend: Arc<dyn L1Cache>) -> Self {
+        self.revocation = Some(Arc::new(RevocationRegistry::new(backend)));
+        self
+    }
+
+    /// Revoke an API key everywhere: evict it from this replica's verify cache
+    /// (immediate, local) AND publish a cross-instance revocation marker so
+    /// peer replicas force a re-verify on their next positive hit (SEC-4). The
+    /// marker publish is a no-op when no [`revocation`](Self::revocation)
+    /// registry is wired — peers then fall back to the `POSITIVE_TTL_SECS`
+    /// window. Call this from the key-revocation path instead of a bare
+    /// `verify_cache.evict_key_id`.
+    pub async fn revoke_key(&self, key_id: uuid::Uuid) {
+        self.verify_cache.evict_key_id(key_id);
+        if let Some(reg) = self.revocation.as_ref() {
+            reg.mark_revoked(key_id).await;
+        }
     }
 
     /// Builder-style attach: enable L2 semantic cache with the given backend.
