@@ -28,12 +28,9 @@ impl Default for ClientConfig {
     }
 }
 
-/// Build a [`reqwest::Client`] with the given configuration.
-///
-/// Uses rustls (no native TLS) and enables gzip decompression. The client is
-/// intended to be created once per [`crate::OpenAiProvider`] and reused across
-/// all requests.
-pub fn build_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
+/// Shared base [`reqwest::ClientBuilder`] for both the guarded and unguarded
+/// variants: timeouts, no redirects, rustls, gzip.
+fn base_builder(cfg: &ClientConfig) -> reqwest::ClientBuilder {
     Client::builder()
         .read_timeout(cfg.timeout)
         .connect_timeout(cfg.connect_timeout)
@@ -42,5 +39,32 @@ pub fn build_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
         // Use rustls (consistent with workspace default features).
         .use_rustls_tls()
         .gzip(true)
-        .build()
+}
+
+/// Build a [`reqwest::Client`] with the given configuration, with the
+/// connect-time SSRF guard installed.
+///
+/// Uses rustls (no native TLS) and enables gzip decompression. The client is
+/// intended to be created once per [`crate::OpenAICompatibleProvider`] and
+/// reused across all requests.
+///
+/// The [`tt_shared::GuardedResolver`] DNS resolver is installed so that, in
+/// addition to the validation-time `validate_provider_url` check, reqwest can
+/// never *connect* to a private/loopback/link-local/metadata address even if a
+/// customer's `base_url` host rebinds to one at connect time (DNS-rebind
+/// TOCTOU). Use [`build_unguarded_client`] only for `allow_local` providers
+/// that legitimately target localhost/private endpoints.
+pub fn build_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
+    tt_shared::with_guarded_dns(base_builder(cfg)).build()
+}
+
+/// Build a [`reqwest::Client`] **without** the connect-time SSRF guard.
+///
+/// Intended only for `allow_local` providers (Ollama/vLLM/LM Studio on
+/// `localhost`/private IPs) and tests pointed at a local mock server, which the
+/// [`GuardedResolver`](tt_shared::GuardedResolver) would otherwise block. All
+/// hosted providers that accept a customer-supplied `base_url` must use
+/// [`build_client`].
+pub fn build_unguarded_client(cfg: &ClientConfig) -> Result<Client, reqwest::Error> {
+    base_builder(cfg).build()
 }

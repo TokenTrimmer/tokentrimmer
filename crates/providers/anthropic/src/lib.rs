@@ -73,7 +73,9 @@ impl AnthropicProvider {
     /// Do not use in production code. This bypasses the SSRF guard.
     #[doc(hidden)]
     pub fn new_allow_local(cfg: ClientConfig) -> Self {
-        let client = client::build_client(&cfg)
+        // Unguarded client: `allow_local` targets localhost/private mock
+        // servers that the connect-time SSRF guard would block.
+        let client = client::build_unguarded_client(&cfg)
             .expect("failed to build reqwest::Client for Anthropic adapter");
         Self {
             client,

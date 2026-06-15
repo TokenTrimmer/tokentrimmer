@@ -46,7 +46,7 @@ use tt_shared::{
     Provider, ProviderError, RequestContext,
 };
 
-use crate::client::{build_client, ClientConfig};
+use crate::client::{build_client, build_unguarded_client, ClientConfig};
 use crate::errors::{map_reqwest_error, map_response_error};
 use crate::{stream, translate};
 
@@ -114,7 +114,17 @@ impl OpenAICompatibleProvider {
     /// Panics if the underlying [`reqwest::Client`] cannot be constructed (very
     /// rare — only happens with invalid TLS configuration).
     pub fn new(client_cfg: ClientConfig, cfg: CompatConfig) -> Self {
-        let client = build_client(&client_cfg)
+        // Hosted providers get the connect-time SSRF guard (defeats DNS
+        // rebinding on customer `base_url`s); `allow_local` providers
+        // (Ollama/vLLM/LM Studio, tests) target localhost/private IPs that the
+        // guard intentionally blocks, so they use the unguarded client —
+        // mirroring how `validate_provider_url` skips its checks for them.
+        let build = if cfg.allow_local {
+            build_unguarded_client
+        } else {
+            build_client
+        };
+        let client = build(&client_cfg)
             .unwrap_or_else(|e| panic!("failed to build HTTP client for {}: {e}", cfg.id));
         Self { client, cfg }
     }

@@ -169,7 +169,10 @@ pub fn validate_provider_url(raw: &str, allow_local: bool) -> Result<(), UrlGuar
 /// - IPv6 link-local fe80::/10
 /// - IPv6 ULA fc00::/7
 /// - IPv6 mapped / compatible IPv4 in blocked ranges
-fn is_blocked_ip(ip: IpAddr) -> bool {
+///
+/// Shared with [`crate::dns_guard`] so the connect-time DNS resolver filters
+/// the exact same ranges this validation-time check rejects.
+pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_v4(v4),
         IpAddr::V6(v6) => is_blocked_v6(v6),
