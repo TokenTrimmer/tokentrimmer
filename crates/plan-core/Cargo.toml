@@ -17,8 +17,18 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-rand = "0.8"
-rand_chacha = "0.3"
+# DETERMINISM PIN (TEST-7): the bootstrap-CI resampling behind signed savings
+# attestations is reproducible only as long as the RNG value stream is stable.
+# `rand_chacha` provides the seeded ChaCha8 stream and `rand`'s `gen_range`
+# provides the index distribution — BOTH feed `bootstrap::bootstrap_ci`, so both
+# are EXACT-pinned. A rand-family bump can silently shift the resampled values
+# (rand 0.9's Uniform already broke value-stability once). Bumping either crate
+# is therefore a DELIBERATE act that requires regenerating the attested goldens
+# (the `tests/replay.rs` insta snapshot + the `tests/bootstrap.rs` value pin) and
+# re-attesting — never an incidental `cargo update`. See the RNG-reproducibility
+# constraint in the repo memory.
+rand = "=0.8.6"
+rand_chacha = "=0.3.1"
 
 [dev-dependencies]
 insta.workspace = true

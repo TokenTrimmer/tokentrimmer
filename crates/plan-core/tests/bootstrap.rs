@@ -16,6 +16,46 @@ fn rand_normal(rng: &mut ChaCha8Rng, mean: f64, sd: f64) -> f64 {
     mean + sd * z
 }
 
+/// VALUE-STABILITY PIN (TEST-7).
+///
+/// The determinism tests above only assert *self-consistency* (`a == b` across
+/// two runs in the same process). That cannot catch a `rand` / `rand_chacha`
+/// bump that shifts the RNG value stream *globally* — both runs would shift
+/// together and still compare equal. This test instead pins
+/// `bootstrap_ci(seed → output)` to the EXACT values produced by the currently
+/// pinned RNG crates (`rand = =0.8.6`, `rand_chacha = =0.3.1`).
+///
+/// Because the bootstrap CI feeds the signed savings attestation, a change here
+/// is a determinism break: if a future `cargo update` (or an un-pinning of the
+/// rand family) alters the resampled means, this assertion fails CI loudly
+/// rather than silently re-attesting different numbers. The fix is NEVER to
+/// blindly re-paste the new values — it is to make the resampling
+/// rand-version-independent first (or to deliberately regenerate + re-attest the
+/// goldens). See the RNG-reproducibility constraint and the pin comment in
+/// `Cargo.toml`.
+///
+/// `plan-self.yml` runs `cargo test -p tt-plan-core`, which executes this file,
+/// so the guard is wired into the public "plan replay determinism" check.
+#[test]
+fn bootstrap_ci_value_stability_pin() {
+    // A small, fully-specified input: means of resamples of 0.0..=9.0.
+    let samples: Vec<f64> = (0..10).map(|i| i as f64).collect();
+    let (lo, hi) = bootstrap_ci(&samples, 42, 1000, (0.025, 0.975));
+
+    // EXACT expected values for (rand 0.8.6, rand_chacha 0.3.1). A rand-family
+    // value-stream change shifts these and fails CI — that is the point.
+    const EXPECTED_LO: f64 = 2.7;
+    const EXPECTED_HI: f64 = 6.3;
+    assert_eq!(
+        (lo, hi),
+        (EXPECTED_LO, EXPECTED_HI),
+        "bootstrap_ci value stream drifted from the attested baseline \
+         (rand=0.8.6, rand_chacha=0.3.1). Do NOT blindly accept new values: a \
+         rand-family bump must first be made value-stream-independent or the \
+         attested goldens deliberately regenerated. got=({lo}, {hi})"
+    );
+}
+
 #[test]
 fn determinism_same_seed_bit_identical() {
     let samples: Vec<f64> = (0..200).map(|i| (i as f64) * 0.123 + 0.5).collect();
