@@ -1327,8 +1327,27 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
             .await
             {
                 Ok(Ok(c)) => {
-                    tracing::info!("L1 cache enabled");
-                    Some(Arc::new(c))
+                    // SEC-2: encrypt L1 (Redis) response payloads at rest when
+                    // `TT_MASTER_KEY` is set. Unset → plaintext (back-compat); a
+                    // malformed key disables L1 rather than serve plaintext under
+                    // a misconfigured key.
+                    match tt_cache::ResponseCodec::from_env() {
+                        Ok(Some(codec)) => {
+                            tracing::info!(
+                                "L1 cache enabled (response encryption on — TT_MASTER_KEY)"
+                            );
+                            Some(Arc::new(c.with_response_codec(codec))
+                                as Arc<dyn tt_cache::L1Cache>)
+                        }
+                        Ok(None) => {
+                            tracing::info!("L1 cache enabled (plaintext — TT_MASTER_KEY unset)");
+                            Some(Arc::new(c) as Arc<dyn tt_cache::L1Cache>)
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "TT_MASTER_KEY invalid — L1 cache disabled (refusing to serve plaintext under a misconfigured key)");
+                            None
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "redis connect failed; L1 cache disabled");
@@ -1352,6 +1371,15 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     let mut state = tt_core::AppState::with_default_providers();
     if let Some(l1) = l1_cache {
         state = state.with_l1(l1, None);
+    }
+
+    // REL-1: hand the Postgres pool to AppState so the `/ready` probe actually
+    // checks the DB (`SELECT 1`) instead of always reporting `not_configured`.
+    // Clone — the pool is reused below for the credential/key/tier/routing
+    // stores. No-op when there is no DB pool (probe keeps reporting
+    // `not_configured`, the honest state).
+    if let Some(pool) = db_pool.as_ref() {
+        state = state.with_db_pool(pool.clone());
     }
 
     // Surface a stale embedded pricing catalog (the dormant freshness signal).
@@ -1501,11 +1529,45 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     base_url: None,
                     extra_headers: Vec::new(),
                 };
-                let embedder =
-                    Arc::new(tt_cache::OpenAIEmbedder::new(openai, "text-embedding-3-small", creds));
-                let l2 = Arc::new(tt_cache::PostgresL2Cache::new(pool.clone()));
-                state = state.with_l2(l2, embedder, None);
-                tracing::info!("L2 semantic cache enabled (pgvector + text-embedding-3-small)");
+                // COST-4(I): wrap the OpenAI embedder in the bounded in-process
+                // LRU so repeated identical lookup/insert texts (re-asked
+                // questions, retried requests) reuse a cached vector instead of
+                // re-paying the embedding call. Pure win — `MemoizingEmbedder`
+                // is transparent on a miss and exact on a hit.
+                let base_embedder: Arc<dyn tt_cache::EmbeddingProvider> = Arc::new(
+                    tt_cache::OpenAIEmbedder::new(openai, "text-embedding-3-small", creds),
+                );
+                let embedder: Arc<dyn tt_cache::EmbeddingProvider> =
+                    Arc::new(tt_cache::MemoizingEmbedder::new(base_embedder));
+                // SEC-2: install the per-org response codec when `TT_MASTER_KEY`
+                // is set — L2 rows are then encrypted at rest. Unset → `None` →
+                // today's plaintext behavior (back-compat). A *malformed*
+                // master key disables L2 (warn) rather than silently serving
+                // plaintext under a misconfigured key.
+                let l2_with_codec = match tt_cache::ResponseCodec::from_env() {
+                    Ok(Some(codec)) => {
+                        tracing::info!(
+                            "L2 response encryption enabled (TT_MASTER_KEY — rows encrypted at rest)"
+                        );
+                        Some(tt_cache::PostgresL2Cache::new(pool.clone()).with_response_codec(codec))
+                    }
+                    Ok(None) => {
+                        tracing::info!(
+                            "L2 response encryption disabled (TT_MASTER_KEY unset — plaintext rows, back-compat)"
+                        );
+                        Some(tt_cache::PostgresL2Cache::new(pool.clone()))
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "TT_MASTER_KEY invalid — L2 disabled (refusing to serve plaintext under a misconfigured key)");
+                        None
+                    }
+                };
+                if let Some(l2) = l2_with_codec {
+                    state = state.with_l2(Arc::new(l2), embedder, None);
+                    tracing::info!(
+                        "L2 semantic cache enabled (pgvector + text-embedding-3-small; LRU-memoized embedder)"
+                    );
+                }
             }
             _ => tracing::warn!(
                 "TT_L2_SEMANTIC_CACHE=1 but DATABASE_URL / TT_OPENAI_EMBED_KEY missing — L2 disabled"
@@ -1675,7 +1737,10 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         let caching: Arc<dyn tt_routing::RoutingStore> = backing;
         state = state
             .with_routing_store(Arc::new(tt_routing::CachingRoutingStore::new(caching)))
-            .with_dogfood_enabled();
+            // SEC-6: dogfood must fail closed off a loopback bind — the resolved
+            // `bind_ip` gates it so an accidentally-public dogfood gateway does
+            // not route real traffic to the internal Groq lane.
+            .with_dogfood_enabled_for_bind(bind_ip.is_loopback());
         tracing::info!(
             "dogfood routing: short prompts on flagship models → llama-3.1-8b-instant (Groq)"
         );
@@ -2075,12 +2140,29 @@ fn run_cost_diff(
     }
     let diff_text = String::from_utf8_lossy(&out.stdout);
 
-    let report = tt_cli::cost_diff::analyze(&diff_text);
+    // PROD-8: honor a per-repo token profile (`.tokentrimmer/cost-profile.toml`)
+    // so the projected per-call cost reflects this repo's typical prompt size.
+    // The profile lives at the git repo root, not the (possibly nested) scope
+    // `path`; resolve it via `git rev-parse --show-toplevel`, falling back to
+    // the scope path / cwd. `load_from_repo` is infallible — a missing or bad
+    // file falls back to the default standard profile, never breaking the gate.
+    let repo_root = ProcCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .unwrap_or_else(|| PathBuf::from(path));
+    let profile = tt_cli::cost_diff::CostProfile::load_from_repo(&repo_root);
+
+    let report = tt_cli::cost_diff::analyze_with_profile(&diff_text, &profile);
 
     let formatted = match output_format_for(output) {
         OutputFormat::Json => serde_json::to_string_pretty(&report)
             .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}")),
-        OutputFormat::Markdown => tt_cli::cost_diff::format_markdown(&report),
+        OutputFormat::Markdown => {
+            tt_cli::cost_diff::format_markdown_with_profile(&report, &profile)
+        }
     };
 
     match output {

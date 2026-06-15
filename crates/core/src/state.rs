@@ -27,6 +27,11 @@ pub const DEFAULT_L2_THRESHOLD: f32 = 0.92;
 /// default is conservative until tier resolution lands with auth.
 pub const DEFAULT_L1_TTL_SECS: u64 = 24 * 60 * 60;
 
+/// Default FP-tolerance pct for the L2 verify gate's adaptive ratchet (COST-5).
+/// Matches the `with_l2_verify` / `TT_L2_FP_TOLERANCE_PCT` default; clamped to
+/// the research route-tolerance band `[0.5, 2.0]` at construction.
+pub const DEFAULT_L2_VERIFY_TOLERANCE_PCT: f64 = 1.0;
+
 /// The L2 false-positive verify gate (research Phase 2.2). Wired via
 /// [`AppState::with_l2_verify`]; absent (`L2Config::verify == None`, the
 /// default) the L2 hit path behaves byte-identically to today.
@@ -86,9 +91,11 @@ pub struct L2Config {
     /// identical to the single-threshold gateway until a class is explicitly
     /// raised. Never loosens a class below the global floor.
     pub class_thresholds: tt_cache::ClassThresholds,
-    /// FP verify gate. `None` (default) = today's behavior exactly.
-    /// **OFF BY DEFAULT** — opt in via `TT_L2_VERIFY` /
-    /// [`AppState::with_l2_verify`].
+    /// FP verify gate. **ON BY DEFAULT** (COST-5(U)): [`AppState::with_l2`]
+    /// seeds it from [`tt_cache::LexicalVerifyConfig::default()`] so an
+    /// unconfigured gateway verifies ambiguous-band hits (pre-0018 rows fail
+    /// open). `None` disables it entirely (today's pre-COST-5 behavior);
+    /// `TT_L2_VERIFY` / [`AppState::with_l2_verify`] override the knobs.
     pub verify: Option<L2VerifyConfig>,
     /// Volatility-class TTL. `None` (default) = today's behavior.
     /// **OFF BY DEFAULT** — opt in via `TT_L2_VOLATILITY_TTL` /
@@ -406,9 +413,28 @@ impl AppState {
             // up to `DEFAULT_L2_THRESHOLD`, so a class can only ever raise the bar,
             // never lower it below today's value.
             class_thresholds: tt_cache::ClassThresholds::with_global_floor(threshold),
-            // Both gates OFF by default — wire via with_l2_verify /
-            // with_l2_volatility_ttl. None = byte-identical behavior to today.
-            verify: None,
+            // COST-5(U): the FP verify gate is ON by default for the ambiguous
+            // band, sourcing its lexical knobs from
+            // [`tt_cache::LexicalVerifyConfig::default()`] (the documented
+            // default-ON gate: a 0.02 band verified at
+            // `DEFAULT_LEXICAL_MIN_AGREEMENT`). An unconfigured gateway thus
+            // lexically verifies near-threshold hits at ~zero cost; pre-0018
+            // rows (no signature) fail OPEN, so legacy data never turns into a
+            // miss. `with_l2_verify` overrides these from env. Volatility TTL
+            // stays OFF by default (separate opt-in).
+            verify: Some({
+                let lex = tt_cache::LexicalVerifyConfig::default();
+                let class_thresholds = tt_cache::ClassThresholds::with_global_floor(threshold);
+                L2VerifyConfig {
+                    epsilon: lex.epsilon,
+                    min_agreement: lex.min_agreement,
+                    tolerance_pct: DEFAULT_L2_VERIFY_TOLERANCE_PCT,
+                    gate: Arc::new(tt_cache::AdaptiveClassThresholds::new(
+                        class_thresholds,
+                        tt_cache::FpGateTuning::default(),
+                    )),
+                }
+            }),
             volatility_ttl: None,
         });
         self
