@@ -15,7 +15,9 @@
 //! * It does **not** verify `tt_test_*` sandbox keys against the key store —
 //!   the chat handler short-circuits sandbox traffic to a deterministic
 //!   synthetic response before touching any provider, so verification would
-//!   be wasted work.
+//!   be wasted work. The sandbox path is still subject to the per-IP rate cap
+//!   ([`crate::middleware::argon2_cap`]) so an unauthenticated flood of
+//!   `tt_test_*` requests cannot pin slots unthrottled (SEC-9).
 //! * It does **not** look up provider credentials. The chat handler does
 //!   that, because credential lookup is per-provider and the provider isn't
 //!   resolved until the model is parsed from the request body.
@@ -25,7 +27,7 @@
 //! | Header value                | Outcome                                          |
 //! | --------------------------- | ------------------------------------------------ |
 //! | (none)                      | pass through                                     |
-//! | `Bearer tt_test_…`          | pass through (sandbox handled downstream)        |
+//! | `Bearer tt_test_…`          | per-IP cap → pass through (sandbox downstream) or 429 |
 //! | `Bearer tt_live_…` + valid  | `ApiKeyContext` attached as extension; continue  |
 //! | `Bearer tt_live_…` + invalid| **401 Unauthorized**                             |
 //! | `Bearer <other format>`     | pass through (forward-compat with future schemes)|
@@ -56,8 +58,25 @@ pub async fn middleware(
     let mut org_id: Option<Uuid> = None;
 
     if let Some(token) = extract_bearer(&req) {
-        // tt_test_* short-circuits to sandbox in the chat handler. No verify needed.
+        // tt_test_* short-circuits to a synthetic sandbox response in the chat
+        // handler — no key-store verify and no provider/credential dispatch. It
+        // must NOT, however, bypass the per-IP rate cap: an unauthenticated
+        // flood of distinct tt_test_* tokens would otherwise pin gateway slots
+        // unthrottled (SEC-9). Charge the same per-IP cap used to guard the
+        // argon2 cold path BEFORE letting the request through; over the cap we
+        // shed with 429 + Retry-After. The synthetic-response behaviour is
+        // unchanged for traffic under the cap.
         if token.starts_with("tt_test_") {
+            let client_ip = crate::middleware::argon2_cap::client_ip(req.headers());
+            if let crate::middleware::argon2_cap::CapDecision::Reject { retry_after_secs } =
+                state.argon2_cap.check(client_ip)
+            {
+                tracing::debug!(
+                    ip = %client_ip,
+                    "auth: per-IP cap exceeded on sandbox (tt_test_) path, shedding"
+                );
+                return Ok(verify_cap_response(retry_after_secs));
+            }
             return Ok(next.run(req).await);
         }
         // tt_live_* needs verification against the key store.
@@ -1008,5 +1027,100 @@ mod tests {
         }
         // argon2 ran exactly once (cold path); the cap was consulted only once.
         assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // (g) SEC-9: the `tt_test_*` sandbox path is rate-limited by the same
+    //     per-IP cap and NEVER verifies against the key store / dispatches a
+    //     credential. A flood of distinct sandbox tokens from one IP is shed
+    //     with 429 past the cap, while the credential store is never touched.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sandbox_key_is_rate_limited_and_never_verifies() {
+        let store = CountingKeyStore::new();
+        // Cap = 2 sandbox passes per IP (burst == per_min).
+        let state = state_with_cap(store.clone(), 2);
+        let router = build_router(state);
+
+        let ip = "203.0.113.50";
+
+        // First 2 distinct sandbox tokens from this IP are UNDER the cap: each
+        // passes through to the (trivial) downstream handler → 200.
+        for n in 0..2 {
+            let token = format!("tt_test_sandbox{n:04}");
+            let r = router
+                .clone()
+                .oneshot(live_bearer_from_ip(&token, ip))
+                .await
+                .expect("under-cap sandbox resp");
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "under-cap sandbox key should pass through"
+            );
+        }
+
+        // Third distinct sandbox token from the SAME IP is OVER the cap → shed
+        // with 429 + Retry-After.
+        let r3 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_test_sandbox9999", ip))
+            .await
+            .expect("over-cap sandbox resp");
+        assert_eq!(
+            r3.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "over-cap sandbox key must be shed with 429"
+        );
+        assert!(
+            r3.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "sandbox 429 must carry Retry-After"
+        );
+
+        // INVARIANT: no sandbox request ever consulted the key store — the
+        // sandbox path never verifies a credential nor dispatches to a provider.
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            0,
+            "sandbox (tt_test_) path must never verify against the key store"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_cap_is_per_ip_other_ip_unaffected() {
+        let store = CountingKeyStore::new();
+        // Cap = 1 per IP.
+        let state = state_with_cap(store.clone(), 1);
+        let router = build_router(state);
+
+        // IP A burns its single cell, then is shed.
+        let a1 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_test_aaaa0000", "198.51.100.1"))
+            .await
+            .expect("a1");
+        assert_eq!(a1.status(), StatusCode::OK);
+        let a2 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_test_aaaa1111", "198.51.100.1"))
+            .await
+            .expect("a2");
+        assert_eq!(a2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A DIFFERENT IP still has its own budget → passes.
+        let b1 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_test_bbbb0000", "198.51.100.2"))
+            .await
+            .expect("b1");
+        assert_eq!(
+            b1.status(),
+            StatusCode::OK,
+            "a different IP within its own sandbox budget is not throttled"
+        );
+
+        // Still: the key store was never consulted by any sandbox request.
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 0);
     }
 }
