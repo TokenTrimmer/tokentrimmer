@@ -553,10 +553,7 @@ async fn some_target_route_still_rewrites_model() {
 
     let mut req = agent_request();
     req["model"] = json!("rec-source");
-    let resp = app
-        .oneshot(request_with_key(req, &key))
-        .await
-        .unwrap();
+    let resp = app.oneshot(request_with_key(req, &key)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         response_model(resp).await,

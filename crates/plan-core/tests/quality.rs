@@ -394,7 +394,7 @@ async fn replay_with_quality_attaches_quality_field() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-3-5-haiku".into(),
+            target_model: Some("claude-3-5-haiku".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,

@@ -5651,7 +5651,11 @@ pub(crate) async fn apply_routing(
     // EQUAL to the caller's, so the routing delta is 0 and only the route's
     // modifier savings (e.g. agentic_budget) are booked. A `Some` target
     // behaves exactly as before (rewrite to that model).
-    let effective_target = m.then.target_model.clone().unwrap_or_else(|| req.model.clone());
+    let effective_target = m
+        .then
+        .target_model
+        .clone()
+        .unwrap_or_else(|| req.model.clone());
     let is_model_rewrite = m.then.target_model.is_some();
     let target_model_for_split = effective_target.clone();
     let minify_json = m.then.minify_json;

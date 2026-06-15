@@ -213,7 +213,7 @@ fn single_request_route_match_cheaper_model_produces_savings() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-3-5-haiku".into(),
+            target_model: Some("claude-3-5-haiku".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -256,7 +256,7 @@ fn conservative_when_pricing_missing() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "nonexistent-model".into(),
+            target_model: Some("nonexistent-model".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -303,7 +303,7 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-haiku-4-5".into(),
+            target_model: Some("claude-haiku-4-5".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -347,7 +347,7 @@ fn cross_provider_target_absent_is_conservative() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-haiku-4-5".into(),
+            target_model: Some("claude-haiku-4-5".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -390,7 +390,7 @@ fn route_over_ceiling_is_blocked_not_saved() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-3-5-haiku".into(),
+            target_model: Some("claude-3-5-haiku".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: Some(0.01), // haiku on 1M/1M tokens still far exceeds $0.01
@@ -437,7 +437,7 @@ fn batch_route(target: &str, model_in: &str) -> ProposedRoute {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
-            target_model: target.into(),
+            target_model: Some(target.into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -700,6 +700,67 @@ fn flex_route_without_rate_projects_standard_with_inapplicable_caveat() {
     );
 }
 
+/// A **modifier-only route** (`target_model: None`) keeps the caller's chosen
+/// model — replay must price the request at its OWN model (model-rewrite delta
+/// = 0) and apply ONLY the route's modifier levers. Here a `flex: true`
+/// modifier-only route's served model (the original `claude-3-5-sonnet`) carries
+/// catalog Flex rates, so the entire projected saving comes from the flex lever,
+/// never a model swap. Also exercises that gateway JSON LACKING `target_model`
+/// deserializes to `None` and projects the same way.
+#[test]
+fn modifier_only_route_keeps_model_and_projects_only_modifier_savings() {
+    // sonnet @ 1000 in / 100 out, baseline $0.0045 (standard 3.0/15.0 per M).
+    //   standard (== request's own model) = 1000×3.0/M + 100×15.0/M = 0.0045
+    //   flex                              = 1000×1.5/M + 100×7.5/M  = 0.00225
+    let req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
+
+    // A modifier-only flex route: deserialize from gateway JSON that OMITS the
+    // `target_model` key, proving it lands as `None` (not a defaulted "").
+    let action: RouteAction =
+        serde_json::from_str(r#"{"flex":true}"#).expect("modifier-only action must deserialize");
+    assert_eq!(
+        action.target_model, None,
+        "omitted target_model must deserialize to None (modifier-only route)"
+    );
+    assert!(action.flex);
+    let route = ProposedRoute {
+        id: det_uuid(100),
+        name: "flex-modifier-only".into(),
+        priority: 100,
+        enabled: true,
+        when: RouteConditions {
+            model_in: vec!["claude-3-5-sonnet".into()],
+            ..Default::default()
+        },
+        then: action,
+    };
+
+    let mut pricing = HashMap::new();
+    let (k, mut v) = pricing_with("anthropic", "claude-3-5-sonnet", 3.0, 15.0);
+    v.flex_input_per_million = Some(1.5);
+    v.flex_output_per_million = Some(7.5);
+    pricing.insert(k, v);
+
+    let result = replay(input_with_routes(vec![req], vec![route], pricing, 100)).unwrap();
+    // The request still "reroutes" through the route (the modifier applies), but
+    // the served model is unchanged, so the projection is the flex rate of the
+    // ORIGINAL model — never a model-swap cost.
+    assert_eq!(result.aggregates.requests_rerouted, 1);
+    let flex_cost = 1000.0 * 1.5 / 1e6 + 100.0 * 7.5 / 1e6;
+    assert!(
+        (result.aggregates.total_projected_cost_usd - flex_cost).abs() < 1e-12,
+        "projected ({}) must be the served (original) model's flex cost ({flex_cost})",
+        result.aggregates.total_projected_cost_usd
+    );
+    // The entire saving is the flex modifier delta — the model-rewrite delta is
+    // exactly 0 (standard projection == baseline for the unchanged model).
+    assert!(
+        (result.aggregates.projected_savings_usd - (0.0045 - flex_cost)).abs() < 1e-12,
+        "savings must be ONLY the flex-modifier delta, not a model swap; got {}",
+        result.aggregates.projected_savings_usd
+    );
+}
+
 /// A `diff: true` route surfaces the measured `diff_saved_usd` carried on its
 /// matched requests as a per-lever caveat — WITHOUT folding it into the
 /// projected cost (the realized saving is already in baseline−projected, so
@@ -801,7 +862,7 @@ fn rerouted_latency_projected_from_target_model_history() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "cheap-model".into(),
+            target_model: Some("cheap-model".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -896,7 +957,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-3-5-haiku".into(),
+            target_model: Some("claude-3-5-haiku".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -1026,7 +1087,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-3-5-haiku".into(),
+            target_model: Some("claude-3-5-haiku".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -1055,7 +1116,7 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
         then: RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-3-haiku-pricier".into(),
+            target_model: Some("claude-3-haiku-pricier".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
