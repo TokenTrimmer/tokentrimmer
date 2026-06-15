@@ -86,6 +86,20 @@ impl BodyCaptureKind {
     }
 }
 
+/// Outcome of re-keying a single stored body blob from one master key to
+/// another. See [`BodyCaptureCodec::rekey_blob`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RekeyOutcome {
+    /// The blob decrypted under the OLD key and was re-sealed under the new key.
+    /// Carries the fresh `nonce || ciphertext` for the caller to persist.
+    Reencrypted(Vec<u8>),
+    /// The blob already decrypts under the NEW key — it was migrated by an
+    /// earlier, interrupted rotation, so there is nothing to write. This is what
+    /// makes [`postgres::PostgresBodyCaptureWriter::reencrypt_all`] idempotent
+    /// and resumable: re-running over an already-rotated row is a no-op.
+    AlreadyMigrated,
+}
+
 #[derive(Clone)]
 pub struct BodyCaptureCodec {
     master_key: [u8; 32],
@@ -194,6 +208,50 @@ impl BodyCaptureCodec {
             )
             .map_err(|_| BodyCaptureError::Crypto)
     }
+
+    /// Re-seal a single stored body blob from this codec's (OLD) key to `new`'s
+    /// key, preserving the `(org_id, trace_id, kind)` AAD binding.
+    ///
+    /// This is the body-capture analogue of the per-row step performed by
+    /// `tt_auth::postgres::PostgresProviderCredentialStore::reencrypt_all`: it
+    /// lets a `TT_MASTER_KEY` rotation re-key `request_body_captures` instead of
+    /// leaving every stored body permanently undecryptable. DB-free and
+    /// reusable — [`postgres::PostgresBodyCaptureWriter::reencrypt_all`] calls it
+    /// once per stored column.
+    ///
+    /// - decrypts `blob` under `self` (the OLD key) and re-encrypts under `new`
+    ///   with a fresh nonce → [`RekeyOutcome::Reencrypted`];
+    /// - if that fails but `blob` decrypts under `new`, the row was already
+    ///   migrated by an interrupted run → [`RekeyOutcome::AlreadyMigrated`]
+    ///   (idempotent / resumable);
+    /// - if it decrypts under NEITHER key, returns the underlying error
+    ///   ([`BodyCaptureError::Malformed`] for a too-short blob, otherwise
+    ///   [`BodyCaptureError::Crypto`]) so a corrupt or foreign-keyed row surfaces
+    ///   loudly rather than being silently dropped.
+    pub fn rekey_blob(
+        &self,
+        new: &BodyCaptureCodec,
+        org_id: Uuid,
+        trace_id: &str,
+        kind: BodyCaptureKind,
+        blob: &[u8],
+    ) -> Result<RekeyOutcome, BodyCaptureError> {
+        match self.decrypt(org_id, trace_id, kind, blob) {
+            Ok(plain) => {
+                let resealed = new.encrypt(org_id, trace_id, kind, &plain)?;
+                Ok(RekeyOutcome::Reencrypted(resealed))
+            }
+            // A truncated blob can never be a valid ciphertext under any key.
+            Err(BodyCaptureError::Malformed) => Err(BodyCaptureError::Malformed),
+            // Didn't open under the OLD key: a resumed rotation may already have
+            // re-sealed it under the NEW key. Anything that opens under neither
+            // is corrupt (or sealed under a third key) and must not be lost.
+            Err(old_err) => match new.decrypt(org_id, trace_id, kind, blob) {
+                Ok(_) => Ok(RekeyOutcome::AlreadyMigrated),
+                Err(_) => Err(old_err),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +314,32 @@ fn aad(org_id: Uuid, trace_id: &str, kind: BodyCaptureKind) -> Vec<u8> {
 pub mod postgres {
     use super::*;
 
+    /// One `request_body_captures` row as fetched for re-encryption:
+    /// `(id, org_id, trace_id, request_enc, response_enc)`.
+    type CaptureRekeyRow = (Uuid, Uuid, String, Vec<u8>, Option<Vec<u8>>);
+
+    /// Default keyset-pagination batch size for
+    /// [`PostgresBodyCaptureWriter::reencrypt_all`]. Each batch is re-keyed in
+    /// its own committed transaction so a rotation over a large
+    /// `request_body_captures` table makes bounded, resumable progress rather
+    /// than holding one table-sized transaction.
+    pub const REENCRYPT_BATCH_SIZE: i64 = 500;
+
+    /// Counts from a body-capture re-encryption pass.
+    /// See [`PostgresBodyCaptureWriter::reencrypt_all`]. Invariant:
+    /// `scanned == reencrypted + already_current`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ReencryptStats {
+        /// Rows examined across every batch.
+        pub scanned: usize,
+        /// Rows whose ciphertext was re-sealed under the new key (request and/or
+        /// response column changed).
+        pub reencrypted: usize,
+        /// Rows already sealed under the new key, skipped because an interrupted
+        /// rotation resumed.
+        pub already_current: usize,
+    }
+
     #[derive(Clone)]
     pub struct PostgresBodyCaptureWriter {
         pool: sqlx::PgPool,
@@ -306,6 +390,149 @@ pub mod postgres {
                 Err(err) if is_undefined_table(&err) => Ok(None),
                 Err(err) => Err(BodyCaptureError::Storage(err.to_string())),
             }
+        }
+
+        /// Re-encrypt every `request_body_captures` row from this writer's
+        /// (current/OLD) `TT_MASTER_KEY` to `new_master_key`. This is the
+        /// body-capture analogue of
+        /// `tt_auth::postgres::PostgresProviderCredentialStore::reencrypt_all`:
+        /// rotating `TT_MASTER_KEY` WITHOUT running this pass leaves every stored
+        /// body permanently undecryptable (each row is sealed with a per-org key
+        /// derived from the master). Run it BEFORE promoting the new key — build
+        /// the writer from the current env, call `reencrypt_all(&new_key)`, then
+        /// swap `TT_MASTER_KEY` and restart. See `docs/SECRETS.md`.
+        ///
+        /// Processed in keyset-paginated batches of [`REENCRYPT_BATCH_SIZE`],
+        /// each committed in its own transaction, so the pass is:
+        /// - **batched** — bounded memory and lock footprint over a large table;
+        /// - **resumable** — committed batches survive an interruption, and a
+        ///   re-run skips rows already sealed under the new key;
+        /// - **idempotent** — running it again after completion re-keys nothing.
+        ///
+        /// A row that decrypts under NEITHER key rolls back its (uncommitted)
+        /// batch and returns an error, so a corrupt row surfaces rather than
+        /// being silently dropped; already-committed batches persist and a
+        /// resumed run continues past them.
+        pub async fn reencrypt_all(
+            &self,
+            new_master_key: &[u8; 32],
+        ) -> Result<ReencryptStats, BodyCaptureError> {
+            self.reencrypt_all_batched(new_master_key, REENCRYPT_BATCH_SIZE)
+                .await
+        }
+
+        /// [`reencrypt_all`](Self::reencrypt_all) with an explicit batch size
+        /// (clamped to `>= 1`). Exposed mainly for tests; production callers use
+        /// the [`REENCRYPT_BATCH_SIZE`] default via [`reencrypt_all`].
+        pub async fn reencrypt_all_batched(
+            &self,
+            new_master_key: &[u8; 32],
+            batch_size: i64,
+        ) -> Result<ReencryptStats, BodyCaptureError> {
+            let batch_size = batch_size.max(1);
+            let new_codec = BodyCaptureCodec::new(*new_master_key);
+            let mut stats = ReencryptStats::default();
+            // Keyset pagination on the UUID primary key: stable ordering, no
+            // OFFSET re-scan, and re-keying never changes `id`, so the cursor
+            // walk visits every row exactly once.
+            let mut cursor = Uuid::nil();
+
+            loop {
+                let rows: Vec<CaptureRekeyRow> = match sqlx::query_as(
+                    r#"SELECT id, org_id, trace_id, request_enc, response_enc
+                             FROM request_body_captures
+                            WHERE id > $1
+                            ORDER BY id
+                            LIMIT $2"#,
+                )
+                .bind(cursor)
+                .bind(batch_size)
+                .fetch_all(&self.pool)
+                .await
+                {
+                    Ok(rows) => rows,
+                    // Table absent in this deployment → nothing to rotate.
+                    Err(err) if is_undefined_table(&err) => return Ok(stats),
+                    Err(err) => return Err(BodyCaptureError::Storage(err.to_string())),
+                };
+
+                if rows.is_empty() {
+                    break;
+                }
+                let fetched = rows.len();
+
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| BodyCaptureError::Storage(e.to_string()))?;
+
+                for (id, org_id, trace_id, request_enc, response_enc) in &rows {
+                    cursor = *id;
+                    stats.scanned += 1;
+
+                    let request_outcome = self.codec.rekey_blob(
+                        &new_codec,
+                        *org_id,
+                        trace_id,
+                        BodyCaptureKind::Request,
+                        request_enc,
+                    )?;
+                    let response_outcome = match response_enc {
+                        Some(blob) => Some(self.codec.rekey_blob(
+                            &new_codec,
+                            *org_id,
+                            trace_id,
+                            BodyCaptureKind::Response,
+                            blob,
+                        )?),
+                        None => None,
+                    };
+
+                    let new_request = match request_outcome {
+                        RekeyOutcome::Reencrypted(blob) => Some(blob),
+                        RekeyOutcome::AlreadyMigrated => None,
+                    };
+                    let new_response = match response_outcome {
+                        Some(RekeyOutcome::Reencrypted(blob)) => Some(blob),
+                        _ => None,
+                    };
+
+                    // Both columns already current → nothing to write for this
+                    // row (the idempotent / resumable case).
+                    if new_request.is_none() && new_response.is_none() {
+                        stats.already_current += 1;
+                        continue;
+                    }
+
+                    // Update only the column(s) that actually changed; COALESCE
+                    // leaves an already-migrated (or NULL response) column as-is.
+                    sqlx::query(
+                        r#"UPDATE request_body_captures
+                              SET request_enc = COALESCE($1, request_enc),
+                                  response_enc = COALESCE($2, response_enc)
+                            WHERE id = $3"#,
+                    )
+                    .bind(&new_request)
+                    .bind(&new_response)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| BodyCaptureError::Storage(e.to_string()))?;
+                    stats.reencrypted += 1;
+                }
+
+                tx.commit()
+                    .await
+                    .map_err(|e| BodyCaptureError::Storage(e.to_string()))?;
+
+                // A short page means we've reached the end of the table.
+                if (fetched as i64) < batch_size {
+                    break;
+                }
+            }
+
+            Ok(stats)
         }
     }
 
@@ -546,5 +773,224 @@ mod tests {
             }
         }
         assert!(AlwaysRecord.is_capture_enabled(Uuid::from_u128(7)).await);
+    }
+
+    /// Core rotation crypto (no DB): a body blob sealed under the OLD master,
+    /// re-keyed to the NEW master, opens under NEW and not OLD. This is the
+    /// per-column step `reencrypt_all` performs across `request_body_captures`.
+    #[test]
+    fn rekey_moves_blob_to_new_master() {
+        let old = BodyCaptureCodec::new([1u8; 32]);
+        let new = BodyCaptureCodec::new([2u8; 32]);
+        let org_id = Uuid::from_u128(5);
+        let trace_id = "trace-rotate";
+        let plain = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"x"}]}"#;
+
+        let blob_old = old
+            .encrypt(org_id, trace_id, BodyCaptureKind::Request, plain)
+            .unwrap();
+        // Before rotation the blob does NOT open under the new key.
+        assert!(new
+            .decrypt(org_id, trace_id, BodyCaptureKind::Request, &blob_old)
+            .is_err());
+
+        let RekeyOutcome::Reencrypted(blob_new) = old
+            .rekey_blob(&new, org_id, trace_id, BodyCaptureKind::Request, &blob_old)
+            .unwrap()
+        else {
+            panic!("expected a freshly re-encrypted blob");
+        };
+
+        // Re-sealed blob opens under NEW (same plaintext) and NOT under OLD.
+        assert_eq!(
+            new.decrypt(org_id, trace_id, BodyCaptureKind::Request, &blob_new)
+                .unwrap(),
+            plain
+        );
+        assert!(old
+            .decrypt(org_id, trace_id, BodyCaptureKind::Request, &blob_new)
+            .is_err());
+    }
+
+    /// Idempotent / resumable: a blob already sealed under the NEW key (an
+    /// earlier interrupted run migrated it) re-keys to nothing.
+    #[test]
+    fn rekey_skips_already_migrated_blob() {
+        let old = BodyCaptureCodec::new([1u8; 32]);
+        let new = BodyCaptureCodec::new([2u8; 32]);
+        let org_id = Uuid::from_u128(6);
+        let trace_id = "trace-resumed";
+        let already = new
+            .encrypt(org_id, trace_id, BodyCaptureKind::Response, b"done")
+            .unwrap();
+
+        assert_eq!(
+            old.rekey_blob(&new, org_id, trace_id, BodyCaptureKind::Response, &already)
+                .unwrap(),
+            RekeyOutcome::AlreadyMigrated
+        );
+    }
+
+    /// A blob that opens under NEITHER key (corrupt, or sealed under a third
+    /// key) is an error — never silently dropped.
+    #[test]
+    fn rekey_rejects_blob_under_neither_key() {
+        let old = BodyCaptureCodec::new([1u8; 32]);
+        let new = BodyCaptureCodec::new([2u8; 32]);
+        let foreign = BodyCaptureCodec::new([3u8; 32]);
+        let org_id = Uuid::from_u128(7);
+        let trace_id = "trace-foreign";
+        let blob = foreign
+            .encrypt(
+                org_id,
+                trace_id,
+                BodyCaptureKind::Request,
+                b"sealed elsewhere",
+            )
+            .unwrap();
+
+        assert!(old
+            .rekey_blob(&new, org_id, trace_id, BodyCaptureKind::Request, &blob)
+            .is_err());
+        // A truncated blob is malformed under any key.
+        assert!(matches!(
+            old.rekey_blob(&new, org_id, trace_id, BodyCaptureKind::Request, &[0u8; 4]),
+            Err(BodyCaptureError::Malformed)
+        ));
+    }
+
+    /// Live Postgres re-encryption of `request_body_captures`. Gated behind
+    /// `TEST_DATABASE_URL`; run with
+    /// `cargo test -p tt-telemetry --features postgres -- --include-ignored`.
+    /// The table ships from the OSS migrator (migration 0022) but the cloud
+    /// schema may differ, so the test creates the minimal shape it needs and
+    /// clears it first for determinism (use a throwaway test database).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL (Postgres; the test creates + clears its own request_body_captures table) — run with --include-ignored"]
+    async fn reencrypt_all_rekeys_request_body_captures() {
+        use super::postgres::PostgresBodyCaptureWriter;
+
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+
+        // Minimal table shape matching migration 0022. `IF NOT EXISTS` keeps the
+        // test idempotent across re-runs; the DELETE isolates this run.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS request_body_captures (
+                 id            uuid PRIMARY KEY,
+                 org_id        uuid NOT NULL,
+                 api_key_id    uuid NOT NULL,
+                 trace_id      text NOT NULL,
+                 ts            timestamptz NOT NULL,
+                 expires_at    timestamptz NOT NULL,
+                 endpoint      text NOT NULL,
+                 provider      text NOT NULL,
+                 model         text NOT NULL,
+                 request_enc   bytea NOT NULL,
+                 response_enc  bytea,
+                 request_bytes integer NOT NULL,
+                 response_bytes integer,
+                 created_at    timestamptz NOT NULL DEFAULT now(),
+                 UNIQUE (org_id, trace_id)
+               )"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create request_body_captures");
+        sqlx::query("DELETE FROM request_body_captures")
+            .execute(&pool)
+            .await
+            .expect("clear table");
+
+        let old_key = [11u8; 32];
+        let new_key = [22u8; 32];
+        let old_codec = BodyCaptureCodec::new(old_key);
+        let new_codec = BodyCaptureCodec::new(new_key);
+        let org_id = Uuid::now_v7();
+        let trace_id = format!("trace-{}", Uuid::now_v7());
+        let req_plain = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"secret"}]}"#;
+        let resp_plain = br#"{"choices":[{"message":{"content":"answer"}}]}"#;
+
+        let req_enc = old_codec
+            .encrypt(org_id, &trace_id, BodyCaptureKind::Request, req_plain)
+            .unwrap();
+        let resp_enc = old_codec
+            .encrypt(org_id, &trace_id, BodyCaptureKind::Response, resp_plain)
+            .unwrap();
+        let id = Uuid::now_v7();
+        sqlx::query(
+            r#"INSERT INTO request_body_captures
+                 (id, org_id, api_key_id, trace_id, ts, expires_at, endpoint,
+                  provider, model, request_enc, response_enc, request_bytes, response_bytes)
+               VALUES ($1, $2, $3, $4, now(), now() + interval '7 days',
+                       'chat', 'openai', 'gpt-4o', $5, $6, $7, $8)"#,
+        )
+        .bind(id)
+        .bind(org_id)
+        .bind(Uuid::now_v7())
+        .bind(&trace_id)
+        .bind(&req_enc)
+        .bind(&resp_enc)
+        .bind(req_plain.len() as i32)
+        .bind(resp_plain.len() as i32)
+        .execute(&pool)
+        .await
+        .expect("insert capture row");
+
+        // Build the writer with the OLD codec (mirrors `from_env` before rotation).
+        let writer = PostgresBodyCaptureWriter::new(pool.clone(), old_codec.clone());
+        let stats = writer
+            .reencrypt_all_batched(&new_key, 1)
+            .await
+            .expect("reencrypt_all");
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.reencrypted, 1);
+        assert_eq!(stats.already_current, 0);
+
+        // The row now decrypts under the NEW key and not the OLD one.
+        let (req_now, resp_now): (Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT request_enc, response_enc FROM request_body_captures WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("re-read row");
+        assert_eq!(
+            new_codec
+                .decrypt(org_id, &trace_id, BodyCaptureKind::Request, &req_now)
+                .unwrap(),
+            req_plain
+        );
+        assert!(old_codec
+            .decrypt(org_id, &trace_id, BodyCaptureKind::Request, &req_now)
+            .is_err());
+        let resp_now = resp_now.expect("response_enc present");
+        assert_eq!(
+            new_codec
+                .decrypt(org_id, &trace_id, BodyCaptureKind::Response, &resp_now)
+                .unwrap(),
+            resp_plain
+        );
+
+        // Idempotent / resumable: a second pass (still under the OLD writer key)
+        // finds the row already migrated and re-keys nothing.
+        let again = writer
+            .reencrypt_all_batched(&new_key, 1)
+            .await
+            .expect("reencrypt_all (resumed)");
+        assert_eq!(again.scanned, 1);
+        assert_eq!(again.reencrypted, 0);
+        assert_eq!(again.already_current, 1);
+
+        sqlx::query("DELETE FROM request_body_captures WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }

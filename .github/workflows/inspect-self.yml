@@ -1,6 +1,6 @@
 name: inspect-self (dogfood)
 
-# Required check — the 19 Tier-1 rules ship and the repo self-scans clean.
+# Required check — the 21 Tier-1 rules ship and the repo self-scans clean.
 # Any new HIGH or CRITICAL finding blocks merge to main.
 
 on:

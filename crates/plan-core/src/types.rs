@@ -93,6 +93,28 @@ pub struct RequestLog {
     /// for older serialized rows that predate this field.
     #[serde(default)]
     pub task_class: L2TaskClass,
+    /// Measured output-diff savings, USD, that the gateway REALIZED on this
+    /// request at serve time (research Phase 3.4 — reconstructed-artifact minus
+    /// billed-patch tokens, the `request_logs.diff_saved_usd` column). Replay
+    /// cannot forward-project diff for traffic that didn't use it (the row
+    /// carries no prior artifact to re-derive a patch from); this carries the
+    /// ALREADY-realized number so the Plan can attribute per-lever ROI for a
+    /// `diff` route. It is already reflected in this row's
+    /// `baseline_cost_usd - cost_usd`, so the Plan surfaces it as a caveat and
+    /// never folds it on top (double-count guard). `None`/absent for rows that
+    /// predate the column or were served without diff. Skipped from JSON when
+    /// `None` so existing snapshots / persisted inputs stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_saved_usd: Option<f64>,
+    /// Estimated minified-JSON whitespace savings, USD (research Phase 3.1 —
+    /// the gateway's pretty-vs-emitted re-tokenize estimate, the
+    /// `request_logs.minify_saved_est_usd` column). A LABELED ESTIMATE, never
+    /// invoice-reconciled: the Plan surfaces it as an estimated caveat for a
+    /// `minify_json` route and NEVER folds it into the projected-savings
+    /// headline (mirroring the runtime contract). `None`/absent when not
+    /// estimated. Skipped from JSON when `None` (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minify_saved_est_usd: Option<f64>,
 }
 
 /// The L2 task class of a replayed request — the plan-core mirror of the
@@ -218,9 +240,11 @@ pub struct RouteConditions {
 /// identical JSON for the same logical value — a requirement for the Plan
 /// apply round-trip (a `ProposedRoute` serialized by the Plan engine and then
 /// deserialized by the Gateway must carry all fields without loss or
-/// reordering). KNOWN EXCEPTION: the gateway's `flex` / `compress` flags are
-/// not mirrored here (pre-existing drift; both are false-omitted on the wire,
-/// so identity holds whenever they are unset). The
+/// reordering). The `flex` flag IS mirrored (COST-7) — it is a real ~50% rate
+/// cut the replay PROJECTS (see [`crate::cost::project_flex_cost`]), so it must
+/// round-trip. KNOWN EXCEPTION: the gateway's `compress` flag is still not
+/// mirrored here (pre-existing drift; it is false-omitted on the wire, so
+/// identity holds whenever it is unset). The
 /// `route_action_cross_type_lockstep_guard` test below fails to compile when
 /// `tt_routing::RouteAction` grows a field, so any future addition must
 /// explicitly decide the mirror question.
@@ -246,6 +270,20 @@ pub struct RouteAction {
     /// it unchanged (no savings) and surfaces a caveat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+    /// Mirror of `tt_routing::RouteAction::flex` — opt the matched request into
+    /// OpenAI's Flex service tier (`service_tier="flex"`), billed at ~50% of
+    /// standard. UNLIKE the advisory Batch Lane, the gateway applies Flex
+    /// in-band and the discount is REALIZED, so replay PROJECTS it: a flex
+    /// route whose served model carries a catalog Flex rate is priced at that
+    /// rate via [`crate::cost::project_flex_cost`] (the exact shape/precision of
+    /// `project_batch_cost`), the delta folds into projected savings, and a
+    /// per-run caveat counts the affected requests. A served model with no Flex
+    /// rate projects NO discount (never a fabricated 0.5×) and is caveated as
+    /// inapplicable — mirroring the gateway's `flex_not_applied:<model>`
+    /// behavior. Same serde gating as the gateway side: omitted when false
+    /// (back-compat — existing plan JSON/snapshots stay byte-identical).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flex: bool,
     /// Mirror of `tt_routing::RouteAction::batch`. Replay PROJECTS the
     /// discount the Batch Lane would deliver (target priced at its catalog
     /// batch rate — see [`crate::cost::project_batch_cost`]) and surfaces a
@@ -373,6 +411,18 @@ pub struct ModelPricing {
     /// [`Self::batch_input_per_million`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_output_per_million: Option<f64>,
+    /// USD per 1M input tokens under OpenAI's **Flex** service tier
+    /// (`service_tier="flex"`), mirroring `tt_shared::pricing::ModelPricing`.
+    /// `None` = no Flex tier; a `flex` route targeting such a model projects NO
+    /// discount (never a fabricated 0.5×). PRESENCE is the eligibility gate.
+    /// Skipped from JSON when `None` so existing snapshots / persisted plan
+    /// inputs stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flex_input_per_million: Option<f64>,
+    /// USD per 1M output tokens under the Flex service tier. See
+    /// [`Self::flex_input_per_million`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flex_output_per_million: Option<f64>,
 }
 
 /// Configuration knobs that affect projection but aren't per-route. Today
@@ -648,6 +698,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -687,6 +738,7 @@ mod tests {
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -719,6 +771,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: true,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: false,
             traffic_pct: None,
@@ -763,6 +816,7 @@ mod tests {
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
+            flex: false,
             batch: false,
             redact: true,
             traffic_pct: None,
@@ -822,6 +876,28 @@ mod tests {
         assert!(!parsed.batch, "batch must default false");
         let j = serde_json::to_string(&parsed).unwrap();
         assert!(!j.contains("batch"), "batch=false must be omitted: {j}");
+    }
+
+    /// Cross-crate wire-compat for the Flex service-tier flag (COST-7):
+    /// gateway-written JSON carrying `"flex":true` deserializes into the
+    /// plan-core type with the flag set and re-emits the same wire form (same
+    /// relative field order + skip_serializing_if gating), and the flag is
+    /// omitted when false. Mirrors `route_action_batch_wire_compat_with_gateway`
+    /// so the two `RouteAction` shapes stay in lockstep on `flex`.
+    #[test]
+    fn route_action_flex_wire_compat_with_gateway() {
+        let gateway_json = r#"{"target_model":"gpt-5.5","flex":true}"#;
+        let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
+        assert_eq!(plan_action.target_model, "gpt-5.5");
+        assert!(plan_action.flex, "flex must round-trip from gateway JSON");
+        let reemitted = serde_json::to_string(&plan_action).unwrap();
+        assert_eq!(reemitted, gateway_json);
+
+        // Defaults false + omitted when false (back-compat for persisted plans).
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.flex, "flex must default false");
+        let j = serde_json::to_string(&parsed).unwrap();
+        assert!(!j.contains("flex"), "flex=false must be omitted: {j}");
     }
 
     /// Cross-crate wire-compat for the canary fields (`traffic_pct` +
@@ -919,13 +995,13 @@ mod tests {
     /// `tt_plan_core::RouteAction` silently drop it on read (the drift this
     /// branch had to repair for the auto-pause fields).
     ///
-    /// KNOWN PRE-EXISTING DRIFT: `flex` and `compress` are NOT mirrored in
-    /// `tt_plan_core::RouteAction` (they predate this guard); they are set to
-    /// `false` here, where their skip_serializing_if gating omits them from
-    /// the wire form, keeping the byte-identity assertion honest for every
-    /// mirrored field. The output-shaping levers (`format_switch` / `diff`,
-    /// research Phase 3.3 + 3.4) ARE mirrored — round-trip-only, not
-    /// projected by replay.
+    /// `flex` IS now mirrored (COST-7) and set TRUE here so the round-trip
+    /// exercises it. KNOWN REMAINING DRIFT: `compress` is NOT mirrored in
+    /// `tt_plan_core::RouteAction` (pre-existing); it is set `false` here, where
+    /// its skip_serializing_if gating omits it from the wire form, keeping the
+    /// byte-identity assertion honest for every mirrored field. The
+    /// output-shaping levers (`format_switch` / `diff`, research Phase 3.3 +
+    /// 3.4) ARE mirrored — round-trip-only, not projected by replay.
     #[test]
     fn route_action_cross_type_lockstep_guard() {
         let gateway = tt_routing::RouteAction {
@@ -934,7 +1010,7 @@ mod tests {
             fallbacks: vec!["claude-haiku-4-5".to_string()],
             disable_cache: true,
             max_cost_usd: Some(0.25),
-            flex: false,     // not mirrored (pre-existing) — omitted when false
+            flex: true,      // mirrored (COST-7) — round-trips to plan-core
             compress: false, // not mirrored (pre-existing) — omitted when false
             redact: true,
             format_switch: Some("csv".to_string()),
@@ -960,6 +1036,7 @@ mod tests {
         assert_eq!(plan_action.fallbacks, vec!["claude-haiku-4-5"]);
         assert!(plan_action.disable_cache);
         assert_eq!(plan_action.max_cost_usd, Some(0.25));
+        assert!(plan_action.flex, "flex must round-trip from gateway JSON");
         assert!(plan_action.redact);
         assert_eq!(plan_action.format_switch.as_deref(), Some("csv"));
         assert!(!plan_action.diff);

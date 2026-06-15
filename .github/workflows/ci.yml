@@ -24,36 +24,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test-changed:
-    name: cargo test (changed crates)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Detect changed crates
-        id: changed
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          base="${BASE_SHA:-HEAD~1}"
-          changed=$(git diff --name-only "$base"...HEAD | grep -E '^crates/' | awk -F/ '{print $2}' | sort -u | tr '\n' ' ')
-          echo "crates=${changed}" >> "$GITHUB_OUTPUT"
-      - name: Test changed crates
-        if: steps.changed.outputs.crates != ''
-        env:
-          CRATES: ${{ steps.changed.outputs.crates }}
-        run: |
-          for c in $CRATES; do
-            crate_name=$(grep -E '^name' "crates/$c/Cargo.toml" | head -1 | sed -E 's/name *= *"([^"]+)".*/\1/' || true)
-            [ -z "$crate_name" ] || cargo test -p "$crate_name" --no-fail-fast
-          done
-
+  # NOTE: a `test-changed` (changed-crate subset) job used to run here too, but it
+  # was a non-required, redundant subset of `test-workspace` below (the full,
+  # required gate). It was dropped to free runner minutes — `test-workspace`
+  # already covers every crate on every PR.
   test-workspace:
     name: cargo test (workspace)
     runs-on: ubuntu-latest
@@ -119,6 +93,11 @@ jobs:
       # default workspace build does not enable — so scope + feature it here.
       - name: tt-auth Postgres key store (ignored)
         run: cargo test -p tt-auth --features postgres -- --include-ignored
+      # Body-capture master-key re-encryption (TT_MASTER_KEY rotation): re-keys
+      # request_body_captures. Gated behind tt-telemetry's `postgres` feature,
+      # like tt-auth above; creates + clears its own table.
+      - name: tt-telemetry body-capture reencrypt (ignored)
+        run: cargo test -p tt-telemetry --features postgres -- --include-ignored
       # L2 pgvector cache: round-trip + org-A-insert / org-B-miss isolation.
       - name: tt-cache L2 + L1 (ignored)
         run: cargo test -p tt-cache -- --include-ignored

@@ -19,6 +19,28 @@ use tower_http::{
 
 use crate::{middleware, routes, AppState};
 
+/// Per-route request-timeout tiers (ARCH-4).
+///
+/// A single flat 600 s `TimeoutLayer` on every route let a hung *non-streaming*
+/// upstream pin a gateway slot for ten minutes on a thin machine. Instead we
+/// apply two tiers via nested per-group `TimeoutLayer`s:
+///
+/// * [`STREAMING_TIMEOUT_SECS`] — the generous ceiling, reserved for the
+///   completion endpoints that may stream a long-lived response.
+/// * [`SHORT_TIMEOUT_SECS`] — every endpoint that never streams (models,
+///   embeddings, preview, routes API, health/ready/metrics).
+///
+/// Note: `/v1/chat/completions`, `/v1/messages` and `/v1/responses` multiplex
+/// streaming and non-streaming on a single path (decided by the request body's
+/// `stream` flag), so they cannot be given the short tier at the router layer
+/// without truncating legitimate streams. A finer body-aware split for the
+/// *non-streaming* use of those routes would have to live in the chat handler
+/// and is intentionally left out of this router-level fix.
+pub(crate) const STREAMING_TIMEOUT_SECS: u64 = 600;
+/// Short request-timeout tier for endpoints that never stream. See
+/// [`STREAMING_TIMEOUT_SECS`].
+pub(crate) const SHORT_TIMEOUT_SECS: u64 = 60;
+
 /// Build the public router. Returns a fully composed `Router` ready to bind.
 ///
 /// Retrieval middleware is activated when `TT_RETRIEVAL_STORE` and
@@ -36,13 +58,27 @@ pub fn build_router_with_retrieval(
 ) -> Router {
     crate::metrics::install();
 
-    let base = Router::new()
-        .route("/health", get(routes::health::handler))
-        .route("/metrics", get(routes::metrics::handler))
-        .route("/v1/models", get(routes::models::handler))
+    // ARCH-4: per-route timeout tiers. The completion endpoints may stream a
+    // long-lived response and keep the generous ceiling; everything else gets
+    // the short tier so a hung non-streaming upstream can't pin a slot for ten
+    // minutes. Each group carries its own `TimeoutLayer` (applied INSIDE the
+    // shared middleware below), so the per-group 504 still bubbles up through
+    // the outermost latency layer and gets the `X-TokenTrimmer-Latency-Ms`
+    // stamp.
+    let streaming = Router::new()
         .route("/v1/chat/completions", post(routes::chat::handler))
         .route("/v1/messages", post(routes::messages::handler))
         .route("/v1/responses", post(routes::responses::handler))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            std::time::Duration::from_secs(STREAMING_TIMEOUT_SECS),
+        ));
+
+    let short = Router::new()
+        .route("/health", get(routes::health::handler))
+        .route("/ready", get(routes::ready::handler))
+        .route("/metrics", get(routes::metrics::handler))
+        .route("/v1/models", get(routes::models::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))
         .route(
             "/v1/preview",
@@ -58,7 +94,13 @@ pub fn build_router_with_retrieval(
         )
         .route("/v1/routes/:id/pause", post(routes::routes_api::pause))
         .route("/v1/routes/:id/resume", post(routes::routes_api::resume))
-        .route("/v1/routes/:id/savings", get(routes::routes_api::savings));
+        .route("/v1/routes/:id/savings", get(routes::routes_api::savings))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            std::time::Duration::from_secs(SHORT_TIMEOUT_SECS),
+        ));
+
+    let base = streaming.merge(short);
 
     let base = match retrieval {
         Some(rs) => base.layer(axum::middleware::from_fn_with_state(
@@ -76,10 +118,14 @@ pub fn build_router_with_retrieval(
     ))
     .layer(axum::middleware::from_fn(middleware::trace::middleware))
     .layer(TraceLayer::new_for_http())
-    .layer(TimeoutLayer::with_status_code(
-        StatusCode::GATEWAY_TIMEOUT,
-        std::time::Duration::from_secs(600),
-    ))
+    // Request timeouts are applied per-route above (ARCH-4), not as a single
+    // flat layer here, so streaming completions keep the long ceiling while
+    // non-streaming endpoints get a short one.
+    //
+    // CORS is intentionally fully open (any origin/method/header): this is a
+    // bearer-token API with no cookies/ambient credentials, so a permissive
+    // CORS policy grants a browser nothing it couldn't already do server-side
+    // — every request must still carry a valid `Authorization: Bearer` key.
     .layer(
         CorsLayer::new()
             .allow_origin(Any)
@@ -329,6 +375,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ready_route_is_wired_and_returns_200_in_degraded_mode() {
+        // No DB pool / L1 wired (the app() default) → readiness has no
+        // configured hard dependency down, so /ready answers 200 ready.
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["checks"]["postgres"], "not_configured");
     }
 
     #[tokio::test]
@@ -1020,5 +1088,100 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("[sandbox]"));
+    }
+
+    // ── Per-route timeout tiers (ARCH-4) ───────────────────────────────────────
+
+    /// The tier constants are ordered and within the intended band: the short
+    /// tier sits in the 30–60 s window and is strictly tighter than the
+    /// streaming ceiling, which stays at the original 600 s.
+    #[test]
+    fn timeout_tiers_are_ordered_and_sane() {
+        // Bind to runtime locals so the assertions exercise the values rather
+        // than const-folding to a literal (clippy::assertions_on_constants).
+        let short = std::hint::black_box(SHORT_TIMEOUT_SECS);
+        let streaming = std::hint::black_box(STREAMING_TIMEOUT_SECS);
+        assert!(
+            (30..=60).contains(&short),
+            "short tier should be 30–60s, got {short}"
+        );
+        assert_eq!(
+            streaming, 600,
+            "streaming completions keep the 600s ceiling"
+        );
+        assert!(
+            short < streaming,
+            "short tier must be tighter than the streaming ceiling"
+        );
+    }
+
+    /// Proves the per-group timeout wiring this router relies on: a slow handler
+    /// behind the SHORT-tier `TimeoutLayer` is shed with a 504, while a fast
+    /// handler in a separate group with a long timeout is unaffected — and the
+    /// outermost latency middleware still stamps `X-TokenTrimmer-Latency-Ms` on
+    /// the timeout 504 (the property that lets streaming keep 600 s while
+    /// everything else gets the short tier, without losing the latency header).
+    #[tokio::test]
+    async fn per_group_timeout_sheds_slow_route_but_not_fast_group() {
+        async fn slow_handler() -> &'static str {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            "slow"
+        }
+        async fn fast_handler() -> &'static str {
+            "fast"
+        }
+
+        // Mirror production wiring: two route groups, each with its OWN
+        // TimeoutLayer, merged, then the latency middleware applied OUTERMOST.
+        let short_group =
+            Router::new()
+                .route("/short", get(slow_handler))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    std::time::Duration::from_millis(50),
+                ));
+        let long_group =
+            Router::new()
+                .route("/long", get(fast_handler))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    std::time::Duration::from_secs(30),
+                ));
+        let app = short_group
+            .merge(long_group)
+            .layer(axum::middleware::from_fn(middleware::latency::middleware));
+
+        // Slow handler under the short tier → 504, with the latency header still
+        // stamped by the outermost layer.
+        let slow = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/short")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            slow.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "slow handler must be shed by the short-tier timeout"
+        );
+        assert!(
+            slow.headers().contains_key("x-tokentrimmer-latency-ms"),
+            "latency header must be stamped even on the per-route timeout 504"
+        );
+
+        // Fast handler in the long-tier group is unaffected → 200.
+        let fast = app
+            .oneshot(Request::builder().uri("/long").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            fast.status(),
+            StatusCode::OK,
+            "a route in the long-tier group is not throttled by the short tier"
+        );
     }
 }

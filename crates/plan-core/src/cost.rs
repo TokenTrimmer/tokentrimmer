@@ -68,6 +68,28 @@ pub fn project_batch_cost(req: &RequestLog, pricing: &ModelPricing) -> Option<Pr
     })
 }
 
+/// Price one request at the served model's **Flex** service-tier rates (full
+/// input at the Flex-input rate + output at the Flex-output rate — the exact
+/// same shape/precision as [`project_batch_cost`], no cache-discount stacking).
+/// `None` when the entry has no Flex tier: nothing real to project, never a
+/// fabricated 0.5×. Feeds the `RouteAction::flex` projection in
+/// [`crate::replay`]. UNLIKE batch, the gateway applies Flex synchronously and
+/// in-band, so this is a REALIZED discount rather than an advisory one.
+#[must_use]
+pub fn project_flex_cost(req: &RequestLog, pricing: &ModelPricing) -> Option<ProjectedCost> {
+    let (flex_in, flex_out) = match (
+        pricing.flex_input_per_million,
+        pricing.flex_output_per_million,
+    ) {
+        (Some(i), Some(o)) => (i, o),
+        _ => return None,
+    };
+    Some(ProjectedCost {
+        cost_usd: f64::from(req.input_tokens) * flex_in / 1_000_000.0
+            + f64::from(req.output_tokens) * flex_out / 1_000_000.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +120,8 @@ mod tests {
             body: None,
             response_body: None,
             task_class: Default::default(),
+            diff_saved_usd: None,
+            minify_saved_est_usd: None,
         }
     }
 
@@ -109,6 +133,8 @@ mod tests {
             cached_input_per_million: Some(0.3),
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
         };
         let req = sample_request(1_000_000, 1_000_000, 0);
         let p = project_cost(&req, "x", &pricing);
@@ -124,6 +150,8 @@ mod tests {
             cached_input_per_million: Some(0.3),
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
         };
         let req = sample_request(1_000_000, 0, 500_000);
         let p = project_cost(&req, "x", &pricing);
@@ -139,6 +167,8 @@ mod tests {
             cached_input_per_million: None,
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
         };
         let req = sample_request(1_000_000, 0, 500_000);
         let p = project_cost(&req, "x", &pricing);
@@ -157,6 +187,8 @@ mod tests {
             cached_input_per_million: Some(0.5),
             batch_input_per_million: Some(2.50),
             batch_output_per_million: Some(15.00),
+            flex_input_per_million: None,
+            flex_output_per_million: None,
         };
         let req = sample_request(1_000_000, 1_000_000, 0);
         let p = project_batch_cost(&req, &with_batch).expect("batch tier present");
@@ -174,6 +206,37 @@ mod tests {
         );
     }
 
+    /// `project_flex_cost` prices at the entry's REAL catalog Flex rates (full
+    /// input, no cache stacking) and returns `None` — never a fabricated 0.5×
+    /// — when the entry carries no Flex tier. Mirrors
+    /// `project_batch_cost_uses_catalog_rates_or_none`.
+    #[test]
+    fn project_flex_cost_uses_catalog_rates_or_none() {
+        let with_flex = ModelPricing {
+            input_per_million: 5.0,
+            output_per_million: 30.0,
+            cached_input_per_million: Some(0.5),
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: Some(2.50),
+            flex_output_per_million: Some(15.00),
+        };
+        let req = sample_request(1_000_000, 1_000_000, 0);
+        let p = project_flex_cost(&req, &with_flex).expect("flex tier present");
+        // 1M input @ $2.50 + 1M output @ $15.00 = $17.50.
+        assert!((p.cost_usd - 17.50).abs() < 1e-9, "got {}", p.cost_usd);
+
+        let without_flex = ModelPricing {
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            ..with_flex
+        };
+        assert!(
+            project_flex_cost(&req, &without_flex).is_none(),
+            "no flex tier → None, never a fabricated discount"
+        );
+    }
+
     #[test]
     fn project_cost_clamps_cached_to_input() {
         let pricing = ModelPricing {
@@ -182,6 +245,8 @@ mod tests {
             cached_input_per_million: Some(0.3),
             batch_input_per_million: None,
             batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
         };
         // cached_tokens > input_tokens — should clamp.
         let req = sample_request(1_000, 0, 5_000);

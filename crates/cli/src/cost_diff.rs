@@ -7,15 +7,32 @@
 //!
 //! Rates come from [`tt_preview::pricing`] (the shared catalog) — no network,
 //! no cloud. We cannot recover the real prompt size from source, so per-call
-//! cost is projected against a fixed [`STD_INPUT_TOKENS`]/[`STD_OUTPUT_TOKENS`]
-//! profile and labelled as such; the *delta* between models is what matters.
+//! cost is projected against a fixed token profile ([`CostProfile`], default
+//! [`STD_INPUT_TOKENS`]/[`STD_OUTPUT_TOKENS`]) and labelled as such; the *delta*
+//! between models is what matters. A repo may override the profile via a
+//! `.tokentrimmer/cost-profile.toml` file (see [`CostProfile::load_from_repo`]).
 //!
-//! Detection is deliberately simple and documented: a `model`-keyed string
-//! assignment on an added/removed line — `model = "…"`, `model: "…"`,
-//! `"model": "…"`, `model="…"` (single or double quotes). It intentionally
-//! does not try to parse every host language's call graph.
+//! **Cross-language by construction.** [`analyze`] operates on the raw unified
+//! diff text — it never parses a host language — so the cost-diff gate works on
+//! *any* repository's diff regardless of language. (The language-specific lint
+//! rule engine is a separate concern.)
+//!
+//! Detection is deliberately simple and documented. On each added/removed line
+//! we match a key that *contains* the word `model` (`model`, `MODEL`,
+//! `OPENAI_MODEL`, `model_name`, `chat_model`, `"model"`), a `:` or `=`, then a
+//! model id in two forms:
+//!
+//! * **Quoted** — `model = "…"`, `model: "…"`, `"model": "…"`, `MODEL="…"`
+//!   (single or double quotes). Covers code, JSON, YAML and TOML.
+//! * **Unquoted** — env/YAML/TOML style such as `OPENAI_MODEL=gpt-4o` or
+//!   `model: gpt-4o`. To avoid catching variable names or keywords
+//!   (`model = None`, `model = self.default`), an unquoted value must look like
+//!   a model id (contain at least one digit, `-`, or `/`).
+//!
+//! It intentionally does not try to parse every host language's call graph.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -27,6 +44,68 @@ use tt_preview::pricing;
 pub const STD_INPUT_TOKENS: u32 = 1_000;
 /// Representative output-token count for the projected per-call cost.
 pub const STD_OUTPUT_TOKENS: u32 = 500;
+
+/// Token profile used to project per-call cost. Defaults to the fixed standard
+/// profile ([`STD_INPUT_TOKENS`] / [`STD_OUTPUT_TOKENS`]); a repo may override
+/// it (e.g. to reflect its typical prompt size) via a per-repo config file —
+/// see [`CostProfile::load_from_repo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CostProfile {
+    /// Representative input-token count per call.
+    pub input_tokens: u32,
+    /// Representative output-token count per call.
+    pub output_tokens: u32,
+}
+
+impl Default for CostProfile {
+    fn default() -> Self {
+        Self {
+            input_tokens: STD_INPUT_TOKENS,
+            output_tokens: STD_OUTPUT_TOKENS,
+        }
+    }
+}
+
+impl CostProfile {
+    /// Load a per-repo token profile from
+    /// `<repo_root>/.tokentrimmer/cost-profile.toml` if present, else the
+    /// default standard profile.
+    ///
+    /// Infallible by design: an absent, unreadable, malformed, or partial file
+    /// falls back to the default (a bad config must never break the CI gate).
+    /// Recognised keys (both optional): `input_tokens`, `output_tokens`.
+    #[must_use]
+    pub fn load_from_repo(repo_root: &Path) -> Self {
+        let path = repo_root.join(".tokentrimmer").join("cost-profile.toml");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| Self::from_toml_str(&text))
+            .unwrap_or_default()
+    }
+
+    /// Parse a profile from TOML text, falling back to the default for any
+    /// missing or non-positive field. Returns `None` only when the TOML itself
+    /// is malformed.
+    fn from_toml_str(text: &str) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            input_tokens: Option<u32>,
+            output_tokens: Option<u32>,
+        }
+        let raw: Raw = toml::from_str(text).ok()?;
+        let d = Self::default();
+        Some(Self {
+            input_tokens: raw
+                .input_tokens
+                .filter(|v| *v > 0)
+                .unwrap_or(d.input_tokens),
+            output_tokens: raw
+                .output_tokens
+                .filter(|v| *v > 0)
+                .unwrap_or(d.output_tokens),
+        })
+    }
+}
 
 /// Per-model cost contribution within a diff.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -63,20 +142,57 @@ impl CostDiffReport {
     }
 }
 
-/// Matches a `model`-keyed string assignment and captures the model id.
-fn model_regex() -> &'static Regex {
+/// Matches a `model`-keyed assignment with a **quoted** value and captures the
+/// model id. The key is any identifier that contains the word `model` (so
+/// `model`, `MODEL`, `OPENAI_MODEL`, `model_name`, `chat_model`, and the JSON
+/// `"model"` key all qualify), then `:` or `=`, then a single/double-quoted id.
+/// Covers code, JSON, YAML and TOML where the model id is quoted.
+fn quoted_model_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // (?i): case-insensitive key. The key is a whole word `model` with an
-        // optional closing quote (for `"model"`), then `:` or `=`, then a
-        // single- or double-quoted model id.
-        Regex::new(r#"(?i)\bmodel"?\s*[:=]\s*['"]([A-Za-z0-9._/\-]+)['"]"#)
-            .expect("model regex is valid")
+        Regex::new(r#"(?i)\b[a-z0-9_]*model[a-z0-9_]*"?\s*[:=]\s*['"]([A-Za-z0-9._/\-]+)['"]"#)
+            .expect("quoted model regex is valid")
     })
 }
 
-/// Parse a unified diff and build a [`CostDiffReport`].
+/// Matches a `model`-keyed assignment with an **unquoted** value (env / YAML /
+/// TOML style: `OPENAI_MODEL=gpt-4o`, `MODEL=o3`, `model: gpt-4o`). To avoid
+/// catching variable names or language keywords (`model = None`,
+/// `model = self.default`), the unquoted value must look like a model id —
+/// i.e. contain at least one digit, `-`, or `/`. This is mutually exclusive
+/// with [`quoted_model_regex`] on any given assignment (a quoted value starts
+/// with `'`/`"`, which this pattern's value class rejects), so the two never
+/// double-count the same reference.
+fn unquoted_model_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b[a-z0-9_]*model[a-z0-9_]*\s*[:=]\s*([a-z0-9._]*[0-9/\-][a-z0-9._/\-]*)"#,
+        )
+        .expect("unquoted model regex is valid")
+    })
+}
+
+/// Record one model reference against the added/removed counters.
+fn bump(counts: &mut BTreeMap<String, (u32, u32)>, model: &str, is_add: bool) {
+    let entry = counts.entry(model.to_string()).or_default();
+    if is_add {
+        entry.0 += 1;
+    } else {
+        entry.1 += 1;
+    }
+}
+
+/// Parse a unified diff and build a [`CostDiffReport`] under the default
+/// standard token profile. Cross-language: operates purely on the raw unified
+/// diff, so it works on any repository's diff regardless of language.
 pub fn analyze(diff_text: &str) -> CostDiffReport {
+    analyze_with_profile(diff_text, &CostProfile::default())
+}
+
+/// Like [`analyze`] but projects per-call cost against an explicit token
+/// [`CostProfile`] (e.g. one loaded from `.tokentrimmer/cost-profile.toml`).
+pub fn analyze_with_profile(diff_text: &str, profile: &CostProfile) -> CostDiffReport {
     // model -> (added, removed)
     let mut counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
 
@@ -92,14 +208,13 @@ pub fn analyze(diff_text: &str) -> CostDiffReport {
             continue;
         };
 
-        for cap in model_regex().captures_iter(content) {
-            let model = cap[1].to_string();
-            let entry = counts.entry(model).or_default();
-            if is_add {
-                entry.0 += 1;
-            } else {
-                entry.1 += 1;
-            }
+        // Quoted and unquoted forms are mutually exclusive per assignment, so
+        // scanning both never double-counts the same reference.
+        for cap in quoted_model_regex().captures_iter(content) {
+            bump(&mut counts, &cap[1], is_add);
+        }
+        for cap in unquoted_model_regex().captures_iter(content) {
+            bump(&mut counts, &cap[1], is_add);
         }
     }
 
@@ -111,7 +226,7 @@ pub fn analyze(diff_text: &str) -> CostDiffReport {
         match pricing::lookup(&model) {
             Ok(hit) => {
                 let projected_call_usd =
-                    pricing::cost_usd(STD_INPUT_TOKENS, STD_OUTPUT_TOKENS, &hit);
+                    pricing::cost_usd(profile.input_tokens, profile.output_tokens, &hit);
                 net_projected_usd += (f64::from(added) - f64::from(removed)) * projected_call_usd;
                 models.push(ModelDelta {
                     model,
@@ -134,9 +249,16 @@ pub fn analyze(diff_text: &str) -> CostDiffReport {
     }
 }
 
-/// Render a [`CostDiffReport`] as markdown suitable for a PR comment / GitHub
-/// check-run summary.
+/// Render a [`CostDiffReport`] as markdown (default standard token profile)
+/// suitable for a PR comment / GitHub check-run summary.
 pub fn format_markdown(report: &CostDiffReport) -> String {
+    format_markdown_with_profile(report, &CostProfile::default())
+}
+
+/// Like [`format_markdown`] but labels the projection with the given token
+/// [`CostProfile`] (must match the profile passed to [`analyze_with_profile`]).
+pub fn format_markdown_with_profile(report: &CostDiffReport, profile: &CostProfile) -> String {
+    let (n_in, n_out) = (profile.input_tokens, profile.output_tokens);
     let mut out = String::new();
     out.push_str("## 💸 TokenTrimmer cost-diff\n\n");
 
@@ -152,12 +274,12 @@ pub fn format_markdown(report: &CostDiffReport) -> String {
     // test, or the gate will silently stop failing.
     let verdict = if report.net_projected_usd > 0.0 {
         format!(
-            "⚠️ **Projected cost increase: +${:.6}/call** (standard profile: {STD_INPUT_TOKENS} in / {STD_OUTPUT_TOKENS} out)",
+            "⚠️ **Projected cost increase: +${:.6}/call** (profile: {n_in} in / {n_out} out)",
             report.net_projected_usd
         )
     } else if report.net_projected_usd < 0.0 {
         format!(
-            "✅ **Projected saving: −${:.6}/call** (standard profile: {STD_INPUT_TOKENS} in / {STD_OUTPUT_TOKENS} out)",
+            "✅ **Projected saving: −${:.6}/call** (profile: {n_in} in / {n_out} out)",
             report.net_projected_usd.abs()
         )
     } else {
@@ -165,6 +287,13 @@ pub fn format_markdown(report: &CostDiffReport) -> String {
     };
     out.push_str(&verdict);
     out.push_str("\n\n");
+
+    // Framing notes. The cross-language note (PROD-11) and the fixed-profile
+    // caveat (PROD-8) MUST NOT contain the literal "Projected cost increase"
+    // (the gate substring above), or a green diff would falsely trip the gate.
+    out.push_str(&format!(
+        "> ℹ️ Cross-language: this gate reads the raw unified diff, so it works on **any** repo's diff regardless of language.\n>\n> ⚠️ Caveat: a green result does **not** guarantee the change is free of any possible cost regression. Costs use a fixed {n_in}/{n_out}-token profile and do not see prompt-size changes or per-call volume.\n\n"
+    ));
 
     if !report.models.is_empty() {
         out.push_str("| Model | Provider | +added | −removed | $/call (std) |\n");
@@ -310,5 +439,184 @@ mod tests {
         // No change MUST NOT render the gate substring either.
         let no_change = format_markdown(&analyze("+just text\n"));
         assert!(!no_change.contains(GATE_SUBSTRING));
+    }
+
+    // ── PROD-8: extended detection forms ───────────────────────────────────────
+
+    #[test]
+    fn detects_uppercase_constant_assignment() {
+        // `MODEL = "…"` — a constant/config assignment, not an inline call.
+        let r = analyze("+MODEL = \"gpt-4o\"\n");
+        let m = r.models.iter().find(|m| m.model == "gpt-4o").unwrap();
+        assert_eq!((m.added, m.removed), (1, 0));
+    }
+
+    #[test]
+    fn detects_env_style_unquoted_values() {
+        // `.env` / shell style: prefixed key, unquoted value, no spaces.
+        let diff = "+OPENAI_MODEL=gpt-4o\n+MODEL=o3\n";
+        let r = analyze(diff);
+        assert!(
+            r.models.iter().any(|m| m.model == "gpt-4o" && m.added == 1),
+            "OPENAI_MODEL=gpt-4o should be detected; got {:?}",
+            r.models
+        );
+        assert!(r.models.iter().any(|m| m.model == "o3" && m.added == 1));
+    }
+
+    #[test]
+    fn detects_unquoted_yaml_value() {
+        // YAML config with an unquoted scalar value.
+        let r = analyze("+  model: claude-sonnet-4-6\n");
+        assert!(
+            r.models.iter().any(|m| m.model == "claude-sonnet-4-6"),
+            "unquoted YAML model value should be detected; got {:?}",
+            r.models
+        );
+    }
+
+    #[test]
+    fn detects_prefixed_quoted_constant() {
+        // `LLM_MODEL: "…"` — prefixed identifier, quoted value (TOML/JSON-ish).
+        let r = analyze("+LLM_MODEL = \"gpt-4o-mini\"\n");
+        assert!(r.models.iter().any(|m| m.model == "gpt-4o-mini"));
+    }
+
+    #[test]
+    fn unquoted_ignores_non_model_values() {
+        // Variable assignments / keywords whose RHS is not a model id must NOT
+        // be captured (no digit/`-`/`/` in the value).
+        let diff = "+model = None\n+model = self.default\n+model = chosen_model\n";
+        let r = analyze(diff);
+        assert!(r.models.is_empty(), "models = {:?}", r.models);
+        assert!(
+            r.unknown_models.is_empty(),
+            "unknown = {:?}",
+            r.unknown_models
+        );
+    }
+
+    #[test]
+    fn quoted_and_unquoted_do_not_double_count() {
+        // A quoted assignment must be counted exactly once (only the quoted
+        // regex fires; the unquoted regex's value class rejects the leading
+        // quote).
+        let r = analyze("+model = \"gpt-4o\"\n");
+        let m = r.models.iter().find(|m| m.model == "gpt-4o").unwrap();
+        assert_eq!((m.added, m.removed), (1, 0), "must count once, not twice");
+    }
+
+    // ── PROD-8: fixed-profile caveat + PROD-11 cross-language framing ──────────
+
+    #[test]
+    fn markdown_includes_caveat_and_cross_language_note() {
+        // A genuine saving (swap flagship → mini) → green verdict.
+        let saving = "-client.chat(model=\"gpt-4o\")\n+client.chat(model=\"gpt-4o-mini\")\n";
+        let report = analyze(saving);
+        assert!(!report.is_increase(), "fixture must project a saving");
+        let md = format_markdown(&report);
+        // Fixed-profile caveat present.
+        assert!(
+            md.contains("Caveat") && md.contains("fixed") && md.contains("profile"),
+            "markdown should carry the fixed-profile caveat; got:\n{md}"
+        );
+        // Cross-language framing present.
+        assert!(
+            md.contains("Cross-language") && md.contains("any"),
+            "markdown should frame the gate as cross-language; got:\n{md}"
+        );
+        // The caveat/notes must never contain the gate substring on a green
+        // diff, or it would falsely trip the fail-on-increase gate.
+        assert!(
+            !md.contains("Projected cost increase"),
+            "a saving diff must not contain the gate substring; got:\n{md}"
+        );
+    }
+
+    // ── PROD-8: per-repo token profile override ────────────────────────────────
+
+    #[test]
+    fn profile_overrides_projected_cost() {
+        let diff = "+client.chat(model=\"gpt-4o\")\n";
+        let default_report = analyze(diff);
+        // Double both token counts → projected per-call cost (and net) doubles.
+        let doubled = CostProfile {
+            input_tokens: STD_INPUT_TOKENS * 2,
+            output_tokens: STD_OUTPUT_TOKENS * 2,
+        };
+        let doubled_report = analyze_with_profile(diff, &doubled);
+        let d0 = default_report.models[0].projected_call_usd;
+        let d1 = doubled_report.models[0].projected_call_usd;
+        assert!(d0 > 0.0, "default projected cost should be positive");
+        assert!(
+            (d1 - 2.0 * d0).abs() < 1e-12,
+            "doubling the profile should double the projection: {d0} -> {d1}"
+        );
+    }
+
+    #[test]
+    fn cost_profile_from_toml_full_partial_and_malformed() {
+        // Full override.
+        let full = CostProfile::from_toml_str("input_tokens = 4000\noutput_tokens = 1000\n")
+            .expect("valid toml");
+        assert_eq!((full.input_tokens, full.output_tokens), (4000, 1000));
+
+        // Partial: only input given → output falls back to default.
+        let partial = CostProfile::from_toml_str("input_tokens = 4000\n").expect("valid toml");
+        assert_eq!(partial.input_tokens, 4000);
+        assert_eq!(partial.output_tokens, STD_OUTPUT_TOKENS);
+
+        // Non-positive values fall back to default.
+        let zero = CostProfile::from_toml_str("input_tokens = 0\noutput_tokens = 0\n")
+            .expect("valid toml");
+        assert_eq!(zero, CostProfile::default());
+
+        // Malformed TOML → None (caller falls back to default).
+        assert!(CostProfile::from_toml_str("input_tokens = = oops").is_none());
+
+        // Empty / unrelated keys → default.
+        assert_eq!(
+            CostProfile::from_toml_str("unrelated = 1\n").unwrap(),
+            CostProfile::default()
+        );
+    }
+
+    #[test]
+    fn load_from_repo_defaults_when_absent_and_reads_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent file → default.
+        assert_eq!(
+            CostProfile::load_from_repo(dir.path()),
+            CostProfile::default()
+        );
+
+        // Present file → parsed.
+        let cfg_dir = dir.path().join(".tokentrimmer");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("cost-profile.toml"),
+            "input_tokens = 8000\noutput_tokens = 2000\n",
+        )
+        .unwrap();
+        let loaded = CostProfile::load_from_repo(dir.path());
+        assert_eq!((loaded.input_tokens, loaded.output_tokens), (8000, 2000));
+    }
+
+    #[test]
+    fn markdown_with_profile_shows_profile_numbers() {
+        let diff = "+client.chat(model=\"gpt-4o-mini\")\n";
+        let profile = CostProfile {
+            input_tokens: 3000,
+            output_tokens: 700,
+        };
+        let md = format_markdown_with_profile(&analyze_with_profile(diff, &profile), &profile);
+        assert!(
+            md.contains("3000 in / 700 out"),
+            "verdict should reflect the custom profile; got:\n{md}"
+        );
+        assert!(
+            md.contains("3000/700-token profile"),
+            "caveat should reflect the custom profile; got:\n{md}"
+        );
     }
 }

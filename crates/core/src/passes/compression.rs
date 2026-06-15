@@ -1,9 +1,36 @@
 //! Compression pass #1 — a conservative, content-lossless trim of *non-prose*
 //! request blocks.
 //!
-//! This is the pass that makes the product's name true: it removes input tokens
-//! a request never needed, without altering meaning. It runs **only** when a
-//! matched route opted in (`RouteAction::compress`) and is **off by default**.
+//! It runs **only** when a matched route opted in (`RouteAction::compress`) and
+//! is **off by default**.
+//!
+//! # Where "compression" actually moves billed tokens
+//!
+//! Be honest about this pass's reach: its edits are whitespace / blank-line /
+//! adjacent-duplicate trims on the **volatile tail**, and under BPE tokenization
+//! those move **~0 billed input tokens** on real traffic — a run of newlines or
+//! trailing spaces collapses to the same token count, and on the dominant
+//! cache-qualified multi-turn shape the whole message list is the *stable
+//! prefix* this pass cannot touch by type, so it no-ops entirely. It is kept as
+//! a safe, lossless canonicalizer (it never inflates and never busts cache), not
+//! as the product's headline saving.
+//!
+//! The real input-saving levers — what "compression" should be read to mean
+//! internally — live elsewhere and DO move billed tokens:
+//!
+//! - [`agentic_budget::ElidePass`](crate::passes::agentic_budget::ElidePass) —
+//!   lossless field-drop / JSON-minify of stale KNOWN-tool results.
+//! - [`agentic_budget::SupersedePass`](crate::passes::agentic_budget::SupersedePass)
+//!   — drops the payload of a stale tool result that a later **identical
+//!   re-issued** call supersedes (a genuine token-moving transform on the
+//!   multi-turn agentic shape).
+//! - [`agentic_budget::SummarizeStep`](crate::passes::agentic_budget::SummarizeStep)
+//!   — judge-gated lossy summary of older tool blocks (Sub-lever 2b).
+//! - the retrieval middleware ([`crate::middleware::retrieval`]) — trims
+//!   oversized context BEFORE it is ever embedded into the request.
+//!
+//! All of those ride the same token-true gate and cache-span invariant as this
+//! pass; they simply operate on the levers that actually reduce billed input.
 //!
 //! # What it touches (non-prose only, VOLATILE TAIL only)
 //!

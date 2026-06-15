@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - 'crates/**'
+      - 'sdk-python/**'
       - 'sdk-typescript/**'
       - 'n8n-nodes-tokentrimmer/**'
       - 'Cargo.toml'
@@ -17,6 +18,7 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'sdk-python/**'
       - 'sdk-typescript/**'
       - 'n8n-nodes-tokentrimmer/**'
       - 'Cargo.toml'
@@ -104,4 +106,34 @@ jobs:
         with:
           name: n8n-lcov
           path: n8n-nodes-tokentrimmer/coverage/lcov.info
+          if-no-files-found: warn
+
+  python-sdk:
+    name: Python SDK pytest coverage artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      # Editable install so coverage maps back to sdk-python/tokentrimmer; the
+      # [test] extra pulls pytest/pytest-asyncio/respx (see pyproject.toml).
+      - name: Install (SDK + test deps + coverage.py)
+        run: pip install -e "sdk-python[test]" "coverage>=7"
+      - name: Collect coverage
+        # coverage.py emits lcov to mirror the rust/ts/n8n artifacts. --source
+        # scopes measurement to the package; the run is non-blocking.
+        run: |
+          mkdir -p sdk-python/coverage
+          cd sdk-python
+          python -m coverage run --source=tokentrimmer -m pytest tests/ -q
+          python -m coverage lcov -o coverage/lcov.info
+      - name: Upload Python SDK coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: python-sdk-lcov
+          path: sdk-python/coverage/lcov.info
           if-no-files-found: warn

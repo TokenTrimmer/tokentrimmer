@@ -15,7 +15,9 @@
 //! * It does **not** verify `tt_test_*` sandbox keys against the key store —
 //!   the chat handler short-circuits sandbox traffic to a deterministic
 //!   synthetic response before touching any provider, so verification would
-//!   be wasted work.
+//!   be wasted work. The sandbox path is still subject to the per-IP rate cap
+//!   ([`crate::middleware::argon2_cap`]) so an unauthenticated flood of
+//!   `tt_test_*` requests cannot pin slots unthrottled (SEC-9).
 //! * It does **not** look up provider credentials. The chat handler does
 //!   that, because credential lookup is per-provider and the provider isn't
 //!   resolved until the model is parsed from the request body.
@@ -25,7 +27,7 @@
 //! | Header value                | Outcome                                          |
 //! | --------------------------- | ------------------------------------------------ |
 //! | (none)                      | pass through                                     |
-//! | `Bearer tt_test_…`          | pass through (sandbox handled downstream)        |
+//! | `Bearer tt_test_…`          | per-IP cap → pass through (sandbox downstream) or 429 |
 //! | `Bearer tt_live_…` + valid  | `ApiKeyContext` attached as extension; continue  |
 //! | `Bearer tt_live_…` + invalid| **401 Unauthorized**                             |
 //! | `Bearer <other format>`     | pass through (forward-compat with future schemes)|
@@ -45,6 +47,33 @@ use crate::middleware::key_cache::CacheLookup;
 use crate::tier_resolver::resolve_or_free;
 use crate::{ApiError, AppState, DOGFOOD_ORG_ID};
 
+/// Fires the SEC-6 non-loopback dogfood warning at most once per process.
+static DOGFOOD_NON_LOOPBACK_WARN: std::sync::Once = std::sync::Once::new();
+
+/// Loud, fire-once warning (SEC-6): dogfood routing is enabled but the gateway
+/// is not bound to loopback, so the anonymous dogfood-org stamp is disabled
+/// (fail closed). Escalates the wording when a credential store is wired —
+/// that is the case where stamping anonymous traffic as the dogfood org could
+/// otherwise leak the dogfood org's upstream provider credentials.
+fn warn_dogfood_non_loopback_once(state: &AppState) {
+    DOGFOOD_NON_LOOPBACK_WARN.call_once(|| {
+        let has_credential_store = state.credential_store.is_some();
+        let detail = if has_credential_store {
+            "A credential store IS wired: without this guard, anonymous callers would be \
+             treated as the dogfood org and could spend its upstream provider credentials."
+        } else {
+            "No credential store is wired, but anonymous callers would still inherit the \
+             dogfood org's routes and budget."
+        };
+        tracing::warn!(
+            credential_store = has_credential_store,
+            "SEC-6: dogfood routing (TT_DOGFOOD_GROQ_ROUTING) is enabled on a NON-loopback bind \
+             — refusing to stamp anonymous requests with the dogfood org (fail closed). {detail} \
+             Bind loopback (TT_BIND_ADDR=127.0.0.1) or unset TT_DOGFOOD_GROQ_ROUTING."
+        );
+    });
+}
+
 /// Axum `from_fn_with_state`-compatible middleware function.
 pub async fn middleware(
     State(state): State<AppState>,
@@ -56,8 +85,25 @@ pub async fn middleware(
     let mut org_id: Option<Uuid> = None;
 
     if let Some(token) = extract_bearer(&req) {
-        // tt_test_* short-circuits to sandbox in the chat handler. No verify needed.
+        // tt_test_* short-circuits to a synthetic sandbox response in the chat
+        // handler — no key-store verify and no provider/credential dispatch. It
+        // must NOT, however, bypass the per-IP rate cap: an unauthenticated
+        // flood of distinct tt_test_* tokens would otherwise pin gateway slots
+        // unthrottled (SEC-9). Charge the same per-IP cap used to guard the
+        // argon2 cold path BEFORE letting the request through; over the cap we
+        // shed with 429 + Retry-After. The synthetic-response behaviour is
+        // unchanged for traffic under the cap.
         if token.starts_with("tt_test_") {
+            let client_ip = crate::middleware::argon2_cap::client_ip(req.headers());
+            if let crate::middleware::argon2_cap::CapDecision::Reject { retry_after_secs } =
+                state.argon2_cap.check(client_ip)
+            {
+                tracing::debug!(
+                    ip = %client_ip,
+                    "auth: per-IP cap exceeded on sandbox (tt_test_) path, shedding"
+                );
+                return Ok(verify_cap_response(retry_after_secs));
+            }
             return Ok(next.run(req).await);
         }
         // tt_live_* needs verification against the key store.
@@ -78,7 +124,34 @@ pub async fn middleware(
             let token_hash = crate::middleware::key_cache::hash_token(&token);
             let cache = &state.verify_cache;
 
-            let ctx_opt = match cache.get(&token_hash) {
+            let mut lookup = cache.get(&token_hash);
+
+            // Cross-instance revocation (SEC-4): a positive verify-cache hit is
+            // honored only if the key is not marked revoked in the shared
+            // registry (the same Redis L1 uses). A revoke on ANY replica SETs
+            // the marker; here a marked hit is downgraded to a Miss so the cold
+            // path re-runs argon2 against the key store (which rejects the
+            // revoked row → 401). This closes the per-replica staleness window
+            // that the local-only `evict_key_id` leaves open on every replica
+            // that didn't process the revoke. Only positive hits are checked
+            // (one Redis GET on the fast path); Failure/Miss skip it. Fails
+            // open: no registry wired or a backend error honors the cached
+            // positive (degrading to the documented `POSITIVE_TTL_SECS` window).
+            if let CacheLookup::Hit(hit_ctx) = &lookup {
+                let key_id = hit_ctx.key_id;
+                if let Some(reg) = state.revocation.as_ref() {
+                    if reg.is_revoked(key_id).await {
+                        tracing::debug!(
+                            %key_id,
+                            "auth: positive cache hit on a revoked key — forcing re-verify"
+                        );
+                        cache.evict_key_id(key_id);
+                        lookup = CacheLookup::Miss;
+                    }
+                }
+            }
+
+            let ctx_opt = match lookup {
                 CacheLookup::Hit(cached_ctx) => {
                     tracing::trace!("auth: cache hit, skipping argon2");
                     Some(cached_ctx)
@@ -150,15 +223,26 @@ pub async fn middleware(
         }
         // Any other token format passes through unchallenged — forward-compat.
     } else if state.dogfood_enabled {
-        // No bearer token + dogfood mode: stamp the fixed dogfood org id so
-        // the routing engine can match the pre-seeded dogfood route. This is
+        // No bearer token + dogfood mode: stamp the fixed dogfood org id so the
+        // routing engine can match the pre-seeded dogfood route. This is
         // internal-only; production requests always carry a tt_live_* key.
-        req.extensions_mut().insert(ApiKeyContext {
-            key_id: Uuid::nil(),
-            org_id: DOGFOOD_ORG_ID,
-            tier: None,
-        });
-        org_id = Some(DOGFOOD_ORG_ID);
+        //
+        // SEC-6 fail-closed guard: stamping a fixed org identity onto anonymous
+        // traffic is only safe on a loopback bind. On a shared/public bind it
+        // would treat every stranger as the dogfood org (and, with a credential
+        // store wired, could spend the dogfood org's upstream credentials), so
+        // we stamp ONLY when the bind is loopback. Off loopback the request
+        // passes through unstamped (anonymous) and we log a loud one-time warning.
+        if state.dogfood_active() {
+            req.extensions_mut().insert(ApiKeyContext {
+                key_id: Uuid::nil(),
+                org_id: DOGFOOD_ORG_ID,
+                tier: None,
+            });
+            org_id = Some(DOGFOOD_ORG_ID);
+        } else {
+            warn_dogfood_non_loopback_once(&state);
+        }
     }
 
     // Pre-flight budget gate for identified orgs. Anonymous/dev requests
@@ -711,6 +795,129 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // (e2) SEC-4: a revoke fanned out via the cross-instance RevocationRegistry
+    //      forces a re-verify on a PEER replica that still has a warm positive
+    //      entry (and never processed the local evict).
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cross_instance_revocation_marker_forces_reverify() {
+        use tt_cache::memory::InMemoryL1Cache;
+
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_xinstance999";
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        // A revocation registry backed by a mock Redis (InMemoryL1Cache),
+        // shared with the peer that performs the revoke below.
+        let registry = Arc::new(crate::middleware::key_cache::RevocationRegistry::new(
+            Arc::new(InMemoryL1Cache::new()),
+        ));
+        let mut app = state_with_store(store.clone());
+        app.revocation = Some(registry.clone());
+        let router = build_router(app);
+
+        // r1 warms a positive verify-cache entry on THIS replica.
+        let r1 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r1");
+        assert_eq!(r1.status(), StatusCode::OK, "pre-revoke should succeed");
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+
+        // A PEER replica revokes the key: store row revoked + cross-instance
+        // marker SET. THIS replica did not process the revoke locally (no
+        // evict_key_id), so its positive entry is still warm — the marker is
+        // the only signal it has.
+        let (key_id, key_org) = {
+            let g = store.by_prefix.lock().unwrap();
+            let k = g.get(&plaintext[..12]).unwrap();
+            (k.id, k.org_id)
+        };
+        store
+            .revoke(key_id, key_org, Utc::now())
+            .await
+            .expect("revoke");
+        registry.mark_revoked(key_id).await;
+
+        // r2 hits the warm positive entry, but the marker downgrades it to a
+        // miss → argon2 re-runs against the now-revoked store row → 401.
+        let r2 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r2");
+        assert_eq!(
+            r2.status(),
+            StatusCode::UNAUTHORIZED,
+            "cross-instance marker must force a re-verify and reject the revoked key"
+        );
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            2,
+            "argon2 must re-run after the marker downgrades the hit to a miss"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (e3) SEC-4 control: WITHOUT a registry, a revoke on a peer leaves this
+    //      replica's warm positive entry stale (the documented per-replica
+    //      window the registry is designed to close).
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn without_registry_stale_positive_is_honored() {
+        let org = Uuid::new_v4();
+        let plaintext = "tt_live_noregistry00";
+
+        let store = CountingKeyStore::new();
+        seed_key(&store, org, plaintext).await;
+
+        // state_with_store leaves `revocation` None — no cross-instance channel.
+        let state = state_with_store(store.clone());
+        let router = build_router(state);
+
+        let r1 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r1");
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+
+        // Peer revokes the store row, but there is no marker and no local evict.
+        let (key_id, key_org) = {
+            let g = store.by_prefix.lock().unwrap();
+            let k = g.get(&plaintext[..12]).unwrap();
+            (k.id, k.org_id)
+        };
+        store
+            .revoke(key_id, key_org, Utc::now())
+            .await
+            .expect("revoke");
+
+        // The warm positive entry is still served — bounded only by the TTL.
+        let r2 = router
+            .clone()
+            .oneshot(live_bearer(plaintext))
+            .await
+            .expect("r2");
+        assert_eq!(
+            r2.status(),
+            StatusCode::OK,
+            "without a registry the stale positive is honored within the TTL window"
+        );
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            1,
+            "no re-verify happens without the cross-instance marker"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // (f) PRE-AUTH per-IP argon2 cap.
     //
     // A flood of DISTINCT bogus suffixes (each a cache miss → would cost one
@@ -858,5 +1065,182 @@ mod tests {
         }
         // argon2 ran exactly once (cold path); the cap was consulted only once.
         assert_eq!(store.find_count.load(Ordering::SeqCst), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // (g) SEC-9: the `tt_test_*` sandbox path is rate-limited by the same
+    //     per-IP cap and NEVER verifies against the key store / dispatches a
+    //     credential. A flood of distinct sandbox tokens from one IP is shed
+    //     with 429 past the cap, while the credential store is never touched.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sandbox_key_is_rate_limited_and_never_verifies() {
+        let store = CountingKeyStore::new();
+        // Cap = 2 sandbox passes per IP (burst == per_min).
+        let state = state_with_cap(store.clone(), 2);
+        let router = build_router(state);
+
+        let ip = "203.0.113.50";
+
+        // First 2 distinct sandbox tokens from this IP are UNDER the cap: each
+        // passes through to the (trivial) downstream handler → 200.
+        for n in 0..2 {
+            let token = format!("tt_test_sandbox{n:04}");
+            let r = router
+                .clone()
+                .oneshot(live_bearer_from_ip(&token, ip))
+                .await
+                .expect("under-cap sandbox resp");
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "under-cap sandbox key should pass through"
+            );
+        }
+
+        // Third distinct sandbox token from the SAME IP is OVER the cap → shed
+        // with 429 + Retry-After.
+        let r3 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_test_sandbox9999", ip))
+            .await
+            .expect("over-cap sandbox resp");
+        assert_eq!(
+            r3.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "over-cap sandbox key must be shed with 429"
+        );
+        assert!(
+            r3.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "sandbox 429 must carry Retry-After"
+        );
+
+        // INVARIANT: no sandbox request ever consulted the key store — the
+        // sandbox path never verifies a credential nor dispatches to a provider.
+        assert_eq!(
+            store.find_count.load(Ordering::SeqCst),
+            0,
+            "sandbox (tt_test_) path must never verify against the key store"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (h) SEC-6: anonymous dogfood-org stamping fails CLOSED off loopback.
+    //
+    //   * loopback bind     → anonymous request is stamped with DOGFOOD_ORG_ID.
+    //   * non-loopback bind → anonymous request passes through UNSTAMPED, so a
+    //     stranger on a shared deploy is never treated as the dogfood org.
+    // ------------------------------------------------------------------
+
+    /// Downstream handler that reports — via the `x-identity` response header —
+    /// whether the auth middleware stamped an `ApiKeyContext`, so the dogfood
+    /// gate is observable end-to-end through the middleware.
+    async fn echo_identity(
+        ext: Option<axum::Extension<tt_auth::ApiKeyContext>>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let val = match ext {
+            Some(axum::Extension(ctx)) => format!("stamped:{}", ctx.org_id),
+            None => "anon".to_string(),
+        };
+        let mut resp = StatusCode::OK.into_response();
+        resp.headers_mut()
+            .insert("x-identity", val.parse().expect("header value"));
+        resp
+    }
+
+    fn build_dogfood_router(state: AppState) -> Router {
+        Router::new()
+            .route("/", get(echo_identity))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::middleware,
+            ))
+            .with_state(state)
+    }
+
+    fn anon_request() -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn dogfood_loopback_stamps_anonymous_org() {
+        let state = AppState::new(crate::registry::ProviderRegistry::new()).with_dogfood_enabled();
+        assert!(state.dogfood_active(), "loopback dogfood must be active");
+
+        let router = build_dogfood_router(state);
+        let resp = router.oneshot(anon_request()).await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-identity")
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("stamped:{}", crate::DOGFOOD_ORG_ID).as_str()),
+            "on a loopback bind, anonymous traffic is stamped with the dogfood org"
+        );
+    }
+
+    #[tokio::test]
+    async fn dogfood_non_loopback_does_not_stamp_anonymous_org() {
+        // Dogfood enabled, but the bind is NOT loopback → SEC-6 fail closed.
+        let state = AppState::new(crate::registry::ProviderRegistry::new())
+            .with_dogfood_enabled_for_bind(false);
+        assert!(state.dogfood_enabled, "dogfood is still enabled…");
+        assert!(
+            !state.dogfood_active(),
+            "…but the loopback guard keeps it inactive"
+        );
+
+        let router = build_dogfood_router(state);
+        let resp = router.oneshot(anon_request()).await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-identity")
+                .and_then(|v| v.to_str().ok()),
+            Some("anon"),
+            "off loopback, anonymous traffic must NOT be stamped as the dogfood org"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_cap_is_per_ip_other_ip_unaffected() {
+        let store = CountingKeyStore::new();
+        // Cap = 1 per IP.
+        let state = state_with_cap(store.clone(), 1);
+        let router = build_router(state);
+
+        // IP A burns its single cell, then is shed.
+        let a1 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_test_aaaa0000", "198.51.100.1"))
+            .await
+            .expect("a1");
+        assert_eq!(a1.status(), StatusCode::OK);
+        let a2 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_test_aaaa1111", "198.51.100.1"))
+            .await
+            .expect("a2");
+        assert_eq!(a2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A DIFFERENT IP still has its own budget → passes.
+        let b1 = router
+            .clone()
+            .oneshot(live_bearer_from_ip("tt_test_bbbb0000", "198.51.100.2"))
+            .await
+            .expect("b1");
+        assert_eq!(
+            b1.status(),
+            StatusCode::OK,
+            "a different IP within its own sandbox budget is not throttled"
+        );
+
+        // Still: the key store was never consulted by any sandbox request.
+        assert_eq!(store.find_count.load(Ordering::SeqCst), 0);
     }
 }

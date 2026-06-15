@@ -1,11 +1,18 @@
-name: TS bindings placeholder
+name: TS bindings drift
 
-# HONESTY NOTE: real TS binding generation is not wired yet. `tt-ts-types` is a
-# reserved placeholder crate with no `ts-rs` derives and no emitted bindings.
+# HONESTY NOTE: this workflow is NOT a real drift guard yet. TS binding generation
+# is not wired — `tt-ts-types` (crates/ts-types) is a reserved placeholder crate
+# with no `ts-rs` derives and no emitted `bindings/` output. All this job can do is
+# compile that placeholder and emit a warning; it can never fail on drift, because
+# there is nothing to regenerate or diff. A real regenerate-and-`git diff
+# --exit-code` guard goes here once `crates/ts-types` actually emits files.
 #
-# Keep the historical job name below for branch-protection compatibility, but
-# this workflow is NOT a drift guard. Replace it with a real regenerate+diff job
-# when `crates/ts-types` actually emits files.
+# The job name is intentionally kept as "TS bindings drift" so it keeps satisfying
+# the existing required status check of that name on `main` (renaming it would
+# leave that required context permanently unreported and block every PR).
+# >>> RECOMMENDED FOLLOW-UP (user-gated): either implement the real drift guard
+# above, or DROP "TS bindings drift" from the required status checks, since it
+# currently provides no real assurance (it only emits a warning). <<<
 
 on:
   pull_request:
@@ -17,6 +24,8 @@ env:
 
 jobs:
   bindings:
+    # Name kept as the required context "TS bindings drift" (see header note); the
+    # warning step below makes the honest reality explicit — placeholder, not a guard.
     name: TS bindings drift
     runs-on: ubuntu-latest
     timeout-minutes: 5

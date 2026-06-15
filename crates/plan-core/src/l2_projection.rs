@@ -324,6 +324,8 @@ mod tests {
             body: None,
             response_body: None,
             task_class: Default::default(),
+            diff_saved_usd: None,
+            minify_saved_est_usd: None,
         }
     }
 
