@@ -172,6 +172,20 @@ pub struct AppState {
     /// for unauthenticated requests so the dogfood routing route fires.
     /// Enabled by setting `TT_DOGFOOD_GROQ_ROUTING=1` at startup.
     pub dogfood_enabled: bool,
+    /// SEC-6 loopback guard for [`Self::dogfood_enabled`].
+    ///
+    /// Stamping a fixed org identity onto *anonymous* (tokenless) traffic is
+    /// only safe when the gateway cannot be reached by strangers — i.e. it is
+    /// bound to loopback. On a shared/public bind it would treat every
+    /// anonymous caller as the dogfood org (and, with a credential store wired,
+    /// could spend the dogfood org's upstream credentials). The dogfood stamp
+    /// therefore **fails closed**: it is applied only when this is `true`.
+    ///
+    /// Default `false` (fail closed). [`Self::with_dogfood_enabled`] sets it
+    /// `true` (the in-process/loopback dev + test path), while the
+    /// production-safe [`Self::with_dogfood_enabled_for_bind`] derives it from
+    /// the resolved bind address.
+    pub dogfood_bind_is_loopback: bool,
     /// Optional per-org spend cap + request-rate enforcer. The auth middleware
     /// checks it pre-flight (429 on deny) and the chat handler records realized
     /// spend. `None` disables budget enforcement (tests, dev, unmetered orgs).
@@ -295,6 +309,7 @@ impl AppState {
             revocation: None,
             argon2_cap: Argon2VerifyCap::new(Argon2CapConfig::from_env()),
             dogfood_enabled: false,
+            dogfood_bind_is_loopback: false,
             budget: None,
             tier_resolver: None,
             dynamic_budget: Arc::new(DynamicBudgetEnforcer::new()),
@@ -617,12 +632,53 @@ impl AppState {
         self
     }
 
-    /// Builder-style: enable dogfood routing mode. The auth middleware will
-    /// inject a [`crate::DOGFOOD_ORG_ID`] identity for unauthenticated
-    /// requests so the pre-seeded dogfood route fires.
+    /// Builder-style: enable dogfood routing mode on a **trusted (loopback)**
+    /// bind. The auth middleware will inject a [`crate::DOGFOOD_ORG_ID`]
+    /// identity for unauthenticated requests so the pre-seeded dogfood route
+    /// fires.
+    ///
+    /// This variant marks the bind as loopback (see
+    /// [`Self::dogfood_bind_is_loopback`]) and is the in-process/loopback dev +
+    /// test entry point. A production boot that may bind a shared address MUST
+    /// use [`Self::with_dogfood_enabled_for_bind`] instead so the dogfood stamp
+    /// fails closed off loopback (SEC-6).
     pub fn with_dogfood_enabled(mut self) -> Self {
         self.dogfood_enabled = true;
+        self.dogfood_bind_is_loopback = true;
         self
+    }
+
+    /// Builder-style: enable dogfood routing mode, deriving the SEC-6 loopback
+    /// guard from the gateway's resolved bind address.
+    ///
+    /// Pass `bind_ip.is_loopback()`. When the bind is **not** loopback the
+    /// dogfood stamp fails closed — `dogfood_enabled` is still recorded but the
+    /// auth middleware will not stamp anonymous traffic with the dogfood org
+    /// (and logs a loud warning on first use, louder still when a credential
+    /// store is wired). This is the production-safe wiring the gateway boot
+    /// path should use.
+    #[must_use]
+    pub fn with_dogfood_enabled_for_bind(mut self, bind_is_loopback: bool) -> Self {
+        self.dogfood_enabled = true;
+        self.dogfood_bind_is_loopback = bind_is_loopback;
+        if !bind_is_loopback {
+            tracing::warn!(
+                "SEC-6: TT_DOGFOOD_GROQ_ROUTING is enabled but the gateway is NOT bound to \
+                 loopback — anonymous-request dogfood-org stamping is DISABLED (fail closed). \
+                 Anonymous traffic will not be treated as the dogfood org on a shared bind. \
+                 Bind loopback (TT_BIND_ADDR=127.0.0.1) to use dogfood routing."
+            );
+        }
+        self
+    }
+
+    /// SEC-6: `true` only when dogfood routing is enabled AND the bind is
+    /// loopback. The auth middleware stamps the anonymous dogfood-org identity
+    /// exclusively when this holds, so a shared/public bind never grants the
+    /// fixed dogfood identity to strangers.
+    #[must_use]
+    pub fn dogfood_active(&self) -> bool {
+        self.dogfood_enabled && self.dogfood_bind_is_loopback
     }
 
     /// Start background catalogue refreshers (currently: OpenRouter's dynamic
@@ -711,6 +767,37 @@ mod tests {
         assert!(
             matches!(state.spend_sink(), SpendSink::None),
             "spend_sink must be None when no enforcer is wired"
+        );
+    }
+
+    /// SEC-6: `dogfood_active()` is the AND of `dogfood_enabled` and the
+    /// loopback guard, so dogfood org stamping fails closed off loopback.
+    #[test]
+    fn dogfood_active_requires_enabled_and_loopback() {
+        // Default: dogfood off → inactive.
+        let off = AppState::with_default_providers();
+        assert!(!off.dogfood_enabled);
+        assert!(!off.dogfood_bind_is_loopback);
+        assert!(!off.dogfood_active());
+
+        // Loopback dev/test path: enabled + loopback → active.
+        let loopback = AppState::with_default_providers().with_dogfood_enabled();
+        assert!(loopback.dogfood_enabled);
+        assert!(loopback.dogfood_bind_is_loopback);
+        assert!(loopback.dogfood_active());
+
+        // Production-safe builder with a loopback bind → active.
+        let bound_loopback = AppState::with_default_providers().with_dogfood_enabled_for_bind(true);
+        assert!(bound_loopback.dogfood_active());
+
+        // Production-safe builder with a NON-loopback bind → enabled but
+        // fails closed (inactive).
+        let bound_public = AppState::with_default_providers().with_dogfood_enabled_for_bind(false);
+        assert!(bound_public.dogfood_enabled);
+        assert!(!bound_public.dogfood_bind_is_loopback);
+        assert!(
+            !bound_public.dogfood_active(),
+            "dogfood must fail closed on a non-loopback bind"
         );
     }
 }

@@ -47,6 +47,33 @@ use crate::middleware::key_cache::CacheLookup;
 use crate::tier_resolver::resolve_or_free;
 use crate::{ApiError, AppState, DOGFOOD_ORG_ID};
 
+/// Fires the SEC-6 non-loopback dogfood warning at most once per process.
+static DOGFOOD_NON_LOOPBACK_WARN: std::sync::Once = std::sync::Once::new();
+
+/// Loud, fire-once warning (SEC-6): dogfood routing is enabled but the gateway
+/// is not bound to loopback, so the anonymous dogfood-org stamp is disabled
+/// (fail closed). Escalates the wording when a credential store is wired —
+/// that is the case where stamping anonymous traffic as the dogfood org could
+/// otherwise leak the dogfood org's upstream provider credentials.
+fn warn_dogfood_non_loopback_once(state: &AppState) {
+    DOGFOOD_NON_LOOPBACK_WARN.call_once(|| {
+        let has_credential_store = state.credential_store.is_some();
+        let detail = if has_credential_store {
+            "A credential store IS wired: without this guard, anonymous callers would be \
+             treated as the dogfood org and could spend its upstream provider credentials."
+        } else {
+            "No credential store is wired, but anonymous callers would still inherit the \
+             dogfood org's routes and budget."
+        };
+        tracing::warn!(
+            credential_store = has_credential_store,
+            "SEC-6: dogfood routing (TT_DOGFOOD_GROQ_ROUTING) is enabled on a NON-loopback bind \
+             — refusing to stamp anonymous requests with the dogfood org (fail closed). {detail} \
+             Bind loopback (TT_BIND_ADDR=127.0.0.1) or unset TT_DOGFOOD_GROQ_ROUTING."
+        );
+    });
+}
+
 /// Axum `from_fn_with_state`-compatible middleware function.
 pub async fn middleware(
     State(state): State<AppState>,
@@ -196,15 +223,26 @@ pub async fn middleware(
         }
         // Any other token format passes through unchallenged — forward-compat.
     } else if state.dogfood_enabled {
-        // No bearer token + dogfood mode: stamp the fixed dogfood org id so
-        // the routing engine can match the pre-seeded dogfood route. This is
+        // No bearer token + dogfood mode: stamp the fixed dogfood org id so the
+        // routing engine can match the pre-seeded dogfood route. This is
         // internal-only; production requests always carry a tt_live_* key.
-        req.extensions_mut().insert(ApiKeyContext {
-            key_id: Uuid::nil(),
-            org_id: DOGFOOD_ORG_ID,
-            tier: None,
-        });
-        org_id = Some(DOGFOOD_ORG_ID);
+        //
+        // SEC-6 fail-closed guard: stamping a fixed org identity onto anonymous
+        // traffic is only safe on a loopback bind. On a shared/public bind it
+        // would treat every stranger as the dogfood org (and, with a credential
+        // store wired, could spend the dogfood org's upstream credentials), so
+        // we stamp ONLY when the bind is loopback. Off loopback the request
+        // passes through unstamped (anonymous) and we log a loud one-time warning.
+        if state.dogfood_active() {
+            req.extensions_mut().insert(ApiKeyContext {
+                key_id: Uuid::nil(),
+                org_id: DOGFOOD_ORG_ID,
+                tier: None,
+            });
+            org_id = Some(DOGFOOD_ORG_ID);
+        } else {
+            warn_dogfood_non_loopback_once(&state);
+        }
     }
 
     // Pre-flight budget gate for identified orgs. Anonymous/dev requests
@@ -1084,6 +1122,88 @@ mod tests {
             store.find_count.load(Ordering::SeqCst),
             0,
             "sandbox (tt_test_) path must never verify against the key store"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (h) SEC-6: anonymous dogfood-org stamping fails CLOSED off loopback.
+    //
+    //   * loopback bind     → anonymous request is stamped with DOGFOOD_ORG_ID.
+    //   * non-loopback bind → anonymous request passes through UNSTAMPED, so a
+    //     stranger on a shared deploy is never treated as the dogfood org.
+    // ------------------------------------------------------------------
+
+    /// Downstream handler that reports — via the `x-identity` response header —
+    /// whether the auth middleware stamped an `ApiKeyContext`, so the dogfood
+    /// gate is observable end-to-end through the middleware.
+    async fn echo_identity(
+        ext: Option<axum::Extension<tt_auth::ApiKeyContext>>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let val = match ext {
+            Some(axum::Extension(ctx)) => format!("stamped:{}", ctx.org_id),
+            None => "anon".to_string(),
+        };
+        let mut resp = StatusCode::OK.into_response();
+        resp.headers_mut()
+            .insert("x-identity", val.parse().expect("header value"));
+        resp
+    }
+
+    fn build_dogfood_router(state: AppState) -> Router {
+        Router::new()
+            .route("/", get(echo_identity))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::middleware,
+            ))
+            .with_state(state)
+    }
+
+    fn anon_request() -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn dogfood_loopback_stamps_anonymous_org() {
+        let state = AppState::new(crate::registry::ProviderRegistry::new()).with_dogfood_enabled();
+        assert!(state.dogfood_active(), "loopback dogfood must be active");
+
+        let router = build_dogfood_router(state);
+        let resp = router.oneshot(anon_request()).await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-identity")
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("stamped:{}", crate::DOGFOOD_ORG_ID).as_str()),
+            "on a loopback bind, anonymous traffic is stamped with the dogfood org"
+        );
+    }
+
+    #[tokio::test]
+    async fn dogfood_non_loopback_does_not_stamp_anonymous_org() {
+        // Dogfood enabled, but the bind is NOT loopback → SEC-6 fail closed.
+        let state = AppState::new(crate::registry::ProviderRegistry::new())
+            .with_dogfood_enabled_for_bind(false);
+        assert!(state.dogfood_enabled, "dogfood is still enabled…");
+        assert!(
+            !state.dogfood_active(),
+            "…but the loopback guard keeps it inactive"
+        );
+
+        let router = build_dogfood_router(state);
+        let resp = router.oneshot(anon_request()).await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-identity")
+                .and_then(|v| v.to_str().ok()),
+            Some("anon"),
+            "off loopback, anonymous traffic must NOT be stamped as the dogfood org"
         );
     }
 
