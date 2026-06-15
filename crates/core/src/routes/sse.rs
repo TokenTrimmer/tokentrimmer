@@ -991,6 +991,9 @@ pub fn stream_response(
                                 model_l2,
                                 ttl_secs,
                                 baseline_l2,
+                                // No streaming L2 lookup occurred, so there is
+                                // no embedding to reuse — embed here (COST-3).
+                                None,
                             )
                             .await;
                         });
@@ -1082,14 +1085,24 @@ async fn stream_insert_into_l2(
     model_used: String,
     ttl_secs: u64,
     baseline_cost_usd: Option<f64>,
+    // A pre-computed embedding to reuse instead of embedding `query_text` again
+    // (COST-3, mirroring `insert_into_l2`). The streaming path performs no L2
+    // *lookup* (only an L1 fake-stream check), so there is no prior embedding to
+    // reuse and callers pass `None` — this then embeds here as before. The
+    // parameter exists for API symmetry and so a future streaming L2 lookup can
+    // thread its vector through without re-embedding.
+    precomputed_embedding: Option<Vec<f32>>,
 ) {
     let embedding_model = l2.embedder.model().to_string();
-    let embed = match l2.embedder.embed(query_text).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "streaming l2 embed during insert failed");
-            return;
-        }
+    let embed = match precomputed_embedding {
+        Some(v) => v,
+        None => match l2.embedder.embed(query_text).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "streaming l2 embed during insert failed");
+                return;
+            }
+        },
     };
     let response_bytes = match serde_json::to_vec(&response) {
         Ok(b) => b,

@@ -692,12 +692,23 @@ async fn try_l2_hit(
     judge_source_provider: Option<&std::sync::Arc<dyn tt_shared::Provider>>,
     judge_source_ctx: Option<&RequestContext>,
     judge_original_req: Option<&ChatCompletionRequest>,
+    // Out-param: the embedding computed for the lookup, surfaced so the miss
+    // path can reuse it for the L2 insert instead of embedding the identical
+    // query text a second time (COST-3). Set on every path that produced an
+    // embedding (hit, verify-reject, or miss); left untouched only when no
+    // context text exists or the embed call failed.
+    lookup_embedding_out: &mut Option<Vec<f32>>,
 ) -> Option<ApiResult<Response>> {
     let query_text = l2_context_text(req)?;
     let query_vec = match l2.embedder.embed(&query_text).await {
         Ok(v) => v,
         Err(_) => return None,
     };
+    // Surface the embedding for reuse on the miss/insert path. `query_text` is
+    // derived from the (already redaction/compression-shaped) `req` and is not
+    // mutated again before the insert, so this vector is the embedding of the
+    // exact text the insert would otherwise re-embed.
+    *lookup_embedding_out = Some(query_vec.clone());
     // Derive the L2 task class for this request. `/chat/completions` is the only
     // v1 class; the helper is the single, extensible derivation point. The
     // effective threshold is resolved through the adaptive gate when the verify
@@ -2127,6 +2138,11 @@ pub async fn handler(
         // 3b. L2 semantic cache. Gated additionally on l2_allowed, and OFF
         // for format-switched requests (`skip_l2` — similarity matching could
         // cross the instruction boundary).
+        //
+        // Captures the embedding `try_l2_hit` computes for the lookup so the
+        // miss path can reuse it for the L2 insert instead of re-embedding the
+        // identical query text (COST-3). `None` until a lookup runs and embeds.
+        let mut l2_lookup_vec: Option<Vec<f32>> = None;
         if cache_behavior.do_lookup && l2_allowed && !skip_l2 {
             if let Some(l2) = state.l2.as_ref() {
                 // Current catalog rate for the (post-routing) request model —
@@ -2150,6 +2166,7 @@ pub async fn handler(
                     judge_source_provider.as_ref(),
                     judge_source_ctx.as_ref(),
                     judge_original_req.as_ref(),
+                    &mut l2_lookup_vec,
                 )
                 .await
                 {
@@ -2749,6 +2766,10 @@ pub async fn handler(
                     // against the catalog current at hit time instead of
                     // freezing a meaningless $0.
                     let l2_baseline = pricing.as_ref().map(|_| baseline_cost_usd);
+                    // Reuse the embedding the L2 lookup already computed for the
+                    // identical query text (COST-3); `None` when no lookup ran
+                    // (e.g. do_lookup=false) — `insert_into_l2` then embeds.
+                    let l2_lookup_embedding = l2_lookup_vec.take();
                     tokio::spawn(async move {
                         insert_into_l2(
                             l2_clone,
@@ -2759,6 +2780,7 @@ pub async fn handler(
                             l2_model_used,
                             l2_ttl_secs,
                             l2_baseline,
+                            l2_lookup_embedding,
                         )
                         .await;
                     });
@@ -3737,14 +3759,22 @@ async fn insert_into_l2(
     model_used: String,
     ttl_secs: u64,
     baseline_cost_usd: Option<f64>,
+    // Embedding the L2 lookup already computed for this exact `query_text`
+    // (COST-3). When `Some`, it is reused verbatim — avoiding a second,
+    // identical embedding call (COGS + latency). When `None` (no lookup ran,
+    // or it failed to embed), fall back to embedding here exactly as before.
+    precomputed_embedding: Option<Vec<f32>>,
 ) {
     let embedding_model = l2.embedder.model().to_string();
-    let embed = match l2.embedder.embed(query_text).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "l2 embed during insert failed");
-            return;
-        }
+    let embed = match precomputed_embedding {
+        Some(v) => v,
+        None => match l2.embedder.embed(query_text).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "l2 embed during insert failed");
+                return;
+            }
+        },
     };
     let response_bytes = match serde_json::to_vec(&response) {
         Ok(b) => b,
@@ -8197,5 +8227,141 @@ mod output_shaping_tests {
             &mut req, None, None, &p, None, "r", &mut w
         ));
         assert!(w.is_empty());
+    }
+}
+
+// COST-3: the L2 miss path must not embed the query text a second time. These
+// tests exercise `insert_into_l2` directly with a call-counting embedder.
+#[cfg(test)]
+mod l2_insert_embed_reuse_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tt_cache::l2::L2Cache;
+    use tt_cache::{embed::EmbedError, EmbeddingProvider, InMemoryL2Cache};
+
+    /// Embedder that counts `embed` calls and returns a fixed, distinctive
+    /// vector (orthogonal to the precomputed one used below) so a lookup can
+    /// tell which vector was actually stored.
+    struct CountingEmbedder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for CountingEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0.0, 1.0])
+        }
+        fn model(&self) -> &str {
+            "mock-embed"
+        }
+    }
+
+    fn l2_config(calls: Arc<AtomicUsize>, cache: Arc<InMemoryL2Cache>) -> L2Config {
+        L2Config {
+            cache,
+            embedder: Arc::new(CountingEmbedder { calls }),
+            threshold: 0.5,
+            class_thresholds: tt_cache::ClassThresholds::default(),
+            verify: None,
+            volatility_ttl: None,
+        }
+    }
+
+    fn resp() -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "r".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            choices: vec![],
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 5,
+                total_tokens: 10,
+                cached_tokens: 0,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn reuses_precomputed_embedding_without_calling_embedder() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(InMemoryL2Cache::new());
+        let l2 = l2_config(calls.clone(), cache.clone());
+        let org = Uuid::now_v7();
+        // Orthogonal to the embedder's [0, 1] so the two are distinguishable.
+        let precomputed = vec![1.0_f32, 0.0];
+
+        insert_into_l2(
+            l2,
+            org,
+            "the query text",
+            resp(),
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            3600,
+            Some(0.001),
+            Some(precomputed.clone()),
+        )
+        .await;
+
+        // The embedder must NOT be called when an embedding is supplied.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "embedder should not be called on the reuse path"
+        );
+
+        // The precomputed embedding is what got stored: a lookup by it hits,
+        // a lookup by the embedder's orthogonal vector misses.
+        let hit = cache
+            .lookup(org, &precomputed, 0.5, "gpt-4o", "mock-embed")
+            .await
+            .unwrap();
+        assert!(hit.is_some(), "precomputed embedding should be recallable");
+        let miss = cache
+            .lookup(org, &[0.0, 1.0], 0.5, "gpt-4o", "mock-embed")
+            .await
+            .unwrap();
+        assert!(miss.is_none(), "embedder's vector was not the one stored");
+    }
+
+    #[tokio::test]
+    async fn embeds_once_when_no_precomputed_embedding() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(InMemoryL2Cache::new());
+        let l2 = l2_config(calls.clone(), cache.clone());
+        let org = Uuid::now_v7();
+
+        insert_into_l2(
+            l2,
+            org,
+            "the query text",
+            resp(),
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            3600,
+            Some(0.001),
+            None,
+        )
+        .await;
+
+        // Fallback path embeds exactly once.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "embedder should be called once on the fallback path"
+        );
+
+        // The embedder's vector [0, 1] was stored.
+        let hit = cache
+            .lookup(org, &[0.0, 1.0], 0.5, "gpt-4o", "mock-embed")
+            .await
+            .unwrap();
+        assert!(hit.is_some(), "fallback embedding should be stored");
     }
 }
