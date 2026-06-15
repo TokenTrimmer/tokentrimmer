@@ -34,6 +34,7 @@ pub mod cache_prefix;
 pub mod elide;
 pub mod substep_cache;
 pub mod summarize_judge;
+pub mod supersede;
 
 #[cfg(test)]
 mod compose_test;
@@ -47,6 +48,7 @@ pub use summarize_judge::{
     map_summary_verdict, AdaptiveSummaryGate, AlwaysCommitGate, NeverCommitGate, SummarizeCall,
     SummarizeStep, Summarizer, SummaryEdit, SummaryGate, SummaryOutcome,
 };
+pub use supersede::SupersedePass;
 
 use tt_routing::AgenticBudget;
 
@@ -121,10 +123,12 @@ impl AgenticBudgetPlanner {
     ///    cache-prefix breakpoint when `cache_prefix` is set. Books NO TT
     ///    savings and NO bust — pure provider-cache enablement (it never
     ///    mutates prefix CONTENT, so the escape hatch is not engaged).
-    /// 2. **Sub-lever 2a** ([`ElidePass`]): field-drop / minify stale KNOWN-tool
-    ///    results when `elide_stale_tools` is set, behind the pipeline's
+    /// 2. **Sub-lever 2a** ([`ElidePass`] + [`SupersedePass`]): field-drop /
+    ///    minify stale KNOWN-tool results AND drop superseded stale results (an
+    ///    earlier identical re-issued call's payload — the real token-moving
+    ///    transform) when `elide_stale_tools` is set, behind the pipeline's
     ///    token-true gate (operating on the volatile tail only — never the
-    ///    prefix). The committed field-drop is gated by `clear_at_least_tokens`:
+    ///    prefix). The committed reduction is gated by `clear_at_least_tokens`:
     ///    an elision freeing fewer tokens than that is SKIPPED, because the
     ///    re-cache a tail mutation forces costs more than a sub-threshold trim
     ///    saves (R1 cache-thrash guard). (Sub-lever 2b summary — Task 7 — and
@@ -268,7 +272,14 @@ impl AgenticBudgetPlanner {
         // Snapshot the tail so a sub-threshold trim can be rolled back
         // byte-identical — a forced re-cache is only worth it above the floor.
         let snapshot = split.tail_snapshot();
-        let pipe = crate::passes::PassPipeline::new().with(ElidePass::new(ab.keep_recent_pairs));
+        // Two lossless tail reductions, both gated by the token-true gate:
+        //   1. ElidePass        — field-drop / minify stale KNOWN-tool results;
+        //   2. SupersedePass    — drop superseded stale results (an earlier
+        //      identical re-issued call's payload), the real TOKEN-MOVING lever.
+        // Their measured deltas sum into the same field-drop bucket.
+        let pipe = crate::passes::PassPipeline::new()
+            .with(ElidePass::new(ab.keep_recent_pairs))
+            .with(SupersedePass::new(ab.keep_recent_pairs));
         let outcome = pipe.run(split, cx);
         let freed = outcome.tokens_removed;
 
