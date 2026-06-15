@@ -31,7 +31,7 @@
 //! it on a per-request basis by passing a different `threshold` value to
 //! [`L2Cache::lookup`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -39,7 +39,64 @@ use chrono::{DateTime, Utc};
 use tt_shared::{ChatCompletionRequest, ContentPart, Message, MessageContent};
 use uuid::Uuid;
 
+use crate::response_codec::{L2Open, ResponseCodec};
 use crate::CacheError;
+
+// ---------------------------------------------------------------------------
+// At-rest response encoding (SEC-2)
+// ---------------------------------------------------------------------------
+
+/// Encode a plaintext response payload into the `serde_json::Value` that goes
+/// into the L2 `response` column.
+///
+/// - With a wired [`ResponseCodec`], returns a self-describing **encrypted
+///   envelope** value bound to `org_id` + the row `id` (the embedding and all
+///   other columns stay plaintext).
+/// - Without a codec, parses the bytes into the plaintext JSON value exactly as
+///   the cache always has (fully back-compat).
+fn encode_response_value(
+    codec: Option<&ResponseCodec>,
+    org_id: Uuid,
+    id: Uuid,
+    response: &[u8],
+) -> Result<serde_json::Value, CacheError> {
+    match codec {
+        Some(codec) => Ok(codec.seal_response_json(org_id, id, response)?),
+        None => serde_json::from_slice::<serde_json::Value>(response).map_err(CacheError::Serde),
+    }
+}
+
+/// Decode the stored `response` value back into plaintext response bytes,
+/// honoring an optional at-rest codec.
+///
+/// Returns `None` to signal the entry must be **skipped** (treated as a cache
+/// miss): an encrypted envelope that does not authenticate (wrong key/org/row),
+/// or an encrypted row read by a cache with no codec wired. A legacy plaintext
+/// row is always readable (fail-open) whether or not a codec is wired.
+fn decode_response_value(
+    codec: Option<&ResponseCodec>,
+    org_id: Uuid,
+    id: Uuid,
+    stored: &serde_json::Value,
+) -> Option<Vec<u8>> {
+    match codec {
+        Some(codec) => match codec.open_response_json(org_id, id, stored) {
+            L2Open::Decrypted(plain) => Some(plain),
+            // Not an envelope → a pre-codec plaintext row: read it as-is.
+            L2Open::Plaintext => serde_json::to_vec(stored).ok(),
+            // Sealed but unreadable → skip rather than serve garbage.
+            L2Open::Undecryptable => None,
+        },
+        None => {
+            if ResponseCodec::is_encrypted_json(stored) {
+                // Encrypted at rest but no codec wired to open it → unservable.
+                None
+            } else {
+                serde_json::to_vec(stored).ok()
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-task-class thresholds
@@ -895,6 +952,10 @@ pub fn l2_tool_context_text(req: &ChatCompletionRequest) -> Option<String> {
 /// ```
 pub struct InMemoryL2Cache {
     entries: Arc<Mutex<Vec<CacheEntry>>>,
+    /// Optional at-rest response codec (SEC-2). `None` = plaintext (default).
+    response_codec: Option<ResponseCodec>,
+    /// Orgs whose inserts are dropped (the per-org "do not cache" hook).
+    no_cache_orgs: Arc<HashSet<Uuid>>,
 }
 
 impl InMemoryL2Cache {
@@ -902,7 +963,28 @@ impl InMemoryL2Cache {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(Vec::new())),
+            response_codec: None,
+            no_cache_orgs: Arc::new(HashSet::new()),
         }
+    }
+
+    /// Enable at-rest response encryption (SEC-2): cached responses are sealed
+    /// with `codec` on insert and opened on lookup. The embedding stays
+    /// plaintext (similarity is unaffected) and legacy plaintext rows stay
+    /// readable. Default (un-wired) is plaintext, identical to today.
+    #[must_use]
+    pub fn with_response_codec(mut self, codec: ResponseCodec) -> Self {
+        self.response_codec = Some(codec);
+        self
+    }
+
+    /// Skip caching entirely for `orgs` (the per-org "do not cache" control hook
+    /// for sensitive workloads): [`insert`](Self::insert) is a silent no-op for a
+    /// listed org, so nothing is ever stored and every lookup misses.
+    #[must_use]
+    pub fn with_no_cache_orgs(mut self, orgs: HashSet<Uuid>) -> Self {
+        self.no_cache_orgs = Arc::new(orgs);
+        self
     }
 }
 
@@ -915,9 +997,21 @@ impl Default for InMemoryL2Cache {
 #[async_trait]
 impl L2Cache for InMemoryL2Cache {
     /// Insert `entry` into the in-memory store.
-    async fn insert(&self, entry: CacheEntry) -> Result<(), CacheError> {
+    async fn insert(&self, mut entry: CacheEntry) -> Result<(), CacheError> {
         if !embedding_is_finite(&entry.embedding) {
             return Err(CacheError::InvalidEmbedding);
+        }
+        // Per-org "do not cache" hook: drop the insert entirely.
+        if self.no_cache_orgs.contains(&entry.org_id) {
+            return Ok(());
+        }
+        // At-rest encryption (SEC-2): seal the response, leaving the embedding
+        // and metadata plaintext. The stored `response` bytes hold the encrypted
+        // envelope value; lookup reverses it. (No codec → unchanged plaintext.)
+        if let Some(codec) = &self.response_codec {
+            let sealed =
+                encode_response_value(Some(codec), entry.org_id, entry.id, &entry.response)?;
+            entry.response = serde_json::to_vec(&sealed).map_err(CacheError::Serde)?;
         }
         let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         guard.push(entry);
@@ -953,7 +1047,28 @@ impl L2Cache for InMemoryL2Cache {
             .filter(|(_, sim)| sim.is_finite() && *sim >= threshold)
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(best.map(|(e, sim)| (e.clone(), sim)))
+        let Some((entry, sim)) = best else {
+            return Ok(None);
+        };
+        // No codec wired → today's behavior exactly: return the stored bytes
+        // unchanged (never round-trip through serde, never skip).
+        let Some(codec) = self.response_codec.as_ref() else {
+            return Ok(Some((entry.clone(), sim)));
+        };
+        // Reverse at-rest encryption (SEC-2). A sealed row that cannot be opened
+        // (wrong key/org) is skipped as a miss; a legacy plaintext row reads back
+        // as-is.
+        let stored: serde_json::Value = match serde_json::from_slice(&entry.response) {
+            Ok(v) => v,
+            // Non-JSON stored bytes can't be an envelope → treat as plaintext.
+            Err(_) => return Ok(Some((entry.clone(), sim))),
+        };
+        let Some(plain) = decode_response_value(Some(codec), org_id, entry.id, &stored) else {
+            return Ok(None);
+        };
+        let mut decoded = entry.clone();
+        decoded.response = plain;
+        Ok(Some((decoded, sim)))
     }
 
     /// Increment `hit_count` for the entry with the given `id`.
@@ -1165,6 +1280,11 @@ fn parse_ef_search(raw: Option<&str>) -> i64 {
 pub struct PostgresL2Cache {
     pool: sqlx::PgPool,
     ef_search: i64,
+    /// Optional at-rest response codec (SEC-2). `None` = the historical
+    /// plaintext JSONB behavior (fully back-compat).
+    response_codec: Option<ResponseCodec>,
+    /// Orgs whose inserts are dropped (the per-org "do not cache" hook).
+    no_cache_orgs: Arc<HashSet<Uuid>>,
 }
 
 impl PostgresL2Cache {
@@ -1176,6 +1296,8 @@ impl PostgresL2Cache {
         Self {
             pool,
             ef_search: ef_search_from_env(),
+            response_codec: None,
+            no_cache_orgs: Arc::new(HashSet::new()),
         }
     }
 
@@ -1185,6 +1307,33 @@ impl PostgresL2Cache {
     #[must_use]
     pub fn with_ef_search(mut self, ef_search: i64) -> Self {
         self.ef_search = ef_search.max(1);
+        self
+    }
+
+    /// Enable at-rest response encryption (SEC-2): the `cache_entries.response`
+    /// JSONB is sealed with `codec` (a self-describing per-org envelope) on
+    /// insert and opened on lookup. The embedding vector and every other column
+    /// stay plaintext, so pgvector similarity is unaffected. Pre-codec plaintext
+    /// rows stay readable (fail-open) and an undecryptable row is skipped as a
+    /// miss, so the codec can be turned on against a live cache.
+    ///
+    /// Default (un-wired) is the historical plaintext behavior. Wiring this ON
+    /// at the gateway cache-construction site is a one-line follow-up
+    /// (`tt-cli`'s gateway builder).
+    #[must_use]
+    pub fn with_response_codec(mut self, codec: ResponseCodec) -> Self {
+        self.response_codec = Some(codec);
+        self
+    }
+
+    /// Skip caching entirely for `orgs` (the per-org "do not cache" control hook
+    /// for sensitive workloads): [`insert`](L2Cache::insert) is a silent no-op
+    /// for a listed org. `CacheEntry` already carries `org_id`, so this is
+    /// honored without any change to the insert/lookup signatures the gateway
+    /// calls.
+    #[must_use]
+    pub fn with_no_cache_orgs(mut self, orgs: HashSet<Uuid>) -> Self {
+        self.no_cache_orgs = Arc::new(orgs);
         self
     }
 
@@ -1204,6 +1353,20 @@ impl L2Cache for PostgresL2Cache {
         if !embedding_is_finite(&entry.embedding) {
             return Err(CacheError::InvalidEmbedding);
         }
+        // Per-org "do not cache" hook: drop the insert before touching the DB.
+        if self.no_cache_orgs.contains(&entry.org_id) {
+            return Ok(());
+        }
+        // At-rest encryption (SEC-2): seal the response into a self-describing
+        // JSONB envelope bound to (org_id, row id). The embedding and every
+        // other column below stay plaintext. (No codec → plaintext JSONB, the
+        // historical behavior.)
+        let response_value = encode_response_value(
+            self.response_codec.as_ref(),
+            entry.org_id,
+            entry.id,
+            &entry.response,
+        )?;
         // Convert Vec<f32> to pgvector::Vector for the Postgres `vector` column.
         let vec = pgvector::Vector::from(entry.embedding);
 
@@ -1221,10 +1384,7 @@ impl L2Cache for PostgresL2Cache {
         .bind(entry.id)
         .bind(entry.org_id)
         .bind(vec)
-        .bind(
-            serde_json::from_slice::<serde_json::Value>(&entry.response)
-                .map_err(CacheError::Serde)?,
-        )
+        .bind(response_value)
         .bind(&entry.model)
         .bind(&entry.embedding_model)
         .bind(entry.input_tokens as i64)
@@ -1337,7 +1497,14 @@ impl L2Cache for PostgresL2Cache {
         let lexical_sig: Option<i64> = row.try_get("lexical_sig").map_err(CacheError::Sqlx)?;
         let similarity: f32 = row.try_get("similarity").map_err(CacheError::Sqlx)?;
 
-        let response_bytes = serde_json::to_vec(&response_json).map_err(CacheError::Serde)?;
+        // Reverse at-rest encryption (SEC-2). A sealed row that cannot be opened
+        // (wrong key/org, or encrypted with no codec wired) is skipped as a cache
+        // miss; a pre-codec plaintext row reads back as-is.
+        let Some(response_bytes) =
+            decode_response_value(self.response_codec.as_ref(), org_id, id, &response_json)
+        else {
+            return Ok(None);
+        };
 
         let entry = CacheEntry {
             id,
@@ -1625,6 +1792,142 @@ mod tests {
             .insert(entry_at(Uuid::new_v4(), org, vec![1.0, 0.0], now))
             .await
             .expect("finite embedding inserts");
+    }
+
+    // ── SEC-2: at-rest response encryption + per-org "do not cache" hook ────
+
+    /// Build an entry whose response is `response` (so we can prove the codec
+    /// hid it and restored it exactly).
+    fn entry_with_response(
+        id: Uuid,
+        org_id: Uuid,
+        embedding: Vec<f32>,
+        response: &[u8],
+        now: DateTime<Utc>,
+    ) -> CacheEntry {
+        CacheEntry {
+            response: response.to_vec(),
+            ..entry_at(id, org_id, embedding, now)
+        }
+    }
+
+    /// Encrypt-on-write / decrypt-on-read round-trip through the cache: a wired
+    /// codec seals the response on insert and a similarity lookup opens it,
+    /// returning the ORIGINAL response bytes. The embedding stays usable
+    /// (similarity still matches) because only the response is encrypted.
+    #[tokio::test]
+    async fn codec_round_trips_response_and_keeps_embedding_usable() {
+        let codec = ResponseCodec::new([1u8; 32]);
+        let cache = InMemoryL2Cache::new().with_response_codec(codec.clone());
+        let now = Utc::now();
+        let org = Uuid::from_u128(10);
+        let id = Uuid::from_u128(11);
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let secret = br#"{"choices":[{"message":{"content":"SSN 123-45-6789"}}]}"#;
+
+        cache
+            .insert(entry_with_response(id, org, q.clone(), secret, now))
+            .await
+            .unwrap();
+
+        // The raw stored bytes must NOT contain the plaintext (it is encrypted).
+        {
+            let guard = cache.entries.lock().unwrap();
+            let raw = &guard[0].response;
+            assert!(
+                !raw.windows(3).any(|w| w == b"SSN"),
+                "stored response must be encrypted at rest"
+            );
+            assert!(
+                crate::ResponseCodec::is_encrypted_json(
+                    &serde_json::from_slice::<serde_json::Value>(raw).unwrap()
+                ),
+                "stored response must be a codec envelope"
+            );
+        }
+
+        // Similarity lookup still finds the entry (embedding plaintext) and the
+        // returned response is the decrypted original.
+        let (hit, sim) = cache
+            .lookup(org, &q, 0.9, "gpt-4o", "mock-v1")
+            .await
+            .unwrap()
+            .expect("similarity match");
+        assert!((sim - 1.0).abs() < 1e-6);
+        assert_eq!(hit.response, secret, "response decrypted back to original");
+    }
+
+    /// The per-org "do not cache" hook: an insert for a listed org is a silent
+    /// no-op, so every lookup for that org misses.
+    #[tokio::test]
+    async fn no_cache_org_is_never_stored() {
+        let blocked = Uuid::from_u128(77);
+        let allowed = Uuid::from_u128(78);
+        let cache = InMemoryL2Cache::new().with_no_cache_orgs(HashSet::from([blocked]));
+        let now = Utc::now();
+        let q = vec![1.0_f32, 0.0];
+
+        cache
+            .insert(entry_at(Uuid::new_v4(), blocked, q.clone(), now))
+            .await
+            .unwrap();
+        cache
+            .insert(entry_at(Uuid::new_v4(), allowed, q.clone(), now))
+            .await
+            .unwrap();
+
+        assert!(
+            cache
+                .lookup(blocked, &q, 0.9, "gpt-4o", "mock-v1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a do-not-cache org must never have a stored entry"
+        );
+        assert!(
+            cache
+                .lookup(allowed, &q, 0.9, "gpt-4o", "mock-v1")
+                .await
+                .unwrap()
+                .is_some(),
+            "other orgs still cache normally"
+        );
+    }
+
+    /// `decode_response_value` reads a pre-codec plaintext row whether or not a
+    /// codec is wired (fail-open), decrypts a matching envelope, and SKIPS
+    /// (returns `None`) an envelope it cannot open (wrong org / no codec).
+    #[test]
+    fn decode_response_value_honors_legacy_and_skips_unreadable() {
+        let codec = ResponseCodec::new([2u8; 32]);
+        let org = Uuid::from_u128(1);
+        let id = Uuid::from_u128(2);
+        let plaintext: serde_json::Value =
+            serde_json::from_slice(br#"{"id":"chatcmpl","choices":[]}"#).unwrap();
+
+        // Legacy plaintext row: readable with or without a codec.
+        assert_eq!(
+            decode_response_value(Some(&codec), org, id, &plaintext),
+            Some(serde_json::to_vec(&plaintext).unwrap())
+        );
+        assert_eq!(
+            decode_response_value(None, org, id, &plaintext),
+            Some(serde_json::to_vec(&plaintext).unwrap())
+        );
+
+        // A matching envelope decrypts.
+        let envelope = codec.seal_response_json(org, id, b"payload").unwrap();
+        assert_eq!(
+            decode_response_value(Some(&codec), org, id, &envelope),
+            Some(b"payload".to_vec())
+        );
+        // Wrong org → skip.
+        assert_eq!(
+            decode_response_value(Some(&codec), Uuid::from_u128(999), id, &envelope),
+            None
+        );
+        // Encrypted row but no codec wired → unservable → skip.
+        assert_eq!(decode_response_value(None, org, id, &envelope), None);
     }
 
     // ── Per-class thresholds (SAFETY: never below today's 0.92) ─────────────

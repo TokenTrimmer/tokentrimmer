@@ -5,6 +5,17 @@
 //! insert time lets a cache hit report accurate `saved_usd` without trying
 //! to recompute pricing from a cached [`Usage`] block (whose token counts
 //! are an approximation of input size, not of price).
+//!
+//! # At-rest posture (SEC-2)
+//!
+//! [`to_bytes`](L1Entry::to_bytes) emits the envelope in **plaintext** — the
+//! verbatim provider response included. That plaintext is what lands in Redis
+//! unless the L1 cache is wired with a
+//! [`ResponseCodec`](crate::ResponseCodec): the codec seals these envelope bytes
+//! at the cache-store boundary
+//! ([`RedisL1Cache::with_response_codec`](crate::redis_impl::RedisL1Cache::with_response_codec)),
+//! so the JSON here never has to change shape. See the crate-root docs for the
+//! full at-rest contract.
 
 use serde::{Deserialize, Serialize};
 use tt_shared::ChatCompletionResponse;
