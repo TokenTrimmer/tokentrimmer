@@ -36,8 +36,8 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tt_routing::{
-    validate_agentic_budget, validate_capability, validate_output_shaping, validate_shadow_model,
-    NewRoute,
+    validate_agentic_budget, validate_capability, validate_output_shaping,
+    validate_route_has_effect, validate_shadow_model, NewRoute,
 };
 use tt_shared::model_catalog::model_catalog;
 use uuid::Uuid;
@@ -131,11 +131,10 @@ impl Tool for AddRouteTool {
                     },
                     "then": {
                         "type": "object",
-                        "description": "Action on match. Requires target_model; optional fallbacks, disable_cache, max_cost_usd, flex, compress, redact, traffic_pct, shadow_model.",
+                        "description": "Action on match. target_model is OPTIONAL — omit it for a modifier-only route (keeps the caller's model); a modifier-only route must carry at least one effect: fallbacks, disable_cache, max_cost_usd, flex, compress, redact, traffic_pct, shadow_model, …. A route with neither a target_model nor any effect is rejected.",
                         "properties": {
                             "target_model": { "type": "string" }
-                        },
-                        "required": ["target_model"]
+                        }
                     },
                     "org_id": {
                         "type": "string",
@@ -169,6 +168,11 @@ impl Tool for AddRouteTool {
         // Phase 3.1/3.2: reject malformed output-shaping caps locally (the
         // gateway's POST /v1/routes re-validates as the final authority).
         validate_output_shaping(&spec.then).map_err(|e| McpError::InvalidParams(e.to_string()))?;
+        // A modifier-only route (no `target_model`) is valid, but a route with
+        // NEITHER a target_model NOR any effect is a no-op mistake — reject it
+        // locally rather than POSTing a useless route to the gateway.
+        validate_route_has_effect(&spec.then)
+            .map_err(|e| McpError::InvalidParams(e.to_string()))?;
 
         let url = format!("{}/v1/routes", self.gateway_base.trim_end_matches('/'));
         let resp = self
@@ -360,12 +364,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_spec_missing_target_model_rejected() {
+    async fn no_op_route_no_model_no_effect_rejected() {
+        // `then: {}` is a no-op (no target_model AND no modifier) — rejected
+        // locally via validate_route_has_effect, without calling the gateway.
         let err = tool("http://unused".into(), Uuid::now_v7())
             .call(json!({ "name": "x", "then": {} }))
             .await
             .unwrap_err();
         assert!(matches!(err, McpError::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn modifier_only_route_no_target_model_is_accepted() {
+        // A modifier-only route (no target_model, but a real effect like `flex`)
+        // is valid: it passes local validation and reaches the gateway.
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/routes");
+                then.status(201).body(r#"{"id":"mod-only"}"#);
+            })
+            .await;
+        let out = tool(server.base_url(), Uuid::now_v7())
+            .call(json!({ "name": "mod-only", "then": { "flex": true } }))
+            .await;
+        assert!(
+            out.is_ok(),
+            "modifier-only route (flex, no target_model) should be accepted, got {out:?}"
+        );
     }
 
     // ── idempotency on id collision ──────────────────────────────────────────

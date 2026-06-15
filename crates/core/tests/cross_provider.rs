@@ -175,7 +175,7 @@ fn route(target: &str, fallbacks: Vec<String>) -> Route {
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
             agentic_budget: None,
-            target_model: target.into(),
+            target_model: Some(target.into()),
             fallbacks,
             disable_cache: false,
             max_cost_usd: None,

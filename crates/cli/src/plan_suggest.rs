@@ -54,7 +54,7 @@ pub fn suggestions_to_proposed_routes(
             then: RouteAction {
                 format_switch: None,
                 diff: false,
-                target_model: s.model.clone(),
+                target_model: Some(s.model.clone()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
@@ -128,7 +128,12 @@ pub fn build_plan_input_json(path: &str) -> anyhow::Result<String> {
     // Build the pricing table for every target model referenced.
     let mut pricing_table: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for route in &proposed_routes {
-        let target = &route.then.target_model;
+        // A modifier-only route (`target_model == None`) keeps the caller's
+        // model and adds no new model to price; skip it. The suggestion
+        // converter only ever emits `Some` targets, so this is defensive.
+        let Some(target) = route.then.target_model.as_deref() else {
+            continue;
+        };
         if let Ok(hit) = tt_preview::pricing::lookup(target) {
             pricing_table
                 .entry(format!("{}:{}", hit.provider, target))
@@ -268,7 +273,10 @@ mod tests {
 
         // First route: matches the source model, targets haiku.
         assert_eq!(routes[0].when.model_in, vec!["claude-sonnet-4-6"]);
-        assert_eq!(routes[0].then.target_model, "claude-haiku-4-5");
+        assert_eq!(
+            routes[0].then.target_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
         assert_eq!(routes[0].name, "swap-to-haiku");
         assert!(routes[0].enabled);
         // Priority decrements: first is higher than second.
@@ -276,7 +284,7 @@ mod tests {
 
         // Second route: same source model condition.
         assert_eq!(routes[1].when.model_in, vec!["claude-sonnet-4-6"]);
-        assert_eq!(routes[1].then.target_model, "gpt-4o-mini");
+        assert_eq!(routes[1].then.target_model.as_deref(), Some("gpt-4o-mini"));
     }
 
     // (b) Empty suggestion list yields empty proposed_routes.
@@ -320,8 +328,8 @@ mod tests {
             vec!["claude-sonnet-4-6"]
         );
         assert_eq!(
-            parsed.proposed_routes[0].then.target_model,
-            "claude-haiku-4-5"
+            parsed.proposed_routes[0].then.target_model.as_deref(),
+            Some("claude-haiku-4-5")
         );
     }
 

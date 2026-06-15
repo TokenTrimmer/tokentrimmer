@@ -174,7 +174,7 @@ async fn setup(disable_cache: bool) -> (axum::Router, String, Arc<AtomicUsize>) 
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
-                target_model: "gpt-4o-mini".into(),
+                target_model: Some("gpt-4o-mini".into()),
                 fallbacks: vec![],
                 disable_cache,
                 max_cost_usd: None,

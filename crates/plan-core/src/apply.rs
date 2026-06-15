@@ -297,7 +297,7 @@ mod tests {
             then: RouteAction {
                 format_switch: None,
                 diff: false,
-                target_model: "claude-haiku-4-5".into(),
+                target_model: Some("claude-haiku-4-5".into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
@@ -378,7 +378,10 @@ mod tests {
         // (a) The proposed routes were persisted alongside the status flip.
         let written = store.applied_routes(plan_id).expect("row exists");
         assert_eq!(written.len(), 1, "the one proposed route must be written");
-        assert_eq!(written[0].then.target_model, "claude-haiku-4-5");
+        assert_eq!(
+            written[0].then.target_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
         assert_eq!(written[0].name, "haiku-for-cheap-classification");
 
         let entries = audit.list(org_id).await.expect("list ok");
@@ -459,7 +462,10 @@ mod tests {
         assert_eq!(written[0].id, route_id);
         assert_eq!(written[0].priority, 100);
         assert_eq!(written[0].when.model_in, vec!["claude-sonnet-4-5"]);
-        assert_eq!(written[0].then.target_model, "claude-haiku-4-5");
+        assert_eq!(
+            written[0].then.target_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
 
         // And the audit row was emitted (after both effects).
         let entries = audit.list(org_id).await.expect("list ok");

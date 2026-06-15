@@ -167,7 +167,7 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
-                target_model: "text-embedding-3-small".into(),
+                target_model: Some("text-embedding-3-small".into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,

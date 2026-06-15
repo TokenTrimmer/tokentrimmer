@@ -239,7 +239,7 @@ async fn harness() -> Harness {
             },
             // Action-only: no model rewrite, just the minify opt-in.
             then: RouteAction {
-                target_model: MODEL.into(),
+                target_model: Some(MODEL.into()),
                 minify_json: true,
                 ..Default::default()
             },

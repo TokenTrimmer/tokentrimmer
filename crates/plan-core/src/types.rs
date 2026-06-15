@@ -253,7 +253,18 @@ pub struct RouteAction {
     /// Rewrite to this model. May target a different provider than the request
     /// (V3d-1). Cost projection resolves the target's own provider from the
     /// pricing table; a target absent from the table is counted unchanged.
-    pub target_model: String,
+    ///
+    /// `None` = **modifier-only route** (mirrors `tt_routing::RouteAction`):
+    /// keep the caller's chosen model and apply only this action's other
+    /// then-effects. Replay treats the served/effective model as the ORIGINAL
+    /// request model, so the model-rewrite cost delta is 0 and ONLY the
+    /// modifier levers (flex/batch/diff/minify, …) project. Existing route JSON
+    /// always carries `target_model`, so it deserializes to `Some`; omitting it
+    /// yields `None`. Same serde gating as `tt_routing::RouteAction` so the wire
+    /// form stays byte-identical (`Some("x")` → `{"target_model":"x"}`, `None`
+    /// → key omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_model: Option<String>,
     /// Ordered fallback model ids, mirroring `tt_routing::RouteAction::fallbacks`.
     /// The replay engine does not yet simulate fallback firing (follow-up:
     /// extend the replay matcher to account for fallback paths); the field
@@ -694,7 +705,7 @@ mod tests {
         let a = RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "x".into(),
+            target_model: Some("x".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -723,7 +734,7 @@ mod tests {
     fn route_action_backward_compat_deserialize() {
         let json = r#"{"target_model":"claude-3-5-haiku"}"#;
         let a: RouteAction = serde_json::from_str(json).unwrap();
-        assert_eq!(a.target_model, "claude-3-5-haiku");
+        assert_eq!(a.target_model.as_deref(), Some("claude-3-5-haiku"));
         assert!(a.fallbacks.is_empty(), "fallbacks must default to empty");
     }
 
@@ -734,7 +745,7 @@ mod tests {
         let original = RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "claude-3-5-haiku".into(),
+            target_model: Some("claude-3-5-haiku".into()),
             fallbacks: vec!["gpt-4o-mini".into(), "gemini-flash".into()],
             disable_cache: false,
             max_cost_usd: None,
@@ -767,7 +778,7 @@ mod tests {
         let a = RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "m".into(),
+            target_model: Some("m".into()),
             fallbacks: Vec::new(),
             disable_cache: true,
             max_cost_usd: None,
@@ -797,7 +808,7 @@ mod tests {
     fn route_action_cross_type_wire_compat() {
         let gateway_json = r#"{"target_model":"gpt-4o-mini","fallbacks":["claude-haiku"]}"#;
         let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
-        assert_eq!(plan_action.target_model, "gpt-4o-mini");
+        assert_eq!(plan_action.target_model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(plan_action.fallbacks, vec!["claude-haiku"]);
         // Re-serialize: must re-produce the same JSON (declaration order).
         let reemitted = serde_json::to_string(&plan_action).unwrap();
@@ -812,7 +823,7 @@ mod tests {
         let a = RouteAction {
             format_switch: None,
             diff: false,
-            target_model: "m".into(),
+            target_model: Some("m".into()),
             fallbacks: Vec::new(),
             disable_cache: false,
             max_cost_usd: None,
@@ -846,7 +857,7 @@ mod tests {
     fn route_action_redact_cross_type_wire_compat() {
         let gateway_json = r#"{"target_model":"gpt-4o","redact":true}"#;
         let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
-        assert_eq!(plan_action.target_model, "gpt-4o");
+        assert_eq!(plan_action.target_model.as_deref(), Some("gpt-4o"));
         assert!(
             plan_action.redact,
             "redact must round-trip from gateway JSON"
@@ -866,7 +877,7 @@ mod tests {
     fn route_action_batch_wire_compat_with_gateway() {
         let gateway_json = r#"{"target_model":"gpt-5.5","batch":true}"#;
         let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
-        assert_eq!(plan_action.target_model, "gpt-5.5");
+        assert_eq!(plan_action.target_model.as_deref(), Some("gpt-5.5"));
         assert!(plan_action.batch, "batch must round-trip from gateway JSON");
         let reemitted = serde_json::to_string(&plan_action).unwrap();
         assert_eq!(reemitted, gateway_json);
@@ -888,7 +899,7 @@ mod tests {
     fn route_action_flex_wire_compat_with_gateway() {
         let gateway_json = r#"{"target_model":"gpt-5.5","flex":true}"#;
         let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
-        assert_eq!(plan_action.target_model, "gpt-5.5");
+        assert_eq!(plan_action.target_model.as_deref(), Some("gpt-5.5"));
         assert!(plan_action.flex, "flex must round-trip from gateway JSON");
         let reemitted = serde_json::to_string(&plan_action).unwrap();
         assert_eq!(reemitted, gateway_json);
@@ -911,7 +922,7 @@ mod tests {
         let gateway_json =
             r#"{"target_model":"gpt-4o","traffic_pct":30,"shadow_model":"claude-haiku-4-5"}"#;
         let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
-        assert_eq!(plan_action.target_model, "gpt-4o");
+        assert_eq!(plan_action.target_model.as_deref(), Some("gpt-4o"));
         assert_eq!(plan_action.traffic_pct, Some(30));
         assert_eq!(
             plan_action.shadow_model.as_deref(),
@@ -1006,7 +1017,7 @@ mod tests {
     fn route_action_cross_type_lockstep_guard() {
         let gateway = tt_routing::RouteAction {
             batch: false,
-            target_model: "gpt-4o-mini".to_string(),
+            target_model: Some("gpt-4o-mini".to_string()),
             fallbacks: vec!["claude-haiku-4-5".to_string()],
             disable_cache: true,
             max_cost_usd: Some(0.25),
@@ -1032,7 +1043,7 @@ mod tests {
         // The gateway JSON deserializes into the plan-core type without
         // dropping any mirrored field…
         let plan_action: RouteAction = serde_json::from_str(&gateway_json).unwrap();
-        assert_eq!(plan_action.target_model, "gpt-4o-mini");
+        assert_eq!(plan_action.target_model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(plan_action.fallbacks, vec!["claude-haiku-4-5"]);
         assert!(plan_action.disable_cache);
         assert_eq!(plan_action.max_cost_usd, Some(0.25));
@@ -1053,6 +1064,48 @@ mod tests {
         // order + same skip_serializing_if gating).
         let reemitted = serde_json::to_string(&plan_action).unwrap();
         assert_eq!(reemitted, gateway_json);
+    }
+
+    /// Modifier-only route wire-compat: gateway JSON that OMITS `target_model`
+    /// (a `tt_routing::RouteAction` with `target_model: None`, e.g. a flex-only
+    /// route) deserializes into the plan-core type with `target_model == None`
+    /// and re-emits the SAME wire form byte-for-byte (the key stays omitted).
+    /// A `Some(model)` still round-trips to `{"target_model":"…"}`, so existing
+    /// route JSON/snapshots stay byte-identical.
+    #[test]
+    fn route_action_modifier_only_target_model_none_wire_compat() {
+        // (a) Omitted `target_model` → None on read, omitted again on write.
+        let gateway_json = r#"{"flex":true}"#;
+        let plan_action: RouteAction = serde_json::from_str(gateway_json).unwrap();
+        assert_eq!(
+            plan_action.target_model, None,
+            "omitted target_model must deserialize to None (modifier-only route)"
+        );
+        assert!(plan_action.flex, "flex must round-trip");
+        let reemitted = serde_json::to_string(&plan_action).unwrap();
+        assert_eq!(
+            reemitted, gateway_json,
+            "None target_model must stay omitted from the wire form"
+        );
+
+        // (b) A Some target still serializes to the canonical key — existing
+        // route JSON is byte-for-byte unchanged.
+        let some_json = r#"{"target_model":"gpt-4o-mini"}"#;
+        let some_action: RouteAction = serde_json::from_str(some_json).unwrap();
+        assert_eq!(some_action.target_model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(serde_json::to_string(&some_action).unwrap(), some_json);
+
+        // (c) Cross-type: a gateway modifier-only RouteAction (None) round-trips
+        // through the plan-core type with byte-identical wire output.
+        let gateway = tt_routing::RouteAction {
+            target_model: None,
+            flex: true,
+            ..Default::default()
+        };
+        let gw_json = serde_json::to_string(&gateway).unwrap();
+        let plan: RouteAction = serde_json::from_str(&gw_json).unwrap();
+        assert_eq!(plan.target_model, None);
+        assert_eq!(serde_json::to_string(&plan).unwrap(), gw_json);
     }
 
     /// Cross-crate lockstep guard for `RouteConditions`, the companion to
@@ -1112,7 +1165,7 @@ mod tests {
     fn route_action_legacy_force_cache_layer_is_ignored() {
         let legacy = r#"{"target_model":"gpt-4o-mini","fallbacks":["x"],"force_cache_layer":"l2"}"#;
         let a: RouteAction = serde_json::from_str(legacy).unwrap();
-        assert_eq!(a.target_model, "gpt-4o-mini");
+        assert_eq!(a.target_model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(a.fallbacks, vec!["x"]);
         let j = serde_json::to_string(&a).unwrap();
         assert!(

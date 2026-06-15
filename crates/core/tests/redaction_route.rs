@@ -210,7 +210,7 @@ async fn app_with_redact_route_and_cache_min(
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
-                target_model: "rec-model".into(),
+                target_model: Some("rec-model".into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,
@@ -465,7 +465,7 @@ async fn no_redact_flag_means_no_redaction() {
                 ..Default::default()
             },
             then: RouteAction {
-                target_model: "rec-model".into(),
+                target_model: Some("rec-model".into()),
                 ..Default::default()
             },
         }],

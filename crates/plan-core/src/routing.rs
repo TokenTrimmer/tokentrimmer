@@ -121,7 +121,7 @@ mod tests {
             then: RouteAction {
                 format_switch: None,
                 diff: false,
-                target_model: "x".into(),
+                target_model: Some("x".into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
                 max_cost_usd: None,

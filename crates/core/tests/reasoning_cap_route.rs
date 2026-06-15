@@ -285,7 +285,7 @@ async fn harness(opts: Opts) -> Harness {
 
 fn cap_action() -> RouteAction {
     RouteAction {
-        target_model: MODEL.into(), // action-only: no rewrite
+        target_model: Some(MODEL.into()), // action-only: no rewrite
         reasoning_max_effort: Some("low".into()),
         ..Default::default()
     }
@@ -382,7 +382,7 @@ async fn capped_route_lowers_effort_books_zero_and_meters() {
     // Control arm: the same request through a gateway whose route has NO cap.
     let control = harness(Opts {
         then: RouteAction {
-            target_model: MODEL.into(),
+            target_model: Some(MODEL.into()),
             ..Default::default()
         },
         paused: false,
@@ -466,7 +466,7 @@ async fn math_classified_request_is_never_capped() {
 async fn paused_route_suppresses_output_shaping_actions() {
     let h = harness(Opts {
         then: RouteAction {
-            target_model: MODEL.into(),
+            target_model: Some(MODEL.into()),
             minify_json: true,
             reasoning_max_effort: Some("low".into()),
             reasoning_budget_tokens: Some(8192),
@@ -517,7 +517,7 @@ async fn paused_route_suppresses_output_shaping_actions() {
 async fn shaped_route_spawns_judge_with_unshaped_baseline() {
     let h = harness(Opts {
         then: RouteAction {
-            target_model: MODEL.into(),
+            target_model: Some(MODEL.into()),
             minify_json: true,
             reasoning_max_effort: Some("low".into()),
             ..Default::default()

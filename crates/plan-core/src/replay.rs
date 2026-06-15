@@ -310,22 +310,36 @@ fn project_requests(
         let matched = routing::match_route(req, routes);
         match matched {
             Some(route) => {
+                // Resolve the effective served model ONCE, mirroring the
+                // gateway's `effective_target =
+                // target_model.unwrap_or_else(|| req.model)`. A modifier-only
+                // route (`then.target_model == None`) keeps the caller's chosen
+                // model, so the served model is the ORIGINAL request model: the
+                // model-rewrite cost delta is 0 (it prices at the request's own
+                // pricing entry) and only the modifier levers (flex/batch/diff/
+                // minify, …) project. A `Some` target behaves exactly as before
+                // (rewrite to that model), so existing routes project
+                // byte-identically.
+                let effective_target = route
+                    .then
+                    .target_model
+                    .as_deref()
+                    .unwrap_or(req.model.as_str());
                 // Prefer the same-provider key (keeps same-provider replays
                 // byte-identical); else resolve the target's own provider so a
                 // cross-provider route is priced correctly.
-                let same_provider_key =
-                    crate::types::pricing_key(&req.provider, &route.then.target_model);
+                let same_provider_key = crate::types::pricing_key(&req.provider, effective_target);
                 let target_key = if pricing.contains_key(&same_provider_key) {
                     same_provider_key
                 } else {
                     let target_provider = model_to_provider
-                        .get(route.then.target_model.as_str())
+                        .get(effective_target)
                         .copied()
                         .unwrap_or(req.provider.as_str());
-                    crate::types::pricing_key(target_provider, &route.then.target_model)
+                    crate::types::pricing_key(target_provider, effective_target)
                 };
                 if let Some(p) = pricing.get(&target_key) {
-                    let projected = cost::project_cost(req, &route.then.target_model, p);
+                    let projected = cost::project_cost(req, effective_target, p);
                     let mut projected_cost = if is_cache_hit {
                         0.0
                     } else {
@@ -426,7 +440,7 @@ fn project_requests(
                     // Project latency from the target model's window history;
                     // fall back to the request's own latency (and flag it) when
                     // the target model has no history to project from.
-                    match model_medians.get(route.then.target_model.as_str()) {
+                    match model_medians.get(effective_target) {
                         Some(&med) => per_request_latency.push(med),
                         None => {
                             per_request_latency.push(f64::from(req.latency_ms));

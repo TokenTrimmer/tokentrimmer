@@ -5645,7 +5645,19 @@ pub(crate) async fn apply_routing(
     let diff = m.then.diff;
     let traffic_pct = m.then.traffic_pct;
     let shadow_model = m.then.shadow_model.clone();
-    let target_model_for_split = m.then.target_model.clone();
+    // Resolve the effective target ONCE. A modifier-only route
+    // (`then.target_model == None`) keeps the caller's chosen model — every
+    // downstream cost/canary/telemetry seam keeps seeing a concrete model
+    // EQUAL to the caller's, so the routing delta is 0 and only the route's
+    // modifier savings (e.g. agentic_budget) are booked. A `Some` target
+    // behaves exactly as before (rewrite to that model).
+    let effective_target = m
+        .then
+        .target_model
+        .clone()
+        .unwrap_or_else(|| req.model.clone());
+    let is_model_rewrite = m.then.target_model.is_some();
+    let target_model_for_split = effective_target.clone();
     let minify_json = m.then.minify_json;
     let reasoning_max_effort = m.then.reasoning_max_effort.clone();
     let reasoning_budget_tokens = m.then.reasoning_budget_tokens;
@@ -5657,13 +5669,13 @@ pub(crate) async fn apply_routing(
     // we positively know a capability is missing.
     let required_caps = tt_shared::RequiredCapabilities::from_request(req);
     let estimated_tokens = u64::from(input_tokens);
-    if let Some(info) = state.registry.model_info(&m.then.target_model) {
+    if let Some(info) = state.registry.model_info(&effective_target) {
         if !required_caps.satisfied_by(info, estimated_tokens) {
             let reasons = required_caps.skip_reasons(info, estimated_tokens);
             tracing::info!(
                 org_id = %ctx.org_id,
                 route_id = %route_id,
-                model = %m.then.target_model,
+                model = %effective_target,
                 reasons = ?reasons,
                 "route_skipped_capability: rewrite target lacks required capabilities, passing through unchanged"
             );
@@ -5673,12 +5685,21 @@ pub(crate) async fn apply_routing(
         }
     }
 
-    let original = std::mem::replace(&mut req.model, m.then.target_model.clone());
+    // Only rewrite the model for a `Some`-target route. A modifier-only route
+    // (`effective_target == req.model`) leaves `req.model` untouched so the
+    // caller's chosen model is what gets dispatched; only the route's other
+    // then-effects apply (routing delta = 0).
+    let original = if is_model_rewrite {
+        std::mem::replace(&mut req.model, effective_target.clone())
+    } else {
+        req.model.clone()
+    };
     tracing::debug!(
         org_id = %ctx.org_id,
         route_id = %route_id,
         from = %original,
         to = %req.model,
+        modifier_only = !is_model_rewrite,
         fallbacks = ?fallbacks,
         "routing rewrite"
     );

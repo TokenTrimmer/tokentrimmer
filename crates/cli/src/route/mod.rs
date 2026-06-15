@@ -51,12 +51,24 @@ pub struct AddArgs {
 
 /// Pure: map `add` flags to the `NewRoute` JSON body the API expects.
 pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
-    let target = match (&args.always, &args.to) {
-        (Some(m), None) => m.clone(),
-        (None, Some(m)) => m.clone(),
+    // `None` = a MODIFIER-ONLY route: no rewrite target, the matched request
+    // keeps the model the caller picked and only the then-effects (currently
+    // `--agentic-budget`) apply. Allowed ONLY when at least one effect is
+    // requested — a route with neither a target NOR `--agentic-budget` is a
+    // no-op mistake, rejected here (and again server-side).
+    let target: Option<String> = match (&args.always, &args.to) {
+        (Some(m), None) => Some(m.clone()),
+        (None, Some(m)) => Some(m.clone()),
         (Some(_), Some(_)) => anyhow::bail!("use either --always or --to, not both"),
         (None, None) => {
-            anyhow::bail!("a target is required: pass --always <model> or --to <model>")
+            if args.agentic_budget {
+                None // modifier-only route
+            } else {
+                anyhow::bail!(
+                    "a target is required: pass --always <model> or --to <model> \
+                     (or --agentic-budget for a modifier-only route that keeps the caller's model)"
+                )
+            }
         }
     };
     let mut when = serde_json::Map::new();
@@ -91,7 +103,11 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
         when.insert("upstream_latency_ms_p95_gt".into(), json!(v));
     }
     let mut then = serde_json::Map::new();
-    then.insert("target_model".into(), json!(target));
+    // Modifier-only route (`target == None`) OMITS `target_model` entirely so
+    // the gateway deserializes it to `None` (keep the caller's model).
+    if let Some(t) = &target {
+        then.insert("target_model".into(), json!(t));
+    }
     if !args.fallback.is_empty() {
         then.insert("fallbacks".into(), json!(args.fallback));
     }
@@ -122,7 +138,7 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
         );
     }
     Ok(json!({
-        "name": args.name.clone().unwrap_or_else(|| default_name(args, &target)),
+        "name": args.name.clone().unwrap_or_else(|| default_name(args, target.as_deref())),
         "priority": args.priority,
         "enabled": !args.disabled,
         "when": Value::Object(when),
@@ -130,7 +146,11 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     }))
 }
 
-fn default_name(args: &AddArgs, target: &str) -> String {
+fn default_name(args: &AddArgs, target: Option<&str>) -> String {
+    // A modifier-only route has no target — name it by the modifier it carries.
+    let Some(target) = target else {
+        return "modifier-only".to_string();
+    };
     match &args.from {
         Some(f) => format!("{f}->{target}"),
         None => format!("all->{target}"),
@@ -441,6 +461,55 @@ mod tests {
             ..base_args()
         });
         assert!(err.is_err());
+    }
+
+    /// MODIFIER-ONLY ROUTE: `--agentic-budget` with NO target (`--always`/`--to`
+    /// both absent) emits a `then` that OMITS `target_model` but carries
+    /// `agentic_budget`, and deserializes into a `tt_routing::RouteAction` with
+    /// `target_model: None` — the gateway reads it as "keep the caller's model".
+    #[test]
+    fn agentic_budget_without_target_is_modifier_only() {
+        let body = build_new_route(&AddArgs {
+            always: None,
+            to: None,
+            from: None,
+            agentic_budget: true,
+            ..base_args()
+        })
+        .unwrap();
+        assert!(
+            body["then"].get("target_model").is_none(),
+            "a modifier-only route must OMIT target_model: {}",
+            body["then"]
+        );
+        assert!(
+            body["then"].get("agentic_budget").is_some(),
+            "a modifier-only route must carry agentic_budget"
+        );
+        let then: tt_routing::RouteAction =
+            serde_json::from_value(body["then"].clone()).expect("then must parse as RouteAction");
+        assert_eq!(
+            then.target_model, None,
+            "omitted target_model deserializes to None (modifier-only)"
+        );
+        assert!(then.agentic_budget.is_some());
+    }
+
+    /// A route with NO target AND NO `--agentic-budget` is a no-op — rejected at
+    /// the CLI (mirrors the server-side `validate_route_has_effect`).
+    #[test]
+    fn no_target_and_no_modifier_is_rejected() {
+        let err = build_new_route(&AddArgs {
+            always: None,
+            to: None,
+            from: None,
+            agentic_budget: false,
+            ..base_args()
+        });
+        assert!(
+            err.is_err(),
+            "a route with neither a target nor a modifier must be rejected"
+        );
     }
 
     #[test]

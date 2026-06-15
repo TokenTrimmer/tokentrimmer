@@ -318,8 +318,14 @@ mod tests {
             for route in &r.routes {
                 let parsed: tt_routing::NewRoute = serde_json::from_value(route.clone())
                     .unwrap_or_else(|e| panic!("recipe {} route is not a NewRoute: {e}", r.slug));
+                // Every curated recipe pins a target model (none are
+                // modifier-only), so target_model must be Some + non-empty.
                 assert!(
-                    !parsed.then.target_model.is_empty(),
+                    parsed
+                        .then
+                        .target_model
+                        .as_ref()
+                        .is_some_and(|t| !t.is_empty()),
                     "{} route has empty target",
                     r.slug
                 );

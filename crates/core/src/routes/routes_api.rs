@@ -10,7 +10,8 @@ use chrono::{DateTime, Utc};
 use tt_auth::ApiKeyContext;
 use tt_routing::{
     validate_agentic_budget, validate_auto_pause, validate_capability, validate_output_shaping,
-    validate_shadow_model, NewRoute, NewRoutePause, PausedBy, Route, RoutingStore,
+    validate_route_has_effect, validate_shadow_model, NewRoute, NewRoutePause, PausedBy, Route,
+    RoutingStore,
 };
 use uuid::Uuid;
 
@@ -80,6 +81,11 @@ pub async fn create(
     // Phase 3.3/3.4: an unknown `format_switch` wire value or a route
     // declaring BOTH output-shaping levers is rejected at config time.
     validate_output_shaping(&spec.then).map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
+    // Modifier-only routes: a route with NO `target_model` (no rewrite) MUST
+    // carry at least one then-effect, otherwise it matches traffic and does
+    // nothing — a no-op mistake. Rejected at config time. Always passes when a
+    // `target_model` is set (the rewrite is the effect).
+    validate_route_has_effect(&spec.then).map_err(|e| ApiError::InvalidRequest(e.to_string()))?;
     let created = store(&state)?
         .create_route(org, spec)
         .await

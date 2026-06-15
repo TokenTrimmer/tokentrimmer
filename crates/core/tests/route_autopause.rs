@@ -239,7 +239,7 @@ async fn end_to_end_auto_pause() {
                 ..Default::default()
             },
             then: RouteAction {
-                target_model: "gpt-4o-mini".into(),
+                target_model: Some("gpt-4o-mini".into()),
                 auto_pause: true,
                 pause_min_verdicts: Some(3),
                 // floor defaults to 0.90; all-Degraded gives 0.0 pass rate.
