@@ -38,6 +38,7 @@ pub fn build_router_with_retrieval(
 
     let base = Router::new()
         .route("/health", get(routes::health::handler))
+        .route("/ready", get(routes::ready::handler))
         .route("/metrics", get(routes::metrics::handler))
         .route("/v1/models", get(routes::models::handler))
         .route("/v1/chat/completions", post(routes::chat::handler))
@@ -329,6 +330,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ready_route_is_wired_and_returns_200_in_degraded_mode() {
+        // No DB pool / L1 wired (the app() default) → readiness has no
+        // configured hard dependency down, so /ready answers 200 ready.
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["checks"]["postgres"], "not_configured");
     }
 
     #[tokio::test]

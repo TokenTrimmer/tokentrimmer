@@ -254,6 +254,19 @@ pub struct AppState {
     /// [`AppState::with_route_savings`] wires a source (a
     /// [`crate::route_savings::PostgresRouteSavingsSource`] in production).
     pub route_savings: Option<Arc<dyn crate::route_savings::RouteSavingsSource>>,
+    /// Optional Postgres pool handle used by the `GET /ready` readiness probe
+    /// to issue a `SELECT 1` liveness check against the database.
+    ///
+    /// `None` (the default, and the intentional DB-less degraded mode) means
+    /// no DB was configured at boot — `/ready` then treats Postgres as a
+    /// non-dependency and does not 503 on it. When a DB URL *was* provided at
+    /// boot the wiring layer attaches the pool here via
+    /// [`with_db_pool`](Self::with_db_pool), and a dead pool makes `/ready`
+    /// answer 503 so an orchestrator (Fly) pulls the process out of rotation.
+    /// Other pool-backed handles (`request_log_writer`, `key_store`, …) keep
+    /// the pool wrapped behind their trait objects; this is the one raw handle
+    /// the probe needs.
+    pub db_pool: Option<sqlx::PgPool>,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -294,7 +307,19 @@ impl AppState {
             shadow_timeout: DEFAULT_SHADOW_TIMEOUT,
             l2_hit_judge_limiter,
             route_savings: None,
+            db_pool: None,
         }
+    }
+
+    /// Builder-style attach: register the Postgres pool with the readiness
+    /// probe (`GET /ready`). Pass the SAME pool the telemetry/auth/routing
+    /// stores were built from. Once attached, a dead pool makes `/ready`
+    /// return 503 (hard dependency); leaving it unset keeps the DB-less
+    /// degraded mode where `/ready` does not gate on Postgres.
+    #[must_use]
+    pub fn with_db_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.db_pool = Some(pool);
+        self
     }
 
     /// Construct the default production state: registry pre-seeded with all
