@@ -29,15 +29,24 @@ pub mod memory;
 pub mod redis_impl;
 
 // Re-export key L2 types at the crate root for convenience.
-pub use embed::{EmbedError, EmbeddingProvider, MockEmbedder, OpenAIEmbedder};
+pub use embed::{
+    EmbedError, EmbeddingProvider, MemoizingEmbedder, MockEmbedder, OpenAIEmbedder,
+    DEFAULT_EMBED_CACHE_CAPACITY,
+};
+pub use key::{
+    cache_key, cache_key_with, AliasMapCanonicalizer, IdentityCanonicalizer, ModelCanonicalizer,
+};
 pub use l1_entry::L1Entry;
 pub use l2::{
-    class_threshold_for, l2_context_text, l2_tool_context_text, AdaptiveClassThresholds,
-    CacheEntry, ClassThresholds, DedupCluster, DedupReport, FpGateTuning, InMemoryL2Cache,
-    JudgeBand, JudgeRecordOutcome, L2Cache, PostgresL2Cache, TaskClass, ADAPTIVE_THRESHOLD_CEILING,
-    DEFAULT_THRESHOLD,
+    class_threshold_for, dedup_collapse, l2_context_text, l2_tool_context_text,
+    AdaptiveClassThresholds, CacheEntry, ClassThresholds, DedupActionReport, DedupCluster,
+    DedupReport, FpGateTuning, InMemoryL2Cache, JudgeBand, JudgeRecordOutcome, L2Cache,
+    PostgresL2Cache, TaskClass, ADAPTIVE_THRESHOLD_CEILING, DEFAULT_THRESHOLD,
 };
-pub use lexical::{lexical_agreement, lexical_sig, DEFAULT_LEXICAL_MIN_AGREEMENT};
+pub use lexical::{
+    lexical_agreement, lexical_sig, lexical_verify_decision, LexicalVerifyConfig,
+    LexicalVerifyDecision, DEFAULT_LEXICAL_MIN_AGREEMENT, DEFAULT_VERIFY_EPSILON,
+};
 
 use async_trait::async_trait;
 use thiserror::Error;

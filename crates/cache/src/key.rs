@@ -22,21 +22,92 @@
 //! hash**.  The request forwarded upstream to the provider is **never
 //! modified** — callers see their original content reflected back verbatim.
 //!
-//! ## Intentionally deferred: model-alias canonicalization
+//! ## Model-alias canonicalization (opt-in)
 //!
 //! Mapping dated model snapshots to floating aliases (e.g. `gpt-4o-2024-08-06`
-//! → `gpt-4o`) is NOT implemented here.  A dated snapshot and its floating
-//! alias can have different capabilities or system-prompt defaults; serving
-//! one model's cached response for another is a correctness risk.  This
-//! optimization is deferred until a registry-backed KNOWN-equivalent map can
-//! guarantee strict semantic equivalence between alias pairs.
+//! → `gpt-4o`) is exposed here as an **opt-in hook** ([`ModelCanonicalizer`]),
+//! not a default.  A dated snapshot and its floating alias can differ in
+//! capabilities or system-prompt defaults, so collapsing them is correct ONLY
+//! for pairs a registry asserts are identical.  [`cache_key`] therefore uses the
+//! no-op [`IdentityCanonicalizer`] (key derivation is unchanged); a caller that
+//! holds an asserted-identical alias map opts in via [`cache_key_with`] with an
+//! [`AliasMapCanonicalizer`], so requests pinning an identical snapshot share
+//! one cache entry instead of fragmenting (higher hit rate, no correctness
+//! risk).
 //!
 //! [`ChatCompletionRequest`]: tt_shared::messages::ChatCompletionRequest
+
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 use unicode_normalization::UnicodeNormalization as _;
 
 use sha2::{Digest, Sha256};
 use tt_shared::messages::ChatCompletionRequest;
+
+// ---------------------------------------------------------------------------
+// Model-alias canonicalization hook (COST-5)
+// ---------------------------------------------------------------------------
+
+/// Maps a (possibly dated-snapshot) model id to the canonical id used for cache
+/// identity, so requests pinning a dated snapshot of a model a registry asserts
+/// is identical to its floating alias (e.g. `gpt-4o-2024-08-06` → `gpt-4o`)
+/// share one cache entry instead of fragmenting across snapshots.
+///
+/// # Correctness contract
+///
+/// An implementation MUST collapse two ids ONLY when a registry asserts the two
+/// produce identical outputs for identical inputs. A dated snapshot and its
+/// floating alias can otherwise differ in capabilities or system-prompt
+/// defaults, and serving one's cached response for the other is a correctness
+/// bug, not a hit-rate win. When in doubt, leave the id unchanged
+/// ([`IdentityCanonicalizer`]).
+pub trait ModelCanonicalizer {
+    /// The canonical cache identity for `model`. Return `model` unchanged when
+    /// no asserted-identical alias is known.
+    fn canonicalize<'a>(&self, model: &'a str) -> Cow<'a, str>;
+}
+
+/// The no-op canonicalizer: every id is its own cache identity. This is the
+/// default used by [`cache_key`], so the default key derivation is unchanged —
+/// no snapshot is ever collapsed unless a caller opts in via [`cache_key_with`]
+/// with a populated [`AliasMapCanonicalizer`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IdentityCanonicalizer;
+
+impl ModelCanonicalizer for IdentityCanonicalizer {
+    fn canonicalize<'a>(&self, model: &'a str) -> Cow<'a, str> {
+        Cow::Borrowed(model)
+    }
+}
+
+/// A canonicalizer backed by an explicit `dated-snapshot → canonical-alias` map.
+///
+/// The map is supplied by the caller from a source that ASSERTS the pairs are
+/// identical (the correctness contract on [`ModelCanonicalizer`]). An id absent
+/// from the map is left unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct AliasMapCanonicalizer {
+    aliases: HashMap<String, String>,
+}
+
+impl AliasMapCanonicalizer {
+    /// Build from a map of `dated-snapshot → canonical-alias` pairs the caller
+    /// has asserted are identical.
+    #[must_use]
+    pub fn new(aliases: HashMap<String, String>) -> Self {
+        Self { aliases }
+    }
+}
+
+impl ModelCanonicalizer for AliasMapCanonicalizer {
+    fn canonicalize<'a>(&self, model: &'a str) -> Cow<'a, str> {
+        match self.aliases.get(model) {
+            Some(canonical) => Cow::Owned(canonical.clone()),
+            None => Cow::Borrowed(model),
+        }
+    }
+}
 
 /// Derive a stable, hex-encoded SHA-256 cache key from `req`.
 ///
@@ -51,7 +122,24 @@ use tt_shared::messages::ChatCompletionRequest;
 /// `frequency_penalty`) are rounded to 6 decimal places before serialization
 /// to avoid hash churn from tiny floating-point representation differences.
 pub fn cache_key(req: &ChatCompletionRequest) -> String {
-    let canonical = build_canonical(req);
+    cache_key_with(req, &IdentityCanonicalizer)
+}
+
+/// Derive a cache key like [`cache_key`], but canonicalize the request's model
+/// id through `canonicalizer` first.
+///
+/// With [`IdentityCanonicalizer`] this is byte-for-byte identical to
+/// [`cache_key`]. With a populated [`AliasMapCanonicalizer`], a request pinning
+/// a dated snapshot the caller asserts is identical to its floating alias hashes
+/// to the SAME key as the alias — so the L1/L2 cache does not fragment across
+/// snapshots. Every other field contributes to the key exactly as in
+/// [`cache_key`].
+pub fn cache_key_with(
+    req: &ChatCompletionRequest,
+    canonicalizer: &dyn ModelCanonicalizer,
+) -> String {
+    let canonical_model = canonicalizer.canonicalize(&req.model);
+    let canonical = build_canonical(req, &canonical_model);
     // serde_json::to_vec with sorted keys is not built-in; we serialize our
     // carefully constructed Value whose keys are already in a defined order.
     let bytes = serde_json::to_vec(&canonical).expect("canonical Value is always serializable");
@@ -118,7 +206,7 @@ fn normalize_text_for_key(s: &str) -> String {
 /// Text segments in messages are normalized via [`normalize_text_for_key`]
 /// (NFC + trailing-whitespace trim) before hashing.  The upstream request is
 /// never modified — normalization applies only to the bytes used for hashing.
-fn build_canonical(req: &ChatCompletionRequest) -> serde_json::Value {
+fn build_canonical(req: &ChatCompletionRequest, model: &str) -> serde_json::Value {
     use serde_json::{json, Value};
     use tt_shared::messages::Message;
 
@@ -196,7 +284,7 @@ fn build_canonical(req: &ChatCompletionRequest) -> serde_json::Value {
         "max_completion_tokens": req.max_completion_tokens,
         "max_tokens": req.max_tokens,
         "messages": messages,
-        "model": req.model,
+        "model": model,
         "parallel_tool_calls": req.parallel_tool_calls,
         "presence_penalty": req.presence_penalty.map(round6),
         "reasoning_effort": req.reasoning_effort,
@@ -325,5 +413,58 @@ mod tests {
             name: None,
         }];
         assert_ne!(cache_key(&a), cache_key(&b));
+    }
+
+    // ── Model-alias canonicalization (COST-5) ───────────────────────────────
+
+    #[test]
+    fn identity_canonicalizer_matches_default_key() {
+        // The default key derivation IS `cache_key_with(.., IdentityCanonicalizer)`
+        // — so the public default is unchanged (no key churn).
+        let req = base_request();
+        assert_eq!(
+            cache_key(&req),
+            cache_key_with(&req, &IdentityCanonicalizer)
+        );
+    }
+
+    #[test]
+    fn alias_map_collapses_asserted_identical_snapshot() {
+        let mut dated = base_request();
+        dated.model = "gpt-4o-2024-08-06".into();
+        let mut bare = base_request();
+        bare.model = "gpt-4o".into();
+
+        // Default (no canonicalization): a dated snapshot fragments the cache.
+        assert_ne!(
+            cache_key(&dated),
+            cache_key(&bare),
+            "without canonicalization a dated snapshot must NOT collide with its alias"
+        );
+
+        // With an asserted-identical alias map, the snapshot shares the alias's key.
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("gpt-4o-2024-08-06".to_string(), "gpt-4o".to_string());
+        let canon = AliasMapCanonicalizer::new(aliases);
+        assert_eq!(
+            cache_key_with(&dated, &canon),
+            cache_key_with(&bare, &canon),
+            "a canonicalized snapshot must share its alias's cache entry"
+        );
+        // The canonicalized snapshot key equals the bare model's DEFAULT key.
+        assert_eq!(cache_key_with(&dated, &canon), cache_key(&bare));
+    }
+
+    #[test]
+    fn alias_map_leaves_unmapped_model_unchanged() {
+        let req = base_request(); // model = "gpt-4o", not in the map
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("some-other-snapshot".to_string(), "some-other".to_string());
+        let canon = AliasMapCanonicalizer::new(aliases);
+        assert_eq!(
+            cache_key_with(&req, &canon),
+            cache_key(&req),
+            "an unmapped model must hash identically to the default key"
+        );
     }
 }

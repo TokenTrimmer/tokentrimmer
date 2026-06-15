@@ -494,6 +494,75 @@ pub const DEDUP_MAX_ENTRIES: usize = 5_000;
 pub const DEDUP_TOP_CLUSTERS: usize = 20;
 
 // ---------------------------------------------------------------------------
+// Paraphrase-dedup ACTION (collapse duplicates) — COST-5
+// ---------------------------------------------------------------------------
+
+/// What [`dedup_collapse`] did (or, in dry-run, WOULD do) for one org: the
+/// read-only [`DedupReport`] it acted on plus the non-representative entry ids
+/// it collapsed away.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DedupActionReport {
+    /// The dedup analysis the action was computed from.
+    pub report: DedupReport,
+    /// Non-representative member ids collapsed (evicted) — or, when
+    /// [`Self::dry_run`] is true, the ids that WOULD be evicted. Sorted for a
+    /// deterministic result. The cluster representative (highest `hit_count`) is
+    /// always KEPT, so every cluster's cached answer survives.
+    pub collapsed_ids: Vec<Uuid>,
+    /// True when the action only reported the plan and evicted nothing.
+    pub dry_run: bool,
+}
+
+/// Collapse near-duplicate cache entries for `org_id` into one representative
+/// per cluster — the maintenance/admin action built on the read-only
+/// [`L2Cache::analyze_dedup`] machinery.
+///
+/// For every near-duplicate cluster the analysis surfaces, the highest-
+/// `hit_count` member is KEPT as the representative and the others are evicted
+/// (via [`L2Cache::evict`] — single-row, idempotent). The representative's
+/// cached answer remains servable, so collapsing never loses a cacheable
+/// response; it only removes redundant rows that fragment the cache.
+///
+/// # Safety
+///
+/// - **Dry-run friendly.** With `dry_run = true` NOTHING is evicted — the
+///   returned [`DedupActionReport::collapsed_ids`] is exactly the plan an
+///   operator can review before committing.
+/// - **Bounded + targeted.** It acts only on the clusters the report surfaces
+///   (the top opportunities by hit weight — see [`DEDUP_TOP_CLUSTERS`]); re-run
+///   to collapse further as remaining clusters re-rank. It only ever deletes
+///   non-representative members — never a bulk delete, never the representative.
+pub async fn dedup_collapse(
+    cache: &dyn L2Cache,
+    org_id: Uuid,
+    dry_run: bool,
+) -> Result<DedupActionReport, CacheError> {
+    let report = cache.analyze_dedup(org_id).await?;
+
+    let mut collapsed_ids: Vec<Uuid> = Vec::new();
+    for cluster in &report.top_clusters {
+        for &id in &cluster.member_ids {
+            if id != cluster.representative_id {
+                collapsed_ids.push(id);
+            }
+        }
+    }
+    collapsed_ids.sort_unstable();
+
+    if !dry_run {
+        for &id in &collapsed_ids {
+            cache.evict(id).await?;
+        }
+    }
+
+    Ok(DedupActionReport {
+        report,
+        collapsed_ids,
+        dry_run,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // L2Cache trait
 // ---------------------------------------------------------------------------
 
@@ -1762,6 +1831,94 @@ mod tests {
         let report = cache.analyze_dedup(org_a).await.unwrap();
         assert_eq!(report.total_entries, 1);
         assert_eq!(report.cluster_count, 0);
+    }
+
+    // ── Paraphrase-dedup ACTION (collapse duplicates, dry-run friendly) ──────
+
+    /// Build a 3-member near-duplicate cluster (a1 is the highest-hit_count rep)
+    /// plus an orthogonal singleton, for the dedup-action tests.
+    async fn seed_dedup_cluster(cache: &InMemoryL2Cache, org: Uuid) -> (Uuid, Uuid, Uuid) {
+        let now = Utc::now();
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let a3 = Uuid::new_v4();
+        for (id, v, hits) in [
+            (a1, vec![1.0_f32, 0.0, 0.0], 10_u64),
+            (a2, vec![0.999_f32, 0.01, 0.0], 3),
+            (a3, vec![0.998_f32, 0.02, 0.0], 1),
+        ] {
+            let mut e = entry_at(id, org, v, now);
+            e.hit_count = hits;
+            cache.insert(e).await.unwrap();
+        }
+        (a1, a2, a3)
+    }
+
+    #[tokio::test]
+    async fn dedup_collapse_dry_run_lists_but_evicts_nothing() {
+        let cache = InMemoryL2Cache::new();
+        let org = Uuid::new_v4();
+        let (a1, a2, a3) = seed_dedup_cluster(&cache, org).await;
+
+        let action = dedup_collapse(&cache, org, true).await.unwrap();
+        assert!(action.dry_run);
+        // a1 (highest hit_count) is the rep and is NEVER collapsed; a2,a3 planned.
+        assert_eq!(action.collapsed_ids.len(), 2);
+        assert!(
+            !action.collapsed_ids.contains(&a1),
+            "the representative is never collapsed"
+        );
+        assert!(action.collapsed_ids.contains(&a2));
+        assert!(action.collapsed_ids.contains(&a3));
+        // DRY RUN: nothing was actually evicted — all 3 cluster members survive.
+        assert_eq!(cache.analyze_dedup(org).await.unwrap().total_entries, 3);
+    }
+
+    #[tokio::test]
+    async fn dedup_collapse_evicts_non_representatives_and_keeps_rep() {
+        let cache = InMemoryL2Cache::new();
+        let org = Uuid::new_v4();
+        let (a1, _a2, _a3) = seed_dedup_cluster(&cache, org).await;
+
+        let action = dedup_collapse(&cache, org, false).await.unwrap();
+        assert!(!action.dry_run);
+        assert_eq!(action.collapsed_ids.len(), 2);
+
+        // The two non-reps are gone; the representative survives and is servable.
+        let report = cache.analyze_dedup(org).await.unwrap();
+        assert_eq!(report.total_entries, 1, "only the representative remains");
+        assert_eq!(report.cluster_count, 0, "no cluster remains after collapse");
+        let (hit, _) = cache
+            .lookup(org, &[1.0, 0.0, 0.0], 0.92, "gpt-4o", "mock-v1")
+            .await
+            .unwrap()
+            .expect("the representative must still be servable");
+        assert_eq!(
+            hit.id, a1,
+            "the kept entry is the highest-hit_count representative"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_collapse_no_clusters_is_noop() {
+        let cache = InMemoryL2Cache::new();
+        let now = Utc::now();
+        let org = Uuid::new_v4();
+        // Two orthogonal singletons — no near-duplicate cluster.
+        cache
+            .insert(entry_at(Uuid::new_v4(), org, vec![1.0, 0.0], now))
+            .await
+            .unwrap();
+        cache
+            .insert(entry_at(Uuid::new_v4(), org, vec![0.0, 1.0], now))
+            .await
+            .unwrap();
+        let action = dedup_collapse(&cache, org, false).await.unwrap();
+        assert!(
+            action.collapsed_ids.is_empty(),
+            "no clusters → nothing collapsed"
+        );
+        assert_eq!(cache.analyze_dedup(org).await.unwrap().total_entries, 2);
     }
 
     // ── Adaptive thresholds (FP gate ratchet — SAFETY: never below 0.92) ─────
