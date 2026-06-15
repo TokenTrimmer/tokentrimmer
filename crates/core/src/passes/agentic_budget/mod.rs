@@ -12,12 +12,16 @@
 //!   cache fires on the static + history prefix. Books NO TT savings and NO
 //!   bust — pure provider-cache enablement, reported on the separate
 //!   `provider_cache_saved_usd` axis (spec §4.3). **Shipped here (Task 4).**
-//! - **Sub-lever 2** — field-drop (lossless, token-true-gated) + summarize
-//!   (lossy, judge-gated) stale tool results. *(Later tasks.)*
+//! - **Sub-lever 2** — field-drop (lossless, token-true-gated, run in
+//!   [`AgenticBudgetPlanner::plan`]) + summarize (lossy, judge-gated, invocable
+//!   via [`AgenticBudgetPlanner::plan_summary`]) stale tool results.
 //! - **Sub-lever 3** — down-route mechanical sub-steps in a cache-isolated
-//!   lane. *(Later tasks.)*
-//! - **Sub-lever 4** — semantic sub-step cache for read-only sub-steps.
-//!   *(Later tasks.)*
+//!   lane. The planner emits the `subagent_lane:<target>` marker; the actual
+//!   routed dispatch lane is the chat HANDLER's to wire *(deferred there)*.
+//! - **Sub-lever 4** — semantic sub-step cache for read-only sub-steps. The
+//!   planner marks the read-only-eligible sub-steps (`substep_cache:<tool>`);
+//!   the async L2 sub-step lookup/serve (needs the embedder + store) is the
+//!   handler's to wire, exactly like Sub-lever 3's dispatch lane.
 //!
 //! # Off by default (load-bearing)
 //!
@@ -129,6 +133,12 @@ impl AgenticBudgetPlanner {
     ///    CACHE-ISOLATED subagent lane (a distinct conversation tag), never
     ///    interleaved on the cached prefix — caching and routing fight (R1
     ///    cache-vs-route), so routed work runs on its own prefix lane.
+    /// 4. **Sub-lever 4** (`semantic_substep_cache`): mark each READ-ONLY /
+    ///    idempotent sub-step (classified fail-closed via [`classify_substep`])
+    ///    as a `substep_cache:<tool>` warning. Read-only-safe and net-positive
+    ///    by construction — it only INSPECTS the request and books no effect; a
+    ///    realized hit on the handler's async L2 sub-step lookup books only its
+    ///    measured delta (caveat C2).
     ///
     /// When a lever DOES mutate the stable prefix (only via the
     /// [`SplitRequest::mutate_whole_request`] escape hatch), the booked
@@ -177,7 +187,73 @@ impl AgenticBudgetPlanner {
             out.warnings.push(format!("subagent_lane:{target}"));
         }
 
+        // ── Sub-lever 4 (read-only-safe, net-positive by construction): mark
+        // read-only sub-steps eligible for the semantic sub-step cache ───────
+        // Scan the transcript's tool calls and surface each READ-ONLY /
+        // idempotent sub-step (classified fail-closed via `classify_substep`) as
+        // a `substep_cache:<tool>` marker. Caching a read-only sub-step's result
+        // is pure upside — this step never mutates the request and only ever
+        // lets the handler AVOID a re-call, so it books no effect here (a
+        // realized hit books only its MEASURED delta on the handler's async L2
+        // lookup, caveat C2). The async lookup/serve (embedder + store) is the
+        // handler's to wire, exactly like Sub-lever 3's dispatch lane.
+        if ab.semantic_substep_cache {
+            Self::mark_substep_cacheable(&mut out, split.request());
+        }
+
         out
+    }
+
+    /// Surface each READ-ONLY sub-step in the transcript as a
+    /// `substep_cache:<tool>` warning (deduped, first-seen order — deterministic).
+    /// Mutating / unknown tools are fail-closed (never marked). Read-only by
+    /// construction: it only inspects the request.
+    fn mark_substep_cacheable(out: &mut PlanOutcome, req: &tt_shared::ChatCompletionRequest) {
+        use tt_shared::messages::Message;
+        for msg in &req.messages {
+            let Message::Assistant { tool_calls, .. } = msg else {
+                continue;
+            };
+            for tc in tool_calls {
+                if classify_substep(&tc.function.name) == SubstepKind::ReadOnly {
+                    let marker = format!("substep_cache:{}", tc.function.name);
+                    if !out.warnings.contains(&marker) {
+                        out.warnings.push(marker);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Make Sub-lever 2b (lossy summarize) invocable from the planner, behind the
+    /// existing blind-paired-judge gate.
+    ///
+    /// [`plan`](Self::plan) runs the LOSSLESS half of Sub-lever 2 (2a field-drop)
+    /// on the token-true gate; the LOSSY summary half commits ONLY behind a
+    /// [`SummaryGate`] (the judge's verdict projection, caveat C1). This is the
+    /// planner seam that wires that step: it is a no-op unless
+    /// `ab.elide_stale_tools` is set, and even then commits nothing for a class
+    /// the `gate` does not trust (fail OPEN to the un-summarized bytes). It keeps
+    /// the last `ab.keep_recent_pairs` tool results verbatim and operates on the
+    /// volatile tail only (the prefix is unreachable by type).
+    ///
+    /// Returns the [`SummaryOutcome`] — committed edits, the self-reported byte
+    /// delta, and the ledgered summarizer tax — so the caller feeds the judge
+    /// samples and ledgers the tax. The production call site (the chat HANDLER,
+    /// with the real [`AdaptiveSummaryGate`] and a metered [`Summarizer`]) is
+    /// wired separately; the handler owns the judge state and the auxiliary
+    /// provider (deferred there).
+    pub fn plan_summary(
+        ab: &AgenticBudget,
+        split: &mut SplitRequest<'_>,
+        gate: &dyn SummaryGate,
+        summarizer: &dyn Summarizer,
+    ) -> SummaryOutcome {
+        if !ab.elide_stale_tools {
+            return SummaryOutcome::default();
+        }
+        let step = SummarizeStep::new(ab.keep_recent_pairs, gate, summarizer);
+        split.run_pass(|_stable, tail| step.apply(tail))
     }
 
     /// Run the field-drop pass over the volatile tail behind the token-true
@@ -499,5 +575,191 @@ mod tests {
             "the bust must surface as cache_bust:<source>: {:?}",
             out.warnings
         );
+    }
+
+    // ── Sub-lever 4: substep-cache marking now runs in plan() (COST-3) ───────
+
+    /// With `semantic_substep_cache` on, `plan()` marks each READ-ONLY sub-step
+    /// `substep_cache:<tool>` and NEVER marks a mutating one (fail-closed). This
+    /// is the assertion that Sub-lever 4 now runs in `plan()`.
+    #[test]
+    fn planner_marks_read_only_substeps_for_cache() {
+        let mut req = req_with(vec![
+            user("scan and then write"),
+            assistant_call("c1", "inspect_diff"), // READ-ONLY (allowlisted)
+            tool_result("c1", diff_result()),
+            assistant_call("c2", "write_file"), // MUTATING (fail-closed)
+            tool_result("c2", diff_result()),
+        ]);
+        let cx = cx();
+        let ab = AgenticBudget {
+            semantic_substep_cache: true,
+            ..budget()
+        };
+        let out = {
+            let mut split = SplitRequest::compute(&mut req, &cx);
+            AgenticBudgetPlanner::plan(&ab, &mut split, &cx)
+        };
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w == "substep_cache:inspect_diff"),
+            "a read-only sub-step must be marked cacheable (Sub-lever 4 runs in plan): {:?}",
+            out.warnings
+        );
+        assert!(
+            !out.warnings.iter().any(|w| w == "substep_cache:write_file"),
+            "a mutating sub-step must NEVER be marked cacheable (fail-closed): {:?}",
+            out.warnings
+        );
+    }
+
+    /// Off by default: no `substep_cache:` marker unless the lever is set.
+    #[test]
+    fn planner_does_not_mark_substeps_when_disabled() {
+        let mut req = req_with(vec![
+            user("scan"),
+            assistant_call("c1", "inspect_diff"),
+            tool_result("c1", diff_result()),
+        ]);
+        let cx = cx();
+        let ab = budget(); // semantic_substep_cache = false
+        let out = {
+            let mut split = SplitRequest::compute(&mut req, &cx);
+            AgenticBudgetPlanner::plan(&ab, &mut split, &cx)
+        };
+        assert!(
+            !out.warnings.iter().any(|w| w.starts_with("substep_cache:")),
+            "no substep_cache marker when the lever is off: {:?}",
+            out.warnings
+        );
+    }
+
+    /// The same read-only tool called twice is marked once (deduped,
+    /// deterministic).
+    #[test]
+    fn planner_dedups_repeated_read_only_substep_markers() {
+        let mut req = req_with(vec![
+            user("scan twice"),
+            assistant_call("c1", "inspect_diff"),
+            tool_result("c1", diff_result()),
+            assistant_call("c2", "inspect_diff"),
+            tool_result("c2", diff_result()),
+        ]);
+        let cx = cx();
+        let ab = AgenticBudget {
+            semantic_substep_cache: true,
+            ..budget()
+        };
+        let out = {
+            let mut split = SplitRequest::compute(&mut req, &cx);
+            AgenticBudgetPlanner::plan(&ab, &mut split, &cx)
+        };
+        let count = out
+            .warnings
+            .iter()
+            .filter(|w| *w == "substep_cache:inspect_diff")
+            .count();
+        assert_eq!(
+            count, 1,
+            "a repeated read-only tool must be marked once (deduped): {:?}",
+            out.warnings
+        );
+    }
+
+    // ── Sub-lever 2b: summarize is now invocable from the planner (COST-3) ───
+
+    /// A fixed-output summarizer for the planner-seam test.
+    struct TestSummarizer {
+        summary: &'static str,
+        cost_usd: Option<f64>,
+    }
+    impl Summarizer for TestSummarizer {
+        fn summarize(&self, _class: &str, _content: &str) -> SummarizeCall {
+            SummarizeCall {
+                summary: Some(self.summary.to_string()),
+                cost_usd: self.cost_usd,
+            }
+        }
+    }
+
+    /// Sub-lever 2b is invocable via `plan_summary`, gated behind the judge: a
+    /// CLOSED gate commits nothing (fail open, byte-identical), an OPEN gate
+    /// commits the lossy summary, and the whole step is a no-op unless
+    /// `elide_stale_tools` is set.
+    #[test]
+    fn plan_summary_invocable_behind_judge_gate() {
+        // A big tool blob so the fixed short summary is clearly byte-shorter.
+        let big = json!({
+            "rows": (0..40).map(|i| format!("row-{i}-noisy-payload")).collect::<Vec<_>>(),
+        });
+        let make_req = || {
+            req_with(vec![
+                user("call a tool"),
+                assistant_call("c1", "mystery_tool"),
+                tool_result("c1", big.clone()),
+            ])
+        };
+        let cx = cx();
+        let summarizer = TestSummarizer {
+            summary: "[s]",
+            cost_usd: Some(0.0001),
+        };
+        // keep_recent_pairs=0 so the single tool result is eligible.
+        let ab = AgenticBudget {
+            elide_stale_tools: true,
+            keep_recent_pairs: 0,
+            ..budget()
+        };
+
+        // Closed gate → nothing commits (fail open to the un-summarized bytes).
+        {
+            let mut req = make_req();
+            let before = serde_json::to_string(&req).unwrap();
+            let closed = NeverCommitGate;
+            let out = {
+                let mut split = SplitRequest::compute(&mut req, &cx);
+                AgenticBudgetPlanner::plan_summary(&ab, &mut split, &closed, &summarizer)
+            };
+            assert!(
+                out.committed.is_empty(),
+                "a closed judge gate commits no summary"
+            );
+            assert_eq!(
+                serde_json::to_string(&req).unwrap(),
+                before,
+                "a gate-refused summary leaves the request byte-identical (fail open)"
+            );
+        }
+
+        // Open gate → commits the lossy summary THROUGH the planner seam.
+        {
+            let mut req = make_req();
+            let open = AlwaysCommitGate;
+            let out = {
+                let mut split = SplitRequest::compute(&mut req, &cx);
+                AgenticBudgetPlanner::plan_summary(&ab, &mut split, &open, &summarizer)
+            };
+            assert_eq!(
+                out.committed.len(),
+                1,
+                "an open judge gate commits the lossy summary via plan_summary"
+            );
+        }
+
+        // Disabled (elide_stale_tools=false) → no-op even with an open gate.
+        {
+            let mut req = make_req();
+            let open = AlwaysCommitGate;
+            let disabled = budget(); // elide_stale_tools = false
+            let out = {
+                let mut split = SplitRequest::compute(&mut req, &cx);
+                AgenticBudgetPlanner::plan_summary(&disabled, &mut split, &open, &summarizer)
+            };
+            assert!(
+                out.committed.is_empty(),
+                "Sub-lever 2b is gated on elide_stale_tools (no-op when off)"
+            );
+        }
     }
 }
