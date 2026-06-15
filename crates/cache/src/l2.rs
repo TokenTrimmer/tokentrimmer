@@ -1129,8 +1129,38 @@ fn cluster_near_duplicates(entries: &[(Uuid, &[f32], u64)]) -> DedupReport {
 /// neighbour can fall outside it, producing a false cache miss (poor recall).
 /// Raising `ef_search` widens the candidate list so the org's vectors reliably
 /// make the cut. 100 restores high recall at a small latency cost; tune via
-/// [`PostgresL2Cache::with_ef_search`].
+/// [`PostgresL2Cache::with_ef_search`] or the [`EF_SEARCH_ENV`] env var.
+///
+/// The recall/cost/RAM tradeoff and a revisit budget (when the single shared
+/// HNSW index + org_id post-filter design needs per-org partial indexes) are
+/// documented in `docs/l2-hnsw-recall-budget.md`.
 pub const DEFAULT_EF_SEARCH: i64 = 100;
+
+/// Env var that overrides [`DEFAULT_EF_SEARCH`] at startup, so operators can tune
+/// the HNSW `ef_search` (recall vs. latency/RAM) without a recompile.
+/// [`PostgresL2Cache::new`] reads it; see `docs/l2-hnsw-recall-budget.md`.
+pub const EF_SEARCH_ENV: &str = "TT_L2_EF_SEARCH";
+
+/// Resolve the HNSW `ef_search` from [`EF_SEARCH_ENV`], falling back to
+/// [`DEFAULT_EF_SEARCH`]. An unset / empty / unparseable / `< 1` value uses the
+/// default (we never silently drop below pgvector's behaviour).
+pub fn ef_search_from_env() -> i64 {
+    parse_ef_search(std::env::var(EF_SEARCH_ENV).ok().as_deref())
+}
+
+/// Pure parser behind [`ef_search_from_env`], split out so it is testable
+/// without mutating process env: `None` / empty / unparseable / `< 1`
+/// → [`DEFAULT_EF_SEARCH`]; otherwise the parsed positive value.
+fn parse_ef_search(raw: Option<&str>) -> i64 {
+    match raw.map(str::trim) {
+        Some(s) if !s.is_empty() => s
+            .parse::<i64>()
+            .ok()
+            .filter(|&v| v >= 1)
+            .unwrap_or(DEFAULT_EF_SEARCH),
+        _ => DEFAULT_EF_SEARCH,
+    }
+}
 
 pub struct PostgresL2Cache {
     pool: sqlx::PgPool,
@@ -1138,11 +1168,14 @@ pub struct PostgresL2Cache {
 }
 
 impl PostgresL2Cache {
-    /// Wrap an existing connected pool, using [`DEFAULT_EF_SEARCH`].
+    /// Wrap an existing connected pool, resolving `ef_search` from
+    /// [`EF_SEARCH_ENV`] (falling back to [`DEFAULT_EF_SEARCH`]). This lets an
+    /// operator tune recall vs. latency/RAM without a recompile; an explicit
+    /// [`with_ef_search`](Self::with_ef_search) still overrides the env value.
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
             pool,
-            ef_search: DEFAULT_EF_SEARCH,
+            ef_search: ef_search_from_env(),
         }
     }
 
@@ -1466,6 +1499,31 @@ mod tests {
             expires_at: now + chrono::Duration::seconds(3600),
             lexical_sig: None,
         }
+    }
+
+    /// `TT_L2_EF_SEARCH` parsing: a valid positive value wins; everything else
+    /// (unset, empty, junk, zero, negative) falls back to the default. Tests the
+    /// pure parser so it never races on process env.
+    #[test]
+    fn parse_ef_search_handles_overrides_and_fallbacks() {
+        assert_eq!(parse_ef_search(Some("250")), 250);
+        assert_eq!(parse_ef_search(Some("  64  ")), 64, "trims whitespace");
+        assert_eq!(parse_ef_search(Some("1")), 1, "minimum valid value");
+        // Fallbacks to the default.
+        assert_eq!(parse_ef_search(None), DEFAULT_EF_SEARCH, "unset");
+        assert_eq!(parse_ef_search(Some("")), DEFAULT_EF_SEARCH, "empty");
+        assert_eq!(parse_ef_search(Some("   ")), DEFAULT_EF_SEARCH, "blank");
+        assert_eq!(
+            parse_ef_search(Some("abc")),
+            DEFAULT_EF_SEARCH,
+            "non-numeric"
+        );
+        assert_eq!(
+            parse_ef_search(Some("0")),
+            DEFAULT_EF_SEARCH,
+            "below minimum"
+        );
+        assert_eq!(parse_ef_search(Some("-5")), DEFAULT_EF_SEARCH, "negative");
     }
 
     /// Recall regression under multi-tenant load: with N orgs each holding a
