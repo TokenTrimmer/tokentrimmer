@@ -34,7 +34,7 @@ with `fly secrets set KEY=value` and read from the Fly runtime environment.
 
 | Key | Blast radius if leaked | Rotation notes |
 |---|---|---|
-| `TT_MASTER_KEY` | Decrypts **all** stored provider credentials (XChaCha20-Poly1305, per-row derived keys). | **Rotation requires re-encrypting `provider_credentials`** — you cannot just swap the key. See the re-encryption procedure below. |
+| `TT_MASTER_KEY` | Decrypts **all** stored provider credentials AND every opt-in captured request/response body (`request_body_captures`) — both use XChaCha20-Poly1305 with per-row/per-org derived keys. | **Rotation requires re-encrypting BOTH `provider_credentials` AND `request_body_captures`** — you cannot just swap the key. See the re-encryption procedure below. |
 | `TT_AUDIT_SIGNING_KEY` (Ed25519) | Forge audit-chain signatures. | Rotate the keypair; record the rotation as an audit event; publish the new verifying key. Old entries stay verifiable under the old public key. |
 | `TT_ADMIN_TOKEN` (cloud) | Full admin API access (`/v1/admin/*`). | Rotate immediately; single bearer value, no migration needed. |
 | `FLY_API_TOKEN` | Deploy/destroy infrastructure. | `fly tokens revoke` + issue a new scoped deploy token. |
@@ -43,34 +43,65 @@ with `fly secrets set KEY=value` and read from the Fly runtime environment.
 
 ## `TT_MASTER_KEY` rotation (re-encryption)
 
-Because every row in `provider_credentials` is sealed with a key **derived from**
-`TT_MASTER_KEY` (+ per-(org,provider) salt + AAD), rotating the master key means
-re-sealing every credential:
+`TT_MASTER_KEY` is the root key for **two** at-rest stores, each sealed with a key
+**derived from** the master:
 
-The re-encryption primitive now exists:
-**`tt_auth::postgres::PostgresProviderCredentialStore::reencrypt_all(&new_master_key)`**
-(crates/auth/src/postgres.rs) decrypts every row under the current key and
-re-seals it under the new one in a single all-or-nothing transaction. Procedure:
+1. **`provider_credentials`** — per-(org, provider) derived keys + AAD.
+2. **`request_body_captures`** — the opt-in encrypted request/response bodies for
+   hosted `/logs` replay, per-org derived keys + (org, trace, kind) AAD.
 
-1. Build the store with the **current** key: `PostgresProviderCredentialStore::from_env(pool)`.
-2. Call `store.reencrypt_all(&new_key_bytes)` — returns the row count re-sealed
-   (transaction rolls back if any row fails, so the table is never half-rotated).
+Rotating the master key means re-sealing **both** stores. Skipping either one
+silently makes that store undecryptable after the swap — and the body-capture
+store is easy to forget because it is opt-in and may be empty on some
+deployments.
+
+Two re-encryption primitives exist:
+
+- **`tt_auth::postgres::PostgresProviderCredentialStore::reencrypt_all(&new_master_key)`**
+  (crates/auth/src/postgres.rs) — re-seals every `provider_credentials` row in a
+  single all-or-nothing transaction; returns the row count.
+- **`tt_telemetry::body_capture::postgres::PostgresBodyCaptureWriter::reencrypt_all(&new_master_key)`**
+  (crates/telemetry/src/body_capture.rs, behind the `postgres` feature) — re-seals
+  every `request_body_captures` row in keyset-paginated batches, each committed
+  in its own transaction so the pass is **resumable** and **idempotent** (a re-run
+  skips rows already sealed under the new key). Returns `ReencryptStats`
+  (`scanned` / `reencrypted` / `already_current`). A row that decrypts under
+  neither key aborts its batch and errors rather than being silently dropped.
+
+Procedure (run BEFORE promoting the new key, with both stores pointed at the
+current `TT_MASTER_KEY`):
+
+1. Build the stores with the **current** key:
+   `PostgresProviderCredentialStore::from_env(pool)` and
+   `PostgresBodyCaptureWriter::from_env(pool)`.
+2. Call `cred_store.reencrypt_all(&new_key_bytes)` **and**
+   `body_writer.reencrypt_all(&new_key_bytes)`. The body-capture pass is
+   resumable, so if it is interrupted just run it again — it continues past the
+   already-rotated rows.
 3. Promote the new key → `TT_MASTER_KEY` (e.g. `fly secrets set`); restart so the
    gateway/api read it. Remove the old key.
-4. Verify a sample credential decrypts under the new key; record the rotation as
-   an audit event.
+4. Verify a sample credential **and** a sample captured body decrypt under the
+   new key; record the rotation as an audit event.
 
-Do **not** swap `TT_MASTER_KEY` in place without running `reencrypt_all` first, or
-every stored credential becomes undecryptable. _(An operator-facing `tt`
-subcommand wrapping `reencrypt_all` is a thin follow-up; the primitive + its
-DB-free round-trip test ship today.)_
+Do **not** swap `TT_MASTER_KEY` in place without running BOTH `reencrypt_all`
+passes first, or every stored credential and every captured body becomes
+undecryptable. If you do not run the body-capture pass you are explicitly
+**accepting the loss of all capture history** — only do this knowingly.
+
+> **Cloud deployments:** the same applies to any cloud-side body-capture table.
+> The hosted `tt-api`/gateway must run the body-capture re-encryption pass over
+> its `request_body_captures` rows during a master-key rotation; mirror this step
+> in the cloud rotation runbook.
+
+_(An operator-facing `tt` subcommand wrapping both `reencrypt_all` passes is a
+thin follow-up; the primitives + their DB-free round-trip tests ship today.)_
 
 ## Operator checklist (the human-gated part)
 
 - [ ] Generate fresh **test** credentials; rewrite `./.env.development` to use only those.
 - [ ] `fly secrets set` every production secret on the gateway and `tt-api` apps.
 - [ ] Delete `./.env.production` from the workstation once `fly secrets` is the source of truth.
-- [ ] Rotate the high-value keys above (run the `TT_MASTER_KEY` re-encryption first).
+- [ ] Rotate the high-value keys above (run BOTH `TT_MASTER_KEY` re-encryption passes — credentials AND body captures — first).
 - [ ] Confirm `.gitignore` still covers `.env*` (it does) and that no secret ever entered git history (`git log -p -- .env*` → empty).
 
 See also: [`SECURITY.md`](../SECURITY.md), `.env.example` (the committed, value-less template).

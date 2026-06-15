@@ -93,6 +93,11 @@ jobs:
       # default workspace build does not enable — so scope + feature it here.
       - name: tt-auth Postgres key store (ignored)
         run: cargo test -p tt-auth --features postgres -- --include-ignored
+      # Body-capture master-key re-encryption (TT_MASTER_KEY rotation): re-keys
+      # request_body_captures. Gated behind tt-telemetry's `postgres` feature,
+      # like tt-auth above; creates + clears its own table.
+      - name: tt-telemetry body-capture reencrypt (ignored)
+        run: cargo test -p tt-telemetry --features postgres -- --include-ignored
       # L2 pgvector cache: round-trip + org-A-insert / org-B-miss isolation.
       - name: tt-cache L2 + L1 (ignored)
         run: cargo test -p tt-cache -- --include-ignored
