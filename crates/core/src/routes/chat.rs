@@ -5573,6 +5573,7 @@ pub(crate) async fn apply_routing(
             input_tokens,
             estimated_cost_usd,
             observed_p95_ms,
+            false, // TODO(COST-1U T3): supply real is_reasoning_class signal
         ) {
             Some(r) => r,
             None => return Ok(None),

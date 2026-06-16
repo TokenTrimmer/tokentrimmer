@@ -504,14 +504,22 @@ impl RoutingEngine {
         input_tokens_estimate: u32,
         estimated_cost_usd: Option<f64>,
     ) -> Option<&Route> {
-        // No latency signal — latency conditions never fire (cold-start FALSE).
-        self.evaluate_with_signals(req, ctx, input_tokens_estimate, estimated_cost_usd, None)
+        // No latency or reasoning-class signal — those conditions never fire.
+        self.evaluate_with_signals(
+            req,
+            ctx,
+            input_tokens_estimate,
+            estimated_cost_usd,
+            None,
+            false,
+        )
     }
 
     /// Like [`RoutingEngine::evaluate_with_cost`] but also threads the live,
     /// gateway-observed p95 upstream latency (milliseconds) for the
     /// originally-requested `(provider, model)`, for the
-    /// `upstream_latency_ms_p95_gt` condition.
+    /// `upstream_latency_ms_p95_gt` condition, and the reasoning-class signal
+    /// for the `not_reasoning_class` condition.
     ///
     /// `observed_p95_ms` is `None` when the gateway's
     /// [`crate::LatencyTracker`] has insufficient samples for that key (cold
@@ -519,6 +527,12 @@ impl RoutingEngine {
     /// condition FALSE — never a fabricated match. The caller computes this once
     /// (all routes evaluate the same originally-requested model) and passes it
     /// in, mirroring `estimated_cost_usd`.
+    ///
+    /// `is_reasoning_class` is `true` when the request has been classified as
+    /// Math/Code/Legal/Medical reasoning-is-the-work traffic (computed by
+    /// `tt-core`'s `reasoning_class`). A route with `not_reasoning_class: true`
+    /// will NOT match when this is `true`. Pass `false` when the signal is
+    /// unknown or inapplicable (the condition evaluates as if not set).
     pub fn evaluate_with_signals(
         &self,
         req: &ChatCompletionRequest,
@@ -526,6 +540,7 @@ impl RoutingEngine {
         input_tokens_estimate: u32,
         estimated_cost_usd: Option<f64>,
         observed_p95_ms: Option<u32>,
+        is_reasoning_class: bool,
     ) -> Option<&Route> {
         self.routes.iter().find(|r| {
             r.enabled
@@ -536,8 +551,23 @@ impl RoutingEngine {
                     input_tokens_estimate,
                     estimated_cost_usd,
                     observed_p95_ms,
+                    is_reasoning_class,
                 )
         })
+    }
+
+    /// Returns `true` when at least one **enabled** route in this engine carries
+    /// the `not_reasoning_class` condition — meaning the caller MUST classify
+    /// the request and supply the `is_reasoning_class` signal to
+    /// [`evaluate_with_signals`] for correct route evaluation.
+    ///
+    /// Callers can use this as a cheap pre-flight check to avoid running the
+    /// (more expensive) classifier when no route needs it.
+    #[must_use]
+    pub fn uses_reasoning_class(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|r| r.enabled && r.when.not_reasoning_class)
     }
 
     /// Find an enabled route by exact name (case-sensitive), bypassing condition
@@ -554,6 +584,7 @@ fn matches(
     input_tokens: u32,
     estimated_cost_usd: Option<f64>,
     observed_p95_ms: Option<u32>,
+    is_reasoning_class: bool,
 ) -> bool {
     let c = &r.when;
     if !c.model_in.is_empty() && !c.model_in.iter().any(|m| m == &req.model) {
@@ -589,6 +620,11 @@ fn matches(
         if !matches!(observed_p95_ms, Some(p95) if p95 > t) {
             return false;
         }
+    }
+    // not_reasoning_class: route explicitly opted out of Math/Code/Legal/Medical
+    // traffic. If the signal says this IS reasoning-class, block the match.
+    if c.not_reasoning_class && is_reasoning_class {
+        return false;
     }
     if let Some(tag) = &c.tag_equals {
         if ctx.tag.as_deref() != Some(tag.as_str()) {
@@ -1460,7 +1496,7 @@ mod tests {
             "no signal → no match"
         );
         assert!(eng
-            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, None)
+            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, None, false)
             .is_none());
     }
 
@@ -1469,11 +1505,25 @@ mod tests {
         let eng = RoutingEngine::with_routes(vec![latency_route(1000)]);
         // p95 == threshold → strictly-greater requirement not met → no match.
         assert!(eng
-            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(1000))
+            .evaluate_with_signals(
+                &make_req("gpt-4o"),
+                &make_ctx(None),
+                100,
+                None,
+                Some(1000),
+                false
+            )
             .is_none());
         // p95 below threshold → no match.
         assert!(eng
-            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(800))
+            .evaluate_with_signals(
+                &make_req("gpt-4o"),
+                &make_ctx(None),
+                100,
+                None,
+                Some(800),
+                false
+            )
             .is_none());
     }
 
@@ -1481,7 +1531,14 @@ mod tests {
     fn p95_condition_true_when_p95_exceeds_threshold() {
         let eng = RoutingEngine::with_routes(vec![latency_route(1000)]);
         let m = eng
-            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(1500))
+            .evaluate_with_signals(
+                &make_req("gpt-4o"),
+                &make_ctx(None),
+                100,
+                None,
+                Some(1500),
+                false,
+            )
             .expect("slow primary → alternate route fires");
         assert_eq!(m.then.target_model.as_deref(), Some("faster-alt"));
     }
@@ -1501,8 +1558,15 @@ mod tests {
         let p95_cold = tracker.p95("openai", "gpt-4o");
         assert!(p95_cold.is_none(), "still cold");
         assert!(
-            eng.evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, p95_cold)
-                .is_none(),
+            eng.evaluate_with_signals(
+                &make_req("gpt-4o"),
+                &make_ctx(None),
+                100,
+                None,
+                p95_cold,
+                false
+            )
+            .is_none(),
             "cold start (insufficient samples) → no match"
         );
 
@@ -1511,8 +1575,15 @@ mod tests {
         let p95_warm = tracker.p95("openai", "gpt-4o");
         assert_eq!(p95_warm, Some(3000));
         assert!(
-            eng.evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, p95_warm)
-                .is_some(),
+            eng.evaluate_with_signals(
+                &make_req("gpt-4o"),
+                &make_ctx(None),
+                100,
+                None,
+                p95_warm,
+                false
+            )
+            .is_some(),
             "warm + slow → alternate route fires"
         );
     }
@@ -1553,7 +1624,14 @@ mod tests {
         let eng = RoutingEngine::with_routes(vec![route]);
         // Right model + slow p95 → match.
         assert!(eng
-            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(2000))
+            .evaluate_with_signals(
+                &make_req("gpt-4o"),
+                &make_ctx(None),
+                100,
+                None,
+                Some(2000),
+                false
+            )
             .is_some());
         // Wrong model → no match even though p95 is high.
         assert!(eng
@@ -1562,12 +1640,20 @@ mod tests {
                 &make_ctx(None),
                 100,
                 None,
-                Some(2000)
+                Some(2000),
+                false
             )
             .is_none());
         // Right model but fast → no match.
         assert!(eng
-            .evaluate_with_signals(&make_req("gpt-4o"), &make_ctx(None), 100, None, Some(500))
+            .evaluate_with_signals(
+                &make_req("gpt-4o"),
+                &make_ctx(None),
+                100,
+                None,
+                Some(500),
+                false
+            )
             .is_none());
     }
 
@@ -1802,14 +1888,94 @@ mod tests {
     // --- not_reasoning_class condition (COST-1U) ---
 
     #[test]
+    fn not_reasoning_class_condition_uses_signal() {
+        // Route: when { model_in:["gpt-4o"], not_reasoning_class:true }, then { target_model: Some("gpt-4o-mini") }
+        let route = Route {
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                not_reasoning_class: true,
+                ..Default::default()
+            },
+            ..make_route("down-route", 10, vec!["gpt-4o"], "gpt-4o-mini")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        let req = make_req("gpt-4o");
+        let ctx = make_ctx(None);
+        // is_reasoning_class=true (Math/Code/Legal/Medical) → must NOT match
+        assert!(
+            eng.evaluate_with_signals(&req, &ctx, 100, None, None, true)
+                .is_none(),
+            "reasoning traffic must not match not_reasoning_class route"
+        );
+        // is_reasoning_class=false (non-reasoning) → must match
+        assert!(
+            eng.evaluate_with_signals(&req, &ctx, 100, None, None, false)
+                .is_some(),
+            "non-reasoning traffic must match not_reasoning_class route"
+        );
+    }
+
+    #[test]
+    fn uses_reasoning_class_reports_presence() {
+        // Route with not_reasoning_class==true → uses_reasoning_class() returns true.
+        let route_on = Route {
+            when: RouteConditions {
+                not_reasoning_class: true,
+                ..Default::default()
+            },
+            ..make_route("a", 10, vec![], "mini")
+        };
+        let eng_on = RoutingEngine::with_routes(vec![route_on]);
+        assert!(
+            eng_on.uses_reasoning_class(),
+            "engine with not_reasoning_class route must report uses_reasoning_class=true"
+        );
+
+        // Same route with not_reasoning_class==false → false.
+        let route_off = Route {
+            when: RouteConditions {
+                not_reasoning_class: false,
+                ..Default::default()
+            },
+            ..make_route("b", 10, vec![], "mini")
+        };
+        let eng_off = RoutingEngine::with_routes(vec![route_off]);
+        assert!(
+            !eng_off.uses_reasoning_class(),
+            "engine with no not_reasoning_class route must report false"
+        );
+
+        // Disabled route with not_reasoning_class==true → false (disabled doesn't count).
+        let mut route_disabled = Route {
+            when: RouteConditions {
+                not_reasoning_class: true,
+                ..Default::default()
+            },
+            ..make_route("c", 10, vec![], "mini")
+        };
+        route_disabled.enabled = false;
+        let eng_disabled = RoutingEngine::with_routes(vec![route_disabled]);
+        assert!(
+            !eng_disabled.uses_reasoning_class(),
+            "disabled route must not count toward uses_reasoning_class"
+        );
+    }
+
+    #[test]
     fn not_reasoning_class_defaults_false_and_round_trips() {
         let c = RouteConditions::default();
         assert!(!c.not_reasoning_class);
         let json = serde_json::to_string(&c).unwrap();
-        assert!(!json.contains("not_reasoning_class"), "absent when false: {json}");
+        assert!(
+            !json.contains("not_reasoning_class"),
+            "absent when false: {json}"
+        );
         let parsed: RouteConditions = serde_json::from_str(r#"{"model_in":["gpt-4o"]}"#).unwrap();
         assert!(!parsed.not_reasoning_class);
-        let on = RouteConditions { not_reasoning_class: true, ..Default::default() };
+        let on = RouteConditions {
+            not_reasoning_class: true,
+            ..Default::default()
+        };
         let j = serde_json::to_string(&on).unwrap();
         assert!(j.contains(r#""not_reasoning_class":true"#));
         let back: RouteConditions = serde_json::from_str(&j).unwrap();
