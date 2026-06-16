@@ -504,7 +504,9 @@ impl RoutingEngine {
         input_tokens_estimate: u32,
         estimated_cost_usd: Option<f64>,
     ) -> Option<&Route> {
-        // No latency or reasoning-class signal — those conditions never fire.
+        // No latency signal or reasoning-class classification on this path:
+        // upstream_latency_ms_p95_gt conditions never fire, and not_reasoning_class
+        // routes match all traffic (treated as non-reasoning).
         self.evaluate_with_signals(
             req,
             ctx,
@@ -1912,6 +1914,44 @@ mod tests {
             eng.evaluate_with_signals(&req, &ctx, 100, None, None, false)
                 .is_some(),
             "non-reasoning traffic must match not_reasoning_class route"
+        );
+    }
+
+    #[test]
+    fn not_reasoning_class_falls_through_to_plain_route() {
+        // Route A (higher priority): when { model_in:["gpt-4o"], not_reasoning_class:true }
+        let route_a = Route {
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                not_reasoning_class: true,
+                ..Default::default()
+            },
+            ..make_route("route-a", 20, vec!["gpt-4o"], "a")
+        };
+        // Route B (lower priority): when { model_in:["gpt-4o"] } — no not_reasoning_class
+        let route_b = Route {
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                ..Default::default()
+            },
+            ..make_route("route-b", 10, vec!["gpt-4o"], "b")
+        };
+        let eng = RoutingEngine::with_routes(vec![route_a, route_b]);
+        let req = make_req("gpt-4o");
+        let ctx = make_ctx(None);
+        // is_reasoning_class=true → A is blocked, engine falls through to B
+        let result_reasoning = eng.evaluate_with_signals(&req, &ctx, 100, None, None, true);
+        assert_eq!(
+            result_reasoning.and_then(|r| r.then.target_model.as_deref()),
+            Some("b"),
+            "reasoning traffic must skip not_reasoning_class route and match plain route"
+        );
+        // is_reasoning_class=false → A matches (higher priority)
+        let result_non_reasoning = eng.evaluate_with_signals(&req, &ctx, 100, None, None, false);
+        assert_eq!(
+            result_non_reasoning.and_then(|r| r.then.target_model.as_deref()),
+            Some("a"),
+            "non-reasoning traffic must match the higher-priority not_reasoning_class route"
         );
     }
 
