@@ -14,6 +14,7 @@
 //! Rules are stored sorted descending by priority. First match wins.
 
 pub mod cache;
+pub mod catalog;
 pub mod latency;
 pub mod store;
 pub mod validate;
