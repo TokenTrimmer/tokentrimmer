@@ -1420,7 +1420,13 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         }
     };
 
-    let mut state = tt_core::AppState::with_default_providers();
+    // REL-3: create a TaskTracker so detached telemetry writes (request_logs,
+    // body capture) can be drained on graceful shutdown instead of abandoned
+    // on every rolling deploy / SIGTERM.
+    let telemetry_tracker = tokio_util::task::TaskTracker::new();
+
+    let mut state = tt_core::AppState::with_default_providers()
+        .with_telemetry_tracker(telemetry_tracker.clone());
     if let Some(l1) = l1_cache {
         state = state.with_l1(l1, None);
     }
@@ -1819,6 +1825,15 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
+
+    // REL-3: drain detached telemetry writes (request_logs/body capture) so a
+    // rolling deploy / SIGTERM doesn't abandon billing rows. Bounded so a stuck
+    // write can't hang shutdown.
+    telemetry_tracker.close();
+    match tokio::time::timeout(std::time::Duration::from_secs(30), telemetry_tracker.wait()).await {
+        Ok(()) => tracing::info!("telemetry writes drained on shutdown"),
+        Err(_) => tracing::error!("telemetry drain timed out; some writes may be lost"),
+    }
 
     Ok(())
 }
