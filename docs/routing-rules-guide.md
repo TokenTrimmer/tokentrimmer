@@ -55,6 +55,7 @@ is ignored, so a route with an empty `when` matches every request.
 | `estimated_cost_gt`      | `float` USD | the request's estimated cost is **greater than** this.                        |
 | `estimated_cost_lt`      | `float` USD | the request's estimated cost is **less than** this.                           |
 | `upstream_latency_ms_p95_gt` | `int` ms | the gateway's **live observed** p95 upstream latency for the requested model is **greater than** this. |
+| `not_reasoning_class`        | `bool`   | `true` matches only requests **not** classified as Math / Code / Legal / Medical; `false` (or absent) matches everything. |
 
 Notes that change behavior in practice:
 
@@ -81,6 +82,14 @@ Notes that change behavior in practice:
   primary is never gated on a fabricated signal. Not evaluable in Plan replay
   (historical logs have no in-process window), so a Plan never projects savings
   for a latency-gated route.
+- **`not_reasoning_class` uses the gateway's reasoning-class classifier.** When
+  `true`, the route fires only when the request is **not** classified as one of
+  the four reasoning-is-the-work categories (Math / Code / Legal / Medical) —
+  keeping cheaper models off the traffic where quality most matters. The
+  classifier runs only when at least one active route sets
+  `not_reasoning_class: true`; with no such route the classifier is skipped
+  entirely (zero overhead). Used by `tt route catalog enable` to guard every
+  curated down-route.
 
 ## Actions (`then`)
 

@@ -59,6 +59,12 @@ fn matches_conditions(req: &RequestLog, c: &RouteConditions) -> bool {
     if c.upstream_latency_ms_p95_gt.is_some() {
         return false;
     }
+    // not_reasoning_class requires the gateway's reasoning-class classifier,
+    // which is not available in Plan replay. Conservative non-match: Plan
+    // never over-projects savings on a catalog route.
+    if c.not_reasoning_class {
+        return false;
+    }
     if !c.prompt_contains_any_of.is_empty() {
         let Some(body) = &req.body else {
             return false;

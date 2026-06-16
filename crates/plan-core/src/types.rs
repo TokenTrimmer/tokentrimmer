@@ -232,6 +232,13 @@ pub struct RouteConditions {
     /// latency route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_latency_ms_p95_gt: Option<u32>,
+    /// Mirror of `tt_routing::RouteConditions::not_reasoning_class`. Carried
+    /// for lossless wire round-trip only — NOT evaluable in replay (Plan has
+    /// no reasoning-class classifier). A route carrying this condition is
+    /// treated as a conservative non-match in `routing::matches_conditions`,
+    /// so Plan never over-projects savings on a catalog route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_reasoning_class: bool,
 }
 
 /// What a matching [`ProposedRoute`] does.
@@ -1132,6 +1139,7 @@ mod tests {
             estimated_cost_gt: Some(0.01),
             estimated_cost_lt: Some(5.0),
             upstream_latency_ms_p95_gt: Some(1500),
+            not_reasoning_class: true,
         };
         let gateway_json = serde_json::to_string(&gateway).unwrap();
 
@@ -1151,6 +1159,7 @@ mod tests {
         assert_eq!(plan_conditions.estimated_cost_gt, Some(0.01));
         assert_eq!(plan_conditions.estimated_cost_lt, Some(5.0));
         assert_eq!(plan_conditions.upstream_latency_ms_p95_gt, Some(1500));
+        assert!(plan_conditions.not_reasoning_class);
 
         // Re-serialize the plan-core value: must reproduce the gateway JSON
         // byte-for-byte (same field order + same skip_serializing_if gating).

@@ -328,6 +328,17 @@ enum RetrievalAction {
     },
 }
 
+/// The action to take on the curated down-route catalog.
+#[derive(clap::ValueEnum, Clone, Debug, Copy)]
+enum CatalogAction {
+    /// Create all curated down-routes (idempotent — skips already-existing routes by name).
+    Enable,
+    /// Remove all catalog-managed routes (never touches user-defined routes).
+    Disable,
+    /// Show which catalog routes are active or paused.
+    Status,
+}
+
 // The `Add` variant carries every `route add` flag inline (clap can't box an
 // inline struct variant's fields). This enum is parsed once at startup and never
 // stored in a hot collection, so its size is immaterial — suppress the lint here
@@ -341,6 +352,11 @@ enum RouteAction {
     Show { id: String },
     /// Delete one route by id.
     Rm { id: String },
+    /// Manage the curated flagship → mini down-route catalog (opt-in, idempotent).
+    Catalog {
+        /// Action to perform: enable, disable, or status.
+        action: CatalogAction,
+    },
     /// Add a route. Use --always <model>, or --from <m> --to <m>, or
     /// --agentic-budget alone for a modifier-only route (keeps the caller's model).
     Add {
@@ -909,11 +925,16 @@ async fn main() -> anyhow::Result<()> {
             tt_api_key,
             tt_api_base,
         } => {
-            use tt_cli::route::{AddArgs, RouteCmd};
+            use tt_cli::route::{AddArgs, CatalogCmd, RouteCmd};
             let cmd = match action {
                 RouteAction::List => RouteCmd::List,
                 RouteAction::Show { id } => RouteCmd::Show(id),
                 RouteAction::Rm { id } => RouteCmd::Rm(id),
+                RouteAction::Catalog { action } => RouteCmd::Catalog(match action {
+                    CatalogAction::Enable => CatalogCmd::Enable,
+                    CatalogAction::Disable => CatalogCmd::Disable,
+                    CatalogAction::Status => CatalogCmd::Status,
+                }),
                 RouteAction::Add {
                     always,
                     from,

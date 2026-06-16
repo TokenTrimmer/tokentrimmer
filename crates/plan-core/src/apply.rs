@@ -293,6 +293,7 @@ mod tests {
                 estimated_cost_gt: None,
                 estimated_cost_lt: None,
                 upstream_latency_ms_p95_gt: None,
+                not_reasoning_class: false,
             },
             then: RouteAction {
                 format_switch: None,

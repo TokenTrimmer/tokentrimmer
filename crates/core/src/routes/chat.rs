@@ -5537,10 +5537,8 @@ pub(crate) async fn apply_routing(
     // provider (resolved before any rewrite).
     let req_provider = state.registry.resolve(&req.model);
     let provider_id = req_provider.as_ref().map(|p| p.id()).unwrap_or("");
-    let input_tokens = {
-        let combined = tt_shared::message_text_for_estimation(req);
-        tt_tokenize::estimate_tokens(provider_id, &combined)
-    };
+    let combined = tt_shared::message_text_for_estimation(req);
+    let input_tokens = tt_tokenize::estimate_tokens(provider_id, &combined);
 
     // Estimated request cost (USD) on the originally-requested model, for
     // cost-based route conditions. Output tokens are unknown pre-flight: use
@@ -5573,6 +5571,12 @@ pub(crate) async fn apply_routing(
             input_tokens,
             estimated_cost_usd,
             observed_p95_ms,
+            // Reasoning-class signal for `not_reasoning_class` conditions.
+            // Computed only when some route uses it (cheap deterministic
+            // substring match, no LLM call); reuses the `combined` text
+            // already built for token estimation above.
+            engine.uses_reasoning_class()
+                && crate::reasoning_class::classify(&combined.to_lowercase()).is_some(),
         ) {
             Some(r) => r,
             None => return Ok(None),

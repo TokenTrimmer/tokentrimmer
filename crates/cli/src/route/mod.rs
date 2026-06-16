@@ -157,6 +157,14 @@ fn default_name(args: &AddArgs, target: Option<&str>) -> String {
     }
 }
 
+/// Which catalog sub-action was requested.
+#[derive(Debug, Clone, Copy)]
+pub enum CatalogCmd {
+    Enable,
+    Disable,
+    Status,
+}
+
 /// What `tt route` was asked to do.
 pub enum RouteCmd {
     List,
@@ -165,6 +173,7 @@ pub enum RouteCmd {
     // `AddArgs` is much larger than the other variants (many flags) — box it so
     // the enum doesn't carry that size on every variant (clippy large_enum_variant).
     Add(Box<AddArgs>),
+    Catalog(CatalogCmd),
 }
 
 /// Dispatch a `tt route` subcommand against the gateway.
@@ -227,6 +236,83 @@ pub async fn run(
                 route["id"].as_str().unwrap_or("?"),
                 route["name"].as_str().unwrap_or("?")
             ));
+        }
+        RouteCmd::Catalog(sub) => {
+            let sp = ui::spinner("Loading routes…");
+            let existing: Value =
+                send(http.get(format!("{base}/v1/routes")).bearer_auth(&key)).await?;
+            drop(sp);
+            let existing_arr = existing.as_array().cloned().unwrap_or_default();
+
+            match sub {
+                CatalogCmd::Enable => {
+                    let catalog = tt_routing::catalog::catalog_routes();
+                    let existing_names: std::collections::HashSet<&str> = existing_arr
+                        .iter()
+                        .filter_map(|r| r["name"].as_str())
+                        .collect();
+                    let mut added = 0usize;
+                    for new_route in &catalog {
+                        if existing_names.contains(new_route.name.as_str()) {
+                            continue;
+                        }
+                        let sp = ui::spinner(&format!("Creating route {}…", new_route.name));
+                        let _: Value = send(
+                            http.post(format!("{base}/v1/routes"))
+                                .bearer_auth(&key)
+                                .json(new_route),
+                        )
+                        .await?;
+                        drop(sp);
+                        added += 1;
+                    }
+                    ui::success(&format!(
+                        "Down-route catalog enabled ({added} new route(s)). Run `tt route list` to view."
+                    ));
+                }
+                CatalogCmd::Disable => {
+                    let mut removed = 0usize;
+                    for r in &existing_arr {
+                        let name = r["name"].as_str().unwrap_or("");
+                        if !tt_routing::catalog::is_catalog_route_name(name) {
+                            continue;
+                        }
+                        let id = r["id"].as_str().unwrap_or("");
+                        let sp = ui::spinner(&format!("Removing catalog route {name}…"));
+                        let _: Value = send(
+                            http.delete(format!("{base}/v1/routes/{}", enc_segment(id)))
+                                .bearer_auth(&key),
+                        )
+                        .await?;
+                        drop(sp);
+                        removed += 1;
+                    }
+                    ui::success(&format!(
+                        "Down-route catalog disabled ({removed} route(s) removed). User routes untouched."
+                    ));
+                }
+                CatalogCmd::Status => {
+                    let catalog_routes: Vec<&Value> = existing_arr
+                        .iter()
+                        .filter(|r| {
+                            tt_routing::catalog::is_catalog_route_name(
+                                r["name"].as_str().unwrap_or(""),
+                            )
+                        })
+                        .collect();
+                    if catalog_routes.is_empty() {
+                        println!("Down-route catalog: not enabled. Run `tt route catalog enable`.");
+                    } else {
+                        ui::heading("DOWN-ROUTE CATALOG");
+                        for r in catalog_routes {
+                            let name = r["name"].as_str().unwrap_or("?");
+                            let paused = r["paused"].as_bool().unwrap_or(false);
+                            let state = if paused { "[paused]" } else { "[active]" };
+                            println!("  {state}  {name}");
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -655,5 +741,22 @@ mod tests {
             .decode_utf8()
             .unwrap();
         assert_eq!(decoded, id);
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    #[test]
+    fn catalog_builder_routes_are_all_catalog_named() {
+        for r in tt_routing::catalog::catalog_routes() {
+            assert!(
+                tt_routing::catalog::is_catalog_route_name(&r.name),
+                "{}",
+                r.name
+            );
+        }
+        assert!(!tt_routing::catalog::is_catalog_route_name(
+            "my custom route"
+        ));
     }
 }
