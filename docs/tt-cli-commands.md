@@ -28,6 +28,51 @@ resolved (masked), and `tt logout` clears it.
 
 ---
 
+## `tt context`
+
+Surface the most relevant repo files for a coding task — before the agent
+starts exploring. `tt context` walks the repo, extracts symbols and imports
+(Python, TypeScript, JavaScript), builds an import graph, ranks files by
+symbol/lexical match plus import centrality minus size, then assembles a
+token-budgeted pack with per-file outlines, reasons, and inlined content.
+**Fully local — no network, no embeddings, no key required.**
+
+It shares the ranking engine with the `get_repo_context` MCP tool, so the
+same context pack that a coding agent gets through MCP is reproducible with
+this command.
+
+### Flags
+
+- `--task <TEXT>` **(required)** — plain-English description of the coding
+  task (e.g. `"fix authenticate"`, `"add CSV export to orders"`).
+- `[path]` — repo root to index. Default: current directory.
+- `--format json|md` — output format. `md` (default) prints a
+  human-readable Markdown report with code fences; `json` prints the raw
+  `ContextPack` JSON (useful for piping into other tools).
+- `--max-files <N>` — maximum number of files to describe. Default `12`.
+- `--token-budget <T>` — token cap for inlined file content. Files are
+  inlined in rank order until this budget is exhausted; the rest receive
+  outlines only. Default `6000`.
+
+### Examples
+
+```bash
+# Markdown overview of the most relevant files before starting a task
+tt context --task "fix the authenticate flow" ./my-app
+
+# Machine-readable JSON for a CI pre-check step
+tt context --task "add CSV export" --format json --max-files 20
+
+# Wider content window for a large refactor
+tt context --task "migrate DB client to async" --token-budget 12000
+```
+
+> `tt context` is the zero-config way to cut a coding agent's exploration
+> before it starts — paste the output into the context window or pipe it
+> with `--format json`.
+
+---
+
 ## `tt login`
 
 Store an API key (and optionally a gateway base URL) in
