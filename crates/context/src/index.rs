@@ -26,6 +26,10 @@ impl RepoIndex {
     pub fn root(&self) -> &Path {
         &self.root
     }
+    /// Returns the indexed files in filesystem walk order (OS-dependent).
+    /// Note: `FileEntry::importers` lists are sorted for determinism, but
+    /// callers must not rely on positional stability of this slice across
+    /// platforms or runs.
     #[must_use]
     pub fn files(&self) -> &[FileEntry] {
         &self.files
@@ -182,7 +186,7 @@ fn candidate_paths(root: &Path, importer: &Path, language: Language, raw: &str) 
             let rel_path = module.replace('.', std::path::MAIN_SEPARATOR_STR);
             vec![
                 root.join(format!("{rel_path}.py")),
-                root.join(format!("{rel_path}/__init__.py")),
+                root.join(&rel_path).join("__init__.py"),
             ]
         }
         Language::Javascript | Language::Typescript => {
@@ -304,6 +308,27 @@ mod tests {
         assert!(
             candidates.contains(&root.join("a/b/__init__.py")),
             "expected a/b/__init__.py; got {candidates:?}"
+        );
+    }
+
+    /// `__init__.py` candidate uses proper `Path::join` segments so that on
+    /// Windows (where `MAIN_SEPARATOR` is `\`) we get `root\a\b\__init__.py`
+    /// rather than the mixed-separator string `root\a\b/__init__.py` which
+    /// Windows treats as a single filename component.
+    #[test]
+    fn candidate_paths_python_init_py_uses_path_join() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let importer = root.join("main.py");
+
+        let candidates = candidate_paths(root, &importer, Language::Python, "from a.b import c");
+
+        // Build the expected path the proper way — this is separator-correct on
+        // all platforms (Windows: root\a\b\__init__.py, Unix: root/a/b/__init__.py).
+        let expected = root.join("a").join("b").join("__init__.py");
+        assert!(
+            candidates.contains(&expected),
+            "expected __init__.py candidate built via Path::join ({expected:?}); got {candidates:?}"
         );
     }
 
