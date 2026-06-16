@@ -44,13 +44,13 @@ MCP server exposing TokenTrimmer intelligence to MCP-compatible clients.
   "files": [
     {
       "path": "src/auth.py",
-      "summary": "1 symbol (authenticate)",
-      "reasons": ["symbol match: authenticate", "import centrality: 3"],
+      "summary": "symbols: authenticate",
+      "reasons": ["matches 1 task term(s)", "imported by 3 file(s)"],
       "content": "def authenticate():\n    ..."
     }
   ],
   "token_estimate": 420,
-  "note": "top 12 of 87 files indexed; budget 6000 tokens"
+  "note": "3 files ranked; 2 inlined within the 6000-token budget."
 }
 ```
 
