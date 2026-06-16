@@ -5157,6 +5157,7 @@ dependencies = [
  "tt-auth",
  "tt-cache",
  "tt-config",
+ "tt-context",
  "tt-core",
  "tt-inspect-core",
  "tt-inspect-rules-tier1",
@@ -5179,6 +5180,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "tt-context"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tt-inspect-core",
+ "tt-tokenize",
 ]
 
 [[package]]
@@ -5293,6 +5307,7 @@ dependencies = [
  "toml",
  "tracing",
  "tt-auth",
+ "tt-context",
  "tt-inspect-core",
  "tt-inspect-rules-tier1",
  "tt-plan-core",
