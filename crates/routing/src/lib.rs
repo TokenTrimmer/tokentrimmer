@@ -121,6 +121,12 @@ pub struct RouteConditions {
     ///   never gate on a fabricated signal. See `matches` / `LatencyTracker::p95`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_latency_ms_p95_gt: Option<u32>,
+    /// Match only when the request is NOT classified as reasoning-is-the-work
+    /// (Math/Code/Legal/Medical, via tt-core's reasoning_class). Used by the
+    /// down-route catalog. The classification is computed in the gateway and
+    /// supplied to the engine as the `is_reasoning_class` signal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_reasoning_class: bool,
 }
 
 /// What a matching [`Route`] does to the request before dispatch.
@@ -1791,6 +1797,23 @@ mod tests {
         assert_eq!(back.reasoning_budget_tokens, Some(8192));
         let reemitted = serde_json::to_string(&back).unwrap();
         assert_eq!(reemitted, j, "round-trip must be byte-identical");
+    }
+
+    // --- not_reasoning_class condition (COST-1U) ---
+
+    #[test]
+    fn not_reasoning_class_defaults_false_and_round_trips() {
+        let c = RouteConditions::default();
+        assert!(!c.not_reasoning_class);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("not_reasoning_class"), "absent when false: {json}");
+        let parsed: RouteConditions = serde_json::from_str(r#"{"model_in":["gpt-4o"]}"#).unwrap();
+        assert!(!parsed.not_reasoning_class);
+        let on = RouteConditions { not_reasoning_class: true, ..Default::default() };
+        let j = serde_json::to_string(&on).unwrap();
+        assert!(j.contains(r#""not_reasoning_class":true"#));
+        let back: RouteConditions = serde_json::from_str(&j).unwrap();
+        assert!(back.not_reasoning_class);
     }
 
     /// Two different orgs reusing the SAME idempotency-key string get
