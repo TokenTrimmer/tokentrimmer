@@ -301,9 +301,7 @@ pub async fn run(
                         })
                         .collect();
                     if catalog_routes.is_empty() {
-                        println!(
-                            "Down-route catalog: not enabled. Run `tt route catalog enable`."
-                        );
+                        println!("Down-route catalog: not enabled. Run `tt route catalog enable`.");
                     } else {
                         ui::heading("DOWN-ROUTE CATALOG");
                         for r in catalog_routes {
@@ -751,8 +749,14 @@ mod catalog_tests {
     #[test]
     fn catalog_builder_routes_are_all_catalog_named() {
         for r in tt_routing::catalog::catalog_routes() {
-            assert!(tt_routing::catalog::is_catalog_route_name(&r.name), "{}", r.name);
+            assert!(
+                tt_routing::catalog::is_catalog_route_name(&r.name),
+                "{}",
+                r.name
+            );
         }
-        assert!(!tt_routing::catalog::is_catalog_route_name("my custom route"));
+        assert!(!tt_routing::catalog::is_catalog_route_name(
+            "my custom route"
+        ));
     }
 }
