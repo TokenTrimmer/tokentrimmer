@@ -687,3 +687,202 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
         "L1 hit saved should equal baseline ({baseline_r2}); got {saved_r2}"
     );
 }
+
+/// A `not_reasoning_class:true` route must be SKIPPED for requests that
+/// classify as Math/Code/Legal/Medical, and APPLIED for plain requests.
+///
+/// Case A: reasoning prompt ("prove that the square root of 2 is irrational"
+///   → MATH via the "prove" keyword) → route must NOT fire → model stays gpt-4o.
+/// Case B: plain prompt ("translate hello into french" → no keyword match)
+///   → route fires → model rewritten to gpt-4o-mini.
+#[tokio::test]
+async fn not_reasoning_class_route_skips_reasoning_requests() {
+    // ── shared setup ──────────────────────────────────────────────────────────
+    let calls_a = Arc::new(AtomicUsize::new(0));
+    let served_a = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut registry_a = ProviderRegistry::new();
+    registry_a.register(Arc::new(RecordingProvider {
+        served_models: Arc::clone(&served_a),
+        calls: Arc::clone(&calls_a),
+    }));
+
+    let raw_store_a = InMemoryKeyStore::new();
+    let org_id_a = Uuid::now_v7();
+    let plaintext_a = issue_key_for(&raw_store_a, org_id_a).await;
+    let key_store_a: Arc<dyn KeyStore> = Arc::new(raw_store_a);
+
+    let routes_backing_a = Arc::new(InMemoryRoutingStore::new());
+    routes_backing_a.set_routes(
+        org_id_a,
+        vec![Route {
+            paused: false,
+            id: Uuid::now_v7(),
+            name: "skip-reasoning".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                not_reasoning_class: true,
+                ..Default::default()
+            },
+            then: RouteAction {
+                format_switch: None,
+                diff: false,
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
+                minify_json: false,
+                reasoning_max_effort: None,
+                reasoning_budget_tokens: None,
+                agentic_budget: None,
+                target_model: Some("gpt-4o-mini".into()),
+                fallbacks: Vec::new(),
+                disable_cache: false,
+                max_cost_usd: None,
+                flex: false,
+                batch: false,
+                compress: false,
+                redact: false,
+                traffic_pct: None,
+                shadow_model: None,
+            },
+        }],
+    );
+    let routing_a = Arc::new(CachingRoutingStore::new(
+        routes_backing_a as Arc<dyn RoutingStore>,
+    ));
+
+    let app_a = build_router(
+        AppState::new(registry_a)
+            .with_key_store(key_store_a)
+            .with_routing_store(routing_a),
+    );
+
+    // ── Case A: reasoning prompt → route must be SKIPPED → model stays gpt-4o ─
+    // "prove" is in MATH_KEYWORDS, so classify() → Some(Math) → is_reasoning_class=true
+    // → not_reasoning_class route does NOT fire.
+    let reasoning_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "prove that the square root of 2 is irrational"}],
+        "stream": false,
+    });
+    let resp_a = app_a
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {plaintext_a}"))
+                .body(Body::from(reasoning_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    assert_eq!(
+        served_a.lock().unwrap().as_slice(),
+        ["gpt-4o"],
+        "Case A: reasoning prompt must NOT be rewritten by not_reasoning_class route"
+    );
+    assert_eq!(
+        resp_a.headers()["x-tokentrimmer-model-used"]
+            .to_str()
+            .unwrap(),
+        "gpt-4o",
+        "Case A: response model-used header must reflect the original model"
+    );
+
+    // ── Case B: plain prompt → route FIRES → model rewritten to gpt-4o-mini ──
+    // "translate hello into french" has no Math/Code/Legal/Medical keywords →
+    // classify() → None → is_reasoning_class=false → route fires.
+    let calls_b = Arc::new(AtomicUsize::new(0));
+    let served_b = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut registry_b = ProviderRegistry::new();
+    registry_b.register(Arc::new(RecordingProvider {
+        served_models: Arc::clone(&served_b),
+        calls: Arc::clone(&calls_b),
+    }));
+
+    let raw_store_b = InMemoryKeyStore::new();
+    let org_id_b = Uuid::now_v7();
+    let plaintext_b = issue_key_for(&raw_store_b, org_id_b).await;
+    let key_store_b: Arc<dyn KeyStore> = Arc::new(raw_store_b);
+
+    let routes_backing_b = Arc::new(InMemoryRoutingStore::new());
+    routes_backing_b.set_routes(
+        org_id_b,
+        vec![Route {
+            paused: false,
+            id: Uuid::now_v7(),
+            name: "skip-reasoning-b".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                not_reasoning_class: true,
+                ..Default::default()
+            },
+            then: RouteAction {
+                format_switch: None,
+                diff: false,
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
+                minify_json: false,
+                reasoning_max_effort: None,
+                reasoning_budget_tokens: None,
+                agentic_budget: None,
+                target_model: Some("gpt-4o-mini".into()),
+                fallbacks: Vec::new(),
+                disable_cache: false,
+                max_cost_usd: None,
+                flex: false,
+                batch: false,
+                compress: false,
+                redact: false,
+                traffic_pct: None,
+                shadow_model: None,
+            },
+        }],
+    );
+    let routing_b = Arc::new(CachingRoutingStore::new(
+        routes_backing_b as Arc<dyn RoutingStore>,
+    ));
+
+    let app_b = build_router(
+        AppState::new(registry_b)
+            .with_key_store(key_store_b)
+            .with_routing_store(routing_b),
+    );
+
+    let plain_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "translate hello into french"}],
+        "stream": false,
+    });
+    let resp_b = app_b
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {plaintext_b}"))
+                .body(Body::from(plain_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_b.status(), StatusCode::OK);
+    assert_eq!(
+        served_b.lock().unwrap().as_slice(),
+        ["gpt-4o-mini"],
+        "Case B: plain prompt must be rewritten by not_reasoning_class route"
+    );
+    assert_eq!(
+        resp_b.headers()["x-tokentrimmer-model-used"]
+            .to_str()
+            .unwrap(),
+        "gpt-4o-mini",
+        "Case B: response model-used header must reflect the rewritten model"
+    );
+}
