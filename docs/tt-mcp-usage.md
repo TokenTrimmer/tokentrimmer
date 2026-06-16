@@ -23,6 +23,48 @@ MCP server exposing TokenTrimmer intelligence to MCP-compatible clients.
 - `find_route_for` — cheapest model for a plain-English task
 - `inspect_diff` — run Inspect rules on a proposed file diff
 - `lookup_semantic_cache` — check if a similar prompt was answered recently
+- `get_repo_context` — given a coding task, return the most relevant repo files
+  (ranked by symbol/import-graph + lexical match) with per-file symbol outlines,
+  reasons, and token-budgeted inlined content — so a coding agent can skip
+  codebase exploration entirely. **Read-only, fully local (no network).**
+
+### `get_repo_context`
+
+| Input | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `task` | string | **yes** | — | Plain-English description of the coding task. |
+| `repo_path` | string | no | `.` (current dir) | Repo root to index. |
+| `max_files` | integer | no | `12` | Maximum files to describe. |
+| `token_budget` | integer | no | `6000` | Token cap for inlined file content. |
+
+**Returns** a `ContextPack` object:
+
+```json
+{
+  "files": [
+    {
+      "path": "src/auth.py",
+      "summary": "symbols: authenticate",
+      "reasons": ["matches 1 task term(s)", "imported by 3 file(s)"],
+      "content": "def authenticate():\n    ..."
+    }
+  ],
+  "token_estimate": 420,
+  "note": "3 files ranked; 2 inlined within the 6000-token budget."
+}
+```
+
+`content` is present for files that fit within the token budget (inlined in
+rank order); remaining files carry `null` for `content` but always have an
+outline in `summary` and their `reasons`. The engine is identical to
+`tt context --format json` on the CLI — the two produce the same pack.
+
+**How a coding agent uses it:** call `get_repo_context` with the task before
+starting exploration. The returned outlines + inlined snippets eliminate most
+`Read`/`grep` round-trips — Claude Code and Codex can be pre-prompted to call
+this tool at session start (e.g. `"always call get_repo_context with the user's
+first task before reading any files"`). The tool is read-only and local, so it
+adds no latency beyond the indexing scan itself.
 
 ## Write tools (off by default)
 

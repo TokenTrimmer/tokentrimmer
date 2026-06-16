@@ -47,6 +47,7 @@ pub mod apply_plan;
 pub mod batch_savings;
 pub mod cost_control;
 pub mod find_route_for;
+pub mod get_repo_context;
 pub mod inspect_diff;
 pub mod list_datasets;
 pub mod lookup_semantic_cache;

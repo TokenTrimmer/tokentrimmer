@@ -28,6 +28,7 @@ members = [
     "crates/providers/openrouter",
     "crates/providers/local",
     "crates/retrieval",
+    "crates/context",
 ]
 
 [workspace.package]
@@ -196,6 +197,7 @@ tt-provider-local = { path = "crates/providers/local", version = "0.1" }
 tt-preview = { path = "crates/preview", version = "0.1" }
 tt-mcp = { path = "crates/mcp", version = "0.1" }
 tt-retrieval = { path = "crates/retrieval", version = "0.1" }
+tt-context = { path = "crates/context", version = "0.1" }
 
 [profile.release]
 lto = "thin"

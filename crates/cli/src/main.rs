@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 
 mod audit;
 use audit::AuditAction;
+mod repo_context;
 
 #[derive(Parser)]
 #[command(name = "tt")]
@@ -304,6 +305,24 @@ enum Command {
         #[arg(long, global = true)]
         tt_api_base: Option<String>,
     },
+    /// Preload the most relevant repo files for a coding task.
+    Context {
+        /// Task description in plain English.
+        #[arg(long)]
+        task: String,
+        /// Repo path to index (default: current dir).
+        #[arg(default_value = ".")]
+        path: String,
+        /// Output format: json | md.
+        #[arg(long, default_value = "md")]
+        format: String,
+        /// Max files to describe.
+        #[arg(long, default_value_t = 12)]
+        max_files: usize,
+        /// Token cap for inlined file content.
+        #[arg(long, default_value_t = 6000)]
+        token_budget: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -586,6 +605,9 @@ async fn main() -> anyhow::Result<()> {
             server
                 .tools
                 .register(Box::new(inspect_diff::InspectDiffTool));
+            server.tools.register(Box::new(
+                tt_mcp::tools::get_repo_context::GetRepoContextTool,
+            ));
             server
                 .tools
                 .register(Box::new(lookup_semantic_cache::LookupSemanticCacheTool {
@@ -1037,6 +1059,15 @@ async fn main() -> anyhow::Result<()> {
             );
             cfg.gateway_base_url = ctx.base_url;
             run_listener(cfg).await.context("tt proxy listener")?;
+        }
+        Command::Context {
+            task,
+            path,
+            format,
+            max_files,
+            token_budget,
+        } => {
+            repo_context::run(&path, &task, &format, max_files, token_budget)?;
         }
     }
     Ok(())

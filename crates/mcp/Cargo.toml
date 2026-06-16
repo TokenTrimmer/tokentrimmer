@@ -10,6 +10,7 @@ description = "Model Context Protocol server exposing TokenTrimmer intelligence 
 [dependencies]
 tt-shared.workspace = true
 tt-auth.workspace = true
+tt-context.workspace = true
 tt-inspect-core.workspace = true
 tt-inspect-rules-tier1.workspace = true
 tt-plan-core.workspace = true
