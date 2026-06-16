@@ -193,10 +193,13 @@ and a gateway with a routing store configured.
 ### Subcommands
 
 ```bash
-tt route list           # table of your routes (NAME, ROUTE, PRIO, STATUS)
-tt route show <id>      # full JSON for one route
-tt route rm <id>        # delete one route
-tt route add ...        # create a route
+tt route list                    # table of your routes (NAME, ROUTE, PRIO, STATUS)
+tt route show <id>               # full JSON for one route
+tt route rm <id>                 # delete one route
+tt route add ...                 # create a route
+tt route catalog enable          # install the curated down-route catalog
+tt route catalog disable         # remove all catalog routes (user routes untouched)
+tt route catalog status          # show active/paused state of each catalog route
 ```
 
 `tt route add` needs a target — `--always <model>` (match all) or
@@ -207,6 +210,37 @@ tt route add ...        # create a route
 the forgone Batch-API discount is attributed for the future async Batch Lane —
 never applied to streaming or interactive requests. There is no in-place
 update: `rm` and re-`add` to change a route.
+
+### `tt route catalog`
+
+The zero-config way to get model-right-sizing savings. `enable` installs a
+curated set of same-provider flagship→mini down-routes — one per major provider
+model — so expensive flagship calls that don't require reasoning-class quality
+are transparently served by a cheaper mini equivalent:
+
+| From | To |
+| --- | --- |
+| `gpt-4o` | `gpt-4o-mini` |
+| `claude-opus-4-7`, `claude-opus-4-8`, `claude-sonnet-4-6` | `claude-haiku-4-5` |
+| `gemini-3.1-pro` | `gemini-3.1-flash-lite` |
+
+Every catalog route is installed with:
+
+- **`not_reasoning_class: true`** — the route only fires when the request is
+  *not* classified as Math / Code / Legal / Medical. Reasoning-is-the-work
+  traffic always reaches the original flagship.
+- **`auto_pause: true` + `pause_floor_pass_rate: 0.92`** — the paired-judge
+  circuit breaker watches quality continuously and pauses the route if the
+  pass-rate drops below 92 %, reverting that model to its flagship
+  automatically.
+- **Low priority** — user-defined routes take precedence over catalog routes.
+
+Catalog routes are normal routes (visible in `tt route list`, pausable and
+deletable with `tt route rm`). They are named with a reserved `catalog:` prefix
+so `disable` can remove exactly them without touching any user-defined routes.
+
+`status` prints the current state (active / paused) of each installed catalog
+route so you can tell at a glance whether a circuit breaker has tripped.
 
 ### Example
 
