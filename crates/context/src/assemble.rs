@@ -52,8 +52,8 @@ pub fn assemble(
         let mut content = None;
         if let Ok(src) = std::fs::read_to_string(&r.path) {
             let cost = tt_tokenize::estimate_tokens("openai", &src);
-            if spent + cost <= token_budget {
-                spent += cost;
+            if spent.saturating_add(cost) <= token_budget {
+                spent = spent.saturating_add(cost);
                 content = Some(src);
             }
         }
@@ -105,6 +105,10 @@ mod tests {
             pack.token_estimate <= 50,
             "estimate {} over budget",
             pack.token_estimate
+        );
+        assert!(
+            pack.files.iter().any(|f| f.path.ends_with("big.py")),
+            "big.py must be in the pack to prove it isn't inlined"
         );
         let big_inlined = pack
             .files

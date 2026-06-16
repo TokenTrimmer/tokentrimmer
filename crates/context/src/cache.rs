@@ -8,9 +8,21 @@ use tt_inspect_core::walk::walk;
 
 use crate::index::RepoIndex;
 
+/// Collision-free cache key derived from the directory walk.
+///
+/// Using a struct with two distinct fields avoids the hash-collision risk of
+/// the old `count.wrapping_mul(...).wrapping_add(max_mtime)` combinator: two
+/// different `(file_count, max_mtime_ns)` pairs can never produce the same
+/// `Fingerprint`.
+#[derive(PartialEq, Eq, Clone)]
+struct Fingerprint {
+    file_count: u64,
+    max_mtime_ns: u128,
+}
+
 #[derive(Default)]
 pub struct IndexCache {
-    inner: Mutex<HashMap<PathBuf, (u128, Arc<RepoIndex>)>>,
+    inner: Mutex<HashMap<PathBuf, (Fingerprint, Arc<RepoIndex>)>>,
 }
 
 impl IndexCache {
@@ -21,6 +33,14 @@ impl IndexCache {
         }
     }
 
+    /// Return a cached `RepoIndex` if the fingerprint is unchanged, otherwise
+    /// rebuild and cache it.
+    ///
+    /// **Locking note:** `RepoIndex::build` runs while the mutex is held, so
+    /// concurrent first-builds for different roots serialize.  This is
+    /// acceptable for v1 (single coding-agent session).  A drop-lock →
+    /// build → reacquire pattern would allow true parallelism but adds
+    /// complexity; defer if high concurrency becomes a concern.
     #[must_use]
     pub fn get_or_build(&self, root: &Path) -> Arc<RepoIndex> {
         let fp = fingerprint(root);
@@ -36,20 +56,23 @@ impl IndexCache {
     }
 }
 
-fn fingerprint(root: &Path) -> u128 {
-    let mut count: u128 = 0;
-    let mut max_mtime: u128 = 0;
+fn fingerprint(root: &Path) -> Fingerprint {
+    let mut file_count: u64 = 0;
+    let mut max_mtime_ns: u128 = 0;
     for (path, _lang) in walk(root) {
-        count += 1;
+        file_count += 1;
         if let Ok(meta) = std::fs::metadata(&path) {
             if let Ok(modified) = meta.modified() {
                 if let Ok(dur) = modified.duration_since(SystemTime::UNIX_EPOCH) {
-                    max_mtime = max_mtime.max(dur.as_nanos());
+                    max_mtime_ns = max_mtime_ns.max(dur.as_nanos());
                 }
             }
         }
     }
-    count.wrapping_mul(1_000_000_007).wrapping_add(max_mtime)
+    Fingerprint {
+        file_count,
+        max_mtime_ns,
+    }
 }
 
 #[cfg(test)]
@@ -66,6 +89,10 @@ mod tests {
         let cache = IndexCache::new();
         let i1 = cache.get_or_build(root);
         let i2 = cache.get_or_build(root);
+        assert!(
+            std::sync::Arc::ptr_eq(&i1, &i2),
+            "second call should return the SAME cached Arc"
+        );
         assert_eq!(i1.files().len(), i2.files().len());
         fs::write(root.join("b.py"), "def b():\n    pass\n").unwrap();
         let i3 = cache.get_or_build(root);

@@ -34,8 +34,24 @@ pub fn repo_context(
 
 #[cfg(test)]
 mod smoke {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
     #[test]
-    fn crate_builds() {
-        assert_eq!(2 + 2, 4);
+    fn repo_context_returns_non_empty_pack() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("helper.py"), "def helper():\n    return 42\n").unwrap();
+        let pack = repo_context(root, "helper", 5, 1000);
+        assert!(
+            !pack.files.is_empty(),
+            "expected at least one file in the pack"
+        );
+        assert!(
+            pack.token_estimate <= 1000,
+            "token_estimate {} exceeds budget",
+            pack.token_estimate
+        );
     }
 }
