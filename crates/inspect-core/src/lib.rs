@@ -6,6 +6,7 @@ pub mod ast;
 pub mod engine;
 pub mod output;
 pub mod parse;
+pub mod symbols;
 pub mod walk;
 
 pub use engine::Engine;
