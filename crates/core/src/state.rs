@@ -288,6 +288,15 @@ pub struct AppState {
     /// the pool wrapped behind their trait objects; this is the one raw handle
     /// the probe needs.
     pub db_pool: Option<sqlx::PgPool>,
+    /// Optional [`TaskTracker`](tokio_util::task::TaskTracker) for detached
+    /// telemetry writes (REL-3). When `Some`, `spawn_request_log` and
+    /// `spawn_body_capture` route their futures through the tracker so a
+    /// graceful shutdown can drain them via `close()` + `wait()` instead of
+    /// abandoning in-flight `request_logs` / body-capture inserts.
+    ///
+    /// `None` (default) keeps the existing fire-and-forget behavior so all
+    /// existing constructors and tests are unaffected.
+    pub telemetry_tracker: Option<tokio_util::task::TaskTracker>,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -330,6 +339,7 @@ impl AppState {
             l2_hit_judge_limiter,
             route_savings: None,
             db_pool: None,
+            telemetry_tracker: None,
         }
     }
 
@@ -341,6 +351,19 @@ impl AppState {
     #[must_use]
     pub fn with_db_pool(mut self, pool: sqlx::PgPool) -> Self {
         self.db_pool = Some(pool);
+        self
+    }
+
+    /// Attach a [`TaskTracker`](tokio_util::task::TaskTracker) so detached
+    /// telemetry writes (`request_logs`, body capture) are drained on graceful
+    /// shutdown instead of abandoned (REL-3).
+    ///
+    /// Pass a `tracker.clone()` here; after `axum::serve` returns, call
+    /// `tracker.close()` then `tokio::time::timeout(…, tracker.wait()).await`
+    /// to drain all in-flight writes before the process exits.
+    #[must_use]
+    pub fn with_telemetry_tracker(mut self, tracker: tokio_util::task::TaskTracker) -> Self {
+        self.telemetry_tracker = Some(tracker);
         self
     }
 

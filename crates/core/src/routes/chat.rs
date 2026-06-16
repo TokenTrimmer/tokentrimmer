@@ -555,6 +555,7 @@ async fn try_l1_hit(
     l1: &L1Config,
     l1_key: &str,
     ctx: &RequestContext,
+    tracker: Option<&tokio_util::task::TaskTracker>,
     request_log_writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
     trace_id: Uuid,
     request_started: Instant,
@@ -572,6 +573,7 @@ async fn try_l1_hit(
                 // either the envelope's own value or the synthetic
                 // fallback for pre-envelope cache rows.
                 spawn_request_log(
+                    tracker,
                     request_log_writer,
                     request_log_for_l1_hit(
                         &entry,
@@ -813,6 +815,7 @@ async fn try_l2_hit(
             // request_logs row report the same figure.
             let baseline_cost_usd = l2_entry_baseline(&entry, current_pricing);
             spawn_request_log(
+                state.telemetry_tracker.as_ref(),
                 request_log_writer,
                 request_log_for_l2_hit(
                     &entry,
@@ -1748,6 +1751,7 @@ pub async fn handler(
                 if let Ok(Some(bytes)) = l1.cache.get(key).await {
                     if let Ok(entry) = L1Entry::from_bytes(&bytes) {
                         spawn_request_log(
+                            state.telemetry_tracker.as_ref(),
                             state.request_log_writer.as_ref(),
                             request_log_for_l1_hit(
                                 &entry,
@@ -1896,6 +1900,7 @@ pub async fn handler(
         let body_captured = capture_request_json.is_some();
         if let Some(request_json) = capture_request_json {
             spawn_body_capture(
+                state.telemetry_tracker.as_ref(),
                 state.body_capture_writer.as_ref(),
                 BodyCaptureRecord {
                     org_id: ctx.org_id,
@@ -2110,6 +2115,7 @@ pub async fn handler(
                     l1,
                     key,
                     &ctx,
+                    state.telemetry_tracker.as_ref(),
                     state.request_log_writer.as_ref(),
                     trace_id,
                     request_started,
@@ -2217,6 +2223,7 @@ pub async fn handler(
                                                 "single-flight: follower served from populated L1"
                                             );
                                             spawn_request_log(
+                                                state.telemetry_tracker.as_ref(),
                                                 state.request_log_writer.as_ref(),
                                                 request_log_for_l1_hit(
                                                     &entry,
@@ -2803,6 +2810,7 @@ pub async fn handler(
             .filter(|s| s.succeeded)
             .map(|s| s.cost_usd);
         spawn_request_log(
+            state.telemetry_tracker.as_ref(),
             state.request_log_writer.as_ref(),
             RequestLogRow {
                 id: Uuid::now_v7(),
@@ -2883,6 +2891,7 @@ pub async fn handler(
                 }
             };
             spawn_body_capture(
+                state.telemetry_tracker.as_ref(),
                 state.body_capture_writer.as_ref(),
                 BodyCaptureRecord {
                     org_id: ctx.org_id,
@@ -4613,29 +4622,58 @@ pub(crate) async fn resolve_credentials_for(
 /// Fire-and-forget `request_logs` insert. The handler MUST NOT block on
 /// this — telemetry rows are best-effort, and a slow DB write would
 /// dominate p50.
-fn spawn_request_log(writer: Option<&std::sync::Arc<dyn RequestLogWriter>>, row: RequestLogRow) {
+///
+/// When `tracker` is `Some` (REL-3), the spawned future is tracked so a
+/// graceful shutdown can drain all in-flight writes via `close()` + `wait()`.
+/// When `None`, falls back to bare `tokio::spawn` (existing behavior).
+fn spawn_request_log(
+    tracker: Option<&tokio_util::task::TaskTracker>,
+    writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
+    row: RequestLogRow,
+) {
     let Some(writer) = writer else { return };
     let writer = writer.clone();
-    tokio::spawn(async move {
+    let fut = async move {
         if let Err(e) = writer.write(row).await {
             tracing::warn!(error = %e, "request_logs write failed");
         }
-    });
+    };
+    match tracker {
+        Some(t) => {
+            t.spawn(fut);
+        }
+        None => {
+            tokio::spawn(fut);
+        }
+    }
 }
 
 /// Fire-and-forget encrypted body capture. The writer itself enforces per-org
 /// opt-in and retention; handler latency should not depend on storage.
+///
+/// When `tracker` is `Some` (REL-3), the spawned future is tracked so a
+/// graceful shutdown can drain all in-flight writes via `close()` + `wait()`.
+/// When `None`, falls back to bare `tokio::spawn` (existing behavior).
 fn spawn_body_capture(
+    tracker: Option<&tokio_util::task::TaskTracker>,
     writer: Option<&std::sync::Arc<dyn BodyCaptureWriter>>,
     record: BodyCaptureRecord,
 ) {
     let Some(writer) = writer else { return };
     let writer = writer.clone();
-    tokio::spawn(async move {
+    let fut = async move {
         if let Err(e) = writer.record(record).await {
             tracing::warn!(error = %e, "request body capture write failed");
         }
-    });
+    };
+    match tracker {
+        Some(t) => {
+            t.spawn(fut);
+        }
+        None => {
+            tokio::spawn(fut);
+        }
+    }
 }
 
 /// Outcome of a canary **shadow** dispatch (`RouteAction::shadow_model`).
@@ -8252,6 +8290,102 @@ mod output_shaping_tests {
             &mut req, None, None, &p, None, "r", &mut w
         ));
         assert!(w.is_empty());
+    }
+}
+
+// REL-3: detached telemetry writes are drained via a TaskTracker so a
+// graceful shutdown (SIGTERM / rolling deploy) cannot abandon billing rows.
+#[cfg(test)]
+mod telemetry_drain_tests {
+    use super::*;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tokio_util::task::TaskTracker;
+    use tt_telemetry::request_logs::{InMemoryRequestLogWriter, RequestLogRow};
+    use uuid::Uuid;
+
+    fn sample_row() -> RequestLogRow {
+        RequestLogRow {
+            id: Uuid::now_v7(),
+            org_id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            ts: Utc::now(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_tokens: 0,
+            cost_usd: 0.001,
+            baseline_cost_usd: 0.001,
+            provider_cache_saved_usd: 0.0,
+            cache_bust_penalty_usd: 0.0,
+            cached: false,
+            cache_layer: None,
+            route_id: None,
+            latency_ms: 50,
+            upstream_latency_ms: None,
+            status: 200,
+            tag: None,
+            error_class: None,
+            trace_id: Some("test-drain".into()),
+            truncated: false,
+            shadow_model: None,
+            shadow_cost_usd: None,
+            traffic_split_arm: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            batch_eligible: false,
+            batch_forgone_usd: 0.0,
+            route_paused: false,
+            minify_saved_est_usd: 0.0,
+            format_switched: None,
+            format_switch_saved_est_usd: 0.0,
+            diff_applied: false,
+            diff_saved_usd: 0.0,
+            diff_failed: false,
+            diff_failed_cost_usd: 0.0,
+            retrieval_tokens_saved: 0,
+        }
+    }
+
+    /// REL-3: when a `TaskTracker` is passed to `spawn_request_log`, the spawned
+    /// write is tracked. After `close()` + `wait()`, the write is guaranteed to
+    /// have completed — no sleep-polling needed.
+    #[tokio::test]
+    async fn spawn_request_log_with_tracker_drains_on_wait() {
+        let writer = Arc::new(InMemoryRequestLogWriter::new());
+        let tracker = TaskTracker::new();
+
+        let writer_arc: Arc<dyn tt_telemetry::request_logs::RequestLogWriter> = writer.clone();
+        spawn_request_log(Some(&tracker), Some(&writer_arc), sample_row());
+
+        // Drain: close the tracker then wait for all tracked tasks to finish.
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
+            .await
+            .expect("telemetry drain must complete within 2 seconds");
+
+        // NO sleep: the drain guarantees the write completed.
+        assert_eq!(writer.rows().len(), 1, "write must be complete after drain");
+    }
+
+    /// REL-3: when no tracker is passed (`None`), `spawn_request_log` falls
+    /// back to bare `tokio::spawn` — same behavior as before REL-3. Callers
+    /// that don't have a tracker are unaffected.
+    #[tokio::test]
+    async fn spawn_request_log_without_tracker_falls_back_to_bare_spawn() {
+        let writer = Arc::new(InMemoryRequestLogWriter::new());
+        let writer_arc: Arc<dyn tt_telemetry::request_logs::RequestLogWriter> = writer.clone();
+
+        spawn_request_log(None, Some(&writer_arc), sample_row());
+
+        // No tracker: we have to yield control to let the bare spawn run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            writer.rows().len(),
+            1,
+            "bare spawn must still work when no tracker is passed"
+        );
     }
 }
 
