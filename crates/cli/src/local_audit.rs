@@ -82,6 +82,23 @@ pub fn append_entry(
 ) -> anyhow::Result<String> {
     let verifying_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
+    // Refuse to append to a chain whose preamble was signed by a different key:
+    // the local key's entries would fail `tt audit verify` (which sources the
+    // verifying key from the preamble), producing a confusing false integrity
+    // failure on an untampered chain.
+    if let Some(existing_key) = read_preamble_key(chain_path)? {
+        if existing_key != verifying_hex {
+            anyhow::bail!(
+                "audit chain {} was created by a different signing key (preamble {}, local {}); \
+                 appending would make `tt audit verify` fail. Move/remove that file or point at a \
+                 different chain path — this chain is not signed by your local key.",
+                chain_path.display(),
+                existing_key,
+                verifying_hex
+            );
+        }
+    }
+
     let existing = read_entries(chain_path)?;
     let entry = build_entry(
         signing_key,
@@ -135,6 +152,32 @@ fn read_entries(chain_path: &Path) -> anyhow::Result<Vec<AuditEntry>> {
     Ok(entries)
 }
 
+/// Read the `verifying_key` from a chain file's `{"meta":true,...}` preamble,
+/// if the file exists and has one. Returns `None` when absent / no preamble.
+fn read_preamble_key(chain_path: &Path) -> anyhow::Result<Option<String>> {
+    if !chain_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(chain_path)
+        .with_context(|| format!("read chain {}", chain_path.display()))?;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(t).context("parse chain line")?;
+        if v.get("meta").and_then(|m| m.as_bool()) == Some(true) {
+            return Ok(v
+                .get("verifying_key")
+                .and_then(|k| k.as_str())
+                .map(String::from));
+        }
+        // First non-empty line is a real entry, not a preamble.
+        return Ok(None);
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +220,49 @@ mod tests {
         let vk_bytes: [u8; 32] = hex::decode(&vk1).unwrap().try_into().unwrap();
         let vk = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes).unwrap();
         tt_telemetry::audit::verify_chain(&entries, &vk).expect("verifies");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn append_rejects_chain_signed_by_a_different_key() {
+        let dir = std::env::temp_dir().join(format!("tt-local-audit-mismatch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chain = dir.join("AUDIT-CHAIN.jsonl");
+        let org = Uuid::new_v4();
+
+        // Create the chain with key A.
+        let key_a = generate_signing_key();
+        append_entry(
+            &chain,
+            &key_a,
+            org,
+            "plan.applied",
+            serde_json::json!({"n":1}),
+        )
+        .expect("first append with key A");
+
+        // Appending with a DIFFERENT key B must be refused.
+        let key_b = generate_signing_key();
+        let err = append_entry(
+            &chain,
+            &key_b,
+            org,
+            "plan.applied",
+            serde_json::json!({"n":2}),
+        )
+        .expect_err("append with mismatched key must error");
+        assert!(err.to_string().contains("different signing key"));
+
+        // Re-appending with key A still works (no false positive).
+        append_entry(
+            &chain,
+            &key_a,
+            org,
+            "plan.applied",
+            serde_json::json!({"n":3}),
+        )
+        .expect("re-append with key A ok");
 
         std::fs::remove_dir_all(&dir).ok();
     }
