@@ -14,6 +14,77 @@ use uuid::Uuid;
 
 use super::{compute_hash, Actor, AuditEntry, AuditError, PayloadFields};
 
+// ─── Free functions ────────────────────────────────────────────────────────────
+
+/// Generate a fresh Ed25519 signing key (OS RNG). Kept here so callers don't
+/// need a direct `rand_core` dependency.
+pub fn generate_signing_key() -> SigningKey {
+    SigningKey::generate(&mut rand_core::OsRng)
+}
+
+/// Build (hash + Ed25519-sign) a new audit entry chaining onto `prev` (or
+/// genesis when `prev` is `None`). Shared by every writer so the chain rules
+/// live in exactly one place.
+pub fn build_entry(
+    signing_key: &SigningKey,
+    prev: Option<&AuditEntry>,
+    org_id: uuid::Uuid,
+    actor: Actor,
+    event: String,
+    payload: serde_json::Value,
+) -> Result<AuditEntry, AuditError> {
+    let seq = prev.map_or(0, |p| p.seq + 1);
+    let (prev_hash_str, prev_hash_bytes): (String, [u8; 32]) = match prev {
+        Some(p) => {
+            let decoded = hex::decode(&p.hash).map_err(|e| AuditError::Storage(e.to_string()))?;
+            if decoded.len() != 32 {
+                return Err(AuditError::Storage(format!(
+                    "prev hash decoded to {} bytes, expected 32",
+                    decoded.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&decoded);
+            (p.hash.clone(), arr)
+        }
+        None => {
+            let zeroes = [0u8; 32];
+            (hex::encode(zeroes), zeroes)
+        }
+    };
+
+    let id = uuid::Uuid::new_v4();
+    let timestamp = chrono::Utc::now();
+    let fields = PayloadFields {
+        id,
+        org_id,
+        timestamp,
+        actor: &actor,
+        event: &event,
+        payload: &payload,
+        seq,
+    };
+    let hash = compute_hash(&prev_hash_bytes, &fields)?;
+    let hash_hex = hash.to_hex().to_string();
+    let signature = signing_key
+        .try_sign(hash.as_bytes())
+        .map_err(|e| AuditError::Signing(e.to_string()))?;
+    let signature_hex = hex::encode(signature.to_bytes());
+
+    Ok(AuditEntry {
+        id,
+        org_id,
+        seq,
+        timestamp,
+        actor,
+        event,
+        payload,
+        prev_hash: prev_hash_str,
+        hash: hash_hex,
+        signature: signature_hex,
+    })
+}
+
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
 /// Storage backend for the audit log.
@@ -97,59 +168,14 @@ impl AuditWriter for InMemoryAuditWriter {
             .map_err(|_| AuditError::Storage("mutex poisoned".to_string()))?;
 
         let chain = guard.entry(org_id).or_default();
-        // 0-based, gap-free per-org sequence (next index == current length).
-        let seq = chain.len() as i64;
-
-        // Genesis uses 32 zero bytes; subsequent entries use the previous hash.
-        let (prev_hash_str, prev_hash_bytes): (String, [u8; 32]) = match chain.last() {
-            Some(prev) => {
-                let decoded =
-                    hex::decode(&prev.hash).map_err(|e| AuditError::Storage(e.to_string()))?;
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&decoded);
-                (prev.hash.clone(), arr)
-            }
-            None => {
-                let zeroes = [0u8; 32];
-                (hex::encode(zeroes), zeroes)
-            }
-        };
-
-        let id = Uuid::new_v4();
-        let timestamp = chrono::Utc::now();
-
-        let fields = PayloadFields {
-            id,
+        let entry = build_entry(
+            &self.signing_key,
+            chain.last(),
             org_id,
-            timestamp,
-            actor: &actor,
-            event: &event,
-            payload: &payload,
-            seq,
-        };
-
-        let hash = compute_hash(&prev_hash_bytes, &fields)?;
-        let hash_hex = hash.to_hex().to_string();
-
-        let signature = self
-            .signing_key
-            .try_sign(hash.as_bytes())
-            .map_err(|e| AuditError::Signing(e.to_string()))?;
-        let signature_hex = hex::encode(signature.to_bytes());
-
-        let entry = AuditEntry {
-            id,
-            org_id,
-            seq,
-            timestamp,
             actor,
             event,
             payload,
-            prev_hash: prev_hash_str,
-            hash: hash_hex,
-            signature: signature_hex,
-        };
-
+        )?;
         chain.push(entry.clone());
         Ok(entry)
     }
@@ -160,5 +186,42 @@ impl AuditWriter for InMemoryAuditWriter {
             .lock()
             .map_err(|_| AuditError::Storage("mutex poisoned".to_string()))?;
         Ok(guard.get(&org_id).cloned().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Actor;
+
+    #[test]
+    fn build_entry_chains_and_verifies() {
+        let key = super::generate_signing_key();
+        let org = uuid::Uuid::new_v4();
+
+        let g = super::build_entry(
+            &key,
+            None,
+            org,
+            Actor::System,
+            "genesis".into(),
+            serde_json::json!({}),
+        )
+        .expect("genesis");
+        assert_eq!(g.seq, 0);
+        assert_eq!(g.prev_hash, "0".repeat(64));
+
+        let next = super::build_entry(
+            &key,
+            Some(&g),
+            org,
+            Actor::System,
+            "plan.applied".into(),
+            serde_json::json!({"k":"v"}),
+        )
+        .expect("next");
+        assert_eq!(next.seq, 1);
+        assert_eq!(next.prev_hash, g.hash);
+
+        super::super::verify_chain(&[g, next], &key.verifying_key()).expect("chain verifies");
     }
 }
