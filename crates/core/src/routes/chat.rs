@@ -842,6 +842,166 @@ async fn try_l2_hit(
     }
 }
 
+/// The fully-prepared per-request setup the branch (streaming | non-streaming)
+/// consumes after the shared pipeline (routing → route-action capture →
+/// redaction → compression → agentic-budget → cache-behavior → body-capture
+/// gating). The chat [`handler`] builds this inline before the `if req.stream`
+/// branch (the streaming arm reads these fields directly); the non-streaming
+/// arm hands it to [`complete_once`]. The future server-side agent loop will
+/// build the same bundle per turn so it can re-route/redact each turn — see
+/// the slice 1a design (`prepare(...)` is the eventual factoring of the inline
+/// setup, deferred here to keep this behavior-preserving refactor's diff
+/// minimal and the streaming path byte-for-byte unchanged).
+///
+/// `'a` borrows the per-request locals (`provider`, `ctx`, `req`, the route
+/// metadata) that the non-streaming pipeline reads/clones but does not move out
+/// of the handler; the owned-by-value fields are the ones the pipeline consumes
+/// (the L2 judge captures) or mutates (`warnings`, the failover chain).
+pub(crate) struct Prepared<'a> {
+    /// Final served provider (post routing / pin / failover-primary).
+    pub provider: &'a std::sync::Arc<dyn tt_shared::Provider>,
+    /// The (possibly routed/shaped/redacted/compressed) request to dispatch.
+    pub req: &'a ChatCompletionRequest,
+    /// Per-request cache behaviour (lookup/insert/ttl), already resolved.
+    pub cache_behavior: &'a CacheBehavior,
+    /// L2 entitlement (paid-tier only).
+    pub l2_allowed: bool,
+    /// Format-switch disables L2 for the request (lookup + insert).
+    pub skip_l2: bool,
+    /// Matched route name for the `X-TokenTrimmer-Route-Matched` header.
+    pub route_matched_name: Option<&'a str>,
+    /// Matched route id for the `request_logs` row.
+    pub matched_route_id: Option<Uuid>,
+    /// Paused-route passthrough marker.
+    pub route_paused: bool,
+    /// Whether routing actually rewrote the model (drives baseline pricing).
+    pub model_was_rewritten: bool,
+    /// Originally-requested model (pre-routing) — `gen_ai.request.model`.
+    pub requested_model: &'a str,
+    /// Pricing for the originally-requested model (baseline when rewritten).
+    pub requested_pricing: Option<&'a ModelPricing>,
+    /// Format-switch plan (response-side shaping), if any.
+    pub format_switch_plan: Option<&'a crate::shaping::format_switch::FormatSwitchPlan>,
+    /// Diff plan (response-side shaping), if any.
+    pub diff_plan: Option<&'a crate::shaping::diff::DiffPlan>,
+    /// Aggregated request-pass effects threaded into the cost computation.
+    pub pass_effects: PassEffects,
+    /// Whether the minify-JSON instruction was injected (drives the estimate).
+    pub minify_applied: bool,
+    /// Whether a reasoning cap fired (judge eligibility).
+    pub reasoning_capped: bool,
+    /// Whether OpenAI Flex was applied (cost attribution).
+    pub flex_applied: bool,
+    /// Whether the request was marked batch-eligible (advisory).
+    pub batch_marked: bool,
+    /// Caller tier (per-tier cache TTL).
+    pub caller_tier: Option<tt_shared::CallerTier>,
+    /// Canary traffic-split arm (`canary`/`control`/None).
+    pub traffic_split_arm: Option<String>,
+    /// Canary traffic-split percentage (span attr).
+    pub route_traffic_pct: Option<u32>,
+    /// Canary shadow model to dispatch concurrently (discarded), if any.
+    pub route_shadow_model: Option<&'a str>,
+    /// Failover candidate model ids (empty = single-provider dispatch).
+    pub failover_candidates: &'a [String],
+    /// Per-provider credentials for the failover candidate set.
+    pub failover_creds: &'a std::collections::HashMap<String, ProviderCredentials>,
+    /// Whether the route declared any fallbacks (single vs failover dispatch).
+    pub has_fallbacks: bool,
+    /// Per-request upstream deadline.
+    pub request_timeout: Option<Duration>,
+    /// Raw bearer (source provider's key; shadow + re-emit credential resolve).
+    pub raw_bearer: &'a str,
+    /// Retrieval-middleware telemetry (tokens saved upstream).
+    pub retrieval_telemetry: &'a RetrievalTelemetry,
+    /// Wall-clock request start for `request_logs.latency_ms`.
+    pub request_started: Instant,
+    /// Serialized request body for capture (`Some` only when capture is armed,
+    /// the org is non-anonymous, and the org opted in). Consumed by value.
+    pub capture_request_json: Option<Vec<u8>>,
+    /// L2 quality-judge captures (PRE-redaction): the source provider/ctx/req
+    /// re-dispatched for the reference answer. Consumed by value (passed by-ref
+    /// into the L2-hit gate, moved into `maybe_spawn_quality_judge`).
+    pub judge_source_provider: Option<std::sync::Arc<dyn tt_shared::Provider>>,
+    pub judge_source_ctx: Option<RequestContext>,
+    pub judge_original_req: Option<ChatCompletionRequest>,
+}
+
+/// Cost/route/cache/warning metadata the chat [`handler`] turns into
+/// `x-tokentrimmer-*` response headers after a dispatched (non-cache-hit)
+/// non-streaming completion. The field set mirrors exactly what the current
+/// non-streaming tail reads when assembling the response: the
+/// [`attach_cost_headers`] inputs, the `x-tokentrimmer-cache` /
+/// `x-tokentrimmer-route-matched` / `x-tokentrimmer-captured` headers, and the
+/// [`attach_warnings`] inputs. (The OTel request-span attributes are recorded
+/// inside [`complete_once`] alongside the other per-request side effects —
+/// `tracing::Span::current()` is identical there and in the handler tail.)
+pub(crate) struct CompletionHeaders {
+    /// `attach_cost_headers` inputs.
+    pub trace_id: Uuid,
+    pub provider_id: String,
+    pub model_used: String,
+    pub cost_breakdown: CostBreakdown,
+    /// `x-tokentrimmer-cache` value (`miss` / `none`).
+    pub cache_state: &'static str,
+    /// `x-tokentrimmer-route-matched` value, if a route matched.
+    pub route_matched_name: Option<String>,
+    /// Whether the request+response bodies were persisted (`x-tokentrimmer-captured`).
+    pub body_captured: bool,
+    /// The dispatched request — `attach_warnings` evaluates `dropped_params`
+    /// against it (and the served model).
+    pub req: ChatCompletionRequest,
+    /// The served provider — `attach_warnings` calls `dropped_params` on it.
+    pub provider: std::sync::Arc<dyn tt_shared::Provider>,
+    /// Pre-dispatch + dispatch warning tokens (comma-joined into the header).
+    pub warnings: Vec<String>,
+}
+
+/// The result of one non-streaming completion through [`complete_once`].
+///
+/// A dispatched completion returns the typed [`ChatCompletionResponse`] plus the
+/// [`CompletionHeaders`] the wrapper turns into the HTTP response — this is the
+/// path the agent loop (slice 1a) consumes per turn. A cache hit (L1 / L2 /
+/// negative cache / single-flight follower) already built the exact client
+/// `Response` it returns today, so it is carried verbatim to keep behavior
+/// byte-for-byte identical (the negative-cache hit in particular is an error
+/// status body, not a `ChatCompletionResponse`, so it cannot be re-typed
+/// losslessly). The loop will consume cache hits via the typed response in a
+/// later slice; 1a-0 only carves the pipeline behavior-preservingly.
+pub(crate) enum CompletionOutcome {
+    /// A fresh provider dispatch: typed response + header metadata.
+    Dispatched {
+        response: ChatCompletionResponse,
+        headers: Box<CompletionHeaders>,
+    },
+    /// A cache hit (or negative-cache hit): the fully-built client response,
+    /// returned verbatim (already carries its own headers).
+    CacheHit(Response),
+}
+
+/// Run one routed, metered, cached **non-streaming** completion: the L1/L2
+/// (and negative-cache) lookups, single-flight coalescing, provider dispatch
+/// (single + `dispatch_with_failover`), response-side output shaping, cost
+/// computation, L1/L2 insert, the `request_logs` row, body capture, the sampled
+/// quality judge, and the OTel request-span attributes — returning the typed
+/// response + header metadata ([`CompletionOutcome`]) instead of building the
+/// HTTP `Response`. The chat [`handler`]'s non-streaming arm calls this and
+/// assembles the final `Response`; the future server-side agent loop (slice 1a)
+/// calls this per turn through a `TurnCompleter` seam.
+///
+/// Behavior-preserving by construction: this is the verbatim non-streaming arm
+/// of [`handler`], with the early cache-hit returns yielding
+/// [`CompletionOutcome::CacheHit`] and the dispatched tail yielding
+/// [`CompletionOutcome::Dispatched`].
+pub(crate) async fn complete_once(
+    state: &AppState,
+    ctx: &RequestContext,
+    prep: Prepared<'_>,
+) -> ApiResult<CompletionOutcome> {
+    let _ = (state, ctx, prep);
+    unreachable!("complete_once skeleton — wired in Task 2")
+}
+
 /// Handler for `POST /v1/chat/completions`.
 ///
 /// Resolves the provider for `req.model`, builds a [`RequestContext`] from the
