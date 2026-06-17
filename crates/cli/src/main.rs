@@ -68,7 +68,7 @@ enum Command {
         from_db: bool,
         /// With --from-db: the org UUID to pull. If omitted, auto-detected when
         /// the window has exactly one org (errors if ambiguous).
-        #[arg(long)]
+        #[arg(long, requires = "from_db")]
         org: Option<String>,
         /// With --from-db: telemetry window size in days.
         #[arg(long, default_value_t = 7)]
@@ -97,9 +97,10 @@ enum Command {
         #[arg(long)]
         example: bool,
 
-        /// Apply the plan via the hosted backend (requires a tt_live_* key).
-        /// Not yet wired: the projection is shown, then the command exits
-        /// NON-ZERO so CI/automation can't assume the config was applied.
+        /// Apply the projected routes to the gateway's Postgres `routes` table
+        /// (requires DATABASE_URL) and record a signed `plan.applied` entry to
+        /// `.claude/AUDIT-CHAIN.jsonl`. Dry-runs + prompts for confirmation
+        /// unless `--yes`. The gateway picks the routes up on its next refresh.
         #[arg(long, conflicts_with = "example")]
         apply: bool,
 
@@ -2353,9 +2354,11 @@ fn run_cost_diff(
 /// Implement `tt plan`.
 ///
 /// v1 reads a serialized [`tt_plan_core::PlanInput`] from a JSON file at
-/// `--input`. Production wiring (read from Postgres given a window + diff
-/// spec) lands when the hosted Plan endpoint ships; the JSON-file interface
-/// stays as the universal offline path for CI gates and developer experiments.
+/// `--input`. The JSON-file interface is the universal offline path for CI
+/// gates and developer experiments.
+///
+/// On `--apply`, writes the projected routes to the gateway's Postgres and
+/// records a signed `plan.applied` audit entry; requires DATABASE_URL.
 async fn run_plan(
     input: Option<&str>,
     output: Option<&str>,
