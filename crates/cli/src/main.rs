@@ -2205,7 +2205,9 @@ async fn run_suggest_plan(
             .await
             .context("connect to DATABASE_URL")?;
         let until = chrono::Utc::now();
-        let since = until - chrono::Duration::days(window_days.max(1));
+        // Clamp to [1, 100yr] so an absurd --window-days can't panic chrono's
+        // TimeDelta on overflow, and a 0/negative window falls back to 1 day.
+        let since = until - chrono::Duration::days(window_days.clamp(1, 36_500));
         let org_uuid = match org {
             Some(s) => Some(uuid::Uuid::parse_str(s).context("--org must be a UUID")?),
             None => None,
