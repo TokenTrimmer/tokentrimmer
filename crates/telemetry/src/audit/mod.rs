@@ -22,7 +22,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub use writer::{AuditWriter, InMemoryAuditWriter};
+pub use writer::{build_entry, generate_signing_key, AuditWriter, InMemoryAuditWriter};
 
 // ─── Schema types ────────────────────────────────────────────────────────────
 

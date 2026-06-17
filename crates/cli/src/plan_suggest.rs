@@ -94,10 +94,24 @@ const STD_OUTPUT_TOKENS: u32 = 500;
 ///
 /// Returns `Ok(json_string)`.
 pub fn build_plan_input_json(path: &str) -> anyhow::Result<String> {
+    let now = Utc::now();
+    build_plan_input_json_inner(path, Uuid::nil(), &[], now - chrono::Duration::days(7), now)
+}
+
+/// Build a `PlanInput` JSON for `path`, injecting a concrete `org_id`, a frozen
+/// set of `requests`, and an explicit replay window. `build_plan_input_json`
+/// calls this with the skeleton defaults (nil org, empty requests, 7-day
+/// window); `--from-db` calls it with a real telemetry window.
+pub fn build_plan_input_json_inner(
+    path: &str,
+    org_id: Uuid,
+    requests: &[tt_plan_core::types::RequestLog],
+    window_start: chrono::DateTime<Utc>,
+    window_end: chrono::DateTime<Utc>,
+) -> anyhow::Result<String> {
     let models = collect_models_from_path(path)?;
 
     let mut proposed_routes: Vec<ProposedRoute> = Vec::new();
-
     for current_model in &models {
         if let Ok(hit) = tt_preview::pricing::lookup(current_model) {
             let current_cost =
@@ -111,8 +125,7 @@ pub fn build_plan_input_json(path: &str) -> anyhow::Result<String> {
                 STD_OUTPUT_TOKENS,
                 tt_preview::classifier::TaskClass::Classification,
             );
-            let routes = suggestions_to_proposed_routes(current_model, &suggestions);
-            proposed_routes.extend(routes);
+            proposed_routes.extend(suggestions_to_proposed_routes(current_model, &suggestions));
         } else {
             tracing::warn!(
                 model = %current_model,
@@ -121,9 +134,7 @@ pub fn build_plan_input_json(path: &str) -> anyhow::Result<String> {
         }
     }
 
-    let now = Utc::now();
     let plan_id = Uuid::new_v4();
-    let org_id = Uuid::nil(); // placeholder — user must fill in their org_id
 
     // Build the pricing table for every target model referenced.
     let mut pricing_table: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -150,9 +161,9 @@ pub fn build_plan_input_json(path: &str) -> anyhow::Result<String> {
     let plan_input = serde_json::json!({
         "plan_id": plan_id,
         "org_id": org_id,
-        "window_start": (now - chrono::Duration::days(7)).to_rfc3339(),
-        "window_end": now.to_rfc3339(),
-        "requests": [],
+        "window_start": window_start.to_rfc3339(),
+        "window_end": window_end.to_rfc3339(),
+        "requests": requests,
         "proposed_routes": proposed_routes,
         "pricing": pricing_table,
         "config": {
@@ -342,5 +353,55 @@ mod tests {
         assert_eq!(routes[0].priority, 100);
         assert!(routes[0].when.input_tokens_lt.is_none());
         assert!(routes[0].when.tag_equals.is_none());
+    }
+
+    // (e) The inner builder injects org_id + frozen requests into the PlanInput.
+    #[test]
+    fn inner_builder_freezes_org_and_requests() {
+        use tt_plan_core::types::{L2TaskClass, RequestLog};
+
+        let req = RequestLog {
+            id: Uuid::new_v4(),
+            org_id: Uuid::from_u128(7),
+            ts: Utc::now(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_tokens: 0,
+            cost_usd: 0.005,
+            baseline_cost_usd: 0.010,
+            cached: false,
+            cache_layer: None,
+            matched_route_id: None,
+            latency_ms: 100,
+            upstream_latency_ms: None,
+            status: 200,
+            tag: None,
+            embedding: None,
+            finish_reason: None,
+            body: None,
+            response_body: None,
+            task_class: L2TaskClass::default(),
+            diff_saved_usd: None,
+            minify_saved_est_usd: None,
+        };
+        let now = Utc::now();
+        // A path with no model strings → empty proposed_routes, but requests + org
+        // must still be frozen in.
+        let dir = std::env::temp_dir();
+        let json = build_plan_input_json_inner(
+            dir.to_str().unwrap(),
+            Uuid::from_u128(7),
+            &[req],
+            now - chrono::Duration::days(3),
+            now,
+        )
+        .expect("inner builder ok");
+
+        let parsed: PlanInput = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.org_id, Uuid::from_u128(7));
+        assert_eq!(parsed.requests.len(), 1);
+        assert_eq!(parsed.requests[0].model, "gpt-4o");
     }
 }

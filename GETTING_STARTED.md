@@ -229,24 +229,37 @@ tt inspect ./my-project --suggest-plan --output plan_input.json
 
 **Requires:** the `tt` binary and a path. No keys, no network, no services.
 
-### 3. Plan — `tt plan`
+### 3. `tt` proof loop — discover → simulate → realize → prove
 
-Replay historical telemetry against a proposed config and project cost/savings/cache-hit impact with 95% confidence intervals. v1 reads a serialized `PlanInput` from a JSON file (the universal offline interface for CI gates and experiments).
+For a self-hosted gateway (your own `DATABASE_URL`), the whole loop runs locally:
 
 ```bash
-# Don't know the JSON shape? Dump a skeleton you can edit:
-tt plan --example > plan_input.json
+# Discover + freeze a real telemetry window into a runnable PlanInput
+#   --org is auto-detected when the window has exactly one org.
+tt inspect --suggest-plan . --from-db --window-days 7 --output plan.json
 
-# Run the replay (text summary to stdout)
-tt plan --input plan_input.json
+# Simulate — deterministic replay of the frozen window (text summary)
+tt plan --input plan.json
 
-# Full PlanResult as JSON
-tt plan --input plan_input.json --output result.json
+# (optional) full PlanResult as JSON
+tt plan --input plan.json --output result.json
+
+# Realize — write the proposed routes to the gateway's routes table.
+#   Dry-runs + prompts for confirmation; the gateway applies them within ~60s.
+#   Use --yes in CI to skip the prompt.
+tt plan --input plan.json --apply
+
+# Prove — verify the signed plan.applied entry recorded by --apply
+tt audit verify
 ```
 
-> `tt plan --apply` is **not yet wired** to the hosted backend — it prints the projection, then **exits non-zero** so CI/automation can't silently treat the config as applied. Apply changes via the dashboard once it ships.
+Without `--from-db`, `tt inspect --suggest-plan` still emits a skeleton you fill in
+by hand. `--from-db` and `--apply` both require `DATABASE_URL` (the gateway's
+Postgres). `--apply` records a signed `plan.applied` entry to
+`.claude/AUDIT-CHAIN.jsonl` using a per-machine key at
+`~/.tokentrimmer/audit-signing-key`, and prints the verifying key for `tt audit verify`.
 
-**Requires:** the `tt` binary and a `PlanInput` JSON file. No keys or services.
+**Requires:** the `tt` binary. Offline simulation needs only a `PlanInput` JSON file; `--from-db` and `--apply` require the gateway's `DATABASE_URL`.
 
 ### 4. `tt init` — install best-practices into your repo
 
