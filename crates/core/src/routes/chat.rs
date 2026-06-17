@@ -1059,8 +1059,7 @@ pub(crate) async fn complete_once(
     // eligibility + tt_extras.cache mode; best-effort (errors fall through).
     if cache_behavior.do_lookup {
         if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
-            if let Some(resp) =
-                try_negative_cache_hit(l1, key, route_matched_name.as_deref()).await
+            if let Some(resp) = try_negative_cache_hit(l1, key, route_matched_name.as_deref()).await
             {
                 return Ok(CompletionOutcome::CacheHit(resp));
             }
@@ -1195,8 +1194,7 @@ pub(crate) async fn complete_once(
                                         // Same advertisement contract as
                                         // the direct L1-hit return above.
                                         if let Some(plan) = format_switch_plan.as_ref() {
-                                            warnings
-                                                .push(format!("format_switch:{}", plan.label));
+                                            warnings.push(format!("format_switch:{}", plan.label));
                                         }
                                         attach_warning_tokens(resp.headers_mut(), &warnings);
                                         return Ok(CompletionOutcome::CacheHit(resp));
@@ -1462,8 +1460,7 @@ pub(crate) async fn complete_once(
                     &response.model,
                     &artifact,
                 );
-                let billed =
-                    u32::try_from(response.usage.completion_tokens).unwrap_or(u32::MAX);
+                let billed = u32::try_from(response.usage.completion_tokens).unwrap_or(u32::MAX);
                 shape_effects.diff_output_tokens_saved = artifact_tokens.saturating_sub(billed);
                 set_assistant_text(&mut response, artifact);
                 // `usage` deliberately STAYS the provider-billed patch
@@ -1503,11 +1500,7 @@ pub(crate) async fn complete_once(
                 // needed (its response_format was None).
                 let mut reemit_req = req.clone();
                 crate::shaping::diff::unapply_diff_request(&mut reemit_req, plan);
-                maybe_downgrade_response_format(
-                    &mut reemit_req,
-                    provider.as_ref(),
-                    &mut warnings,
-                );
+                maybe_downgrade_response_format(&mut reemit_req, provider.as_ref(), &mut warnings);
                 // Single provider, no failover chain — the chain already
                 // chose this provider for the patch dispatch.
                 let reemit = with_request_timeout(request_timeout, async {
@@ -1649,11 +1642,8 @@ pub(crate) async fn complete_once(
                     let l1_clone = l1.clone();
                     // TTL priority: tt_extras override > tier-based TTL >
                     // L1 config default (spec §8.4 / rv-per-tier-ttl).
-                    let ttl = effective_ttl_secs(
-                        cache_behavior.ttl_secs,
-                        caller_tier,
-                        l1_clone.ttl_secs,
-                    );
+                    let ttl =
+                        effective_ttl_secs(cache_behavior.ttl_secs, caller_tier, l1_clone.ttl_secs);
                     if let Some(guard) = single_flight_guard.take() {
                         // Leader path: await the insert so followers can
                         // read it from L1 immediately after we signal them.
@@ -1800,9 +1790,7 @@ pub(crate) async fn complete_once(
             // dispatch is discarded — only the SERVED response's cache
             // telemetry is recorded (shadow cost has its own columns).
             cache_read_input_tokens: opt_tokens_i32(response.usage.cache_read_input_tokens),
-            cache_creation_input_tokens: opt_tokens_i32(
-                response.usage.cache_creation_input_tokens,
-            ),
+            cache_creation_input_tokens: opt_tokens_i32(response.usage.cache_creation_input_tokens),
             // Advisory batch-eligibility marker (research Phase 2.1).
             // `batch_eligible` records route INTENT (the marker survived
             // the hard-ineligibility gate); `batch_forgone_usd` is the
