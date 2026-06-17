@@ -159,19 +159,14 @@ pub async fn apply_routes(
         "projected_savings_usd": result.aggregates.projected_savings_usd,
         "projected_savings_pct": result.aggregates.projected_savings_pct,
     });
-    let verifying_hex = local_audit::append_entry(
-        chain_path,
-        signing_key,
-        org_id,
-        "plan.applied",
-        payload,
-    )
-    .with_context(|| {
-        format!(
+    let verifying_hex =
+        local_audit::append_entry(chain_path, signing_key, org_id, "plan.applied", payload)
+            .with_context(|| {
+                format!(
             "{} route(s) were created and are live, but recording the plan.applied proof failed",
             created.len()
         )
-    })?;
+            })?;
     crate::ui::ok(&format!(
         "recorded plan.applied to {} — verify with: tt audit verify --key-hex {}",
         chain_path.display(),
