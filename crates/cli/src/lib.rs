@@ -10,6 +10,7 @@ pub mod cost_diff;
 pub mod embed;
 pub mod init;
 pub mod local_audit;
+pub mod plan_apply;
 pub mod plan_suggest;
 pub mod proxy;
 pub mod recipes;
