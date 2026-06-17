@@ -14,4 +14,5 @@ pub mod proxy;
 pub mod recipes;
 pub mod retrieval;
 pub mod route;
+pub mod telemetry_window;
 pub mod ui;
