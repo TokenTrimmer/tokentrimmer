@@ -102,6 +102,11 @@ enum Command {
         /// NON-ZERO so CI/automation can't assume the config was applied.
         #[arg(long, conflicts_with = "example")]
         apply: bool,
+
+        /// With --apply: skip the interactive confirmation prompt (for CI /
+        /// automation). Ignored without --apply.
+        #[arg(long)]
+        yes: bool,
     },
     /// Audit log helpers.
     Audit {
@@ -576,8 +581,9 @@ async fn main() -> anyhow::Result<()> {
             output,
             example,
             apply,
+            yes,
         } => {
-            run_plan(input.as_deref(), output.as_deref(), example, apply)?;
+            run_plan(input.as_deref(), output.as_deref(), example, apply, yes).await?;
         }
         Command::Audit {
             action:
@@ -2350,12 +2356,15 @@ fn run_cost_diff(
 /// `--input`. Production wiring (read from Postgres given a window + diff
 /// spec) lands when the hosted Plan endpoint ships; the JSON-file interface
 /// stays as the universal offline path for CI gates and developer experiments.
-fn run_plan(
+async fn run_plan(
     input: Option<&str>,
     output: Option<&str>,
     example: bool,
     apply: bool,
+    yes: bool,
 ) -> anyhow::Result<()> {
+    use anyhow::Context;
+
     if example {
         print_plan_example();
         return Ok(());
@@ -2368,6 +2377,11 @@ fn run_plan(
         .map_err(|e| anyhow::anyhow!("read {input_path}: {e}"))?;
     let plan_input: tt_plan_core::PlanInput =
         serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parse {input_path}: {e}"))?;
+
+    // Capture what the apply path needs before `plan_input` is consumed.
+    let org_id = plan_input.org_id;
+    let plan_id = plan_input.plan_id;
+    let proposed = plan_input.proposed_routes.clone();
 
     let result =
         tt_plan_core::replay(plan_input).map_err(|e| anyhow::anyhow!("replay failed: {e}"))?;
@@ -2400,15 +2414,29 @@ fn run_plan(
         tt_cli::ui::note("No projected savings for this config.");
     }
 
-    // `--apply` is not wired to a hosted backend yet. The projection above is
-    // real, but NO config was applied. Exit non-zero so CI/automation using
-    // `--apply` can't silently treat the run as "applied" (rv-plan-apply-cli-honest, §1.8).
     if apply {
-        anyhow::bail!(
-            "tt plan --apply is not wired yet (needs the hosted backend + a tt_live_* key); \
-             the projection above did NOT change any routing config. Apply via the dashboard \
-             once it ships. Exiting non-zero so automation does not assume the plan was applied."
-        );
+        let url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context(
+                "tt plan --apply requires DATABASE_URL (the gateway's Postgres connection string)",
+            )?;
+        let pool = tt_core::connect(&url, 4)
+            .await
+            .context("connect to DATABASE_URL")?;
+        let signing_key = tt_cli::local_audit::load_or_create_signing_key()?;
+        let chain_path = std::path::Path::new(tt_cli::local_audit::DEFAULT_CHAIN_PATH);
+        tt_cli::plan_apply::apply_routes(
+            &pool,
+            org_id,
+            plan_id,
+            &proposed,
+            &result,
+            yes,
+            &signing_key,
+            chain_path,
+        )
+        .await?;
     }
 
     Ok(())
@@ -2670,31 +2698,53 @@ mod plan_apply_tests {
         f
     }
 
-    /// `--apply` must exit non-zero until the hosted backend is wired, so CI /
-    /// automation can't assume a no-op run actually applied the config.
-    #[test]
-    fn apply_exits_nonzero_until_wired() {
+    /// `--apply` requires a Postgres connection string. With `DATABASE_URL`
+    /// unset it must error (and mention `DATABASE_URL`) rather than silently
+    /// treating the run as applied. The real apply path (with a live DB) is
+    /// covered by the DB-integration tests on `tt_cli::plan_apply::apply_routes`.
+    #[tokio::test]
+    async fn apply_without_database_url_errors() {
         let input = example_input_file();
         let out = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+
+        // Ensure DATABASE_URL is absent for the duration of this test, then
+        // restore whatever was there before.
+        let saved = std::env::var("DATABASE_URL").ok();
+        std::env::remove_var("DATABASE_URL");
+
         let res = run_plan(
             input.path().to_str(),
             out.path().to_str(),
             false,
-            true, // --apply
-        );
-        let err = res.expect_err("--apply must error until the hosted backend is wired");
+            true,  // --apply
+            false, // --yes
+        )
+        .await;
+
+        if let Some(v) = saved {
+            std::env::set_var("DATABASE_URL", v);
+        }
+
+        let err = res.expect_err("--apply without DATABASE_URL must error");
         assert!(
-            err.to_string().contains("apply"),
-            "error should mention apply: {err}"
+            err.to_string().contains("DATABASE_URL"),
+            "error should mention DATABASE_URL: {err}"
         );
     }
 
-    /// The same projection WITHOUT `--apply` succeeds (exit 0).
-    #[test]
-    fn plan_without_apply_succeeds() {
+    /// The same projection WITHOUT `--apply` succeeds (exit 0) and touches no DB.
+    #[tokio::test]
+    async fn plan_without_apply_succeeds() {
         let input = example_input_file();
         let out = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
-        run_plan(input.path().to_str(), out.path().to_str(), false, false)
-            .expect("projection without --apply should succeed");
+        run_plan(
+            input.path().to_str(),
+            out.path().to_str(),
+            false,
+            false, // --apply
+            false, // --yes
+        )
+        .await
+        .expect("projection without --apply should succeed");
     }
 }
