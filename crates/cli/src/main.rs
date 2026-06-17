@@ -61,6 +61,18 @@ enum Command {
         /// Pairs with `--output` to write to a file instead of stdout.
         #[arg(long, conflicts_with_all = ["cost_diff"])]
         suggest_plan: bool,
+        /// With --suggest-plan: pull a real `request_logs` telemetry window
+        /// from the gateway's Postgres (DATABASE_URL) into the emitted
+        /// PlanInput's `requests`, making the file immediately runnable.
+        #[arg(long, requires = "suggest_plan")]
+        from_db: bool,
+        /// With --from-db: the org UUID to pull. If omitted, auto-detected when
+        /// the window has exactly one org (errors if ambiguous).
+        #[arg(long)]
+        org: Option<String>,
+        /// With --from-db: telemetry window size in days.
+        #[arg(long, default_value_t = 7)]
+        window_days: i64,
     },
     /// Replay historical telemetry against a proposed config and project
     /// cost/savings/cache-hit-rate impact with bootstrap confidence intervals.
@@ -540,11 +552,21 @@ async fn main() -> anyhow::Result<()> {
             base,
             fail_on_cost_increase,
             suggest_plan,
+            from_db,
+            org,
+            window_days,
         } => {
             if cost_diff {
                 run_cost_diff(&path, &base, output.as_deref(), fail_on_cost_increase)?;
             } else if suggest_plan {
-                run_suggest_plan(&path, output.as_deref())?;
+                run_suggest_plan(
+                    &path,
+                    output.as_deref(),
+                    from_db,
+                    org.as_deref(),
+                    window_days,
+                )
+                .await?;
             } else {
                 run_inspect(&path, &fail_on, output.as_deref())?;
             }
@@ -2163,14 +2185,60 @@ fn run_inspect(path: &str, fail_on: &str, output: Option<&str>) -> anyhow::Resul
 ///
 /// Users write the output to a file (via `--output`), fill in `org_id` /
 /// `requests` / `pricing`, then run `tt plan --input <file>` to replay.
-fn run_suggest_plan(path: &str, output: Option<&str>) -> anyhow::Result<()> {
-    let json = tt_cli::plan_suggest::build_plan_input_json(path)?;
+async fn run_suggest_plan(
+    path: &str,
+    output: Option<&str>,
+    from_db: bool,
+    org: Option<&str>,
+    window_days: i64,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let json = if from_db {
+        let url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context(
+                "--from-db requires DATABASE_URL (the gateway's Postgres connection string)",
+            )?;
+        let pool = tt_core::connect(&url, 4)
+            .await
+            .context("connect to DATABASE_URL")?;
+        let until = chrono::Utc::now();
+        let since = until - chrono::Duration::days(window_days.max(1));
+        let org_uuid = match org {
+            Some(s) => Some(uuid::Uuid::parse_str(s).context("--org must be a UUID")?),
+            None => None,
+        };
+        let (resolved_org, requests) =
+            tt_cli::telemetry_window::fetch_window(&pool, org_uuid, since, until).await?;
+        tt_cli::ui::note(&format!(
+            "pulled {} request_logs rows for org {} ({}-day window)",
+            requests.len(),
+            resolved_org,
+            window_days
+        ));
+        tt_cli::plan_suggest::build_plan_input_json_inner(
+            path,
+            resolved_org,
+            &requests,
+            since,
+            until,
+        )?
+    } else {
+        tt_cli::plan_suggest::build_plan_input_json(path)?
+    };
 
     match output {
         Some(p) if !p.is_empty() && p != "-" => {
             std::fs::write(p, &json)
                 .map_err(|e| anyhow::anyhow!("failed to write plan input to {p}: {e}"))?;
-            tt_cli::ui::note(&format!("wrote plan-input skeleton to {p}  (edit org_id + requests, then: tt plan --input {p})"));
+            let hint = if from_db {
+                format!("wrote runnable plan-input to {p}  (then: tt plan --input {p})")
+            } else {
+                format!("wrote plan-input skeleton to {p}  (edit org_id + requests, then: tt plan --input {p})")
+            };
+            tt_cli::ui::note(&hint);
         }
         _ => {
             print!("{json}");
