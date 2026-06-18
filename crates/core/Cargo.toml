@@ -13,6 +13,11 @@ tt-tokenize.workspace = true
 tt-cache.workspace = true
 tt-retrieval = { workspace = true, features = ["postgres"] }
 tt-preview.workspace = true
+# Gateway-tool executor (routes/gateway_tools.rs): the `inspect_diff` read-only
+# tool scans a proposed diff via inspect-core + the Tier-1 rule set, ported from
+# the MCP tool so the agent loop can run it inline (no core->mcp cycle).
+tt-inspect-core.workspace = true
+tt-inspect-rules-tier1.workspace = true
 # Reuse the plan-replay quality judge (JudgeProvider/RiskBand/SampleScore) for
 # the live sampled judge on rerouted traffic (quality_sample.rs).
 tt-plan-core.workspace = true
@@ -69,6 +74,9 @@ futures.workspace = true
 async-stream.workspace = true
 # Zeroizing wrapper for the plaintext retrieval-prompt clone (middleware/retrieval.rs).
 zeroize.workspace = true
+# `inspect_diff` gateway tool writes proposed content to a temp file to scan it
+# (routes/gateway_tools.rs), mirroring the MCP tool.
+tempfile.workspace = true
 
 [dev-dependencies]
 argon2.workspace = true

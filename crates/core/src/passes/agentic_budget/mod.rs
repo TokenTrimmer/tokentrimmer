@@ -16,8 +16,14 @@
 //!   [`AgenticBudgetPlanner::plan`]) + summarize (lossy, judge-gated, invocable
 //!   via [`AgenticBudgetPlanner::plan_summary`]) stale tool results.
 //! - **Sub-lever 3** — down-route mechanical sub-steps in a cache-isolated
-//!   lane. The planner emits the `subagent_lane:<target>` marker; the actual
-//!   routed dispatch lane is the chat HANDLER's to wire *(deferred there)*.
+//!   lane. The planner emits the `subagent_lane:<target>` marker as a CLIENT
+//!   SIGNAL: the gateway is a per-request proxy and the agent tool-loop runs
+//!   client-side, so each sub-step is a separate request with no chat-handler
+//!   seam to dispatch from — the client may route its next mechanical sub-step
+//!   to `<target>`. The SERVER-SIDE realization is the agent loop
+//!   (`POST /v1/agent/runs`, slices 1a→2), which owns the loop and dispatches /
+//!   caches / down-routes mechanical sub-steps itself; cache-isolation of a
+//!   down-routed sub-step is already achieved by the model-keyed L2 lane.
 //! - **Sub-lever 4** — semantic sub-step cache for read-only sub-steps. The
 //!   planner marks the read-only-eligible sub-steps (`substep_cache:<tool>`);
 //!   the async L2 sub-step lookup/serve (needs the embedder + store) is the
@@ -131,12 +137,17 @@ impl AgenticBudgetPlanner {
     ///    prefix). The committed reduction is gated by `clear_at_least_tokens`:
     ///    an elision freeing fewer tokens than that is SKIPPED, because the
     ///    re-cache a tail mutation forces costs more than a sub-threshold trim
-    ///    saves (R1 cache-thrash guard). (Sub-lever 2b summary — Task 7 — and
-    ///    Sub-lever 3 routing wire in later.)
-    /// 3. **Sub-lever 3** (`route_mechanical_to`): mark routed work as a
-    ///    CACHE-ISOLATED subagent lane (a distinct conversation tag), never
-    ///    interleaved on the cached prefix — caching and routing fight (R1
-    ///    cache-vs-route), so routed work runs on its own prefix lane.
+    ///    saves (R1 cache-thrash guard). (Sub-lever 2b summary — Task 7 — wires
+    ///    in later; Sub-lever 3 emits a client signal, realized server-side by
+    ///    the agent loop — see item 3.)
+    /// 3. **Sub-lever 3** (`route_mechanical_to`): emit a `subagent_lane:<target>`
+    ///    CLIENT SIGNAL for a down-routed mechanical sub-step. Caching and
+    ///    routing fight (R1 cache-vs-route), but cache-isolation is already
+    ///    achieved by the model-keyed L2 lane. The gateway is a per-request
+    ///    proxy and the agent tool-loop runs client-side, so each sub-step is a
+    ///    separate request with no chat-handler seam to dispatch from; the
+    ///    SERVER-SIDE realization is the agent loop (`POST /v1/agent/runs`,
+    ///    slices 1a→2), which owns the loop and routes/caches sub-steps itself.
     /// 4. **Sub-lever 4** (`semantic_substep_cache`): mark each READ-ONLY /
     ///    idempotent sub-step (classified fail-closed via [`classify_substep`])
     ///    as a `substep_cache:<tool>` warning. Read-only-safe and net-positive
@@ -183,10 +194,15 @@ impl AgenticBudgetPlanner {
 
         // ── Sub-lever 3 (R1 cache-vs-route isolation): mark the routed lane ──
         // Caching and routing fight: a mid-loop model switch busts the prefix
-        // cache, so routed work runs as a CACHE-ISOLATED subagent lane (its own
-        // conversation tag), never interleaved on the cached prefix. We surface
-        // the lane marker as a warning so the routed dispatch lands on a
-        // distinct prefix; the actual dispatch lane is the handler's to wire.
+        // cache, so a down-routed sub-step runs CACHE-ISOLATED — already
+        // achieved by the model-keyed L2 lane (the cache key carries the model).
+        // The `subagent_lane:<target>` warning is a CLIENT SIGNAL: the gateway
+        // is a per-request proxy and the agent tool-loop runs client-side, so
+        // each sub-step is a separate request and there is no chat-handler seam
+        // to dispatch a sub-step from — the client may route its next mechanical
+        // sub-step to `<target>`. The SERVER-SIDE realization is the agent loop
+        // (`POST /v1/agent/runs`, slices 1a→2), which owns the loop and
+        // dispatches / caches / down-routes mechanical sub-steps itself.
         if let Some(target) = &ab.route_mechanical_to {
             out.warnings.push(format!("subagent_lane:{target}"));
         }

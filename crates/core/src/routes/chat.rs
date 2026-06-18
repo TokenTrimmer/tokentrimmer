@@ -845,18 +845,16 @@ async fn try_l2_hit(
 /// The fully-prepared per-request setup the branch (streaming | non-streaming)
 /// consumes after the shared pipeline (routing → route-action capture →
 /// redaction → compression → agentic-budget → cache-behavior → body-capture
-/// gating). The chat [`handler`] builds this inline before the `if req.stream`
-/// branch (the streaming arm reads these fields directly); the non-streaming
-/// arm hands it to [`complete_once`]. The future server-side agent loop will
-/// build the same bundle per turn so it can re-route/redact each turn — see
-/// the slice 1a design (`prepare(...)` is the eventual factoring of the inline
-/// setup, deferred here to keep this behavior-preserving refactor's diff
-/// minimal and the streaming path byte-for-byte unchanged).
+/// gating). [`prepare`] runs that shared pipeline and returns this bundle; the
+/// chat [`handler`] calls it once before the `if req.stream` branch, then the
+/// streaming arm reads these fields directly and the non-streaming arm hands
+/// the bundle to [`complete_once`]. The server-side agent loop (slice 1a)
+/// rebuilds the same bundle per turn via [`prepare`] so it can re-route/redact
+/// each turn.
 ///
-/// All fields are owned and moved out of the handler's non-streaming `else`
-/// arm (which is the only consumer post-branch — the streaming arm is the
-/// mutually-exclusive `if` arm), so the field set + types mirror the handler's
-/// post-setup locals exactly. This keeps the carved pipeline body
+/// All fields are owned (moved out of the shared setup in [`prepare`]), so the
+/// field set + types mirror the handler's post-setup locals exactly. This keeps
+/// both the carved [`complete_once`] pipeline body and the streaming arm
 /// byte-for-byte the handler's, which is what makes the refactor verifiably
 /// behavior-preserving.
 pub(crate) struct Prepared {
@@ -880,6 +878,13 @@ pub(crate) struct Prepared {
     pub requested_model: String,
     /// Pricing for the originally-requested model (baseline when rewritten).
     pub requested_pricing: Option<ModelPricing>,
+    /// Whether routing actually rewrote `req.model` (a matched, non-paused route
+    /// on the canary/unconditional arm — NOT a control-arm revert). The
+    /// streaming arm reads this to price its `request_logs` baseline against the
+    /// originally-requested model only on a real rewrite. (`complete_once`
+    /// derives its own baseline from `matched_route_id.is_some()` — the
+    /// pre-existing per-arm difference — so it ignores this field.)
+    pub model_was_rewritten: bool,
     /// Format-switch plan (response-side shaping), if any.
     pub format_switch_plan: Option<crate::shaping::format_switch::FormatSwitchPlan>,
     /// Diff plan (response-side shaping), if any.
@@ -1018,6 +1023,10 @@ pub(crate) async fn complete_once(
         route_paused,
         requested_model,
         requested_pricing,
+        // `complete_once` prices its baseline from `matched_route_id.is_some()`
+        // (its own pre-existing rule), so the streaming-only rewrite flag is
+        // ignored here.
+        model_was_rewritten: _,
         format_switch_plan,
         diff_plan,
         pass_effects,
@@ -1957,17 +1966,16 @@ pub async fn handler(
     let request_started = Instant::now();
     let retrieval_telemetry = retrieval.map(|Extension(v)| v).unwrap_or_default();
 
-    // 1. Resolve provider — 404 for unknown models. (May be re-resolved after
-    //    routing rewrites req.model below.) `resolve` falls back to provider
-    //    inference for valid-but-unlisted model ids so they dispatch instead
-    //    of 404ing.
-    let mut provider =
-        state
-            .registry
-            .resolve(&req.model)
-            .ok_or_else(|| ApiError::ModelNotFound {
-                model: req.model.clone(),
-            })?;
+    // 1. Resolve provider — 404 for unknown models. (May be re-resolved inside
+    //    `prepare` after routing rewrites req.model.) `resolve` falls back to
+    //    provider inference for valid-but-unlisted model ids so they dispatch
+    //    instead of 404ing.
+    let provider = state
+        .registry
+        .resolve(&req.model)
+        .ok_or_else(|| ApiError::ModelNotFound {
+            model: req.model.clone(),
+        })?;
 
     // 2. Pull api_key from "Authorization: Bearer <key>" if present. This is
     //    the customer's TokenTrimmer key — the auth middleware already
@@ -2084,6 +2092,145 @@ pub async fn handler(
         deadline: request_timeout,
     };
 
+    // 2c+. Shared per-request setup (routing → route-action capture → redaction
+    //      → compression → agentic-budget → cache-behavior → body-capture
+    //      gating). Factored into `prepare` so the server-side agent loop
+    //      (slice 1a) can rebuild the same `Prepared` bundle per turn. `&mut ctx`
+    //      / `&mut req` are mutated in place exactly as the former inline setup
+    //      did (cross-provider credential rebinding, model rewrite, request
+    //      shaping); the final `req`/`provider` are moved into the returned
+    //      `Prepared`.
+    let prep = prepare(
+        &state,
+        &mut ctx,
+        &mut req,
+        &headers,
+        provider,
+        provider_pin,
+        forced_route,
+        request_timeout,
+        idempotency_key,
+        raw_bearer,
+        org_id,
+        source_provider_id,
+        source_creds_missing,
+        caller_tier,
+        l2_allowed,
+        retrieval_telemetry,
+        request_started,
+    )
+    .await?;
+
+    // 3. Branch: streaming vs non-streaming. Both arms consume `prep` (the
+    //    streaming arm reads the fields it needs; the non-streaming arm hands
+    //    the whole bundle to `complete_once`).
+    if prep.req.stream {
+        return handle_streaming(&state, &ctx, prep).await;
+    }
+    // Non-streaming: hand the prepared per-request setup to `complete_once`
+    // (the carved, reusable completion pipeline the server-side agent loop also
+    // calls per turn) and assemble the HTTP response from its typed outcome. A
+    // cache hit already built its client `Response`; a dispatched completion
+    // returns the typed body + header metadata.
+    match complete_once(&state, &ctx, prep).await? {
+        // Cache hit (L1 / L2 / negative cache / single-flight follower): the
+        // fully-built client response is returned verbatim.
+        CompletionOutcome::CacheHit(resp) => Ok(resp),
+        // Dispatched completion: build the HTTP response from the typed body +
+        // the cost/route/cache/warning metadata, via the same
+        // `attach_cost_headers` / `attach_warnings` the tail used inline.
+        CompletionOutcome::Dispatched { response, headers } => {
+            let CompletionHeaders {
+                trace_id,
+                provider_id,
+                model_used,
+                cost_breakdown,
+                cache_state,
+                route_matched_name,
+                body_captured,
+                req,
+                provider,
+                warnings,
+            } = *headers;
+
+            // 5. Serialize body and attach TokenTrimmer extension headers.
+            let mut http_response = Json(response).into_response();
+            attach_cost_headers(
+                http_response.headers_mut(),
+                trace_id,
+                &provider_id,
+                &model_used,
+                &cost_breakdown,
+            );
+            if let Ok(v) = cache_state.parse() {
+                http_response
+                    .headers_mut()
+                    .insert("x-tokentrimmer-cache", v);
+            }
+            if let Some(name) = route_matched_name.as_deref() {
+                if let Ok(v) = name.parse() {
+                    http_response
+                        .headers_mut()
+                        .insert("x-tokentrimmer-route-matched", v);
+                }
+            }
+            // Present ONLY when the org opted in and the request+response bodies
+            // were persisted to the encrypted capture sink — absent on the
+            // default (capture-off) path AND for armed-but-not-opted-in orgs,
+            // which both stay byte-identical.
+            if body_captured {
+                http_response.headers_mut().insert(
+                    "x-tokentrimmer-captured",
+                    axum::http::HeaderValue::from_static("true"),
+                );
+            }
+            attach_warnings(
+                http_response.headers_mut(),
+                provider.as_ref(),
+                &req,
+                &model_used,
+                &warnings,
+            );
+            Ok(http_response)
+        }
+    }
+}
+
+/// Run the shared per-request setup for a chat completion and bundle the result
+/// into a [`Prepared`] for the streaming arm / [`complete_once`] / the
+/// server-side agent loop.
+///
+/// This is the routing → route-action capture → request-side output shaping →
+/// redaction → compression → agentic-budget → cache-behavior → body-capture
+/// gating pipeline that the chat [`handler`] formerly ran inline before its
+/// `if req.stream` branch. It mutates `ctx` (cross-provider credential
+/// rebinding) and `req` (model rewrite + request shaping) in place, then moves
+/// the final `req`/`provider` into the returned bundle. All early returns
+/// (credential / cost-limit / model-not-found) propagate via `?` exactly as the
+/// inline setup did.
+///
+/// The agent loop (slice 1a) calls this per turn (with a fresh `req`) so each
+/// turn re-routes/redacts independently; the chat handler calls it once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare(
+    state: &AppState,
+    ctx: &mut RequestContext,
+    req: &mut ChatCompletionRequest,
+    headers: &HeaderMap,
+    mut provider: std::sync::Arc<dyn tt_shared::Provider>,
+    provider_pin: Option<String>,
+    forced_route: Option<String>,
+    request_timeout: Option<Duration>,
+    idempotency_key: String,
+    raw_bearer: String,
+    org_id: Uuid,
+    source_provider_id: String,
+    source_creds_missing: bool,
+    caller_tier: Option<tt_shared::CallerTier>,
+    l2_allowed: bool,
+    retrieval_telemetry: RetrievalTelemetry,
+    request_started: Instant,
+) -> ApiResult<Prepared> {
     // 2c. Routing engine. Rewrite `req.model` if the org has a matching
     //     enabled route — must happen BEFORE the cache lookup (so L1 keys
     //     and L2 lookups use the routed model) and BEFORE provider
@@ -2114,7 +2261,7 @@ pub async fn handler(
     } else {
         (None, None, None)
     };
-    let route_match = apply_routing(&state, &ctx, &mut req, forced_route.as_deref()).await?;
+    let route_match = apply_routing(state, ctx, req, forced_route.as_deref()).await?;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
     // The matched route is sticky-PAUSED: apply_routing suppressed the rewrite
     // and every cost lever (req.model is untouched). Captured before
@@ -2299,7 +2446,7 @@ pub async fn handler(
         // target and fail closed if the org has no credential (never forward
         // the source key). The failover path resolves per-candidate below.
         if route_fallbacks.is_empty() && provider.id() != source_provider_id {
-            match resolve_credentials_for(&state, org_id, provider.id(), &raw_bearer, false).await {
+            match resolve_credentials_for(state, org_id, provider.id(), &raw_bearer, false).await {
                 Some(c) => ctx.credentials = c,
                 None => {
                     return Err(ApiError::MissingProviderCredential {
@@ -2328,7 +2475,7 @@ pub async fn handler(
     //     routed/inferred provider; the routed model is kept. Fails closed on a
     //     cross-provider pin with no stored credential.
     let (pinned_provider, pin_creds) = apply_provider_override(
-        &state,
+        state,
         provider_pin.as_deref(),
         org_id,
         &raw_bearer,
@@ -2346,7 +2493,7 @@ pub async fn handler(
         // path re-resolves the primary candidate by model id and so cannot honor a
         // pinned primary provider. The pin wins (single-provider dispatch).
         route_fallbacks.clear();
-    } else if let Some(chain) = fallback_override_from_header(&headers) {
+    } else if let Some(chain) = fallback_override_from_header(headers) {
         // `X-TokenTrimmer-Fallback` overrides the route-derived chain (no pin).
         route_fallbacks = chain;
     }
@@ -2358,10 +2505,10 @@ pub async fn handler(
     // undercount multi-turn / large-system-prompt requests and let an over-limit
     // request slip past the cap.
     {
-        let combined = tt_shared::message_text_for_estimation(&req);
+        let combined = tt_shared::message_text_for_estimation(req);
         let cl_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
         enforce_cost_limit(
-            cost_limit_from_header(&headers),
+            cost_limit_from_header(headers),
             provider.pricing(&req.model).as_ref(),
             cl_input_tokens,
             req.max_tokens,
@@ -2392,7 +2539,7 @@ pub async fn handler(
     // config-rejected at route creation (`validate_output_shaping`);
     // defensively, if both somehow apply, diff wins and the switch is skipped
     // with the `conflict` token.
-    let diff_decision = crate::shaping::diff::plan_diff(&req, route_diff);
+    let diff_decision = crate::shaping::diff::plan_diff(req, route_diff);
     let format_switch_requested =
         if matches!(diff_decision, Some(crate::shaping::ShapeDecision::Apply(_)))
             && route_format_switch.is_some()
@@ -2404,9 +2551,9 @@ pub async fn handler(
             route_format_switch.as_deref()
         };
     let mut format_switch_plan: Option<crate::shaping::format_switch::FormatSwitchPlan> = None;
-    match crate::shaping::format_switch::plan_format_switch(&req, format_switch_requested) {
+    match crate::shaping::format_switch::plan_format_switch(req, format_switch_requested) {
         Some(crate::shaping::ShapeDecision::Apply(p)) => {
-            crate::shaping::format_switch::apply_format_switch_request(&mut req, &p);
+            crate::shaping::format_switch::apply_format_switch_request(req, &p);
             format_switch_plan = Some(p);
         }
         Some(crate::shaping::ShapeDecision::Skip(r)) => {
@@ -2426,7 +2573,7 @@ pub async fn handler(
             // redaction guardrail on a redact+diff route and dispatch
             // un-flexed bytes that `compute_cost_full` prices at flex
             // rates.
-            crate::shaping::diff::apply_diff_request(&mut req, &p);
+            crate::shaping::diff::apply_diff_request(req, &p);
             diff_plan = Some(p);
         }
         Some(crate::shaping::ShapeDecision::Skip(r)) => {
@@ -2436,8 +2583,8 @@ pub async fn handler(
         None => {}
     }
 
-    maybe_downgrade_response_format(&mut req, provider.as_ref(), &mut warnings);
-    maybe_clamp_temperature(&mut req, provider.as_ref(), &mut warnings);
+    maybe_downgrade_response_format(req, provider.as_ref(), &mut warnings);
+    maybe_clamp_temperature(req, provider.as_ref(), &mut warnings);
 
     // OpenAI Flex (route action): opt the upstream request into `service_tier:
     // "flex"` ONLY when the served model is flex-eligible (carries a Flex rate in
@@ -2445,7 +2592,7 @@ pub async fn handler(
     // `flex_not_applied:<model>` warning is surfaced. `flex_applied` drives the
     // cost computation below so savings attribute to the `flex` source. Evaluated
     // against the FINAL served provider/model (post-routing/pin/failover-primary).
-    let flex_applied = maybe_apply_flex(&mut req, route_flex, provider.as_ref(), &mut warnings);
+    let flex_applied = maybe_apply_flex(req, route_flex, provider.as_ref(), &mut warnings);
 
     // Advisory batch-eligibility marker (route action, research Phase 2.1):
     // never mutates the request or detours dispatch — the gateway is
@@ -2453,7 +2600,7 @@ pub async fn handler(
     // the forgone-discount attribution below. Hard ineligibility (streaming /
     // interactive) and the catalog-batch-rate gate are enforced inside.
     let batch_marked = maybe_mark_batch_eligible(
-        &req,
+        req,
         route_batch,
         interactive_client,
         provider.as_ref(),
@@ -2470,8 +2617,7 @@ pub async fn handler(
     // suffix is deterministic-on-ingress, so no provider prompt-cache bust is
     // booked (redaction precedent). `minify_applied` drives the per-response
     // ESTIMATE (non-streaming only), the metric, and judge eligibility.
-    let minify_applied =
-        maybe_minify_json(&mut req, route_minify, provider.as_ref(), &mut warnings);
+    let minify_applied = maybe_minify_json(req, route_minify, provider.as_ref(), &mut warnings);
 
     // Class-gated reasoning-token cap (route action, research Phase 3.2):
     // lowers OpenAI-style `reasoning_effort` / Anthropic-style thinking
@@ -2489,7 +2635,7 @@ pub async fn handler(
     // instruction or the keyword tables, re-check the intersection.
     let served_model_info = state.registry.model_info(&req.model).cloned();
     let reasoning_capped = maybe_cap_reasoning(
-        &mut req,
+        req,
         route_reasoning_max_effort.as_deref(),
         route_reasoning_budget_tokens,
         provider.as_ref(),
@@ -2556,7 +2702,7 @@ pub async fn handler(
     if route_redact {
         // Boundary + prefix token estimate are computed BEFORE the mutation:
         // the warm prefix the provider cached is the pre-mutation bytes.
-        let split = crate::passes::SplitRequest::compute(&mut req, &pass_cx);
+        let split = crate::passes::SplitRequest::compute(req, &pass_cx);
         let stable_len = split.stable().messages.len();
         let (req_mut, bust_token) = split.mutate_whole_request(
             "redaction-1",
@@ -2627,7 +2773,7 @@ pub async fn handler(
     // Wave-B2 judge gate inside `PassPipeline::run`.
     let compression_tokens_removed: u32 = if route_compress {
         let out = {
-            let mut split = crate::passes::SplitRequest::compute(&mut req, &pass_cx);
+            let mut split = crate::passes::SplitRequest::compute(req, &pass_cx);
             crate::passes::PassPipeline::conservative_compression().run(&mut split, &pass_cx)
         };
         for name in &out.rejected {
@@ -2661,7 +2807,7 @@ pub async fn handler(
     // warning tokens (`cache_bust:<source>`, the cache-isolated subagent lane).
     let agentic_effects = if let Some(ab) = &route_agentic_budget {
         let out = {
-            let mut split = crate::passes::SplitRequest::compute(&mut req, &pass_cx);
+            let mut split = crate::passes::SplitRequest::compute(req, &pass_cx);
             crate::passes::agentic_budget::AgenticBudgetPlanner::plan(ab, &mut split, &pass_cx)
         };
         warnings.extend(out.warnings);
@@ -2687,7 +2833,7 @@ pub async fn handler(
     // the estimated per-request waste of the busted provider cache. Read-only;
     // it never injects `cache_control` (adapter-owned per #126/#150). Runs after
     // the agentic planner so it classifies the FINAL dispatched bytes.
-    warnings.extend(crate::passes::CacheClassifierPass::classify(&req, &pass_cx));
+    warnings.extend(crate::passes::CacheClassifierPass::classify(req, &pass_cx));
 
     // Aggregated pass effects for the cost path (threaded into both the
     // non-streaming and streaming `compute_cost_full` calls): the measured
@@ -2734,7 +2880,7 @@ pub async fn handler(
         for pid in provider_ids {
             let allow_bearer = pid == source_provider_id;
             if let Some(c) =
-                resolve_credentials_for(&state, org_id, &pid, &raw_bearer, allow_bearer).await
+                resolve_credentials_for(state, org_id, &pid, &raw_bearer, allow_bearer).await
             {
                 map.insert(pid, c);
             }
@@ -2773,12 +2919,12 @@ pub async fn handler(
     // 2d. Determine cache behaviour for this request (Fix A §2.2 + Fix B §2.7).
     //     Resolved once here so all four call-sites (streaming L1 read,
     //     non-streaming L1 read, L2 read, L1/L2 insert) share a single decision.
-    let mut cache_behavior = CacheBehavior::resolve(&req);
+    let mut cache_behavior = CacheBehavior::resolve(req);
     // `X-TokenTrimmer-Cache` overrides the request-body decision (header beats
     // body). force-write=(true,true) here overrides the eligibility gate that
     // `resolve()` may have applied; the tool-call exclusion at insert time is
     // unaffected, so tool-call responses are still never cached.
-    if let Some((lookup, insert)) = cache_override_from_header(&headers)? {
+    if let Some((lookup, insert)) = cache_override_from_header(headers)? {
         cache_behavior.do_lookup = lookup;
         cache_behavior.do_insert = insert;
     }
@@ -2827,8 +2973,99 @@ pub async fn handler(
         None
     };
 
-    // 3. Branch: streaming vs non-streaming.
-    if req.stream {
+    // Bundle the shared setup. `req` is moved out (the caller's `&mut req` is
+    // left empty — the handler/loop branches on `prep.req.stream`, never the
+    // now-emptied caller local); `provider` is the final served provider.
+    Ok(Prepared {
+        provider,
+        req: std::mem::take(req),
+        cache_behavior,
+        l2_allowed,
+        skip_l2,
+        route_matched_name,
+        matched_route_id,
+        route_paused,
+        requested_model,
+        requested_pricing,
+        model_was_rewritten,
+        format_switch_plan,
+        diff_plan,
+        pass_effects,
+        minify_applied,
+        reasoning_capped,
+        flex_applied,
+        batch_marked,
+        caller_tier,
+        traffic_split_arm_owned,
+        route_traffic_pct,
+        route_shadow_model,
+        failover_candidates,
+        failover_creds,
+        route_fallbacks,
+        warnings,
+        request_timeout,
+        raw_bearer,
+        retrieval_telemetry,
+        request_started,
+        capture_request_json,
+        judge_source_provider,
+        judge_source_ctx,
+        judge_original_req,
+    })
+}
+
+/// Dispatch the **streaming** arm of a chat completion from a [`Prepared`]
+/// bundle: the L1 fake-stream cache hit, the live (single-provider or failover)
+/// stream establishment, the streaming cost/telemetry/cache-insert wiring, and
+/// the SSE response assembly. Byte-for-byte the chat [`handler`]'s former inline
+/// `if req.stream` arm — it now reads its inputs from `prep` (destructured into
+/// the exact locals the arm always used) instead of the handler's setup locals.
+async fn handle_streaming(
+    state: &AppState,
+    ctx: &RequestContext,
+    prep: Prepared,
+) -> ApiResult<Response> {
+    // Destructure into the exact locals the streaming arm reads (the fields it
+    // does not use are bound to `_` so the move is explicit). `trace_id` mirrors
+    // the handler's former local (`== ctx.trace_id` by construction).
+    let Prepared {
+        provider,
+        req,
+        cache_behavior,
+        l2_allowed,
+        skip_l2: _,
+        route_matched_name,
+        matched_route_id,
+        route_paused,
+        requested_model,
+        requested_pricing,
+        model_was_rewritten,
+        format_switch_plan: _,
+        diff_plan: _,
+        pass_effects,
+        minify_applied,
+        reasoning_capped: _,
+        flex_applied,
+        batch_marked: _,
+        caller_tier,
+        traffic_split_arm_owned,
+        route_traffic_pct,
+        route_shadow_model: _,
+        failover_candidates,
+        failover_creds,
+        route_fallbacks,
+        warnings,
+        request_timeout,
+        raw_bearer: _,
+        retrieval_telemetry,
+        request_started,
+        capture_request_json,
+        judge_source_provider: _,
+        judge_source_ctx: _,
+        judge_original_req: _,
+    } = prep;
+    let trace_id = ctx.trace_id;
+    {
         // 3α. L1 fake-stream — when a streaming request has a cached
         //     response, synthesize an SSE stream from the cached body
         //     instead of dispatching live. The chunk key matches the
@@ -2850,7 +3087,7 @@ pub async fn handler(
                             state.request_log_writer.as_ref(),
                             request_log_for_l1_hit(
                                 &entry,
-                                &ctx,
+                                ctx,
                                 trace_id,
                                 request_started,
                                 matched_route_id,
@@ -2938,7 +3175,7 @@ pub async fn handler(
                 // any chunk is yielded); mid-stream errors are not retried.
                 let __started = std::time::Instant::now();
                 let __stream_result = with_retry(&RetryPolicy::default(), || {
-                    provider.chat_completion_stream(req.clone(), &ctx)
+                    provider.chat_completion_stream(req.clone(), ctx)
                 })
                 .await;
                 let __elapsed = __started.elapsed();
@@ -2963,7 +3200,7 @@ pub async fn handler(
                     &RetryPolicy::default(),
                     &failover_candidates,
                     &req,
-                    &ctx,
+                    ctx,
                     &failover_creds,
                     Utc::now(),
                     Some(crate::failover::CapCheck {
@@ -3188,109 +3425,6 @@ pub async fn handler(
             );
         }
         Ok(resp)
-    } else {
-        // Non-streaming: hand the prepared per-request setup to `complete_once`
-        // (the carved, reusable completion pipeline the future server-side
-        // agent loop also calls per turn) and assemble the HTTP response from
-        // its typed outcome. A cache hit already built its client `Response`;
-        // a dispatched completion returns the typed body + header metadata.
-        let prepared = Prepared {
-            provider,
-            req,
-            cache_behavior,
-            l2_allowed,
-            skip_l2,
-            route_matched_name,
-            matched_route_id,
-            route_paused,
-            requested_model,
-            requested_pricing,
-            format_switch_plan,
-            diff_plan,
-            pass_effects,
-            minify_applied,
-            reasoning_capped,
-            flex_applied,
-            batch_marked,
-            caller_tier,
-            traffic_split_arm_owned,
-            route_traffic_pct,
-            route_shadow_model,
-            failover_candidates,
-            failover_creds,
-            route_fallbacks,
-            warnings,
-            request_timeout,
-            raw_bearer,
-            retrieval_telemetry,
-            request_started,
-            capture_request_json,
-            judge_source_provider,
-            judge_source_ctx,
-            judge_original_req,
-        };
-        match complete_once(&state, &ctx, prepared).await? {
-            // Cache hit (L1 / L2 / negative cache / single-flight follower):
-            // the fully-built client response is returned verbatim.
-            CompletionOutcome::CacheHit(resp) => Ok(resp),
-            // Dispatched completion: build the HTTP response from the typed
-            // body + the cost/route/cache/warning metadata, via the same
-            // `attach_cost_headers` / `attach_warnings` the tail used inline.
-            CompletionOutcome::Dispatched { response, headers } => {
-                let CompletionHeaders {
-                    trace_id,
-                    provider_id,
-                    model_used,
-                    cost_breakdown,
-                    cache_state,
-                    route_matched_name,
-                    body_captured,
-                    req,
-                    provider,
-                    warnings,
-                } = *headers;
-
-                // 5. Serialize body and attach TokenTrimmer extension headers.
-                let mut http_response = Json(response).into_response();
-                attach_cost_headers(
-                    http_response.headers_mut(),
-                    trace_id,
-                    &provider_id,
-                    &model_used,
-                    &cost_breakdown,
-                );
-                if let Ok(v) = cache_state.parse() {
-                    http_response
-                        .headers_mut()
-                        .insert("x-tokentrimmer-cache", v);
-                }
-                if let Some(name) = route_matched_name.as_deref() {
-                    if let Ok(v) = name.parse() {
-                        http_response
-                            .headers_mut()
-                            .insert("x-tokentrimmer-route-matched", v);
-                    }
-                }
-                // Present ONLY when the org opted in and the request+response
-                // bodies were persisted to the encrypted capture sink — absent
-                // on the default (capture-off) path AND for armed-but-not-opted-in
-                // orgs, which both stay byte-identical.
-                if body_captured {
-                    http_response.headers_mut().insert(
-                        "x-tokentrimmer-captured",
-                        axum::http::HeaderValue::from_static("true"),
-                    );
-                }
-                attach_warnings(
-                    http_response.headers_mut(),
-                    provider.as_ref(),
-                    &req,
-                    &model_used,
-                    &warnings,
-                );
-                Ok(http_response)
-            }
-        }
     }
 }
 
