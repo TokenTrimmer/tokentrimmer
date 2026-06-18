@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use axum::{
-    extract::{Extension, State},
+    extract::{Extension, Path, State},
     http::HeaderMap,
     Json,
 };
@@ -272,9 +272,9 @@ pub async fn run_loop(
 // ---------------------------------------------------------------------------
 // Persisted run record + L1-backed run store helpers (slice 1b Task 2)
 //
-// These are wired into the create/get/resume handlers by slice-1b Tasks 3-5;
-// until then they are exercised only by the round-trip unit test, hence the
-// `#[allow(dead_code)]` on the not-yet-called items.
+// Wired into the create/get handlers by slice-1b Tasks 3-4 (`create_run`
+// persists a paused run; `get_run` fetches it). Resume (Task 5) consumes them
+// too.
 // ---------------------------------------------------------------------------
 
 /// TTL for a persisted run record. A paused run is GETtable/resumable for this
@@ -342,7 +342,6 @@ pub(crate) async fn store_run(
 }
 
 /// Fetch a run record scoped by (org, id). `None` when absent/expired.
-#[allow(dead_code)] // wired in by Tasks 3-5
 pub(crate) async fn fetch_run(
     cache: &dyn tt_cache::L1Cache,
     org_id: uuid::Uuid,
@@ -715,6 +714,33 @@ pub async fn create_run(
     }
 }
 
+/// `GET /v1/agent/runs/:id` — fetch a persisted run's current state. Org is
+/// derived from the authenticated key (a real key is required; anonymous /
+/// dogfood callers get 401) and embedded in the store key, so a fetch with the
+/// wrong org cleanly misses (404). Requires the L1/Redis store; without it the
+/// run was never persisted, so the handler returns 503.
+pub async fn get_run(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Run>> {
+    // Resolve the caller's real org, or 401 (mirrors `routes_api::require_org`,
+    // which is private to that module). Dogfood/absent contexts are rejected.
+    let org = match ctx {
+        Some(Extension(c)) if c.org_id != crate::DOGFOOD_ORG_ID => c.org_id,
+        _ => return Err(ApiError::Unauthorized),
+    };
+    let l1 = state.l1.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "agent runs require the L1/Redis store (none configured)".into(),
+        )
+    })?;
+    let stored = fetch_run(l1.cache.as_ref(), org, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no run with id {id}")))?;
+    Ok(Json(stored.to_run()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1067,5 +1093,44 @@ mod tests {
             fetch_run(&cache, org, id).await.unwrap().unwrap().status,
             RunStatus::RequiresAction
         );
+    }
+
+    // ----- get_run org-scoped fetch (slice 1b Task 4) -----
+
+    // `get_run` maps `fetch_run` outcomes to the HTTP response: `None` → 404,
+    // `Some` → the `Run` view. The org is embedded in the store key, so a fetch
+    // with the wrong org misses (→ 404). Assert that store-level contract
+    // (provider-free); the 401/503 guards are thin and integration-covered.
+    #[tokio::test]
+    async fn get_run_missing_is_404_and_wrong_org_misses() {
+        let cache = tt_cache::memory::InMemoryL1Cache::new();
+        let org = uuid::Uuid::new_v4();
+        let id = uuid::Uuid::new_v4();
+        // absent → fetch returns None (handler maps to 404)
+        assert!(fetch_run(&cache, org, id).await.unwrap().is_none());
+        // seed, then wrong-org fetch misses
+        let stored = StoredRun {
+            id,
+            org_id: org,
+            status: RunStatus::RequiresAction,
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_turns: 8,
+            turns_done: 1,
+            usage: RunUsage::default(),
+            pending_tool_calls: vec![],
+            routing: StoredRouting {
+                provider_pin: None,
+                forced_route: None,
+                tag: None,
+            },
+        };
+        store_run(&cache, &stored).await.unwrap();
+        assert!(fetch_run(&cache, uuid::Uuid::new_v4(), id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(fetch_run(&cache, org, id).await.unwrap().is_some());
     }
 }

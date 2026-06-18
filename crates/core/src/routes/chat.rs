@@ -289,7 +289,9 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         | ApiError::RequestTimeout { .. }
         | ApiError::Internal(_)
         | ApiError::NotFound(_)
-        | ApiError::ServiceUnavailable(_) => false,
+        | ApiError::ServiceUnavailable(_)
+        // Agent-run control-flow signal (not a provider response) — never cache.
+        | ApiError::Conflict(_) => false,
     }
 }
 
@@ -317,6 +319,7 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ApiError::NotFound(_) => StatusCode::NOT_FOUND,
         ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ApiError::Conflict(_) => StatusCode::CONFLICT,
     };
     status.as_u16()
 }
