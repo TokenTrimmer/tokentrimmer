@@ -308,7 +308,6 @@ pub(crate) struct StoredRun {
 }
 
 /// L1 key for a run record, scoped by org so a fetch with the wrong org misses.
-#[allow(dead_code)] // wired in by Tasks 3-5
 fn run_key(org_id: uuid::Uuid, run_id: uuid::Uuid) -> String {
     format!("tt:runs:{org_id}:{run_id}")
 }
@@ -316,7 +315,6 @@ fn run_key(org_id: uuid::Uuid, run_id: uuid::Uuid) -> String {
 impl StoredRun {
     /// Derive the HTTP `Run` view from a stored record (the `requires_action`
     /// response body). `turns` is the turns completed so far; no note.
-    #[allow(dead_code)] // wired in by Tasks 3-5
     pub(crate) fn to_run(&self) -> Run {
         Run {
             id: self.id,
@@ -330,7 +328,6 @@ impl StoredRun {
 }
 
 /// Persist (overwrite) a run record with the run TTL.
-#[allow(dead_code)] // wired in by Tasks 3-5
 pub(crate) async fn store_run(
     cache: &dyn tt_cache::L1Cache,
     run: &StoredRun,
@@ -642,21 +639,80 @@ pub async fn create_run(
     Json(req): Json<CreateRunRequest>,
 ) -> ApiResult<Json<Run>> {
     let identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
+    // Capture the org + non-secret routing config BEFORE `identity` is moved
+    // into the completer — a paused run persists these (never any credential).
+    let org_id = identity.org_id;
+    let routing = StoredRouting {
+        provider_pin: identity.provider_pin.clone(),
+        forced_route: identity.forced_route.clone(),
+        tag: identity.tag.clone(),
+    };
+    let model = req.model.clone();
+    let tools = req.tools.clone();
+    let max_turns = req.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     let completer = GatewayCompleter {
         state: &state,
         identity,
     };
     let id = Uuid::new_v4();
-    let run = run_loop(
+
+    match run_loop_core(
         &completer,
         id,
-        req.model,
+        model.clone(),
         req.messages,
-        req.tools,
-        req.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+        tools.clone(),
+        max_turns,
+        0,
+        RunUsage::default(),
     )
-    .await;
-    Ok(Json(run))
+    .await
+    {
+        // Inline completion — terminal runs are not persisted.
+        LoopOutcome::Terminal(run) => Ok(Json(run)),
+        LoopOutcome::Paused {
+            messages,
+            turns_done,
+            usage,
+            pending_tool_calls,
+        } => match state.l1.as_ref() {
+            // Redis present → persist the paused run so it can be GET/resumed.
+            Some(l1) => {
+                let stored = StoredRun {
+                    id,
+                    org_id,
+                    status: RunStatus::RequiresAction,
+                    model,
+                    messages,
+                    tools,
+                    max_turns,
+                    turns_done,
+                    usage,
+                    pending_tool_calls,
+                    routing,
+                };
+                store_run(l1.cache.as_ref(), &stored).await?;
+                Ok(Json(stored.to_run()))
+            }
+            // No Redis → 1a fallback: surface the pause as Incomplete.
+            None => {
+                let name = pending_tool_calls
+                    .first()
+                    .map(|tc| tc.function.name.clone())
+                    .unwrap_or_default();
+                Ok(Json(Run {
+                    id,
+                    status: RunStatus::Incomplete,
+                    messages,
+                    turns: turns_done,
+                    usage,
+                    note: Some(format!(
+                        "client tool '{name}' requires Redis to pause/resume (none configured)"
+                    )),
+                }))
+            }
+        },
+    }
 }
 
 #[cfg(test)]
@@ -975,5 +1031,41 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // ----- create_run persist-on-pause (slice 1b Task 3) -----
+
+    // `create_run` builds its completer from `GatewayCompleter` (needs a
+    // provider), so the persist DECISION is asserted at the seam: a Paused
+    // outcome + an L1 store ⇒ a `StoredRun` lands in the cache with status
+    // `RequiresAction`. The full create→pause→persist HTTP path is exercised by
+    // Task 5's resume tests, which seed a `StoredRun` directly.
+    #[tokio::test]
+    async fn paused_with_l1_persists_requires_action() {
+        let cache = tt_cache::memory::InMemoryL1Cache::new();
+        let org = uuid::Uuid::new_v4();
+        let id = uuid::Uuid::new_v4();
+        let stored = StoredRun {
+            id,
+            org_id: org,
+            status: RunStatus::RequiresAction,
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_turns: 8,
+            turns_done: 1,
+            usage: RunUsage::default(),
+            pending_tool_calls: vec![],
+            routing: StoredRouting {
+                provider_pin: None,
+                forced_route: None,
+                tag: None,
+            },
+        };
+        store_run(&cache, &stored).await.unwrap();
+        assert_eq!(
+            fetch_run(&cache, org, id).await.unwrap().unwrap().status,
+            RunStatus::RequiresAction
+        );
     }
 }
