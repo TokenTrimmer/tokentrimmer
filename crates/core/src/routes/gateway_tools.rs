@@ -9,11 +9,8 @@
 //! underlying libraries (`tt_preview`, `tt_inspect_core` + `tt_inspect_rules_tier1`,
 //! `tt_shared::batch_advisor` + `tt_shared::pricing`) directly.
 //!
-//! `dead_code` is allowed module-wide: the public surface (`execute`,
-//! `is_gateway_tool`, `GATEWAY_TOOLS`) and the private `run_*` helpers are
-//! exercised by the in-module tests but have no non-test caller until the agent
-//! loop (`routes::agent_run`, slice 1a Task 3) consumes them.
-#![allow(dead_code)]
+//! The executor's public surface (`is_gateway_tool`, `execute`) is consumed by
+//! the agent loop (`routes::agent_run`, slice 1a Task 3).
 
 use serde::Deserialize;
 use serde_json::{json, Value};
