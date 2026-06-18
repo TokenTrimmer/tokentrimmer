@@ -58,6 +58,11 @@ pub enum ApiError {
 
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// 409 — the request conflicts with the resource's current state (e.g. a
+    /// run that is not awaiting tool outputs, or already being resumed).
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 #[derive(Serialize)]
@@ -156,6 +161,12 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "server_error",
                 "service_unavailable",
+                m.clone(),
+            ),
+            ApiError::Conflict(m) => (
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "conflict",
                 m.clone(),
             ),
         };
