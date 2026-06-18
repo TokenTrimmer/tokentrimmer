@@ -741,6 +741,166 @@ pub async fn get_run(
     Ok(Json(stored.to_run()))
 }
 
+/// One tool result the caller submits to resume a paused run: the id of the
+/// pending tool_call it answers + the (opaque, client-produced) output text.
+#[derive(serde::Deserialize)]
+pub struct ToolOutput {
+    pub tool_call_id: String,
+    pub output: String,
+}
+
+/// Request body for `POST /v1/agent/runs/:id/tool_outputs`. The submitted ids
+/// must EXACTLY cover the run's `pending_tool_calls` (see [`submit_tool_outputs`]).
+#[derive(serde::Deserialize)]
+pub struct ToolOutputsRequest {
+    pub tool_outputs: Vec<ToolOutput>,
+}
+
+/// `POST /v1/agent/runs/:id/tool_outputs` — resume a `requires_action` run by
+/// submitting the client tool outputs it paused on.
+///
+/// Order of checks (each maps to its HTTP status):
+/// 1. Org from the resume request's auth (real key required; dogfood/absent →
+///    401). The run is fetched scoped by this org, so a wrong-org caller misses.
+/// 2. L1/Redis store required, else 503 (without it the run was never persisted).
+/// 3. Run not found for (org, id) → 404.
+/// 4. Run not in `RequiresAction` → 409 (it is terminal or otherwise not
+///    awaiting outputs).
+/// 5. Submitted `tool_call_id`s must EXACTLY cover the pending client tool_calls
+///    (set equality) → 400 otherwise (lists the expected ids).
+/// 6. Single-flight on the run key: only one resume drives a run at a time; a
+///    concurrent resume loses the leader race → 409. The leader guard is held
+///    across the resume so a second request can't interleave.
+///
+/// On resume the per-turn completer is rebuilt from the RESUME request's auth +
+/// headers (re-authenticated; org verified equal to `stored.org_id` in step 1)
+/// and the run's stored, non-secret routing config (`provider_pin`/`forced_route`
+/// /`tag`) — no credential is ever persisted. The submitted outputs are appended
+/// as `Tool` messages (the paused turn's gateway tool_calls were answered inline
+/// at pause, so every tool_call of that assistant turn is now answered) and
+/// [`run_loop_core`] continues from `turns_done`. The updated run is persisted
+/// (terminal → stays GETtable to TTL; paused again → another `requires_action`).
+pub async fn submit_tool_outputs(
+    State(state): State<AppState>,
+    Extension(trace): Extension<TraceId>,
+    auth_ctx: Option<Extension<ApiKeyContext>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ToolOutputsRequest>,
+) -> ApiResult<Json<Run>> {
+    // (1) Org from the resume request's auth (mirrors `routes_api::require_org`).
+    // `auth_ctx` is borrowed (not consumed) so it can rebuild the identity below.
+    let org = match auth_ctx.as_deref() {
+        Some(c) if c.org_id != crate::DOGFOOD_ORG_ID => c.org_id,
+        _ => return Err(ApiError::Unauthorized),
+    };
+    // (2) The run store is required; without it nothing was ever persisted.
+    let l1 = state.l1.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "agent runs require the L1/Redis store (none configured)".into(),
+        )
+    })?;
+
+    // (3) Fetch scoped by (org, id); a wrong-org caller cleanly misses → 404.
+    let mut stored = fetch_run(l1.cache.as_ref(), org, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no run with id {id}")))?;
+    // (4) Only a paused (`requires_action`) run accepts tool outputs.
+    if stored.status != RunStatus::RequiresAction {
+        return Err(ApiError::Conflict(format!(
+            "run {id} is {:?}, not awaiting tool outputs",
+            stored.status
+        )));
+    }
+
+    // (5) The submitted ids must EXACTLY cover the pending client tool_calls.
+    let pending_ids: std::collections::HashSet<&str> = stored
+        .pending_tool_calls
+        .iter()
+        .map(|tc| tc.id.as_str())
+        .collect();
+    let submitted_ids: std::collections::HashSet<&str> = body
+        .tool_outputs
+        .iter()
+        .map(|o| o.tool_call_id.as_str())
+        .collect();
+    if submitted_ids != pending_ids {
+        return Err(ApiError::InvalidRequest(format!(
+            "tool_outputs must cover exactly the pending tool_call ids {pending_ids:?}"
+        )));
+    }
+
+    // (6) Single-flight: only one resume drives a given run at a time. The guard
+    // is held across the resume so a concurrent caller (loser) is rejected for
+    // the run's whole resume rather than racing into a second loop.
+    let sf_key = run_key(org, id);
+    let _guard = state
+        .single_flight
+        .try_become_leader(&sf_key)
+        .map_err(|_| ApiError::Conflict(format!("run {id} is already being resumed")))?;
+
+    // Append each submitted output as a Tool message answering its pending
+    // client tool_call (gateway results were appended at pause, so every
+    // tool_call of the paused assistant turn is now answered).
+    for o in &body.tool_outputs {
+        stored.messages.push(Message::Tool {
+            content: MessageContent::Text(o.output.clone()),
+            tool_call_id: o.tool_call_id.clone(),
+        });
+    }
+
+    // Rebuild the completer from the RESUME request's auth/headers (re-auth; org
+    // verified == stored.org_id above) + the stored, non-secret routing config.
+    let mut identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
+    identity.provider_pin = stored.routing.provider_pin.clone();
+    identity.forced_route = stored.routing.forced_route.clone();
+    identity.tag = stored.routing.tag.clone();
+    let completer = GatewayCompleter {
+        state: &state,
+        identity,
+    };
+
+    let outcome = run_loop_core(
+        &completer,
+        stored.id,
+        stored.model.clone(),
+        std::mem::take(&mut stored.messages),
+        stored.tools.clone(),
+        stored.max_turns,
+        stored.turns_done,
+        stored.usage.clone(),
+    )
+    .await;
+
+    match outcome {
+        // Terminal — record the final state and keep it GETtable until the TTL.
+        LoopOutcome::Terminal(run) => {
+            stored.status = run.status;
+            stored.messages = run.messages.clone();
+            stored.turns_done = run.turns;
+            stored.usage = run.usage.clone();
+            stored.pending_tool_calls = Vec::new();
+            store_run(l1.cache.as_ref(), &stored).await?;
+            Ok(Json(run))
+        }
+        // Paused again on another client tool — re-persist as `requires_action`.
+        LoopOutcome::Paused {
+            messages,
+            turns_done,
+            usage,
+            pending_tool_calls,
+        } => {
+            stored.status = RunStatus::RequiresAction;
+            stored.messages = messages;
+            stored.turns_done = turns_done;
+            stored.usage = usage;
+            stored.pending_tool_calls = pending_tool_calls;
+            store_run(l1.cache.as_ref(), &stored).await?;
+            Ok(Json(stored.to_run()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,5 +1292,56 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(fetch_run(&cache, org, id).await.unwrap().is_some());
+    }
+
+    // ----- submit_tool_outputs resume (slice 1b Task 5) -----
+
+    // The handler validates that the submitted `tool_call_id`s EXACTLY cover the
+    // run's `pending_tool_calls` (HashSet equality) — a partial set is a 400,
+    // the exact set proceeds. `submit_tool_outputs` builds its completer from
+    // `GatewayCompleter` (needs a provider), so the id-coverage rule is asserted
+    // here at the seam; the happy-path resume is covered by
+    // `core_resume_continues_to_completion` (Task 1) + the store round-trip
+    // (Task 2), which the handler wires together.
+    #[test]
+    fn tool_outputs_id_coverage_check() {
+        // pending {c1,c2}; submitting only {c1} must be rejected; {c1,c2} accepted.
+        let pending: std::collections::HashSet<&str> = ["c1", "c2"].into_iter().collect();
+        let only_one: std::collections::HashSet<&str> = ["c1"].into_iter().collect();
+        let both: std::collections::HashSet<&str> = ["c1", "c2"].into_iter().collect();
+        assert_ne!(only_one, pending);
+        assert_eq!(both, pending);
+    }
+
+    // A Completed (terminal) stored run is exactly what the status guard 409s on:
+    // its status is not `RequiresAction`, so `submit_tool_outputs` returns
+    // `ApiError::Conflict` before touching the loop. Seed one and assert the
+    // guard condition (provider-free).
+    #[tokio::test]
+    async fn terminal_stored_run_is_not_requires_action() {
+        let cache = tt_cache::memory::InMemoryL1Cache::new();
+        let org = uuid::Uuid::new_v4();
+        let id = uuid::Uuid::new_v4();
+        let stored = StoredRun {
+            id,
+            org_id: org,
+            status: RunStatus::Completed,
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_turns: 8,
+            turns_done: 2,
+            usage: RunUsage::default(),
+            pending_tool_calls: vec![],
+            routing: StoredRouting {
+                provider_pin: None,
+                forced_route: None,
+                tag: None,
+            },
+        };
+        store_run(&cache, &stored).await.unwrap();
+        let got = fetch_run(&cache, org, id).await.unwrap().expect("present");
+        // The handler's status guard: a non-RequiresAction run → 409 Conflict.
+        assert_ne!(got.status, RunStatus::RequiresAction);
     }
 }

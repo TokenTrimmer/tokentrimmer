@@ -83,6 +83,10 @@ pub fn build_router_with_retrieval(
         .route("/v1/agent/runs", post(routes::agent_run::create_run))
         .route("/v1/agent/runs/:id", get(routes::agent_run::get_run))
         .route(
+            "/v1/agent/runs/:id/tool_outputs",
+            post(routes::agent_run::submit_tool_outputs),
+        )
+        .route(
             "/v1/preview",
             axum::routing::post(crate::routes::preview::post_preview),
         )
