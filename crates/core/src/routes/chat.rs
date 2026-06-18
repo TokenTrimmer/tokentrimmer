@@ -417,7 +417,7 @@ fn response_has_tool_calls(resp: &ChatCompletionResponse) -> bool {
 /// Consolidated cache behaviour for a single request, derived from both
 /// eligibility (Fix A) and the caller's `tt_extras.cache` override (Fix B).
 #[derive(Debug)]
-struct CacheBehavior {
+pub(crate) struct CacheBehavior {
     /// Whether to attempt a cache lookup (L1 + L2).
     do_lookup: bool,
     /// Whether to insert a fresh response into cache. Also gated on
@@ -840,6 +840,1101 @@ async fn try_l2_hit(
         }
         Err(_) => None,
     }
+}
+
+/// The fully-prepared per-request setup the branch (streaming | non-streaming)
+/// consumes after the shared pipeline (routing → route-action capture →
+/// redaction → compression → agentic-budget → cache-behavior → body-capture
+/// gating). The chat [`handler`] builds this inline before the `if req.stream`
+/// branch (the streaming arm reads these fields directly); the non-streaming
+/// arm hands it to [`complete_once`]. The future server-side agent loop will
+/// build the same bundle per turn so it can re-route/redact each turn — see
+/// the slice 1a design (`prepare(...)` is the eventual factoring of the inline
+/// setup, deferred here to keep this behavior-preserving refactor's diff
+/// minimal and the streaming path byte-for-byte unchanged).
+///
+/// All fields are owned and moved out of the handler's non-streaming `else`
+/// arm (which is the only consumer post-branch — the streaming arm is the
+/// mutually-exclusive `if` arm), so the field set + types mirror the handler's
+/// post-setup locals exactly. This keeps the carved pipeline body
+/// byte-for-byte the handler's, which is what makes the refactor verifiably
+/// behavior-preserving.
+pub(crate) struct Prepared {
+    /// Final served provider (post routing / pin / failover-primary).
+    pub provider: std::sync::Arc<dyn tt_shared::Provider>,
+    /// The (possibly routed/shaped/redacted/compressed) request to dispatch.
+    pub req: ChatCompletionRequest,
+    /// Per-request cache behaviour (lookup/insert/ttl), already resolved.
+    pub cache_behavior: CacheBehavior,
+    /// L2 entitlement (paid-tier only).
+    pub l2_allowed: bool,
+    /// Format-switch disables L2 for the request (lookup + insert).
+    pub skip_l2: bool,
+    /// Matched route name for the `X-TokenTrimmer-Route-Matched` header.
+    pub route_matched_name: Option<String>,
+    /// Matched route id for the `request_logs` row.
+    pub matched_route_id: Option<Uuid>,
+    /// Paused-route passthrough marker.
+    pub route_paused: bool,
+    /// Originally-requested model (pre-routing) — `gen_ai.request.model`.
+    pub requested_model: String,
+    /// Pricing for the originally-requested model (baseline when rewritten).
+    pub requested_pricing: Option<ModelPricing>,
+    /// Format-switch plan (response-side shaping), if any.
+    pub format_switch_plan: Option<crate::shaping::format_switch::FormatSwitchPlan>,
+    /// Diff plan (response-side shaping), if any.
+    pub diff_plan: Option<crate::shaping::diff::DiffPlan>,
+    /// Aggregated request-pass effects threaded into the cost computation.
+    pub pass_effects: PassEffects,
+    /// Whether the minify-JSON instruction was injected (drives the estimate).
+    pub minify_applied: bool,
+    /// Whether a reasoning cap fired (judge eligibility).
+    pub reasoning_capped: bool,
+    /// Whether OpenAI Flex was applied (cost attribution).
+    pub flex_applied: bool,
+    /// Whether the request was marked batch-eligible (advisory).
+    pub batch_marked: bool,
+    /// Caller tier (per-tier cache TTL).
+    pub caller_tier: Option<tt_shared::CallerTier>,
+    /// Canary traffic-split arm (`canary`/`control`/None). Bound to the
+    /// `traffic_split_arm_owned` local the pipeline reads.
+    pub traffic_split_arm_owned: Option<String>,
+    /// Canary traffic-split percentage (span attr).
+    pub route_traffic_pct: Option<u32>,
+    /// Canary shadow model to dispatch concurrently (discarded), if any.
+    pub route_shadow_model: Option<String>,
+    /// Failover candidate model ids (empty = single-provider dispatch).
+    pub failover_candidates: Vec<String>,
+    /// Per-provider credentials for the failover candidate set.
+    pub failover_creds: std::collections::HashMap<String, ProviderCredentials>,
+    /// Route-derived fallback chain (its `is_empty()` selects single vs failover
+    /// dispatch — the pipeline reads `route_fallbacks.is_empty()` verbatim).
+    pub route_fallbacks: Vec<String>,
+    /// Pre-dispatch warning tokens (route_paused / redacted / shaping skips),
+    /// extended in-pipeline with response-shaping + dispatch tokens.
+    pub warnings: Vec<String>,
+    /// Per-request upstream deadline.
+    pub request_timeout: Option<Duration>,
+    /// Raw bearer (source provider's key; shadow + re-emit credential resolve).
+    pub raw_bearer: String,
+    /// Retrieval-middleware telemetry (tokens saved upstream).
+    pub retrieval_telemetry: RetrievalTelemetry,
+    /// Wall-clock request start for `request_logs.latency_ms`.
+    pub request_started: Instant,
+    /// Serialized request body for capture (`Some` only when capture is armed,
+    /// the org is non-anonymous, and the org opted in). Consumed by value.
+    pub capture_request_json: Option<Vec<u8>>,
+    /// L2 quality-judge captures (PRE-redaction): the source provider/ctx/req
+    /// re-dispatched for the reference answer. Consumed by value (passed by-ref
+    /// into the L2-hit gate, moved into `maybe_spawn_quality_judge`).
+    pub judge_source_provider: Option<std::sync::Arc<dyn tt_shared::Provider>>,
+    pub judge_source_ctx: Option<RequestContext>,
+    pub judge_original_req: Option<ChatCompletionRequest>,
+}
+
+/// Cost/route/cache/warning metadata the chat [`handler`] turns into
+/// `x-tokentrimmer-*` response headers after a dispatched (non-cache-hit)
+/// non-streaming completion. The field set mirrors exactly what the current
+/// non-streaming tail reads when assembling the response: the
+/// [`attach_cost_headers`] inputs, the `x-tokentrimmer-cache` /
+/// `x-tokentrimmer-route-matched` / `x-tokentrimmer-captured` headers, and the
+/// [`attach_warnings`] inputs. (The OTel request-span attributes are recorded
+/// inside [`complete_once`] alongside the other per-request side effects —
+/// `tracing::Span::current()` is identical there and in the handler tail.)
+pub(crate) struct CompletionHeaders {
+    /// `attach_cost_headers` inputs.
+    pub trace_id: Uuid,
+    pub provider_id: String,
+    pub model_used: String,
+    pub cost_breakdown: CostBreakdown,
+    /// `x-tokentrimmer-cache` value (`miss` / `none`).
+    pub cache_state: &'static str,
+    /// `x-tokentrimmer-route-matched` value, if a route matched.
+    pub route_matched_name: Option<String>,
+    /// Whether the request+response bodies were persisted (`x-tokentrimmer-captured`).
+    pub body_captured: bool,
+    /// The dispatched request — `attach_warnings` evaluates `dropped_params`
+    /// against it (and the served model).
+    pub req: ChatCompletionRequest,
+    /// The served provider — `attach_warnings` calls `dropped_params` on it.
+    pub provider: std::sync::Arc<dyn tt_shared::Provider>,
+    /// Pre-dispatch + dispatch warning tokens (comma-joined into the header).
+    pub warnings: Vec<String>,
+}
+
+/// The result of one non-streaming completion through [`complete_once`].
+///
+/// A dispatched completion returns the typed [`ChatCompletionResponse`] plus the
+/// [`CompletionHeaders`] the wrapper turns into the HTTP response — this is the
+/// path the agent loop (slice 1a) consumes per turn. A cache hit (L1 / L2 /
+/// negative cache / single-flight follower) already built the exact client
+/// `Response` it returns today, so it is carried verbatim to keep behavior
+/// byte-for-byte identical (the negative-cache hit in particular is an error
+/// status body, not a `ChatCompletionResponse`, so it cannot be re-typed
+/// losslessly). The loop will consume cache hits via the typed response in a
+/// later slice; 1a-0 only carves the pipeline behavior-preservingly.
+pub(crate) enum CompletionOutcome {
+    /// A fresh provider dispatch: typed response + header metadata.
+    Dispatched {
+        response: ChatCompletionResponse,
+        headers: Box<CompletionHeaders>,
+    },
+    /// A cache hit (or negative-cache hit): the fully-built client response,
+    /// returned verbatim (already carries its own headers).
+    CacheHit(Response),
+}
+
+/// Run one routed, metered, cached **non-streaming** completion: the L1/L2
+/// (and negative-cache) lookups, single-flight coalescing, provider dispatch
+/// (single + `dispatch_with_failover`), response-side output shaping, cost
+/// computation, L1/L2 insert, the `request_logs` row, body capture, the sampled
+/// quality judge, and the OTel request-span attributes — returning the typed
+/// response + header metadata ([`CompletionOutcome`]) instead of building the
+/// HTTP `Response`. The chat [`handler`]'s non-streaming arm calls this and
+/// assembles the final `Response`; the future server-side agent loop (slice 1a)
+/// calls this per turn through a `TurnCompleter` seam.
+///
+/// Behavior-preserving by construction: this is the verbatim non-streaming arm
+/// of [`handler`], with the early cache-hit returns yielding
+/// [`CompletionOutcome::CacheHit`] and the dispatched tail yielding
+/// [`CompletionOutcome::Dispatched`].
+pub(crate) async fn complete_once(
+    state: &AppState,
+    ctx: &RequestContext,
+    prep: Prepared,
+) -> ApiResult<CompletionOutcome> {
+    // Destructure the prepared setup into locals with the exact names + types
+    // the carved pipeline (the former handler non-streaming arm) reads, so the
+    // body below is byte-for-byte the handler's. `state`/`ctx` are the params;
+    // everything else is moved out of `prep`.
+    let Prepared {
+        provider,
+        req,
+        cache_behavior,
+        l2_allowed,
+        skip_l2,
+        route_matched_name,
+        matched_route_id,
+        route_paused,
+        requested_model,
+        requested_pricing,
+        format_switch_plan,
+        diff_plan,
+        pass_effects,
+        minify_applied,
+        reasoning_capped,
+        flex_applied,
+        batch_marked,
+        caller_tier,
+        traffic_split_arm_owned,
+        route_traffic_pct,
+        route_shadow_model,
+        failover_candidates,
+        failover_creds,
+        route_fallbacks,
+        mut warnings,
+        request_timeout,
+        raw_bearer,
+        retrieval_telemetry,
+        request_started,
+        capture_request_json,
+        judge_source_provider,
+        judge_source_ctx,
+        judge_original_req,
+    } = prep;
+    // The handler built `ctx.trace_id` from the same trace-id it derived; the
+    // carved pipeline reads `trace_id` directly (cache rows, L1 envelopes,
+    // headers). They are identical by construction.
+    let trace_id = ctx.trace_id;
+
+    // 3a. L1 exact-match cache. Cheapest lookup — try first. Gated on
+    //     cache eligibility (Fix A §2.2) and tt_extras.cache mode (Fix B §2.7).
+    //     Best-effort: any Redis error falls through to L2/provider.
+    let l1_key = state
+        .l1
+        .as_ref()
+        .map(|_| namespaced_l1_key(ctx.org_id, &req));
+
+    // 3a/3a-neg. Negative cache, then L1 exact-match. Gated on cache
+    // eligibility + tt_extras.cache mode; best-effort (errors fall through).
+    if cache_behavior.do_lookup {
+        if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
+            if let Some(resp) = try_negative_cache_hit(l1, key, route_matched_name.as_deref()).await
+            {
+                return Ok(CompletionOutcome::CacheHit(resp));
+            }
+            if let Some(mut resp) = try_l1_hit(
+                l1,
+                key,
+                ctx,
+                state.telemetry_tracker.as_ref(),
+                state.request_log_writer.as_ref(),
+                trace_id,
+                request_started,
+                matched_route_id,
+                route_paused,
+                retrieval_telemetry.tokens_saved,
+                route_matched_name.as_deref(),
+            )
+            .await
+            {
+                // A validated switch is the ONLY thing ever inserted
+                // under a switched key (3e suppresses fail-open bodies),
+                // so a hit here is genuinely switched — advertise it
+                // exactly like the dispatch path. Other pre-dispatch
+                // tokens (route_paused / redacted / shaping skips)
+                // survive on hit responses too.
+                if let Some(plan) = format_switch_plan.as_ref() {
+                    warnings.push(format!("format_switch:{}", plan.label));
+                }
+                attach_warning_tokens(resp.headers_mut(), &warnings);
+                return Ok(CompletionOutcome::CacheHit(resp));
+            }
+        }
+    }
+
+    // 3b. L2 semantic cache. Gated additionally on l2_allowed, and OFF
+    // for format-switched requests (`skip_l2` — similarity matching could
+    // cross the instruction boundary).
+    //
+    // Captures the embedding `try_l2_hit` computes for the lookup so the
+    // miss path can reuse it for the L2 insert instead of re-embedding the
+    // identical query text (COST-3). `None` until a lookup runs and embeds.
+    let mut l2_lookup_vec: Option<Vec<f32>> = None;
+    if cache_behavior.do_lookup && l2_allowed && !skip_l2 {
+        if let Some(l2) = state.l2.as_ref() {
+            // Current catalog rate for the (post-routing) request model —
+            // the legacy-row fallback in `l2_entry_baseline`. The entry's
+            // model always equals `req.model` here (lookup filters on it).
+            let current_pricing = provider.pricing(&req.model);
+            if let Some(result) = try_l2_hit(
+                state,
+                l2,
+                ctx,
+                &req,
+                current_pricing.as_ref(),
+                state.request_log_writer.as_ref(),
+                trace_id,
+                request_started,
+                matched_route_id,
+                route_paused,
+                retrieval_telemetry.tokens_saved,
+                route_matched_name.as_deref(),
+                &raw_bearer,
+                judge_source_provider.as_ref(),
+                judge_source_ctx.as_ref(),
+                judge_original_req.as_ref(),
+                &mut l2_lookup_vec,
+            )
+            .await
+            {
+                // No format_switch token here: switched requests skip L2
+                // entirely (`skip_l2`), so an L2 hit is never switched.
+                return result.map(|mut resp| {
+                    attach_warning_tokens(resp.headers_mut(), &warnings);
+                    CompletionOutcome::CacheHit(resp)
+                });
+            }
+        }
+    }
+
+    // 3b.5. Single-flight coalescing for cache-eligible non-streaming requests.
+    //
+    // When multiple concurrent requests share the same L1 key and all miss
+    // L1+L2, only the FIRST (leader) dispatches to the provider.  The rest
+    // (followers) wait up to FOLLOWER_TIMEOUT and then re-read L1; if the
+    // leader has populated it they serve from cache.  If the leader fails or
+    // the timeout fires, followers fall through to their own provider dispatch
+    // (correctness over coalescing).
+    //
+    // Scope: cache-eligible, do_lookup=true, non-streaming, L1 configured.
+    // Streaming single-flight is a follow-up (broadcasting an SSE stream to
+    // multiple waiters is non-trivial).
+    let mut single_flight_guard = None::<crate::single_flight::LeaderGuard>;
+    if cache_behavior.do_lookup {
+        if let Some(sf_key) = l1_key.as_deref() {
+            match state.single_flight.try_become_leader(sf_key) {
+                Ok(guard) => {
+                    // We are the leader — proceed to provider dispatch below
+                    // and call guard.complete() after populating L1.
+                    tracing::debug!(key = %sf_key, "single-flight: became leader");
+                    single_flight_guard = Some(guard);
+                }
+                Err(rx) => {
+                    // We are a follower — wait for the leader to finish.
+                    tracing::debug!(key = %sf_key, "single-flight: following leader");
+                    let populated = wait_for_leader(rx).await;
+                    if populated {
+                        // Re-read L1; if it's there, serve it directly.
+                        if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_deref()) {
+                            match l1.cache.get(key).await {
+                                Ok(Some(bytes)) => match L1Entry::from_bytes(&bytes) {
+                                    Ok(entry) => {
+                                        tracing::debug!(
+                                            key = %key,
+                                            "single-flight: follower served from populated L1"
+                                        );
+                                        spawn_request_log(
+                                            state.telemetry_tracker.as_ref(),
+                                            state.request_log_writer.as_ref(),
+                                            request_log_for_l1_hit(
+                                                &entry,
+                                                ctx,
+                                                trace_id,
+                                                request_started,
+                                                matched_route_id,
+                                                route_paused,
+                                                retrieval_telemetry.tokens_saved,
+                                            ),
+                                        );
+                                        let mut resp = with_route_matched(
+                                            build_hit_l1_response(entry, trace_id),
+                                            route_matched_name.as_deref(),
+                                        );
+                                        // Same advertisement contract as
+                                        // the direct L1-hit return above.
+                                        if let Some(plan) = format_switch_plan.as_ref() {
+                                            warnings.push(format!("format_switch:{}", plan.label));
+                                        }
+                                        attach_warning_tokens(resp.headers_mut(), &warnings);
+                                        return Ok(CompletionOutcome::CacheHit(resp));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            key = %key,
+                                            "single-flight: follower L1 re-read deserialized failed, falling through"
+                                        );
+                                    }
+                                },
+                                Ok(None) => {
+                                    tracing::debug!(
+                                        key = %key,
+                                        "single-flight: follower L1 re-read empty, falling through"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "single-flight: follower L1 re-read error, falling through"
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            key = %sf_key,
+                            "single-flight: leader failed or timed out, follower dispatching independently"
+                        );
+                    }
+                    // Fall through to provider dispatch (leader failed /
+                    // L1 re-read miss / timeout).
+                }
+            }
+        }
+    }
+
+    // 3c. No cache hit — dispatch to provider. When the matched route
+    //     declared fallbacks, fail over across the candidate chain
+    //     (primary first, then each fallback) skipping providers whose
+    //     circuit breaker is open; otherwise dispatch the single provider
+    //     with retry. `provider` is rebound to whichever provider actually
+    //     served the request so cost/headers/telemetry below reflect it.
+    let __primary = provider.id();
+    let primary_dispatch = with_request_timeout(request_timeout, async {
+        if route_fallbacks.is_empty() {
+            let __started = std::time::Instant::now();
+            let __dispatch = with_retry(&RetryPolicy::default(), || {
+                provider.chat_completion(req.clone(), ctx)
+            })
+            .await;
+            let __elapsed = __started.elapsed();
+            crate::metrics::record_provider_latency(provider.id(), "chat", __elapsed);
+            // Feed the rolling p95 window (the live signal behind the
+            // `upstream_latency_ms_p95_gt` route condition) on success only —
+            // errored/short-circuited dispatches aren't representative
+            // upstream latency. Keyed by the served `(provider, model)`.
+            if __dispatch.is_ok() {
+                let __ms = u32::try_from(__elapsed.as_millis()).unwrap_or(u32::MAX);
+                state
+                    .latency_tracker
+                    .record(provider.id(), &req.model, __ms);
+            }
+            __dispatch
+                .map(|resp| (provider, resp))
+                .map_err(ApiError::from)
+        } else {
+            // Build the capability check for the failover path.
+            let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
+            let cap_est_tokens = {
+                let combined = tt_shared::message_text_for_estimation(&req);
+                tt_tokenize::estimate_tokens(provider.id(), &combined) as u64
+            };
+            crate::failover::dispatch_with_failover(
+                &state.registry,
+                &state.breaker,
+                &RetryPolicy::default(),
+                &failover_candidates,
+                &req,
+                ctx,
+                &failover_creds,
+                Utc::now(),
+                Some(crate::failover::CapCheck {
+                    required: &cap_required,
+                    estimated_tokens: cap_est_tokens,
+                }),
+            )
+            .await
+            .map_err(ApiError::from)
+        }
+    });
+
+    // Canary SHADOW dispatch (#454): when the matched route declares a
+    // `shadow_model`, run it CONCURRENTLY with the primary — same prompt,
+    // shadow model, non-streaming, single candidate, NO failover, its own
+    // short deadline. The shadow response is DISCARDED; only its cost is kept
+    // (in a separate column / span attr). Opt-in only: `route_shadow_model`
+    // is None for every request whose route did not set it, so the default
+    // path runs the primary alone with zero added work. We base the shadow on
+    // `req` AFTER redaction/compression so it exercises the exact prompt the
+    // primary dispatches. `tokio::join!` polls both on this task so the
+    // shadow never blocks the primary beyond their concurrent overlap.
+    let (dispatch_result, shadow_outcome): (ApiResult<_>, Option<ShadowOutcome>) =
+        if let Some(shadow_model) = route_shadow_model.as_deref() {
+            let shadow_fut = dispatch_shadow(state, ctx, &req, shadow_model, &raw_bearer);
+            let (primary, shadow) = tokio::join!(primary_dispatch, shadow_fut);
+            (primary, Some(shadow))
+        } else {
+            (primary_dispatch.await, None)
+        };
+
+    // Attributed to the primary provider: the request deadline spans any
+    // failover loop, so the in-flight candidate at timeout isn't known here
+    // without threading it out of dispatch_with_failover.
+    if matches!(dispatch_result, Err(ApiError::RequestTimeout { .. })) {
+        crate::metrics::record_provider_timeout(__primary, "chat");
+    }
+
+    // 3c-neg. Negative-cache write on deterministic client errors.
+    //
+    // When the provider returned a deterministic 4xx (e.g. InvalidRequest /
+    // ProviderUpstream 400..=499 excluding 429), store a short-lived entry
+    // in L1 under "neg:{l1_key}" so identical repeat requests are served
+    // from the negative cache instead of re-hitting the provider.
+    //
+    // Gated on cache_behavior.do_insert — the same flag used for positive
+    // cache inserts — so Bypass/ReadOnly mode suppresses negative caching
+    // as well as positive caching.
+    //
+    // NEVER caches: 429/RateLimited, timeout, 5xx, network, internal errors.
+    if let Err(ref err) = dispatch_result {
+        if cache_behavior.do_insert && is_deterministic_client_error(err) {
+            if let (Some(l1), Some(pos_key)) = (state.l1.as_ref(), l1_key.as_ref()) {
+                let neg_key = negative_l1_key(pos_key);
+                let entry = NegativeCacheEntry {
+                    status: error_status_code(err),
+                    message: err.to_string(),
+                };
+                match serde_json::to_vec(&entry) {
+                    Ok(bytes) => {
+                        let l1_clone = l1.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = l1_clone
+                                .cache
+                                .set(&neg_key, &bytes, NEGATIVE_CACHE_TTL_SECS)
+                                .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    key = %neg_key,
+                                    "negative cache insert failed"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    key = %neg_key,
+                                    "negative cache entry stored"
+                                );
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "negative cache entry serialization failed"
+                        );
+                    }
+                }
+            }
+        }
+        // Also drop any single-flight guard so followers don't wait forever.
+        drop(single_flight_guard.take());
+    }
+
+    let (provider, response) = dispatch_result?;
+    let mut response = response;
+
+    // ── Response-side output shaping (research Phase 3.3 + 3.4) ─────────
+    //
+    // Runs BEFORE pricing/caching/telemetry so every downstream consumer
+    // (cost math, L1 envelope, request_logs, judge) sees the response the
+    // CALLER receives. Neither arm can 5xx: format-switch fails OPEN
+    // (untouched body), diff fails CLOSED to a full re-emit — and if even
+    // the re-emit dispatch errors, the raw patch passes through marked
+    // `diff_degraded` (a 5xx after a successful upstream call is the
+    // worst outcome).
+    let mut shape_effects = crate::shaping::ShapeEffects::default();
+    let mut format_switch_outcome: Option<&'static str> = None;
+    let mut format_switch_failed = false;
+    let mut diff_applied = false;
+    let mut diff_failed = false;
+    if let Some(plan) = format_switch_plan.as_ref() {
+        // Tool-call-only responses yield empty assistant text → the
+        // validator rejects → fail-open, same arm as a prose mismatch.
+        let body = response_assistant_text(&response);
+        // Truncation gate FIRST: a max-token-cut emission can end
+        // exactly at a record-line boundary and pass the per-line arity
+        // check, silently serving a SHORTER record set than the model
+        // intended — whereas the JSON contract being replaced would
+        // have been detectably invalid on truncation. The switched
+        // contract must not be weaker, so a non-"stop" finish_reason
+        // fails OPEN like any other validation mismatch.
+        let validated = if response_emission_truncated(&response) {
+            Err("truncated")
+        } else {
+            crate::shaping::format_switch::validate_switched_body(&body, &plan.format)
+        };
+        match validated {
+            Ok(stripped) => {
+                // Tokenizer-grounded ESTIMATE only (labeled "Est"
+                // everywhere): not computable ⇒ book $0 + meter.
+                match crate::shaping::format_switch::estimate_saved_tokens(
+                    provider.id(),
+                    &response.model,
+                    &stripped,
+                    &plan.format,
+                ) {
+                    Some(saved_tokens) => {
+                        if let Some(p) = provider.pricing(&response.model) {
+                            shape_effects.format_switch_saved_est_usd =
+                                f64::from(saved_tokens) * p.output_per_million / 1_000_000.0;
+                        }
+                    }
+                    None => crate::metrics::record_format_switch_unestimated(),
+                }
+                set_assistant_text(&mut response, stripped);
+                warnings.push(format!("format_switch:{}", plan.label));
+                format_switch_outcome = Some(plan.label);
+                crate::metrics::record_format_switch(plan.label, "applied");
+            }
+            Err(_reason) => {
+                // Fail OPEN: the body passes through untouched, $0
+                // booked, and 3e below never caches an unswitched body
+                // under the switched key.
+                warnings.push(format!("format_switch_failed:{}", plan.label));
+                format_switch_failed = true;
+                crate::metrics::record_format_switch(plan.label, "failed");
+            }
+        }
+    }
+    if let Some(plan) = diff_plan.as_ref() {
+        let patch_text = response_assistant_text(&response);
+        // Truncation gate FIRST (fail closed): a patch cut by the
+        // provider's token limit exactly at a `>>>>>>> REPLACE`
+        // boundary parses as a valid-but-INCOMPLETE multi-block patch
+        // and would silently serve a PARTIALLY edited artifact — the
+        // unique-anchor and JSON-validity checks cannot detect a
+        // missing trailing block. Mid-block truncation already fails
+        // closed as Malformed; this closes the boundary case.
+        let reconstructed = if response_emission_truncated(&response) {
+            Err(crate::shaping::diff::DiffError::Truncated)
+        } else {
+            crate::shaping::diff::reconstruct(plan, &patch_text)
+        };
+        match reconstructed {
+            Ok(artifact) => {
+                // MEASURED saving: both sides are real tokenizer counts
+                // on real strings — the reconstructed artifact the caller
+                // receives vs the patch tokens the provider billed.
+                let artifact_tokens = tt_tokenize::estimate_tokens_for_model(
+                    provider.id(),
+                    &response.model,
+                    &artifact,
+                );
+                let billed = u32::try_from(response.usage.completion_tokens).unwrap_or(u32::MAX);
+                shape_effects.diff_output_tokens_saved = artifact_tokens.saturating_sub(billed);
+                set_assistant_text(&mut response, artifact);
+                // `usage` deliberately STAYS the provider-billed patch
+                // usage — the invoice shows the short patch; the savings
+                // being real is the point (documented contract).
+                warnings.push("diff_applied".to_string());
+                diff_applied = true;
+                crate::metrics::record_diff("applied", "");
+            }
+            Err(e) => {
+                // FAIL CLOSED → full re-emit. Book the failed attempt's
+                // realized (pre-fee) cost first — it is real invoice
+                // spend.
+                let patch_pricing = provider.pricing(&response.model);
+                shape_effects.diff_failed_cost_usd = compute_cost(
+                    &response.usage,
+                    patch_pricing.as_ref(),
+                    patch_pricing.as_ref(),
+                    1.0,
+                )
+                .cost_usd;
+                warnings.push(format!("diff_failed:{}", e.reason()));
+                diff_failed = true;
+                crate::metrics::record_diff("failed", e.reason());
+                // The re-emit request is derived from the DISPATCHED
+                // request — drop the patch instruction, restore the
+                // caller's response_format — NOT from a pre-pipeline
+                // clone, so it inherits every dispatch-path
+                // normalization: the redaction guardrail (a
+                // redact+diff route's re-emit must never out-leak the
+                // dispatch path — same invariant that skips the judge
+                // wholesale on redact routes), compression, the flex
+                // tier (`compute_cost_full` prices the metered re-emit
+                // usage with `flex_applied`), and the temperature
+                // clamp. The restored response_format then needs the
+                // provider-compat downgrade the patch dispatch never
+                // needed (its response_format was None).
+                let mut reemit_req = req.clone();
+                crate::shaping::diff::unapply_diff_request(&mut reemit_req, plan);
+                maybe_downgrade_response_format(&mut reemit_req, provider.as_ref(), &mut warnings);
+                // Single provider, no failover chain — the chain already
+                // chose this provider for the patch dispatch.
+                let reemit = with_request_timeout(request_timeout, async {
+                    with_retry(&RetryPolicy::default(), || {
+                        provider.chat_completion(reemit_req.clone(), ctx)
+                    })
+                    .await
+                    .map_err(ApiError::from)
+                })
+                .await;
+                match reemit {
+                    Ok(full) => response = full,
+                    Err(err) => {
+                        // Last resort: never 5xx after a successful
+                        // upstream call — serve the raw patch response
+                        // marked degraded. The trace billed exactly ONE
+                        // dispatch (the failed re-emit errored, nothing
+                        // billed), and that dispatch IS the response
+                        // being metered below — so the separate
+                        // failed-attempt booking must be zeroed or
+                        // cost_usd would double-count the patch call.
+                        shape_effects.diff_failed_cost_usd = 0.0;
+                        tracing::warn!(
+                            error = %err,
+                            "diff fail-closed re-emit dispatch failed — serving raw patch marked diff_degraded"
+                        );
+                        warnings.push("diff_degraded".to_string());
+                        crate::metrics::record_diff("degraded", "reemit_error");
+                    }
+                }
+            }
+        }
+    }
+
+    // 3d. Compute cost via provider pricing table BEFORE caching — the L1
+    //     envelope carries baseline_cost_usd so hit responses can report
+    //     accurate savings without re-running pricing later.
+    let pricing = provider.pricing(&response.model);
+
+    // Warn when a model is absent from the pricing catalog so the request
+    // is priced at $0. This is distinct from a local provider (ollama,
+    // vllm, lmstudio) where pricing() intentionally returns Some(zero) —
+    // those providers never return None. A None here means the model is
+    // simply missing from data/pricing.toml and the cost will be recorded
+    // as zero, silently under-counting spend. Update pricing.toml to fix.
+    if pricing.is_none() {
+        tracing::warn!(
+            provider = provider.id(),
+            model = %response.model,
+            "model absent from pricing catalog — request cost recorded as $0; \
+             update data/pricing.toml to restore accurate cost tracking"
+        );
+        metrics::counter!(
+            "catalog_zero_price_total",
+            "provider" => provider.id(),
+            "model" => response.model.clone(),
+        )
+        .increment(1);
+    }
+
+    // Baseline is priced against the originally-requested model when a route
+    // rewrote it; otherwise against the served model (same pricing → no
+    // routing saving, only cache/discount savings).
+    let baseline_pricing = if matched_route_id.is_some() {
+        requested_pricing.clone()
+    } else {
+        pricing.clone()
+    };
+    // Minify ESTIMATE (research Phase 3.1): grounded in the actual
+    // emission — the pretty re-render of the emitted JSON re-tokenized
+    // with the served model's tokenizer, minus the tokens actually
+    // emitted. 0 when the instruction was not injected or the response is
+    // not valid JSON (no claim).
+    let minify_saved_tokens = if minify_applied {
+        minify_saved_tokens_est(provider.id(), &response.model, &response)
+    } else {
+        0
+    };
+    let cost_breakdown = compute_cost_full(
+        &response.usage,
+        pricing.as_ref(),
+        baseline_pricing.as_ref(),
+        provider.fee_multiplier(),
+        flex_applied,
+        batch_marked,
+        pass_effects,
+        minify_saved_tokens,
+        shape_effects,
+    );
+    if minify_applied {
+        crate::metrics::record_minify_estimate(
+            route_matched_name.as_deref().unwrap_or("none"),
+            minify_saved_tokens,
+            cost_breakdown.minify_saved_est_usd,
+        );
+    }
+    let cost_usd = cost_breakdown.cost_usd;
+    let baseline_cost_usd = cost_breakdown.baseline_cost_usd;
+    // headline saved_usd (header) is TT-attributed only — the provider's
+    // automatic cache discount is excluded by `CostBreakdown::tt_saved_usd`
+    // and surfaced via its own header/ledger field.
+    let provider_cache_saved_usd = cost_breakdown.provider_cache_saved_usd;
+
+    // Record realized spend into the same enforcer the pre-flight check uses
+    // (dynamic_budget on the tier-aware path) so the monthly_cap_usd hard stop trips.
+    state.spend_sink().record(ctx.org_id, cost_usd, Utc::now());
+
+    let provider_id = provider.id().to_string();
+    let model_used = response.model.clone();
+    // Token counts for the request-span attributes, captured before
+    // `response` is moved into the HTTP body below.
+    let input_tokens = response.usage.prompt_tokens;
+    let output_tokens = response.usage.completion_tokens;
+
+    // 3e. Best-effort L1 insert. Gated on do_insert (Fix A + Fix B) and
+    //     the response not containing tool_calls (non-deterministic output).
+    //     Errors are logged but never block the request.
+    //
+    //     Single-flight note: when this request is the single-flight leader
+    //     we must ensure the L1 entry is visible before signalling followers.
+    //     To do that we await the insert inline (rather than spawning it) and
+    //     then call guard.complete().  When no guard is held the normal
+    //     fire-and-forget spawn is used so the non-coalesced path is unchanged.
+    let response_has_tools = response_has_tool_calls(&response);
+    // `!format_switch_failed`: a fail-open (unswitched) body must never
+    // be cached under the switched request's key — every hit under a
+    // switched key must be genuinely switched (the hit-path
+    // advertisement above depends on this invariant).
+    if cache_behavior.do_insert && !response_has_tools && !format_switch_failed {
+        if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key) {
+            let entry = L1Entry::new(
+                response.clone(),
+                baseline_cost_usd,
+                cost_usd,
+                provider_id.clone(),
+            );
+            match entry.to_bytes() {
+                Ok(bytes) => {
+                    let l1_clone = l1.clone();
+                    // TTL priority: tt_extras override > tier-based TTL >
+                    // L1 config default (spec §8.4 / rv-per-tier-ttl).
+                    let ttl =
+                        effective_ttl_secs(cache_behavior.ttl_secs, caller_tier, l1_clone.ttl_secs);
+                    if let Some(guard) = single_flight_guard.take() {
+                        // Leader path: await the insert so followers can
+                        // read it from L1 immediately after we signal them.
+                        if let Err(e) = l1_clone.cache.set(&key, &bytes, ttl).await {
+                            tracing::warn!(error = %e, "l1 cache insert failed (leader)");
+                            // Drop guard without calling complete() — followers
+                            // will fall through to their own dispatch.
+                            drop(guard);
+                        } else {
+                            // Insert succeeded; signal followers.
+                            guard.complete();
+                        }
+                    } else {
+                        // Non-leader path: fire-and-forget as before.
+                        tokio::spawn(async move {
+                            if let Err(e) = l1_clone.cache.set(&key, &bytes, ttl).await {
+                                tracing::warn!(error = %e, "l1 cache insert failed");
+                            }
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "l1 envelope serialization failed");
+                    // Guard drops here (single_flight_guard still Some if
+                    // we didn't take it above); followers fall through.
+                    drop(single_flight_guard.take());
+                }
+            }
+        } else {
+            // No L1 configured — drop any guard so followers fall through.
+            drop(single_flight_guard.take());
+        }
+    } else {
+        // Insert skipped (tool calls or do_insert=false) — drop guard so
+        // followers are not left waiting indefinitely.
+        drop(single_flight_guard.take());
+    }
+
+    // 3f. Best-effort L2 insert. Same gate as L1, plus the format-switch
+    // L2 opt-out (`skip_l2`): a switched body must never become a
+    // similarity-served answer for an unswitched near-duplicate.
+    if cache_behavior.do_insert && !response_has_tools && l2_allowed && !skip_l2 {
+        if let Some(l2) = state.l2.as_ref() {
+            if let Some(query_text) = l2_context_text(&req) {
+                let l2_provider_id = provider_id.clone();
+                let l2_model_used = response.model.clone();
+                let response_clone = response.clone();
+                let l2_clone = l2.clone();
+                let org_id = ctx.org_id;
+                // TTL priority: tt_extras override > tier-based TTL >
+                // L2_DEFAULT_TTL (spec §8.4 / rv-per-tier-ttl).
+                let l2_ttl_secs = effective_ttl_secs(
+                    cache_behavior.ttl_secs,
+                    caller_tier,
+                    L2_DEFAULT_TTL.as_secs(),
+                );
+                // Volatility-class TTL (opt-in, shorten-only, L2-scoped):
+                // a volatile query's entry expires sooner so a stale
+                // realtime answer can't be re-served for the full base
+                // TTL. An explicit tt_extras override always wins.
+                let l2_ttl_secs = crate::cache_volatility::l2_ttl_with_volatility(
+                    l2_ttl_secs,
+                    cache_behavior.ttl_secs.is_some(),
+                    &query_text,
+                    l2.volatility_ttl.as_ref(),
+                );
+                // Store the catalog-derived baseline on the row so later
+                // hits report honest savings. None (→ NULL) when the model
+                // is absent from the catalog: the hit path then re-prices
+                // against the catalog current at hit time instead of
+                // freezing a meaningless $0.
+                let l2_baseline = pricing.as_ref().map(|_| baseline_cost_usd);
+                // Reuse the embedding the L2 lookup already computed for the
+                // identical query text (COST-3); `None` when no lookup ran
+                // (e.g. do_lookup=false) — `insert_into_l2` then embeds.
+                let l2_lookup_embedding = l2_lookup_vec.take();
+                tokio::spawn(async move {
+                    insert_into_l2(
+                        l2_clone,
+                        org_id,
+                        &query_text,
+                        response_clone,
+                        l2_provider_id,
+                        l2_model_used,
+                        l2_ttl_secs,
+                        l2_baseline,
+                        l2_lookup_embedding,
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+
+    // 3g. Best-effort request_logs row. Cache-miss path: cached=false,
+    //     cache_layer=None. L1/L2-hit paths log their own rows where
+    //     they early-return.
+    //
+    // Canary shadow attribution: when a shadow fired, record its model +
+    // cost in their OWN columns (NEVER folded into `cost_usd`). `shadow_cost`
+    // is `Some` only when the shadow succeeded (a failed shadow still logs
+    // its model with `None` cost so the attempt is auditable). The doubled
+    // spend is thus visible and reconcilable as a distinct experiment cost.
+    let shadow_model_logged = shadow_outcome.as_ref().map(|s| s.model.clone());
+    let shadow_cost_logged = shadow_outcome
+        .as_ref()
+        .filter(|s| s.succeeded)
+        .map(|s| s.cost_usd);
+    spawn_request_log(
+        state.telemetry_tracker.as_ref(),
+        state.request_log_writer.as_ref(),
+        RequestLogRow {
+            id: Uuid::now_v7(),
+            org_id: ctx.org_id,
+            api_key_id: ctx.api_key_id,
+            ts: Utc::now(),
+            provider: provider_id.clone(),
+            model: model_used.clone(),
+            input_tokens: response.usage.prompt_tokens as i32,
+            output_tokens: response.usage.completion_tokens as i32,
+            cached_tokens: response.usage.cached_tokens as i32,
+            cost_usd,
+            baseline_cost_usd,
+            provider_cache_saved_usd,
+            // Fee-applied, matching the header/span figure — keeps the
+            // row-derived TT headline equal to `tt_saved_usd()`.
+            cache_bust_penalty_usd: cost_breakdown.cache_bust_penalty_usd,
+            cached: false,
+            cache_layer: None,
+            route_id: matched_route_id,
+            latency_ms: request_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
+            upstream_latency_ms: None,
+            status: 200,
+            tag: ctx.tag.clone(),
+            error_class: None,
+            trace_id: Some(trace_id.to_string()),
+            truncated: false,
+            shadow_model: shadow_model_logged.clone(),
+            shadow_cost_usd: shadow_cost_logged,
+            traffic_split_arm: traffic_split_arm_owned.clone(),
+            // Raw provider prompt-cache counts (research Phase 0.2):
+            // None (NULL) when the provider didn't report the field,
+            // Some(0) when it explicitly reported zero. The shadow
+            // dispatch is discarded — only the SERVED response's cache
+            // telemetry is recorded (shadow cost has its own columns).
+            cache_read_input_tokens: opt_tokens_i32(response.usage.cache_read_input_tokens),
+            cache_creation_input_tokens: opt_tokens_i32(response.usage.cache_creation_input_tokens),
+            // Advisory batch-eligibility marker (research Phase 2.1).
+            // `batch_eligible` records route INTENT (the marker survived
+            // the hard-ineligibility gate); `batch_forgone_usd` is the
+            // PRICED claim — 0.0 when failover served a model with no
+            // catalog batch tier, while `batch_eligible` stays true so the
+            // route's intent remains auditable.
+            batch_eligible: batch_marked,
+            batch_forgone_usd: cost_breakdown.batch_forgone_usd,
+            route_paused,
+            // ESTIMATED minify saving — own column (migration 0020),
+            // never folded into cost/baseline/saved.
+            minify_saved_est_usd: cost_breakdown.minify_saved_est_usd,
+            // Output shaping (research Phase 3.3 + 3.4). `format_switched`
+            // is set ONLY on a VALIDATED switch; the est/saved/failed-cost
+            // figures come from the same breakdown the headers carry.
+            format_switched: format_switch_outcome.map(str::to_string),
+            format_switch_saved_est_usd: cost_breakdown.format_switch_saved_est_usd,
+            diff_applied,
+            diff_saved_usd: cost_breakdown.diff_saved_usd,
+            diff_failed,
+            diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
+            retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
+        },
+    );
+
+    // Whether this trace's body was actually handed to the capture sink for
+    // persistence: `capture_request_json` is `Some` only when a writer is
+    // armed, the org is non-anonymous, AND the org opted in
+    // (`is_capture_enabled` above), so the header reflects a body that was
+    // truly stored. Captured before the Option is consumed so the response
+    // can advertise it.
+    let body_captured = capture_request_json.is_some();
+    if let Some(request_json) = capture_request_json {
+        let response_json = match serde_json::to_vec(&response) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(error = %e, "response body capture serialization failed");
+                None
+            }
+        };
+        spawn_body_capture(
+            state.telemetry_tracker.as_ref(),
+            state.body_capture_writer.as_ref(),
+            BodyCaptureRecord {
+                org_id: ctx.org_id,
+                api_key_id: ctx.api_key_id,
+                trace_id: trace_id.to_string(),
+                endpoint: "/v1/chat/completions".into(),
+                provider: provider_id.clone(),
+                model: model_used.clone(),
+                request_json,
+                response_json,
+                ts: Utc::now(),
+            },
+        );
+    }
+
+    // Per-route provider-cache counters from the same authoritative usage
+    // the row records.
+    crate::metrics::record_provider_cache_usage(
+        &provider_id,
+        route_matched_name.as_deref(),
+        response.usage.cache_read_input_tokens,
+        response.usage.cache_creation_input_tokens,
+    );
+
+    // 3h. Sampled async quality judge on rerouted-DOWN traffic. Spawns a
+    //     detached task ONLY when: the judge is enabled + a sink is wired,
+    //     a route rewrote the model, the served model is cheaper than the
+    //     originally-requested one (a true downgrade priced on realized
+    //     usage), this task class (chat-completions) is in scope, and the
+    //     trace falls in the deterministic ~2% sample. The judge runs AFTER
+    //     this point and never touches `http_response`, so it adds ZERO
+    //     latency to the user request (see `quality_sample::spawn_quality_judge`).
+    maybe_spawn_quality_judge(
+        state,
+        matched_route_id,
+        &requested_model,
+        &response,
+        requested_pricing.as_ref(),
+        pricing.as_ref(),
+        // Output-shaped requests are judge-eligible even without a price
+        // downgrade — the un-shaped pre-routing capture is the paired
+        // counterfactual.
+        minify_applied || reasoning_capped,
+        trace_id,
+        ctx.org_id,
+        &raw_bearer,
+        judge_source_provider,
+        judge_source_ctx,
+        judge_original_req,
+        // A shaped response (validated format-switch or applied diff)
+        // samples the judge even without a model downgrade — shaping is
+        // exactly what the #155 gate exists to police.
+        format_switch_outcome.is_some() || diff_applied,
+    );
+
+    // 5. Return the typed response + header metadata. The chat wrapper (and
+    //    the agent loop) build the HTTP response from this; here we only
+    //    compute the cache-state header value and record the request-span
+    //    attributes (same `tracing::Span::current()` as the wrapper tail).
+    // Cache state: miss when ANY cache layer is configured but didn't hit;
+    // none when both are disabled.
+    let cache_state = if state.l1.is_some() || state.l2.is_some() {
+        "miss"
+    } else {
+        "none"
+    };
+
+    // Record OTel GenAI semconv + TokenTrimmer cost attributes on the
+    // request span from the same per-request values the headers carry (no
+    // recompute). The served model may differ from the requested one after
+    // routing / cross-model failover.
+    record_request_span_attributes(
+        &requested_model,
+        &model_used,
+        &provider_id,
+        span_cost(&cost_breakdown, input_tokens, output_tokens),
+        cache_state,
+        route_matched_name.as_deref(),
+        // Canary span attributes — additive; each omitted when its value is
+        // None (no split / no shadow). The shadow cost is recorded SEPARATELY
+        // here, never folded into `tokentrimmer.cost_usd` (carried by
+        // `cost_breakdown` above).
+        route_traffic_pct,
+        shadow_model_logged.as_deref(),
+        shadow_cost_logged,
+    );
+
+    Ok(CompletionOutcome::Dispatched {
+        response,
+        headers: Box::new(CompletionHeaders {
+            trace_id,
+            provider_id,
+            model_used,
+            cost_breakdown,
+            cache_state,
+            route_matched_name,
+            body_captured,
+            req,
+            provider,
+            warnings,
+        }),
+    })
 }
 
 /// Handler for `POST /v1/chat/completions`.
@@ -2094,925 +3189,108 @@ pub async fn handler(
         }
         Ok(resp)
     } else {
-        // 3a. L1 exact-match cache. Cheapest lookup — try first. Gated on
-        //     cache eligibility (Fix A §2.2) and tt_extras.cache mode (Fix B §2.7).
-        //     Best-effort: any Redis error falls through to L2/provider.
-        let l1_key = state
-            .l1
-            .as_ref()
-            .map(|_| namespaced_l1_key(ctx.org_id, &req));
-
-        // 3a/3a-neg. Negative cache, then L1 exact-match. Gated on cache
-        // eligibility + tt_extras.cache mode; best-effort (errors fall through).
-        if cache_behavior.do_lookup {
-            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_ref()) {
-                if let Some(resp) =
-                    try_negative_cache_hit(l1, key, route_matched_name.as_deref()).await
-                {
-                    return Ok(resp);
-                }
-                if let Some(mut resp) = try_l1_hit(
-                    l1,
-                    key,
-                    &ctx,
-                    state.telemetry_tracker.as_ref(),
-                    state.request_log_writer.as_ref(),
-                    trace_id,
-                    request_started,
-                    matched_route_id,
-                    route_paused,
-                    retrieval_telemetry.tokens_saved,
-                    route_matched_name.as_deref(),
-                )
-                .await
-                {
-                    // A validated switch is the ONLY thing ever inserted
-                    // under a switched key (3e suppresses fail-open bodies),
-                    // so a hit here is genuinely switched — advertise it
-                    // exactly like the dispatch path. Other pre-dispatch
-                    // tokens (route_paused / redacted / shaping skips)
-                    // survive on hit responses too.
-                    if let Some(plan) = format_switch_plan.as_ref() {
-                        warnings.push(format!("format_switch:{}", plan.label));
-                    }
-                    attach_warning_tokens(resp.headers_mut(), &warnings);
-                    return Ok(resp);
-                }
-            }
-        }
-
-        // 3b. L2 semantic cache. Gated additionally on l2_allowed, and OFF
-        // for format-switched requests (`skip_l2` — similarity matching could
-        // cross the instruction boundary).
-        //
-        // Captures the embedding `try_l2_hit` computes for the lookup so the
-        // miss path can reuse it for the L2 insert instead of re-embedding the
-        // identical query text (COST-3). `None` until a lookup runs and embeds.
-        let mut l2_lookup_vec: Option<Vec<f32>> = None;
-        if cache_behavior.do_lookup && l2_allowed && !skip_l2 {
-            if let Some(l2) = state.l2.as_ref() {
-                // Current catalog rate for the (post-routing) request model —
-                // the legacy-row fallback in `l2_entry_baseline`. The entry's
-                // model always equals `req.model` here (lookup filters on it).
-                let current_pricing = provider.pricing(&req.model);
-                if let Some(result) = try_l2_hit(
-                    &state,
-                    l2,
-                    &ctx,
-                    &req,
-                    current_pricing.as_ref(),
-                    state.request_log_writer.as_ref(),
-                    trace_id,
-                    request_started,
-                    matched_route_id,
-                    route_paused,
-                    retrieval_telemetry.tokens_saved,
-                    route_matched_name.as_deref(),
-                    &raw_bearer,
-                    judge_source_provider.as_ref(),
-                    judge_source_ctx.as_ref(),
-                    judge_original_req.as_ref(),
-                    &mut l2_lookup_vec,
-                )
-                .await
-                {
-                    // No format_switch token here: switched requests skip L2
-                    // entirely (`skip_l2`), so an L2 hit is never switched.
-                    return result.map(|mut resp| {
-                        attach_warning_tokens(resp.headers_mut(), &warnings);
-                        resp
-                    });
-                }
-            }
-        }
-
-        // 3b.5. Single-flight coalescing for cache-eligible non-streaming requests.
-        //
-        // When multiple concurrent requests share the same L1 key and all miss
-        // L1+L2, only the FIRST (leader) dispatches to the provider.  The rest
-        // (followers) wait up to FOLLOWER_TIMEOUT and then re-read L1; if the
-        // leader has populated it they serve from cache.  If the leader fails or
-        // the timeout fires, followers fall through to their own provider dispatch
-        // (correctness over coalescing).
-        //
-        // Scope: cache-eligible, do_lookup=true, non-streaming, L1 configured.
-        // Streaming single-flight is a follow-up (broadcasting an SSE stream to
-        // multiple waiters is non-trivial).
-        let mut single_flight_guard = None::<crate::single_flight::LeaderGuard>;
-        if cache_behavior.do_lookup {
-            if let Some(sf_key) = l1_key.as_deref() {
-                match state.single_flight.try_become_leader(sf_key) {
-                    Ok(guard) => {
-                        // We are the leader — proceed to provider dispatch below
-                        // and call guard.complete() after populating L1.
-                        tracing::debug!(key = %sf_key, "single-flight: became leader");
-                        single_flight_guard = Some(guard);
-                    }
-                    Err(rx) => {
-                        // We are a follower — wait for the leader to finish.
-                        tracing::debug!(key = %sf_key, "single-flight: following leader");
-                        let populated = wait_for_leader(rx).await;
-                        if populated {
-                            // Re-read L1; if it's there, serve it directly.
-                            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key.as_deref()) {
-                                match l1.cache.get(key).await {
-                                    Ok(Some(bytes)) => match L1Entry::from_bytes(&bytes) {
-                                        Ok(entry) => {
-                                            tracing::debug!(
-                                                key = %key,
-                                                "single-flight: follower served from populated L1"
-                                            );
-                                            spawn_request_log(
-                                                state.telemetry_tracker.as_ref(),
-                                                state.request_log_writer.as_ref(),
-                                                request_log_for_l1_hit(
-                                                    &entry,
-                                                    &ctx,
-                                                    trace_id,
-                                                    request_started,
-                                                    matched_route_id,
-                                                    route_paused,
-                                                    retrieval_telemetry.tokens_saved,
-                                                ),
-                                            );
-                                            let mut resp = with_route_matched(
-                                                build_hit_l1_response(entry, trace_id),
-                                                route_matched_name.as_deref(),
-                                            );
-                                            // Same advertisement contract as
-                                            // the direct L1-hit return above.
-                                            if let Some(plan) = format_switch_plan.as_ref() {
-                                                warnings
-                                                    .push(format!("format_switch:{}", plan.label));
-                                            }
-                                            attach_warning_tokens(resp.headers_mut(), &warnings);
-                                            return Ok(resp);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                error = %e,
-                                                key = %key,
-                                                "single-flight: follower L1 re-read deserialized failed, falling through"
-                                            );
-                                        }
-                                    },
-                                    Ok(None) => {
-                                        tracing::debug!(
-                                            key = %key,
-                                            "single-flight: follower L1 re-read empty, falling through"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "single-flight: follower L1 re-read error, falling through"
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
-                            tracing::debug!(
-                                key = %sf_key,
-                                "single-flight: leader failed or timed out, follower dispatching independently"
-                            );
-                        }
-                        // Fall through to provider dispatch (leader failed /
-                        // L1 re-read miss / timeout).
-                    }
-                }
-            }
-        }
-
-        // 3c. No cache hit — dispatch to provider. When the matched route
-        //     declared fallbacks, fail over across the candidate chain
-        //     (primary first, then each fallback) skipping providers whose
-        //     circuit breaker is open; otherwise dispatch the single provider
-        //     with retry. `provider` is rebound to whichever provider actually
-        //     served the request so cost/headers/telemetry below reflect it.
-        let __primary = provider.id();
-        let primary_dispatch = with_request_timeout(request_timeout, async {
-            if route_fallbacks.is_empty() {
-                let __started = std::time::Instant::now();
-                let __dispatch = with_retry(&RetryPolicy::default(), || {
-                    provider.chat_completion(req.clone(), &ctx)
-                })
-                .await;
-                let __elapsed = __started.elapsed();
-                crate::metrics::record_provider_latency(provider.id(), "chat", __elapsed);
-                // Feed the rolling p95 window (the live signal behind the
-                // `upstream_latency_ms_p95_gt` route condition) on success only —
-                // errored/short-circuited dispatches aren't representative
-                // upstream latency. Keyed by the served `(provider, model)`.
-                if __dispatch.is_ok() {
-                    let __ms = u32::try_from(__elapsed.as_millis()).unwrap_or(u32::MAX);
-                    state
-                        .latency_tracker
-                        .record(provider.id(), &req.model, __ms);
-                }
-                __dispatch
-                    .map(|resp| (provider, resp))
-                    .map_err(ApiError::from)
-            } else {
-                // Build the capability check for the failover path.
-                let cap_required = tt_shared::RequiredCapabilities::from_request(&req);
-                let cap_est_tokens = {
-                    let combined = tt_shared::message_text_for_estimation(&req);
-                    tt_tokenize::estimate_tokens(provider.id(), &combined) as u64
-                };
-                crate::failover::dispatch_with_failover(
-                    &state.registry,
-                    &state.breaker,
-                    &RetryPolicy::default(),
-                    &failover_candidates,
-                    &req,
-                    &ctx,
-                    &failover_creds,
-                    Utc::now(),
-                    Some(crate::failover::CapCheck {
-                        required: &cap_required,
-                        estimated_tokens: cap_est_tokens,
-                    }),
-                )
-                .await
-                .map_err(ApiError::from)
-            }
-        });
-
-        // Canary SHADOW dispatch (#454): when the matched route declares a
-        // `shadow_model`, run it CONCURRENTLY with the primary — same prompt,
-        // shadow model, non-streaming, single candidate, NO failover, its own
-        // short deadline. The shadow response is DISCARDED; only its cost is kept
-        // (in a separate column / span attr). Opt-in only: `route_shadow_model`
-        // is None for every request whose route did not set it, so the default
-        // path runs the primary alone with zero added work. We base the shadow on
-        // `req` AFTER redaction/compression so it exercises the exact prompt the
-        // primary dispatches. `tokio::join!` polls both on this task so the
-        // shadow never blocks the primary beyond their concurrent overlap.
-        let (dispatch_result, shadow_outcome): (ApiResult<_>, Option<ShadowOutcome>) =
-            if let Some(shadow_model) = route_shadow_model.as_deref() {
-                let shadow_fut = dispatch_shadow(&state, &ctx, &req, shadow_model, &raw_bearer);
-                let (primary, shadow) = tokio::join!(primary_dispatch, shadow_fut);
-                (primary, Some(shadow))
-            } else {
-                (primary_dispatch.await, None)
-            };
-
-        // Attributed to the primary provider: the request deadline spans any
-        // failover loop, so the in-flight candidate at timeout isn't known here
-        // without threading it out of dispatch_with_failover.
-        if matches!(dispatch_result, Err(ApiError::RequestTimeout { .. })) {
-            crate::metrics::record_provider_timeout(__primary, "chat");
-        }
-
-        // 3c-neg. Negative-cache write on deterministic client errors.
-        //
-        // When the provider returned a deterministic 4xx (e.g. InvalidRequest /
-        // ProviderUpstream 400..=499 excluding 429), store a short-lived entry
-        // in L1 under "neg:{l1_key}" so identical repeat requests are served
-        // from the negative cache instead of re-hitting the provider.
-        //
-        // Gated on cache_behavior.do_insert — the same flag used for positive
-        // cache inserts — so Bypass/ReadOnly mode suppresses negative caching
-        // as well as positive caching.
-        //
-        // NEVER caches: 429/RateLimited, timeout, 5xx, network, internal errors.
-        if let Err(ref err) = dispatch_result {
-            if cache_behavior.do_insert && is_deterministic_client_error(err) {
-                if let (Some(l1), Some(pos_key)) = (state.l1.as_ref(), l1_key.as_ref()) {
-                    let neg_key = negative_l1_key(pos_key);
-                    let entry = NegativeCacheEntry {
-                        status: error_status_code(err),
-                        message: err.to_string(),
-                    };
-                    match serde_json::to_vec(&entry) {
-                        Ok(bytes) => {
-                            let l1_clone = l1.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = l1_clone
-                                    .cache
-                                    .set(&neg_key, &bytes, NEGATIVE_CACHE_TTL_SECS)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        error = %e,
-                                        key = %neg_key,
-                                        "negative cache insert failed"
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        key = %neg_key,
-                                        "negative cache entry stored"
-                                    );
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "negative cache entry serialization failed"
-                            );
-                        }
-                    }
-                }
-            }
-            // Also drop any single-flight guard so followers don't wait forever.
-            drop(single_flight_guard.take());
-        }
-
-        let (provider, response) = dispatch_result?;
-        let mut response = response;
-
-        // ── Response-side output shaping (research Phase 3.3 + 3.4) ─────────
-        //
-        // Runs BEFORE pricing/caching/telemetry so every downstream consumer
-        // (cost math, L1 envelope, request_logs, judge) sees the response the
-        // CALLER receives. Neither arm can 5xx: format-switch fails OPEN
-        // (untouched body), diff fails CLOSED to a full re-emit — and if even
-        // the re-emit dispatch errors, the raw patch passes through marked
-        // `diff_degraded` (a 5xx after a successful upstream call is the
-        // worst outcome).
-        let mut shape_effects = crate::shaping::ShapeEffects::default();
-        let mut format_switch_outcome: Option<&'static str> = None;
-        let mut format_switch_failed = false;
-        let mut diff_applied = false;
-        let mut diff_failed = false;
-        if let Some(plan) = format_switch_plan.as_ref() {
-            // Tool-call-only responses yield empty assistant text → the
-            // validator rejects → fail-open, same arm as a prose mismatch.
-            let body = response_assistant_text(&response);
-            // Truncation gate FIRST: a max-token-cut emission can end
-            // exactly at a record-line boundary and pass the per-line arity
-            // check, silently serving a SHORTER record set than the model
-            // intended — whereas the JSON contract being replaced would
-            // have been detectably invalid on truncation. The switched
-            // contract must not be weaker, so a non-"stop" finish_reason
-            // fails OPEN like any other validation mismatch.
-            let validated = if response_emission_truncated(&response) {
-                Err("truncated")
-            } else {
-                crate::shaping::format_switch::validate_switched_body(&body, &plan.format)
-            };
-            match validated {
-                Ok(stripped) => {
-                    // Tokenizer-grounded ESTIMATE only (labeled "Est"
-                    // everywhere): not computable ⇒ book $0 + meter.
-                    match crate::shaping::format_switch::estimate_saved_tokens(
-                        provider.id(),
-                        &response.model,
-                        &stripped,
-                        &plan.format,
-                    ) {
-                        Some(saved_tokens) => {
-                            if let Some(p) = provider.pricing(&response.model) {
-                                shape_effects.format_switch_saved_est_usd =
-                                    f64::from(saved_tokens) * p.output_per_million / 1_000_000.0;
-                            }
-                        }
-                        None => crate::metrics::record_format_switch_unestimated(),
-                    }
-                    set_assistant_text(&mut response, stripped);
-                    warnings.push(format!("format_switch:{}", plan.label));
-                    format_switch_outcome = Some(plan.label);
-                    crate::metrics::record_format_switch(plan.label, "applied");
-                }
-                Err(_reason) => {
-                    // Fail OPEN: the body passes through untouched, $0
-                    // booked, and 3e below never caches an unswitched body
-                    // under the switched key.
-                    warnings.push(format!("format_switch_failed:{}", plan.label));
-                    format_switch_failed = true;
-                    crate::metrics::record_format_switch(plan.label, "failed");
-                }
-            }
-        }
-        if let Some(plan) = diff_plan.as_ref() {
-            let patch_text = response_assistant_text(&response);
-            // Truncation gate FIRST (fail closed): a patch cut by the
-            // provider's token limit exactly at a `>>>>>>> REPLACE`
-            // boundary parses as a valid-but-INCOMPLETE multi-block patch
-            // and would silently serve a PARTIALLY edited artifact — the
-            // unique-anchor and JSON-validity checks cannot detect a
-            // missing trailing block. Mid-block truncation already fails
-            // closed as Malformed; this closes the boundary case.
-            let reconstructed = if response_emission_truncated(&response) {
-                Err(crate::shaping::diff::DiffError::Truncated)
-            } else {
-                crate::shaping::diff::reconstruct(plan, &patch_text)
-            };
-            match reconstructed {
-                Ok(artifact) => {
-                    // MEASURED saving: both sides are real tokenizer counts
-                    // on real strings — the reconstructed artifact the caller
-                    // receives vs the patch tokens the provider billed.
-                    let artifact_tokens = tt_tokenize::estimate_tokens_for_model(
-                        provider.id(),
-                        &response.model,
-                        &artifact,
-                    );
-                    let billed =
-                        u32::try_from(response.usage.completion_tokens).unwrap_or(u32::MAX);
-                    shape_effects.diff_output_tokens_saved = artifact_tokens.saturating_sub(billed);
-                    set_assistant_text(&mut response, artifact);
-                    // `usage` deliberately STAYS the provider-billed patch
-                    // usage — the invoice shows the short patch; the savings
-                    // being real is the point (documented contract).
-                    warnings.push("diff_applied".to_string());
-                    diff_applied = true;
-                    crate::metrics::record_diff("applied", "");
-                }
-                Err(e) => {
-                    // FAIL CLOSED → full re-emit. Book the failed attempt's
-                    // realized (pre-fee) cost first — it is real invoice
-                    // spend.
-                    let patch_pricing = provider.pricing(&response.model);
-                    shape_effects.diff_failed_cost_usd = compute_cost(
-                        &response.usage,
-                        patch_pricing.as_ref(),
-                        patch_pricing.as_ref(),
-                        1.0,
-                    )
-                    .cost_usd;
-                    warnings.push(format!("diff_failed:{}", e.reason()));
-                    diff_failed = true;
-                    crate::metrics::record_diff("failed", e.reason());
-                    // The re-emit request is derived from the DISPATCHED
-                    // request — drop the patch instruction, restore the
-                    // caller's response_format — NOT from a pre-pipeline
-                    // clone, so it inherits every dispatch-path
-                    // normalization: the redaction guardrail (a
-                    // redact+diff route's re-emit must never out-leak the
-                    // dispatch path — same invariant that skips the judge
-                    // wholesale on redact routes), compression, the flex
-                    // tier (`compute_cost_full` prices the metered re-emit
-                    // usage with `flex_applied`), and the temperature
-                    // clamp. The restored response_format then needs the
-                    // provider-compat downgrade the patch dispatch never
-                    // needed (its response_format was None).
-                    let mut reemit_req = req.clone();
-                    crate::shaping::diff::unapply_diff_request(&mut reemit_req, plan);
-                    maybe_downgrade_response_format(
-                        &mut reemit_req,
-                        provider.as_ref(),
-                        &mut warnings,
-                    );
-                    // Single provider, no failover chain — the chain already
-                    // chose this provider for the patch dispatch.
-                    let reemit = with_request_timeout(request_timeout, async {
-                        with_retry(&RetryPolicy::default(), || {
-                            provider.chat_completion(reemit_req.clone(), &ctx)
-                        })
-                        .await
-                        .map_err(ApiError::from)
-                    })
-                    .await;
-                    match reemit {
-                        Ok(full) => response = full,
-                        Err(err) => {
-                            // Last resort: never 5xx after a successful
-                            // upstream call — serve the raw patch response
-                            // marked degraded. The trace billed exactly ONE
-                            // dispatch (the failed re-emit errored, nothing
-                            // billed), and that dispatch IS the response
-                            // being metered below — so the separate
-                            // failed-attempt booking must be zeroed or
-                            // cost_usd would double-count the patch call.
-                            shape_effects.diff_failed_cost_usd = 0.0;
-                            tracing::warn!(
-                                error = %err,
-                                "diff fail-closed re-emit dispatch failed — serving raw patch marked diff_degraded"
-                            );
-                            warnings.push("diff_degraded".to_string());
-                            crate::metrics::record_diff("degraded", "reemit_error");
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3d. Compute cost via provider pricing table BEFORE caching — the L1
-        //     envelope carries baseline_cost_usd so hit responses can report
-        //     accurate savings without re-running pricing later.
-        let pricing = provider.pricing(&response.model);
-
-        // Warn when a model is absent from the pricing catalog so the request
-        // is priced at $0. This is distinct from a local provider (ollama,
-        // vllm, lmstudio) where pricing() intentionally returns Some(zero) —
-        // those providers never return None. A None here means the model is
-        // simply missing from data/pricing.toml and the cost will be recorded
-        // as zero, silently under-counting spend. Update pricing.toml to fix.
-        if pricing.is_none() {
-            tracing::warn!(
-                provider = provider.id(),
-                model = %response.model,
-                "model absent from pricing catalog — request cost recorded as $0; \
-                 update data/pricing.toml to restore accurate cost tracking"
-            );
-            metrics::counter!(
-                "catalog_zero_price_total",
-                "provider" => provider.id(),
-                "model" => response.model.clone(),
-            )
-            .increment(1);
-        }
-
-        // Baseline is priced against the originally-requested model when a route
-        // rewrote it; otherwise against the served model (same pricing → no
-        // routing saving, only cache/discount savings).
-        let baseline_pricing = if matched_route_id.is_some() {
-            requested_pricing.clone()
-        } else {
-            pricing.clone()
-        };
-        // Minify ESTIMATE (research Phase 3.1): grounded in the actual
-        // emission — the pretty re-render of the emitted JSON re-tokenized
-        // with the served model's tokenizer, minus the tokens actually
-        // emitted. 0 when the instruction was not injected or the response is
-        // not valid JSON (no claim).
-        let minify_saved_tokens = if minify_applied {
-            minify_saved_tokens_est(provider.id(), &response.model, &response)
-        } else {
-            0
-        };
-        let cost_breakdown = compute_cost_full(
-            &response.usage,
-            pricing.as_ref(),
-            baseline_pricing.as_ref(),
-            provider.fee_multiplier(),
+        // Non-streaming: hand the prepared per-request setup to `complete_once`
+        // (the carved, reusable completion pipeline the future server-side
+        // agent loop also calls per turn) and assemble the HTTP response from
+        // its typed outcome. A cache hit already built its client `Response`;
+        // a dispatched completion returns the typed body + header metadata.
+        let prepared = Prepared {
+            provider,
+            req,
+            cache_behavior,
+            l2_allowed,
+            skip_l2,
+            route_matched_name,
+            matched_route_id,
+            route_paused,
+            requested_model,
+            requested_pricing,
+            format_switch_plan,
+            diff_plan,
+            pass_effects,
+            minify_applied,
+            reasoning_capped,
             flex_applied,
             batch_marked,
-            pass_effects,
-            minify_saved_tokens,
-            shape_effects,
-        );
-        if minify_applied {
-            crate::metrics::record_minify_estimate(
-                route_matched_name.as_deref().unwrap_or("none"),
-                minify_saved_tokens,
-                cost_breakdown.minify_saved_est_usd,
-            );
-        }
-        let cost_usd = cost_breakdown.cost_usd;
-        let baseline_cost_usd = cost_breakdown.baseline_cost_usd;
-        // headline saved_usd (header) is TT-attributed only — the provider's
-        // automatic cache discount is excluded by `CostBreakdown::tt_saved_usd`
-        // and surfaced via its own header/ledger field.
-        let provider_cache_saved_usd = cost_breakdown.provider_cache_saved_usd;
-
-        // Record realized spend into the same enforcer the pre-flight check uses
-        // (dynamic_budget on the tier-aware path) so the monthly_cap_usd hard stop trips.
-        state.spend_sink().record(ctx.org_id, cost_usd, Utc::now());
-
-        let provider_id = provider.id().to_string();
-        let model_used = response.model.clone();
-        // Token counts for the request-span attributes, captured before
-        // `response` is moved into the HTTP body below.
-        let input_tokens = response.usage.prompt_tokens;
-        let output_tokens = response.usage.completion_tokens;
-
-        // 3e. Best-effort L1 insert. Gated on do_insert (Fix A + Fix B) and
-        //     the response not containing tool_calls (non-deterministic output).
-        //     Errors are logged but never block the request.
-        //
-        //     Single-flight note: when this request is the single-flight leader
-        //     we must ensure the L1 entry is visible before signalling followers.
-        //     To do that we await the insert inline (rather than spawning it) and
-        //     then call guard.complete().  When no guard is held the normal
-        //     fire-and-forget spawn is used so the non-coalesced path is unchanged.
-        let response_has_tools = response_has_tool_calls(&response);
-        // `!format_switch_failed`: a fail-open (unswitched) body must never
-        // be cached under the switched request's key — every hit under a
-        // switched key must be genuinely switched (the hit-path
-        // advertisement above depends on this invariant).
-        if cache_behavior.do_insert && !response_has_tools && !format_switch_failed {
-            if let (Some(l1), Some(key)) = (state.l1.as_ref(), l1_key) {
-                let entry = L1Entry::new(
-                    response.clone(),
-                    baseline_cost_usd,
-                    cost_usd,
-                    provider_id.clone(),
-                );
-                match entry.to_bytes() {
-                    Ok(bytes) => {
-                        let l1_clone = l1.clone();
-                        // TTL priority: tt_extras override > tier-based TTL >
-                        // L1 config default (spec §8.4 / rv-per-tier-ttl).
-                        let ttl = effective_ttl_secs(
-                            cache_behavior.ttl_secs,
-                            caller_tier,
-                            l1_clone.ttl_secs,
-                        );
-                        if let Some(guard) = single_flight_guard.take() {
-                            // Leader path: await the insert so followers can
-                            // read it from L1 immediately after we signal them.
-                            if let Err(e) = l1_clone.cache.set(&key, &bytes, ttl).await {
-                                tracing::warn!(error = %e, "l1 cache insert failed (leader)");
-                                // Drop guard without calling complete() — followers
-                                // will fall through to their own dispatch.
-                                drop(guard);
-                            } else {
-                                // Insert succeeded; signal followers.
-                                guard.complete();
-                            }
-                        } else {
-                            // Non-leader path: fire-and-forget as before.
-                            tokio::spawn(async move {
-                                if let Err(e) = l1_clone.cache.set(&key, &bytes, ttl).await {
-                                    tracing::warn!(error = %e, "l1 cache insert failed");
-                                }
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "l1 envelope serialization failed");
-                        // Guard drops here (single_flight_guard still Some if
-                        // we didn't take it above); followers fall through.
-                        drop(single_flight_guard.take());
-                    }
-                }
-            } else {
-                // No L1 configured — drop any guard so followers fall through.
-                drop(single_flight_guard.take());
-            }
-        } else {
-            // Insert skipped (tool calls or do_insert=false) — drop guard so
-            // followers are not left waiting indefinitely.
-            drop(single_flight_guard.take());
-        }
-
-        // 3f. Best-effort L2 insert. Same gate as L1, plus the format-switch
-        // L2 opt-out (`skip_l2`): a switched body must never become a
-        // similarity-served answer for an unswitched near-duplicate.
-        if cache_behavior.do_insert && !response_has_tools && l2_allowed && !skip_l2 {
-            if let Some(l2) = state.l2.as_ref() {
-                if let Some(query_text) = l2_context_text(&req) {
-                    let l2_provider_id = provider_id.clone();
-                    let l2_model_used = response.model.clone();
-                    let response_clone = response.clone();
-                    let l2_clone = l2.clone();
-                    let org_id = ctx.org_id;
-                    // TTL priority: tt_extras override > tier-based TTL >
-                    // L2_DEFAULT_TTL (spec §8.4 / rv-per-tier-ttl).
-                    let l2_ttl_secs = effective_ttl_secs(
-                        cache_behavior.ttl_secs,
-                        caller_tier,
-                        L2_DEFAULT_TTL.as_secs(),
-                    );
-                    // Volatility-class TTL (opt-in, shorten-only, L2-scoped):
-                    // a volatile query's entry expires sooner so a stale
-                    // realtime answer can't be re-served for the full base
-                    // TTL. An explicit tt_extras override always wins.
-                    let l2_ttl_secs = crate::cache_volatility::l2_ttl_with_volatility(
-                        l2_ttl_secs,
-                        cache_behavior.ttl_secs.is_some(),
-                        &query_text,
-                        l2.volatility_ttl.as_ref(),
-                    );
-                    // Store the catalog-derived baseline on the row so later
-                    // hits report honest savings. None (→ NULL) when the model
-                    // is absent from the catalog: the hit path then re-prices
-                    // against the catalog current at hit time instead of
-                    // freezing a meaningless $0.
-                    let l2_baseline = pricing.as_ref().map(|_| baseline_cost_usd);
-                    // Reuse the embedding the L2 lookup already computed for the
-                    // identical query text (COST-3); `None` when no lookup ran
-                    // (e.g. do_lookup=false) — `insert_into_l2` then embeds.
-                    let l2_lookup_embedding = l2_lookup_vec.take();
-                    tokio::spawn(async move {
-                        insert_into_l2(
-                            l2_clone,
-                            org_id,
-                            &query_text,
-                            response_clone,
-                            l2_provider_id,
-                            l2_model_used,
-                            l2_ttl_secs,
-                            l2_baseline,
-                            l2_lookup_embedding,
-                        )
-                        .await;
-                    });
-                }
-            }
-        }
-
-        // 3g. Best-effort request_logs row. Cache-miss path: cached=false,
-        //     cache_layer=None. L1/L2-hit paths log their own rows where
-        //     they early-return.
-        //
-        // Canary shadow attribution: when a shadow fired, record its model +
-        // cost in their OWN columns (NEVER folded into `cost_usd`). `shadow_cost`
-        // is `Some` only when the shadow succeeded (a failed shadow still logs
-        // its model with `None` cost so the attempt is auditable). The doubled
-        // spend is thus visible and reconcilable as a distinct experiment cost.
-        let shadow_model_logged = shadow_outcome.as_ref().map(|s| s.model.clone());
-        let shadow_cost_logged = shadow_outcome
-            .as_ref()
-            .filter(|s| s.succeeded)
-            .map(|s| s.cost_usd);
-        spawn_request_log(
-            state.telemetry_tracker.as_ref(),
-            state.request_log_writer.as_ref(),
-            RequestLogRow {
-                id: Uuid::now_v7(),
-                org_id: ctx.org_id,
-                api_key_id: ctx.api_key_id,
-                ts: Utc::now(),
-                provider: provider_id.clone(),
-                model: model_used.clone(),
-                input_tokens: response.usage.prompt_tokens as i32,
-                output_tokens: response.usage.completion_tokens as i32,
-                cached_tokens: response.usage.cached_tokens as i32,
-                cost_usd,
-                baseline_cost_usd,
-                provider_cache_saved_usd,
-                // Fee-applied, matching the header/span figure — keeps the
-                // row-derived TT headline equal to `tt_saved_usd()`.
-                cache_bust_penalty_usd: cost_breakdown.cache_bust_penalty_usd,
-                cached: false,
-                cache_layer: None,
-                route_id: matched_route_id,
-                latency_ms: request_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
-                upstream_latency_ms: None,
-                status: 200,
-                tag: ctx.tag.clone(),
-                error_class: None,
-                trace_id: Some(trace_id.to_string()),
-                truncated: false,
-                shadow_model: shadow_model_logged.clone(),
-                shadow_cost_usd: shadow_cost_logged,
-                traffic_split_arm: traffic_split_arm_owned.clone(),
-                // Raw provider prompt-cache counts (research Phase 0.2):
-                // None (NULL) when the provider didn't report the field,
-                // Some(0) when it explicitly reported zero. The shadow
-                // dispatch is discarded — only the SERVED response's cache
-                // telemetry is recorded (shadow cost has its own columns).
-                cache_read_input_tokens: opt_tokens_i32(response.usage.cache_read_input_tokens),
-                cache_creation_input_tokens: opt_tokens_i32(
-                    response.usage.cache_creation_input_tokens,
-                ),
-                // Advisory batch-eligibility marker (research Phase 2.1).
-                // `batch_eligible` records route INTENT (the marker survived
-                // the hard-ineligibility gate); `batch_forgone_usd` is the
-                // PRICED claim — 0.0 when failover served a model with no
-                // catalog batch tier, while `batch_eligible` stays true so the
-                // route's intent remains auditable.
-                batch_eligible: batch_marked,
-                batch_forgone_usd: cost_breakdown.batch_forgone_usd,
-                route_paused,
-                // ESTIMATED minify saving — own column (migration 0020),
-                // never folded into cost/baseline/saved.
-                minify_saved_est_usd: cost_breakdown.minify_saved_est_usd,
-                // Output shaping (research Phase 3.3 + 3.4). `format_switched`
-                // is set ONLY on a VALIDATED switch; the est/saved/failed-cost
-                // figures come from the same breakdown the headers carry.
-                format_switched: format_switch_outcome.map(str::to_string),
-                format_switch_saved_est_usd: cost_breakdown.format_switch_saved_est_usd,
-                diff_applied,
-                diff_saved_usd: cost_breakdown.diff_saved_usd,
-                diff_failed,
-                diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
-                retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
-            },
-        );
-
-        // Whether this trace's body was actually handed to the capture sink for
-        // persistence: `capture_request_json` is `Some` only when a writer is
-        // armed, the org is non-anonymous, AND the org opted in
-        // (`is_capture_enabled` above), so the header reflects a body that was
-        // truly stored. Captured before the Option is consumed so the response
-        // can advertise it.
-        let body_captured = capture_request_json.is_some();
-        if let Some(request_json) = capture_request_json {
-            let response_json = match serde_json::to_vec(&response) {
-                Ok(bytes) => Some(bytes),
-                Err(e) => {
-                    tracing::warn!(error = %e, "response body capture serialization failed");
-                    None
-                }
-            };
-            spawn_body_capture(
-                state.telemetry_tracker.as_ref(),
-                state.body_capture_writer.as_ref(),
-                BodyCaptureRecord {
-                    org_id: ctx.org_id,
-                    api_key_id: ctx.api_key_id,
-                    trace_id: trace_id.to_string(),
-                    endpoint: "/v1/chat/completions".into(),
-                    provider: provider_id.clone(),
-                    model: model_used.clone(),
-                    request_json,
-                    response_json,
-                    ts: Utc::now(),
-                },
-            );
-        }
-
-        // Per-route provider-cache counters from the same authoritative usage
-        // the row records.
-        crate::metrics::record_provider_cache_usage(
-            &provider_id,
-            route_matched_name.as_deref(),
-            response.usage.cache_read_input_tokens,
-            response.usage.cache_creation_input_tokens,
-        );
-
-        // 3h. Sampled async quality judge on rerouted-DOWN traffic. Spawns a
-        //     detached task ONLY when: the judge is enabled + a sink is wired,
-        //     a route rewrote the model, the served model is cheaper than the
-        //     originally-requested one (a true downgrade priced on realized
-        //     usage), this task class (chat-completions) is in scope, and the
-        //     trace falls in the deterministic ~2% sample. The judge runs AFTER
-        //     this point and never touches `http_response`, so it adds ZERO
-        //     latency to the user request (see `quality_sample::spawn_quality_judge`).
-        maybe_spawn_quality_judge(
-            &state,
-            matched_route_id,
-            &requested_model,
-            &response,
-            requested_pricing.as_ref(),
-            pricing.as_ref(),
-            // Output-shaped requests are judge-eligible even without a price
-            // downgrade — the un-shaped pre-routing capture is the paired
-            // counterfactual.
-            minify_applied || reasoning_capped,
-            trace_id,
-            ctx.org_id,
-            &raw_bearer,
+            caller_tier,
+            traffic_split_arm_owned,
+            route_traffic_pct,
+            route_shadow_model,
+            failover_candidates,
+            failover_creds,
+            route_fallbacks,
+            warnings,
+            request_timeout,
+            raw_bearer,
+            retrieval_telemetry,
+            request_started,
+            capture_request_json,
             judge_source_provider,
             judge_source_ctx,
             judge_original_req,
-            // A shaped response (validated format-switch or applied diff)
-            // samples the judge even without a model downgrade — shaping is
-            // exactly what the #155 gate exists to police.
-            format_switch_outcome.is_some() || diff_applied,
-        );
-
-        // 5. Serialize body and attach TokenTrimmer extension headers.
-        let mut http_response = Json(response).into_response();
-        attach_cost_headers(
-            http_response.headers_mut(),
-            trace_id,
-            &provider_id,
-            &model_used,
-            &cost_breakdown,
-        );
-        // Cache state: miss when ANY cache layer is configured but didn't hit;
-        // none when both are disabled.
-        let cache_state = if state.l1.is_some() || state.l2.is_some() {
-            "miss"
-        } else {
-            "none"
         };
-        if let Ok(v) = cache_state.parse() {
-            http_response
-                .headers_mut()
-                .insert("x-tokentrimmer-cache", v);
-        }
-        if let Some(name) = route_matched_name.as_deref() {
-            if let Ok(v) = name.parse() {
-                http_response
-                    .headers_mut()
-                    .insert("x-tokentrimmer-route-matched", v);
+        match complete_once(&state, &ctx, prepared).await? {
+            // Cache hit (L1 / L2 / negative cache / single-flight follower):
+            // the fully-built client response is returned verbatim.
+            CompletionOutcome::CacheHit(resp) => Ok(resp),
+            // Dispatched completion: build the HTTP response from the typed
+            // body + the cost/route/cache/warning metadata, via the same
+            // `attach_cost_headers` / `attach_warnings` the tail used inline.
+            CompletionOutcome::Dispatched { response, headers } => {
+                let CompletionHeaders {
+                    trace_id,
+                    provider_id,
+                    model_used,
+                    cost_breakdown,
+                    cache_state,
+                    route_matched_name,
+                    body_captured,
+                    req,
+                    provider,
+                    warnings,
+                } = *headers;
+
+                // 5. Serialize body and attach TokenTrimmer extension headers.
+                let mut http_response = Json(response).into_response();
+                attach_cost_headers(
+                    http_response.headers_mut(),
+                    trace_id,
+                    &provider_id,
+                    &model_used,
+                    &cost_breakdown,
+                );
+                if let Ok(v) = cache_state.parse() {
+                    http_response
+                        .headers_mut()
+                        .insert("x-tokentrimmer-cache", v);
+                }
+                if let Some(name) = route_matched_name.as_deref() {
+                    if let Ok(v) = name.parse() {
+                        http_response
+                            .headers_mut()
+                            .insert("x-tokentrimmer-route-matched", v);
+                    }
+                }
+                // Present ONLY when the org opted in and the request+response
+                // bodies were persisted to the encrypted capture sink — absent
+                // on the default (capture-off) path AND for armed-but-not-opted-in
+                // orgs, which both stay byte-identical.
+                if body_captured {
+                    http_response.headers_mut().insert(
+                        "x-tokentrimmer-captured",
+                        axum::http::HeaderValue::from_static("true"),
+                    );
+                }
+                attach_warnings(
+                    http_response.headers_mut(),
+                    provider.as_ref(),
+                    &req,
+                    &model_used,
+                    &warnings,
+                );
+                Ok(http_response)
             }
         }
-        // Present ONLY when the org opted in and the request+response bodies
-        // were persisted to the encrypted capture sink — absent on the default
-        // (capture-off) path AND for armed-but-not-opted-in orgs (the
-        // `is_capture_enabled` gate above), which both stay byte-identical.
-        if body_captured {
-            http_response.headers_mut().insert(
-                "x-tokentrimmer-captured",
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
-
-        // Record OTel GenAI semconv + TokenTrimmer cost attributes on the
-        // request span from the same per-request values the headers carry (no
-        // recompute). The served model may differ from the requested one after
-        // routing / cross-model failover.
-        record_request_span_attributes(
-            &requested_model,
-            &model_used,
-            &provider_id,
-            span_cost(&cost_breakdown, input_tokens, output_tokens),
-            cache_state,
-            route_matched_name.as_deref(),
-            // Canary span attributes — additive; each omitted when its value is
-            // None (no split / no shadow). The shadow cost is recorded SEPARATELY
-            // here, never folded into `tokentrimmer.cost_usd` (carried by
-            // `cost_breakdown` above).
-            route_traffic_pct,
-            shadow_model_logged.as_deref(),
-            shadow_cost_logged,
-        );
-        attach_warnings(
-            http_response.headers_mut(),
-            provider.as_ref(),
-            &req,
-            &model_used,
-            &warnings,
-        );
-        Ok(http_response)
     }
 }
 
