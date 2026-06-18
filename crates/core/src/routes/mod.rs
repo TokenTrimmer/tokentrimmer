@@ -3,6 +3,7 @@
 
 pub mod chat;
 pub mod embeddings;
+pub(crate) mod gateway_tools;
 pub mod health;
 pub mod messages;
 pub mod metrics;
