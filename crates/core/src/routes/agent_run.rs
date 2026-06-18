@@ -76,6 +76,38 @@ pub trait TurnCompleter: Send + Sync {
     async fn complete(&self, req: ChatCompletionRequest) -> Result<(Message, RunUsage), ApiError>;
 }
 
+/// A turn is "mechanical" when the model is about to digest ONLY read-only tool
+/// output: scanning back over the trailing `Message::Tool` results to the
+/// assistant turn that produced them, that assistant turn called >=1 tool and
+/// EVERY tool_call is read-only (`classify_substep == ReadOnly`). Conservative:
+/// any client/mutating tool in that turn — or no preceding assistant tool turn
+/// (e.g. the first turn, or a plain user/assistant message) — => not mechanical.
+#[allow(dead_code)] // wired in Task 2 (threaded through TurnCompleter::complete → prepare)
+fn is_mechanical_continuation(messages: &[tt_shared::messages::Message]) -> bool {
+    use crate::passes::agentic_budget::substep_cache::{classify_substep, SubstepKind};
+    use tt_shared::messages::Message;
+    // Walk back over trailing Tool results.
+    let mut i = messages.len();
+    let mut saw_tool_result = false;
+    while i > 0 {
+        match &messages[i - 1] {
+            Message::Tool { .. } => {
+                saw_tool_result = true;
+                i -= 1;
+            }
+            Message::Assistant { tool_calls, .. } if saw_tool_result => {
+                // The assistant turn whose tool results we just appended.
+                return !tool_calls.is_empty()
+                    && tool_calls
+                        .iter()
+                        .all(|tc| classify_substep(&tc.function.name) == SubstepKind::ReadOnly);
+            }
+            _ => return false, // a non-Tool, non-producing message (or no tool results) => not mechanical
+        }
+    }
+    false
+}
+
 /// Default cap on completion turns when the caller does not specify one.
 ///
 /// Consumed by the `POST /v1/agent/runs` handler ([`create_run`]).
@@ -976,6 +1008,55 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message::Tool {
+            content: tt_shared::messages::MessageContent::Text("r".into()),
+            tool_call_id: id.into(),
+        }
+    }
+
+    // ----- is_mechanical_continuation detection (slice 2a Task 1) -----
+
+    #[test]
+    fn mechanical_after_readonly_tool_continuation() {
+        // assistant called a read-only gateway tool, its result appended → next turn is mechanical
+        let msgs = vec![assistant_toolcall("find_route_for"), tool_result("c1")];
+        assert!(is_mechanical_continuation(&msgs));
+    }
+
+    #[test]
+    fn not_mechanical_after_client_tool() {
+        let msgs = vec![assistant_toolcall("write_file"), tool_result("c1")];
+        assert!(!is_mechanical_continuation(&msgs));
+    }
+
+    #[test]
+    fn not_mechanical_mixed_prior_turn() {
+        // a turn with a read-only AND a client tool → not mechanical
+        let msgs = vec![
+            assistant_two_toolcalls("find_route_for", "write_file"),
+            tool_result("c1"),
+            tool_result("c2"),
+        ];
+        assert!(!is_mechanical_continuation(&msgs));
+    }
+
+    #[test]
+    fn not_mechanical_first_turn() {
+        assert!(!is_mechanical_continuation(&[]));
+        assert!(!is_mechanical_continuation(&[Message::User {
+            content: tt_shared::messages::MessageContent::Text("hi".into()),
+            name: None,
+        }]));
+    }
+
+    #[test]
+    fn not_mechanical_after_final_answer() {
+        // last message is an assistant final (no tool results trailing) → not mechanical
+        let msgs = vec![assistant_final()];
+        assert!(!is_mechanical_continuation(&msgs));
     }
 
     #[tokio::test]
