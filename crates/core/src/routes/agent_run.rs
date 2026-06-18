@@ -46,7 +46,10 @@ pub enum RunStatus {
 }
 
 /// Accumulated token usage across every turn of a run.
-#[derive(Debug, Default, Clone, serde::Serialize)]
+///
+/// `Deserialize` is needed by `StoredRun`, which round-trips a `RunUsage`
+/// through the run store (slice 1b).
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -263,6 +266,102 @@ pub async fn run_loop(
                 note: Some(format!("client tool '{name}' requires slice-1b round-trip")),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persisted run record + L1-backed run store helpers (slice 1b Task 2)
+//
+// These are wired into the create/get/resume handlers by slice-1b Tasks 3-5;
+// until then they are exercised only by the round-trip unit test, hence the
+// `#[allow(dead_code)]` on the not-yet-called items.
+// ---------------------------------------------------------------------------
+
+/// TTL for a persisted run record. A paused run is GETtable/resumable for this
+/// long; after it the L1 store evicts the record (one hour).
+const RUN_TTL_SECS: u64 = 3600;
+
+/// Non-secret routing config carried across a pause so resume turns route
+/// consistently. NEVER includes credentials.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredRouting {
+    pub provider_pin: Option<String>,
+    pub forced_route: Option<String>,
+    pub tag: Option<String>,
+}
+
+/// The full resumable run state persisted to the L1 store. NO secrets — only
+/// the conversation transcript and the non-secret routing config.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredRun {
+    pub id: uuid::Uuid,
+    pub org_id: uuid::Uuid,
+    pub status: RunStatus,
+    pub model: String,
+    pub messages: Vec<Message>,
+    pub tools: Vec<tt_shared::messages::Tool>,
+    pub max_turns: u32,
+    pub turns_done: u32,
+    pub usage: RunUsage,
+    pub pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
+    pub routing: StoredRouting,
+}
+
+/// L1 key for a run record, scoped by org so a fetch with the wrong org misses.
+#[allow(dead_code)] // wired in by Tasks 3-5
+fn run_key(org_id: uuid::Uuid, run_id: uuid::Uuid) -> String {
+    format!("tt:runs:{org_id}:{run_id}")
+}
+
+impl StoredRun {
+    /// Derive the HTTP `Run` view from a stored record (the `requires_action`
+    /// response body). `turns` is the turns completed so far; no note.
+    #[allow(dead_code)] // wired in by Tasks 3-5
+    pub(crate) fn to_run(&self) -> Run {
+        Run {
+            id: self.id,
+            status: self.status,
+            messages: self.messages.clone(),
+            turns: self.turns_done,
+            usage: self.usage.clone(),
+            note: None,
+        }
+    }
+}
+
+/// Persist (overwrite) a run record with the run TTL.
+#[allow(dead_code)] // wired in by Tasks 3-5
+pub(crate) async fn store_run(
+    cache: &dyn tt_cache::L1Cache,
+    run: &StoredRun,
+) -> Result<(), ApiError> {
+    let bytes =
+        serde_json::to_vec(run).map_err(|e| ApiError::Internal(format!("run serialize: {e}")))?;
+    cache
+        .set(&run_key(run.org_id, run.id), &bytes, RUN_TTL_SECS)
+        .await
+        .map_err(|e| ApiError::Internal(format!("run store: {e}")))?;
+    Ok(())
+}
+
+/// Fetch a run record scoped by (org, id). `None` when absent/expired.
+#[allow(dead_code)] // wired in by Tasks 3-5
+pub(crate) async fn fetch_run(
+    cache: &dyn tt_cache::L1Cache,
+    org_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+) -> Result<Option<StoredRun>, ApiError> {
+    match cache
+        .get(&run_key(org_id, run_id))
+        .await
+        .map_err(|e| ApiError::Internal(format!("run fetch: {e}")))?
+    {
+        Some(bytes) => {
+            Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
+                ApiError::Internal(format!("run deserialize: {e}"))
+            })?))
+        }
+        None => Ok(None),
     }
 }
 
@@ -835,5 +934,46 @@ mod tests {
         assert_eq!(id.org_id, Uuid::from_u128(2));
         assert_eq!(id.api_key_id, Uuid::from_u128(1));
         assert!(id.l2_allowed);
+    }
+
+    // ----- Run store round-trip (slice 1b Task 2) -----
+
+    #[tokio::test]
+    async fn stored_run_roundtrips_through_cache() {
+        let cache = tt_cache::memory::InMemoryL1Cache::new();
+        let org = uuid::Uuid::new_v4();
+        let run = StoredRun {
+            id: uuid::Uuid::new_v4(),
+            org_id: org,
+            status: RunStatus::RequiresAction,
+            model: "m".into(),
+            messages: vec![assistant_toolcall("write_file")],
+            tools: vec![],
+            max_turns: 8,
+            turns_done: 1,
+            usage: RunUsage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+            },
+            pending_tool_calls: vec![],
+            routing: StoredRouting {
+                provider_pin: None,
+                forced_route: None,
+                tag: None,
+            },
+        };
+        store_run(&cache, &run).await.unwrap();
+        let got = fetch_run(&cache, org, run.id)
+            .await
+            .unwrap()
+            .expect("present");
+        assert_eq!(got.id, run.id);
+        assert_eq!(got.status, RunStatus::RequiresAction);
+        assert_eq!(got.turns_done, 1);
+        // wrong org → miss
+        assert!(fetch_run(&cache, uuid::Uuid::new_v4(), run.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
