@@ -27,15 +27,22 @@ use crate::{
 /// Terminal status of a run.
 ///
 /// `Completed` = the model returned a final (tool-call-free) answer.
-/// `Incomplete` = the loop stopped without a final answer (an unknown/client
-/// tool requires a slice-1b round-trip, or `max_turns` was reached).
+/// `Incomplete` = the loop stopped without a final answer (`max_turns` was
+/// reached, or — for non-persisting/1a callers — a client tool surfaced).
 /// `Failed` = a completion turn errored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
+/// `RequiresAction` = the loop paused on a client (non-gateway) tool and the
+/// run was persisted awaiting the caller's tool outputs (slice 1b).
+///
+/// `snake_case` keeps `completed`/`incomplete`/`failed` byte-identical to 1a's
+/// `lowercase` rename and adds `requires_action`. `Deserialize` is needed by
+/// `StoredRun`, which round-trips a `RunStatus` through the run store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Completed,
     Incomplete,
     Failed,
+    RequiresAction,
 }
 
 /// Accumulated token usage across every turn of a run.
@@ -73,27 +80,53 @@ pub(crate) const DEFAULT_MAX_TURNS: u32 = 8;
 /// Hard upper bound on completion turns regardless of the caller's request.
 const MAX_MAX_TURNS: u32 = 32;
 
-/// Run the synchronous agent loop. `model`/`messages`/`tools` come from the
-/// request; `max_turns` is clamped to `[1, 32]`.
+/// Outcome of running (or resuming) the loop until a terminal state or a pause.
+pub(crate) enum LoopOutcome {
+    /// The run reached a terminal state (the `Run` carries the final status).
+    Terminal(Run),
+    /// The model called a client (non-gateway) tool; the loop paused. Any
+    /// gateway tool_calls of that same assistant turn were executed inline
+    /// (their results are in `messages`); `pending_tool_calls` are the CLIENT
+    /// tool_calls awaiting the caller's output.
+    Paused {
+        messages: Vec<Message>,
+        turns_done: u32,
+        usage: RunUsage,
+        pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
+    },
+}
+
+/// The pausable loop core. Runs from `turns_done` (0 for a fresh run, >0 on
+/// resume) up to `max_turns` (clamped to `[1, 32]`). `id`/usage-carry-in let
+/// resume continue a run.
 ///
 /// Each turn builds a non-streaming [`ChatCompletionRequest`], calls
 /// `completer.complete`, appends the assistant message and accumulates usage.
-/// If the assistant returns no tool calls the run is `Completed`. If any tool
-/// call is not a gateway-executable read-only tool the run is `Incomplete`
-/// (slice 1b round-trips it). Otherwise each gateway tool is executed and its
-/// result appended as a [`Message::Tool`] before the next turn. A completer
-/// error ends the run as `Failed`; exhausting `max_turns` ends it `Incomplete`.
-pub async fn run_loop(
+/// If the assistant returns no tool calls the run is `Terminal(Completed)`. A
+/// completer error ends the run `Terminal(Failed)`; exhausting `max_turns` ends
+/// it `Terminal(Incomplete)`. Gateway (read-only) tool_calls are executed and
+/// their results appended as [`Message::Tool`]. If a turn calls ANY client
+/// (non-gateway) tool, the turn's gateway tool_calls are still executed inline
+/// (so a mixed turn's gateway work isn't wasted and, on resume, every tool_call
+/// of the assistant turn is answered) and the loop returns [`LoopOutcome::Paused`]
+/// with the CLIENT tool_calls as `pending_tool_calls`.
+// Eight params mirror the persisted resume state (id/usage/turns_done carry-in
+// for resume); grouping them into a struct would just shuffle the run-state
+// fields that Tasks 3/5 already track separately.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_loop_core(
     completer: &dyn TurnCompleter,
     id: uuid::Uuid,
     model: String,
     mut messages: Vec<Message>,
     tools: Vec<tt_shared::messages::Tool>,
     max_turns: u32,
-) -> Run {
+    turns_done: u32,
+    mut usage: RunUsage,
+) -> LoopOutcome {
     let max_turns = max_turns.clamp(1, MAX_MAX_TURNS);
-    let mut usage = RunUsage::default();
-    for turn in 0..max_turns {
+    let mut turn = turns_done;
+    while turn < max_turns {
         let req = ChatCompletionRequest {
             model: model.clone(),
             messages: messages.clone(),
@@ -104,14 +137,14 @@ pub async fn run_loop(
         let (assistant, turn_usage) = match completer.complete(req).await {
             Ok(x) => x,
             Err(e) => {
-                return Run {
+                return LoopOutcome::Terminal(Run {
                     id,
                     status: RunStatus::Failed,
                     messages,
                     turns: turn + 1,
                     usage,
                     note: Some(format!("turn {turn} failed: {e}")),
-                };
+                });
             }
         };
         usage.prompt_tokens += turn_usage.prompt_tokens;
@@ -123,56 +156,113 @@ pub async fn run_loop(
             _ => Vec::new(),
         };
         if tool_calls.is_empty() {
-            return Run {
+            return LoopOutcome::Terminal(Run {
                 id,
                 status: RunStatus::Completed,
                 messages,
                 turns: turn + 1,
                 usage,
                 note: None,
-            };
-        }
-        // Partition: every tool_call must be gateway-executable in 1a. A single
-        // non-gateway (client) tool ends the run as `Incomplete` — slice 1b
-        // round-trips it to the caller.
-        for tc in &tool_calls {
-            if !crate::routes::gateway_tools::is_gateway_tool(&tc.function.name) {
-                return Run {
-                    id,
-                    status: RunStatus::Incomplete,
-                    messages,
-                    turns: turn + 1,
-                    usage,
-                    note: Some(format!(
-                        "client tool '{}' requires slice-1b round-trip",
-                        tc.function.name
-                    )),
-                };
-            }
-        }
-        for tc in &tool_calls {
-            let result = match crate::routes::gateway_tools::execute(
-                &tc.function.name,
-                &tc.function.arguments,
-            ) {
-                Ok(s) => s,
-                // A tool error is appended as the tool result (not aborted) so
-                // the model can read it and react on the next turn.
-                Err(e) => format!("tool error: {e}"),
-            };
-            messages.push(Message::Tool {
-                content: MessageContent::Text(result),
-                tool_call_id: tc.id.clone(),
             });
         }
+
+        let has_client_tool = tool_calls
+            .iter()
+            .any(|tc| !crate::routes::gateway_tools::is_gateway_tool(&tc.function.name));
+
+        // Execute the gateway tool_calls of this turn inline (whether or not we
+        // are about to pause — so a mixed turn's gateway work isn't wasted and,
+        // on resume, every tool_call of this assistant turn is answered).
+        for tc in &tool_calls {
+            if crate::routes::gateway_tools::is_gateway_tool(&tc.function.name) {
+                let result = match crate::routes::gateway_tools::execute(
+                    &tc.function.name,
+                    &tc.function.arguments,
+                ) {
+                    Ok(s) => s,
+                    // A tool error is appended as the tool result (not aborted)
+                    // so the model can read it and react on the next turn.
+                    Err(e) => format!("tool error: {e}"),
+                };
+                messages.push(Message::Tool {
+                    content: MessageContent::Text(result),
+                    tool_call_id: tc.id.clone(),
+                });
+            }
+        }
+
+        if has_client_tool {
+            let pending: Vec<_> = tool_calls
+                .into_iter()
+                .filter(|tc| !crate::routes::gateway_tools::is_gateway_tool(&tc.function.name))
+                .collect();
+            return LoopOutcome::Paused {
+                messages,
+                turns_done: turn + 1,
+                usage,
+                pending_tool_calls: pending,
+            };
+        }
+        turn += 1;
     }
-    Run {
+    LoopOutcome::Terminal(Run {
         id,
         status: RunStatus::Incomplete,
         messages,
         turns: max_turns,
         usage,
         note: Some("max_turns reached".into()),
+    })
+}
+
+/// Run the synchronous agent loop. `model`/`messages`/`tools` come from the
+/// request; `max_turns` is clamped to `[1, 32]`.
+///
+/// Thin wrapper over [`run_loop_core`] preserving slice-1a behavior for callers
+/// without persistence: a pause on a client tool is surfaced as an `Incomplete`
+/// `Run` (the note names the first pending client tool), exactly as 1a did.
+pub async fn run_loop(
+    completer: &dyn TurnCompleter,
+    id: uuid::Uuid,
+    model: String,
+    messages: Vec<Message>,
+    tools: Vec<tt_shared::messages::Tool>,
+    max_turns: u32,
+) -> Run {
+    match run_loop_core(
+        completer,
+        id,
+        model,
+        messages,
+        tools,
+        max_turns,
+        0,
+        RunUsage::default(),
+    )
+    .await
+    {
+        LoopOutcome::Terminal(run) => run,
+        LoopOutcome::Paused {
+            messages,
+            turns_done,
+            usage,
+            pending_tool_calls,
+        } => {
+            // 1a callers (no persistence) surface a pause as Incomplete, exactly
+            // as before. The note names the first client tool.
+            let name = pending_tool_calls
+                .first()
+                .map(|tc| tc.function.name.clone())
+                .unwrap_or_default();
+            Run {
+                id,
+                status: RunStatus::Incomplete,
+                messages,
+                turns: turns_done,
+                usage,
+                note: Some(format!("client tool '{name}' requires slice-1b round-trip")),
+            }
+        }
     }
 }
 
@@ -520,6 +610,33 @@ mod tests {
         }
     }
 
+    /// An assistant turn calling two tools (ids `c1`/`c2`) — used to exercise the
+    /// mixed gateway+client pause path.
+    fn assistant_two_toolcalls(a: &str, b: &str) -> Message {
+        Message::Assistant {
+            content: None,
+            name: None,
+            tool_calls: vec![
+                tt_shared::messages::ToolCall {
+                    id: "c1".into(),
+                    r#type: "function".into(),
+                    function: tt_shared::messages::ToolCallFunction {
+                        name: a.into(),
+                        arguments: r#"{"task_description":"x"}"#.into(),
+                    },
+                },
+                tt_shared::messages::ToolCall {
+                    id: "c2".into(),
+                    r#type: "function".into(),
+                    function: tt_shared::messages::ToolCallFunction {
+                        name: b.into(),
+                        arguments: r#"{"task_description":"y"}"#.into(),
+                    },
+                },
+            ],
+        }
+    }
+
     #[tokio::test]
     async fn completes_on_final_answer() {
         let stub = Stub {
@@ -570,6 +687,111 @@ mod tests {
         let run = run_loop(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 3).await;
         assert_eq!(run.status, RunStatus::Incomplete);
         assert_eq!(run.turns, 3);
+    }
+
+    // ----- Loop-core pause/resume (slice 1b Task 1) -----
+
+    #[tokio::test]
+    async fn core_pauses_on_client_tool_with_pending() {
+        // Stub returns an assistant turn calling a client tool "write_file".
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![assistant_toolcall("write_file")]),
+        };
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0,
+            RunUsage::default(),
+        )
+        .await;
+        match out {
+            LoopOutcome::Paused {
+                pending_tool_calls,
+                turns_done,
+                ..
+            } => {
+                assert_eq!(turns_done, 1);
+                assert_eq!(pending_tool_calls.len(), 1);
+                assert_eq!(pending_tool_calls[0].function.name, "write_file");
+            }
+            _ => panic!("expected Paused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn core_resume_continues_to_completion() {
+        // Resume: messages already contain the paused assistant turn + the
+        // appended client tool result; the next completion is a final answer.
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![assistant_final()]),
+        };
+        let resumed_messages = vec![
+            assistant_toolcall("write_file"),
+            Message::Tool {
+                content: MessageContent::Text("ok".into()),
+                tool_call_id: "c1".into(),
+            },
+        ];
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            resumed_messages,
+            vec![],
+            8,
+            1,
+            RunUsage::default(),
+        )
+        .await;
+        match out {
+            LoopOutcome::Terminal(run) => {
+                assert_eq!(run.status, RunStatus::Completed);
+                assert_eq!(run.turns, 2);
+            }
+            _ => panic!("expected Terminal Completed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn core_mixed_turn_executes_gateway_then_pauses() {
+        // An assistant turn with BOTH a gateway tool and a client tool: gateway
+        // executed inline (a Tool result appears), pause with only the client one.
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![assistant_two_toolcalls(
+                "find_route_for",
+                "write_file",
+            )]),
+        };
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0,
+            RunUsage::default(),
+        )
+        .await;
+        match out {
+            LoopOutcome::Paused {
+                messages,
+                pending_tool_calls,
+                ..
+            } => {
+                assert!(
+                    messages.iter().any(|m| matches!(m, Message::Tool { .. })),
+                    "gateway result appended"
+                );
+                assert_eq!(pending_tool_calls.len(), 1);
+                assert_eq!(pending_tool_calls[0].function.name, "write_file");
+            }
+            _ => panic!("expected Paused"),
+        }
     }
 
     // ----- Task 4 wiring (no provider, no DB) -----
