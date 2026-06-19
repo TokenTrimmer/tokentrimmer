@@ -344,9 +344,7 @@ impl AppState {
             route_savings: None,
             db_pool: None,
             telemetry_tracker: None,
-            summary_gate: Arc::new(
-                crate::passes::agentic_budget::summarize_judge::NeverCommitGate,
-            ),
+            summary_gate: Arc::new(crate::passes::agentic_budget::summarize_judge::NeverCommitGate),
         }
     }
 

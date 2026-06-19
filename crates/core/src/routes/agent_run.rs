@@ -234,7 +234,9 @@ pub(crate) async fn run_loop_core(
     let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0);
     while turn < max_turns {
         if let Some(s) = summarizer {
-            let tax = s.summarize_before_turn(&mut messages, &mut summarized_upto).await;
+            let tax = s
+                .summarize_before_turn(&mut messages, &mut summarized_upto)
+                .await;
             summarizer_tax = sum_metered(summarizer_tax, tax);
         }
         let req = ChatCompletionRequest {
@@ -800,30 +802,37 @@ pub async fn create_run(
     // ⇒ summarize off (the `summarizer: None` loop path is byte-identical to
     // pre-2c-1). With the default `NeverCommit` gate, `is_committable` is always
     // false, so no summarize dispatch ever happens even when a route opts in.
-    let summarize_cfg = resolve_summarize_config(&state, &identity, &req.model, &req.messages).await;
-    let base_provider_id = state.registry.resolve(&req.model).map(|p| p.id().to_string());
+    let summarize_cfg =
+        resolve_summarize_config(&state, &identity, &req.model, &req.messages).await;
+    let base_provider_id = state
+        .registry
+        .resolve(&req.model)
+        .map(|p| p.id().to_string());
     let summarizer_model = summarizer_model(&state);
     let base_ctx = base_request_context(&identity);
-    let summarizer_obj = summarize_cfg.clone().map(|cfg| GatewayTranscriptSummarizer {
-        state: &state,
-        org_id: identity.org_id,
-        raw_bearer: identity.raw_bearer.clone(),
-        base_ctx,
-        gate: state.summary_gate.clone(),
-        cfg,
-        base_model: req.model.clone(),
-        base_provider_id,
-        summarizer_model,
-        deadline: state.judge_config.baseline_timeout,
-    });
+    let summarizer_obj = summarize_cfg
+        .clone()
+        .map(|cfg| GatewayTranscriptSummarizer {
+            state: &state,
+            org_id: identity.org_id,
+            raw_bearer: identity.raw_bearer.clone(),
+            base_ctx,
+            gate: state.summary_gate.clone(),
+            cfg,
+            base_model: req.model.clone(),
+            base_provider_id,
+            summarizer_model,
+            deadline: state.judge_config.baseline_timeout,
+        });
 
     let completer = GatewayCompleter {
         state: &state,
         identity,
     };
     let id = Uuid::new_v4();
-    let summ_ref: Option<&dyn TranscriptSummarizer> =
-        summarizer_obj.as_ref().map(|s| s as &dyn TranscriptSummarizer);
+    let summ_ref: Option<&dyn TranscriptSummarizer> = summarizer_obj
+        .as_ref()
+        .map(|s| s as &dyn TranscriptSummarizer);
 
     match run_loop_core(
         &completer,
@@ -1043,10 +1052,17 @@ pub async fn submit_tool_outputs(
     let summ_obj = stored.summarize.clone().map(|cfg| {
         let base_ctx = base_request_context(&identity);
         GatewayTranscriptSummarizer {
-            state: &state, org_id: identity.org_id, raw_bearer: identity.raw_bearer.clone(), base_ctx,
-            gate: state.summary_gate.clone(), cfg,
+            state: &state,
+            org_id: identity.org_id,
+            raw_bearer: identity.raw_bearer.clone(),
+            base_ctx,
+            gate: state.summary_gate.clone(),
+            cfg,
             base_model: stored.model.clone(),
-            base_provider_id: state.registry.resolve(&stored.model).map(|p| p.id().to_string()),
+            base_provider_id: state
+                .registry
+                .resolve(&stored.model)
+                .map(|p| p.id().to_string()),
             summarizer_model: summarizer_model(&state),
             deadline: state.judge_config.baseline_timeout,
         }
@@ -1146,7 +1162,10 @@ fn summary_call_from_result(
     res: Result<crate::measurement::MeasuredDispatch, String>,
 ) -> SummarizeCall {
     match res {
-        Err(_) => SummarizeCall { summary: None, cost_usd: None },
+        Err(_) => SummarizeCall {
+            summary: None,
+            cost_usd: None,
+        },
         Ok(d) => {
             let cost_usd = d.cost_usd;
             let text = d
@@ -1155,11 +1174,17 @@ fn summary_call_from_result(
                 .into_iter()
                 .next()
                 .and_then(|c| match c.message {
-                    Message::Assistant { content: Some(MessageContent::Text(t)), .. } => Some(t),
+                    Message::Assistant {
+                        content: Some(MessageContent::Text(t)),
+                        ..
+                    } => Some(t),
                     _ => None,
                 })
                 .filter(|t| !t.trim().is_empty());
-            SummarizeCall { summary: text, cost_usd }
+            SummarizeCall {
+                summary: text,
+                cost_usd,
+            }
         }
     }
 }
@@ -1179,14 +1204,24 @@ async fn dispatch_summary(
     deadline: std::time::Duration,
 ) -> SummarizeCall {
     let Some(provider) = state.registry.resolve(summarizer_model) else {
-        return SummarizeCall { summary: None, cost_usd: None };
+        return SummarizeCall {
+            summary: None,
+            cost_usd: None,
+        };
     };
-    let ctx = match chat::resolve_credentials_for(state, org_id, provider.id(), raw_bearer, true)
-        .await
-    {
-        Some(credentials) => RequestContext { credentials, ..base_ctx.clone() },
-        None => return SummarizeCall { summary: None, cost_usd: None },
-    };
+    let ctx =
+        match chat::resolve_credentials_for(state, org_id, provider.id(), raw_bearer, true).await {
+            Some(credentials) => RequestContext {
+                credentials,
+                ..base_ctx.clone()
+            },
+            None => {
+                return SummarizeCall {
+                    summary: None,
+                    cost_usd: None,
+                }
+            }
+        };
     let req = build_summary_request(class, original, summarizer_model);
     let res = crate::measurement::measured_single_dispatch(&provider, req, &ctx, deadline).await;
     summary_call_from_result(res)
@@ -1218,10 +1253,18 @@ impl TranscriptSummarizer for GatewayTranscriptSummarizer<'_> {
         messages: &mut Vec<Message>,
         summarized_upto: &mut u32,
     ) -> Option<f64> {
-        use crate::passes::agentic_budget::summarize_judge::{is_error_blob, resolve_summary_class};
-        let Some(provider_id) = self.base_provider_id.as_deref() else { return Some(0.0); };
-        let tool_count = messages.iter().filter(|m| matches!(m, Message::Tool { .. })).count() as u32;
-        let eligible = eligible_tool_ordinals(messages, *summarized_upto, self.cfg.keep_recent_pairs);
+        use crate::passes::agentic_budget::summarize_judge::{
+            is_error_blob, resolve_summary_class,
+        };
+        let Some(provider_id) = self.base_provider_id.as_deref() else {
+            return Some(0.0);
+        };
+        let tool_count = messages
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { .. }))
+            .count() as u32;
+        let eligible =
+            eligible_tool_ordinals(messages, *summarized_upto, self.cfg.keep_recent_pairs);
         let mut tax: Option<f64> = Some(0.0);
         for idx in eligible {
             let class = resolve_summary_class(messages, idx);
@@ -1229,16 +1272,34 @@ impl TranscriptSummarizer for GatewayTranscriptSummarizer<'_> {
                 continue;
             }
             let original = match &messages[idx] {
-                Message::Tool { content: MessageContent::Text(t), .. } if !is_error_blob(t) => t.clone(),
+                Message::Tool {
+                    content: MessageContent::Text(t),
+                    ..
+                } if !is_error_blob(t) => t.clone(),
                 _ => continue,
             };
             let call = dispatch_summary(
-                self.state, self.org_id, &self.raw_bearer, &self.base_ctx,
-                &self.summarizer_model, &class, &original, self.deadline,
-            ).await;
+                self.state,
+                self.org_id,
+                &self.raw_bearer,
+                &self.base_ctx,
+                &self.summarizer_model,
+                &class,
+                &original,
+                self.deadline,
+            )
+            .await;
             tax = crate::passes::agentic_budget::summarize_judge::sum_metered(tax, call.cost_usd);
-            let Some(summary) = call.summary else { continue };
-            if !token_true_ok(provider_id, &self.base_model, &original, &summary, self.cfg.clear_at_least_tokens) {
+            let Some(summary) = call.summary else {
+                continue;
+            };
+            if !token_true_ok(
+                provider_id,
+                &self.base_model,
+                &original,
+                &summary,
+                self.cfg.clear_at_least_tokens,
+            ) {
                 continue;
             }
             if let Message::Tool { content, .. } = &mut messages[idx] {
@@ -1264,10 +1325,15 @@ async fn resolve_summarize_config(
         messages: messages.to_vec(),
         ..Default::default()
     };
-    let route_match = chat::apply_routing(state, &ctx, &mut req_clone, identity.forced_route.as_deref())
-        .await
-        .ok()
-        .flatten()?;
+    let route_match = chat::apply_routing(
+        state,
+        &ctx,
+        &mut req_clone,
+        identity.forced_route.as_deref(),
+    )
+    .await
+    .ok()
+    .flatten()?;
     let ab = route_match.agentic_budget?;
     if !ab.elide_stale_tools {
         return None;
@@ -1898,7 +1964,11 @@ mod tests {
             turns_done: 1,
             usage: RunUsage::default(),
             pending_tool_calls: vec![],
-            routing: StoredRouting { provider_pin: None, forced_route: None, tag: None },
+            routing: StoredRouting {
+                provider_pin: None,
+                forced_route: None,
+                tag: None,
+            },
             summarized_upto: 3,
             summarizer_tax_usd: Some(0.0004),
             summarize: None,
@@ -1912,10 +1982,14 @@ mod tests {
     fn eligible_ordinals_keeps_recent_and_respects_watermark() {
         // messages: A(tc) T0 A(tc) T1 A(tc) T2 A(tc) T3  (4 tool blocks)
         let msgs = vec![
-            assistant_toolcall("find_route_for"), tool_result("c1"),
-            assistant_toolcall("find_route_for"), tool_result("c2"),
-            assistant_toolcall("find_route_for"), tool_result("c3"),
-            assistant_toolcall("find_route_for"), tool_result("c4"),
+            assistant_toolcall("find_route_for"),
+            tool_result("c1"),
+            assistant_toolcall("find_route_for"),
+            tool_result("c2"),
+            assistant_toolcall("find_route_for"),
+            tool_result("c3"),
+            assistant_toolcall("find_route_for"),
+            tool_result("c4"),
         ];
         // keep_recent_pairs=2 → eligible tool blocks are T0,T1 (the 2 oldest); their
         // MESSAGE indices are 1 and 3. watermark=0 → both.
@@ -1977,7 +2051,10 @@ mod tests {
             }],
             usage: tt_shared::Usage::default(),
         };
-        let call = summary_call_from_result(Ok(MeasuredDispatch { response: resp, cost_usd: Some(0.0001) }));
+        let call = summary_call_from_result(Ok(MeasuredDispatch {
+            response: resp,
+            cost_usd: Some(0.0001),
+        }));
         assert_eq!(call.summary.as_deref(), Some("short"));
         assert_eq!(call.cost_usd, Some(0.0001));
     }
@@ -1986,14 +2063,23 @@ mod tests {
 
     #[test]
     fn summarize_commit_decision_gates_and_token_checks() {
-        use crate::passes::agentic_budget::summarize_judge::{ConfigSummaryGate, SummaryGate, is_error_blob, parse_trusted_classes};
+        use crate::passes::agentic_budget::summarize_judge::{
+            is_error_blob, parse_trusted_classes, ConfigSummaryGate, SummaryGate,
+        };
         let gate = ConfigSummaryGate::new(parse_trusted_classes("inspect_diff"));
         assert!(gate.is_committable("inspect_diff"));
-        assert!(!is_error_blob("a long verbose tool result with lots of words"));
-        assert!(token_true_ok("openai", "gpt-4o-mini",
-            "a long verbose tool result with lots of words to remove", "short", 0));
-        assert!(!gate.is_committable("write_file"));            // untrusted → no commit
-        assert!(is_error_blob(r#"{"error":"boom"}"#));          // error blob → never summarized
+        assert!(!is_error_blob(
+            "a long verbose tool result with lots of words"
+        ));
+        assert!(token_true_ok(
+            "openai",
+            "gpt-4o-mini",
+            "a long verbose tool result with lots of words to remove",
+            "short",
+            0
+        ));
+        assert!(!gate.is_committable("write_file")); // untrusted → no commit
+        assert!(is_error_blob(r#"{"error":"boom"}"#)); // error blob → never summarized
     }
 
     // ----- TranscriptSummarizer hook threading (slice 2c-1 Task 6) -----
@@ -2010,7 +2096,10 @@ mod tests {
             summarized_upto: &mut u32,
         ) -> Option<f64> {
             *self.calls.lock().unwrap() += 1;
-            let tools = messages.iter().filter(|m| matches!(m, Message::Tool { .. })).count() as u32;
+            let tools = messages
+                .iter()
+                .filter(|m| matches!(m, Message::Tool { .. }))
+                .count() as u32;
             *summarized_upto = tools.saturating_sub(1);
             Some(0.0002)
         }
@@ -2018,15 +2107,28 @@ mod tests {
 
     #[tokio::test]
     async fn loop_calls_summarizer_each_turn_and_accrues_tax() {
-        let stub = Stub { script: std::sync::Mutex::new(vec![
-            assistant_toolcall("find_route_for"),
-            assistant_final(),
-        ]) };
-        let summ = StubSummarizer { calls: std::sync::Mutex::new(0) };
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+        };
+        let summ = StubSummarizer {
+            calls: std::sync::Mutex::new(0),
+        };
         let out = run_loop_core(
-            &stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, 0, 0,
-            RunUsage::default(), Some(&summ),
-        ).await;
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0,
+            0,
+            RunUsage::default(),
+            Some(&summ),
+        )
+        .await;
         match out {
             LoopOutcome::Terminal(run) => {
                 assert_eq!(run.status, RunStatus::Completed);
@@ -2039,11 +2141,22 @@ mod tests {
 
     #[tokio::test]
     async fn loop_with_no_summarizer_is_unchanged() {
-        let stub = Stub { script: std::sync::Mutex::new(vec![assistant_final()]) };
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![assistant_final()]),
+        };
         let out = run_loop_core(
-            &stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, 0, 0,
-            RunUsage::default(), None,
-        ).await;
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0,
+            0,
+            RunUsage::default(),
+            None,
+        )
+        .await;
         match out {
             LoopOutcome::Terminal(run) => assert_eq!(run.summarizer_tax_usd, None),
             _ => panic!("expected Terminal"),

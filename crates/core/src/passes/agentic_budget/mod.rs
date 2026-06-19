@@ -52,8 +52,7 @@ pub use substep_cache::{
 };
 pub use summarize_judge::{
     map_summary_verdict, AdaptiveSummaryGate, AlwaysCommitGate, ConfigSummaryGate, NeverCommitGate,
-    SummarizeCall,
-    SummarizeStep, Summarizer, SummaryEdit, SummaryGate, SummaryOutcome,
+    SummarizeCall, SummarizeStep, Summarizer, SummaryEdit, SummaryGate, SummaryOutcome,
 };
 pub use supersede::SupersedePass;
 
