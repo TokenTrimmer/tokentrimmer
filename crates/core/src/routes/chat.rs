@@ -2121,6 +2121,10 @@ pub async fn handler(
         l2_allowed,
         retrieval_telemetry,
         request_started,
+        // The chat path is never a mechanical agent-loop sub-step: pass `false`
+        // so the `prepare` mechanical down-route block is inert (behavior-
+        // preserving — `/v1/chat/completions` stays byte-identical).
+        false,
     )
     .await?;
 
@@ -2233,6 +2237,7 @@ pub(crate) async fn prepare(
     l2_allowed: bool,
     retrieval_telemetry: RetrievalTelemetry,
     request_started: Instant,
+    is_mechanical: bool,
 ) -> ApiResult<Prepared> {
     // 2c. Routing engine. Rewrite `req.model` if the org has a matching
     //     enabled route — must happen BEFORE the cache lookup (so L1 keys
@@ -2435,6 +2440,36 @@ pub(crate) async fn prepare(
     }
     let traffic_split_arm_owned = traffic_split_arm.map(str::to_string);
 
+    // Sub-lever 3 (agent-loop only): down-route a mechanical sub-step turn to
+    // the route's `route_mechanical_to` model, IF the route opted in AND is not
+    // auto-paused. Keeping `matched_route_id` set => the existing paired-quality
+    // judge + `route_autopause` treat it as a routed serving and self-revert on
+    // regression. Placed BEFORE the `if model_was_rewritten` block so setting
+    // `model_was_rewritten = true` triggers the existing provider/credential
+    // (re)resolve for the cheaper `req.model` — the down-routed model's
+    // provider/creds are used for dispatch. `is_mechanical` is always false on
+    // the chat path (the handler passes `false`), so this block is inert there.
+    // The unresolved-target warning is deferred to `mechanical_route_warning`
+    // because the pre-dispatch `warnings` vec is not yet in scope here.
+    let mut mechanical_route_warning: Option<String> = None;
+    if is_mechanical && !route_paused {
+        if let Some(target) = route_agentic_budget
+            .as_ref()
+            .and_then(|ab| ab.route_mechanical_to.clone())
+        {
+            if target != req.model {
+                if state.registry.resolve(&target).is_some() {
+                    req.model = target;
+                    model_was_rewritten = true; // baseline priced vs the original model
+                                                // provider is (re)resolved below for the new req.model
+                } else {
+                    mechanical_route_warning =
+                        Some(format!("mechanical_route_unresolved:{target}"));
+                }
+            }
+        }
+    }
+
     if model_was_rewritten {
         // Provider may change when a route crosses providers (V3d-1); the
         // registry is the source of truth.
@@ -2521,6 +2556,12 @@ pub(crate) async fn prepare(
     // Normalize the request for the routed provider and collect any pre-dispatch
     // warnings (B2: response_format_downgrade; B3 will add temperature_clamped).
     let mut warnings: Vec<String> = Vec::new();
+    // A mechanical down-route whose `route_mechanical_to` model did not resolve
+    // surfaces a warning and the original model is served unchanged (captured
+    // above before `warnings` existed).
+    if let Some(w) = mechanical_route_warning {
+        warnings.push(w);
+    }
     // Surface a paused-route passthrough on the warnings header (the
     // request_logs row carries the durable `route_paused` marker; this is the
     // caller-visible signal). The `route_paused_passthrough_total` metric is
