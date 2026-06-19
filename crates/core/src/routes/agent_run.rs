@@ -170,6 +170,39 @@ fn token_true_ok(
     orig.saturating_sub(new) >= clear_at_least_tokens.max(1)
 }
 
+/// Deterministic per-edit sampling key: a `Uuid` digest of `(trace_id, tool_call_id)`,
+/// so `should_sample`/`ab_order_for` (which hash an opaque `Uuid`) give a stable,
+/// uniform per-edit decision. No RNG.
+#[allow(dead_code)] // wired into the summary judge in slice 2c-2 Task 4
+fn sample_key(trace_id: Uuid, tool_call_id: &str) -> Uuid {
+    use std::hash::{Hash, Hasher};
+    let mut hi = std::collections::hash_map::DefaultHasher::new();
+    trace_id.hash(&mut hi);
+    tool_call_id.hash(&mut hi);
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    tool_call_id.hash(&mut lo);
+    trace_id.hash(&mut lo);
+    lo.write_u8(0x9e); // distinct salt so hi != lo
+    Uuid::from_u64_pair(hi.finish(), lo.finish())
+}
+
+/// The run's task context for the summary judge's `input`: the most-recent
+/// `Message::User` text, or `""` (the judge still compares A/B info-preservation).
+#[allow(dead_code)] // wired into the summary judge in slice 2c-2 Task 4
+fn latest_user_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::User {
+                content: MessageContent::Text(t),
+                ..
+            } => Some(t.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// Default cap on completion turns when the caller does not specify one.
 ///
 /// Consumed by the `POST /v1/agent/runs` handler ([`create_run`]).
@@ -2013,6 +2046,39 @@ mod tests {
         assert!(!token_true_ok("openai", "gpt-4o-mini", long, long, 0));
         // a reduction below the clear_at_least_tokens floor is rejected.
         assert!(!token_true_ok("openai", "gpt-4o-mini", long, short, 9999));
+    }
+
+    #[test]
+    fn sample_key_is_deterministic_and_spreads() {
+        let t = uuid::Uuid::from_u128(42);
+        assert_eq!(sample_key(t, "c1"), sample_key(t, "c1")); // deterministic
+        assert_ne!(sample_key(t, "c1"), sample_key(t, "c2")); // distinct tool_call_ids differ
+        assert_ne!(
+            sample_key(uuid::Uuid::from_u128(1), "c1"),
+            sample_key(uuid::Uuid::from_u128(2), "c1")
+        );
+    }
+
+    #[test]
+    fn latest_user_text_takes_the_most_recent_user_message() {
+        let msgs = vec![
+            Message::User {
+                content: MessageContent::Text("first".into()),
+                name: None,
+            },
+            Message::Assistant {
+                content: Some(MessageContent::Text("a".into())),
+                tool_calls: vec![],
+                name: None,
+            },
+            Message::User {
+                content: MessageContent::Text("second".into()),
+                name: None,
+            },
+            tool_result("c1"),
+        ];
+        assert_eq!(latest_user_text(&msgs), "second");
+        assert_eq!(latest_user_text(&[]), ""); // no user message → empty
     }
 
     #[test]
