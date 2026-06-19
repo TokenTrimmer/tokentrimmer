@@ -297,6 +297,10 @@ pub struct AppState {
     /// `None` (default) keeps the existing fire-and-forget behavior so all
     /// existing constructors and tests are unaffected.
     pub telemetry_tracker: Option<tokio_util::task::TaskTracker>,
+    /// Per-class trust gate for the agent-loop summarize lever (slice 2c-1).
+    /// `NeverCommitGate` by default ⇒ summarize is a total no-op until an
+    /// operator promotes classes via `TT_SUMMARIZE_TRUSTED_CLASSES`.
+    pub summary_gate: Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -340,6 +344,7 @@ impl AppState {
             route_savings: None,
             db_pool: None,
             telemetry_tracker: None,
+            summary_gate: Arc::new(crate::passes::agentic_budget::summarize_judge::NeverCommitGate),
         }
     }
 
@@ -367,6 +372,18 @@ impl AppState {
         self
     }
 
+    /// Builder-style attach: set the process-wide summary trust gate (slice
+    /// 2c-1). Defaults to `NeverCommitGate`; production wires
+    /// `ConfigSummaryGate::from_env()`.
+    #[must_use]
+    pub fn with_summary_gate(
+        mut self,
+        gate: Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
+    ) -> Self {
+        self.summary_gate = gate;
+        self
+    }
+
     /// Construct the default production state: registry pre-seeded with all
     /// in-tree providers. As new provider crates land, extend
     /// [`register_default_providers`] — this constructor stays stable.
@@ -374,7 +391,9 @@ impl AppState {
     pub fn with_default_providers() -> Self {
         let mut registry = ProviderRegistry::new();
         register_default_providers(&mut registry);
-        Self::new(registry)
+        Self::new(registry).with_summary_gate(Arc::new(
+            crate::passes::agentic_budget::summarize_judge::ConfigSummaryGate::from_env(),
+        ))
     }
 
     /// Builder-style attach: enable L1 exact-match cache with the given backend.
@@ -848,5 +867,19 @@ mod tests {
             !bound_public.dogfood_active(),
             "dogfood must fail closed on a non-loopback bind"
         );
+    }
+
+    #[test]
+    fn default_summary_gate_never_commits() {
+        let st = AppState::new(crate::registry::ProviderRegistry::new());
+        assert!(!st.summary_gate.is_committable("inspect_diff"));
+    }
+
+    #[test]
+    fn with_summary_gate_overrides_default() {
+        use crate::passes::agentic_budget::summarize_judge::AlwaysCommitGate;
+        let st = AppState::new(crate::registry::ProviderRegistry::new())
+            .with_summary_gate(std::sync::Arc::new(AlwaysCommitGate));
+        assert!(st.summary_gate.is_committable("anything"));
     }
 }

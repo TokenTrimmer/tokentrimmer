@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::{
     error::ApiError,
     middleware::trace::TraceId,
+    passes::agentic_budget::summarize_judge::SummarizeCall,
     routes::chat::{self, CompletionOutcome},
     ApiResult, AppState,
 };
@@ -66,6 +67,11 @@ pub struct Run {
     pub usage: RunUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Summarizer measurement tax (USD) accrued across the run's turns (slice
+    /// 2c-1). `None` ⇒ unmetered or no summarization. Never folded into served
+    /// cost — a measurement tax, like the quality-judge tax.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarizer_tax_usd: Option<f64>,
 }
 
 /// One completion turn. Production impl wraps `prepare` + `complete_once`
@@ -78,6 +84,21 @@ pub trait TurnCompleter: Send + Sync {
         req: ChatCompletionRequest,
         is_mechanical: bool,
     ) -> Result<(Message, RunUsage), ApiError>;
+}
+
+/// Optional per-turn transcript summarizer injected into [`run_loop_core`].
+/// `summarize_before_turn` may rewrite aging tool-result blocks in `messages`
+/// in place and advance `summarized_upto`; it returns this call's metered tax
+/// (`Some(0.0)` when nothing was summarized; `None` only when a dispatch was
+/// billed but unpriced). Fail-open: it never errors the run. The pure loop
+/// tests + the 1a `run_loop` wrapper pass `None`.
+#[async_trait]
+pub(crate) trait TranscriptSummarizer: Send + Sync {
+    async fn summarize_before_turn(
+        &self,
+        messages: &mut Vec<Message>,
+        summarized_upto: &mut u32,
+    ) -> Option<f64>;
 }
 
 /// A turn is "mechanical" when the model is about to digest ONLY read-only tool
@@ -111,6 +132,44 @@ fn is_mechanical_continuation(messages: &[tt_shared::messages::Message]) -> bool
     false
 }
 
+/// Message indices of the tool-result blocks eligible for summarization: the
+/// tool blocks OLDER than the last `keep_recent_pairs` (caveat C1 — recent tail
+/// verbatim) AND beyond the `summarized_upto` high-water mark (tool blocks with a
+/// lower ordinal are already summarized; each block is processed at most once).
+fn eligible_tool_ordinals(
+    messages: &[Message],
+    summarized_upto: u32,
+    keep_recent_pairs: u32,
+) -> Vec<usize> {
+    let tool_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::Tool { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let n = tool_idxs.len();
+    let cutoff = n.saturating_sub(keep_recent_pairs as usize); // ordinals [0, cutoff) are old
+    let start = (summarized_upto as usize).min(cutoff);
+    tool_idxs[start..cutoff].to_vec()
+}
+
+/// Token-true gate: a summary commits only when it reduces the served-model
+/// token count by at least `clear_at_least_tokens.max(1)` (≥1 ⇒ never a
+/// token-neutral/-inflating commit; the floor is the R1 cache-thrash guard).
+/// Mirrors the pipeline gate's discipline (`passes/mod.rs`): even on the
+/// `Confidence::Low` (`chars/4`) fallback a non-reduction is rejected.
+fn token_true_ok(
+    provider_id: &str,
+    model: &str,
+    original: &str,
+    summary: &str,
+    clear_at_least_tokens: u32,
+) -> bool {
+    let orig = tt_tokenize::estimate_input_tokens_for_model(provider_id, model, original).tokens;
+    let new = tt_tokenize::estimate_input_tokens_for_model(provider_id, model, summary).tokens;
+    orig.saturating_sub(new) >= clear_at_least_tokens.max(1)
+}
+
 /// Default cap on completion turns when the caller does not specify one.
 ///
 /// Consumed by the `POST /v1/agent/runs` handler ([`create_run`]).
@@ -131,6 +190,8 @@ pub(crate) enum LoopOutcome {
         turns_done: u32,
         usage: RunUsage,
         pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
+        summarized_upto: u32,
+        summarizer_tax_usd: Option<f64>,
     },
 }
 
@@ -160,11 +221,24 @@ pub(crate) async fn run_loop_core(
     tools: Vec<tt_shared::messages::Tool>,
     max_turns: u32,
     turns_done: u32,
+    mut summarized_upto: u32,
     mut usage: RunUsage,
+    summarizer: Option<&dyn TranscriptSummarizer>,
 ) -> LoopOutcome {
+    use crate::passes::agentic_budget::summarize_judge::sum_metered;
     let max_turns = max_turns.clamp(1, MAX_MAX_TURNS);
     let mut turn = turns_done;
+    // No summarizer ⇒ no tax (`None`), keeping the `summarizer: None` path
+    // byte-behavior-identical to pre-2c-1. With a summarizer, start the metered
+    // accumulator at `Some(0.0)` so each turn's tax folds in via `sum_metered`.
+    let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0);
     while turn < max_turns {
+        if let Some(s) = summarizer {
+            let tax = s
+                .summarize_before_turn(&mut messages, &mut summarized_upto)
+                .await;
+            summarizer_tax = sum_metered(summarizer_tax, tax);
+        }
         let req = ChatCompletionRequest {
             model: model.clone(),
             messages: messages.clone(),
@@ -187,6 +261,7 @@ pub(crate) async fn run_loop_core(
                     turns: turn + 1,
                     usage,
                     note: Some(format!("turn {turn} failed: {e}")),
+                    summarizer_tax_usd: summarizer_tax,
                 });
             }
         };
@@ -206,6 +281,7 @@ pub(crate) async fn run_loop_core(
                 turns: turn + 1,
                 usage,
                 note: None,
+                summarizer_tax_usd: summarizer_tax,
             });
         }
 
@@ -244,6 +320,8 @@ pub(crate) async fn run_loop_core(
                 turns_done: turn + 1,
                 usage,
                 pending_tool_calls: pending,
+                summarized_upto,
+                summarizer_tax_usd: summarizer_tax,
             };
         }
         turn += 1;
@@ -255,6 +333,7 @@ pub(crate) async fn run_loop_core(
         turns: max_turns,
         usage,
         note: Some("max_turns reached".into()),
+        summarizer_tax_usd: summarizer_tax,
     })
 }
 
@@ -279,8 +358,10 @@ pub async fn run_loop(
         messages,
         tools,
         max_turns,
-        0,
+        0, /*turns_done*/
+        0, /*summarized_upto*/
         RunUsage::default(),
+        None, /*summarizer*/
     )
     .await
     {
@@ -290,6 +371,8 @@ pub async fn run_loop(
             turns_done,
             usage,
             pending_tool_calls,
+            summarized_upto: _,
+            summarizer_tax_usd,
         } => {
             // 1a callers (no persistence) surface a pause as Incomplete, exactly
             // as before. The note names the first client tool.
@@ -304,6 +387,7 @@ pub async fn run_loop(
                 turns: turns_done,
                 usage,
                 note: Some(format!("client tool '{name}' requires slice-1b round-trip")),
+                summarizer_tax_usd,
             }
         }
     }
@@ -330,6 +414,14 @@ pub(crate) struct StoredRouting {
     pub tag: Option<String>,
 }
 
+/// Non-secret summarize policy resolved once from the run's (turn-0) route and
+/// persisted with the run so resume drives the same policy. Tiny config only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SummarizeConfig {
+    pub keep_recent_pairs: u32,
+    pub clear_at_least_tokens: u32,
+}
+
 /// The full resumable run state persisted to the L1 store. NO secrets — only
 /// the conversation transcript and the non-secret routing config.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -345,6 +437,17 @@ pub(crate) struct StoredRun {
     pub usage: RunUsage,
     pub pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
     pub routing: StoredRouting,
+    /// Tool-block watermark: count of leading `Message::Tool` blocks already
+    /// summarized. Restored on resume so each block is summarized at most once.
+    #[serde(default)]
+    pub summarized_upto: u32,
+    /// Accrued summarizer measurement tax (USD). `#[serde(default)]` for
+    /// cross-deploy resume back-compat (a pre-2c-1 record has no key).
+    #[serde(default)]
+    pub summarizer_tax_usd: Option<f64>,
+    /// The run's pinned summarize policy (turn-0 route). `None` ⇒ summarize off.
+    #[serde(default)]
+    pub summarize: Option<SummarizeConfig>,
 }
 
 /// L1 key for a run record, scoped by org so a fetch with the wrong org misses.
@@ -363,6 +466,7 @@ impl StoredRun {
             turns: self.turns_done,
             usage: self.usage.clone(),
             note: None,
+            summarizer_tax_usd: self.summarizer_tax_usd,
         }
     }
 }
@@ -691,11 +795,44 @@ pub async fn create_run(
     let model = req.model.clone();
     let tools = req.tools.clone();
     let max_turns = req.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
+
+    // Resolve the run's summarize policy ONCE from the turn-0 route, then build
+    // the production summarizer. Done BEFORE `identity` is moved into the
+    // completer and BEFORE `req.messages` is moved into the loop. `None` policy
+    // ⇒ summarize off (the `summarizer: None` loop path is byte-identical to
+    // pre-2c-1). With the default `NeverCommit` gate, `is_committable` is always
+    // false, so no summarize dispatch ever happens even when a route opts in.
+    let summarize_cfg =
+        resolve_summarize_config(&state, &identity, &req.model, &req.messages).await;
+    let base_provider_id = state
+        .registry
+        .resolve(&req.model)
+        .map(|p| p.id().to_string());
+    let summarizer_model = summarizer_model(&state);
+    let base_ctx = base_request_context(&identity);
+    let summarizer_obj = summarize_cfg
+        .clone()
+        .map(|cfg| GatewayTranscriptSummarizer {
+            state: &state,
+            org_id: identity.org_id,
+            raw_bearer: identity.raw_bearer.clone(),
+            base_ctx,
+            gate: state.summary_gate.clone(),
+            cfg,
+            base_model: req.model.clone(),
+            base_provider_id,
+            summarizer_model,
+            deadline: state.judge_config.baseline_timeout,
+        });
+
     let completer = GatewayCompleter {
         state: &state,
         identity,
     };
     let id = Uuid::new_v4();
+    let summ_ref: Option<&dyn TranscriptSummarizer> = summarizer_obj
+        .as_ref()
+        .map(|s| s as &dyn TranscriptSummarizer);
 
     match run_loop_core(
         &completer,
@@ -705,7 +842,9 @@ pub async fn create_run(
         tools.clone(),
         max_turns,
         0,
+        0,
         RunUsage::default(),
+        summ_ref,
     )
     .await
     {
@@ -716,8 +855,12 @@ pub async fn create_run(
             turns_done,
             usage,
             pending_tool_calls,
+            summarized_upto,
+            summarizer_tax_usd,
         } => match state.l1.as_ref() {
             // Redis present → persist the paused run so it can be GET/resumed.
+            // Persist the COMPUTED watermark + tax + pinned policy (create_run is
+            // the first segment, so there is no prior tax to fold in).
             Some(l1) => {
                 let stored = StoredRun {
                     id,
@@ -731,11 +874,15 @@ pub async fn create_run(
                     usage,
                     pending_tool_calls,
                     routing,
+                    summarized_upto,
+                    summarizer_tax_usd,
+                    summarize: summarize_cfg,
                 };
                 store_run(l1.cache.as_ref(), &stored).await?;
                 Ok(Json(stored.to_run()))
             }
-            // No Redis → 1a fallback: surface the pause as Incomplete.
+            // No Redis → 1a fallback: surface the pause as Incomplete (carry the
+            // segment's summarizer tax through to the returned Run).
             None => {
                 let name = pending_tool_calls
                     .first()
@@ -750,6 +897,7 @@ pub async fn create_run(
                     note: Some(format!(
                         "client tool '{name}' requires Redis to pause/resume (none configured)"
                     )),
+                    summarizer_tax_usd,
                 }))
             }
         },
@@ -897,10 +1045,35 @@ pub async fn submit_tool_outputs(
     identity.provider_pin = stored.routing.provider_pin.clone();
     identity.forced_route = stored.routing.forced_route.clone();
     identity.tag = stored.routing.tag.clone();
+
+    // Rebuild the production summarizer from the PERSISTED, turn-0-pinned policy
+    // (no re-resolution on resume — the route could have changed). Built BEFORE
+    // `identity` is moved into the completer. `None` policy ⇒ summarize off.
+    let summ_obj = stored.summarize.clone().map(|cfg| {
+        let base_ctx = base_request_context(&identity);
+        GatewayTranscriptSummarizer {
+            state: &state,
+            org_id: identity.org_id,
+            raw_bearer: identity.raw_bearer.clone(),
+            base_ctx,
+            gate: state.summary_gate.clone(),
+            cfg,
+            base_model: stored.model.clone(),
+            base_provider_id: state
+                .registry
+                .resolve(&stored.model)
+                .map(|p| p.id().to_string()),
+            summarizer_model: summarizer_model(&state),
+            deadline: state.judge_config.baseline_timeout,
+        }
+    });
+
     let completer = GatewayCompleter {
         state: &state,
         identity,
     };
+    let summ_ref: Option<&dyn TranscriptSummarizer> =
+        summ_obj.as_ref().map(|s| s as &dyn TranscriptSummarizer);
 
     let outcome = run_loop_core(
         &completer,
@@ -910,36 +1083,293 @@ pub async fn submit_tool_outputs(
         stored.tools.clone(),
         stored.max_turns,
         stored.turns_done,
+        stored.summarized_upto,
         stored.usage.clone(),
+        summ_ref,
     )
     .await;
 
+    use crate::passes::agentic_budget::summarize_judge::sum_metered;
     match outcome {
         // Terminal — record the final state and keep it GETtable until the TTL.
-        LoopOutcome::Terminal(run) => {
+        // Tax is CUMULATIVE across segments (fold this segment's into the prior
+        // total); the returned `Run` carries the TOTAL.
+        LoopOutcome::Terminal(mut run) => {
+            let cumulative = sum_metered(stored.summarizer_tax_usd, run.summarizer_tax_usd);
             stored.status = run.status;
             stored.messages = run.messages.clone();
             stored.turns_done = run.turns;
             stored.usage = run.usage.clone();
+            stored.summarizer_tax_usd = cumulative;
             stored.pending_tool_calls = Vec::new();
             store_run(l1.cache.as_ref(), &stored).await?;
+            run.summarizer_tax_usd = cumulative; // return the TOTAL across segments
             Ok(Json(run))
         }
         // Paused again on another client tool — re-persist as `requires_action`.
+        // Watermark REPLACES (absolute high-water mark); tax FOLDS in (cumulative).
         LoopOutcome::Paused {
             messages,
             turns_done,
             usage,
             pending_tool_calls,
+            summarized_upto,
+            summarizer_tax_usd,
         } => {
             stored.status = RunStatus::RequiresAction;
             stored.messages = messages;
             stored.turns_done = turns_done;
             stored.usage = usage;
+            stored.summarized_upto = summarized_upto;
+            stored.summarizer_tax_usd = sum_metered(stored.summarizer_tax_usd, summarizer_tax_usd);
             stored.pending_tool_calls = pending_tool_calls;
             store_run(l1.cache.as_ref(), &stored).await?;
             Ok(Json(stored.to_run()))
         }
+    }
+}
+
+/// Build the cheap-model summarize request for one tool-result blob.
+fn build_summary_request(class: &str, original: &str, model: &str) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model.to_string(),
+        messages: vec![
+            Message::System {
+                content: MessageContent::Text(format!(
+                    "Summarize this `{class}` tool result. Preserve every fact a later \
+                     step might need; drop only redundancy and formatting. Output only \
+                     the summary, no preamble."
+                )),
+            },
+            Message::User {
+                content: MessageContent::Text(original.to_string()),
+                name: None,
+            },
+        ],
+        stream: false,
+        // Bound a runaway summarizer's generation cost. The token-true gate
+        // already protects correctness (a non-reducing summary is rejected);
+        // this only caps wasted output tokens on a misbehaving cheap model.
+        max_tokens: Some(1024),
+        ..Default::default()
+    }
+}
+
+/// Map a measured dispatch result into a `SummarizeCall` (fail-open): `Err` →
+/// decline (`summary: None`); `Ok` → the first choice's assistant text (empty/
+/// missing ⇒ decline) + the dispatch's metered cost.
+fn summary_call_from_result(
+    res: Result<crate::measurement::MeasuredDispatch, String>,
+) -> SummarizeCall {
+    match res {
+        Err(_) => SummarizeCall {
+            summary: None,
+            cost_usd: None,
+        },
+        Ok(d) => {
+            let cost_usd = d.cost_usd;
+            let text = d
+                .response
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|c| match c.message {
+                    Message::Assistant {
+                        content: Some(MessageContent::Text(t)),
+                        ..
+                    } => Some(t),
+                    _ => None,
+                })
+                .filter(|t| !t.trim().is_empty());
+            SummarizeCall {
+                summary: text,
+                cost_usd,
+            }
+        }
+    }
+}
+
+/// Dispatch one cheap-model summarize call on the SUMMARIZER model's own
+/// provider+creds (NOT the turn's served provider), bounded by `deadline`.
+/// Fail-open: any resolution/dispatch failure ⇒ a declined `SummarizeCall`.
+#[allow(clippy::too_many_arguments)] // all args are required; no natural grouping
+async fn dispatch_summary(
+    state: &AppState,
+    org_id: Uuid,
+    raw_bearer: &str,
+    base_ctx: &RequestContext,
+    summarizer_model: &str,
+    class: &str,
+    original: &str,
+    deadline: std::time::Duration,
+) -> SummarizeCall {
+    let Some(provider) = state.registry.resolve(summarizer_model) else {
+        return SummarizeCall {
+            summary: None,
+            cost_usd: None,
+        };
+    };
+    let ctx =
+        match chat::resolve_credentials_for(state, org_id, provider.id(), raw_bearer, true).await {
+            Some(credentials) => RequestContext {
+                credentials,
+                ..base_ctx.clone()
+            },
+            None => {
+                return SummarizeCall {
+                    summary: None,
+                    cost_usd: None,
+                }
+            }
+        };
+    let req = build_summary_request(class, original, summarizer_model);
+    let res = crate::measurement::measured_single_dispatch(&provider, req, &ctx, deadline).await;
+    summary_call_from_result(res)
+}
+
+/// Production transcript summarizer: for each eligible aging tool block, if its
+/// class is gate-trusted and it is not an error blob, dispatch a cheap-model
+/// summary and commit it when the token-true gate passes. Advances the watermark
+/// to the eligible cutoff after a pass (a rejected/declined block is dispatched —
+/// and taxed — at most once, never retried); the only early return is the
+/// no-provider bail, which advances nothing. Fail-open throughout.
+struct GatewayTranscriptSummarizer<'a> {
+    state: &'a AppState,
+    org_id: Uuid,
+    raw_bearer: String,
+    base_ctx: RequestContext,
+    gate: std::sync::Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
+    cfg: SummarizeConfig,
+    base_model: String,
+    base_provider_id: Option<String>,
+    summarizer_model: String,
+    deadline: std::time::Duration,
+}
+
+#[async_trait]
+impl TranscriptSummarizer for GatewayTranscriptSummarizer<'_> {
+    async fn summarize_before_turn(
+        &self,
+        messages: &mut Vec<Message>,
+        summarized_upto: &mut u32,
+    ) -> Option<f64> {
+        use crate::passes::agentic_budget::summarize_judge::{
+            is_error_blob, resolve_summary_class,
+        };
+        let Some(provider_id) = self.base_provider_id.as_deref() else {
+            return Some(0.0);
+        };
+        let tool_count = messages
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { .. }))
+            .count() as u32;
+        let eligible =
+            eligible_tool_ordinals(messages, *summarized_upto, self.cfg.keep_recent_pairs);
+        let mut tax: Option<f64> = Some(0.0);
+        for idx in eligible {
+            let class = resolve_summary_class(messages, idx);
+            if !self.gate.is_committable(&class) {
+                continue;
+            }
+            let original = match &messages[idx] {
+                Message::Tool {
+                    content: MessageContent::Text(t),
+                    ..
+                } if !is_error_blob(t) => t.clone(),
+                _ => continue,
+            };
+            let call = dispatch_summary(
+                self.state,
+                self.org_id,
+                &self.raw_bearer,
+                &self.base_ctx,
+                &self.summarizer_model,
+                &class,
+                &original,
+                self.deadline,
+            )
+            .await;
+            tax = crate::passes::agentic_budget::summarize_judge::sum_metered(tax, call.cost_usd);
+            let Some(summary) = call.summary else {
+                continue;
+            };
+            if !token_true_ok(
+                provider_id,
+                &self.base_model,
+                &original,
+                &summary,
+                self.cfg.clear_at_least_tokens,
+            ) {
+                continue;
+            }
+            if let Message::Tool { content, .. } = &mut messages[idx] {
+                *content = MessageContent::Text(summary);
+            }
+        }
+        *summarized_upto = tool_count.saturating_sub(self.cfg.keep_recent_pairs);
+        tax
+    }
+}
+
+/// Resolve the run's summarize policy ONCE from the turn-0 route (pinned).
+/// `None` ⇒ summarize off (no route / nil-org / `elide_stale_tools` unset).
+async fn resolve_summarize_config(
+    state: &AppState,
+    identity: &RunIdentity,
+    model: &str,
+    messages: &[Message],
+) -> Option<SummarizeConfig> {
+    let ctx = base_request_context(identity);
+    let mut req_clone = ChatCompletionRequest {
+        model: model.to_string(),
+        messages: messages.to_vec(),
+        ..Default::default()
+    };
+    let route_match = chat::apply_routing(
+        state,
+        &ctx,
+        &mut req_clone,
+        identity.forced_route.as_deref(),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    let ab = route_match.agentic_budget?;
+    if !ab.elide_stale_tools {
+        return None;
+    }
+    Some(SummarizeConfig {
+        keep_recent_pairs: ab.keep_recent_pairs,
+        clear_at_least_tokens: ab.clear_at_least_tokens,
+    })
+}
+
+/// The cheap summarizer model: `TT_SUMMARIZER_MODEL` (new env) or the resolved
+/// judge model (default `gpt-4o-mini`).
+fn summarizer_model(state: &AppState) -> String {
+    std::env::var("TT_SUMMARIZER_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| state.judge_config.judge_model.clone())
+}
+
+/// Build the base `RequestContext` for a run's auxiliary (summarizer/routing)
+/// calls from the run identity. The credential is left EMPTY: routing reads only
+/// org_id/tag, and the summarizer dispatch re-resolves the summarizer model's
+/// OWN provider credential per call (so carrying the source bearer here would be
+/// unused — and a wrong-vendor footgun).
+fn base_request_context(identity: &RunIdentity) -> RequestContext {
+    RequestContext {
+        trace_id: identity.trace_id,
+        org_id: identity.org_id,
+        api_key_id: identity.api_key_id,
+        credentials: ProviderCredentials {
+            api_key: SecretString::new(String::new()),
+            base_url: None,
+            extra_headers: Vec::new(),
+        },
+        tag: identity.tag.clone(),
+        deadline: identity.request_timeout,
     }
 }
 
@@ -1183,7 +1613,9 @@ mod tests {
             vec![],
             8,
             0,
+            0, /*summarized_upto*/
             RunUsage::default(),
+            None, /*summarizer*/
         )
         .await;
         match out {
@@ -1222,7 +1654,9 @@ mod tests {
             vec![],
             8,
             1,
+            0, /*summarized_upto*/
             RunUsage::default(),
+            None, /*summarizer*/
         )
         .await;
         match out {
@@ -1252,7 +1686,9 @@ mod tests {
             vec![],
             8,
             0,
+            0, /*summarized_upto*/
             RunUsage::default(),
+            None, /*summarizer*/
         )
         .await;
         match out {
@@ -1340,6 +1776,9 @@ mod tests {
                 forced_route: None,
                 tag: None,
             },
+            summarized_upto: 0,
+            summarizer_tax_usd: None,
+            summarize: None,
         };
         store_run(&cache, &run).await.unwrap();
         let got = fetch_run(&cache, org, run.id)
@@ -1384,6 +1823,9 @@ mod tests {
                 forced_route: None,
                 tag: None,
             },
+            summarized_upto: 0,
+            summarizer_tax_usd: None,
+            summarize: None,
         };
         store_run(&cache, &stored).await.unwrap();
         assert_eq!(
@@ -1422,6 +1864,9 @@ mod tests {
                 forced_route: None,
                 tag: None,
             },
+            summarized_upto: 0,
+            summarizer_tax_usd: None,
+            summarize: None,
         };
         store_run(&cache, &stored).await.unwrap();
         assert!(fetch_run(&cache, uuid::Uuid::new_v4(), id)
@@ -1475,10 +1920,246 @@ mod tests {
                 forced_route: None,
                 tag: None,
             },
+            summarized_upto: 0,
+            summarizer_tax_usd: None,
+            summarize: None,
         };
         store_run(&cache, &stored).await.unwrap();
         let got = fetch_run(&cache, org, id).await.unwrap().expect("present");
         // The handler's status guard: a non-RequiresAction run → 409 Conflict.
         assert_ne!(got.status, RunStatus::RequiresAction);
+    }
+
+    // ----- SummarizeConfig + Run/StoredRun tax & watermark fields (slice 2c-1 Task 3) -----
+
+    #[test]
+    fn stored_run_deserializes_without_new_fields() {
+        // A run persisted BEFORE this deploy has no summarized_upto/summarizer_tax_usd
+        // /summarize keys; #[serde(default)] must let it deserialize (resumes unsummarized).
+        let json = r#"{
+            "id":"00000000-0000-0000-0000-000000000001",
+            "org_id":"00000000-0000-0000-0000-000000000002",
+            "status":"requires_action","model":"m","messages":[],"tools":[],
+            "max_turns":8,"turns_done":1,
+            "usage":{"prompt_tokens":0,"completion_tokens":0},
+            "pending_tool_calls":[],
+            "routing":{"provider_pin":null,"forced_route":null,"tag":null}
+        }"#;
+        let sr: StoredRun = serde_json::from_str(json).expect("back-compat deserialize");
+        assert_eq!(sr.summarized_upto, 0);
+        assert_eq!(sr.summarizer_tax_usd, None);
+        assert!(sr.summarize.is_none());
+    }
+
+    #[test]
+    fn to_run_maps_summarizer_tax() {
+        let sr = StoredRun {
+            id: uuid::Uuid::nil(),
+            org_id: uuid::Uuid::nil(),
+            status: RunStatus::RequiresAction,
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_turns: 8,
+            turns_done: 1,
+            usage: RunUsage::default(),
+            pending_tool_calls: vec![],
+            routing: StoredRouting {
+                provider_pin: None,
+                forced_route: None,
+                tag: None,
+            },
+            summarized_upto: 3,
+            summarizer_tax_usd: Some(0.0004),
+            summarize: None,
+        };
+        assert_eq!(sr.to_run().summarizer_tax_usd, Some(0.0004));
+    }
+
+    // ----- eligible_tool_ordinals + token_true_ok (slice 2c-1 Task 4) -----
+
+    #[test]
+    fn eligible_ordinals_keeps_recent_and_respects_watermark() {
+        // messages: A(tc) T0 A(tc) T1 A(tc) T2 A(tc) T3  (4 tool blocks)
+        let msgs = vec![
+            assistant_toolcall("find_route_for"),
+            tool_result("c1"),
+            assistant_toolcall("find_route_for"),
+            tool_result("c2"),
+            assistant_toolcall("find_route_for"),
+            tool_result("c3"),
+            assistant_toolcall("find_route_for"),
+            tool_result("c4"),
+        ];
+        // keep_recent_pairs=2 → eligible tool blocks are T0,T1 (the 2 oldest); their
+        // MESSAGE indices are 1 and 3. watermark=0 → both.
+        assert_eq!(eligible_tool_ordinals(&msgs, 0, 2), vec![1, 3]);
+        // watermark=1 → T0 already done → only T1 (index 3).
+        assert_eq!(eligible_tool_ordinals(&msgs, 1, 2), vec![3]);
+        // keep_recent_pairs >= tool count → nothing eligible.
+        assert!(eligible_tool_ordinals(&msgs, 0, 4).is_empty());
+        assert!(eligible_tool_ordinals(&msgs, 0, 9).is_empty());
+        // watermark advanced to/past the eligible cutoff → nothing to do
+        assert!(eligible_tool_ordinals(&msgs, 2, 2).is_empty());
+        assert!(eligible_tool_ordinals(&msgs, 99, 2).is_empty());
+    }
+
+    #[test]
+    fn token_true_ok_requires_real_reduction() {
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu";
+        let short = "alpha";
+        assert!(token_true_ok("openai", "gpt-4o-mini", long, short, 0));
+        // a non-reduction (same text) must be rejected even at floor 0 (>=1 required).
+        assert!(!token_true_ok("openai", "gpt-4o-mini", long, long, 0));
+        // a reduction below the clear_at_least_tokens floor is rejected.
+        assert!(!token_true_ok("openai", "gpt-4o-mini", long, short, 9999));
+    }
+
+    #[test]
+    fn build_summary_request_shapes_a_cheap_call() {
+        let req = build_summary_request("inspect_diff", "big tool output", "gpt-4o-mini");
+        assert_eq!(req.model, "gpt-4o-mini");
+        assert!(!req.stream);
+        assert_eq!(req.messages.len(), 2);
+        assert!(matches!(req.messages[0], Message::System { .. }));
+        assert!(matches!(req.messages[1], Message::User { .. }));
+    }
+
+    #[test]
+    fn summary_call_maps_dispatch_and_fails_open_on_err() {
+        use crate::measurement::MeasuredDispatch;
+        // Err → fail open (no summary, no cost).
+        let call = summary_call_from_result(Err("deadline exceeded".into()));
+        assert!(call.summary.is_none());
+        assert!(call.cost_usd.is_none());
+
+        // Ok with text → summary + cost passed through. ChatCompletionResponse has
+        // NO Default — construct all 6 fields explicitly; Usage DOES derive Default.
+        let resp = tt_shared::ChatCompletionResponse {
+            id: String::new(),
+            object: String::new(),
+            created: 0,
+            model: "gpt-4o-mini".into(),
+            choices: vec![tt_shared::messages::Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("short".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: tt_shared::Usage::default(),
+        };
+        let call = summary_call_from_result(Ok(MeasuredDispatch {
+            response: resp,
+            cost_usd: Some(0.0001),
+        }));
+        assert_eq!(call.summary.as_deref(), Some("short"));
+        assert_eq!(call.cost_usd, Some(0.0001));
+    }
+
+    // ----- per-block commit decision: gate ∧ ¬error-blob ∧ token-true (slice 2c-1 Task 7) -----
+
+    #[test]
+    fn summarize_commit_decision_gates_and_token_checks() {
+        use crate::passes::agentic_budget::summarize_judge::{
+            is_error_blob, parse_trusted_classes, ConfigSummaryGate, SummaryGate,
+        };
+        let gate = ConfigSummaryGate::new(parse_trusted_classes("inspect_diff"));
+        assert!(gate.is_committable("inspect_diff"));
+        assert!(!is_error_blob(
+            "a long verbose tool result with lots of words"
+        ));
+        assert!(token_true_ok(
+            "openai",
+            "gpt-4o-mini",
+            "a long verbose tool result with lots of words to remove",
+            "short",
+            0
+        ));
+        assert!(!gate.is_committable("write_file")); // untrusted → no commit
+        assert!(is_error_blob(r#"{"error":"boom"}"#)); // error blob → never summarized
+    }
+
+    // ----- TranscriptSummarizer hook threading (slice 2c-1 Task 6) -----
+
+    /// A stub summarizer that records calls, advances the watermark, reports a fixed tax.
+    struct StubSummarizer {
+        calls: std::sync::Mutex<u32>,
+    }
+    #[async_trait]
+    impl TranscriptSummarizer for StubSummarizer {
+        async fn summarize_before_turn(
+            &self,
+            messages: &mut Vec<Message>,
+            summarized_upto: &mut u32,
+        ) -> Option<f64> {
+            *self.calls.lock().unwrap() += 1;
+            let tools = messages
+                .iter()
+                .filter(|m| matches!(m, Message::Tool { .. }))
+                .count() as u32;
+            *summarized_upto = tools.saturating_sub(1);
+            Some(0.0002)
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_calls_summarizer_each_turn_and_accrues_tax() {
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+        };
+        let summ = StubSummarizer {
+            calls: std::sync::Mutex::new(0),
+        };
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0,
+            0,
+            RunUsage::default(),
+            Some(&summ),
+        )
+        .await;
+        match out {
+            LoopOutcome::Terminal(run) => {
+                assert_eq!(run.status, RunStatus::Completed);
+                assert_eq!(*summ.calls.lock().unwrap(), 2); // hook ran before each of the 2 turns
+                assert_eq!(run.summarizer_tax_usd, Some(0.0004)); // 0.0002 * 2, metered
+            }
+            _ => panic!("expected Terminal Completed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_with_no_summarizer_is_unchanged() {
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![assistant_final()]),
+        };
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0,
+            0,
+            RunUsage::default(),
+            None,
+        )
+        .await;
+        match out {
+            LoopOutcome::Terminal(run) => assert_eq!(run.summarizer_tax_usd, None),
+            _ => panic!("expected Terminal"),
+        }
     }
 }
