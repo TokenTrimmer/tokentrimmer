@@ -372,9 +372,10 @@ impl AppState {
         self
     }
 
-    /// Builder-style attach: set the process-wide summary trust gate (slice
-    /// 2c-1). Defaults to `NeverCommitGate`; production wires
-    /// `ConfigSummaryGate::from_env()`.
+    /// Builder-style attach: set the process-wide summary trust gate. Defaults
+    /// to `NeverCommitGate`; production wires `RatchetSummaryGate::from_env()`
+    /// (slice 2c-2: the operator allowlist opens a class, the live judge shuts
+    /// it on a windowed pass-rate dip).
     #[must_use]
     pub fn with_summary_gate(
         mut self,
@@ -392,7 +393,7 @@ impl AppState {
         let mut registry = ProviderRegistry::new();
         register_default_providers(&mut registry);
         Self::new(registry).with_summary_gate(Arc::new(
-            crate::passes::agentic_budget::summarize_judge::ConfigSummaryGate::from_env(),
+            crate::passes::agentic_budget::summarize_judge::RatchetSummaryGate::from_env(),
         ))
     }
 
@@ -881,5 +882,22 @@ mod tests {
         let st = AppState::new(crate::registry::ProviderRegistry::new())
             .with_summary_gate(std::sync::Arc::new(AlwaysCommitGate));
         assert!(st.summary_gate.is_committable("anything"));
+    }
+
+    // The prod gate is `RatchetSummaryGate` (slice 2c-2): an allowlisted,
+    // never-judged class is committable (operator opens); a non-allowlisted one
+    // is not. Asserted env-free via the gate directly (the `with_default_providers`
+    // swap itself is covered by compilation + `default_summary_gate_never_commits`).
+    #[test]
+    fn ratchet_gate_opens_allowlisted_class() {
+        use crate::passes::agentic_budget::summarize_judge::{
+            RatchetConfig, RatchetSummaryGate, SummaryGate,
+        };
+        let g = RatchetSummaryGate::new(
+            ["inspect_diff".to_string()].into_iter().collect(),
+            RatchetConfig::default(),
+        );
+        assert!(g.is_committable("inspect_diff"));
+        assert!(!g.is_committable("write_file"));
     }
 }

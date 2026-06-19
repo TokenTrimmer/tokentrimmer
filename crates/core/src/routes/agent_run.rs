@@ -21,6 +21,7 @@ use crate::{
     error::ApiError,
     middleware::trace::TraceId,
     passes::agentic_budget::summarize_judge::SummarizeCall,
+    quality_sample::{self, GatewayLlmJudge},
     routes::chat::{self, CompletionOutcome},
     ApiResult, AppState,
 };
@@ -168,6 +169,37 @@ fn token_true_ok(
     let orig = tt_tokenize::estimate_input_tokens_for_model(provider_id, model, original).tokens;
     let new = tt_tokenize::estimate_input_tokens_for_model(provider_id, model, summary).tokens;
     orig.saturating_sub(new) >= clear_at_least_tokens.max(1)
+}
+
+/// Deterministic per-edit sampling key: a `Uuid` digest of `(trace_id, tool_call_id)`,
+/// so `should_sample`/`ab_order_for` (which hash an opaque `Uuid`) give a stable,
+/// uniform per-edit decision. No RNG.
+fn sample_key(trace_id: Uuid, tool_call_id: &str) -> Uuid {
+    use std::hash::{Hash, Hasher};
+    let mut hi = std::collections::hash_map::DefaultHasher::new();
+    trace_id.hash(&mut hi);
+    tool_call_id.hash(&mut hi);
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    tool_call_id.hash(&mut lo);
+    trace_id.hash(&mut lo);
+    lo.write_u8(0x9e); // distinct salt so hi != lo
+    Uuid::from_u64_pair(hi.finish(), lo.finish())
+}
+
+/// The run's task context for the summary judge's `input`: the most-recent
+/// `Message::User` text, or `""` (the judge still compares A/B info-preservation).
+fn latest_user_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::User {
+                content: MessageContent::Text(t),
+                ..
+            } => Some(t.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Default cap on completion turns when the caller does not specify one.
@@ -1302,12 +1334,99 @@ impl TranscriptSummarizer for GatewayTranscriptSummarizer<'_> {
             ) {
                 continue;
             }
+            // Capture the judge inputs BEFORE the in-place overwrite of messages[idx].
+            let tool_call_id = match &messages[idx] {
+                Message::Tool { tool_call_id, .. } => tool_call_id.clone(),
+                _ => String::new(),
+            };
+            let input = latest_user_text(messages);
             if let Message::Tool { content, .. } = &mut messages[idx] {
-                *content = MessageContent::Text(summary);
+                *content = MessageContent::Text(summary.clone());
             }
+            // Sample + detached-judge the committed summary (feeds the ratchet
+            // for FUTURE turns/runs). No-op unless this commit is sampled.
+            self.maybe_spawn_summary_judge(&tool_call_id, &input, &class, original, summary);
         }
         *summarized_upto = tool_count.saturating_sub(self.cfg.keep_recent_pairs);
         tax
+    }
+}
+
+impl GatewayTranscriptSummarizer<'_> {
+    /// Sample (~`judge_config.sample_rate`) a freshly-committed summary and, if
+    /// sampled, spawn a DETACHED blind judge (zero added latency) comparing the
+    /// original vs the summary (recall-of-baseline). Its verdict feeds the gate's
+    /// ratchet for FUTURE turns/runs. Fail-open: any resolve/dispatch failure ⇒
+    /// no verdict recorded (a flaky judge must never shut a class). Owned clones
+    /// only — never captures `&self`/`&self.state` (the spawn is `'static + Send`).
+    fn maybe_spawn_summary_judge(
+        &self,
+        tool_call_id: &str,
+        input: &str,
+        class: &str,
+        original: String,
+        summary: String,
+    ) {
+        let key = sample_key(self.base_ctx.trace_id, tool_call_id);
+        if !quality_sample::should_sample(key, self.state.judge_config.sample_rate) {
+            return;
+        }
+        // Owned captures only — the spawned future is `'static + Send`.
+        let state = self.state.clone(); // AppState: Clone — owned, not the borrow
+        let gate = self.gate.clone();
+        let org_id = self.org_id;
+        let raw_bearer = self.raw_bearer.clone();
+        let base_ctx = self.base_ctx.clone();
+        let class = class.to_string();
+        let input = input.to_string();
+        tokio::spawn(async move {
+            let Some(provider) = state.registry.resolve(&state.judge_config.judge_model) else {
+                return;
+            };
+            let Some(creds) =
+                chat::resolve_credentials_for(&state, org_id, provider.id(), &raw_bearer, true)
+                    .await
+            else {
+                return;
+            };
+            let judge_ctx = RequestContext {
+                credentials: creds,
+                ..base_ctx
+            };
+            let judge =
+                GatewayLlmJudge::new(provider, state.judge_config.judge_model.clone(), judge_ctx)
+                    .with_call_timeout(state.judge_config.baseline_timeout);
+            // `summary` is the OPTIMIZED arg + the matching `order`, so the returned
+            // verdict reads as the SUMMARY's recall-of-baseline verdict.
+            match quality_sample::judge_paired(
+                &judge,
+                &input,
+                &original,
+                &summary,
+                quality_sample::ab_order_for(key),
+                false,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    tracing::info!(
+                        target: "tokentrimmer.summary_judge",
+                        class = %class,
+                        verdict = quality_sample::verdict_str(outcome.verdict),
+                        cost_usd = ?outcome.judge_cost_usd,
+                        "summary judge verdict"
+                    );
+                    gate.record_summary_verdict(&class, outcome.verdict);
+                }
+                Err(_failure) => {
+                    tracing::debug!(
+                        target: "tokentrimmer.summary_judge",
+                        class = %class,
+                        "summary judge failed; no verdict recorded (fail-open)"
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -2013,6 +2132,39 @@ mod tests {
         assert!(!token_true_ok("openai", "gpt-4o-mini", long, long, 0));
         // a reduction below the clear_at_least_tokens floor is rejected.
         assert!(!token_true_ok("openai", "gpt-4o-mini", long, short, 9999));
+    }
+
+    #[test]
+    fn sample_key_is_deterministic_and_spreads() {
+        let t = uuid::Uuid::from_u128(42);
+        assert_eq!(sample_key(t, "c1"), sample_key(t, "c1")); // deterministic
+        assert_ne!(sample_key(t, "c1"), sample_key(t, "c2")); // distinct tool_call_ids differ
+        assert_ne!(
+            sample_key(uuid::Uuid::from_u128(1), "c1"),
+            sample_key(uuid::Uuid::from_u128(2), "c1")
+        );
+    }
+
+    #[test]
+    fn latest_user_text_takes_the_most_recent_user_message() {
+        let msgs = vec![
+            Message::User {
+                content: MessageContent::Text("first".into()),
+                name: None,
+            },
+            Message::Assistant {
+                content: Some(MessageContent::Text("a".into())),
+                tool_calls: vec![],
+                name: None,
+            },
+            Message::User {
+                content: MessageContent::Text("second".into()),
+                name: None,
+            },
+            tool_result("c1"),
+        ];
+        assert_eq!(latest_user_text(&msgs), "second");
+        assert_eq!(latest_user_text(&[]), ""); // no user message → empty
     }
 
     #[test]
