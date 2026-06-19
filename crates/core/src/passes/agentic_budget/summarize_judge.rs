@@ -66,6 +66,13 @@ pub trait SummaryGate: Send + Sync {
     /// untrusted → fail OPEN to the un-summarized bytes (never commit a lossy
     /// rewrite the judge has not vouched for).
     fn is_committable(&self, class: &str) -> bool;
+
+    /// Feed one blind-paired judge verdict for a committed summary of `class`
+    /// (the detached judge write-side, slice 2c-2). Default no-op — only the
+    /// ratchet gate acts on it; `NeverCommitGate`/`ConfigSummaryGate`/
+    /// `AdaptiveSummaryGate` ignore it. (`AdaptiveSummaryGate` has its own
+    /// inherent `record_verdict` under a different name — no collision.)
+    fn record_summary_verdict(&self, _class: &str, _verdict: JudgeVerdict) {}
 }
 
 /// A [`SummaryGate`] that always refuses — the conservative default (no class is
@@ -961,6 +968,15 @@ mod tests {
         let out = run_summary(&step, &mut req);
         assert!(out.committed.is_empty());
         assert_eq!(serde_json::to_string(&req).unwrap(), before);
+    }
+
+    #[test]
+    fn record_summary_verdict_default_is_noop_and_object_safe() {
+        use tt_plan_core::JudgeVerdict;
+        // Object-safe: callable on a dyn gate; the default impl ignores the verdict.
+        let gate: std::sync::Arc<dyn SummaryGate> = std::sync::Arc::new(NeverCommitGate);
+        gate.record_summary_verdict("inspect_diff", JudgeVerdict::Degraded); // no-op, must not panic
+        assert!(!gate.is_committable("inspect_diff")); // unchanged by the no-op
     }
 
     #[test]
