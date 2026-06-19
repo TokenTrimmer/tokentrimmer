@@ -73,7 +73,11 @@ pub struct Run {
 /// usage for the turn.
 #[async_trait]
 pub trait TurnCompleter: Send + Sync {
-    async fn complete(&self, req: ChatCompletionRequest) -> Result<(Message, RunUsage), ApiError>;
+    async fn complete(
+        &self,
+        req: ChatCompletionRequest,
+        is_mechanical: bool,
+    ) -> Result<(Message, RunUsage), ApiError>;
 }
 
 /// A turn is "mechanical" when the model is about to digest ONLY read-only tool
@@ -82,7 +86,6 @@ pub trait TurnCompleter: Send + Sync {
 /// EVERY tool_call is read-only (`classify_substep == ReadOnly`). Conservative:
 /// any client/mutating tool in that turn — or no preceding assistant tool turn
 /// (e.g. the first turn, or a plain user/assistant message) — => not mechanical.
-#[allow(dead_code)] // wired in Task 2 (threaded through TurnCompleter::complete → prepare)
 fn is_mechanical_continuation(messages: &[tt_shared::messages::Message]) -> bool {
     use crate::passes::agentic_budget::substep_cache::{classify_substep, SubstepKind};
     use tt_shared::messages::Message;
@@ -169,7 +172,12 @@ pub(crate) async fn run_loop_core(
             stream: false,
             ..Default::default()
         };
-        let (assistant, turn_usage) = match completer.complete(req).await {
+        // A "mechanical" turn digests ONLY read-only tool output (the prior
+        // assistant turn called solely read-only tools and their results are
+        // already appended to `messages`). Computed from the transcript that is
+        // about to be SENT — before this turn's assistant response is pushed.
+        let is_mechanical = is_mechanical_continuation(&messages);
+        let (assistant, turn_usage) = match completer.complete(req, is_mechanical).await {
             Ok(x) => x,
             Err(e) => {
                 return LoopOutcome::Terminal(Run {
@@ -547,6 +555,7 @@ impl TurnCompleter for GatewayCompleter<'_> {
     async fn complete(
         &self,
         mut req: ChatCompletionRequest,
+        is_mechanical: bool,
     ) -> Result<(Message, RunUsage), ApiError> {
         Self::disable_cache(&mut req);
 
@@ -610,6 +619,7 @@ impl TurnCompleter for GatewayCompleter<'_> {
             self.identity.l2_allowed,
             Default::default(),
             request_started,
+            is_mechanical,
         )
         .await?;
 
@@ -948,10 +958,37 @@ mod tests {
         async fn complete(
             &self,
             _req: ChatCompletionRequest,
+            _is_mechanical: bool,
         ) -> Result<(Message, RunUsage), ApiError> {
             let mut s = self.script.lock().unwrap();
             Ok((
                 s.remove(0),
+                RunUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                },
+            ))
+        }
+    }
+
+    /// A completer that records the `is_mechanical` flag it is handed each turn
+    /// (and pops the next scripted assistant message), so a test can assert the
+    /// loop's per-turn mechanical classification.
+    struct RecordingStub {
+        mech: std::sync::Mutex<Vec<bool>>,
+        script: std::sync::Mutex<Vec<Message>>,
+    }
+
+    #[async_trait]
+    impl TurnCompleter for RecordingStub {
+        async fn complete(
+            &self,
+            _req: ChatCompletionRequest,
+            is_mechanical: bool,
+        ) -> Result<(Message, RunUsage), ApiError> {
+            self.mech.lock().unwrap().push(is_mechanical);
+            Ok((
+                self.script.lock().unwrap().remove(0),
                 RunUsage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
@@ -1085,6 +1122,25 @@ mod tests {
             .messages
             .iter()
             .any(|m| matches!(m, Message::Tool { .. })));
+    }
+
+    #[tokio::test]
+    async fn loop_passes_is_mechanical_on_readonly_continuation() {
+        // turn1: assistant calls a read-only gateway tool → loop executes it,
+        // appends the result; turn2: the digest turn over that read-only result
+        // → is_mechanical should be true. turn2 returns a final answer.
+        let stub = RecordingStub {
+            mech: std::sync::Mutex::new(vec![]),
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+        };
+        let run = run_loop(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8).await;
+        assert_eq!(run.status, RunStatus::Completed);
+        let mech = stub.mech.lock().unwrap().clone();
+        // turn1 not mechanical (fresh transcript), turn2 mechanical (read-only continuation).
+        assert_eq!(mech, vec![false, true]);
     }
 
     #[tokio::test]
