@@ -803,18 +803,7 @@ pub async fn create_run(
     let summarize_cfg = resolve_summarize_config(&state, &identity, &req.model, &req.messages).await;
     let base_provider_id = state.registry.resolve(&req.model).map(|p| p.id().to_string());
     let summarizer_model = summarizer_model(&state);
-    let base_ctx = RequestContext {
-        trace_id: identity.trace_id,
-        org_id: identity.org_id,
-        api_key_id: identity.api_key_id,
-        credentials: ProviderCredentials {
-            api_key: SecretString::new(identity.raw_bearer.clone()),
-            base_url: None,
-            extra_headers: Vec::new(),
-        },
-        tag: identity.tag.clone(),
-        deadline: identity.request_timeout,
-    };
+    let base_ctx = base_request_context(&identity);
     let summarizer_obj = summarize_cfg.clone().map(|cfg| GatewayTranscriptSummarizer {
         state: &state,
         org_id: identity.org_id,
@@ -1052,13 +1041,7 @@ pub async fn submit_tool_outputs(
     // (no re-resolution on resume — the route could have changed). Built BEFORE
     // `identity` is moved into the completer. `None` policy ⇒ summarize off.
     let summ_obj = stored.summarize.clone().map(|cfg| {
-        let base_ctx = RequestContext {
-            trace_id: identity.trace_id, org_id: identity.org_id, api_key_id: identity.api_key_id,
-            credentials: ProviderCredentials {
-                api_key: SecretString::new(identity.raw_bearer.clone()), base_url: None, extra_headers: Vec::new(),
-            },
-            tag: identity.tag.clone(), deadline: identity.request_timeout,
-        };
+        let base_ctx = base_request_context(&identity);
         GatewayTranscriptSummarizer {
             state: &state, org_id: identity.org_id, raw_bearer: identity.raw_bearer.clone(), base_ctx,
             gate: state.summary_gate.clone(), cfg,
@@ -1211,9 +1194,10 @@ async fn dispatch_summary(
 
 /// Production transcript summarizer: for each eligible aging tool block, if its
 /// class is gate-trusted and it is not an error blob, dispatch a cheap-model
-/// summary and commit it when the token-true gate passes. Advances the
-/// watermark unconditionally (a rejected/declined block is dispatched — and
-/// taxed — at most once, never retried). Fail-open throughout.
+/// summary and commit it when the token-true gate passes. Advances the watermark
+/// to the eligible cutoff after a pass (a rejected/declined block is dispatched —
+/// and taxed — at most once, never retried); the only early return is the
+/// no-provider bail, which advances nothing. Fail-open throughout.
 struct GatewayTranscriptSummarizer<'a> {
     state: &'a AppState,
     org_id: Uuid,
@@ -1274,18 +1258,7 @@ async fn resolve_summarize_config(
     model: &str,
     messages: &[Message],
 ) -> Option<SummarizeConfig> {
-    let ctx = RequestContext {
-        trace_id: identity.trace_id,
-        org_id: identity.org_id,
-        api_key_id: identity.api_key_id,
-        credentials: ProviderCredentials {
-            api_key: SecretString::new(String::new()),
-            base_url: None,
-            extra_headers: Vec::new(),
-        },
-        tag: identity.tag.clone(),
-        deadline: identity.request_timeout,
-    };
+    let ctx = base_request_context(identity);
     let mut req_clone = ChatCompletionRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
@@ -1312,6 +1285,26 @@ fn summarizer_model(state: &AppState) -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| state.judge_config.judge_model.clone())
+}
+
+/// Build the base `RequestContext` for a run's auxiliary (summarizer/routing)
+/// calls from the run identity. The credential is left EMPTY: routing reads only
+/// org_id/tag, and the summarizer dispatch re-resolves the summarizer model's
+/// OWN provider credential per call (so carrying the source bearer here would be
+/// unused — and a wrong-vendor footgun).
+fn base_request_context(identity: &RunIdentity) -> RequestContext {
+    RequestContext {
+        trace_id: identity.trace_id,
+        org_id: identity.org_id,
+        api_key_id: identity.api_key_id,
+        credentials: ProviderCredentials {
+            api_key: SecretString::new(String::new()),
+            base_url: None,
+            extra_headers: Vec::new(),
+        },
+        tag: identity.tag.clone(),
+        deadline: identity.request_timeout,
+    }
 }
 
 #[cfg(test)]
