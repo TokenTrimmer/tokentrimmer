@@ -66,6 +66,11 @@ pub struct Run {
     pub usage: RunUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Summarizer measurement tax (USD) accrued across the run's turns (slice
+    /// 2c-1). `None` ⇒ unmetered or no summarization. Never folded into served
+    /// cost — a measurement tax, like the quality-judge tax.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarizer_tax_usd: Option<f64>,
 }
 
 /// One completion turn. Production impl wraps `prepare` + `complete_once`
@@ -187,6 +192,7 @@ pub(crate) async fn run_loop_core(
                     turns: turn + 1,
                     usage,
                     note: Some(format!("turn {turn} failed: {e}")),
+                    summarizer_tax_usd: None,
                 });
             }
         };
@@ -206,6 +212,7 @@ pub(crate) async fn run_loop_core(
                 turns: turn + 1,
                 usage,
                 note: None,
+                summarizer_tax_usd: None,
             });
         }
 
@@ -255,6 +262,7 @@ pub(crate) async fn run_loop_core(
         turns: max_turns,
         usage,
         note: Some("max_turns reached".into()),
+        summarizer_tax_usd: None,
     })
 }
 
@@ -304,6 +312,7 @@ pub async fn run_loop(
                 turns: turns_done,
                 usage,
                 note: Some(format!("client tool '{name}' requires slice-1b round-trip")),
+                summarizer_tax_usd: None,
             }
         }
     }
@@ -330,6 +339,14 @@ pub(crate) struct StoredRouting {
     pub tag: Option<String>,
 }
 
+/// Non-secret summarize policy resolved once from the run's (turn-0) route and
+/// persisted with the run so resume drives the same policy. Tiny config only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SummarizeConfig {
+    pub keep_recent_pairs: u32,
+    pub clear_at_least_tokens: u32,
+}
+
 /// The full resumable run state persisted to the L1 store. NO secrets — only
 /// the conversation transcript and the non-secret routing config.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -345,6 +362,17 @@ pub(crate) struct StoredRun {
     pub usage: RunUsage,
     pub pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
     pub routing: StoredRouting,
+    /// Tool-block watermark: count of leading `Message::Tool` blocks already
+    /// summarized. Restored on resume so each block is summarized at most once.
+    #[serde(default)]
+    pub summarized_upto: u32,
+    /// Accrued summarizer measurement tax (USD). `#[serde(default)]` for
+    /// cross-deploy resume back-compat (a pre-2c-1 record has no key).
+    #[serde(default)]
+    pub summarizer_tax_usd: Option<f64>,
+    /// The run's pinned summarize policy (turn-0 route). `None` ⇒ summarize off.
+    #[serde(default)]
+    pub summarize: Option<SummarizeConfig>,
 }
 
 /// L1 key for a run record, scoped by org so a fetch with the wrong org misses.
@@ -363,6 +391,7 @@ impl StoredRun {
             turns: self.turns_done,
             usage: self.usage.clone(),
             note: None,
+            summarizer_tax_usd: self.summarizer_tax_usd,
         }
     }
 }
@@ -731,6 +760,9 @@ pub async fn create_run(
                     usage,
                     pending_tool_calls,
                     routing,
+                    summarized_upto: 0,
+                    summarizer_tax_usd: None,
+                    summarize: None,
                 };
                 store_run(l1.cache.as_ref(), &stored).await?;
                 Ok(Json(stored.to_run()))
@@ -750,6 +782,7 @@ pub async fn create_run(
                     note: Some(format!(
                         "client tool '{name}' requires Redis to pause/resume (none configured)"
                     )),
+                    summarizer_tax_usd: None,
                 }))
             }
         },
@@ -1340,6 +1373,9 @@ mod tests {
                 forced_route: None,
                 tag: None,
             },
+            summarized_upto: 0,
+            summarizer_tax_usd: None,
+            summarize: None,
         };
         store_run(&cache, &run).await.unwrap();
         let got = fetch_run(&cache, org, run.id)
@@ -1384,6 +1420,9 @@ mod tests {
                 forced_route: None,
                 tag: None,
             },
+            summarized_upto: 0,
+            summarizer_tax_usd: None,
+            summarize: None,
         };
         store_run(&cache, &stored).await.unwrap();
         assert_eq!(
@@ -1422,6 +1461,9 @@ mod tests {
                 forced_route: None,
                 tag: None,
             },
+            summarized_upto: 0,
+            summarizer_tax_usd: None,
+            summarize: None,
         };
         store_run(&cache, &stored).await.unwrap();
         assert!(fetch_run(&cache, uuid::Uuid::new_v4(), id)
@@ -1475,10 +1517,55 @@ mod tests {
                 forced_route: None,
                 tag: None,
             },
+            summarized_upto: 0,
+            summarizer_tax_usd: None,
+            summarize: None,
         };
         store_run(&cache, &stored).await.unwrap();
         let got = fetch_run(&cache, org, id).await.unwrap().expect("present");
         // The handler's status guard: a non-RequiresAction run → 409 Conflict.
         assert_ne!(got.status, RunStatus::RequiresAction);
+    }
+
+    // ----- SummarizeConfig + Run/StoredRun tax & watermark fields (slice 2c-1 Task 3) -----
+
+    #[test]
+    fn stored_run_deserializes_without_new_fields() {
+        // A run persisted BEFORE this deploy has no summarized_upto/summarizer_tax_usd
+        // /summarize keys; #[serde(default)] must let it deserialize (resumes unsummarized).
+        let json = r#"{
+            "id":"00000000-0000-0000-0000-000000000001",
+            "org_id":"00000000-0000-0000-0000-000000000002",
+            "status":"requires_action","model":"m","messages":[],"tools":[],
+            "max_turns":8,"turns_done":1,
+            "usage":{"prompt_tokens":0,"completion_tokens":0},
+            "pending_tool_calls":[],
+            "routing":{"provider_pin":null,"forced_route":null,"tag":null}
+        }"#;
+        let sr: StoredRun = serde_json::from_str(json).expect("back-compat deserialize");
+        assert_eq!(sr.summarized_upto, 0);
+        assert_eq!(sr.summarizer_tax_usd, None);
+        assert!(sr.summarize.is_none());
+    }
+
+    #[test]
+    fn to_run_maps_summarizer_tax() {
+        let sr = StoredRun {
+            id: uuid::Uuid::nil(),
+            org_id: uuid::Uuid::nil(),
+            status: RunStatus::RequiresAction,
+            model: "m".into(),
+            messages: vec![],
+            tools: vec![],
+            max_turns: 8,
+            turns_done: 1,
+            usage: RunUsage::default(),
+            pending_tool_calls: vec![],
+            routing: StoredRouting { provider_pin: None, forced_route: None, tag: None },
+            summarized_upto: 3,
+            summarizer_tax_usd: Some(0.0004),
+            summarize: None,
+        };
+        assert_eq!(sr.to_run().summarizer_tax_usd, Some(0.0004));
     }
 }
