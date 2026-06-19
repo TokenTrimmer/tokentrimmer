@@ -116,6 +116,44 @@ fn is_mechanical_continuation(messages: &[tt_shared::messages::Message]) -> bool
     false
 }
 
+/// Message indices of the tool-result blocks eligible for summarization: the
+/// tool blocks OLDER than the last `keep_recent_pairs` (caveat C1 — recent tail
+/// verbatim) AND beyond the `summarized_upto` watermark (count of leading tool
+/// blocks already summarized, so each block is processed at most once).
+fn eligible_tool_ordinals(
+    messages: &[Message],
+    summarized_upto: u32,
+    keep_recent_pairs: u32,
+) -> Vec<usize> {
+    let tool_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::Tool { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let n = tool_idxs.len();
+    let cutoff = n.saturating_sub(keep_recent_pairs as usize); // ordinals [0, cutoff) are old
+    let start = (summarized_upto as usize).min(cutoff);
+    tool_idxs[start..cutoff].to_vec()
+}
+
+/// Token-true gate: a summary commits only when it reduces the served-model
+/// token count by at least `clear_at_least_tokens.max(1)` (≥1 ⇒ never a
+/// token-neutral/-inflating commit; the floor is the R1 cache-thrash guard).
+/// Mirrors the pipeline gate's discipline (`passes/mod.rs`): even on the
+/// `Confidence::Low` (`chars/4`) fallback a non-reduction is rejected.
+fn token_true_ok(
+    provider_id: &str,
+    model: &str,
+    original: &str,
+    summary: &str,
+    clear_at_least_tokens: u32,
+) -> bool {
+    let orig = tt_tokenize::estimate_input_tokens_for_model(provider_id, model, original).tokens;
+    let new = tt_tokenize::estimate_input_tokens_for_model(provider_id, model, summary).tokens;
+    orig.saturating_sub(new) >= clear_at_least_tokens.max(1)
+}
+
 /// Default cap on completion turns when the caller does not specify one.
 ///
 /// Consumed by the `POST /v1/agent/runs` handler ([`create_run`]).
@@ -1567,5 +1605,37 @@ mod tests {
             summarize: None,
         };
         assert_eq!(sr.to_run().summarizer_tax_usd, Some(0.0004));
+    }
+
+    // ----- eligible_tool_ordinals + token_true_ok (slice 2c-1 Task 4) -----
+
+    #[test]
+    fn eligible_ordinals_keeps_recent_and_respects_watermark() {
+        // messages: A(tc) T0 A(tc) T1 A(tc) T2 A(tc) T3  (4 tool blocks)
+        let msgs = vec![
+            assistant_toolcall("find_route_for"), tool_result("c1"),
+            assistant_toolcall("find_route_for"), tool_result("c2"),
+            assistant_toolcall("find_route_for"), tool_result("c3"),
+            assistant_toolcall("find_route_for"), tool_result("c4"),
+        ];
+        // keep_recent_pairs=2 → eligible tool blocks are T0,T1 (the 2 oldest); their
+        // MESSAGE indices are 1 and 3. watermark=0 → both.
+        assert_eq!(eligible_tool_ordinals(&msgs, 0, 2), vec![1, 3]);
+        // watermark=1 → T0 already done → only T1 (index 3).
+        assert_eq!(eligible_tool_ordinals(&msgs, 1, 2), vec![3]);
+        // keep_recent_pairs >= tool count → nothing eligible.
+        assert!(eligible_tool_ordinals(&msgs, 0, 4).is_empty());
+        assert!(eligible_tool_ordinals(&msgs, 0, 9).is_empty());
+    }
+
+    #[test]
+    fn token_true_ok_requires_real_reduction() {
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu";
+        let short = "alpha";
+        assert!(token_true_ok("openai", "gpt-4o-mini", long, short, 0));
+        // a non-reduction (same text) must be rejected even at floor 0 (>=1 required).
+        assert!(!token_true_ok("openai", "gpt-4o-mini", long, long, 0));
+        // a reduction below the clear_at_least_tokens floor is rejected.
+        assert!(!token_true_ok("openai", "gpt-4o-mini", long, short, 9999));
     }
 }
