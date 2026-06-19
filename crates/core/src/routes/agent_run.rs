@@ -305,6 +305,7 @@ pub(crate) async fn run_loop_core(
         };
         usage.prompt_tokens += turn_usage.prompt_tokens;
         usage.completion_tokens += turn_usage.completion_tokens;
+        usage.cost_usd += turn_usage.cost_usd; // served cost across turns (and resume, via the carried usage)
         messages.push(assistant.clone());
 
         let tool_calls = match &assistant {
@@ -766,11 +767,11 @@ impl TurnCompleter for GatewayCompleter<'_> {
         .await?;
 
         match chat::complete_once(self.state, &ctx, prep).await? {
-            CompletionOutcome::Dispatched { response, .. } => {
+            CompletionOutcome::Dispatched { response, headers } => {
                 let usage = RunUsage {
                     prompt_tokens: response.usage.prompt_tokens,
                     completion_tokens: response.usage.completion_tokens,
-                    cost_usd: 0.0,
+                    cost_usd: headers.cost_breakdown.cost_usd, // served cost (x-tokentrimmer-cost-usd)
                 };
                 let msg = response
                     .choices
@@ -2334,5 +2335,76 @@ mod tests {
         assert_eq!(ru.prompt_tokens, 5);
         assert_eq!(ru.completion_tokens, 7);
         assert_eq!(ru.cost_usd, 0.0);
+    }
+
+    /// A completer that returns a fixed per-turn served cost (+ a scripted message),
+    /// so a test can assert the loop accumulates `usage.cost_usd` across turns.
+    struct CostStub {
+        script: std::sync::Mutex<Vec<Message>>,
+        cost_per_turn: f64,
+    }
+    #[async_trait]
+    impl TurnCompleter for CostStub {
+        async fn complete(
+            &self,
+            _req: ChatCompletionRequest,
+            _is_mechanical: bool,
+        ) -> Result<(Message, RunUsage), ApiError> {
+            Ok((
+                self.script.lock().unwrap().remove(0),
+                RunUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cost_usd: self.cost_per_turn,
+                },
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_accumulates_served_cost_across_turns() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.25,
+        };
+        let run = run_loop(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8).await;
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.turns, 2);
+        assert_eq!(run.usage.cost_usd, 0.5); // 2 * 0.25, exact in f64
+    }
+
+    #[tokio::test]
+    async fn loop_cost_continues_from_restored_usage_on_resume() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.5,
+        };
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0, // turns_done
+            0, // summarized_upto
+            RunUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cost_usd: 1.0,
+            }, // restored carry-in
+            None, // summarizer
+        )
+        .await;
+        match out {
+            LoopOutcome::Terminal(run) => assert_eq!(run.usage.cost_usd, 2.0),
+            _ => panic!("expected Terminal"),
+        }
     }
 }
