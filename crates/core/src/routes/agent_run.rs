@@ -118,8 +118,9 @@ fn is_mechanical_continuation(messages: &[tt_shared::messages::Message]) -> bool
 
 /// Message indices of the tool-result blocks eligible for summarization: the
 /// tool blocks OLDER than the last `keep_recent_pairs` (caveat C1 — recent tail
-/// verbatim) AND beyond the `summarized_upto` watermark (count of leading tool
-/// blocks already summarized, so each block is processed at most once).
+/// verbatim) AND beyond the `summarized_upto` high-water mark (tool blocks with a
+/// lower ordinal are already summarized; each block is processed at most once).
+#[allow(dead_code)] // wired into the loop in slice 2c-1 Task 7 (GatewayTranscriptSummarizer)
 fn eligible_tool_ordinals(
     messages: &[Message],
     summarized_upto: u32,
@@ -142,6 +143,7 @@ fn eligible_tool_ordinals(
 /// token-neutral/-inflating commit; the floor is the R1 cache-thrash guard).
 /// Mirrors the pipeline gate's discipline (`passes/mod.rs`): even on the
 /// `Confidence::Low` (`chars/4`) fallback a non-reduction is rejected.
+#[allow(dead_code)] // wired into the loop in slice 2c-1 Task 7 (GatewayTranscriptSummarizer)
 fn token_true_ok(
     provider_id: &str,
     model: &str,
@@ -1626,6 +1628,9 @@ mod tests {
         // keep_recent_pairs >= tool count → nothing eligible.
         assert!(eligible_tool_ordinals(&msgs, 0, 4).is_empty());
         assert!(eligible_tool_ordinals(&msgs, 0, 9).is_empty());
+        // watermark advanced to/past the eligible cutoff → nothing to do
+        assert!(eligible_tool_ordinals(&msgs, 2, 2).is_empty());
+        assert!(eligible_tool_ordinals(&msgs, 99, 2).is_empty());
     }
 
     #[test]
