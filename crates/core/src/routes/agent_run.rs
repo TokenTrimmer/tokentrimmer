@@ -81,6 +81,51 @@ pub struct Run {
     pub summarizer_tax_usd: Option<f64>,
 }
 
+/// One server-sent event from a streaming agent run (slice 3b). TT-native,
+/// turn-level (per-turn completion is non-streaming, so no token deltas).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type")]
+pub enum RunEvent {
+    #[serde(rename = "run.turn")]
+    Turn { turn: u32 },
+    #[serde(rename = "run.message")]
+    Message { message: tt_shared::messages::Message },
+    #[serde(rename = "run.tool_result")]
+    ToolResult { tool_call_id: String, content: String },
+    #[serde(rename = "run.requires_action")]
+    RequiresAction {
+        run: Run,
+        pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
+    },
+    #[serde(rename = "run.completed")]
+    Completed { run: Run },
+    #[serde(rename = "run.failed")]
+    Failed { run: Run },
+    #[serde(rename = "run.incomplete")]
+    Incomplete { run: Run },
+}
+
+impl RunEvent {
+    fn event_name(&self) -> &'static str {
+        match self {
+            RunEvent::Turn { .. } => "run.turn",
+            RunEvent::Message { .. } => "run.message",
+            RunEvent::ToolResult { .. } => "run.tool_result",
+            RunEvent::RequiresAction { .. } => "run.requires_action",
+            RunEvent::Completed { .. } => "run.completed",
+            RunEvent::Failed { .. } => "run.failed",
+            RunEvent::Incomplete { .. } => "run.incomplete",
+        }
+    }
+    /// Render as an axum SSE event (named, JSON data).
+    #[allow(dead_code)] // used by the streaming path in Task 4
+    fn to_sse(&self) -> axum::response::sse::Event {
+        axum::response::sse::Event::default()
+            .event(self.event_name())
+            .data(serde_json::to_string(self).unwrap_or_default())
+    }
+}
+
 /// One completion turn. Production impl wraps `prepare` + `complete_once`
 /// (slice 1a Task 4); tests inject a stub. Returns the assistant message +
 /// usage for the turn.
@@ -2406,5 +2451,23 @@ mod tests {
             LoopOutcome::Terminal(run) => assert_eq!(run.usage.cost_usd, 2.0),
             _ => panic!("expected Terminal"),
         }
+    }
+
+    // ----- RunEvent enum (slice 3b Task 1) -----
+
+    #[test]
+    fn run_event_serializes_with_type_tag_and_event_name() {
+        let ev = RunEvent::Turn { turn: 1 };
+        assert_eq!(ev.event_name(), "run.turn");
+        assert_eq!(serde_json::to_value(&ev).unwrap()["type"], "run.turn");
+
+        let m = RunEvent::Message { message: assistant_final() };
+        assert_eq!(m.event_name(), "run.message");
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["type"], "run.message");
+        assert!(v.get("message").is_some());
+
+        let tr = RunEvent::ToolResult { tool_call_id: "c1".into(), content: "r".into() };
+        assert_eq!(tr.event_name(), "run.tool_result");
     }
 }
