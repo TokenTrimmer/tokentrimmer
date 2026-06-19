@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::{
     error::ApiError,
     middleware::trace::TraceId,
+    passes::agentic_budget::summarize_judge::SummarizeCall,
     routes::chat::{self, CompletionOutcome},
     ApiResult, AppState,
 };
@@ -1016,6 +1017,84 @@ pub async fn submit_tool_outputs(
     }
 }
 
+/// Build the cheap-model summarize request for one tool-result blob.
+#[allow(dead_code)] // wired into the loop in slice 2c-1 Task 7 (GatewayTranscriptSummarizer)
+fn build_summary_request(class: &str, original: &str, model: &str) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model.to_string(),
+        messages: vec![
+            Message::System {
+                content: MessageContent::Text(format!(
+                    "Summarize this `{class}` tool result. Preserve every fact a later \
+                     step might need; drop only redundancy and formatting. Output only \
+                     the summary, no preamble."
+                )),
+            },
+            Message::User {
+                content: MessageContent::Text(original.to_string()),
+                name: None,
+            },
+        ],
+        stream: false,
+        ..Default::default()
+    }
+}
+
+/// Map a measured dispatch result into a `SummarizeCall` (fail-open): `Err` →
+/// decline (`summary: None`); `Ok` → the first choice's assistant text (empty/
+/// missing ⇒ decline) + the dispatch's metered cost.
+#[allow(dead_code)] // wired into the loop in slice 2c-1 Task 7 (GatewayTranscriptSummarizer)
+fn summary_call_from_result(
+    res: Result<crate::measurement::MeasuredDispatch, String>,
+) -> SummarizeCall {
+    match res {
+        Err(_) => SummarizeCall { summary: None, cost_usd: None },
+        Ok(d) => {
+            let cost_usd = d.cost_usd;
+            let text = d
+                .response
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|c| match c.message {
+                    Message::Assistant { content: Some(MessageContent::Text(t)), .. } => Some(t),
+                    _ => None,
+                })
+                .filter(|t| !t.trim().is_empty());
+            SummarizeCall { summary: text, cost_usd }
+        }
+    }
+}
+
+/// Dispatch one cheap-model summarize call on the SUMMARIZER model's own
+/// provider+creds (NOT the turn's served provider), bounded by `deadline`.
+/// Fail-open: any resolution/dispatch failure ⇒ a declined `SummarizeCall`.
+#[allow(dead_code)] // wired into the loop in slice 2c-1 Task 7 (GatewayTranscriptSummarizer)
+#[allow(clippy::too_many_arguments)] // all args are required; no natural grouping before the struct lands in Task 7
+async fn dispatch_summary(
+    state: &AppState,
+    org_id: Uuid,
+    raw_bearer: &str,
+    base_ctx: &RequestContext,
+    summarizer_model: &str,
+    class: &str,
+    original: &str,
+    deadline: std::time::Duration,
+) -> SummarizeCall {
+    let Some(provider) = state.registry.resolve(summarizer_model) else {
+        return SummarizeCall { summary: None, cost_usd: None };
+    };
+    let ctx = match chat::resolve_credentials_for(state, org_id, provider.id(), raw_bearer, true)
+        .await
+    {
+        Some(credentials) => RequestContext { credentials, ..base_ctx.clone() },
+        None => return SummarizeCall { summary: None, cost_usd: None },
+    };
+    let req = build_summary_request(class, original, summarizer_model);
+    let res = crate::measurement::measured_single_dispatch(&provider, req, &ctx, deadline).await;
+    summary_call_from_result(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1642,5 +1721,46 @@ mod tests {
         assert!(!token_true_ok("openai", "gpt-4o-mini", long, long, 0));
         // a reduction below the clear_at_least_tokens floor is rejected.
         assert!(!token_true_ok("openai", "gpt-4o-mini", long, short, 9999));
+    }
+
+    #[test]
+    fn build_summary_request_shapes_a_cheap_call() {
+        let req = build_summary_request("inspect_diff", "big tool output", "gpt-4o-mini");
+        assert_eq!(req.model, "gpt-4o-mini");
+        assert!(!req.stream);
+        assert_eq!(req.messages.len(), 2);
+        assert!(matches!(req.messages[0], Message::System { .. }));
+        assert!(matches!(req.messages[1], Message::User { .. }));
+    }
+
+    #[test]
+    fn summary_call_maps_dispatch_and_fails_open_on_err() {
+        use crate::measurement::MeasuredDispatch;
+        // Err → fail open (no summary, no cost).
+        let call = summary_call_from_result(Err("deadline exceeded".into()));
+        assert!(call.summary.is_none());
+        assert!(call.cost_usd.is_none());
+
+        // Ok with text → summary + cost passed through. ChatCompletionResponse has
+        // NO Default — construct all 6 fields explicitly; Usage DOES derive Default.
+        let resp = tt_shared::ChatCompletionResponse {
+            id: String::new(),
+            object: String::new(),
+            created: 0,
+            model: "gpt-4o-mini".into(),
+            choices: vec![tt_shared::messages::Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("short".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: tt_shared::Usage::default(),
+        };
+        let call = summary_call_from_result(Ok(MeasuredDispatch { response: resp, cost_usd: Some(0.0001) }));
+        assert_eq!(call.summary.as_deref(), Some("short"));
+        assert_eq!(call.cost_usd, Some(0.0001));
     }
 }
