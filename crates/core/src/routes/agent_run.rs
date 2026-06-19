@@ -86,6 +86,21 @@ pub trait TurnCompleter: Send + Sync {
     ) -> Result<(Message, RunUsage), ApiError>;
 }
 
+/// Optional per-turn transcript summarizer injected into [`run_loop_core`].
+/// `summarize_before_turn` may rewrite aging tool-result blocks in `messages`
+/// in place and advance `summarized_upto`; it returns this call's metered tax
+/// (`Some(0.0)` when nothing was summarized; `None` only when a dispatch was
+/// billed but unpriced). Fail-open: it never errors the run. The pure loop
+/// tests + the 1a `run_loop` wrapper pass `None`.
+#[async_trait]
+pub(crate) trait TranscriptSummarizer: Send + Sync {
+    async fn summarize_before_turn(
+        &self,
+        messages: &mut Vec<Message>,
+        summarized_upto: &mut u32,
+    ) -> Option<f64>;
+}
+
 /// A turn is "mechanical" when the model is about to digest ONLY read-only tool
 /// output: scanning back over the trailing `Message::Tool` results to the
 /// assistant turn that produced them, that assistant turn called >=1 tool and
@@ -177,6 +192,8 @@ pub(crate) enum LoopOutcome {
         turns_done: u32,
         usage: RunUsage,
         pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
+        summarized_upto: u32,
+        summarizer_tax_usd: Option<f64>,
     },
 }
 
@@ -206,11 +223,22 @@ pub(crate) async fn run_loop_core(
     tools: Vec<tt_shared::messages::Tool>,
     max_turns: u32,
     turns_done: u32,
+    mut summarized_upto: u32,
     mut usage: RunUsage,
+    summarizer: Option<&dyn TranscriptSummarizer>,
 ) -> LoopOutcome {
+    use crate::passes::agentic_budget::summarize_judge::sum_metered;
     let max_turns = max_turns.clamp(1, MAX_MAX_TURNS);
     let mut turn = turns_done;
+    // No summarizer ⇒ no tax (`None`), keeping the `summarizer: None` path
+    // byte-behavior-identical to pre-2c-1. With a summarizer, start the metered
+    // accumulator at `Some(0.0)` so each turn's tax folds in via `sum_metered`.
+    let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0);
     while turn < max_turns {
+        if let Some(s) = summarizer {
+            let tax = s.summarize_before_turn(&mut messages, &mut summarized_upto).await;
+            summarizer_tax = sum_metered(summarizer_tax, tax);
+        }
         let req = ChatCompletionRequest {
             model: model.clone(),
             messages: messages.clone(),
@@ -233,7 +261,7 @@ pub(crate) async fn run_loop_core(
                     turns: turn + 1,
                     usage,
                     note: Some(format!("turn {turn} failed: {e}")),
-                    summarizer_tax_usd: None,
+                    summarizer_tax_usd: summarizer_tax,
                 });
             }
         };
@@ -253,7 +281,7 @@ pub(crate) async fn run_loop_core(
                 turns: turn + 1,
                 usage,
                 note: None,
-                summarizer_tax_usd: None,
+                summarizer_tax_usd: summarizer_tax,
             });
         }
 
@@ -292,6 +320,8 @@ pub(crate) async fn run_loop_core(
                 turns_done: turn + 1,
                 usage,
                 pending_tool_calls: pending,
+                summarized_upto,
+                summarizer_tax_usd: summarizer_tax,
             };
         }
         turn += 1;
@@ -303,7 +333,7 @@ pub(crate) async fn run_loop_core(
         turns: max_turns,
         usage,
         note: Some("max_turns reached".into()),
-        summarizer_tax_usd: None,
+        summarizer_tax_usd: summarizer_tax,
     })
 }
 
@@ -328,8 +358,10 @@ pub async fn run_loop(
         messages,
         tools,
         max_turns,
-        0,
+        0, /*turns_done*/
+        0, /*summarized_upto*/
         RunUsage::default(),
+        None, /*summarizer*/
     )
     .await
     {
@@ -339,6 +371,8 @@ pub async fn run_loop(
             turns_done,
             usage,
             pending_tool_calls,
+            summarized_upto: _,
+            summarizer_tax_usd,
         } => {
             // 1a callers (no persistence) surface a pause as Incomplete, exactly
             // as before. The note names the first client tool.
@@ -353,7 +387,7 @@ pub async fn run_loop(
                 turns: turns_done,
                 usage,
                 note: Some(format!("client tool '{name}' requires slice-1b round-trip")),
-                summarizer_tax_usd: None,
+                summarizer_tax_usd,
             }
         }
     }
@@ -775,7 +809,9 @@ pub async fn create_run(
         tools.clone(),
         max_turns,
         0,
+        0,
         RunUsage::default(),
+        None,
     )
     .await
     {
@@ -786,6 +822,8 @@ pub async fn create_run(
             turns_done,
             usage,
             pending_tool_calls,
+            summarized_upto: _paused_upto,
+            summarizer_tax_usd: _paused_tax,
         } => match state.l1.as_ref() {
             // Redis present → persist the paused run so it can be GET/resumed.
             Some(l1) => {
@@ -984,7 +1022,9 @@ pub async fn submit_tool_outputs(
         stored.tools.clone(),
         stored.max_turns,
         stored.turns_done,
+        stored.summarized_upto,
         stored.usage.clone(),
+        None,
     )
     .await;
 
@@ -1005,6 +1045,8 @@ pub async fn submit_tool_outputs(
             turns_done,
             usage,
             pending_tool_calls,
+            summarized_upto: _paused_upto,
+            summarizer_tax_usd: _paused_tax,
         } => {
             stored.status = RunStatus::RequiresAction;
             stored.messages = messages;
@@ -1335,7 +1377,9 @@ mod tests {
             vec![],
             8,
             0,
+            0, /*summarized_upto*/
             RunUsage::default(),
+            None, /*summarizer*/
         )
         .await;
         match out {
@@ -1374,7 +1418,9 @@ mod tests {
             vec![],
             8,
             1,
+            0, /*summarized_upto*/
             RunUsage::default(),
+            None, /*summarizer*/
         )
         .await;
         match out {
@@ -1404,7 +1450,9 @@ mod tests {
             vec![],
             8,
             0,
+            0, /*summarized_upto*/
             RunUsage::default(),
+            None, /*summarizer*/
         )
         .await;
         match out {
@@ -1762,5 +1810,59 @@ mod tests {
         let call = summary_call_from_result(Ok(MeasuredDispatch { response: resp, cost_usd: Some(0.0001) }));
         assert_eq!(call.summary.as_deref(), Some("short"));
         assert_eq!(call.cost_usd, Some(0.0001));
+    }
+
+    // ----- TranscriptSummarizer hook threading (slice 2c-1 Task 6) -----
+
+    /// A stub summarizer that records calls, advances the watermark, reports a fixed tax.
+    struct StubSummarizer {
+        calls: std::sync::Mutex<u32>,
+    }
+    #[async_trait]
+    impl TranscriptSummarizer for StubSummarizer {
+        async fn summarize_before_turn(
+            &self,
+            messages: &mut Vec<Message>,
+            summarized_upto: &mut u32,
+        ) -> Option<f64> {
+            *self.calls.lock().unwrap() += 1;
+            let tools = messages.iter().filter(|m| matches!(m, Message::Tool { .. })).count() as u32;
+            *summarized_upto = tools.saturating_sub(1);
+            Some(0.0002)
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_calls_summarizer_each_turn_and_accrues_tax() {
+        let stub = Stub { script: std::sync::Mutex::new(vec![
+            assistant_toolcall("find_route_for"),
+            assistant_final(),
+        ]) };
+        let summ = StubSummarizer { calls: std::sync::Mutex::new(0) };
+        let out = run_loop_core(
+            &stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, 0, 0,
+            RunUsage::default(), Some(&summ),
+        ).await;
+        match out {
+            LoopOutcome::Terminal(run) => {
+                assert_eq!(run.status, RunStatus::Completed);
+                assert_eq!(*summ.calls.lock().unwrap(), 2); // hook ran before each of the 2 turns
+                assert_eq!(run.summarizer_tax_usd, Some(0.0004)); // 0.0002 * 2, metered
+            }
+            _ => panic!("expected Terminal Completed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_with_no_summarizer_is_unchanged() {
+        let stub = Stub { script: std::sync::Mutex::new(vec![assistant_final()]) };
+        let out = run_loop_core(
+            &stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, 0, 0,
+            RunUsage::default(), None,
+        ).await;
+        match out {
+            LoopOutcome::Terminal(run) => assert_eq!(run.summarizer_tax_usd, None),
+            _ => panic!("expected Terminal"),
+        }
     }
 }
