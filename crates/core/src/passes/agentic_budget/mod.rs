@@ -218,6 +218,8 @@ impl AgenticBudgetPlanner {
         // realized hit books only its MEASURED delta on the handler's async L2
         // lookup, caveat C2). The async lookup/serve (embedder + store) is the
         // handler's to wire, exactly like Sub-lever 3's dispatch lane.
+        // NOTE: the substep-cache SERVE path is intentionally deferred — see
+        // substep_cache.rs module doc (slice 2c-1).
         if ab.semantic_substep_cache {
             Self::mark_substep_cacheable(&mut out, split.request());
         }

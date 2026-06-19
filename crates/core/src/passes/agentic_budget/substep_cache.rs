@@ -29,6 +29,15 @@
 //! This module is the pure, unit-testable confinement + accounting policy; the
 //! handler wires it to the real (Postgres) L2 store and embedder. The in-memory
 //! [`SubstepCache`] mirrors `tt_cache::InMemoryL2Cache` for tests/local dev.
+//!
+//! **Slice 2c-1 status — intentionally deferred (not wired into the agent loop).**
+//! Sub-lever 4 stays a tested building block but is NOT served in the loop: the
+//! only read-only/cacheable tools today are the 4 near-free gateway tools
+//! (`find_route_for`/`preview_cost`/`inspect_diff`/`batch_savings`), so caching
+//! their results saves ~nothing while adding an embedding tax + a persistent
+//! pgvector store. It earns its keep only once an *expensive* read-only gateway
+//! tool (e.g. retrieval) exists. Mirrors the COST-3(U) per-request-proxy
+//! doc-closure. (Slice 2c-1 wired the *summarize* lever instead.)
 
 use std::sync::Mutex;
 

@@ -325,6 +325,11 @@ pub fn map_summary_verdict(verdict: PairVerdict, summary_slot: AbOrder) -> Judge
 /// step inside the pipeline gate; until then the byte check is a conservative
 /// placeholder, weaker than the token-true guarantee the [`SummaryOutcome`] docs
 /// describe.
+/// **Slice 2c-1 update:** the server-side agent loop (`routes::agent_run`)
+/// applies its OWN loop-level token-true gate around an out-of-band summarizer
+/// dispatch (it operates on the loop's flat `Vec<Message>`, not a `VolatileTail`,
+/// since old tool blocks are never in a cache-stable prefix). This `apply`/
+/// `VolatileTail` byte path is unchanged and remains for any future pipeline use.
 pub struct SummarizeStep<'a> {
     /// Keep the last N tool-result blocks (`role:"tool"`) verbatim — the
     /// load-bearing recent context is never summarized (caveat C1 blast-radius
