@@ -42,8 +42,9 @@
 //! (`Unclear`, never an optimistic pass), detached post-response (zero added
 //! user latency).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -208,6 +209,125 @@ impl SummaryGate for AdaptiveSummaryGate {
         // Ratchet: ANY confirmed regression keeps the class shut; otherwise it
         // opens once enough confirmed-equivalent verdicts accumulate.
         degraded == 0 && acceptable >= self.min_acceptable
+    }
+}
+
+/// Tunables for the [`RatchetSummaryGate`] (slice 2c-2). Defaults mirror
+/// `route_autopause` (floor 0.90) + a conservative window.
+#[derive(Debug, Clone)]
+pub struct RatchetConfig {
+    /// Windowed pass-rate floor; below it (over >= `min_samples`) the class shuts.
+    pub floor: f64,
+    /// Sliding verdict-window length (per class).
+    pub window: usize,
+    /// Minimum judged verdicts in the window before the floor can shut a class.
+    pub min_samples: usize,
+    /// How long a shut class stays shut before a half-open re-trial.
+    pub cooldown: Duration,
+}
+
+impl Default for RatchetConfig {
+    fn default() -> Self {
+        Self { floor: 0.90, window: 20, min_samples: 5, cooldown: Duration::from_secs(3600) }
+    }
+}
+
+#[derive(Default)]
+struct ClassRatchet {
+    /// Recent verdicts: `true` = Acceptable, `false` = Degraded (Unclear excluded).
+    window: VecDeque<bool>,
+    /// `Some(t)` while the class is shut; cleared on the half-open re-trial.
+    shut_at: Option<Instant>,
+}
+
+/// A [`SummaryGate`] that the OPERATOR opens (allowlist) and the JUDGE shuts
+/// (slice 2c-2): `committable = allowlisted && !shut`. The judge feeds
+/// [`SummaryGate::record_summary_verdict`]; a windowed pass-rate dip below
+/// `floor` (over >= `min_samples`) shuts the class for `cooldown`, after which a
+/// half-open re-trial clears the window and re-opens it (recovers on fresh real
+/// verdicts). In-process per replica (resets on restart). Empty allowlist trusts
+/// nothing (== `NeverCommitGate`).
+pub struct RatchetSummaryGate {
+    trusted: HashSet<String>,
+    cfg: RatchetConfig,
+    classes: Mutex<HashMap<String, ClassRatchet>>,
+}
+
+impl RatchetSummaryGate {
+    #[must_use]
+    pub fn new(trusted: HashSet<String>, cfg: RatchetConfig) -> Self {
+        Self { trusted, cfg, classes: Mutex::new(HashMap::new()) }
+    }
+
+    /// Build from `TT_SUMMARIZE_TRUSTED_CLASSES` (the 2c-1 allowlist) +
+    /// `TT_SUMMARIZE_JUDGE_{FLOOR,WINDOW,MIN_SAMPLES,COOLDOWN_SECS}` (defaults
+    /// from [`RatchetConfig::default`]).
+    #[must_use]
+    pub fn from_env() -> Self {
+        let trusted = std::env::var("TT_SUMMARIZE_TRUSTED_CLASSES")
+            .ok()
+            .as_deref()
+            .map(parse_trusted_classes)
+            .unwrap_or_default();
+        let d = RatchetConfig::default();
+        let cfg = RatchetConfig {
+            floor: env_parse("TT_SUMMARIZE_JUDGE_FLOOR", d.floor),
+            window: env_parse("TT_SUMMARIZE_JUDGE_WINDOW", d.window),
+            min_samples: env_parse("TT_SUMMARIZE_JUDGE_MIN_SAMPLES", d.min_samples),
+            cooldown: Duration::from_secs(env_parse(
+                "TT_SUMMARIZE_JUDGE_COOLDOWN_SECS",
+                d.cooldown.as_secs(),
+            )),
+        };
+        Self::new(trusted, cfg)
+    }
+}
+
+/// Parse an env var to `T`, falling back to `default` on unset/empty/malformed.
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+impl SummaryGate for RatchetSummaryGate {
+    fn is_committable(&self, class: &str) -> bool {
+        if !self.trusted.contains(class) {
+            return false;
+        }
+        let mut g = self.classes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cr) = g.get_mut(class) {
+            if let Some(shut_at) = cr.shut_at {
+                if shut_at.elapsed() >= self.cfg.cooldown {
+                    // Half-open re-trial: clear the window (so stale Degradeds
+                    // don't instantly re-shut) and re-open.
+                    cr.window.clear();
+                    cr.shut_at = None;
+                } else {
+                    return false; // shut within cooldown
+                }
+            }
+        }
+        true
+    }
+
+    fn record_summary_verdict(&self, class: &str, verdict: JudgeVerdict) {
+        let acceptable = match verdict {
+            JudgeVerdict::Acceptable => true,
+            JudgeVerdict::Degraded => false,
+            JudgeVerdict::Unclear => return, // no valence — excluded
+        };
+        let mut g = self.classes.lock().unwrap_or_else(|e| e.into_inner());
+        let cr = g.entry(class.to_string()).or_default();
+        cr.window.push_back(acceptable);
+        while cr.window.len() > self.cfg.window {
+            cr.window.pop_front();
+        }
+        if cr.window.len() >= self.cfg.min_samples {
+            let acc = cr.window.iter().filter(|&&b| b).count();
+            let rate = acc as f64 / cr.window.len() as f64;
+            if rate < self.cfg.floor {
+                cr.shut_at = Some(Instant::now());
+            }
+        }
     }
 }
 
@@ -977,6 +1097,58 @@ mod tests {
         let gate: std::sync::Arc<dyn SummaryGate> = std::sync::Arc::new(NeverCommitGate);
         gate.record_summary_verdict("inspect_diff", JudgeVerdict::Degraded); // no-op, must not panic
         assert!(!gate.is_committable("inspect_diff")); // unchanged by the no-op
+    }
+
+    // ── RatchetSummaryGate (slice 2c-2) ──────────────────────────────────────
+
+    use std::time::Duration;
+
+    fn ratchet(trusted: &[&str], cooldown_secs: u64) -> RatchetSummaryGate {
+        let set = trusted.iter().map(|s| s.to_string()).collect();
+        RatchetSummaryGate::new(set, RatchetConfig {
+            floor: 0.90, window: 20, min_samples: 5, cooldown: Duration::from_secs(cooldown_secs),
+        })
+    }
+
+    #[test]
+    fn ratchet_allowlist_gates_commit() {
+        let g = ratchet(&["inspect_diff"], 3600);
+        assert!(g.is_committable("inspect_diff"));   // allowlisted, no verdicts → open
+        assert!(!g.is_committable("write_file"));    // not allowlisted → closed
+    }
+
+    #[test]
+    fn ratchet_shuts_below_floor_after_min_samples() {
+        use tt_plan_core::JudgeVerdict::*;
+        let g = ratchet(&["inspect_diff"], 3600);
+        for v in [Degraded, Degraded, Degraded, Acceptable] { g.record_summary_verdict("inspect_diff", v); }
+        assert!(g.is_committable("inspect_diff"));    // 4 < min_samples(5) ⇒ not shut
+        g.record_summary_verdict("inspect_diff", Degraded); // 5th: rate 1/5=0.20 < 0.90 ⇒ shut
+        assert!(!g.is_committable("inspect_diff"));
+    }
+
+    #[test]
+    fn ratchet_clean_window_stays_open() {
+        use tt_plan_core::JudgeVerdict::*;
+        let g = ratchet(&["inspect_diff"], 3600);
+        for _ in 0..10 { g.record_summary_verdict("inspect_diff", Acceptable); }
+        assert!(g.is_committable("inspect_diff"));
+    }
+
+    #[test]
+    fn ratchet_unclear_excluded() {
+        use tt_plan_core::JudgeVerdict::*;
+        let g = ratchet(&["inspect_diff"], 3600);
+        for _ in 0..10 { g.record_summary_verdict("inspect_diff", Unclear); }
+        assert!(g.is_committable("inspect_diff")); // 0 acc / 0 deg ⇒ never shut
+    }
+
+    #[test]
+    fn ratchet_cooldown_half_open_clears_window() {
+        use tt_plan_core::JudgeVerdict::*;
+        let g = ratchet(&["inspect_diff"], 0); // cooldown 0 ⇒ shut class immediately half-open
+        for _ in 0..5 { g.record_summary_verdict("inspect_diff", Degraded); } // shuts
+        assert!(g.is_committable("inspect_diff")); // elapsed>=0==cooldown ⇒ half-open, window cleared, re-open
     }
 
     #[test]
