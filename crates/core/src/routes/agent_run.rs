@@ -307,8 +307,14 @@ pub(crate) async fn run_loop_core(
     mut summarized_upto: u32,
     mut usage: RunUsage,
     summarizer: Option<&dyn TranscriptSummarizer>,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<RunEvent>>,
 ) -> LoopOutcome {
     use crate::passes::agentic_budget::summarize_judge::sum_metered;
+    let emit = |ev: RunEvent| {
+        if let Some(tx) = events {
+            let _ = tx.send(ev); // unbounded, sync; receiver-dropped ⇒ ignored
+        }
+    };
     let max_turns = max_turns.clamp(1, MAX_MAX_TURNS);
     let mut turn = turns_done;
     // No summarizer ⇒ no tax (`None`), keeping the `summarizer: None` path
@@ -316,6 +322,7 @@ pub(crate) async fn run_loop_core(
     // accumulator at `Some(0.0)` so each turn's tax folds in via `sum_metered`.
     let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0);
     while turn < max_turns {
+        emit(RunEvent::Turn { turn: turn + 1 }); // 1-indexed
         if let Some(s) = summarizer {
             let tax = s
                 .summarize_before_turn(&mut messages, &mut summarized_upto)
@@ -352,6 +359,7 @@ pub(crate) async fn run_loop_core(
         usage.completion_tokens += turn_usage.completion_tokens;
         usage.cost_usd += turn_usage.cost_usd; // served cost across turns (and resume, via the carried usage)
         messages.push(assistant.clone());
+        emit(RunEvent::Message { message: assistant.clone() });
 
         let tool_calls = match &assistant {
             Message::Assistant { tool_calls, .. } => tool_calls.clone(),
@@ -387,6 +395,7 @@ pub(crate) async fn run_loop_core(
                     // so the model can read it and react on the next turn.
                     Err(e) => format!("tool error: {e}"),
                 };
+                emit(RunEvent::ToolResult { tool_call_id: tc.id.clone(), content: result.clone() });
                 messages.push(Message::Tool {
                     content: MessageContent::Text(result),
                     tool_call_id: tc.id.clone(),
@@ -446,6 +455,7 @@ pub async fn run_loop(
         0, /*summarized_upto*/
         RunUsage::default(),
         None, /*summarizer*/
+        None, /*events*/
     )
     .await
     {
@@ -930,6 +940,7 @@ pub async fn create_run(
         0,
         RunUsage::default(),
         summ_ref,
+        None, /*events*/
     )
     .await
     {
@@ -1171,6 +1182,7 @@ pub async fn submit_tool_outputs(
         stored.summarized_upto,
         stored.usage.clone(),
         summ_ref,
+        None, /*events*/
     )
     .await;
 
@@ -1790,6 +1802,7 @@ mod tests {
             0, /*summarized_upto*/
             RunUsage::default(),
             None, /*summarizer*/
+            None, /*events*/
         )
         .await;
         match out {
@@ -1831,6 +1844,7 @@ mod tests {
             0, /*summarized_upto*/
             RunUsage::default(),
             None, /*summarizer*/
+            None, /*events*/
         )
         .await;
         match out {
@@ -1863,6 +1877,7 @@ mod tests {
             0, /*summarized_upto*/
             RunUsage::default(),
             None, /*summarizer*/
+            None, /*events*/
         )
         .await;
         match out {
@@ -2290,6 +2305,34 @@ mod tests {
         assert!(is_error_blob(r#"{"error":"boom"}"#)); // error blob → never summarized
     }
 
+    // ----- run_loop_core optional event sink (slice 3b Task 2) -----
+
+    #[tokio::test]
+    async fn loop_emits_run_events_to_sink() {
+        let stub = Stub { script: std::sync::Mutex::new(vec![
+            assistant_toolcall("find_route_for"),
+            assistant_final(),
+        ]) };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let out = run_loop_core(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, 0, 0,
+                                RunUsage::default(), None, Some(&tx)).await;
+        assert!(matches!(out, LoopOutcome::Terminal(_)));
+        drop(tx);
+        let mut evs = vec![];
+        while let Some(ev) = rx.recv().await { evs.push(ev); }
+        let names: Vec<&str> = evs.iter().map(|e| e.event_name()).collect();
+        assert_eq!(names, vec!["run.turn", "run.message", "run.tool_result", "run.turn", "run.message"]);
+        assert!(matches!(evs[0], RunEvent::Turn { turn: 1 })); // 1-indexed
+    }
+
+    #[tokio::test]
+    async fn loop_with_no_event_sink_emits_nothing() {
+        let stub = Stub { script: std::sync::Mutex::new(vec![assistant_final()]) };
+        let out = run_loop_core(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, 0, 0,
+                                RunUsage::default(), None, None).await;
+        assert!(matches!(out, LoopOutcome::Terminal(_)));
+    }
+
     // ----- TranscriptSummarizer hook threading (slice 2c-1 Task 6) -----
 
     /// A stub summarizer that records calls, advances the watermark, reports a fixed tax.
@@ -2335,6 +2378,7 @@ mod tests {
             0,
             RunUsage::default(),
             Some(&summ),
+            None, /*events*/
         )
         .await;
         match out {
@@ -2363,6 +2407,7 @@ mod tests {
             0,
             RunUsage::default(),
             None,
+            None, /*events*/
         )
         .await;
         match out {
@@ -2445,6 +2490,7 @@ mod tests {
                 cost_usd: 1.0,
             }, // restored carry-in
             None, // summarizer
+            None, // events
         )
         .await;
         match out {
