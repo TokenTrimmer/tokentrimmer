@@ -51,7 +51,8 @@ pub use substep_cache::{
     classify_substep, SubstepCache, SubstepEntry, SubstepKind, SubstepLookup, SubstepSpace,
 };
 pub use summarize_judge::{
-    map_summary_verdict, AdaptiveSummaryGate, AlwaysCommitGate, NeverCommitGate, SummarizeCall,
+    map_summary_verdict, AdaptiveSummaryGate, AlwaysCommitGate, ConfigSummaryGate, NeverCommitGate,
+    SummarizeCall,
     SummarizeStep, Summarizer, SummaryEdit, SummaryGate, SummaryOutcome,
 };
 pub use supersede::SupersedePass;
