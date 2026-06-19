@@ -7,8 +7,14 @@ use async_trait::async_trait;
 use axum::{
     extract::{Extension, Path, State},
     http::HeaderMap,
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
+    },
     Json,
 };
+use futures::StreamExt; // for .chain
+use tokio::sync::mpsc;
 use tt_auth::ApiKeyContext;
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
@@ -79,6 +85,55 @@ pub struct Run {
     /// cost — a measurement tax, like the quality-judge tax.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summarizer_tax_usd: Option<f64>,
+}
+
+/// One server-sent event from a streaming agent run (slice 3b). TT-native,
+/// turn-level (per-turn completion is non-streaming, so no token deltas).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type")]
+pub enum RunEvent {
+    #[serde(rename = "run.turn")]
+    Turn { turn: u32 },
+    #[serde(rename = "run.message")]
+    Message {
+        message: tt_shared::messages::Message,
+    },
+    #[serde(rename = "run.tool_result")]
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+    },
+    #[serde(rename = "run.requires_action")]
+    RequiresAction {
+        run: Run,
+        pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
+    },
+    #[serde(rename = "run.completed")]
+    Completed { run: Run },
+    #[serde(rename = "run.failed")]
+    Failed { run: Run },
+    #[serde(rename = "run.incomplete")]
+    Incomplete { run: Run },
+}
+
+impl RunEvent {
+    fn event_name(&self) -> &'static str {
+        match self {
+            RunEvent::Turn { .. } => "run.turn",
+            RunEvent::Message { .. } => "run.message",
+            RunEvent::ToolResult { .. } => "run.tool_result",
+            RunEvent::RequiresAction { .. } => "run.requires_action",
+            RunEvent::Completed { .. } => "run.completed",
+            RunEvent::Failed { .. } => "run.failed",
+            RunEvent::Incomplete { .. } => "run.incomplete",
+        }
+    }
+    /// Render as an axum SSE event (named, JSON data).
+    fn to_sse(&self) -> axum::response::sse::Event {
+        axum::response::sse::Event::default()
+            .event(self.event_name())
+            .data(serde_json::to_string(self).unwrap_or_default())
+    }
 }
 
 /// One completion turn. Production impl wraps `prepare` + `complete_once`
@@ -262,8 +317,14 @@ pub(crate) async fn run_loop_core(
     mut summarized_upto: u32,
     mut usage: RunUsage,
     summarizer: Option<&dyn TranscriptSummarizer>,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<RunEvent>>,
 ) -> LoopOutcome {
     use crate::passes::agentic_budget::summarize_judge::sum_metered;
+    let emit = |ev: RunEvent| {
+        if let Some(tx) = events {
+            let _ = tx.send(ev); // unbounded, sync; receiver-dropped ⇒ ignored
+        }
+    };
     let max_turns = max_turns.clamp(1, MAX_MAX_TURNS);
     let mut turn = turns_done;
     // No summarizer ⇒ no tax (`None`), keeping the `summarizer: None` path
@@ -271,6 +332,7 @@ pub(crate) async fn run_loop_core(
     // accumulator at `Some(0.0)` so each turn's tax folds in via `sum_metered`.
     let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0);
     while turn < max_turns {
+        emit(RunEvent::Turn { turn: turn + 1 }); // 1-indexed
         if let Some(s) = summarizer {
             let tax = s
                 .summarize_before_turn(&mut messages, &mut summarized_upto)
@@ -307,6 +369,9 @@ pub(crate) async fn run_loop_core(
         usage.completion_tokens += turn_usage.completion_tokens;
         usage.cost_usd += turn_usage.cost_usd; // served cost across turns (and resume, via the carried usage)
         messages.push(assistant.clone());
+        emit(RunEvent::Message {
+            message: assistant.clone(),
+        });
 
         let tool_calls = match &assistant {
             Message::Assistant { tool_calls, .. } => tool_calls.clone(),
@@ -342,6 +407,10 @@ pub(crate) async fn run_loop_core(
                     // so the model can read it and react on the next turn.
                     Err(e) => format!("tool error: {e}"),
                 };
+                emit(RunEvent::ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: result.clone(),
+                });
                 messages.push(Message::Tool {
                     content: MessageContent::Text(result),
                     tool_call_id: tc.id.clone(),
@@ -401,6 +470,7 @@ pub async fn run_loop(
         0, /*summarized_upto*/
         RunUsage::default(),
         None, /*summarizer*/
+        None, /*events*/
     )
     .await
     {
@@ -809,6 +879,120 @@ pub struct CreateRunRequest {
     /// Turn cap; clamped to `[1, 32]`. Defaults to [`DEFAULT_MAX_TURNS`].
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// When true, `POST /v1/agent/runs` streams run events as SSE (slice 3b)
+    /// instead of returning a single JSON `Run`. Default false.
+    #[serde(default)]
+    pub stream: bool,
+}
+
+/// Build the production summarizer + completer (borrowing `state` + `identity`)
+/// and run the loop with an optional event sink. Shared by the JSON and SSE paths.
+#[allow(clippy::too_many_arguments)]
+async fn drive_run_loop(
+    state: &AppState,
+    identity: RunIdentity,
+    id: Uuid,
+    model: String,
+    messages: Vec<Message>,
+    tools: Vec<tt_shared::messages::Tool>,
+    max_turns: u32,
+    summarize_cfg: Option<SummarizeConfig>,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<RunEvent>>,
+) -> LoopOutcome {
+    let base_provider_id = state.registry.resolve(&model).map(|p| p.id().to_string());
+    let summarizer_model = summarizer_model(state);
+    let base_ctx = base_request_context(&identity);
+    let summarizer_obj = summarize_cfg.map(|cfg| GatewayTranscriptSummarizer {
+        state,
+        org_id: identity.org_id,
+        raw_bearer: identity.raw_bearer.clone(),
+        base_ctx,
+        gate: state.summary_gate.clone(),
+        cfg,
+        base_model: model.clone(),
+        base_provider_id,
+        summarizer_model,
+        deadline: state.judge_config.baseline_timeout,
+    });
+    let summ_ref: Option<&dyn TranscriptSummarizer> = summarizer_obj
+        .as_ref()
+        .map(|s| s as &dyn TranscriptSummarizer);
+    let completer = GatewayCompleter { state, identity };
+    run_loop_core(
+        &completer,
+        id,
+        model,
+        messages,
+        tools,
+        max_turns,
+        0,
+        0,
+        RunUsage::default(),
+        summ_ref,
+        events,
+    )
+    .await
+}
+
+/// Handle a paused run: Redis present ⇒ persist a `RequiresAction` `StoredRun`
+/// (returns its `Run` view); no Redis ⇒ the 1a `Incomplete` fallback `Run`. The
+/// returned `Run.status` discriminates the two for the caller.
+#[allow(clippy::too_many_arguments)]
+async fn persist_paused(
+    state: &AppState,
+    id: Uuid,
+    org_id: Uuid,
+    routing: StoredRouting,
+    model: String,
+    messages: Vec<Message>,
+    tools: Vec<tt_shared::messages::Tool>,
+    max_turns: u32,
+    turns_done: u32,
+    usage: RunUsage,
+    pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
+    summarized_upto: u32,
+    summarizer_tax_usd: Option<f64>,
+    summarize_cfg: Option<SummarizeConfig>,
+) -> ApiResult<Run> {
+    match state.l1.as_ref() {
+        Some(l1) => {
+            let stored = StoredRun {
+                id,
+                org_id,
+                status: RunStatus::RequiresAction,
+                model,
+                messages,
+                tools,
+                max_turns,
+                turns_done,
+                usage,
+                pending_tool_calls,
+                routing,
+                summarized_upto,
+                summarizer_tax_usd,
+                summarize: summarize_cfg,
+            };
+            store_run(l1.cache.as_ref(), &stored).await?;
+            Ok(stored.to_run())
+        }
+        None => {
+            let name = pending_tool_calls
+                .first()
+                .map(|tc| tc.function.name.clone())
+                .unwrap_or_default();
+            Ok(Run {
+                id,
+                status: RunStatus::Incomplete,
+                messages,
+                turns: turns_done,
+                usage,
+                note: Some(format!(
+                    "client tool '{name}' requires Redis to pause/resume (none configured)"
+                )),
+                summarizer_tax_usd,
+            })
+        }
+    }
 }
 
 /// `POST /v1/agent/runs` — run a synchronous server-side agent loop
@@ -822,7 +1006,7 @@ pub async fn create_run(
     auth_ctx: Option<Extension<ApiKeyContext>>,
     headers: HeaderMap,
     Json(req): Json<CreateRunRequest>,
-) -> ApiResult<Json<Run>> {
+) -> ApiResult<Response> {
     let identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
     // Capture the org + non-secret routing config BEFORE `identity` is moved
     // into the completer — a paused run persists these (never any credential).
@@ -844,52 +1028,116 @@ pub async fn create_run(
     // false, so no summarize dispatch ever happens even when a route opts in.
     let summarize_cfg =
         resolve_summarize_config(&state, &identity, &req.model, &req.messages).await;
-    let base_provider_id = state
-        .registry
-        .resolve(&req.model)
-        .map(|p| p.id().to_string());
-    let summarizer_model = summarizer_model(&state);
-    let base_ctx = base_request_context(&identity);
-    let summarizer_obj = summarize_cfg
-        .clone()
-        .map(|cfg| GatewayTranscriptSummarizer {
-            state: &state,
-            org_id: identity.org_id,
-            raw_bearer: identity.raw_bearer.clone(),
-            base_ctx,
-            gate: state.summary_gate.clone(),
-            cfg,
-            base_model: req.model.clone(),
-            base_provider_id,
-            summarizer_model,
-            deadline: state.judge_config.baseline_timeout,
-        });
 
-    let completer = GatewayCompleter {
-        state: &state,
-        identity,
-    };
     let id = Uuid::new_v4();
-    let summ_ref: Option<&dyn TranscriptSummarizer> = summarizer_obj
-        .as_ref()
-        .map(|s| s as &dyn TranscriptSummarizer);
 
-    match run_loop_core(
-        &completer,
+    if req.stream {
+        let owned_state = state.clone(); // cheap Arcs; 'static for the spawned task
+        let messages = req.messages;
+        let (tx, rx) = mpsc::unbounded_channel::<RunEvent>();
+        tokio::spawn(async move {
+            let outcome = drive_run_loop(
+                &owned_state,
+                identity,
+                id,
+                model.clone(),
+                messages,
+                tools.clone(),
+                max_turns,
+                summarize_cfg.clone(),
+                Some(&tx),
+            )
+            .await;
+            match outcome {
+                LoopOutcome::Terminal(run) => {
+                    let _ = tx.send(match run.status {
+                        RunStatus::Completed => RunEvent::Completed { run },
+                        RunStatus::Failed => RunEvent::Failed { run },
+                        _ => RunEvent::Incomplete { run }, // max_turns
+                    });
+                }
+                LoopOutcome::Paused {
+                    messages,
+                    turns_done,
+                    usage,
+                    pending_tool_calls,
+                    summarized_upto,
+                    summarizer_tax_usd,
+                } => {
+                    let pending = pending_tool_calls.clone();
+                    match persist_paused(
+                        &owned_state,
+                        id,
+                        org_id,
+                        routing,
+                        model,
+                        messages,
+                        tools,
+                        max_turns,
+                        turns_done,
+                        usage,
+                        pending_tool_calls,
+                        summarized_upto,
+                        summarizer_tax_usd,
+                        summarize_cfg,
+                    )
+                    .await
+                    {
+                        Ok(run) => {
+                            let _ = tx.send(match run.status {
+                                RunStatus::RequiresAction => RunEvent::RequiresAction {
+                                    run,
+                                    pending_tool_calls: pending,
+                                },
+                                _ => RunEvent::Incomplete { run }, // no-Redis fallback
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(run_id = %id, error = %e, "agent run persist failed");
+                            let _ = tx.send(RunEvent::Failed {
+                                run: Run {
+                                    id,
+                                    status: RunStatus::Failed,
+                                    messages: vec![],
+                                    turns: turns_done,
+                                    usage: RunUsage::default(),
+                                    note: Some(format!("persist failed: {e}")),
+                                    summarizer_tax_usd: None,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+            // tx dropped here ⇒ the stream ends after [DONE]
+        });
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|ev| (Ok::<_, std::convert::Infallible>(ev.to_sse()), rx))
+        })
+        .chain(futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
+        }));
+        return Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response());
+    }
+
+    let outcome = drive_run_loop(
+        &state,
+        identity,
         id,
         model.clone(),
         req.messages,
         tools.clone(),
         max_turns,
-        0,
-        0,
-        RunUsage::default(),
-        summ_ref,
+        summarize_cfg.clone(),
+        None,
     )
-    .await
-    {
-        // Inline completion — terminal runs are not persisted.
-        LoopOutcome::Terminal(run) => Ok(Json(run)),
+    .await;
+    match outcome {
+        LoopOutcome::Terminal(run) => Ok(Json(run).into_response()),
         LoopOutcome::Paused {
             messages,
             turns_done,
@@ -897,50 +1145,26 @@ pub async fn create_run(
             pending_tool_calls,
             summarized_upto,
             summarizer_tax_usd,
-        } => match state.l1.as_ref() {
-            // Redis present → persist the paused run so it can be GET/resumed.
-            // Persist the COMPUTED watermark + tax + pinned policy (create_run is
-            // the first segment, so there is no prior tax to fold in).
-            Some(l1) => {
-                let stored = StoredRun {
-                    id,
-                    org_id,
-                    status: RunStatus::RequiresAction,
-                    model,
-                    messages,
-                    tools,
-                    max_turns,
-                    turns_done,
-                    usage,
-                    pending_tool_calls,
-                    routing,
-                    summarized_upto,
-                    summarizer_tax_usd,
-                    summarize: summarize_cfg,
-                };
-                store_run(l1.cache.as_ref(), &stored).await?;
-                Ok(Json(stored.to_run()))
-            }
-            // No Redis → 1a fallback: surface the pause as Incomplete (carry the
-            // segment's summarizer tax through to the returned Run).
-            None => {
-                let name = pending_tool_calls
-                    .first()
-                    .map(|tc| tc.function.name.clone())
-                    .unwrap_or_default();
-                Ok(Json(Run {
-                    id,
-                    status: RunStatus::Incomplete,
-                    messages,
-                    turns: turns_done,
-                    usage,
-                    note: Some(format!(
-                        "client tool '{name}' requires Redis to pause/resume (none configured)"
-                    )),
-                    summarizer_tax_usd,
-                }))
-            }
-        },
+        } => {
+            let run = persist_paused(
+                &state,
+                id,
+                org_id,
+                routing,
+                model,
+                messages,
+                tools,
+                max_turns,
+                turns_done,
+                usage,
+                pending_tool_calls,
+                summarized_upto,
+                summarizer_tax_usd,
+                summarize_cfg,
+            )
+            .await?;
+            Ok(Json(run).into_response())
+        }
     }
 }
 
@@ -1126,6 +1350,7 @@ pub async fn submit_tool_outputs(
         stored.summarized_upto,
         stored.usage.clone(),
         summ_ref,
+        None, /*events*/
     )
     .await;
 
@@ -1745,6 +1970,7 @@ mod tests {
             0, /*summarized_upto*/
             RunUsage::default(),
             None, /*summarizer*/
+            None, /*events*/
         )
         .await;
         match out {
@@ -1786,6 +2012,7 @@ mod tests {
             0, /*summarized_upto*/
             RunUsage::default(),
             None, /*summarizer*/
+            None, /*events*/
         )
         .await;
         match out {
@@ -1818,6 +2045,7 @@ mod tests {
             0, /*summarized_upto*/
             RunUsage::default(),
             None, /*summarizer*/
+            None, /*events*/
         )
         .await;
         match out {
@@ -2245,6 +2473,73 @@ mod tests {
         assert!(is_error_blob(r#"{"error":"boom"}"#)); // error blob → never summarized
     }
 
+    // ----- run_loop_core optional event sink (slice 3b Task 2) -----
+
+    #[tokio::test]
+    async fn loop_emits_run_events_to_sink() {
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0,
+            0,
+            RunUsage::default(),
+            None,
+            Some(&tx),
+        )
+        .await;
+        assert!(matches!(out, LoopOutcome::Terminal(_)));
+        drop(tx);
+        let mut evs = vec![];
+        while let Some(ev) = rx.recv().await {
+            evs.push(ev);
+        }
+        let names: Vec<&str> = evs.iter().map(|e| e.event_name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "run.turn",
+                "run.message",
+                "run.tool_result",
+                "run.turn",
+                "run.message"
+            ]
+        );
+        assert!(matches!(evs[0], RunEvent::Turn { turn: 1 })); // 1-indexed
+    }
+
+    #[tokio::test]
+    async fn loop_with_no_event_sink_emits_nothing() {
+        let stub = Stub {
+            script: std::sync::Mutex::new(vec![assistant_final()]),
+        };
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            0,
+            0,
+            RunUsage::default(),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(out, LoopOutcome::Terminal(_)));
+    }
+
     // ----- TranscriptSummarizer hook threading (slice 2c-1 Task 6) -----
 
     /// A stub summarizer that records calls, advances the watermark, reports a fixed tax.
@@ -2290,6 +2585,7 @@ mod tests {
             0,
             RunUsage::default(),
             Some(&summ),
+            None, /*events*/
         )
         .await;
         match out {
@@ -2318,6 +2614,7 @@ mod tests {
             0,
             RunUsage::default(),
             None,
+            None, /*events*/
         )
         .await;
         match out {
@@ -2400,11 +2697,35 @@ mod tests {
                 cost_usd: 1.0,
             }, // restored carry-in
             None, // summarizer
+            None, // events
         )
         .await;
         match out {
             LoopOutcome::Terminal(run) => assert_eq!(run.usage.cost_usd, 2.0),
             _ => panic!("expected Terminal"),
         }
+    }
+
+    // ----- RunEvent enum (slice 3b Task 1) -----
+
+    #[test]
+    fn run_event_serializes_with_type_tag_and_event_name() {
+        let ev = RunEvent::Turn { turn: 1 };
+        assert_eq!(ev.event_name(), "run.turn");
+        assert_eq!(serde_json::to_value(&ev).unwrap()["type"], "run.turn");
+
+        let m = RunEvent::Message {
+            message: assistant_final(),
+        };
+        assert_eq!(m.event_name(), "run.message");
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["type"], "run.message");
+        assert!(v.get("message").is_some());
+
+        let tr = RunEvent::ToolResult {
+            tool_call_id: "c1".into(),
+            content: "r".into(),
+        };
+        assert_eq!(tr.event_name(), "run.tool_result");
     }
 }
