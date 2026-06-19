@@ -34,6 +34,11 @@
 //!    information) closes the [`AdaptiveSummaryGate`] for that class and feeds
 //!    the same `auto_pause` window the down-route judge does.
 //!
+//! [`RatchetSummaryGate`] (slice 2c-2) is the production judge-fed gate: the
+//! operator allowlist opens a class; a windowed pass-rate dip shuts it with
+//! cooldown half-open. [`AdaptiveSummaryGate`] remains the open-on-accumulated-
+//! Acceptable variant, kept for a future auto-earn path.
+//!
 //! The blind paired judge itself is the existing [`crate::quality_sample`]
 //! machinery, reused not re-derived: position-debiased via
 //! [`crate::quality_sample::ab_order_for`], recall-of-baseline
@@ -214,6 +219,8 @@ impl SummaryGate for AdaptiveSummaryGate {
 
 /// Tunables for the [`RatchetSummaryGate`] (slice 2c-2). Defaults mirror
 /// `route_autopause` (floor 0.90) + a conservative window.
+///
+/// Note: `min_samples` must be `<= window`, else the floor can never trigger.
 #[derive(Debug, Clone)]
 pub struct RatchetConfig {
     /// Windowed pass-rate floor; below it (over >= `min_samples`) the class shuts.
@@ -228,11 +235,16 @@ pub struct RatchetConfig {
 
 impl Default for RatchetConfig {
     fn default() -> Self {
-        Self { floor: 0.90, window: 20, min_samples: 5, cooldown: Duration::from_secs(3600) }
+        Self {
+            floor: 0.90,
+            window: 20,
+            min_samples: 5,
+            cooldown: Duration::from_secs(3600),
+        }
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ClassRatchet {
     /// Recent verdicts: `true` = Acceptable, `false` = Degraded (Unclear excluded).
     window: VecDeque<bool>,
@@ -247,6 +259,7 @@ struct ClassRatchet {
 /// half-open re-trial clears the window and re-opens it (recovers on fresh real
 /// verdicts). In-process per replica (resets on restart). Empty allowlist trusts
 /// nothing (== `NeverCommitGate`).
+#[derive(Debug)]
 pub struct RatchetSummaryGate {
     trusted: HashSet<String>,
     cfg: RatchetConfig,
@@ -256,7 +269,17 @@ pub struct RatchetSummaryGate {
 impl RatchetSummaryGate {
     #[must_use]
     pub fn new(trusted: HashSet<String>, cfg: RatchetConfig) -> Self {
-        Self { trusted, cfg, classes: Mutex::new(HashMap::new()) }
+        debug_assert!(
+            cfg.min_samples <= cfg.window,
+            "RatchetConfig.min_samples ({}) must be <= window ({}) or the floor can never trigger (class never shuts)",
+            cfg.min_samples,
+            cfg.window,
+        );
+        Self {
+            trusted,
+            cfg,
+            classes: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Build from `TT_SUMMARIZE_TRUSTED_CLASSES` (the 2c-1 allowlist) +
@@ -285,7 +308,10 @@ impl RatchetSummaryGate {
 
 /// Parse an env var to `T`, falling back to `default` on unset/empty/malformed.
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 impl SummaryGate for RatchetSummaryGate {
@@ -324,7 +350,9 @@ impl SummaryGate for RatchetSummaryGate {
         if cr.window.len() >= self.cfg.min_samples {
             let acc = cr.window.iter().filter(|&&b| b).count();
             let rate = acc as f64 / cr.window.len() as f64;
-            if rate < self.cfg.floor {
+            // Only START the cooldown on the first shut; in-flight verdicts during
+            // cooldown must not drift the recovery time (half-open clears the window).
+            if rate < self.cfg.floor && cr.shut_at.is_none() {
                 cr.shut_at = Some(Instant::now());
             }
         }
@@ -1105,24 +1133,32 @@ mod tests {
 
     fn ratchet(trusted: &[&str], cooldown_secs: u64) -> RatchetSummaryGate {
         let set = trusted.iter().map(|s| s.to_string()).collect();
-        RatchetSummaryGate::new(set, RatchetConfig {
-            floor: 0.90, window: 20, min_samples: 5, cooldown: Duration::from_secs(cooldown_secs),
-        })
+        RatchetSummaryGate::new(
+            set,
+            RatchetConfig {
+                floor: 0.90,
+                window: 20,
+                min_samples: 5,
+                cooldown: Duration::from_secs(cooldown_secs),
+            },
+        )
     }
 
     #[test]
     fn ratchet_allowlist_gates_commit() {
         let g = ratchet(&["inspect_diff"], 3600);
-        assert!(g.is_committable("inspect_diff"));   // allowlisted, no verdicts → open
-        assert!(!g.is_committable("write_file"));    // not allowlisted → closed
+        assert!(g.is_committable("inspect_diff")); // allowlisted, no verdicts → open
+        assert!(!g.is_committable("write_file")); // not allowlisted → closed
     }
 
     #[test]
     fn ratchet_shuts_below_floor_after_min_samples() {
         use tt_plan_core::JudgeVerdict::*;
         let g = ratchet(&["inspect_diff"], 3600);
-        for v in [Degraded, Degraded, Degraded, Acceptable] { g.record_summary_verdict("inspect_diff", v); }
-        assert!(g.is_committable("inspect_diff"));    // 4 < min_samples(5) ⇒ not shut
+        for v in [Degraded, Degraded, Degraded, Acceptable] {
+            g.record_summary_verdict("inspect_diff", v);
+        }
+        assert!(g.is_committable("inspect_diff")); // 4 < min_samples(5) ⇒ not shut
         g.record_summary_verdict("inspect_diff", Degraded); // 5th: rate 1/5=0.20 < 0.90 ⇒ shut
         assert!(!g.is_committable("inspect_diff"));
     }
@@ -1131,7 +1167,9 @@ mod tests {
     fn ratchet_clean_window_stays_open() {
         use tt_plan_core::JudgeVerdict::*;
         let g = ratchet(&["inspect_diff"], 3600);
-        for _ in 0..10 { g.record_summary_verdict("inspect_diff", Acceptable); }
+        for _ in 0..10 {
+            g.record_summary_verdict("inspect_diff", Acceptable);
+        }
         assert!(g.is_committable("inspect_diff"));
     }
 
@@ -1139,7 +1177,9 @@ mod tests {
     fn ratchet_unclear_excluded() {
         use tt_plan_core::JudgeVerdict::*;
         let g = ratchet(&["inspect_diff"], 3600);
-        for _ in 0..10 { g.record_summary_verdict("inspect_diff", Unclear); }
+        for _ in 0..10 {
+            g.record_summary_verdict("inspect_diff", Unclear);
+        }
         assert!(g.is_committable("inspect_diff")); // 0 acc / 0 deg ⇒ never shut
     }
 
@@ -1147,7 +1187,9 @@ mod tests {
     fn ratchet_cooldown_half_open_clears_window() {
         use tt_plan_core::JudgeVerdict::*;
         let g = ratchet(&["inspect_diff"], 0); // cooldown 0 ⇒ shut class immediately half-open
-        for _ in 0..5 { g.record_summary_verdict("inspect_diff", Degraded); } // shuts
+        for _ in 0..5 {
+            g.record_summary_verdict("inspect_diff", Degraded);
+        } // shuts
         assert!(g.is_committable("inspect_diff")); // elapsed>=0==cooldown ⇒ half-open, window cleared, re-open
     }
 
