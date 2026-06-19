@@ -7,8 +7,14 @@ use async_trait::async_trait;
 use axum::{
     extract::{Extension, Path, State},
     http::HeaderMap,
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
+    },
     Json,
 };
+use futures::StreamExt; // for .chain
+use tokio::sync::mpsc;
 use tt_auth::ApiKeyContext;
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
@@ -123,7 +129,6 @@ impl RunEvent {
         }
     }
     /// Render as an axum SSE event (named, JSON data).
-    #[allow(dead_code)] // used by the streaming path in Task 4
     fn to_sse(&self) -> axum::response::sse::Event {
         axum::response::sse::Event::default()
             .event(self.event_name())
@@ -874,6 +879,10 @@ pub struct CreateRunRequest {
     /// Turn cap; clamped to `[1, 32]`. Defaults to [`DEFAULT_MAX_TURNS`].
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// When true, `POST /v1/agent/runs` streams run events as SSE (slice 3b)
+    /// instead of returning a single JSON `Run`. Default false.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// Build the production summarizer + completer (borrowing `state` + `identity`)
@@ -997,7 +1006,7 @@ pub async fn create_run(
     auth_ctx: Option<Extension<ApiKeyContext>>,
     headers: HeaderMap,
     Json(req): Json<CreateRunRequest>,
-) -> ApiResult<Json<Run>> {
+) -> ApiResult<Response> {
     let identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
     // Capture the org + non-secret routing config BEFORE `identity` is moved
     // into the completer — a paused run persists these (never any credential).
@@ -1021,6 +1030,100 @@ pub async fn create_run(
         resolve_summarize_config(&state, &identity, &req.model, &req.messages).await;
 
     let id = Uuid::new_v4();
+
+    if req.stream {
+        let owned_state = state.clone(); // cheap Arcs; 'static for the spawned task
+        let messages = req.messages;
+        let (tx, rx) = mpsc::unbounded_channel::<RunEvent>();
+        tokio::spawn(async move {
+            let outcome = drive_run_loop(
+                &owned_state,
+                identity,
+                id,
+                model.clone(),
+                messages,
+                tools.clone(),
+                max_turns,
+                summarize_cfg.clone(),
+                Some(&tx),
+            )
+            .await;
+            match outcome {
+                LoopOutcome::Terminal(run) => {
+                    let _ = tx.send(match run.status {
+                        RunStatus::Completed => RunEvent::Completed { run },
+                        RunStatus::Failed => RunEvent::Failed { run },
+                        _ => RunEvent::Incomplete { run }, // max_turns
+                    });
+                }
+                LoopOutcome::Paused {
+                    messages,
+                    turns_done,
+                    usage,
+                    pending_tool_calls,
+                    summarized_upto,
+                    summarizer_tax_usd,
+                } => {
+                    let pending = pending_tool_calls.clone();
+                    match persist_paused(
+                        &owned_state,
+                        id,
+                        org_id,
+                        routing,
+                        model,
+                        messages,
+                        tools,
+                        max_turns,
+                        turns_done,
+                        usage,
+                        pending_tool_calls,
+                        summarized_upto,
+                        summarizer_tax_usd,
+                        summarize_cfg,
+                    )
+                    .await
+                    {
+                        Ok(run) => {
+                            let _ = tx.send(match run.status {
+                                RunStatus::RequiresAction => RunEvent::RequiresAction {
+                                    run,
+                                    pending_tool_calls: pending,
+                                },
+                                _ => RunEvent::Incomplete { run }, // no-Redis fallback
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(run_id = %id, error = %e, "agent run persist failed");
+                            let _ = tx.send(RunEvent::Failed {
+                                run: Run {
+                                    id,
+                                    status: RunStatus::Failed,
+                                    messages: vec![],
+                                    turns: turns_done,
+                                    usage: RunUsage::default(),
+                                    note: Some(format!("persist failed: {e}")),
+                                    summarizer_tax_usd: None,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+            // tx dropped here ⇒ the stream ends after [DONE]
+        });
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|ev| (Ok::<_, std::convert::Infallible>(ev.to_sse()), rx))
+        })
+        .chain(futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
+        }));
+        return Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response());
+    }
+
     let outcome = drive_run_loop(
         &state,
         identity,
@@ -1034,7 +1137,7 @@ pub async fn create_run(
     )
     .await;
     match outcome {
-        LoopOutcome::Terminal(run) => Ok(Json(run)),
+        LoopOutcome::Terminal(run) => Ok(Json(run).into_response()),
         LoopOutcome::Paused {
             messages,
             turns_done,
@@ -1060,7 +1163,7 @@ pub async fn create_run(
                 summarize_cfg,
             )
             .await?;
-            Ok(Json(run))
+            Ok(Json(run).into_response())
         }
     }
 }
