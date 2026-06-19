@@ -93,6 +93,54 @@ impl SummaryGate for AlwaysCommitGate {
     }
 }
 
+/// A [`SummaryGate`] promoted by operator config: a class is committable iff it
+/// is in the env allowlist `TT_SUMMARIZE_TRUSTED_CLASSES` (comma-separated tool
+/// names, each TRIMMED, matched CASE-SENSITIVELY against the raw tool name from
+/// [`resolve_summary_class`]). An empty/unset allowlist trusts nothing — behaving
+/// exactly like [`NeverCommitGate`]. This is slice 2c-1's operator trust surface;
+/// slice 2c-2 replaces it with the live [`AdaptiveSummaryGate`].
+#[derive(Debug, Clone, Default)]
+pub struct ConfigSummaryGate {
+    trusted: std::collections::HashSet<String>,
+}
+
+/// Parse `TT_SUMMARIZE_TRUSTED_CLASSES` value: comma-separated, each entry
+/// trimmed, empty entries dropped. NOT lowercased — matched case-sensitively
+/// against the raw tool name.
+pub(crate) fn parse_trusted_classes(raw: &str) -> std::collections::HashSet<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+impl ConfigSummaryGate {
+    /// Build from the `TT_SUMMARIZE_TRUSTED_CLASSES` env var (unset/empty ⇒
+    /// trusts nothing).
+    #[must_use]
+    pub fn from_env() -> Self {
+        let trusted = std::env::var("TT_SUMMARIZE_TRUSTED_CLASSES")
+            .ok()
+            .as_deref()
+            .map(parse_trusted_classes)
+            .unwrap_or_default();
+        Self { trusted }
+    }
+
+    /// Build from an explicit class set (tests / embedded use).
+    #[must_use]
+    pub fn new(trusted: std::collections::HashSet<String>) -> Self {
+        Self { trusted }
+    }
+}
+
+impl SummaryGate for ConfigSummaryGate {
+    fn is_committable(&self, class: &str) -> bool {
+        self.trusted.contains(class)
+    }
+}
+
 /// Per-class adaptive gate mirroring L2's verify ratchet: a class starts CLOSED
 /// (untrusted) and OPENS once enough blind paired verdicts confirm equivalence;
 /// a single confirmed `Degraded` ratchets it CLOSED again (and it can never
@@ -391,7 +439,7 @@ impl<'a> SummarizeStep<'a> {
 /// NAME (matched via its `tool_call_id` against any `Message::Assistant`'s
 /// `tool_calls`), or `"unknown"` when no match is found. The class is the gate
 /// key + the per-class ratchet bucket.
-fn resolve_summary_class(msgs: &[Message], tail_idx: usize) -> String {
+pub(crate) fn resolve_summary_class(msgs: &[Message], tail_idx: usize) -> String {
     let Message::Tool { tool_call_id, .. } = &msgs[tail_idx] else {
         return "unknown".to_string();
     };
@@ -413,7 +461,7 @@ fn resolve_summary_class(msgs: &[Message], tail_idx: usize) -> String {
 /// Enforced in [`SummarizeStep::apply`]'s eligibility filter, even for a
 /// gate-trusted class.
 #[must_use]
-fn is_error_blob(content: &str) -> bool {
+pub(crate) fn is_error_blob(content: &str) -> bool {
     serde_json::from_str::<Value>(content)
         .ok()
         .and_then(|v| v.as_object().map(|o| o.contains_key("error")))
@@ -908,5 +956,29 @@ mod tests {
         let out = run_summary(&step, &mut req);
         assert!(out.committed.is_empty());
         assert_eq!(serde_json::to_string(&req).unwrap(), before);
+    }
+
+    #[test]
+    fn parse_trusted_classes_trims_and_drops_empties() {
+        let got = parse_trusted_classes("inspect_diff, preview_cost ,, ");
+        assert!(got.contains("inspect_diff"));
+        assert!(got.contains("preview_cost"));
+        assert_eq!(got.len(), 2);
+        assert!(parse_trusted_classes("").is_empty());
+        assert!(parse_trusted_classes("   ").is_empty());
+    }
+
+    #[test]
+    fn config_gate_empty_trusts_nothing() {
+        let gate = ConfigSummaryGate::new(std::collections::HashSet::new());
+        assert!(!gate.is_committable("inspect_diff"));
+    }
+
+    #[test]
+    fn config_gate_trusts_listed_classes_case_sensitively() {
+        let gate = ConfigSummaryGate::new(parse_trusted_classes("inspect_diff"));
+        assert!(gate.is_committable("inspect_diff"));
+        assert!(!gate.is_committable("Inspect_Diff")); // case-sensitive (raw tool name)
+        assert!(!gate.is_committable("preview_cost"));
     }
 }
