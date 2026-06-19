@@ -742,7 +742,7 @@ In the body: add a tax accumulator before the loop (`use crate::passes::agentic_
 ```rust
     let max_turns = max_turns.clamp(1, MAX_MAX_TURNS);
     let mut turn = turns_done;
-    let mut summarizer_tax: Option<f64> = Some(0.0);
+    let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0); // None ⇒ no summarizer ⇒ tax stays None (1b byte-identical); Some(0.0) when present
     while turn < max_turns {
         // Summarize aging tool blocks BEFORE building this turn's request, so
         // the shrunk transcript is sent (and persisted) from here on.
@@ -1026,15 +1026,23 @@ Update the `run_loop_core` call + both outcome arms:
         std::mem::take(&mut stored.messages), stored.tools.clone(),
         stored.max_turns, stored.turns_done, stored.summarized_upto, stored.usage.clone(), summ_ref,
     ).await;
+    // The summarizer tax is CUMULATIVE across pause/resume segments: each
+    // resume's run_loop_core starts its own accumulator at Some(0.0), so add it
+    // to the tax already persisted from prior segments. `sum_metered` is in
+    // scope (imported in Task 6).
+    use crate::passes::agentic_budget::summarize_judge::sum_metered;
     match outcome {
-        LoopOutcome::Terminal(run) => {
+        LoopOutcome::Terminal(mut run) => {
+            let cumulative = sum_metered(stored.summarizer_tax_usd, run.summarizer_tax_usd);
             stored.status = run.status;
             stored.messages = run.messages.clone();
             stored.turns_done = run.turns;
             stored.usage = run.usage.clone();
-            stored.summarizer_tax_usd = run.summarizer_tax_usd;
+            stored.summarizer_tax_usd = cumulative;
             stored.pending_tool_calls = Vec::new();
             store_run(l1.cache.as_ref(), &stored).await?;
+            // Return the cumulative tax to the client (total across all segments).
+            run.summarizer_tax_usd = cumulative;
             Ok(Json(run))
         }
         LoopOutcome::Paused { messages, turns_done, usage, pending_tool_calls, summarized_upto, summarizer_tax_usd } => {
@@ -1043,13 +1051,14 @@ Update the `run_loop_core` call + both outcome arms:
             stored.turns_done = turns_done;
             stored.usage = usage;
             stored.summarized_upto = summarized_upto;
-            stored.summarizer_tax_usd = summarizer_tax_usd;
+            stored.summarizer_tax_usd = sum_metered(stored.summarizer_tax_usd, summarizer_tax_usd);
             stored.pending_tool_calls = pending_tool_calls;
             store_run(l1.cache.as_ref(), &stored).await?;
             Ok(Json(stored.to_run()))
         }
     }
 ```
+> **Cumulative-tax note (Task 6 review I-1/M-4):** the watermark (`summarized_upto`) is REPLACED with the resume segment's value (it's an absolute high-water mark, already restored into `run_loop_core` from `stored.summarized_upto`), while the tax is ACCUMULATED via `sum_metered` (each segment's `run_loop_core` accumulator starts fresh at `Some(0.0)`). `create_run` is the first segment, so its persisted `summarized_upto`/`summarizer_tax_usd` come straight from its Paused outcome (no prior segment to add).
 
 - [ ] **Step 6: Run the full agent_run + build the whole crate**
 
