@@ -55,6 +55,12 @@ pub enum RunStatus {
 pub struct RunUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Accumulated SERVED cost (USD) across the run's turns — the sum of each
+    /// turn's `x-tokentrimmer-cost-usd` (`CompletionHeaders.cost_breakdown.cost_usd`).
+    /// Unsigned, like the per-request cost header. Distinct from `Run`/`StoredRun`'s
+    /// `summarizer_tax_usd` (the 2c-2 measurement tax).
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// The result of running the agent loop. The full message transcript is
@@ -764,6 +770,7 @@ impl TurnCompleter for GatewayCompleter<'_> {
                 let usage = RunUsage {
                     prompt_tokens: response.usage.prompt_tokens,
                     completion_tokens: response.usage.completion_tokens,
+                    cost_usd: 0.0,
                 };
                 let msg = response
                     .choices
@@ -1515,6 +1522,7 @@ mod tests {
                 RunUsage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
+                    cost_usd: 0.0,
                 },
             ))
         }
@@ -1541,6 +1549,7 @@ mod tests {
                 RunUsage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
+                    cost_usd: 0.0,
                 },
             ))
         }
@@ -1888,6 +1897,7 @@ mod tests {
             usage: RunUsage {
                 prompt_tokens: 5,
                 completion_tokens: 7,
+                cost_usd: 0.0,
             },
             pending_tool_calls: vec![],
             routing: StoredRouting {
@@ -2313,5 +2323,16 @@ mod tests {
             LoopOutcome::Terminal(run) => assert_eq!(run.summarizer_tax_usd, None),
             _ => panic!("expected Terminal"),
         }
+    }
+
+    #[test]
+    fn run_usage_deserializes_without_cost_usd() {
+        // A RunUsage persisted before this deploy has no cost_usd key; #[serde(default)]
+        // must default it to 0.0 (so old StoredRun.usage round-trips).
+        let ru: RunUsage = serde_json::from_str(r#"{"prompt_tokens":5,"completion_tokens":7}"#)
+            .expect("back-compat deserialize");
+        assert_eq!(ru.prompt_tokens, 5);
+        assert_eq!(ru.completion_tokens, 7);
+        assert_eq!(ru.cost_usd, 0.0);
     }
 }
