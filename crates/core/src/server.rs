@@ -101,6 +101,20 @@ pub fn build_router_with_retrieval(
         .route("/v1/routes/:id/pause", post(routes::routes_api::pause))
         .route("/v1/routes/:id/resume", post(routes::routes_api::resume))
         .route("/v1/routes/:id/savings", get(routes::routes_api::savings))
+        // Batch Lane (slice 2): OpenAI-compatible submit/status + file proxy.
+        // Non-streaming, so the short timeout tier. The slice-3 worker owns
+        // long-running polling; these handlers only proxy + persist.
+        .route("/v1/files", post(routes::batches::upload_file))
+        .route(
+            "/v1/files/:id/content",
+            get(routes::batches::download_file_content),
+        )
+        .route("/v1/batches", post(routes::batches::create_batch))
+        .route("/v1/batches/:id", get(routes::batches::get_batch))
+        .route(
+            "/v1/batches/:id/cancel",
+            post(routes::batches::cancel_batch),
+        )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             std::time::Duration::from_secs(SHORT_TIMEOUT_SECS),

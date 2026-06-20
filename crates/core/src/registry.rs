@@ -25,6 +25,13 @@ pub struct ProviderRegistry {
     /// `Arc<dyn Provider>` in `by_id` erases the concrete type needed to call
     /// `refresh_models`). `None` when OpenRouter is not enabled.
     openrouter: Option<Arc<OpenRouterProvider>>,
+    /// Concrete handle to the OpenAI adapter when registered, kept so the Batch
+    /// Lane endpoints can call its slice-1 batch methods (`create_batch`,
+    /// `upload_batch_input`, …) — the `Arc<dyn Provider>` in `by_id` erases the
+    /// concrete type those inherent methods live on. `None` when OpenAI is not
+    /// enabled. Set explicitly by [`register_providers`] (the trait-object
+    /// [`register`](Self::register) cannot recover the concrete type).
+    openai: Option<Arc<OpenAiProvider>>,
 }
 
 impl ProviderRegistry {
@@ -84,6 +91,25 @@ impl ProviderRegistry {
     /// OpenRouter is not enabled.
     pub fn openrouter(&self) -> Option<Arc<OpenRouterProvider>> {
         self.openrouter.clone()
+    }
+
+    /// The concrete OpenAI adapter, when registered. Used by the Batch Lane
+    /// endpoints to call the slice-1 batch methods (`create_batch`,
+    /// `upload_batch_input`, `get_batch`, `cancel_batch`,
+    /// `download_file_content`), which are inherent methods on `OpenAiProvider`
+    /// that the type-erased `Arc<dyn Provider>` cannot reach. `None` when OpenAI
+    /// is not enabled.
+    pub fn openai(&self) -> Option<Arc<OpenAiProvider>> {
+        self.openai.clone()
+    }
+
+    /// Register a concrete [`OpenAiProvider`] for BOTH dispatch (a type-erased
+    /// clone in the model tables) AND the Batch Lane (the concrete handle). Used
+    /// by tests that point the adapter at a local mock and need the batch
+    /// methods reachable; production wiring goes through [`register_providers`].
+    pub fn register_openai(&mut self, provider: Arc<OpenAiProvider>) {
+        self.register(Arc::clone(&provider) as Arc<dyn Provider>);
+        self.openai = Some(provider);
     }
 }
 
@@ -223,7 +249,12 @@ pub fn register_default_providers(registry: &mut ProviderRegistry) {
 pub fn register_providers(registry: &mut ProviderRegistry, cfg: &ProvidersConfig) {
     // Native APIs
     if cfg.openai {
-        registry.register(Arc::new(OpenAiProvider::new(OpenAiClientConfig::default())));
+        // Keep the concrete handle so the Batch Lane endpoints can reach the
+        // slice-1 batch methods (inherent on `OpenAiProvider`, erased by the
+        // `Arc<dyn Provider>` dispatch clone). `register_openai` registers the
+        // type-erased clone for dispatch AND stashes the concrete handle.
+        let openai = Arc::new(OpenAiProvider::new(OpenAiClientConfig::default()));
+        registry.register_openai(openai);
     }
     if cfg.anthropic {
         registry.register(Arc::new(AnthropicProvider::new(
