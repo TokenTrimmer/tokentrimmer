@@ -324,6 +324,257 @@ export interface TokenTrimmerChat extends Omit<OpenAI.Chat, 'completions'> {
   completions: TokenTrimmerCompletions;
 }
 
+// --- Server-side agent loop (`POST /v1/agent/runs`) -------------------------
+//
+// Unlike a single chat completion — where the caller drives every
+// model->tool->model round-trip — the Gateway's agent-run endpoint owns the loop
+// server-side (down-routing, judge-gated summarize, substep cache). The SDK's
+// job is narrower: kick off a run, and whenever the run pauses on a CLIENT
+// (non-gateway) tool, execute it via the caller's `executor` and resume by
+// POSTing the tool outputs, until the run reaches a terminal answer. Mirrors the
+// Rust `tt-client` driver (crates/client/src/agent.rs).
+//
+// Cost differs from chat: the agent endpoint returns a single JSON `Run` whose
+// `usage` aggregates served cost across every server-side turn — there are NO
+// per-turn x-tokentrimmer-* headers — so the aggregate cost is read from the
+// response body (`run.usage.costUsd`), not the headers.
+
+/** Terminal (or paused) status of a run, mirroring the Gateway's `RunStatus`. */
+export type RunStatus = 'completed' | 'incomplete' | 'failed' | 'requires_action';
+
+/**
+ * Accumulated token usage + served cost across every turn of a run. `costUsd` is
+ * the SUM of each turn's served cost — the agent-loop analogue of a chat
+ * response's `.tt.costUsd`.
+ */
+export interface RunUsage {
+  promptTokens: number;
+  completionTokens: number;
+  costUsd: number;
+}
+
+/** One message in a run transcript (OpenAI chat shape; loosely typed). */
+export interface RunMessage {
+  role: string;
+  content?: string | null;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type?: string;
+    function: { name: string; arguments: string };
+  }>;
+  [key: string]: unknown;
+}
+
+/**
+ * A run record returned by `POST /v1/agent/runs` and the resume endpoint — the
+ * Gateway's `Run` view. The full `messages` transcript is included so the caller
+ * sees the whole model/tool exchange.
+ */
+export interface Run {
+  id: string;
+  status: RunStatus;
+  messages: RunMessage[];
+  turns: number;
+  usage: RunUsage;
+  note?: string | null;
+  /** Summarizer measurement tax (USD); never folded into `usage.costUsd`. */
+  summarizerTaxUsd?: number | null;
+}
+
+/** The result of driving an agent run to a terminal state (or the resume cap). */
+export interface AgentOutcome {
+  /** The final run record (terminal unless the resume cap was hit while paused). */
+  run: Run;
+  /** Number of `POST .../tool_outputs` resume round-trips the driver made. */
+  resumeRounds: number;
+  /** Aggregate token usage + served cost across the whole run (`run.usage`). */
+  usage: RunUsage;
+  /** The full final transcript of the run (`run.messages`). */
+  messages: RunMessage[];
+  /** The run's final answer text (last assistant string content), or `null`. */
+  text: string | null;
+}
+
+/**
+ * A caller-supplied client-tool executor: `(name, arguments) => output`.
+ * `arguments` is the raw JSON string the model produced; `output` is the raw
+ * string fed back to the model as the tool result. May be async. Throwing is
+ * allowed — the driver catches it and feeds the error back as the tool output
+ * (the run never aborts on an executor failure).
+ */
+export type AgentExecutor = (name: string, args: string) => Promise<string> | string;
+
+/** Parameters for {@link Agent.run}. */
+export interface AgentRunParams {
+  /** Model id to route the run with (required, non-empty). */
+  model: string;
+  /** OpenAI-shaped conversation to seed the run. */
+  messages: RunMessage[];
+  /** Function tools advertised to the model (OpenAI shape). */
+  tools?: unknown[];
+  /** Executes any client tool the run pauses on. See {@link AgentExecutor}. */
+  executor: AgentExecutor;
+  /** Server-side per-run turn cap (Gateway clamps to `[1, 32]`); omit for default. */
+  maxTurns?: number;
+  /** Client-side cap on resume round-trips before returning a still-paused run (default 8). */
+  maxResumeRounds?: number;
+  /** `X-TokenTrimmer-Tag` — forwarded on the create AND every resume request. */
+  ttTag?: string;
+}
+
+/** The raw (snake_case wire) shape of a `Run` JSON body. */
+interface RunWire {
+  id?: string;
+  status?: string;
+  messages?: RunMessage[];
+  turns?: number;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; cost_usd?: number };
+  note?: string | null;
+  summarizer_tax_usd?: number | null;
+}
+
+/** Resume (`tool_outputs`) round-trip cap, matching the Rust driver default. */
+const DEFAULT_MAX_RESUME_ROUNDS = 8;
+
+function parseRun(wire: RunWire): Run {
+  const u = wire.usage ?? {};
+  return {
+    id: String(wire.id ?? ''),
+    status: (wire.status ?? '') as RunStatus,
+    messages: wire.messages ?? [],
+    turns: num(wire.turns),
+    usage: {
+      promptTokens: num(u.prompt_tokens),
+      completionTokens: num(u.completion_tokens),
+      costUsd: num(u.cost_usd),
+    },
+    note: wire.note ?? null,
+    summarizerTaxUsd: wire.summarizer_tax_usd ?? null,
+  };
+}
+
+/** The final assistant text (last assistant message's string content), if any. */
+function finalText(messages: RunMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role === 'assistant' && typeof m.content === 'string') return m.content;
+  }
+  return null;
+}
+
+/**
+ * The CLIENT tool calls a run is paused on: assistant `tool_calls` in the
+ * transcript with NO answering `tool` message. The Gateway answers its own
+ * (read-only gateway) tool calls inline before pausing, so the unanswered
+ * remainder are exactly the client tools the caller must run.
+ */
+function pendingToolCalls(messages: RunMessage[]) {
+  const answered = new Set<string>();
+  for (const m of messages) {
+    if (m.role === 'tool' && typeof m.tool_call_id === 'string') answered.add(m.tool_call_id);
+  }
+  const pending: Array<{ id: string; function: { name: string; arguments: string } }> = [];
+  for (const m of messages) {
+    if (m.role !== 'assistant' || !m.tool_calls) continue;
+    for (const call of m.tool_calls) {
+      if (!answered.has(call.id)) pending.push(call);
+    }
+  }
+  return pending;
+}
+
+/**
+ * Server-side agent-loop driver, exposed as `client.agent`.
+ *
+ * Reuses the SDK's existing base URL, API key, and configured `fetch`/transport
+ * via the inherited OpenAI `post()` helper (no new HTTP dependency, and the same
+ * transport the chat path uses — so it's mockable with the same test harness).
+ */
+export class Agent {
+  constructor(private readonly client: OpenAI) {}
+
+  /**
+   * Drive the agent run to completion: create the run, then while it is paused
+   * on client tools, execute them via `executor` and resume — until a terminal
+   * status or the resume cap.
+   *
+   * @throws if `model` is empty, or on a gateway/transport failure of the create
+   *   or a resume call (a gateway failure aborts the run). Per-tool executor
+   *   errors do NOT propagate — they are submitted back as the tool's output.
+   */
+  async run(params: AgentRunParams): Promise<AgentOutcome> {
+    const { model, messages, tools, executor, maxTurns, ttTag } = params;
+    const maxResumeRounds = params.maxResumeRounds ?? DEFAULT_MAX_RESUME_ROUNDS;
+    if (typeof model !== 'string' || model.trim() === '') {
+      throw new Error('model must be a non-empty string');
+    }
+
+    let run = await this.create(model, messages, tools, maxTurns, ttTag);
+    let resumeRounds = 0;
+
+    while (run.status === 'requires_action' && resumeRounds < maxResumeRounds) {
+      const pending = pendingToolCalls(run.messages);
+      // A `requires_action` run always has >=1 pending client tool; an empty
+      // list would mean a server contract break. Stop rather than POST an empty
+      // resume the Gateway would reject.
+      if (pending.length === 0) break;
+      const toolOutputs: Array<{ tool_call_id: string; output: string }> = [];
+      for (const call of pending) {
+        let output: string;
+        try {
+          output = await executor(call.function.name, call.function.arguments);
+        } catch (err) {
+          // Feed the error BACK as the tool output (never abort) so the model
+          // can react — mirrors the chat run_tools loop and the Rust driver.
+          output = JSON.stringify({ error: err instanceof Error ? err.message : String(err) });
+        }
+        toolOutputs.push({ tool_call_id: call.id, output });
+      }
+      run = await this.resume(run.id, toolOutputs, ttTag);
+      resumeRounds += 1;
+    }
+
+    return {
+      run,
+      resumeRounds,
+      usage: run.usage,
+      messages: run.messages,
+      text: finalText(run.messages),
+    };
+  }
+
+  private async create(
+    model: string,
+    messages: RunMessage[],
+    tools: unknown[] | undefined,
+    maxTurns: number | undefined,
+    ttTag: string | undefined,
+  ): Promise<Run> {
+    const body: Record<string, unknown> = { model, messages, stream: false };
+    if (tools && tools.length > 0) body.tools = tools;
+    if (maxTurns !== undefined) body.max_turns = maxTurns;
+    return this.send('/agent/runs', body, ttTag);
+  }
+
+  private async resume(
+    runId: string,
+    toolOutputs: Array<{ tool_call_id: string; output: string }>,
+    ttTag: string | undefined,
+  ): Promise<Run> {
+    return this.send(`/agent/runs/${runId}/tool_outputs`, { tool_outputs: toolOutputs }, ttTag);
+  }
+
+  private async send(path: string, body: unknown, ttTag: string | undefined): Promise<Run> {
+    const headers = ttTag !== undefined ? { 'X-TokenTrimmer-Tag': ttTag } : undefined;
+    // The inherited OpenAI `post()` joins `path` to `baseURL`, attaches the
+    // bearer auth header, uses the configured `fetch`, throws on non-2xx, and
+    // returns the parsed JSON body.
+    const wire = (await this.client.post(path, { body, headers })) as RunWire;
+    return parseRun(wire);
+  }
+}
+
 export class TokenTrimmer extends OpenAI {
   /**
    * Narrowed type for the inherited `chat` resource: `chat.completions.create`
@@ -336,12 +587,17 @@ export class TokenTrimmer extends OpenAI {
    */
   declare chat: TokenTrimmerChat & OpenAI.Chat;
 
+  /** Driver for the server-side agent loop (`client.agent.run(...)`). See {@link Agent}. */
+  readonly agent: Agent;
+
   constructor(options: ClientOptions = {}) {
     super({
       ...options,
       apiKey: options.apiKey ?? resolveApiKey(),
       baseURL: options.baseURL ?? DEFAULT_BASE_URL,
     });
+
+    this.agent = new Agent(this);
 
     // Capture the original OpenAI `create` (an `APIPromise`-returning, overloaded
     // method) before we replace it. The `chat` field is type-narrowed to the

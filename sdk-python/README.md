@@ -56,6 +56,44 @@ if stream.tt is not None:
     print(f"saved ${stream.tt.saved_usd:.4f}")
 ```
 
+## Agent loop
+
+For multi-step tool-using runs, `client.agent.run(...)` drives the Gateway's
+server-side agent loop (`POST /v1/agent/runs`). The Gateway owns the loop
+(down-routing, judge-gated summarize, substep cache); the SDK just executes any
+**client** tool the run pauses on (via your `executor`) and resumes — until a
+final answer. Aggregate cost spans every turn and is read from the run body
+(`outcome.usage.cost_usd`), not response headers.
+
+```python
+def executor(name: str, arguments: str) -> str:
+    # `arguments` is the raw JSON string the model produced; return the tool's
+    # result as a string. Raising is fine — the error is fed back to the model.
+    if name == "get_weather":
+        return '{"temp_c": 21, "sky": "clear"}'
+    return "{}"
+
+outcome = client.agent.run(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }],
+    executor=executor,
+    max_turns=8,          # optional: server-side per-run turn cap
+    tt_tag="feature=agent",
+)
+
+print(outcome.text)                       # final assistant answer
+print(f"cost   ${outcome.usage.cost_usd:.4f}")
+print(f"rounds {outcome.resume_rounds}")  # client-side tool_outputs resumes made
+```
+
 ## Self-hosted Gateway
 
 ```python
