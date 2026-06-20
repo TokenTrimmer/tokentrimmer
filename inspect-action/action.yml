@@ -40,6 +40,24 @@ inputs:
     description: tt-cli version to use, e.g. "0.1.0" or "latest".
     required: false
     default: latest
+  upload-sarif:
+    description: >-
+      When `true`, additionally run the Inspect static-analysis rules over
+      `path` and upload the results as SARIF 2.1.0 to the GitHub Code Scanning /
+      Security tab (and inline PR annotations). This is independent of the
+      cost-diff gate above. Requires `permissions: security-events: write` in
+      the calling workflow; on fork-contributor PRs the token is read-only, so
+      the upload is skipped with a warning rather than failing the job.
+    required: false
+    default: 'false'
+  sarif-fail-on:
+    description: >-
+      With `upload-sarif: true`, the minimum finding severity that fails the
+      job (`low` | `medium` | `high` | `critical`). The SARIF is still produced
+      and uploaded regardless. Set to `critical` to upload findings without
+      gating, or `low` to gate on everything.
+    required: false
+    default: critical
 
 runs:
   using: composite
@@ -153,6 +171,83 @@ runs:
         echo "::error::TokenTrimmer cost gate: a projected per-call cost increase was detected."
         exit 1
 
+    # ---------------------------------------------------------------------
+    # Optional: SARIF static-analysis upload (opt-in via `upload-sarif: true`).
+    # Independent of the cost-diff gate above.
+    # ---------------------------------------------------------------------
+    - name: Run tt inspect (SARIF)
+      id: sarif
+      if: ${{ inputs.upload-sarif == 'true' }}
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.path }}
+        SARIF_FAIL_ON: ${{ inputs.sarif-fail-on }}
+      run: |
+        set -euo pipefail
+        sarif_file="$(mktemp -t tt-inspect.XXXXXX.sarif)"
+        echo "sarif-file=$sarif_file" >> "$GITHUB_OUTPUT"
+
+        # Generate SARIF WITHOUT gating so a genuine setup error fails this step
+        # loudly rather than being mistaken for "findings found". The findings
+        # gate is applied separately in the "Fail on findings" step below, using
+        # the SARIF that was uploaded. `--format sarif` prints SARIF 2.1.0 to
+        # stdout; we redirect it to the file. (Stdout is clean: the CLI silences
+        # its startup log line for machine-readable stdout output.)
+        tt inspect "$SCAN_PATH" --format sarif --fail-on critical > "$sarif_file"
+
+        # Decide the findings gate from the SARIF result levels. With the
+        # severity→level mapping (critical/high→error, medium→warning, low→note),
+        # translate the requested fail-on into the SARIF levels that should fail.
+        case "$SARIF_FAIL_ON" in
+          low)      fail_levels='error warning note' ;;
+          medium)   fail_levels='error warning' ;;
+          high)     fail_levels='error' ;;
+          critical) fail_levels='error' ;;   # critical & high both map to error
+          *)        fail_levels='error' ;;
+        esac
+
+        gate=passed
+        for lvl in $fail_levels; do
+          if grep -q "\"level\": \"$lvl\"" "$sarif_file"; then
+            gate=failed
+            break
+          fi
+        done
+        echo "findings-gate=$gate" >> "$GITHUB_OUTPUT"
+
+    - name: Upload SARIF to Code Scanning
+      id: upload-sarif
+      if: ${{ inputs.upload-sarif == 'true' && steps.sarif.outputs.sarif-file != '' }}
+      # A read-only token (fork-contributor PR) cannot upload SARIF. That must
+      # NOT red-X the job — the findings verdict is decided independently in the
+      # next step. continue-on-error downgrades an upload failure to a warning.
+      continue-on-error: true
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.sarif.outputs.sarif-file }}
+        category: tokentrimmer-inspect
+
+    - name: Note when SARIF upload was skipped
+      if: ${{ inputs.upload-sarif == 'true' && steps.sarif.outputs.sarif-file != '' }}
+      shell: bash
+      run: |
+        # `upload-sarif` step uses continue-on-error, so reaching here is normal.
+        # If the upload was denied (read-only token on a fork PR), surface a
+        # warning so the absence of Security-tab annotations is explained.
+        if [ "${{ steps.upload-sarif.outcome }}" = "failure" ]; then
+          echo "::warning::TokenTrimmer Inspect could not upload SARIF (the token is likely read-only, e.g. a fork-contributor PR). The findings gate verdict is unaffected." || true
+        fi
+        echo "TokenTrimmer Inspect SARIF generated: ${{ steps.sarif.outputs.sarif-file }}"
+
+    - name: Fail on findings (SARIF gate)
+      if: ${{ inputs.upload-sarif == 'true' && steps.sarif.outputs.findings-gate == 'failed' }}
+      shell: bash
+      env:
+        SARIF_FAIL_ON: ${{ inputs.sarif-fail-on }}
+      run: |
+        echo "::error::TokenTrimmer Inspect: findings at or above '${SARIF_FAIL_ON}' severity were detected. See the Code Scanning / Security tab for details."
+        exit 1
+
 outputs:
   cost-gate:
     description: passed or failed based on the projected per-call cost change.
@@ -160,3 +255,8 @@ outputs:
   base-ref:
     description: The base git ref the working tree was diffed against.
     value: ${{ steps.run.outputs.base-ref }}
+  findings-gate:
+    description: >-
+      With `upload-sarif: true`, `passed` or `failed` based on whether any
+      finding met the `sarif-fail-on` severity. Empty when SARIF is disabled.
+    value: ${{ steps.sarif.outputs.findings-gate }}

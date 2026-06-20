@@ -37,10 +37,17 @@ enum Command {
         /// Fail the process if any finding meets or exceeds this severity.
         #[arg(long, default_value = "high")]
         fail_on: String,
-        /// Output destination. Omitted or "-" writes markdown to stdout.
-        /// A path ending in ".json" writes JSON; any other path writes markdown.
+        /// Output destination. Omitted or "-" writes to stdout.
+        /// A path ending in ".json" writes JSON, ".sarif" writes SARIF; any
+        /// other path writes markdown. An explicit `--format` overrides this.
         #[arg(long)]
         output: Option<String>,
+        /// Output format for rule findings: `md` (default), `json`, or `sarif`
+        /// (SARIF 2.1.0, for the GitHub Code Scanning / Security tab + inline PR
+        /// annotations). When set, overrides the format inferred from `--output`.
+        /// Ignored in `--cost-diff` / `--suggest-plan` mode.
+        #[arg(long)]
+        format: Option<String>,
         /// Cost-diff mode: instead of running rules, estimate the projected
         /// per-call cost change of LLM model ids added/removed in `git diff
         /// <base> -- <path>`. Reuses the pricing catalog; no cloud dependency.
@@ -564,6 +571,22 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    // The telemetry tracing layer emits a JSON line (e.g. "tracing initialized")
+    // to STDOUT on startup. That's fine for human commands, but it corrupts a
+    // machine-readable `tt inspect --format json|sarif` report when that report
+    // is printed to stdout (the GitHub Action does `... > results.sarif`, which
+    // would otherwise prepend a log line and break SARIF parsing). When this
+    // invocation is exactly that, silence the stdout log layer before init by
+    // forcing the env filter off — unless the operator has set RUST_LOG, in
+    // which case we honor their explicit choice.
+    if inspect_emits_machine_output_to_stdout(std::env::args())
+        && std::env::var_os("RUST_LOG").is_none()
+    {
+        // SAFETY: set before any threads are spawned that read RUST_LOG; tracing
+        // init below reads it synchronously on this thread.
+        std::env::set_var("RUST_LOG", "off");
+    }
+
     // Initialize tracing via the telemetry crate so the OTLP span exporter
     // activates when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (no-op JSON-stdout
     // otherwise). The guard is bound to `main`'s lifetime; dropping it on
@@ -590,6 +613,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             fail_on,
             output,
+            format,
             cost_diff,
             base,
             fail_on_cost_increase,
@@ -610,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             } else {
-                run_inspect(&path, &fail_on, output.as_deref())?;
+                run_inspect(&path, &fail_on, output.as_deref(), format.as_deref())?;
             }
         }
         Command::Plan {
@@ -2159,18 +2183,116 @@ mod gateway_fail_closed_tests {
 // Output format detection
 // ---------------------------------------------------------------------------
 
-/// Whether to emit a markdown report or a JSON array.
+/// Whether to emit a markdown report, a JSON array, or a SARIF 2.1.0 log.
 enum OutputFormat {
     Markdown,
     Json,
+    /// SARIF 2.1.0 — only valid for `tt inspect` rule findings.
+    Sarif,
 }
 
 /// Infer the desired output format from the destination path.
+///
+/// Used by `--cost-diff` (which only emits Markdown or JSON); a `.sarif` path
+/// here falls through to Markdown since SARIF is not a cost-diff format.
 fn output_format_for(output: Option<&str>) -> OutputFormat {
     match output {
         Some(p) if p.ends_with(".json") => OutputFormat::Json,
         _ => OutputFormat::Markdown,
     }
+}
+
+/// Decide, from the raw process args (before clap parsing), whether this is a
+/// `tt inspect` invocation that prints a **machine-readable** report (`json` or
+/// `sarif`) to **stdout** — i.e. with no `--output <file>` redirect.
+///
+/// Used to silence the startup tracing log line so it can't corrupt the
+/// machine output. Conservative by construction: a false negative just leaves
+/// the (harmless-for-humans) log on stdout; it never suppresses output.
+///
+/// `--cost-diff` / `--suggest-plan` are excluded — they don't honor `--format`
+/// and never emit SARIF.
+fn inspect_emits_machine_output_to_stdout<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    // args[0] is the binary; the subcommand is the first non-flag token.
+    let is_inspect = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .is_some_and(|sub| sub == "inspect");
+    if !is_inspect {
+        return false;
+    }
+
+    // These modes ignore --format and never emit SARIF.
+    if args
+        .iter()
+        .any(|a| a == "--cost-diff" || a == "--suggest-plan")
+    {
+        return false;
+    }
+
+    // Pull --format and --output values (supporting both `--flag val` and
+    // `--flag=val`). Last occurrence wins, mirroring clap.
+    let value_of = |flag: &str| -> Option<String> {
+        let mut found = None;
+        let mut it = args.iter().peekable();
+        while let Some(a) = it.next() {
+            if let Some(v) = a.strip_prefix(&format!("{flag}=")) {
+                found = Some(v.to_string());
+            } else if a == flag {
+                if let Some(v) = it.next() {
+                    found = Some(v.clone());
+                }
+            }
+        }
+        found
+    };
+
+    let format = value_of("--format");
+    let output = value_of("--output");
+
+    // Report goes to stdout iff there is no real --output file (absent or "-").
+    let to_stdout = matches!(output.as_deref(), None | Some("") | Some("-"));
+    if !to_stdout {
+        return false;
+    }
+
+    // Machine-readable iff --format is json/sarif (path inference is moot here
+    // since the report is going to stdout, not a file).
+    matches!(
+        format.as_deref().map(str::to_lowercase).as_deref(),
+        Some("json") | Some("sarif")
+    )
+}
+
+/// Resolve the `tt inspect` output format from an explicit `--format` value
+/// (when set) and otherwise from the `--output` path extension.
+///
+/// Precedence: an explicit `--format` always wins. Accepted `--format` values
+/// (case-insensitive): `md`/`markdown`, `json`, `sarif`. An unrecognised value
+/// is an error so a typo never silently degrades to markdown.
+fn inspect_output_format(
+    format: Option<&str>,
+    output: Option<&str>,
+) -> anyhow::Result<OutputFormat> {
+    if let Some(fmt) = format {
+        return match fmt.to_lowercase().as_str() {
+            "md" | "markdown" => Ok(OutputFormat::Markdown),
+            "json" => Ok(OutputFormat::Json),
+            "sarif" => Ok(OutputFormat::Sarif),
+            other => anyhow::bail!("unknown --format {other:?} (expected one of: md, json, sarif)"),
+        };
+    }
+    Ok(match output {
+        Some(p) if p.ends_with(".json") => OutputFormat::Json,
+        Some(p) if p.ends_with(".sarif") => OutputFormat::Sarif,
+        _ => OutputFormat::Markdown,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2180,7 +2302,12 @@ fn output_format_for(output: Option<&str>) -> OutputFormat {
 /// Run the inspect engine against `path`, format the results, and either write
 /// them to `output` or print to stdout.  Exits non-zero via [`anyhow::bail!`]
 /// when any finding meets or exceeds `fail_on`.
-fn run_inspect(path: &str, fail_on: &str, output: Option<&str>) -> anyhow::Result<()> {
+fn run_inspect(
+    path: &str,
+    fail_on: &str,
+    output: Option<&str>,
+    format: Option<&str>,
+) -> anyhow::Result<()> {
     use tt_inspect_core::Severity;
 
     let fail_on_sev = Severity::from_str_ci(fail_on).unwrap_or(Severity::High);
@@ -2193,8 +2320,9 @@ fn run_inspect(path: &str, fail_on: &str, output: Option<&str>) -> anyhow::Resul
 
     let findings = engine.scan(std::path::Path::new(path));
 
-    let formatted = match output_format_for(output) {
+    let formatted = match inspect_output_format(format, output)? {
         OutputFormat::Json => tt_inspect_core::output::format_json(&findings),
+        OutputFormat::Sarif => tt_inspect_core::output::format_sarif(&findings),
         OutputFormat::Markdown => tt_inspect_core::output::format_markdown(&findings),
     };
 
@@ -2366,7 +2494,9 @@ fn run_cost_diff(
     let formatted = match output_format_for(output) {
         OutputFormat::Json => serde_json::to_string_pretty(&report)
             .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}")),
-        OutputFormat::Markdown => {
+        // SARIF is not a cost-diff format; `output_format_for` never yields it,
+        // so cost-diff only ever produces markdown or JSON.
+        OutputFormat::Markdown | OutputFormat::Sarif => {
             tt_cli::cost_diff::format_markdown_with_profile(&report, &profile)
         }
     };
@@ -2811,5 +2941,93 @@ mod plan_apply_tests {
         )
         .await
         .expect("projection without --apply should succeed");
+    }
+}
+
+#[cfg(test)]
+mod inspect_format_tests {
+    use super::{inspect_emits_machine_output_to_stdout, inspect_output_format, OutputFormat};
+
+    fn argv(s: &str) -> Vec<String> {
+        std::iter::once("tt".to_string())
+            .chain(s.split_whitespace().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn explicit_format_overrides_output_extension() {
+        // --format wins over the .json path inference.
+        assert!(matches!(
+            inspect_output_format(Some("sarif"), Some("out.json")).unwrap(),
+            OutputFormat::Sarif
+        ));
+        assert!(matches!(
+            inspect_output_format(Some("md"), Some("out.json")).unwrap(),
+            OutputFormat::Markdown
+        ));
+        assert!(matches!(
+            inspect_output_format(Some("json"), None).unwrap(),
+            OutputFormat::Json
+        ));
+    }
+
+    #[test]
+    fn output_extension_infers_format_when_no_explicit_flag() {
+        assert!(matches!(
+            inspect_output_format(None, Some("results.sarif")).unwrap(),
+            OutputFormat::Sarif
+        ));
+        assert!(matches!(
+            inspect_output_format(None, Some("findings.json")).unwrap(),
+            OutputFormat::Json
+        ));
+        assert!(matches!(
+            inspect_output_format(None, Some("report.md")).unwrap(),
+            OutputFormat::Markdown
+        ));
+        assert!(matches!(
+            inspect_output_format(None, None).unwrap(),
+            OutputFormat::Markdown
+        ));
+    }
+
+    #[test]
+    fn unknown_format_is_an_error() {
+        assert!(inspect_output_format(Some("xml"), None).is_err());
+    }
+
+    #[test]
+    fn detects_machine_output_to_stdout() {
+        // sarif/json to stdout (no --output) → silence logs.
+        assert!(inspect_emits_machine_output_to_stdout(argv(
+            "inspect . --format sarif"
+        )));
+        assert!(inspect_emits_machine_output_to_stdout(argv(
+            "inspect . --format=json"
+        )));
+        assert!(inspect_emits_machine_output_to_stdout(argv(
+            "inspect . --format sarif --output -"
+        )));
+    }
+
+    #[test]
+    fn ignores_when_not_inspect_or_not_machine_or_to_file() {
+        // Not inspect.
+        assert!(!inspect_emits_machine_output_to_stdout(argv(
+            "plan --example"
+        )));
+        // Markdown / default → log line is harmless.
+        assert!(!inspect_emits_machine_output_to_stdout(argv("inspect .")));
+        assert!(!inspect_emits_machine_output_to_stdout(argv(
+            "inspect . --format md"
+        )));
+        // Redirected to a real file → stdout is free for the log line.
+        assert!(!inspect_emits_machine_output_to_stdout(argv(
+            "inspect . --format sarif --output results.sarif"
+        )));
+        // cost-diff / suggest-plan never emit SARIF.
+        assert!(!inspect_emits_machine_output_to_stdout(argv(
+            "inspect . --cost-diff --format json"
+        )));
     }
 }
