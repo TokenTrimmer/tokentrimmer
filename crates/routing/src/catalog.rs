@@ -17,17 +17,33 @@ struct Mapping {
     target: &'static str,
 }
 
-/// Curated flagship → mini down-route mappings. All ids are verified against
-/// the embedded ModelCatalog (models.toml). Sources and targets must exist and
-/// the target must be cheaper (asserted by the `targets_exist_same_provider_and_cheaper`
-/// test). Pure-reasoning o-series models (o3, o4-mini) are intentionally
-/// excluded — `not_reasoning_class: true` would guard them anyway, but they're
-/// not chat flagships in the first place.
+/// Curated flagship → cheaper same-family down-route mappings. All ids are
+/// verified against BOTH the embedded ModelCatalog (models.toml) AND the
+/// PricingCatalog (pricing.toml), and the target must be cheaper — every id is
+/// asserted present in both catalogs and the target priced ≤ the source by the
+/// `targets_exist_same_provider_and_cheaper` test. Pure-reasoning o-series
+/// models (o3, o4-mini) are intentionally excluded — `not_reasoning_class: true`
+/// would guard them anyway, but they're not chat flagships in the first place.
 ///
-/// OpenAI: gpt-4o → gpt-4o-mini (gpt-5.5/5.4 have no mini in the catalog yet).
-/// Anthropic: opus/sonnet flagships → haiku-4-5.
-/// Gemini: gemini-3.1-pro → gemini-3.1-flash-lite (cheapest same-provider mini).
+/// OpenAI — `gpt-5.5` → `gpt-5.4`: the current gpt-5.x flagship down to its
+/// cheaper same-family sibling (both full chat models: 200K context, vision,
+/// tools, json_mode, prompt_caching; $5/M → $2.50/M input). `gpt-5.4` has no
+/// cheaper same-family target *in the ModelCatalog* (gpt-5.4-mini is priced but
+/// absent from models.toml), so it stays a source only via `gpt-5.5`. Also
+/// `gpt-4o` → `gpt-4o-mini` for the legacy 4o flagship.
+///
+/// Anthropic — `claude-opus-4-7` / `claude-opus-4-8` / `claude-sonnet-4-6`
+/// flagships → `claude-haiku-4-5`.
+///
+/// Gemini — `gemini-3.1-pro` → `gemini-3.1-flash-lite` (cheapest same-provider
+/// variant) and `gemini-3.5-flash` → `gemini-3.1-flash-lite`
+/// ($1.50/M → $0.25/M input).
 const MAPPINGS: &[Mapping] = &[
+    Mapping {
+        provider: "openai",
+        sources: &["gpt-5.5"],
+        target: "gpt-5.4",
+    },
     Mapping {
         provider: "openai",
         sources: &["gpt-4o"],
@@ -40,7 +56,7 @@ const MAPPINGS: &[Mapping] = &[
     },
     Mapping {
         provider: "gemini",
-        sources: &["gemini-3.1-pro"],
+        sources: &["gemini-3.1-pro", "gemini-3.5-flash"],
         target: "gemini-3.1-flash-lite",
     },
 ];
@@ -142,6 +158,49 @@ mod tests {
                     m.provider,
                     s,
                     src_price.input_per_million,
+                );
+            }
+        }
+    }
+
+    /// Pin the source → target pairs the catalog must offer, so the gpt-5.x and
+    /// gemini-flash families can't silently regress out of coverage. Each pair
+    /// is also exercised by `targets_exist_same_provider_and_cheaper` above.
+    #[test]
+    fn covers_current_flagship_families() {
+        // (provider, source, expected target) — every pair MUST be present.
+        let expected: &[(&str, &str, &str)] = &[
+            // OpenAI: current gpt-5.x flagship + legacy 4o flagship.
+            ("openai", "gpt-5.5", "gpt-5.4"),
+            ("openai", "gpt-4o", "gpt-4o-mini"),
+            // Anthropic: every current chat flagship → haiku.
+            ("anthropic", "claude-opus-4-8", "claude-haiku-4-5"),
+            ("anthropic", "claude-opus-4-7", "claude-haiku-4-5"),
+            ("anthropic", "claude-sonnet-4-6", "claude-haiku-4-5"),
+            // Gemini: pro + 3.5-flash → flash-lite.
+            ("gemini", "gemini-3.1-pro", "gemini-3.1-flash-lite"),
+            ("gemini", "gemini-3.5-flash", "gemini-3.1-flash-lite"),
+        ];
+        for (provider, source, target) in expected {
+            let found = MAPPINGS.iter().any(|m| {
+                m.provider == *provider && m.target == *target && m.sources.contains(source)
+            });
+            assert!(
+                found,
+                "expected catalog mapping {provider}: {source} -> {target} is missing",
+            );
+        }
+    }
+
+    /// Reasoning-only models (o3, o4-mini) must never appear as catalog
+    /// sources or targets — the catalog is chat-flagship only.
+    #[test]
+    fn excludes_reasoning_only_models() {
+        for m in MAPPINGS {
+            for id in m.sources.iter().chain(std::iter::once(&m.target)) {
+                assert!(
+                    !matches!(*id, "o3" | "o4-mini"),
+                    "reasoning-only model {id} must not be a catalog source/target",
                 );
             }
         }
