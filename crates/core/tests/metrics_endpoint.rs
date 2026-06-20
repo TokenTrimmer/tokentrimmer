@@ -144,10 +144,27 @@ mod nopricing {
         }
         async fn embeddings(
             &self,
-            _req: EmbeddingsRequest,
+            req: EmbeddingsRequest,
             _ctx: &RequestContext,
         ) -> Result<EmbeddingsResponse, ProviderError> {
-            Err(ProviderError::Unsupported("n/a".into()))
+            use tt_shared::messages::EmbeddingData;
+            Ok(EmbeddingsResponse {
+                object: "list".into(),
+                data: vec![EmbeddingData {
+                    object: "embedding".into(),
+                    index: 0,
+                    embedding: vec![0.1, 0.2, 0.3],
+                }],
+                model: req.model,
+                usage: Usage {
+                    prompt_tokens: 5,
+                    completion_tokens: 0,
+                    total_tokens: 5,
+                    cached_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            })
         }
     }
 }
@@ -437,6 +454,104 @@ async fn provider_cache_usage_counters_recorded() {
     assert!(
         metrics_body.contains("result=\"hit\""),
         "hit result label missing: {metrics_body}"
+    );
+}
+
+/// P2 (metering durability): the synchronous `tt_requests_served_total`
+/// served-counter must be emitted IN-BAND on a non-streaming chat DISPATCH —
+/// the cheap sync truth to diff against the async-written `request_logs` row.
+#[tokio::test]
+async fn served_counter_recorded_for_chat_dispatch() {
+    use std::sync::Arc;
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(nopricing::NoPricingEcho));
+    let app = build_router(AppState::new(registry));
+
+    let body = serde_json::json!({
+        "model": "np-1",
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (_s, _h, metrics_body) = get(app, "/metrics").await;
+    let line = metrics_body
+        .lines()
+        .find(|l| l.starts_with("tt_requests_served_total") && l.contains("path=\"chat\""))
+        .unwrap_or_else(|| panic!("no chat tt_requests_served_total line:\n{metrics_body}"));
+    assert!(
+        line.contains("result=\"dispatch\""),
+        "chat dispatch must be labelled result=dispatch: {line}"
+    );
+}
+
+/// P2: the served-counter fires for a streaming chat DISPATCH (the SSE path),
+/// labelled `path="sse"`, once the response is built.
+#[tokio::test]
+async fn served_counter_recorded_for_sse_dispatch() {
+    use std::sync::Arc;
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(streamnousage::StreamNoUsageEcho));
+    let app = build_router(AppState::new(registry));
+
+    let body = serde_json::json!({
+        "model": "snu-1",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": true
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+    let (_s, _h, metrics_body) = get(app, "/metrics").await;
+    assert!(
+        metrics_body
+            .lines()
+            .any(|l| l.starts_with("tt_requests_served_total") && l.contains("path=\"sse\"")),
+        "sse served-counter line missing:\n{metrics_body}"
+    );
+}
+
+/// P2: the served-counter fires for an embeddings DISPATCH, labelled
+/// `path="embeddings"`.
+#[tokio::test]
+async fn served_counter_recorded_for_embeddings_dispatch() {
+    use std::sync::Arc;
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(nopricing::NoPricingEcho));
+    let app = build_router(AppState::new(registry));
+
+    let body = serde_json::json!({ "model": "np-1", "input": "hello" });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (_s, _h, metrics_body) = get(app, "/metrics").await;
+    assert!(
+        metrics_body
+            .lines()
+            .any(|l| l.starts_with("tt_requests_served_total") && l.contains("path=\"embeddings\"")),
+        "embeddings served-counter line missing:\n{metrics_body}"
     );
 }
 

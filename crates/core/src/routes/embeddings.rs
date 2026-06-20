@@ -322,6 +322,12 @@ pub async fn handler(
         },
     );
 
+    // P2: synchronous served-counter bump, in-band, once per served embeddings
+    // response. Embeddings always dispatch (no cache short-circuit) and write no
+    // `request_logs` row today, so this is the sole sync served-truth for the
+    // path — labelled `dispatch` for consistency with the chat/sse paths.
+    crate::metrics::record_request_served("embeddings", "dispatch");
+
     let mut http = (StatusCode::OK, Json(resp)).into_response();
     attach_cost_headers(
         http.headers_mut(),

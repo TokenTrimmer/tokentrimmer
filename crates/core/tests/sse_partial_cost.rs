@@ -142,6 +142,8 @@ impl Provider for MockProvider {
 fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
     StreamLogContext {
         writer: Some(writer),
+        // No graceful-shutdown drain in this test — bare spawn fallback.
+        tracker: None,
         org_id: Uuid::nil(),
         api_key_id: Uuid::nil(),
         trace_id: Uuid::nil(),

@@ -219,14 +219,96 @@ fn f64_is_zero(v: &f64) -> bool {
 /// Errors returned by [`RequestLogWriter`].
 #[derive(Debug, Error)]
 pub enum RequestLogError {
+    /// A TERMINAL storage error: a unique-key violation (the row already
+    /// committed — see the idempotency note on [`write_with_retry`]), a
+    /// constraint/check failure, or any other error that retrying cannot fix.
+    /// Retrying these is pointless, so [`RequestLogError::is_transient`]
+    /// returns `false`.
     #[error("storage: {0}")]
     Storage(String),
+    /// A TRANSIENT storage error worth retrying: a pool-acquire timeout, a
+    /// dropped/closed connection, or a low-level I/O error. The committed row
+    /// is billable revenue, so the writer retries these a bounded number of
+    /// times (see [`write_with_retry`]) before giving up.
+    #[error("transient storage: {0}")]
+    Transient(String),
+}
+
+impl RequestLogError {
+    /// `true` for errors [`write_with_retry`] should re-attempt (connection /
+    /// pool / I/O blips). Terminal errors (unique-key violation, constraint
+    /// failure) return `false` — retrying them would either re-hit the same
+    /// committed row's PK or fail identically.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, RequestLogError::Transient(_))
+    }
 }
 
 /// Persistence contract for the `request_logs` table.
 #[async_trait]
 pub trait RequestLogWriter: Send + Sync {
     async fn write(&self, row: RequestLogRow) -> Result<(), RequestLogError>;
+}
+
+/// Default bounded retry budget for [`write_with_retry`] — the total number of
+/// write attempts (1 initial + 2 retries). A `request_logs` row is billable
+/// revenue, so a transient DB blip must not silently drop it.
+pub const DEFAULT_WRITE_ATTEMPTS: u32 = 3;
+
+/// Base backoff between retry attempts in [`write_with_retry`]. Doubled each
+/// attempt (50ms, 100ms). Deliberately short: the spawned write task is best-
+/// effort and may be drained on shutdown, so retries must not pin a task for
+/// long.
+pub const DEFAULT_WRITE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Write a `request_logs` row with a bounded retry on TRANSIENT failure.
+///
+/// Revenue substrate: a committed-but-unwritten billing row is silent
+/// under-billing. So a transient storage error (connection / pool / I/O blip,
+/// classified by [`RequestLogError::is_transient`]) is retried up to
+/// `max_attempts` total tries with an exponentially-growing backoff starting
+/// at `base_backoff`. A TERMINAL error (`Storage`) is returned immediately —
+/// retrying it cannot help.
+///
+/// **Idempotent-safe.** Every retry re-sends the SAME `row` (same `id`, the
+/// `request_logs` PRIMARY KEY). If the original INSERT never committed, the
+/// retry inserts the single row. If it DID commit but the ack was lost, the
+/// retry hits the PK unique-violation — which the Postgres writer surfaces as a
+/// TERMINAL `Storage` error (not `Transient`), so the loop stops with no
+/// duplicate row. Either way the table ends with exactly one row per `id`.
+///
+/// Returns the outcome of the final attempt; the caller is responsible for
+/// counting a permanent failure (e.g. `tt_request_log_write_failed_total`).
+pub async fn write_with_retry<W: RequestLogWriter + ?Sized>(
+    writer: &W,
+    row: RequestLogRow,
+    max_attempts: u32,
+    base_backoff: std::time::Duration,
+) -> Result<(), RequestLogError> {
+    let attempts = max_attempts.max(1);
+    let mut backoff = base_backoff;
+    for attempt in 1..=attempts {
+        // Clone per attempt so a retry re-sends the identical row (same PK).
+        match writer.write(row.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let last = attempt == attempts;
+                if last || !e.is_transient() {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    max_attempts = attempts,
+                    "request_logs write transient failure — retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2);
+            }
+        }
+    }
+    // Unreachable: the loop always returns on the final attempt.
+    Ok(())
 }
 
 // ─── InMemory ──────────────────────────────────────────────────────────────
@@ -380,8 +462,33 @@ pub mod postgres {
                 .bind(row.retrieval_tokens_saved) // $39
                 .execute(&self.pool)
                 .await
-                .map_err(|e| RequestLogError::Storage(e.to_string()))?;
+                .map_err(classify_sqlx_error)?;
             Ok(())
+        }
+    }
+
+    /// Map a `sqlx::Error` to a [`RequestLogError`], splitting TRANSIENT blips
+    /// (worth retrying) from TERMINAL failures (not).
+    ///
+    /// TRANSIENT: pool-acquire timeout, a closed/dropped connection, or a
+    /// low-level I/O error — the row never committed and a retry on a fresh
+    /// pooled connection can succeed.
+    ///
+    /// TERMINAL: a `Database` error (this includes a unique-key violation on
+    /// the `id` PRIMARY KEY — proof the row ALREADY committed, so a retry must
+    /// NOT re-insert — and any constraint/check failure), plus encode/decode
+    /// and other non-recoverable errors.
+    fn classify_sqlx_error(e: sqlx::Error) -> RequestLogError {
+        let transient = matches!(
+            e,
+            sqlx::Error::PoolTimedOut
+                | sqlx::Error::PoolClosed
+                | sqlx::Error::Io(_)
+        ) || matches!(&e, sqlx::Error::Tls(_));
+        if transient {
+            RequestLogError::Transient(e.to_string())
+        } else {
+            RequestLogError::Storage(e.to_string())
         }
     }
 }
@@ -389,6 +496,45 @@ pub mod postgres {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Test writer that returns the queued error/ok results in order, recording
+    /// how many `write` calls it saw and the `id` of every row it was handed.
+    /// Drives the [`write_with_retry`] retry-budget tests.
+    struct ScriptedWriter {
+        /// Per-attempt outcome: `None` = Ok, `Some(true)` = Transient error,
+        /// `Some(false)` = terminal Storage error. Once exhausted, returns Ok.
+        script: Mutex<std::collections::VecDeque<Option<bool>>>,
+        calls: AtomicUsize,
+        ids: Mutex<Vec<Uuid>>,
+    }
+
+    impl ScriptedWriter {
+        fn new(script: Vec<Option<bool>>) -> Self {
+            Self {
+                script: Mutex::new(script.into_iter().collect()),
+                calls: AtomicUsize::new(0),
+                ids: Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RequestLogWriter for ScriptedWriter {
+        async fn write(&self, row: RequestLogRow) -> Result<(), RequestLogError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.ids.lock().unwrap().push(row.id);
+            let next = self.script.lock().unwrap().pop_front().flatten();
+            match next {
+                None => Ok(()),
+                Some(true) => Err(RequestLogError::Transient("connection reset".into())),
+                Some(false) => Err(RequestLogError::Storage("duplicate key".into())),
+            }
+        }
+    }
 
     fn sample_row() -> RequestLogRow {
         RequestLogRow {
@@ -440,6 +586,70 @@ mod tests {
         w.write(sample_row()).await.unwrap();
         w.write(sample_row()).await.unwrap();
         assert_eq!(w.rows().len(), 2);
+    }
+
+    // ── write_with_retry (P2 metering durability) ──────────────────────────────
+
+    /// A transient blip that resolves on the 2nd attempt: `write_with_retry`
+    /// retries and ultimately succeeds. Uses a zero backoff so the test is fast.
+    #[tokio::test]
+    async fn retry_recovers_from_transient_then_succeeds() {
+        // attempt 1 → Transient, attempt 2 → Ok.
+        let w = ScriptedWriter::new(vec![Some(true), None]);
+        let res = write_with_retry(&w, sample_row(), 3, std::time::Duration::ZERO).await;
+        assert!(res.is_ok(), "transient-then-ok must succeed: {res:?}");
+        assert_eq!(w.calls(), 2, "should retry exactly once after the blip");
+    }
+
+    /// Retries are bounded: a writer that is transiently broken for MORE
+    /// attempts than the budget gives up and returns the transient error after
+    /// exactly `max_attempts` tries (no infinite loop).
+    #[tokio::test]
+    async fn retry_is_bounded_and_returns_last_error() {
+        // Always transient.
+        let w = ScriptedWriter::new(vec![Some(true), Some(true), Some(true), Some(true)]);
+        let res = write_with_retry(&w, sample_row(), 3, std::time::Duration::ZERO).await;
+        let err = res.expect_err("exhausted transient retries must return Err");
+        assert!(err.is_transient(), "the surfaced error is the transient one");
+        assert_eq!(w.calls(), 3, "must stop at exactly max_attempts");
+    }
+
+    /// A TERMINAL (`Storage`) error is NOT retried — retrying a unique-key
+    /// violation (the row already committed) would be wasted work and could
+    /// not succeed. Fails fast after a single attempt.
+    #[tokio::test]
+    async fn retry_does_not_retry_terminal_error() {
+        // attempt 1 → terminal Storage error.
+        let w = ScriptedWriter::new(vec![Some(false), None]);
+        let res = write_with_retry(&w, sample_row(), 3, std::time::Duration::ZERO).await;
+        let err = res.expect_err("terminal error must surface");
+        assert!(!err.is_transient(), "Storage is terminal, not transient");
+        assert_eq!(w.calls(), 1, "terminal error must NOT be retried");
+    }
+
+    /// Idempotency: every retry re-sends the SAME row `id` (the `request_logs`
+    /// PRIMARY KEY), so a retried INSERT cannot create a duplicate row.
+    #[tokio::test]
+    async fn retry_resends_identical_row_id() {
+        let w = ScriptedWriter::new(vec![Some(true), Some(true), None]);
+        let row = sample_row();
+        let id = row.id;
+        write_with_retry(&w, row, 3, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let ids = w.ids.lock().unwrap();
+        assert_eq!(ids.len(), 3, "three attempts");
+        assert!(
+            ids.iter().all(|&seen| seen == id),
+            "every retry must carry the same PK id ({id}), got {ids:?}"
+        );
+    }
+
+    /// `is_transient` correctly partitions the two variants.
+    #[test]
+    fn error_transient_classification() {
+        assert!(RequestLogError::Transient("pool timeout".into()).is_transient());
+        assert!(!RequestLogError::Storage("unique violation".into()).is_transient());
     }
 
     #[tokio::test]
