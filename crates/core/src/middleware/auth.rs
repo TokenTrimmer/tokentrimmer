@@ -290,6 +290,18 @@ pub async fn middleware(
                     None,
                 ));
             }
+            BudgetDecision::DenyServed => {
+                // P0-3 COGS guard: served-request ceiling (cache hits included)
+                // reached. Distinct reason from the billed quota — this is an
+                // abuse/infra-cost ceiling, not the advertised included-request
+                // limit.
+                return Ok(budget_denied_response(
+                    "Monthly served-request limit reached for this org.",
+                    "served_quota_exceeded",
+                    None,
+                    None,
+                ));
+            }
             BudgetDecision::DenyRate { retry_after_secs } => {
                 return Ok(budget_denied_response(
                     "Request rate limit exceeded for this org.",

@@ -144,6 +144,7 @@ async fn spend_cap_returns_429_after_spend_recorded() {
             monthly_cap_usd: Some(0.000_000_1), // any recorded spend exceeds it
             max_requests_per_min: None,
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         },
         Arc::new(raw),
@@ -177,6 +178,7 @@ async fn rate_limit_returns_429_with_retry_after() {
             monthly_cap_usd: None,
             max_requests_per_min: Some(2),
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         },
         Arc::new(raw),

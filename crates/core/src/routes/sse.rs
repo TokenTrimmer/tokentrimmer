@@ -766,6 +766,11 @@ pub fn stream_response(
 
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, cost_usd, Utc::now());
+                // P0-1/P0-3: settle the served request. Streaming always
+                // dispatches to the provider (never a cache hit), so this is a
+                // non-cached settle — advances both the billed and served
+                // counters.
+                spend_sink.settle(org_id, false, Utc::now());
 
                 // Record OTel GenAI semconv + TokenTrimmer cost attributes onto
                 // the captured `http_request` span, mirroring the non-streaming

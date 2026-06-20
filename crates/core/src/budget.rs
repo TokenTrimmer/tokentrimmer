@@ -33,9 +33,19 @@ pub struct BudgetLimits {
     pub monthly_cap_usd: Option<f64>,
     /// Max requests per rolling 60s window. `None` = unlimited rate.
     pub max_requests_per_min: Option<u32>,
-    /// Max requests per calendar month. `None` = unlimited monthly volume.
-    /// Resets with the spend accumulator at the month boundary.
+    /// Max **billed** requests per calendar month — only requests that hit the
+    /// provider (non-cached) count toward this. Cache hits are excluded
+    /// (P0-1): the pricing page promises cache hits do not consume included
+    /// requests. `None` = unlimited monthly billed volume. Resets with the
+    /// spend accumulator at the month boundary.
     pub monthly_request_cap: Option<u32>,
+    /// Max **served** requests per calendar month — EVERY served request counts,
+    /// cache hits included (P0-3 COGS guard). Once cache hits stop counting
+    /// toward `monthly_request_cap`, a pathological high-hit-rate free tenant
+    /// could otherwise serve unbounded traffic at pure infra cost; this ceiling
+    /// (defaulting to ~10x `monthly_request_cap`) bounds that. `None` =
+    /// unlimited served volume (paid tiers). Resets with the billed counter.
+    pub monthly_served_cap: Option<u32>,
     /// Whether the L2 semantic cache is available for this tier.
     /// Free is L1-only (`false`); Pro/Team/Scale enable L2 (`true`).
     pub l2_cache: bool,
@@ -52,6 +62,10 @@ impl BudgetLimits {
             monthly_cap_usd: None,
             max_requests_per_min: Some(60),
             monthly_request_cap: Some(10_000),
+            // P0-3 COGS guard: ~10x the billed cap. A pure-cache-hit free
+            // tenant bills nothing but still consumes infra; bound served
+            // volume at 100 000/month.
+            monthly_served_cap: Some(100_000),
             l2_cache: false,
         }
     }
@@ -65,6 +79,7 @@ impl BudgetLimits {
             monthly_cap_usd: None,
             max_requests_per_min: None,
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: true,
         }
     }
@@ -98,12 +113,14 @@ pub fn tier_budget_limits(tier: &str, status: &str) -> BudgetLimits {
             monthly_cap_usd: None,
             max_requests_per_min: Some(600),
             monthly_request_cap: None, // paid tiers bill overage, no hard-stop
+            monthly_served_cap: None,  // paid tiers have no COGS ceiling
             l2_cache: true,
         },
         "team" | "scale" => BudgetLimits {
             monthly_cap_usd: None,
             max_requests_per_min: None, // unlimited rpm for team/scale
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: true,
         },
         // "free", "", "enterprise", unknown → Free caps.
@@ -124,8 +141,15 @@ pub enum BudgetDecision {
     Allow { spend_remaining_usd: Option<f64> },
     /// Monthly spend cap reached — no headroom left this month.
     DenySpend,
-    /// Monthly request-count cap reached — no requests left this month.
+    /// Monthly **billed** request-count cap reached — no billable (provider-hit)
+    /// requests left this month. Cache hits do not contribute to this cap.
     DenyMonthlyRequests,
+    /// Monthly **served** request-count cap reached (P0-3 COGS guard) — the org
+    /// has served `monthly_served_cap` requests (cache hits included) this
+    /// month. Distinct from [`BudgetDecision::DenyMonthlyRequests`] so the
+    /// caller can return a different error reason: this is an abuse/COGS guard,
+    /// not the advertised billed quota. A pure-cache-hit tenant trips this.
+    DenyServed,
     /// Per-minute request rate exceeded; client should retry after the given
     /// number of seconds (when the window rolls over).
     DenyRate { retry_after_secs: u64 },
@@ -139,11 +163,36 @@ impl BudgetDecision {
     }
 }
 
-/// Pre-flight gate + post-request spend recorder, keyed per org.
+/// Pre-flight gate + post-request spend/request recorder, keyed per org.
+///
+/// ## Two-phase request counting (P0-1)
+///
+/// A request's cache-hit status is only known *after* the L1/L2/negative-cache
+/// lookup, but [`BudgetEnforcer::check`] runs *before* any work (in the auth
+/// middleware). So request counting is split in two:
+///
+/// * [`check`](BudgetEnforcer::check) does pre-flight deny/allow gating
+///   (spend/billed-cap/served-cap/rate) and counts the attempt against the
+///   per-minute rate window — but does **not** advance the monthly billed or
+///   served counters.
+/// * [`settle`](BudgetEnforcer::settle) runs once the cache-hit status is
+///   known and advances the monthly counters: `served_request_count` always,
+///   and `month_request_count` (billed) only when the request was **not** a
+///   cache hit. This keeps cache hits off the advertised billed quota while
+///   still bounding total served volume (the P0-3 COGS guard).
 pub trait BudgetEnforcer: Send + Sync {
     /// Pre-flight: may `org_id` make a request at `now`? Counts the attempt
-    /// against the per-minute rate window.
+    /// against the per-minute rate window. Does **not** advance the monthly
+    /// billed/served counters — that is [`settle`](BudgetEnforcer::settle)'s job
+    /// (run after cache resolution).
     fn check(&self, org_id: Uuid, now: DateTime<Utc>) -> BudgetDecision;
+
+    /// Post-resolution: record that one request was served at `now`. Advances
+    /// `served_request_count` always; advances the billed `month_request_count`
+    /// only when `!cached`. Called once per request after the L1/L2/negative
+    /// cache resolves the `cached` status. The per-minute rate window is NOT
+    /// touched here — that was already counted in [`check`](BudgetEnforcer::check).
+    fn settle(&self, org_id: Uuid, cached: bool, now: DateTime<Utc>);
 
     /// Record realized spend after the response. `cost_usd` may be `0.0`
     /// (e.g. a cache hit) — that still happened, it just costs nothing.
@@ -162,8 +211,14 @@ struct OrgState {
     /// `(year, month)` the monthly accumulators belong to; reset across months.
     month: (i32, u32),
     spend_usd: f64,
-    /// Requests counted this calendar month (for `monthly_request_cap`).
+    /// **Billed** requests counted this calendar month (for
+    /// `monthly_request_cap`). Advanced by `settle` only for non-cached
+    /// requests — cache hits are excluded (P0-1).
     month_request_count: u32,
+    /// **Served** requests counted this calendar month (for
+    /// `monthly_served_cap`, the P0-3 COGS guard). Advanced by `settle` for
+    /// EVERY served request, cache hits included.
+    served_request_count: u32,
     /// Start of the current rate window.
     window_start: DateTime<Utc>,
     window_count: u32,
@@ -175,21 +230,50 @@ impl OrgState {
             month: (now.year(), now.month()),
             spend_usd: 0.0,
             month_request_count: 0,
+            served_request_count: 0,
             window_start: now,
             window_count: 0,
         }
     }
 
-    /// Reset the monthly accumulators (spend + request count) when `now` falls
-    /// in a new month.
+    /// Reset the monthly accumulators (spend + billed + served request counts)
+    /// when `now` falls in a new month.
     fn roll_month(&mut self, now: DateTime<Utc>) {
         let ym = (now.year(), now.month());
         if self.month != ym {
             self.month = ym;
             self.spend_usd = 0.0;
             self.month_request_count = 0;
+            self.served_request_count = 0;
         }
     }
+
+    /// Post-resolution counter advance shared by both enforcer impls:
+    /// served always, billed only when not a cache hit.
+    fn settle(&mut self, cached: bool) {
+        self.served_request_count = self.served_request_count.saturating_add(1);
+        if !cached {
+            self.month_request_count = self.month_request_count.saturating_add(1);
+        }
+    }
+}
+
+/// The pre-flight monthly gates shared by both enforcer impls: deny when the
+/// billed cap is reached, or when the served (COGS) ceiling is reached. Returns
+/// `None` when neither cap is tripped. Reads only — counters are advanced by
+/// `settle`, not here.
+fn monthly_caps_decision(st: &OrgState, limits: &BudgetLimits) -> Option<BudgetDecision> {
+    if let Some(mcap) = limits.monthly_request_cap {
+        if st.month_request_count >= mcap {
+            return Some(BudgetDecision::DenyMonthlyRequests);
+        }
+    }
+    if let Some(scap) = limits.monthly_served_cap {
+        if st.served_request_count >= scap {
+            return Some(BudgetDecision::DenyServed);
+        }
+    }
+    None
 }
 
 impl InMemoryBudgetEnforcer {
@@ -215,14 +299,13 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
             }
         }
 
-        // Monthly request-count cap — pre-flight on attempts this month.
-        if let Some(mcap) = self.limits.monthly_request_cap {
-            if st.month_request_count >= mcap {
-                return BudgetDecision::DenyMonthlyRequests;
-            }
+        // Monthly billed-cap + served-ceiling — pre-flight, read-only. The
+        // counters advance in `settle` (after cache resolution), not here.
+        if let Some(decision) = monthly_caps_decision(st, &self.limits) {
+            return decision;
         }
 
-        // Per-minute rate window (also counts this attempt).
+        // Per-minute rate window (counts every attempt, cache hits included).
         if let Some(rpm) = self.limits.max_requests_per_min {
             let elapsed = now.signed_duration_since(st.window_start).num_seconds();
             if elapsed >= RATE_WINDOW_SECS {
@@ -238,9 +321,6 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
             }
         }
 
-        // The request passed every gate — count it toward the monthly volume.
-        st.month_request_count = st.month_request_count.saturating_add(1);
-
         BudgetDecision::Allow {
             spend_remaining_usd: self
                 .limits
@@ -249,11 +329,29 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
         }
     }
 
+    fn settle(&self, org_id: Uuid, cached: bool, now: DateTime<Utc>) {
+        let mut guard = self.state.lock().expect("budget state poisoned");
+        let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
+        st.roll_month(now);
+        st.settle(cached);
+    }
+
     fn record(&self, org_id: Uuid, cost_usd: f64, now: DateTime<Utc>) {
         let mut guard = self.state.lock().expect("budget state poisoned");
         let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
         st.roll_month(now);
         st.spend_usd += cost_usd.max(0.0);
+    }
+}
+
+#[cfg(test)]
+impl InMemoryBudgetEnforcer {
+    /// `(billed, served)` request counts for `org_id` this month. Test-only.
+    fn counts_for_test(&self, org_id: Uuid) -> (u32, u32) {
+        let guard = self.state.lock().expect("budget state poisoned");
+        guard
+            .get(&org_id)
+            .map_or((0, 0), |st| (st.month_request_count, st.served_request_count))
     }
 }
 
@@ -277,6 +375,26 @@ impl SpendSink {
         match self {
             SpendSink::Dynamic(d) => d.record(org_id, cost_usd, now),
             SpendSink::Global(g) => g.record(org_id, cost_usd, now),
+            SpendSink::None => {}
+        }
+    }
+
+    /// Settle one served request for `org_id` (P0-1/P0-3): advance the served
+    /// counter always, and the billed monthly counter only when `!cached`.
+    /// Called once per request after cache resolution, into the same enforcer
+    /// the pre-flight `check` read. No-op for the nil org or `None` sink.
+    ///
+    /// The counter advance does not depend on the org's limit values, so the
+    /// dynamic path passes a default `BudgetLimits` for signature symmetry.
+    pub fn settle(&self, org_id: Uuid, cached: bool, now: DateTime<Utc>) {
+        if org_id == Uuid::nil() {
+            return;
+        }
+        match self {
+            SpendSink::Dynamic(d) => {
+                d.settle_with_limits(org_id, &BudgetLimits::default(), cached, now)
+            }
+            SpendSink::Global(g) => g.settle(org_id, cached, now),
             SpendSink::None => {}
         }
     }
@@ -321,10 +439,10 @@ impl DynamicBudgetEnforcer {
             }
         }
 
-        if let Some(mcap) = limits.monthly_request_cap {
-            if st.month_request_count >= mcap {
-                return BudgetDecision::DenyMonthlyRequests;
-            }
+        // Monthly billed-cap + served-ceiling — read-only; advanced in
+        // `settle_with_limits` after cache resolution.
+        if let Some(decision) = monthly_caps_decision(st, limits) {
+            return decision;
         }
 
         if let Some(rpm) = limits.max_requests_per_min {
@@ -342,13 +460,29 @@ impl DynamicBudgetEnforcer {
             }
         }
 
-        st.month_request_count = st.month_request_count.saturating_add(1);
-
         BudgetDecision::Allow {
             spend_remaining_usd: limits
                 .monthly_cap_usd
                 .map(|cap| (cap - st.spend_usd).max(0.0)),
         }
+    }
+
+    /// Post-resolution: advance the served counter always, and the billed
+    /// counter only for non-cached requests. Mirrors
+    /// [`BudgetEnforcer::settle`] for the per-org dynamic path. `limits` is
+    /// accepted for signature symmetry with `check_with_limits` (counter
+    /// advance does not depend on the limit values).
+    pub fn settle_with_limits(
+        &self,
+        org_id: Uuid,
+        _limits: &BudgetLimits,
+        cached: bool,
+        now: DateTime<Utc>,
+    ) {
+        let mut guard = self.state.lock().expect("dynamic budget state poisoned");
+        let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
+        st.roll_month(now);
+        st.settle(cached);
     }
 
     /// Record realized spend after the response completes.
@@ -399,6 +533,7 @@ mod tests {
             monthly_cap_usd: Some(10.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
@@ -417,6 +552,7 @@ mod tests {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
@@ -431,6 +567,7 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: Some(2),
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
@@ -450,6 +587,7 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: Some(1),
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
@@ -469,6 +607,7 @@ mod tests {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         });
         let may = t(2026, 5, 31, 23, 0, 0);
@@ -485,11 +624,14 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: None,
             monthly_request_cap: Some(3),
+            monthly_served_cap: None,
             l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
+        // P0-1: the billed counter advances on settle(cached=false), not check.
         for _ in 0..3 {
             assert!(e.check(org(), now).is_allowed());
+            e.settle(org(), false, now);
         }
         assert_eq!(e.check(org(), now), BudgetDecision::DenyMonthlyRequests);
     }
@@ -500,10 +642,13 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: None,
             monthly_request_cap: Some(1),
+            monthly_served_cap: None,
             l2_cache: false,
         });
         let may = t(2026, 5, 31, 23, 0, 0);
+        // P0-1: settle (not check) advances the billed counter.
         assert!(e.check(org(), may).is_allowed());
+        e.settle(org(), false, may);
         assert_eq!(e.check(org(), may), BudgetDecision::DenyMonthlyRequests);
         // June → monthly counter resets, allowed again.
         let june = t(2026, 6, 1, 0, 0, 0);
@@ -540,6 +685,7 @@ mod tests {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
@@ -652,13 +798,17 @@ mod tests {
             monthly_cap_usd: None,
             max_requests_per_min: None,
             monthly_request_cap: Some(10_000),
+            monthly_served_cap: None,
             l2_cache: false,
         };
         let e = InMemoryBudgetEnforcer::new(cap_only);
         let now = t(2026, 5, 1, 0, 0, 0);
         let org = Uuid::from_u128(99);
+        // P0-1: the billed counter advances on settle(cached=false), so each
+        // billable request is check()+settle(false).
         for _ in 0..10_000 {
             assert!(e.check(org, now).is_allowed());
+            e.settle(org, false, now);
         }
         assert_eq!(
             e.check(org, now),
@@ -667,7 +817,9 @@ mod tests {
         );
 
         // Also verify the free_tier() limits (with rpm) hit the monthly cap
-        // when the clock advances to avoid rpm conflicts.
+        // when the clock advances to avoid rpm conflicts. Each billable request
+        // is check()+settle(false); the 100k served cap is far above 10k so it
+        // never fires here.
         let e2 = InMemoryBudgetEnforcer::new(limits);
         let org2 = Uuid::from_u128(199);
         let mut total = 0u32;
@@ -681,6 +833,7 @@ mod tests {
                     e2.check(org2, ts).is_allowed(),
                     "request {total} at minute {minute}"
                 );
+                e2.settle(org2, false, ts);
                 total += 1;
             }
         }
@@ -709,6 +862,7 @@ mod tests {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         };
         let now = t(2026, 6, 1, 0, 0, 0);
@@ -740,6 +894,7 @@ mod tests {
             monthly_cap_usd: Some(1.0),
             max_requests_per_min: None,
             monthly_request_cap: None,
+            monthly_served_cap: None,
             l2_cache: false,
         };
         let now = t(2026, 6, 1, 0, 0, 0);
@@ -770,5 +925,208 @@ mod tests {
             matches!(e.check(org, now), BudgetDecision::DenyRate { .. }),
             "Free org at 60 rpm must be rate-denied"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P0-1 / P0-3: two-phase billed/served counting (settle excludes cache
+    // hits from the billed monthly cap but counts every served request).
+    // -----------------------------------------------------------------------
+
+    /// `monthly_request_cap` + a `monthly_served_cap` at 10x, no rpm/spend caps,
+    /// so the billed and served counters can be exercised in isolation.
+    fn billed_and_served(billed: u32, served: u32) -> BudgetLimits {
+        BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: None,
+            monthly_request_cap: Some(billed),
+            monthly_served_cap: Some(served),
+            l2_cache: false,
+        }
+    }
+
+    #[test]
+    fn cache_hit_does_not_advance_billed_but_advances_served() {
+        // A request that passes check() and then settles as a cache hit must
+        // NOT consume a billed monthly slot, but MUST count as served.
+        let e = InMemoryBudgetEnforcer::new(billed_and_served(2, 100));
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = org();
+
+        // Three cache hits in a row: check passes, settle(cached=true).
+        for _ in 0..3 {
+            assert!(e.check(org, now).is_allowed());
+            e.settle(org, true, now);
+        }
+        // Billed count never advanced → still under the billed cap of 2 even
+        // after 3 served requests. A non-cached request must still be allowed
+        // and consume the FIRST billed slot.
+        assert!(
+            e.check(org, now).is_allowed(),
+            "billed cap must be untouched by cache hits"
+        );
+        e.settle(org, false, now);
+        // One billed request used; cap is 2, so a second non-cached request OK.
+        assert!(e.check(org, now).is_allowed());
+        e.settle(org, false, now);
+        // Now 2 billed used = cap → next non-cached must be denied.
+        assert_eq!(e.check(org, now), BudgetDecision::DenyMonthlyRequests);
+    }
+
+    #[test]
+    fn non_cached_request_advances_both_counters() {
+        let e = InMemoryBudgetEnforcer::new(billed_and_served(5, 50));
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = org();
+        assert!(e.check(org, now).is_allowed());
+        e.settle(org, false, now);
+        let (billed, served) = e.counts_for_test(org);
+        assert_eq!(billed, 1, "non-cached must advance billed count");
+        assert_eq!(served, 1, "non-cached must advance served count");
+    }
+
+    #[test]
+    fn billed_cap_still_denies_at_cap_on_non_cached_traffic() {
+        let e = InMemoryBudgetEnforcer::new(billed_and_served(3, 1000));
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = org();
+        for _ in 0..3 {
+            assert!(e.check(org, now).is_allowed());
+            e.settle(org, false, now);
+        }
+        assert_eq!(
+            e.check(org, now),
+            BudgetDecision::DenyMonthlyRequests,
+            "non-cached traffic must still hit the billed cap"
+        );
+    }
+
+    #[test]
+    fn served_ceiling_denies_pure_cache_hit_tenant_at_10x() {
+        // A pure-cache-hit tenant: billed never advances, but served does.
+        // The served cap (10x the billed cap) must eventually deny.
+        let e = InMemoryBudgetEnforcer::new(billed_and_served(3, 30));
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = org();
+        for i in 0..30 {
+            assert!(
+                e.check(org, now).is_allowed(),
+                "served request {i} under the 30 ceiling must pass"
+            );
+            e.settle(org, true, now); // all cache hits
+        }
+        // 30 served = served cap → next request denied by the COGS guard, even
+        // though the billed count is still 0.
+        assert_eq!(
+            e.check(org, now),
+            BudgetDecision::DenyServed,
+            "pure-cache-hit tenant must be denied at the served ceiling"
+        );
+        let (billed, served) = e.counts_for_test(org);
+        assert_eq!(billed, 0, "billed must remain 0 for a pure-hit tenant");
+        assert_eq!(served, 30, "served must have reached the ceiling");
+    }
+
+    #[test]
+    fn free_tier_served_cap_is_10x_billed_cap() {
+        let l = BudgetLimits::free_tier();
+        assert_eq!(l.monthly_request_cap, Some(10_000));
+        assert_eq!(
+            l.monthly_served_cap,
+            Some(100_000),
+            "free served cap should default to ~10x the billed cap"
+        );
+    }
+
+    #[test]
+    fn rate_limit_counts_every_attempt_including_hits() {
+        // The per-minute rate window must count EVERY attempt — cache hits
+        // included — independent of the billed monthly exclusion. check()
+        // counts the attempt; settle does not touch the rate window.
+        let e = InMemoryBudgetEnforcer::new(BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: Some(2),
+            monthly_request_cap: Some(10_000),
+            monthly_served_cap: Some(100_000),
+            l2_cache: false,
+        });
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = org();
+        // Two attempts that settle as cache hits still fill the rate window.
+        assert!(e.check(org, now).is_allowed());
+        e.settle(org, true, now);
+        assert!(e.check(org, now).is_allowed());
+        e.settle(org, true, now);
+        // Third attempt — window full → rate-denied even though the first two
+        // were cache hits that did not bill.
+        assert!(
+            matches!(e.check(org, now), BudgetDecision::DenyRate { .. }),
+            "rate window must count cache-hit attempts"
+        );
+    }
+
+    #[test]
+    fn month_rollover_resets_both_counters() {
+        let e = InMemoryBudgetEnforcer::new(billed_and_served(2, 4));
+        let may = t(2026, 5, 31, 23, 0, 0);
+        let org = org();
+        // Exhaust both: 2 billed (non-cached) + 2 served (cache hits) = 4 served.
+        e.check(org, may);
+        e.settle(org, false, may);
+        e.check(org, may);
+        e.settle(org, false, may);
+        e.check(org, may);
+        e.settle(org, true, may);
+        e.check(org, may);
+        e.settle(org, true, may);
+        let (billed, served) = e.counts_for_test(org);
+        assert_eq!((billed, served), (2, 4), "both counters accumulated in May");
+        // June → both reset.
+        let june = t(2026, 6, 1, 0, 0, 0);
+        assert!(
+            e.check(org, june).is_allowed(),
+            "billed cap must reset in June"
+        );
+        let (billed, served) = e.counts_for_test(org);
+        assert_eq!(billed, 0, "billed count must reset at month boundary");
+        assert_eq!(served, 0, "served count must reset at month boundary");
+    }
+
+    #[test]
+    fn dynamic_settle_with_limits_mirrors_in_memory() {
+        // The DynamicBudgetEnforcer path must apply the same billed/served
+        // semantics via settle_with_limits.
+        let e = DynamicBudgetEnforcer::new();
+        let limits = billed_and_served(2, 6);
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = org();
+        // 6 cache hits → served cap reached, billed untouched.
+        for _ in 0..6 {
+            assert!(e.check_with_limits(org, &limits, now).is_allowed());
+            e.settle_with_limits(org, &limits, true, now);
+        }
+        assert_eq!(
+            e.check_with_limits(org, &limits, now),
+            BudgetDecision::DenyServed,
+            "dynamic served ceiling must deny a pure-hit tenant"
+        );
+    }
+
+    #[test]
+    fn served_cap_none_disables_the_cogs_guard() {
+        // Paid tiers carry no served cap (monthly_served_cap = None) → unbounded
+        // served volume, never DenyServed.
+        let e = InMemoryBudgetEnforcer::new(BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: None,
+            monthly_request_cap: None,
+            monthly_served_cap: None,
+            l2_cache: false,
+        });
+        let now = t(2026, 5, 1, 0, 0, 0);
+        let org = org();
+        for _ in 0..1000 {
+            assert!(e.check(org, now).is_allowed());
+            e.settle(org, true, now);
+        }
     }
 }

@@ -1619,6 +1619,11 @@ pub(crate) async fn complete_once(
     // Record realized spend into the same enforcer the pre-flight check uses
     // (dynamic_budget on the tier-aware path) so the monthly_cap_usd hard stop trips.
     state.spend_sink().record(ctx.org_id, cost_usd, Utc::now());
+    // P0-1/P0-3: settle the served request. This is the dispatched (non-cached)
+    // tail — the request hit the provider — so it advances BOTH the billed
+    // monthly counter and the served counter. Cache hits settle with
+    // `cached=true` at the `complete_once` consumer (they never reach here).
+    state.spend_sink().settle(ctx.org_id, false, Utc::now());
 
     let provider_id = provider.id().to_string();
     let model_used = response.model.clone();
@@ -2142,7 +2147,14 @@ pub async fn handler(
     match complete_once(&state, &ctx, prep).await? {
         // Cache hit (L1 / L2 / negative cache / single-flight follower): the
         // fully-built client response is returned verbatim.
-        CompletionOutcome::CacheHit(resp) => Ok(resp),
+        CompletionOutcome::CacheHit(resp) => {
+            // P0-1/P0-3: settle the served request as a cache hit. Advances the
+            // served counter (COGS guard) but NOT the billed monthly counter —
+            // cache hits do not consume an included request. The dispatched arm
+            // already settled `cached=false` inside `complete_once`.
+            state.spend_sink().settle(ctx.org_id, true, Utc::now());
+            Ok(resp)
+        }
         // Dispatched completion: build the HTTP response from the typed body +
         // the cost/route/cache/warning metadata, via the same
         // `attach_cost_headers` / `attach_warnings` the tail used inline.

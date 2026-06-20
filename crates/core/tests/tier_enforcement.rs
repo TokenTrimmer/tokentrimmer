@@ -215,11 +215,18 @@ fn chat_request(bearer: &str) -> Request<Body> {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-/// (a) Free org with its monthly cap exhausted via DynamicBudgetEnforcer
-/// must get 429 `monthly_quota_exceeded` on the next request.
+/// (a) Free org with its monthly **billed** cap exhausted via
+/// DynamicBudgetEnforcer must get 429 `monthly_quota_exceeded` on the next
+/// request.
+///
+/// P0-1 NOTE: the billed monthly counter now advances on `settle(cached=false)`
+/// (after cache resolution), NOT on the pre-flight `check`. Cache hits no
+/// longer consume a billed slot. So this test pre-fills the cap by calling
+/// `settle_with_limits` with `cached=false` `cap` times (one per billed
+/// request) rather than relying on `check` to increment. `settle` does not
+/// touch the rpm window, so no clock-advance dance is needed.
 #[tokio::test]
 async fn free_org_over_monthly_cap_returns_429() {
-    use tt_core::budget::BudgetDecision;
     let store = InMemoryKeyStore::new();
     let org = Uuid::now_v7();
     let key = issue_key_for(&store, org).await;
@@ -231,32 +238,16 @@ async fn free_org_over_monthly_cap_returns_429() {
         .with_tier_resolver(Arc::new(resolver) as Arc<dyn TierResolver>)
         .with_key_store(Arc::new(store));
 
-    // Pre-exhaust the monthly cap by draining the dynamic_budget enforcer.
-    // We advance the clock 61s per batch of 59 to avoid the rpm window blocking.
+    // Pre-exhaust the billed monthly cap by settling `cap` non-cached requests
+    // into the dynamic_budget enforcer the auth middleware reads.
     let free_limits = tt_core::budget::BudgetLimits::free_tier();
     let cap = free_limits.monthly_request_cap.expect("free tier has cap");
-    let base = chrono::Utc::now();
-    let mut allowed = 0u32;
-    let mut minute = 0i64;
-    while allowed < cap {
-        let ts = base + chrono::Duration::seconds(minute * 61);
-        minute += 1;
-        for _ in 0..59u32 {
-            if allowed >= cap {
-                break;
-            }
-            let decision = state
-                .dynamic_budget
-                .check_with_limits(org, &free_limits, ts);
-            if matches!(decision, BudgetDecision::Allow { .. }) {
-                allowed += 1;
-            }
-        }
+    let now = chrono::Utc::now();
+    for _ in 0..cap {
+        state
+            .dynamic_budget
+            .settle_with_limits(org, &free_limits, false, now);
     }
-    assert_eq!(
-        allowed, cap,
-        "should have pre-filled exactly {cap} requests"
-    );
 
     let app = build_router(state);
 
@@ -424,6 +415,7 @@ async fn spend_sink_and_auth_share_same_enforcer_seam() {
                     monthly_cap_usd: Some(1.0),
                     max_requests_per_min: None,
                     monthly_request_cap: None,
+                    monthly_served_cap: None,
                     l2_cache: true,
                 },
             })
