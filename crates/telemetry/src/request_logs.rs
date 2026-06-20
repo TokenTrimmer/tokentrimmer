@@ -481,9 +481,7 @@ pub mod postgres {
     fn classify_sqlx_error(e: sqlx::Error) -> RequestLogError {
         let transient = matches!(
             e,
-            sqlx::Error::PoolTimedOut
-                | sqlx::Error::PoolClosed
-                | sqlx::Error::Io(_)
+            sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_)
         ) || matches!(&e, sqlx::Error::Tls(_));
         if transient {
             RequestLogError::Transient(e.to_string())
@@ -610,7 +608,10 @@ mod tests {
         let w = ScriptedWriter::new(vec![Some(true), Some(true), Some(true), Some(true)]);
         let res = write_with_retry(&w, sample_row(), 3, std::time::Duration::ZERO).await;
         let err = res.expect_err("exhausted transient retries must return Err");
-        assert!(err.is_transient(), "the surfaced error is the transient one");
+        assert!(
+            err.is_transient(),
+            "the surfaced error is the transient one"
+        );
         assert_eq!(w.calls(), 3, "must stop at exactly max_attempts");
     }
 
