@@ -24,8 +24,12 @@
 //!   volatile prompt within the L1 window is the same bytes either way; the
 //!   near-miss-paraphrase risk this lane addresses is an L2 phenomenon).
 //!
-//! OFF BY DEFAULT: wired only when `L2Config.volatility_ttl` is `Some`
-//! (`TT_L2_VOLATILITY_TTL=1`).
+//! ON BY DEFAULT (P2): [`crate::state::AppState::with_l2`] seeds
+//! `L2Config.volatility_ttl` with [`L2VolatilityTtl::default`], so volatile
+//! prompts get a shortened L2 TTL out of the box. Because the lane is
+//! shorten-only, default-on is safe (worst case a miss, never staleness).
+//! Disable via [`crate::state::AppState::without_l2_volatility_ttl`] /
+//! `TT_L2_VOLATILITY_TTL=0`.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;

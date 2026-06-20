@@ -97,9 +97,13 @@ pub struct L2Config {
     /// open). `None` disables it entirely (today's pre-COST-5 behavior);
     /// `TT_L2_VERIFY` / [`AppState::with_l2_verify`] override the knobs.
     pub verify: Option<L2VerifyConfig>,
-    /// Volatility-class TTL. `None` (default) = today's behavior.
-    /// **OFF BY DEFAULT** — opt in via `TT_L2_VOLATILITY_TTL` /
-    /// [`AppState::with_l2_volatility_ttl`].
+    /// Volatility-class TTL. **ON BY DEFAULT** (P2): [`AppState::with_l2`] seeds
+    /// it with [`L2VolatilityTtl::default`] so volatile prompts get a shortened
+    /// L2 TTL out of the box. Shorten-only, so a misclassification's worst case
+    /// is an early re-dispatch (a miss), never a stale answer. `None` disables it
+    /// (pre-P2 behavior); override the knobs via
+    /// [`AppState::with_l2_volatility_ttl`] or disable via
+    /// [`AppState::without_l2_volatility_ttl`] / `TT_L2_VOLATILITY_TTL=0`.
     pub volatility_ttl: Option<L2VolatilityTtl>,
 }
 
@@ -463,8 +467,8 @@ impl AppState {
             // `DEFAULT_LEXICAL_MIN_AGREEMENT`). An unconfigured gateway thus
             // lexically verifies near-threshold hits at ~zero cost; pre-0018
             // rows (no signature) fail OPEN, so legacy data never turns into a
-            // miss. `with_l2_verify` overrides these from env. Volatility TTL
-            // stays OFF by default (separate opt-in).
+            // miss. `with_l2_verify` overrides these from env. Volatility TTL is
+            // ON by default too (see `volatility_ttl` below).
             verify: Some({
                 let lex = tt_cache::LexicalVerifyConfig::default();
                 let class_thresholds = tt_cache::ClassThresholds::with_global_floor(threshold);
@@ -478,7 +482,15 @@ impl AppState {
                     )),
                 }
             }),
-            volatility_ttl: None,
+            // Volatility-class TTL is ON by default (P2): volatile prompts get a
+            // shortened L2 TTL so a stale realtime answer can't be re-served for
+            // the full base TTL. Shorten-only by construction — a
+            // misclassification's worst case is an early re-dispatch (a cache
+            // miss), NEVER a stale answer — so default-on is safe. Disable via
+            // [`without_l2_volatility_ttl`](Self::without_l2_volatility_ttl) /
+            // `TT_L2_VOLATILITY_TTL=0`; override the knobs via
+            // [`with_l2_volatility_ttl`](Self::with_l2_volatility_ttl).
+            volatility_ttl: Some(L2VolatilityTtl::default()),
         });
         self
     }
@@ -534,6 +546,21 @@ impl AppState {
                 },
                 floor_secs: cfg.floor_secs,
             });
+        }
+        self
+    }
+
+    /// Builder-style: DISABLE volatility-class TTLs for L2 inserts, reverting to
+    /// the pre-P2 behavior where every L2 entry (volatile or not) gets the full
+    /// base tier TTL. Volatility TTL is ON by default (set by [`with_l2`]); this
+    /// is the escape hatch the `TT_L2_VOLATILITY_TTL=0` env gate selects. No-op
+    /// when L2 itself is not attached.
+    ///
+    /// [`with_l2`]: Self::with_l2
+    #[must_use]
+    pub fn without_l2_volatility_ttl(mut self) -> Self {
+        if let Some(l2) = self.l2.as_mut() {
+            l2.volatility_ttl = None;
         }
         self
     }
