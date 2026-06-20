@@ -1628,12 +1628,16 @@ pub(crate) async fn complete_once(
 
     // Record realized spend into the same enforcer the pre-flight check uses
     // (dynamic_budget on the tier-aware path) so the monthly_cap_usd hard stop trips.
-    state.spend_sink().record(ctx.org_id, cost_usd, Utc::now());
+    state
+        .spend_sink()
+        .record(ctx.org_id, ctx.api_key_id, cost_usd, Utc::now());
     // P0-1/P0-3: settle the served request. This is the dispatched (non-cached)
     // tail — the request hit the provider — so it advances BOTH the billed
     // monthly counter and the served counter. Cache hits settle with
     // `cached=true` at the `complete_once` consumer (they never reach here).
-    state.spend_sink().settle(ctx.org_id, false, Utc::now());
+    state
+        .spend_sink()
+        .settle(ctx.org_id, ctx.api_key_id, false, Utc::now());
 
     let provider_id = provider.id().to_string();
     let model_used = response.model.clone();
@@ -2162,7 +2166,9 @@ pub async fn handler(
             // served counter (COGS guard) but NOT the billed monthly counter —
             // cache hits do not consume an included request. The dispatched arm
             // already settled `cached=false` inside `complete_once`.
-            state.spend_sink().settle(ctx.org_id, true, Utc::now());
+            state
+                .spend_sink()
+                .settle(ctx.org_id, ctx.api_key_id, true, Utc::now());
             // P2: synchronous served-counter bump, in-band, once per served
             // cache hit — the cheap sync truth to diff against the async-written
             // `request_logs` row (the L1/L2-hit row is spawned fire-and-forget
@@ -3231,7 +3237,9 @@ async fn handle_streaming(
                         // not consume an included request. Without this, a free
                         // tenant using `stream:true` could serve unbounded cache
                         // hits and never trip the served ceiling.
-                        state.spend_sink().settle(ctx.org_id, true, Utc::now());
+                        state
+                            .spend_sink()
+                            .settle(ctx.org_id, ctx.api_key_id, true, Utc::now());
                         // Pre-dispatch tokens (route_paused / redacted /
                         // shaping skips) must survive on hit responses too.
                         attach_warning_tokens(resp.headers_mut(), &warnings);

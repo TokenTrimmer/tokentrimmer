@@ -153,6 +153,81 @@ pub enum BudgetDecision {
     /// Per-minute request rate exceeded; client should retry after the given
     /// number of seconds (when the window rolls over).
     DenyRate { retry_after_secs: u64 },
+    /// Per-**key** monthly spend cap reached (P2): the specific API key has
+    /// accumulated spend at or above its `api_key_budget_caps.monthly_cap_usd`
+    /// this month. Distinct from [`BudgetDecision::DenySpend`] (the org-wide
+    /// cap) so the caller can return a key-scoped reason — the org may still
+    /// have headroom, but this individual key is capped.
+    DenyKeySpend,
+    /// Per-**key** monthly billed-request cap reached (P2): the specific API key
+    /// has hit its `api_key_budget_caps.monthly_request_cap` this month. Like
+    /// [`BudgetDecision::DenyMonthlyRequests`] but scoped to the key. Cache hits
+    /// do not contribute (mirrors the billed-cap semantics).
+    DenyKeyRequests,
+}
+
+/// A per-API-key spend cap, mirroring cloud `api_key_budget_caps`
+/// (`key_budget_caps::KeyBudgetCap`). `None` on a dimension = that dimension is
+/// uncapped *at the key level* (the org cap / tier default still applies).
+///
+/// This is the gateway-side replica of the cloud config row. The DB read that
+/// produces it lives in [`crate::tier_resolver`]; the precedence rule against
+/// the org cap is [`compose_key_cap`], the gateway mirror of cloud
+/// `key_budget_caps::compose_caps` (tighter-of, min).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct KeyBudgetCap {
+    /// Monthly USD spend cap for this key. `None` = no per-key spend cap.
+    pub monthly_cap_usd: Option<f64>,
+    /// Monthly billed-request cap for this key. `None` = no per-key request cap.
+    pub monthly_request_cap: Option<u32>,
+}
+
+impl KeyBudgetCap {
+    /// `true` when both dimensions are unset — the "no per-key override" row the
+    /// gateway treats as absent.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.monthly_cap_usd.is_none() && self.monthly_request_cap.is_none()
+    }
+}
+
+/// Fold an org-level cap and a per-key cap into the single effective cap, taking
+/// the **tighter (min)** of the two on each dimension. This is the gateway
+/// mirror of cloud `key_budget_caps::compose_caps`: a present cap on either side
+/// binds, the smaller wins when both are present, and `None` on both leaves the
+/// dimension uncapped. A per-key cap therefore only ever *tightens* what the org
+/// already allows — it never loosens an org cap.
+///
+/// The gateway does NOT actually call this to produce one merged number for the
+/// org accumulator (the per-key cap is enforced against a separate per-`(org,
+/// key)` accumulator); it is the documented, unit-tested precedence rule the
+/// per-key cap honours. NaN-safe via `f64::min` (NaN caps are filtered upstream
+/// in `tier_resolver`).
+#[must_use]
+pub fn compose_key_cap(org: KeyBudgetCap, key: KeyBudgetCap) -> KeyBudgetCap {
+    KeyBudgetCap {
+        monthly_cap_usd: tighter_f64(org.monthly_cap_usd, key.monthly_cap_usd),
+        monthly_request_cap: tighter_u32(org.monthly_request_cap, key.monthly_request_cap),
+    }
+}
+
+/// The tighter (smaller) of two optional USD caps. `None` = uncapped, so a
+/// present value always wins over `None`.
+fn tighter_f64(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// The tighter (smaller) of two optional request caps.
+fn tighter_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
 }
 
 impl BudgetDecision {
@@ -383,37 +458,43 @@ pub enum SpendSink {
 }
 
 impl SpendSink {
-    /// Record realized `cost_usd` for `org_id` (no-op for the nil org or `None` sink).
-    pub fn record(&self, org_id: Uuid, cost_usd: f64, now: DateTime<Utc>) {
+    /// Record realized `cost_usd` for `(org_id, api_key_id)` (no-op for the nil
+    /// org or `None` sink). The per-key spend is tracked on the dynamic path so
+    /// the per-key spend cap (P2) trips against this key's own spend; a nil
+    /// `api_key_id` (dogfood/anon) records org-only.
+    pub fn record(&self, org_id: Uuid, api_key_id: Uuid, cost_usd: f64, now: DateTime<Utc>) {
         if org_id == Uuid::nil() {
             return;
         }
         match self {
-            SpendSink::Dynamic(d) => d.record(org_id, cost_usd, now),
+            SpendSink::Dynamic(d) => d.record_keyed(org_id, key_opt(api_key_id), cost_usd, now),
             SpendSink::Global(g) => g.record(org_id, cost_usd, now),
             SpendSink::None => {}
         }
     }
 
-    /// Settle one served request for `org_id` (P0-1/P0-3): advance the served
-    /// counter always, and the billed monthly counter only when `!cached`.
-    /// Called once per request after cache resolution, into the same enforcer
-    /// the pre-flight `check` read. No-op for the nil org or `None` sink.
-    ///
-    /// The counter advance does not depend on the org's limit values, so the
-    /// dynamic path passes a default `BudgetLimits` for signature symmetry.
-    pub fn settle(&self, org_id: Uuid, cached: bool, now: DateTime<Utc>) {
+    /// Settle one served request for `(org_id, api_key_id)` (P0-1/P0-3 + P2):
+    /// advance the served counter always, and the billed monthly counter only
+    /// when `!cached`, on both the org accumulator and (dynamic path) the
+    /// per-key accumulator. Called once per request after cache resolution, into
+    /// the same enforcer the pre-flight `check` read. No-op for the nil org or
+    /// `None` sink.
+    pub fn settle(&self, org_id: Uuid, api_key_id: Uuid, cached: bool, now: DateTime<Utc>) {
         if org_id == Uuid::nil() {
             return;
         }
         match self {
-            SpendSink::Dynamic(d) => {
-                d.settle_with_limits(org_id, &BudgetLimits::default(), cached, now)
-            }
+            SpendSink::Dynamic(d) => d.settle_keyed(org_id, key_opt(api_key_id), cached, now),
             SpendSink::Global(g) => g.settle(org_id, cached, now),
             SpendSink::None => {}
         }
     }
+}
+
+/// Treat a nil `api_key_id` (dogfood/anonymous stamp) as "no per-key dimension"
+/// so the per-key accumulator is never keyed on the nil uuid.
+fn key_opt(api_key_id: Uuid) -> Option<Uuid> {
+    (api_key_id != Uuid::nil()).then_some(api_key_id)
 }
 
 /// Budget enforcer where each org's [`BudgetLimits`] are resolved at check
@@ -425,7 +506,16 @@ impl SpendSink {
 /// [`DynamicBudgetEnforcer::check_with_limits`] — the caller resolves them
 /// (async) from the tier resolver, then passes the result in.
 pub struct DynamicBudgetEnforcer {
+    /// Per-ORG accumulators (spend + billed/served counts + rate window). The
+    /// org cap is enforced against these.
     state: Mutex<HashMap<Uuid, OrgState>>,
+    /// Per-`(org_id, api_key_id)` accumulators for the per-KEY spend/request
+    /// caps (P2). Scoped to the individual key so one key's spend never trips a
+    /// sibling key's cap under the same org. Only the spend + billed-request
+    /// dimensions are read here (the per-key cap surface is USD + billed
+    /// requests, mirroring `api_key_budget_caps`); the rate window + served
+    /// ceiling remain org-scoped.
+    key_state: Mutex<HashMap<(Uuid, Uuid), OrgState>>,
 }
 
 impl DynamicBudgetEnforcer {
@@ -434,17 +524,74 @@ impl DynamicBudgetEnforcer {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(HashMap::new()),
+            key_state: Mutex::new(HashMap::new()),
         }
     }
 
     /// Pre-flight check: may `org_id` make a request at `now` given `limits`?
     /// Mutates internal state (rate window, request count).
+    ///
+    /// Org-only convenience wrapper — equivalent to
+    /// [`check_with_limits_keyed`](Self::check_with_limits_keyed) with no
+    /// `api_key_id`/per-key cap. The per-key dimension is not consulted.
     pub fn check_with_limits(
         &self,
         org_id: Uuid,
         limits: &BudgetLimits,
         now: DateTime<Utc>,
     ) -> BudgetDecision {
+        self.check_with_limits_keyed(org_id, None, limits, &KeyBudgetCap::default(), now)
+    }
+
+    /// Pre-flight check with a per-KEY spend cap (P2). Enforces the org cap
+    /// against the per-org accumulator exactly as before, AND — when
+    /// `api_key_id` is `Some` and `key_cap` is non-empty — enforces the per-key
+    /// cap against a separate per-`(org, api_key)` accumulator.
+    ///
+    /// Precedence is "tighter-of" ([`compose_key_cap`]): the org cap and the
+    /// per-key cap are two independent ceilings. A request is denied if EITHER
+    /// trips. The per-key gate is evaluated first, but because the looser cap
+    /// simply will not have been reached, the *tighter* ceiling is the one that
+    /// surfaces — a key-scoped reason
+    /// ([`BudgetDecision::DenyKeySpend`] / [`BudgetDecision::DenyKeyRequests`])
+    /// when the key cap is tighter, the org reason ([`BudgetDecision::DenySpend`]
+    /// / [`BudgetDecision::DenyMonthlyRequests`]) when the org cap is tighter.
+    /// The rate window is advanced on the org accumulator only (rate limiting
+    /// stays org-scoped).
+    pub fn check_with_limits_keyed(
+        &self,
+        org_id: Uuid,
+        api_key_id: Option<Uuid>,
+        limits: &BudgetLimits,
+        key_cap: &KeyBudgetCap,
+        now: DateTime<Utc>,
+    ) -> BudgetDecision {
+        // ── Per-key gates (read-only). Evaluated before the org gates; the
+        //    looser cap won't have been reached, so the tighter ceiling is what
+        //    surfaces (with its scoped reason). Conservative: only consulted
+        //    when a key id is present AND a per-key cap is actually set —
+        //    otherwise the behaviour is identical to the org-only path.
+        if let Some(key_id) = api_key_id {
+            if !key_cap.is_empty() {
+                let mut kguard = self.key_state.lock().expect("dynamic key state poisoned");
+                let kst = kguard
+                    .entry((org_id, key_id))
+                    .or_insert_with(|| OrgState::fresh(now));
+                kst.roll_month(now);
+                if let Some(cap) = key_cap.monthly_cap_usd {
+                    if kst.spend_usd >= cap {
+                        return BudgetDecision::DenyKeySpend;
+                    }
+                }
+                if let Some(mcap) = key_cap.monthly_request_cap {
+                    if kst.month_request_count >= mcap {
+                        return BudgetDecision::DenyKeyRequests;
+                    }
+                }
+            }
+        }
+
+        // ── Org-wide gates (unchanged) ──────────────────────────────────────
         let mut guard = self.state.lock().expect("dynamic budget state poisoned");
         let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
         st.roll_month(now);
@@ -488,6 +635,10 @@ impl DynamicBudgetEnforcer {
     /// [`BudgetEnforcer::settle`] for the per-org dynamic path. `limits` is
     /// accepted for signature symmetry with `check_with_limits` (counter
     /// advance does not depend on the limit values).
+    ///
+    /// Org-only convenience wrapper — does NOT advance any per-key accumulator.
+    /// Use [`settle_keyed`](Self::settle_keyed) on the request path so the
+    /// per-key billed counter tracks the per-key cap.
     pub fn settle_with_limits(
         &self,
         org_id: Uuid,
@@ -495,18 +646,70 @@ impl DynamicBudgetEnforcer {
         cached: bool,
         now: DateTime<Utc>,
     ) {
-        let mut guard = self.state.lock().expect("dynamic budget state poisoned");
-        let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
-        st.roll_month(now);
-        st.settle(cached);
+        self.settle_keyed(org_id, None, cached, now);
     }
 
-    /// Record realized spend after the response completes.
+    /// Post-resolution settle that advances BOTH the org accumulator and (when
+    /// `api_key_id` is `Some`) the per-`(org, api_key)` accumulator with the
+    /// same billed/served semantics: served always, billed only when not a
+    /// cache hit. The per-key accumulator is updated unconditionally when a key
+    /// id is present (no cap value needed — the counter must be ready the
+    /// moment a cap is set).
+    pub fn settle_keyed(
+        &self,
+        org_id: Uuid,
+        api_key_id: Option<Uuid>,
+        cached: bool,
+        now: DateTime<Utc>,
+    ) {
+        {
+            let mut guard = self.state.lock().expect("dynamic budget state poisoned");
+            let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
+            st.roll_month(now);
+            st.settle(cached);
+        }
+        if let Some(key_id) = api_key_id {
+            let mut kguard = self.key_state.lock().expect("dynamic key state poisoned");
+            let kst = kguard
+                .entry((org_id, key_id))
+                .or_insert_with(|| OrgState::fresh(now));
+            kst.roll_month(now);
+            kst.settle(cached);
+        }
+    }
+
+    /// Record realized spend after the response completes (org accumulator).
+    /// Org-only convenience wrapper — does NOT advance any per-key spend.
     pub fn record(&self, org_id: Uuid, cost_usd: f64, now: DateTime<Utc>) {
-        let mut guard = self.state.lock().expect("dynamic budget state poisoned");
-        let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
-        st.roll_month(now);
-        st.spend_usd += cost_usd.max(0.0);
+        self.record_keyed(org_id, None, cost_usd, now);
+    }
+
+    /// Record realized spend into BOTH the org accumulator and (when
+    /// `api_key_id` is `Some`) the per-`(org, api_key)` accumulator, so the
+    /// per-key spend cap trips against this key's own realized spend. The
+    /// per-key accumulator is updated unconditionally when a key id is present.
+    pub fn record_keyed(
+        &self,
+        org_id: Uuid,
+        api_key_id: Option<Uuid>,
+        cost_usd: f64,
+        now: DateTime<Utc>,
+    ) {
+        let add = cost_usd.max(0.0);
+        {
+            let mut guard = self.state.lock().expect("dynamic budget state poisoned");
+            let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
+            st.roll_month(now);
+            st.spend_usd += add;
+        }
+        if let Some(key_id) = api_key_id {
+            let mut kguard = self.key_state.lock().expect("dynamic key state poisoned");
+            let kst = kguard
+                .entry((org_id, key_id))
+                .or_insert_with(|| OrgState::fresh(now));
+            kst.roll_month(now);
+            kst.spend_usd += add;
+        }
     }
 
     /// `(billed, served)` request counts for `org_id` this month: the values
@@ -518,6 +721,18 @@ impl DynamicBudgetEnforcer {
     pub fn monthly_counts(&self, org_id: Uuid) -> (u32, u32) {
         let guard = self.state.lock().expect("dynamic budget state poisoned");
         guard.get(&org_id).map_or((0, 0), |st| {
+            (st.month_request_count, st.served_request_count)
+        })
+    }
+
+    /// `(billed, served)` request counts for `(org_id, api_key_id)` this month
+    /// from the per-KEY accumulator — the values `settle_keyed`/`record_keyed`
+    /// advance for the key dimension. Introspection only (mirrors
+    /// [`Self::monthly_counts`]). `(0, 0)` when the key has no accumulator yet.
+    #[must_use]
+    pub fn key_monthly_counts(&self, org_id: Uuid, api_key_id: Uuid) -> (u32, u32) {
+        let guard = self.key_state.lock().expect("dynamic key state poisoned");
+        guard.get(&(org_id, api_key_id)).map_or((0, 0), |st| {
             (st.month_request_count, st.served_request_count)
         })
     }
@@ -903,7 +1118,7 @@ mod tests {
         );
 
         // Record spend that exceeds the cap.
-        sink.record(org, 1.5, now);
+        sink.record(org, Uuid::nil(), 1.5, now);
 
         // After recording: check on the same enforcer must deny.
         assert_eq!(
@@ -930,7 +1145,7 @@ mod tests {
         let real_org = Uuid::from_u128(99);
 
         // Record against nil — should be a no-op.
-        sink.record(Uuid::nil(), 5.0, now);
+        sink.record(Uuid::nil(), Uuid::nil(), 5.0, now);
 
         // A real org with no spend should still be allowed (nil spend not recorded).
         assert!(
@@ -1157,5 +1372,290 @@ mod tests {
             assert!(e.check(org, now).is_allowed());
             e.settle(org, true, now);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // P2: per-API-key spend/request cap enforcement (compose_key_cap +
+    // DynamicBudgetEnforcer::check_with_limits_keyed / record_keyed /
+    // settle_keyed). The per-key cap binds against a per-(org, key)
+    // accumulator, tighter-of-org-and-key (min), scoped to the key.
+    // -----------------------------------------------------------------------
+
+    fn key_cap(usd: Option<f64>, req: Option<u32>) -> KeyBudgetCap {
+        KeyBudgetCap {
+            monthly_cap_usd: usd,
+            monthly_request_cap: req,
+        }
+    }
+
+    // ── compose_key_cap: tighter-of (mirror of cloud compose_caps) ──────────
+
+    #[test]
+    fn compose_key_cap_tightens_an_org_cap() {
+        // Org allows $100; the key is capped at $25 → effective $25.
+        let c = compose_key_cap(key_cap(Some(100.0), None), key_cap(Some(25.0), None));
+        assert_eq!(c.monthly_cap_usd, Some(25.0));
+    }
+
+    #[test]
+    fn compose_key_cap_never_loosens_an_org_cap() {
+        // A *larger* per-key value must NOT raise the org's $25 ceiling.
+        let c = compose_key_cap(key_cap(Some(25.0), None), key_cap(Some(100.0), None));
+        assert_eq!(
+            c.monthly_cap_usd,
+            Some(25.0),
+            "the tighter org cap must win — no double-spend"
+        );
+    }
+
+    #[test]
+    fn compose_key_cap_binds_where_org_has_none() {
+        // Paid org has no spend cap; a per-key cap sets the hard stop.
+        let c = compose_key_cap(key_cap(None, None), key_cap(Some(40.0), None));
+        assert_eq!(c.monthly_cap_usd, Some(40.0));
+        // Request caps compose the same way.
+        let cr = compose_key_cap(key_cap(None, None), key_cap(None, Some(500)));
+        assert_eq!(cr.monthly_request_cap, Some(500));
+    }
+
+    #[test]
+    fn compose_key_cap_no_caps_is_uncapped() {
+        let c = compose_key_cap(KeyBudgetCap::default(), KeyBudgetCap::default());
+        assert_eq!(c.monthly_cap_usd, None);
+        assert_eq!(c.monthly_request_cap, None);
+        assert!(KeyBudgetCap::default().is_empty());
+    }
+
+    #[test]
+    fn compose_key_cap_request_caps_only_tighten() {
+        assert_eq!(
+            compose_key_cap(key_cap(None, Some(10_000)), key_cap(None, Some(2_000)))
+                .monthly_request_cap,
+            Some(2_000)
+        );
+        assert_eq!(
+            compose_key_cap(key_cap(None, Some(2_000)), key_cap(None, Some(10_000)))
+                .monthly_request_cap,
+            Some(2_000),
+            "key request cap must not loosen the org request cap"
+        );
+    }
+
+    // ── check_with_limits_keyed: enforcement ────────────────────────────────
+
+    /// An org with no USD cap (paid-tier shape) — so the per-key cap is the
+    /// only spend ceiling under test.
+    fn uncapped_org() -> BudgetLimits {
+        BudgetLimits {
+            monthly_cap_usd: None,
+            max_requests_per_min: None,
+            monthly_request_cap: None,
+            monthly_served_cap: None,
+            l2_cache: false,
+        }
+    }
+
+    #[test]
+    fn per_key_spend_cap_tighter_than_org_denies_at_key_cap() {
+        // Org cap $100, key cap $10. Spend $12 on the key → key cap trips first
+        // even though the org still has $88 of headroom.
+        let e = DynamicBudgetEnforcer::new();
+        let org = Uuid::from_u128(1);
+        let key = Uuid::from_u128(7);
+        let limits = BudgetLimits {
+            monthly_cap_usd: Some(100.0),
+            ..uncapped_org()
+        };
+        let kcap = key_cap(Some(10.0), None);
+        let now = t(2026, 6, 1, 0, 0, 0);
+
+        assert!(e
+            .check_with_limits_keyed(org, Some(key), &limits, &kcap, now)
+            .is_allowed());
+        e.record_keyed(org, Some(key), 12.0, now);
+        assert_eq!(
+            e.check_with_limits_keyed(org, Some(key), &limits, &kcap, now),
+            BudgetDecision::DenyKeySpend,
+            "the tighter per-key cap must deny while the org still has headroom"
+        );
+    }
+
+    #[test]
+    fn per_key_spend_cap_looser_than_org_is_bounded_by_org() {
+        // Org cap $10, key cap $100 (looser). The ORG cap binds — a key cap
+        // never loosens the org ceiling.
+        let e = DynamicBudgetEnforcer::new();
+        let org = Uuid::from_u128(2);
+        let key = Uuid::from_u128(8);
+        let limits = BudgetLimits {
+            monthly_cap_usd: Some(10.0),
+            ..uncapped_org()
+        };
+        let kcap = key_cap(Some(100.0), None);
+        let now = t(2026, 6, 1, 0, 0, 0);
+
+        assert!(e
+            .check_with_limits_keyed(org, Some(key), &limits, &kcap, now)
+            .is_allowed());
+        // Spend $12 — over the $10 org cap but under the $100 key cap.
+        e.record_keyed(org, Some(key), 12.0, now);
+        assert_eq!(
+            e.check_with_limits_keyed(org, Some(key), &limits, &kcap, now),
+            BudgetDecision::DenySpend,
+            "the org cap is the tighter ceiling — org reason, not key reason"
+        );
+    }
+
+    #[test]
+    fn no_per_key_cap_is_org_cap_only_unchanged() {
+        // An empty key cap (or no key id) must behave exactly like the org-only
+        // path: only the org cap gates.
+        let e = DynamicBudgetEnforcer::new();
+        let org = Uuid::from_u128(3);
+        let key = Uuid::from_u128(9);
+        let limits = BudgetLimits {
+            monthly_cap_usd: Some(5.0),
+            ..uncapped_org()
+        };
+        let now = t(2026, 6, 1, 0, 0, 0);
+
+        // Empty per-key cap: allowed until org spend trips.
+        assert!(e
+            .check_with_limits_keyed(org, Some(key), &limits, &KeyBudgetCap::default(), now)
+            .is_allowed());
+        e.record_keyed(org, Some(key), 6.0, now);
+        assert_eq!(
+            e.check_with_limits_keyed(org, Some(key), &limits, &KeyBudgetCap::default(), now),
+            BudgetDecision::DenySpend,
+            "empty key cap → org cap only"
+        );
+        // And the plain org-only wrapper agrees.
+        assert_eq!(
+            e.check_with_limits(org, &limits, now),
+            BudgetDecision::DenySpend
+        );
+    }
+
+    #[test]
+    fn per_key_counter_is_scoped_to_the_key() {
+        // Two keys under the same org, each with a $10 key cap. Spending on key A
+        // must NOT push key B over its cap. The org itself is uncapped.
+        let e = DynamicBudgetEnforcer::new();
+        let org = Uuid::from_u128(4);
+        let key_a = Uuid::from_u128(10);
+        let key_b = Uuid::from_u128(11);
+        let limits = uncapped_org();
+        let kcap = key_cap(Some(10.0), None);
+        let now = t(2026, 6, 1, 0, 0, 0);
+
+        // Drive key A over its cap.
+        e.record_keyed(org, Some(key_a), 12.0, now);
+        assert_eq!(
+            e.check_with_limits_keyed(org, Some(key_a), &limits, &kcap, now),
+            BudgetDecision::DenyKeySpend,
+            "key A is over its own cap"
+        );
+        // Key B, same org, untouched → still allowed.
+        assert!(
+            e.check_with_limits_keyed(org, Some(key_b), &limits, &kcap, now)
+                .is_allowed(),
+            "key B must be unaffected by key A's spend"
+        );
+    }
+
+    #[test]
+    fn per_key_request_cap_denies_after_billed_limit() {
+        // Per-key billed-request cap of 3, no org request cap. Cache hits do not
+        // advance the per-key billed counter (mirrors the org billed semantics).
+        let e = DynamicBudgetEnforcer::new();
+        let org = Uuid::from_u128(5);
+        let key = Uuid::from_u128(12);
+        let limits = uncapped_org();
+        let kcap = key_cap(None, Some(3));
+        let now = t(2026, 6, 1, 0, 0, 0);
+
+        for _ in 0..3 {
+            assert!(e
+                .check_with_limits_keyed(org, Some(key), &limits, &kcap, now)
+                .is_allowed());
+            e.settle_keyed(org, Some(key), false, now);
+        }
+        assert_eq!(
+            e.check_with_limits_keyed(org, Some(key), &limits, &kcap, now),
+            BudgetDecision::DenyKeyRequests,
+            "per-key billed cap must deny after the limit"
+        );
+
+        // A fresh key with a cache-hit-only history never advances the billed
+        // counter → never trips DenyKeyRequests.
+        let key2 = Uuid::from_u128(13);
+        for _ in 0..10 {
+            assert!(e
+                .check_with_limits_keyed(org, Some(key2), &limits, &kcap, now)
+                .is_allowed());
+            e.settle_keyed(org, Some(key2), true, now); // cache hits
+        }
+        let (billed, served) = e.key_monthly_counts(org, key2);
+        assert_eq!(
+            billed, 0,
+            "cache hits must not advance per-key billed count"
+        );
+        assert_eq!(served, 10, "served counter still advances per key");
+    }
+
+    #[test]
+    fn per_key_cap_resets_next_month() {
+        let e = DynamicBudgetEnforcer::new();
+        let org = Uuid::from_u128(6);
+        let key = Uuid::from_u128(14);
+        let limits = uncapped_org();
+        let kcap = key_cap(Some(10.0), None);
+        let may = t(2026, 5, 31, 23, 0, 0);
+        e.record_keyed(org, Some(key), 12.0, may);
+        assert_eq!(
+            e.check_with_limits_keyed(org, Some(key), &limits, &kcap, may),
+            BudgetDecision::DenyKeySpend
+        );
+        // June → the per-key accumulator resets, allowed again.
+        let june = t(2026, 6, 1, 0, 0, 0);
+        assert!(e
+            .check_with_limits_keyed(org, Some(key), &limits, &kcap, june)
+            .is_allowed());
+    }
+
+    #[test]
+    fn spend_sink_threads_key_id_into_per_key_accumulator() {
+        // SpendSink::record/settle must forward api_key_id so the per-key
+        // accumulator advances; a nil api_key_id records org-only.
+        let enforcer = std::sync::Arc::new(DynamicBudgetEnforcer::new());
+        let sink = SpendSink::Dynamic(enforcer.clone());
+        let org = Uuid::from_u128(20);
+        let key = Uuid::from_u128(21);
+        let limits = uncapped_org();
+        let kcap = key_cap(Some(10.0), None);
+        let now = t(2026, 6, 1, 0, 0, 0);
+
+        sink.record(org, key, 12.0, now);
+        assert_eq!(
+            enforcer.check_with_limits_keyed(org, Some(key), &limits, &kcap, now),
+            BudgetDecision::DenyKeySpend,
+            "SpendSink::record must populate the per-key accumulator"
+        );
+        // settle threads through too.
+        sink.settle(org, key, false, now);
+        let (billed, _served) = enforcer.key_monthly_counts(org, key);
+        assert_eq!(
+            billed, 1,
+            "SpendSink::settle must advance the per-key billed count"
+        );
+
+        // A nil key id records org-only — no per-key accumulator created.
+        let org2 = Uuid::from_u128(22);
+        sink.record(org2, Uuid::nil(), 5.0, now);
+        assert_eq!(
+            enforcer.key_monthly_counts(org2, Uuid::nil()),
+            (0, 0),
+            "nil api_key_id must not create a per-key accumulator"
+        );
     }
 }

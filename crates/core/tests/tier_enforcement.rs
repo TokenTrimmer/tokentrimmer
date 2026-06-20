@@ -8,6 +8,8 @@
 //! (d) A second request within TTL does not re-query the inner resolver
 //!     (cache counter stays at 1).
 //! (e) ApiKeyContext.tier is set to Free by the middleware.
+//! (f) A per-API-key spend cap denies through the full router with 429
+//!     `key_budget_exceeded` while the org itself is uncapped (P2).
 
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -196,6 +198,17 @@ async fn issue_key_for(store: &InMemoryKeyStore, org_id: Uuid) -> String {
         .await
         .expect("issue key")
         .plaintext
+}
+
+/// Issue a key and return `(plaintext, key_id)` — the `key_id` is the
+/// `api_key_id` the auth middleware stamps onto `ApiKeyContext` and the gateway
+/// keys the per-key accumulator on (P2).
+async fn issue_key_full(store: &InMemoryKeyStore, org_id: Uuid) -> (String, Uuid) {
+    let audit = InMemoryAuditWriter::new();
+    let issued = issue(store, &audit, org_id, "k", Environment::Live, Actor::System)
+        .await
+        .expect("issue key");
+    (issued.plaintext, issued.record.id)
 }
 
 fn chat_request(bearer: &str) -> Request<Body> {
@@ -390,7 +403,7 @@ async fn tier_cache_serves_second_request_without_re_querying() {
 /// Steps:
 ///   1. Build an AppState with a FixedTierResolver returning `monthly_cap_usd:
 ///      Some(1.0)` (only the USD cap is in play; rpm/request caps are None).
-///   2. Record >$1 of spend via `state.spend_sink().record(org, 2.0, now)`.
+///   2. Record >$1 of spend via `state.spend_sink().record(org, key, 2.0, now)`.
 ///   3. Drive an HTTP request for that org through the router.
 ///   4. Assert 429 `budget_exceeded`.
 #[tokio::test]
@@ -435,7 +448,7 @@ async fn spend_sink_and_auth_share_same_enforcer_seam() {
         matches!(state.spend_sink(), SpendSink::Dynamic(_)),
         "expected SpendSink::Dynamic when tier_resolver is wired"
     );
-    state.spend_sink().record(org, 2.0, now);
+    state.spend_sink().record(org, Uuid::nil(), 2.0, now);
 
     // Build the router AFTER recording spend so the router's clone of state
     // shares the same Arc<DynamicBudgetEnforcer>.
@@ -454,5 +467,75 @@ async fn spend_sink_and_auth_share_same_enforcer_seam() {
     assert_eq!(
         body["error"]["type"], "budget_exceeded",
         "should be budget_exceeded (spend cap), got: {body}"
+    );
+}
+
+/// P2 end-to-end: a per-API-key spend cap denies a request through the FULL
+/// router (auth middleware → `resolve_key_cap` → `check_with_limits_keyed`),
+/// returning 429 `key_budget_exceeded`, while the ORG itself has no spend cap.
+/// Proves the gateway actually reads + enforces `api_key_budget_caps` — the bug
+/// this fixes (the cap was a silent no-op).
+#[tokio::test]
+async fn per_key_spend_cap_denies_through_router() {
+    use tt_core::budget::{BudgetLimits, KeyBudgetCap};
+    use tt_core::tier_resolver::ResolvedTier;
+    use tt_shared::CallerTier;
+
+    let store = InMemoryKeyStore::new();
+    let org = Uuid::now_v7();
+    let (key, key_id) = issue_key_full(&store, org).await;
+
+    // Resolver: NO org USD cap (paid tier), and a $1/month PER-KEY cap for any
+    // key under this org. Only the per-key cap can fire.
+    struct KeyCapResolver;
+    #[async_trait]
+    impl TierResolver for KeyCapResolver {
+        async fn resolve(&self, _org_id: Uuid) -> Result<ResolvedTier, TierResolverError> {
+            Ok(ResolvedTier {
+                caller_tier: CallerTier::Pro,
+                limits: BudgetLimits {
+                    monthly_cap_usd: None, // org uncapped — only the key cap binds
+                    max_requests_per_min: None,
+                    monthly_request_cap: None,
+                    monthly_served_cap: None,
+                    l2_cache: true,
+                },
+            })
+        }
+        async fn resolve_key_cap(&self, _org_id: Uuid, _api_key_id: Uuid) -> KeyBudgetCap {
+            KeyBudgetCap {
+                monthly_cap_usd: Some(1.0),
+                monthly_request_cap: None,
+            }
+        }
+    }
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(EchoProvider));
+    let state = AppState::new(registry)
+        .with_tier_resolver(Arc::new(KeyCapResolver) as Arc<dyn TierResolver>)
+        .with_key_store(Arc::new(store));
+
+    // Record $2 of per-key spend against THIS key's id (the same id the auth
+    // middleware stamps onto `ApiKeyContext.key_id` for the verified key), so
+    // the $1 per-key cap is already over when the request arrives. The record
+    // lands on the same `dynamic_budget` Arc the router clone shares.
+    let now = chrono::Utc::now();
+    state.spend_sink().record(org, key_id, 2.0, now);
+
+    let app = build_router(state);
+    let resp = app.oneshot(chat_request(&key)).await.expect("response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "key over its per-key spend cap must get 429"
+    );
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 8192)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json");
+    assert_eq!(
+        body["error"]["type"], "key_budget_exceeded",
+        "should be key_budget_exceeded (per-key spend cap), got: {body}"
     );
 }
