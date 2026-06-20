@@ -1382,6 +1382,16 @@ pub(crate) async fn complete_once(
         drop(single_flight_guard.take());
     }
 
+    // P0-1/P0-3 budget accounting (B3): a fully-failed dispatch (provider 5xx /
+    // timeout / failover-exhausted) returns HERE via `?`, BEFORE the
+    // `spend_sink().settle(...)` and the `cached: false` `request_logs` row
+    // below. This is deliberate: a failed request writes NO billable
+    // `request_logs` row (the row is spawned only on the 200 success path), so
+    // settle-on-success-only keeps the gateway counters CONSISTENT with the
+    // cloud overage meter (which counts `request_logs WHERE NOT cached`). A
+    // failed request therefore advances neither the billed nor the served
+    // counter — the per-minute rate window (counted pre-flight in `check`)
+    // backstops abuse via repeated failing requests.
     let (provider, response) = dispatch_result?;
     let mut response = response;
 
@@ -1619,6 +1629,11 @@ pub(crate) async fn complete_once(
     // Record realized spend into the same enforcer the pre-flight check uses
     // (dynamic_budget on the tier-aware path) so the monthly_cap_usd hard stop trips.
     state.spend_sink().record(ctx.org_id, cost_usd, Utc::now());
+    // P0-1/P0-3: settle the served request. This is the dispatched (non-cached)
+    // tail — the request hit the provider — so it advances BOTH the billed
+    // monthly counter and the served counter. Cache hits settle with
+    // `cached=true` at the `complete_once` consumer (they never reach here).
+    state.spend_sink().settle(ctx.org_id, false, Utc::now());
 
     let provider_id = provider.id().to_string();
     let model_used = response.model.clone();
@@ -2142,7 +2157,14 @@ pub async fn handler(
     match complete_once(&state, &ctx, prep).await? {
         // Cache hit (L1 / L2 / negative cache / single-flight follower): the
         // fully-built client response is returned verbatim.
-        CompletionOutcome::CacheHit(resp) => Ok(resp),
+        CompletionOutcome::CacheHit(resp) => {
+            // P0-1/P0-3: settle the served request as a cache hit. Advances the
+            // served counter (COGS guard) but NOT the billed monthly counter —
+            // cache hits do not consume an included request. The dispatched arm
+            // already settled `cached=false` inside `complete_once`.
+            state.spend_sink().settle(ctx.org_id, true, Utc::now());
+            Ok(resp)
+        }
         // Dispatched completion: build the HTTP response from the typed body +
         // the cost/route/cache/warning metadata, via the same
         // `attach_cost_headers` / `attach_warnings` the tail used inline.
@@ -3188,6 +3210,18 @@ async fn handle_streaming(
                             sse::stream_response(fake, &provider, trace_id, None),
                             route_matched_name.as_deref(),
                         );
+                        // P0-1/P0-3: settle the served request as a cache hit.
+                        // This fake-stream path passes `None` log_ctx to
+                        // `stream_response`, which takes the simple-passthrough
+                        // branch with no DropGuard — so the streamed-dispatch
+                        // settle at `sse.rs` NEVER runs here. Settle inline (as
+                        // the non-streaming CacheHit arm does) so the served
+                        // counter advances (the COGS guard) while the billed
+                        // monthly counter does NOT — a streaming cache hit does
+                        // not consume an included request. Without this, a free
+                        // tenant using `stream:true` could serve unbounded cache
+                        // hits and never trip the served ceiling.
+                        state.spend_sink().settle(ctx.org_id, true, Utc::now());
                         // Pre-dispatch tokens (route_paused / redacted /
                         // shaping skips) must survive on hit responses too.
                         attach_warning_tokens(resp.headers_mut(), &warnings);

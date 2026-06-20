@@ -836,6 +836,19 @@ impl TurnCompleter for GatewayCompleter<'_> {
         )
         .await?;
 
+        // P0-1/P0-3 budget accounting (B2): each agent-loop turn is its OWN
+        // billed request. `complete_once` writes one `request_logs` row per
+        // provider call (`cached: false`, status 200) AND settles `cached=false`
+        // into the spend sink inline — so per-turn settle is CONSISTENT with
+        // per-row billing (one row + one billed/served advance per turn). Cache
+        // is disabled per turn (`disable_cache` → `do_lookup=false`), so every
+        // turn dispatches and the `CacheHit` arm below is an invariant
+        // violation, never a free turn.
+        //
+        // The auth pre-flight `check()` runs ONCE per run (at the `/v1/agent/runs`
+        // boundary), not per turn, so the free monthly cap is best-effort across
+        // a multi-turn run and may overshoot WITHIN one run; it is re-enforced on
+        // the next request once the per-turn settles have advanced the counter.
         match chat::complete_once(self.state, &ctx, prep).await? {
             CompletionOutcome::Dispatched { response, headers } => {
                 let usage = RunUsage {

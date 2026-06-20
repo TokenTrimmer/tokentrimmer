@@ -282,6 +282,10 @@ pub async fn handler(
     state
         .spend_sink()
         .record(org_id, breakdown.cost_usd, Utc::now());
+    // P0-1/P0-3: settle the served request. Embeddings always dispatch to the
+    // provider (no cache-hit short-circuit), so this is a non-cached settle —
+    // advances both the billed and served counters.
+    state.spend_sink().settle(org_id, false, Utc::now());
 
     // OTel GenAI semconv + TokenTrimmer cost span attributes, mirroring the
     // chat path so embeddings traffic shows up in the same spend/savings/tokens

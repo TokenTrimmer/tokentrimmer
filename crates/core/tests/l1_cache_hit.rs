@@ -586,3 +586,190 @@ async fn provider_cache_discount_excluded_from_tt_saved() {
          got {provider_cache_saved}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M1: route-level settle-count tests (P0-1 / P0-3).
+//
+// The enforcer unit tests in `budget.rs` only exercise `check`/`settle`
+// directly — nothing drove a real request through the chat handler to assert
+// `settle` fires with the right `cached` flag. That gap is exactly why the
+// streaming L1 cache-hit settle (B1) went missing: the fake-stream path passes
+// `None` log_ctx to `sse::stream_response`, taking the no-DropGuard branch, so
+// the streamed-dispatch settle never ran for a streaming cache hit.
+//
+// These tests drive a real request through the chat handler and assert the
+// (billed, served) counts the handler advanced via `settle`, using the public
+// `InMemoryBudgetEnforcer::monthly_counts` accessor.
+//
+// To get a non-nil `ctx.org_id` (the spend sink no-ops on the nil org) WITHOUT
+// paying argon2's deliberately-expensive key verification on every request
+// (which is glacial in debug builds), the harness uses the dogfood loopback
+// stamp: `with_dogfood_enabled()` makes the auth middleware stamp an anonymous
+// (no-bearer) request with the fixed `DOGFOOD_ORG_ID` and run the pre-flight
+// budget `check` against the wired `budget` enforcer — no key store, no argon2.
+// `with_budget(InMemoryBudgetEnforcer)` makes `spend_sink()` resolve to that
+// SAME enforcer (Global), so `settle` lands where `monthly_counts` reads.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An anonymous (no-bearer) chat request. With dogfood loopback enabled the auth
+/// middleware stamps it with `DOGFOOD_ORG_ID` — no key store / argon2 verify.
+fn dogfood_chat_request(stream: bool) -> Request<Body> {
+    let body = json!({
+        "model": "counting-1",
+        "messages": [{ "role": "user", "content": "hello there" }],
+        "stream": stream,
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Build a dogfood-loopback router over a `CountingProvider` + L1 with an
+/// injected [`tt_core::InMemoryBudgetEnforcer`] (Free-tier caps, far above what
+/// these single-request tests reach). Returns the app, the dogfood org id, the
+/// enforcer (for `monthly_counts`), and the provider call counter.
+fn dogfood_app_with_l1() -> (
+    axum::Router,
+    uuid::Uuid,
+    Arc<tt_core::InMemoryBudgetEnforcer>,
+    Arc<AtomicUsize>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let enforcer = Arc::new(tt_core::InMemoryBudgetEnforcer::new(
+        tt_core::budget::BudgetLimits::free_tier(),
+    ));
+    let l1 = Arc::new(InMemoryL1Cache::new());
+    let state = AppState::new(registry)
+        .with_l1(l1, None)
+        .with_dogfood_enabled()
+        .with_budget(enforcer.clone() as Arc<dyn tt_core::budget::BudgetEnforcer>);
+    let app = build_router(state);
+    (app, tt_core::DOGFOOD_ORG_ID, enforcer, calls)
+}
+
+/// B1 regression: a STREAMING L1 cache hit must advance `served_request_count`
+/// (the COGS guard) but NOT the billed `month_request_count` — and the body must
+/// be drained so any settle has run. Before the fix the fake-stream path never
+/// settled, so a free `stream:true` tenant served unbounded cache hits.
+#[tokio::test]
+async fn streaming_l1_hit_advances_served_not_billed() {
+    let (app, org, enforcer, calls) = dogfood_app_with_l1();
+
+    // Prime the cache with a non-streaming request (1 dispatch → billed+served).
+    let r1 = app
+        .clone()
+        .oneshot(dogfood_chat_request(false))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    // Drain the non-streaming body and let the spawned L1 insert land.
+    let _ = to_bytes(r1.into_body(), 16 * 1024).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "prime dispatched once");
+    let (billed_after_prime, served_after_prime) = enforcer.monthly_counts(org);
+    assert_eq!(
+        (billed_after_prime, served_after_prime),
+        (1, 1),
+        "the priming non-streaming dispatch advances both counters"
+    );
+
+    // Same prompt with stream:true — must fake-stream from L1, NOT dispatch.
+    let r2 = app.oneshot(dogfood_chat_request(true)).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    // Fully drain the SSE body so any DropGuard / inline settle has executed.
+    let bytes = to_bytes(r2.into_body(), 16 * 1024).await.unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    assert!(body.contains("[DONE]"), "fake-stream should emit [DONE]");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "streaming L1 hit must NOT dispatch to the provider"
+    );
+
+    let (billed, served) = enforcer.monthly_counts(org);
+    assert_eq!(
+        billed, 1,
+        "a streaming CACHE HIT must NOT advance the billed counter (stayed at the prime's 1)"
+    );
+    assert_eq!(
+        served, 2,
+        "a streaming cache hit MUST advance the served counter (COGS guard): prime + hit"
+    );
+}
+
+/// A STREAMING provider dispatch (no cache entry) must advance BOTH counters.
+/// The settle fires from the SSE DropGuard, so the body must be drained.
+#[tokio::test]
+async fn streaming_dispatch_advances_both() {
+    let (app, org, enforcer, calls) = dogfood_app_with_l1();
+
+    // Brand-new prompt, stream:true, empty L1 → live dispatch.
+    let r = app.oneshot(dogfood_chat_request(true)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let ct = r.headers()["content-type"].to_str().unwrap();
+    assert!(ct.contains("text/event-stream"), "expected SSE, got {ct}");
+    // Drain to fire the DropGuard settle.
+    let bytes = to_bytes(r.into_body(), 16 * 1024).await.unwrap();
+    assert!(
+        std::str::from_utf8(&bytes).unwrap().contains("[DONE]"),
+        "streamed dispatch should terminate with [DONE]"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "must dispatch once");
+
+    let (billed, served) = enforcer.monthly_counts(org);
+    assert_eq!(
+        billed, 1,
+        "streaming dispatch must advance the billed counter"
+    );
+    assert_eq!(
+        served, 1,
+        "streaming dispatch must advance the served counter"
+    );
+}
+
+/// A NON-streaming L1 cache hit must advance `served` but NOT `billed` —
+/// mirrors the streaming case through the `CompletionOutcome::CacheHit` arm.
+#[tokio::test]
+async fn non_streaming_l1_hit_advances_served_not_billed() {
+    let (app, org, enforcer, calls) = dogfood_app_with_l1();
+
+    // First request: dispatch (billed+served = 1,1).
+    let r1 = app
+        .clone()
+        .oneshot(dogfood_chat_request(false))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let _ = to_bytes(r1.into_body(), 16 * 1024).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(enforcer.monthly_counts(org), (1, 1));
+
+    // Second identical request: L1 hit, no dispatch.
+    let r2 = app.oneshot(dogfood_chat_request(false)).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    assert_eq!(
+        r2.headers()
+            .get("x-tokentrimmer-cache")
+            .and_then(|v| v.to_str().ok()),
+        Some("hit-l1"),
+        "second request should hit L1"
+    );
+    let _ = to_bytes(r2.into_body(), 16 * 1024).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "non-streaming L1 hit must NOT dispatch"
+    );
+
+    let (billed, served) = enforcer.monthly_counts(org);
+    assert_eq!(billed, 1, "non-streaming cache hit must NOT advance billed");
+    assert_eq!(served, 2, "non-streaming cache hit MUST advance served");
+}
