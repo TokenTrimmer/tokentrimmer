@@ -11,9 +11,14 @@ description = "OpenAI provider adapter — chat completions, embeddings, streami
 tt-shared.workspace = true
 tt-provider-compat.workspace = true
 async-trait.workspace = true
-reqwest.workspace = true
+# `multipart` is enabled here (not in the workspace reqwest) because only the
+# Batch input-file upload needs it; the rest of the adapter uses JSON bodies.
+reqwest = { workspace = true, features = ["multipart"] }
 futures.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
