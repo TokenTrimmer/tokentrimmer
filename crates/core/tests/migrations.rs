@@ -201,6 +201,21 @@ fn migrator_includes_request_logs_retrieval_tokens_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_batch_jobs_migration() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let twenty_fourth = migrations
+        .iter()
+        .find(|m| m.version == 24)
+        .expect("migration version 24 not found");
+    let desc = twenty_fourth.description.to_lowercase();
+    assert!(
+        desc.contains("batch") || desc.contains("jobs"),
+        "migration 0024 description is '{}', expected to mention batch/jobs",
+        twenty_fourth.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]

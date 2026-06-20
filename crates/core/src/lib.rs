@@ -2,6 +2,7 @@
 //!
 //! See `docs/04-gateway-api-reference.md` for the public API contract.
 
+pub mod batch_store;
 pub mod budget;
 pub mod cache_volatility;
 pub mod db;
@@ -25,6 +26,9 @@ pub mod single_flight;
 pub mod state;
 pub mod tier_resolver;
 
+pub use batch_store::{
+    BatchJob, BatchStore, BatchStoreError, InMemoryBatchStore, PostgresBatchStore,
+};
 pub use budget::{
     tier_budget_limits, BudgetDecision, BudgetEnforcer, BudgetLimits, DynamicBudgetEnforcer,
     InMemoryBudgetEnforcer, SpendSink,

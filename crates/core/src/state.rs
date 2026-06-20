@@ -305,6 +305,12 @@ pub struct AppState {
     /// `NeverCommitGate` by default ⇒ summarize is a total no-op until an
     /// operator promotes classes via `TT_SUMMARIZE_TRUSTED_CLASSES`.
     pub summary_gate: Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
+    /// Optional durable store for the async Batch Lane (`batch_jobs`, slice 2).
+    /// The Batch endpoints (`/v1/batches`, `/v1/files`) persist + read submitted
+    /// batches through it, strictly org-scoped. `None` (default) makes the Batch
+    /// endpoints answer 503 (`batch processing is not configured`) — no other
+    /// path consults it, so leaving it unset never affects chat/embeddings.
+    pub batch_store: Option<Arc<dyn crate::batch_store::BatchStore>>,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -349,6 +355,7 @@ impl AppState {
             db_pool: None,
             telemetry_tracker: None,
             summary_gate: Arc::new(crate::passes::agentic_budget::summarize_judge::NeverCommitGate),
+            batch_store: None,
         }
     }
 
@@ -574,6 +581,15 @@ impl AppState {
     /// Builder-style attach: enable per-org upstream credential lookup.
     pub fn with_credential_store(mut self, store: Arc<dyn ProviderCredentialStore>) -> Self {
         self.credential_store = Some(store);
+        self
+    }
+
+    /// Builder-style attach: enable the durable Batch Lane store (`batch_jobs`).
+    /// Until set, the `/v1/batches` + `/v1/files` endpoints answer 503; wiring
+    /// this changes no chat/embeddings behavior.
+    #[must_use]
+    pub fn with_batch_store(mut self, store: Arc<dyn crate::batch_store::BatchStore>) -> Self {
+        self.batch_store = Some(store);
         self
     }
 

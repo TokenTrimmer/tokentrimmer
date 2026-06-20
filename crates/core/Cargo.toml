@@ -49,7 +49,9 @@ governor.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 
-axum.workspace = true
+# `multipart` enables `axum::extract::Multipart` for the Batch Lane file-upload
+# endpoint (`POST /v1/files`, routes/batches.rs).
+axum = { workspace = true, features = ["multipart"] }
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true
