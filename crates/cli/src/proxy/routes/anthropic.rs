@@ -1,6 +1,12 @@
-//! POST /v1/messages — accept Anthropic native, forward direct to the
-//! Anthropic upstream (bypass path) in every mode: the gateway exposes no
-//! /v1/messages ingress yet, so routing it there is a guaranteed 404.
+//! POST /v1/messages — accept Anthropic native, forward per mode.
+//!
+//! The hosted gateway now exposes an Anthropic-native `/v1/messages` ingress
+//! that multiplexes through the SAME routing/cache/failover pipeline as
+//! `/v1/chat/completions` (see `tt-core`'s `routes::messages` → `chat::handler`).
+//! So in Gateway and Hybrid mode we forward `/v1/messages` to the GATEWAY — just
+//! like the OpenAI-wire route — so Anthropic-wire clients (Claude Code, Cursor)
+//! actually get caching + routing + failover, not logging-only. Only Bypass mode
+//! (no gateway) forwards direct to the Anthropic upstream.
 
 use std::sync::Arc;
 
@@ -27,10 +33,18 @@ pub async fn post_messages(
     body: Bytes,
 ) -> Response {
     let upstream = upstream_url(&state.config, "/v1/messages");
-    // Anthropic traffic always takes the bypass path (see `upstream_url`),
-    // so the client's own credentials pass through untouched — never inject
-    // the TokenTrimmer key: it would leak to Anthropic and clobber OAuth.
-    //
+    // In Gateway mode the request goes to the gateway, so inject the
+    // TokenTrimmer key (same as the OpenAI-wire route). In Hybrid mode the
+    // request also goes to the gateway but the client's own credentials pass
+    // through untouched. In Bypass mode the request goes direct to Anthropic,
+    // where we must NEVER inject the TokenTrimmer key — it would leak to
+    // Anthropic and clobber the client's OAuth/API key.
+    let mut headers = headers;
+    if state.config.mode == Mode::Gateway {
+        if let Some(k) = &state.config.tt_api_key {
+            headers.insert("authorization", format!("Bearer {k}").parse().unwrap());
+        }
+    }
     // Best-effort cost preview. Bounded by PREVIEW_TIMEOUT_MS (500 ms) so we
     // never delay the user request by more than that even when the gateway
     // is slow. Failure → None → no header injection.
@@ -104,12 +118,15 @@ pub async fn post_messages(
     }
 }
 
-/// Anthropic wire endpoints always go direct to the Anthropic upstream
-/// (the bypass path), regardless of mode: the gateway exposes no
-/// /v1/messages ingress yet, so forwarding there would 404. Revisit once
-/// the gateway grows an Anthropic-native route.
+/// Pick the upstream for an Anthropic-wire path per mode. Gateway and Hybrid
+/// route through the gateway (which now has an Anthropic `/v1/messages` ingress
+/// that runs the full routing/cache/failover pipeline); only Bypass forwards
+/// direct to the Anthropic upstream.
 fn upstream_url(cfg: &Config, path: &str) -> String {
-    format!("{}{}", cfg.upstream_anthropic, path)
+    match cfg.mode {
+        Mode::Gateway | Mode::Hybrid => format!("{}{}", cfg.gateway_base_url, path),
+        Mode::Bypass => format!("{}{}", cfg.upstream_anthropic, path),
+    }
 }
 
 #[cfg(test)]
@@ -132,18 +149,115 @@ mod tests {
         }
     }
 
-    /// The gateway exposes no /v1/messages ingress, so Anthropic wire
-    /// traffic must take the bypass path in every mode — routing it to the
-    /// gateway in Gateway/Hybrid is a guaranteed 404.
+    /// The gateway now exposes an Anthropic-native /v1/messages ingress that
+    /// multiplexes through the same routing/cache/failover pipeline as
+    /// /v1/chat/completions. So Gateway and Hybrid mode must forward
+    /// /v1/messages to the GATEWAY (to get those features), exactly like the
+    /// OpenAI-wire route does — only Bypass (no gateway) goes direct to
+    /// Anthropic.
     #[test]
-    fn messages_route_to_anthropic_upstream_in_all_modes() {
-        for mode in [Mode::Gateway, Mode::Bypass, Mode::Hybrid] {
+    fn messages_route_to_gateway_in_gateway_and_hybrid_modes() {
+        for mode in [Mode::Gateway, Mode::Hybrid] {
             let cfg = cfg_with_mode(mode);
             assert_eq!(
                 upstream_url(&cfg, "/v1/messages"),
-                "http://anthropic.test/v1/messages",
-                "mode {mode:?} must bypass the gateway for /v1/messages"
+                "http://gateway.test/v1/messages",
+                "mode {mode:?} must route /v1/messages through the gateway"
             );
         }
+    }
+
+    /// Bypass mode has no gateway, so /v1/messages goes direct to Anthropic.
+    #[test]
+    fn messages_route_to_anthropic_upstream_in_bypass_mode() {
+        let cfg = cfg_with_mode(Mode::Bypass);
+        assert_eq!(
+            upstream_url(&cfg, "/v1/messages"),
+            "http://anthropic.test/v1/messages",
+            "bypass mode must forward /v1/messages direct to Anthropic"
+        );
+    }
+
+    /// End-to-end through the handler: in Gateway/Hybrid the POST must land at
+    /// the gateway base URL's /v1/messages (not api.anthropic.com), and in
+    /// Bypass it must land at the Anthropic upstream. Mirrors the httpmock
+    /// style of `forward.rs`.
+    #[tokio::test]
+    async fn handler_forwards_messages_to_gateway_then_anthropic_per_mode() {
+        use crate::proxy::session::SessionLog;
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use httpmock::prelude::*;
+        use std::sync::Arc;
+
+        let gateway = MockServer::start_async().await;
+        let anthropic = MockServer::start_async().await;
+
+        let gw_mock = gateway
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/messages");
+                then.status(200).body("gateway-resp");
+            })
+            .await;
+        let anthropic_mock = anthropic
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/messages");
+                then.status(200).body("anthropic-resp");
+            })
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("tt-proxy-test-{}", std::process::id()));
+        let log = Arc::new(SessionLog::new(&tmp).unwrap());
+
+        let make_state = |mode: Mode| AppState {
+            config: Arc::new(Config {
+                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                mode,
+                tt_api_key: Some("tt-secret".into()),
+                gateway_base_url: gateway.base_url(),
+                upstream_anthropic: anthropic.base_url(),
+                upstream_openai: "http://openai.unused".into(),
+                session_log_dir: tmp.clone(),
+                no_tui: true,
+                no_preview: true,
+            }),
+            http: reqwest::Client::new(),
+            log: log.clone(),
+        };
+
+        // Gateway + Hybrid → gateway ingress.
+        for mode in [Mode::Gateway, Mode::Hybrid] {
+            let resp = post_messages(
+                State(make_state(mode)),
+                HeaderMap::new(),
+                bytes::Bytes::from_static(b"{}"),
+            )
+            .await;
+            assert_eq!(resp.status(), 200, "mode {mode:?} status");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                &body[..],
+                b"gateway-resp",
+                "mode {mode:?} must hit the gateway, not Anthropic"
+            );
+        }
+
+        // Bypass → Anthropic upstream.
+        let resp = post_messages(
+            State(make_state(Mode::Bypass)),
+            HeaderMap::new(),
+            bytes::Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"anthropic-resp", "bypass must hit Anthropic");
+
+        gw_mock.assert_calls(2); // Gateway + Hybrid
+        anthropic_mock.assert_calls(1); // Bypass only
     }
 }

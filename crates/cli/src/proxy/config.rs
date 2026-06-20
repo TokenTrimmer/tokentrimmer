@@ -6,17 +6,17 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// OpenAI-wire endpoints (/v1/chat/completions, /v1/models) → hosted
-    /// TokenTrimmer Gateway with the TokenTrimmer key injected (full
-    /// features). Anthropic-wire endpoints (/v1/messages) → Anthropic
-    /// upstream directly: the gateway has no Anthropic ingress yet.
+    /// All endpoints → hosted TokenTrimmer Gateway with the TokenTrimmer key
+    /// injected (full features). The gateway exposes an Anthropic-native
+    /// `/v1/messages` ingress that multiplexes through the same routing/cache/
+    /// failover pipeline as `/v1/chat/completions`, so Anthropic-wire clients
+    /// (Claude Code, Cursor) get the same optimization as OpenAI-wire clients.
     Gateway,
     /// Forward to upstream provider directly (logging only).
     Bypass,
-    /// Same routing as Gateway — /v1/chat/completions and /v1/models →
-    /// gateway, /v1/messages → Anthropic upstream directly — but the
-    /// client's own credentials pass through (no TokenTrimmer key
-    /// injection).
+    /// Same routing as Gateway — all endpoints (/v1/chat/completions,
+    /// /v1/messages, /v1/models) → gateway — but the client's own credentials
+    /// pass through (no TokenTrimmer key injection).
     Hybrid,
 }
 

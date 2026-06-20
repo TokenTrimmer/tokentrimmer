@@ -1,10 +1,11 @@
 # tt proxy
 
-Local OpenAI/Anthropic-compatible listener that routes OpenAI-wire traffic
-through the hosted TokenTrimmer Gateway and writes per-session cost rollups.
-Note: Anthropic-wire requests (`/v1/messages`) forward directly to the
-Anthropic upstream in every mode, with your client's own credentials passed
-through — the Gateway has no Anthropic ingress yet.
+Local OpenAI/Anthropic-compatible listener that routes both OpenAI-wire and
+Anthropic-wire traffic through the hosted TokenTrimmer Gateway and writes
+per-session cost rollups. The Gateway exposes an Anthropic-native `/v1/messages`
+ingress that runs the same routing/cache/failover pipeline as
+`/v1/chat/completions`, so Anthropic-wire clients (Claude Code, Cursor) get the
+same optimization as OpenAI-wire clients in `gateway`/`hybrid` mode.
 
 > **`tt proxy` is not self-hosting.** It is a *local egress shim* — a listener on
 > port 31415 that forwards your app's OpenAI/Anthropic-wire traffic to a remote
@@ -23,11 +24,11 @@ export ANTHROPIC_BASE_URL=http://localhost:31415
 
 ## Modes
 
-- `gateway` (default) — OpenAI-wire endpoints forward to the hosted TT Gateway with your TokenTrimmer key injected. Requires `--tt-api-key` or `TT_API_KEY`.
-- `bypass` — forward directly to the upstream provider. Logging only, no features.
-- `hybrid` — OpenAI-wire endpoints to the gateway, but your client's own credentials pass through (no TokenTrimmer key injection).
+- `gateway` (default) — all endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/models`) forward to the hosted TT Gateway with your TokenTrimmer key injected. Requires `--tt-api-key` or `TT_API_KEY`.
+- `bypass` — forward directly to the upstream provider (OpenAI for OpenAI-wire, Anthropic for `/v1/messages`). Logging only, no features.
+- `hybrid` — all endpoints to the gateway, but your client's own credentials pass through (no TokenTrimmer key injection).
 
-In all three modes `/v1/messages` goes directly to the Anthropic upstream.
+In `gateway` and `hybrid` mode `/v1/messages` routes through the Gateway (getting routing/caching/failover); only `bypass` forwards it directly to the Anthropic upstream.
 
 ## Session log
 
