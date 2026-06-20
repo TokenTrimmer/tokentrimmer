@@ -2163,12 +2163,22 @@ pub async fn handler(
             // cache hits do not consume an included request. The dispatched arm
             // already settled `cached=false` inside `complete_once`.
             state.spend_sink().settle(ctx.org_id, true, Utc::now());
+            // P2: synchronous served-counter bump, in-band, once per served
+            // cache hit — the cheap sync truth to diff against the async-written
+            // `request_logs` row (the L1/L2-hit row is spawned fire-and-forget
+            // inside `complete_once`).
+            crate::metrics::record_request_served("chat", "cache_hit");
             Ok(resp)
         }
         // Dispatched completion: build the HTTP response from the typed body +
         // the cost/route/cache/warning metadata, via the same
         // `attach_cost_headers` / `attach_warnings` the tail used inline.
         CompletionOutcome::Dispatched { response, headers } => {
+            // P2: synchronous served-counter bump, in-band, once per served
+            // dispatched completion — the cheap sync truth to diff against the
+            // async-written `request_logs` row (spawned fire-and-forget inside
+            // `complete_once`). A divergence ⇒ lost billing writes.
+            crate::metrics::record_request_served("chat", "dispatch");
             let CompletionHeaders {
                 trace_id,
                 provider_id,
@@ -3420,6 +3430,10 @@ async fn handle_streaming(
         let log_ctx = if needs_tracking {
             Some(StreamLogContext {
                 writer: state.request_log_writer.as_ref().map(|w| w.clone()),
+                // Drain the detached streaming request_logs write on graceful
+                // shutdown (REL-3 / P2), so a rolling deploy / SIGTERM mid-stream
+                // doesn't abandon the committed billing row.
+                tracker: state.telemetry_tracker.clone(),
                 org_id: ctx.org_id,
                 api_key_id: ctx.api_key_id,
                 trace_id,
@@ -5113,9 +5127,22 @@ pub(crate) async fn resolve_credentials_for(
 /// this — telemetry rows are best-effort, and a slow DB write would
 /// dominate p50.
 ///
+/// Durability (P2): the spawned write goes through
+/// [`tt_telemetry::request_logs::write_with_retry`], which retries a TRANSIENT
+/// DB blip a bounded number of times (idempotent-safe — the row's `id` is the
+/// `request_logs` PK, so a retry cannot double-insert). On PERMANENT failure
+/// the loud, alertable `tt_request_log_write_failed_total` counter is bumped
+/// (alongside the existing `tracing` log) so lost billing rows surface instead
+/// of vanishing silently.
+///
 /// When `tracker` is `Some` (REL-3), the spawned future is tracked so a
 /// graceful shutdown can drain all in-flight writes via `close()` + `wait()`.
 /// When `None`, falls back to bare `tokio::spawn` (existing behavior).
+///
+/// NOTE: the synchronous `tt_requests_served_total` served-counter bump is the
+/// CALLER's responsibility — it must run IN-BAND (on the request thread),
+/// never inside this spawn, so it is the cheap sync truth to diff against the
+/// async row count.
 fn spawn_request_log(
     tracker: Option<&tokio_util::task::TaskTracker>,
     writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
@@ -5124,8 +5151,18 @@ fn spawn_request_log(
     let Some(writer) = writer else { return };
     let writer = writer.clone();
     let fut = async move {
-        if let Err(e) = writer.write(row).await {
-            tracing::warn!(error = %e, "request_logs write failed");
+        if let Err(e) = tt_telemetry::request_logs::write_with_retry(
+            writer.as_ref(),
+            row,
+            tt_telemetry::request_logs::DEFAULT_WRITE_ATTEMPTS,
+            tt_telemetry::request_logs::DEFAULT_WRITE_BACKOFF,
+        )
+        .await
+        {
+            // Permanent failure after the bounded retry: a billing row was
+            // served (counted) but never persisted. Loud + alertable.
+            tracing::error!(error = %e, "request_logs write failed permanently after retries");
+            crate::metrics::record_request_log_write_failed("chat");
         }
     };
     match tracker {
@@ -8875,6 +8912,115 @@ mod telemetry_drain_tests {
             writer.rows().len(),
             1,
             "bare spawn must still work when no tracker is passed"
+        );
+    }
+
+    // ── P2: retry + drain interaction ──────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tt_telemetry::request_logs::{RequestLogError, RequestLogWriter};
+
+    /// Test writer that takes a short async pause before recording each row
+    /// (simulating a slow DB), and can fail TRANSIENTLY for the first N writes
+    /// of a given row `id` before succeeding — to exercise the retry+drain path.
+    struct SlowFlakyWriter {
+        inner: Arc<InMemoryRequestLogWriter>,
+        /// Number of LEADING transient failures to emit before the first success.
+        transient_failures: AtomicUsize,
+        delay: std::time::Duration,
+    }
+
+    impl SlowFlakyWriter {
+        fn new(
+            inner: Arc<InMemoryRequestLogWriter>,
+            transient_failures: usize,
+            delay: std::time::Duration,
+        ) -> Self {
+            Self {
+                inner,
+                transient_failures: AtomicUsize::new(transient_failures),
+                delay,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RequestLogWriter for SlowFlakyWriter {
+        async fn write(&self, row: RequestLogRow) -> Result<(), RequestLogError> {
+            tokio::time::sleep(self.delay).await;
+            // Burn down the leading-transient-failure budget first.
+            loop {
+                let remaining = self.transient_failures.load(Ordering::SeqCst);
+                if remaining == 0 {
+                    break;
+                }
+                if self
+                    .transient_failures
+                    .compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Err(RequestLogError::Transient("flaky".into()));
+                }
+            }
+            self.inner.write(row).await
+        }
+    }
+
+    /// P2 drain: a SLOW tracked write is still in flight when shutdown begins;
+    /// the drain (`close()` + `wait()`) must NOT resolve until that enqueued
+    /// write has fully completed. Proven by asserting the row landed with no
+    /// post-drain sleep.
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_slow_write() {
+        let inner = Arc::new(InMemoryRequestLogWriter::new());
+        let slow: Arc<dyn RequestLogWriter> = Arc::new(SlowFlakyWriter::new(
+            inner.clone(),
+            0,
+            std::time::Duration::from_millis(150),
+        ));
+        let tracker = TaskTracker::new();
+
+        spawn_request_log(Some(&tracker), Some(&slow), sample_row());
+        // Begin shutdown immediately — the 150ms write is still running.
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
+            .await
+            .expect("drain must complete within the bound");
+
+        // NO post-drain sleep: if the drain didn't wait for the in-flight
+        // write, this row would be missing.
+        assert_eq!(
+            inner.rows().len(),
+            1,
+            "drain must not resolve until the in-flight write finished"
+        );
+    }
+
+    /// P2 retry + drain + idempotency: a write that fails transiently twice then
+    /// succeeds, routed through `spawn_request_log`, lands EXACTLY ONE row after
+    /// the drain — the retry happened, the drain waited for it, and the
+    /// same-`id` retries did not double-insert.
+    #[tokio::test]
+    async fn tracked_write_retries_then_lands_single_row_on_drain() {
+        let inner = Arc::new(InMemoryRequestLogWriter::new());
+        // 2 leading transient failures < DEFAULT_WRITE_ATTEMPTS (3) → succeeds.
+        let flaky: Arc<dyn RequestLogWriter> = Arc::new(SlowFlakyWriter::new(
+            inner.clone(),
+            2,
+            std::time::Duration::from_millis(1),
+        ));
+        let tracker = TaskTracker::new();
+
+        spawn_request_log(Some(&tracker), Some(&flaky), sample_row());
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tracker.wait())
+            .await
+            .expect("drain must complete within the bound");
+
+        assert_eq!(
+            inner.rows().len(),
+            1,
+            "transient-then-success must persist exactly one row (no double-insert)"
         );
     }
 }

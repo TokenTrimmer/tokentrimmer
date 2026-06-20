@@ -27,6 +27,9 @@ async-trait.workspace = true
 hex.workspace = true
 rand_core.workspace = true
 chacha20poly1305.workspace = true
+# `write_with_retry` backs off between transient-failure retries with
+# `tokio::time::sleep`; only the `time` feature is needed here.
+tokio = { workspace = true, features = ["time"] }
 
 # Optional — gated behind `postgres` so OSS distributions that don't run
 # the request-log writer stay sqlx-free.

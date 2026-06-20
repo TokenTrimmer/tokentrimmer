@@ -47,6 +47,39 @@ pub fn uptime_seconds() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Count one SERVED, billable response — incremented IN-BAND (synchronously, on
+/// the request thread) on every response the gateway returns to the caller:
+/// TokenTrimmer cache hits (L1/L2) AND dispatched completions, across the chat /
+/// SSE / embeddings paths.
+///
+/// This is the cheap synchronous truth to diff against the ASYNC-written
+/// `request_logs` count (the billing rows are spawned fire-and-forget). A
+/// divergence — `tt_requests_served_total` climbing faster than the row count —
+/// is the alertable signal that billing writes are being lost (transient DB
+/// failure, an undrained SIGTERM, etc.). It is NOT itself a billing record.
+///
+/// `path` ∈ `chat|sse|embeddings` (the served endpoint family); `result` ∈
+/// `cache_hit|dispatch` (whether TokenTrimmer served from cache or dispatched
+/// upstream). Both label sets are bounded, matching the discipline of the other
+/// counters in this module.
+pub fn record_request_served(path: &'static str, result: &'static str) {
+    metrics::counter!("tt_requests_served_total", "path" => path, "result" => result).increment(1);
+}
+
+/// Count one PERMANENT `request_logs` write failure — a billing row that was
+/// committed-as-served (`tt_requests_served_total`) but could NOT be persisted
+/// even after the bounded retry in
+/// [`tt_telemetry::request_logs::write_with_retry`]. This is silent
+/// under-billing on the revenue substrate, so the counter is loud and meant to
+/// be alerted on (it should sit at zero). A `tracing` error is emitted
+/// alongside at the call site.
+///
+/// `path` ∈ `chat|sse` (the paths that persist a row; embeddings writes none
+/// today). Bounded label.
+pub fn record_request_log_write_failed(path: &'static str) {
+    metrics::counter!("tt_request_log_write_failed_total", "path" => path).increment(1);
+}
+
 /// Record a provider-dispatch latency sample. DRY helper for the dispatch sites.
 pub fn record_provider_latency(provider: &'static str, operation: &'static str, dur: Duration) {
     metrics::histogram!(

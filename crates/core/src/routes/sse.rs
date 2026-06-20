@@ -384,6 +384,13 @@ pub struct StreamLogContext {
     /// environments without a DB), but cache insertion still fires if
     /// `cache_insert` is `Some`.
     pub writer: Option<Arc<dyn RequestLogWriter>>,
+    /// Optional [`TaskTracker`](tokio_util::task::TaskTracker) (REL-3 / P2). The
+    /// terminal `request_logs` write is detached on stream end; when this is
+    /// `Some` the spawned write is TRACKED so a graceful shutdown can drain it
+    /// (and its bounded retries) instead of dropping a committed billing row on
+    /// a rolling deploy / SIGTERM. `None` falls back to a bare `tokio::spawn`
+    /// (tests / dev without a tracker wired).
+    pub tracker: Option<tokio_util::task::TaskTracker>,
     pub org_id: Uuid,
     pub api_key_id: Uuid,
     pub trace_id: Uuid,
@@ -710,6 +717,7 @@ pub fn stream_response(
 
             // Capture everything the guard closure needs.
             let writer = ctx.writer.clone();
+            let tracker = ctx.tracker.clone();
             let org_id = ctx.org_id;
             let api_key_id = ctx.api_key_id;
             let provider_id_log = ctx.provider_id.clone();
@@ -894,12 +902,38 @@ pub fn stream_response(
                 }
 
                 if let Some(w) = writer {
+                    // Durability (P2): retry a TRANSIENT DB blip a bounded number
+                    // of times (idempotent-safe — `row.id` is the request_logs
+                    // PK, so a retry cannot double-insert), and on PERMANENT
+                    // failure bump the loud, alertable
+                    // `tt_request_log_write_failed_total{path="sse"}` counter.
+                    // Tracked through the TaskTracker when present so a graceful
+                    // shutdown drains this committed billing row.
                     let writer_clone = w.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = writer_clone.write(row).await {
-                            tracing::warn!(error = %e, "sse request_logs write failed");
+                    let fut = async move {
+                        if let Err(e) = tt_telemetry::request_logs::write_with_retry(
+                            writer_clone.as_ref(),
+                            row,
+                            tt_telemetry::request_logs::DEFAULT_WRITE_ATTEMPTS,
+                            tt_telemetry::request_logs::DEFAULT_WRITE_BACKOFF,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                error = %e,
+                                "sse request_logs write failed permanently after retries"
+                            );
+                            crate::metrics::record_request_log_write_failed("sse");
                         }
-                    });
+                    };
+                    match &tracker {
+                        Some(t) => {
+                            t.spawn(fut);
+                        }
+                        None => {
+                            tokio::spawn(fut);
+                        }
+                    }
                 }
 
                 // Best-effort cache insert on clean completion (§rv-l2-streaming-cache-write).
@@ -1013,6 +1047,14 @@ pub fn stream_response(
                 inner: event_stream,
                 _guard: guard,
             };
+
+            // Synchronous served-counter bump (P2): in-band, once per served
+            // streaming dispatch, BEFORE the response is handed back — the cheap
+            // sync truth to diff against the async-written streaming
+            // `request_logs` row. The cache-HIT streaming path is a separate
+            // fake-stream that logs its own `chat` row, so this path is always a
+            // dispatch.
+            crate::metrics::record_request_served("sse", "dispatch");
 
             Sse::new(guarded_stream)
                 .keep_alive(KeepAlive::default())
