@@ -67,6 +67,44 @@ console.log(`\ncost  $${stream.tt?.costUsd.toFixed(4)}`);
 console.log(`saved $${stream.tt?.savedUsd.toFixed(4)}`);
 ```
 
+### Agent loop
+
+For multi-step tool-using runs, `client.agent.run(...)` drives the Gateway's
+server-side agent loop (`POST /v1/agent/runs`). The Gateway owns the loop
+(down-routing, judge-gated summarize, substep cache); the SDK just executes any
+**client** tool the run pauses on (via your `executor`) and resumes — until a
+final answer. Aggregate cost spans every turn and is read from the run body
+(`outcome.usage.costUsd`), not response headers.
+
+```ts
+const outcome = await client.agent.run({
+  model: 'claude-sonnet-4-6',
+  messages: [{ role: 'user', content: "What's the weather in Paris?" }],
+  tools: [
+    {
+      type: 'function',
+      function: {
+        name: 'get_weather',
+        description: 'Current weather for a city',
+        parameters: { type: 'object', properties: { city: { type: 'string' } } },
+      },
+    },
+  ],
+  // `args` is the raw JSON string the model produced; return the tool result as a
+  // string (sync or async). Throwing is fine — the error is fed back to the model.
+  executor: async (name, args) => {
+    if (name === 'get_weather') return JSON.stringify({ temp_c: 21, sky: 'clear' });
+    return '{}';
+  },
+  maxTurns: 8,          // optional: server-side per-run turn cap
+  ttTag: 'feature=agent',
+});
+
+console.log(outcome.text);                          // final assistant answer
+console.log(`cost   $${outcome.usage.costUsd.toFixed(4)}`);
+console.log(`rounds ${outcome.resumeRounds}`);      // client-side tool_outputs resumes made
+```
+
 ## Self-hosted Gateway
 
 ```ts

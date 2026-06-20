@@ -38,6 +38,8 @@ from typing import Any, Iterator, Optional
 import httpx
 from openai import OpenAI
 
+from tokentrimmer.agent import Agent
+
 # Internals dependency: the streaming strip below imports `ServerSentEvent` and
 # swaps the stream's injectable `_decoder` (built via `client._make_sse_decoder()`).
 # These require openai>=1.70.0 (the tested floor pinned in pyproject.toml); on
@@ -218,6 +220,20 @@ class TokenTrimmer(OpenAI):
             api_key = os.environ.get("TOKENTRIMMER_API_KEY")
         super().__init__(api_key=api_key, base_url=base_url, **kwargs)
         self._wrap_chat_completions()
+        # Driver for the server-side agent loop (`POST /v1/agent/runs`). Reuses
+        # this client's base URL / key / httpx transport. See agent.py.
+        self._agent = Agent(self)
+
+    @property
+    def agent(self) -> Agent:
+        """Driver for the server-side agent loop (``client.agent.run(...)``).
+
+        See :class:`tokentrimmer.agent.Agent`. Mirrors the Rust ``tt-client``
+        agent driver: it creates an agent run and, whenever the run pauses on a
+        client (non-gateway) tool, executes it via the caller's ``executor`` and
+        resumes — until a terminal answer or the resume cap.
+        """
+        return self._agent
 
     def _wrap_chat_completions(self) -> None:
         completions = self.chat.completions
