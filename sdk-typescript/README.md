@@ -76,6 +76,11 @@ const client = new TokenTrimmer({
 });
 ```
 
+## Releasing
+
+Maintainers: publishing to npm is tag-triggered and documented in
+[`RELEASING.md`](RELEASING.md).
+
 ## License
 
 Apache 2.0.
