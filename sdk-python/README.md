@@ -65,6 +65,11 @@ client = TokenTrimmer(
 )
 ```
 
+## Releasing
+
+Maintainers: publishing to PyPI is tag-triggered and documented in
+[`RELEASING.md`](RELEASING.md).
+
 ## License
 
 Apache 2.0.
