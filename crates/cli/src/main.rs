@@ -1796,11 +1796,19 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         }
     }
 
-    // L2 volatility-class TTL — opt-in via TT_L2_VOLATILITY_TTL=1. Volatile
-    // queries (news/realtime/version-ish) get a shortened L2 TTL
-    // (shorten-only, floor-bounded; explicit per-request TTLs always win).
-    if std::env::var("TT_L2_VOLATILITY_TTL").as_deref() == Ok("1") {
-        if state.l2.is_some() {
+    // L2 volatility-class TTL — ON BY DEFAULT (P2). Volatile queries
+    // (news/realtime/version-ish) get a shortened L2 TTL (shorten-only,
+    // floor-bounded; explicit per-request TTLs always win). `with_l2` already
+    // seeds the default config, so the work here is: honor the optional
+    // multiplier/floor overrides, or disable entirely with
+    // TT_L2_VOLATILITY_TTL=0. Default-on is safe because the lane is
+    // shorten-only — a misclassification's worst case is an early re-dispatch
+    // (a cache miss), never a stale answer.
+    if state.l2.is_some() {
+        if std::env::var("TT_L2_VOLATILITY_TTL").as_deref() == Ok("0") {
+            state = state.without_l2_volatility_ttl();
+            tracing::info!("L2 volatility-class TTL disabled (TT_L2_VOLATILITY_TTL=0)");
+        } else {
             let default_cfg = tt_core::state::L2VolatilityTtl::default();
             let volatile_multiplier = std::env::var("TT_L2_VOLATILE_TTL_MULTIPLIER")
                 .ok()
@@ -1817,11 +1825,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
             tracing::info!(
                 volatile_multiplier,
                 floor_secs,
-                "L2 volatility-class TTL enabled (volatile entries expire sooner)"
-            );
-        } else {
-            tracing::warn!(
-                "TT_L2_VOLATILITY_TTL=1 but the L2 semantic cache is off — volatility TTL disabled"
+                "L2 volatility-class TTL enabled (volatile entries expire sooner; default-on)"
             );
         }
     }

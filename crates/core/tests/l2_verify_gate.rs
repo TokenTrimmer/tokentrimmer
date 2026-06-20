@@ -12,9 +12,9 @@
 //!    entry fails open.
 //! 4. Adaptive ratchet: after a breaching FP batch, a similarity that used to
 //!    hit now misses — and the effective threshold never drops below 0.92.
-//! 5. Volatility TTL: opt-in shorten-only L2 expiry for volatile prompts, on
-//!    both the non-streaming and streaming insert paths (L1 untouched);
-//!    off-by-default keeps the base TTL.
+//! 5. Volatility TTL: shorten-only L2 expiry for volatile prompts (ON BY
+//!    DEFAULT, P2), on both the non-streaming and streaming insert paths (L1
+//!    untouched); `without_l2_volatility_ttl` reverts to the base TTL.
 //! 6. L2-hit judge: dedicated `l2_hit_sample_rate` / `l2_band_sample_rate`
 //!    override the shared rate; the hourly cap (`l2_hit_max_per_hour = 0`)
 //!    stops L2-hit judging entirely.
@@ -554,9 +554,44 @@ async fn volatile_prompt_l2_entry_expires_sooner() {
     }
 }
 
-/// Without the volatility flag, even a volatile prompt keeps the base TTL.
+/// ON BY DEFAULT: plain `with_l2` (no explicit `with_l2_volatility_ttl`) now
+/// shortens a volatile prompt's L2 entry to the default `base * 0.25`, while a
+/// stable prompt keeps the base (tier) TTL. Shorten-only, so default-on is safe
+/// (worst case a cache miss, never a stale answer).
 #[tokio::test]
-async fn volatility_ttl_off_by_default() {
+async fn volatility_ttl_on_by_default() {
+    let base = CallerTier::Pro.ttl_secs() as i64;
+    for (content, expected_ttl) in [
+        ("what are today's headlines", base / 4),
+        ("explain the borrow checker in rust", base),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        }));
+        let cache = Arc::new(InMemoryL2Cache::new());
+        let embedder = Arc::new(FixedEmbedder { vec: e0() });
+        // No explicit volatility wiring — the default carried by `with_l2`.
+        let state = AppState::new(registry).with_l2(cache.clone(), embedder, None);
+        let app = build_router(state);
+
+        let resp = app.oneshot(chat_request_pro(content, false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let entry = wait_for_l2_entry(&cache, &e0()).await;
+        assert_eq!(
+            ttl_secs_of(&entry),
+            expected_ttl,
+            "default-on: prompt {content:?} must get TTL {expected_ttl}"
+        );
+    }
+}
+
+/// The disable escape hatch: `without_l2_volatility_ttl()` reverts to the base
+/// tier TTL even for a volatile prompt (the pre-default-on behavior the
+/// `TT_L2_VOLATILITY_TTL=0` env gate selects).
+#[tokio::test]
+async fn volatility_ttl_disabled_keeps_base_ttl() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(CountingProvider {
@@ -564,7 +599,9 @@ async fn volatility_ttl_off_by_default() {
     }));
     let cache = Arc::new(InMemoryL2Cache::new());
     let embedder = Arc::new(FixedEmbedder { vec: e0() });
-    let state = AppState::new(registry).with_l2(cache.clone(), embedder, None);
+    let state = AppState::new(registry)
+        .with_l2(cache.clone(), embedder, None)
+        .without_l2_volatility_ttl();
     let app = build_router(state);
 
     let resp = app
@@ -576,7 +613,7 @@ async fn volatility_ttl_off_by_default() {
     assert_eq!(
         ttl_secs_of(&entry),
         CallerTier::Pro.ttl_secs() as i64,
-        "off by default: the base tier TTL applies even to volatile text"
+        "disabled: the base tier TTL applies even to volatile text"
     );
 }
 
