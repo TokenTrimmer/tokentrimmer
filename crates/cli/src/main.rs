@@ -341,6 +341,42 @@ enum Command {
         #[arg(long, default_value_t = 6000)]
         token_budget: u32,
     },
+    /// Drive the gateway's server-side agent loop (POST /v1/agent/runs).
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+        /// Override the API key (else V0 resolution: env / ~/.tokentrimmer).
+        #[arg(long, global = true)]
+        tt_api_key: Option<String>,
+        /// Override the gateway base URL.
+        #[arg(long, global = true)]
+        tt_api_base: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Run a server-side agent loop against a prompt and print the result.
+    Run {
+        /// The user prompt to run the agent on.
+        prompt: String,
+        /// Model to request (the gateway may route it). Default: gpt-4o-mini.
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional system prompt.
+        #[arg(long)]
+        system: Option<String>,
+        /// Advertise the read-only gateway tools (find_route_for, preview_cost,
+        /// inspect_diff, batch_savings) so the loop can call them server-side.
+        #[arg(long)]
+        tools: bool,
+        /// Server-side per-run turn cap (the gateway clamps to 1..=32).
+        #[arg(long)]
+        max_turns: Option<u32>,
+        /// X-TokenTrimmer-Tag cost-attribution tag.
+        #[arg(long)]
+        tag: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1098,6 +1134,32 @@ async fn main() -> anyhow::Result<()> {
         } => {
             repo_context::run(&path, &task, &format, max_files, token_budget)?;
         }
+        Command::Agent {
+            action,
+            tt_api_key,
+            tt_api_base,
+        } => match action {
+            AgentAction::Run {
+                prompt,
+                model,
+                system,
+                tools,
+                max_turns,
+                tag,
+            } => {
+                tt_cli::agent::run(tt_cli::agent::RunOpts {
+                    prompt,
+                    model,
+                    system,
+                    tools,
+                    max_turns,
+                    tag,
+                    flag_key: tt_api_key,
+                    flag_base: tt_api_base,
+                })
+                .await?;
+            }
+        },
     }
     Ok(())
 }

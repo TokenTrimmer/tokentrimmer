@@ -74,6 +74,7 @@ One binary, every surface:
 | `tt plan` | Replay telemetry against a proposed config; project cost/savings with bootstrap CIs |
 | `tt audit verify` | Verify the integrity of a hash-chained, Ed25519-signed audit log export |
 | `tt chat` | Interactive chat through a gateway — streaming, savings display, optional tool-calling |
+| `tt agent run` | Drive a gateway's server-side agent loop (`POST /v1/agent/runs`) over a prompt; prints turns + aggregate cost |
 | `tt proxy` | Local OpenAI/Anthropic-compatible proxy for coding agents (port 31415) |
 | `tt advise` | AI cost advisor: scans a repo and recommends optimizations (read-only) |
 | `tt route` | Manage routing rules on a gateway (list / show / add / rm) |
