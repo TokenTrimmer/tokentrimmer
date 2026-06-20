@@ -50,6 +50,9 @@ cargo install --locked tt-cli
 
 # Scan a codebase for token waste
 tt inspect ./my-project --fail-on=high
+
+# Emit SARIF 2.1.0 for the GitHub Code Scanning / Security tab
+tt inspect ./my-project --format sarif > results.sarif
 ```
 
 ### Local development

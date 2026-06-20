@@ -76,6 +76,8 @@ PR's base, prices the model changes, posts a comment like:
 | `comment` | `true` | Post/update a sticky PR comment with the cost-diff report (pull requests only). |
 | `github-token` | `${{ github.token }}` | Token used to post the PR comment. |
 | `tt-version` | `latest` | `tt-cli` version to use. |
+| `upload-sarif` | `false` | Also run the Inspect static-analysis rules over `path` and upload the results as SARIF 2.1.0 to the Code Scanning / Security tab. Requires `permissions: security-events: write`. |
+| `sarif-fail-on` | `critical` | With `upload-sarif: true`, the minimum finding severity that fails the job (`low`\|`medium`\|`high`\|`critical`). SARIF is still produced/uploaded regardless. |
 
 ## Outputs
 
@@ -83,6 +85,45 @@ PR's base, prices the model changes, posts a comment like:
 |---|---|
 | `cost-gate` | `passed` or `failed` based on the projected per-call cost change. |
 | `base-ref` | The base git ref the working tree was diffed against. |
+| `findings-gate` | With `upload-sarif: true`, `passed`/`failed` based on whether any finding met `sarif-fail-on`. Empty when SARIF is disabled. |
+
+## SARIF / Code Scanning (opt-in)
+
+Set `upload-sarif: true` to additionally run the Inspect static-analysis rules
+and surface findings in the GitHub **Security → Code Scanning** tab plus inline
+PR annotations. This is independent of the cost-diff gate above.
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write   # cost-diff comment
+  security-events: write # required to upload SARIF
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Monorepo subpath today: TokenTrimmer/tokentrimmer/inspect-action@v1
+      - uses: tokentrimmer/cost-gate-action@v1
+        with:
+          path: .
+          upload-sarif: true
+          sarif-fail-on: high   # gate on high+; upload everything
+```
+
+Under the hood the action runs `tt inspect --format sarif > results.sarif` and
+uploads it with `github/codeql-action/upload-sarif`. The CLI emits clean SARIF
+2.1.0 to stdout (severity → SARIF level: critical/high → `error`, medium →
+`warning`, low → `note`); the finding's confidence and fix hint ride along in
+each result's `properties`.
+
+On **fork-contributor PRs** the token is read-only and cannot upload SARIF:
+the upload step warns-and-continues (it never red-Xes the job), and the
+`sarif-fail-on` findings gate is still applied independently from the generated
+SARIF — so gating keeps working even when the Security-tab upload is denied.
 
 ## Report-only mode
 
