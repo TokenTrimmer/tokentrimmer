@@ -3,6 +3,7 @@
 
 pub mod account;
 pub mod advise;
+pub mod agent;
 pub mod catalog;
 pub mod chat;
 pub mod context;

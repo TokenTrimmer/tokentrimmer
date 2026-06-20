@@ -25,6 +25,9 @@ mod tools;
 pub use async_trait::async_trait;
 pub use tools::{AggregateCost, ToolExecutor, ToolOutcome};
 
+mod agent;
+pub use agent::{AgentBuilder, AgentOutcome, Run, RunStatus, RunUsage};
+
 /// Build a `user` message.
 #[must_use]
 pub fn user(content: impl Into<String>) -> Message {
@@ -371,6 +374,20 @@ impl Client {
             base: base.into().trim_end_matches('/').to_string(),
             key: key.into(),
         }
+    }
+
+    /// Start building a server-side agent run (`POST /v1/agent/runs`).
+    ///
+    /// Unlike [`chat`](Self::chat)'s client-driven [`run_tools`](ChatBuilder::run_tools)
+    /// loop, the gateway owns the model->tool->model loop server-side (mid-loop
+    /// down-routing, judge-gated summarize, substep cache). The returned
+    /// [`AgentBuilder`] only re-drives the run when it pauses on a CLIENT tool —
+    /// executing it via your [`ToolExecutor`] and resuming — until a terminal
+    /// answer. Aggregate cost is read from the [`Run::usage`] body (the agent
+    /// endpoint emits no per-turn `x-tokentrimmer-*` headers).
+    #[must_use]
+    pub fn agent(&self) -> AgentBuilder<'_> {
+        AgentBuilder::new(self)
     }
 
     /// Start building a chat completion.

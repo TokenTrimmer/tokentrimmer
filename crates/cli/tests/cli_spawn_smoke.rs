@@ -222,6 +222,21 @@ fn advise_spawns_without_panic() {
 }
 
 #[test]
+fn agent_run_spawns_without_panic() {
+    // Create POST hits the gateway; a refused base → clean connection error,
+    // no panic.
+    assert_exits_cleanly(&[
+        "agent",
+        "run",
+        "say hi",
+        "--tt-api-key",
+        "tt_test_smoke",
+        "--tt-api-base",
+        REFUSED_BASE,
+    ]);
+}
+
+#[test]
 fn init_spawns_without_panic() {
     // Non-git tempdir → clean refusal; --dry-run guarantees no writes anyway.
     let dir = tempfile::tempdir().unwrap();

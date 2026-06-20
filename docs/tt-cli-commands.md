@@ -168,6 +168,39 @@ tt chat --model gpt-4o --system "Be terse." --tools
 
 ---
 
+## `tt agent run`
+
+Drive the gateway's **server-side** agent loop (`POST /v1/agent/runs`) over a
+single prompt and print the result. Unlike `tt chat --tools` — where the CLI
+drives every model→tool→model round-trip — the gateway owns the loop here
+(mid-loop down-routing, judge-gated summarize, substep cache); the CLI just kicks
+it off and resumes it if it pauses on a client tool. Requires a key.
+
+The aggregate cost is read from the run's JSON `usage` (the agent endpoint emits
+no per-turn `x-tokentrimmer-*` headers): the final answer prints to **stdout**,
+the status/cost footer to **stderr**.
+
+### Flags
+
+- `--model <id>` — model to request; the gateway may still route it per turn.
+  Default `gpt-4o-mini`.
+- `--system <prompt>` — system prompt for the run.
+- `--tools` — advertise the four read-only gateway tools (`find_route_for`,
+  `preview_cost`, `inspect_diff`, `batch_savings`) so the loop can call them.
+  They execute server-side, so the CLI never runs a tool itself.
+- `--max-turns <n>` — server-side per-run turn cap (the gateway clamps to
+  `1..=32`).
+- `--tag <value>` — `X-TokenTrimmer-Tag` cost-attribution tag.
+- `--tt-api-key <KEY>` / `--tt-api-base <URL>` — override the resolved key / base.
+
+### Example
+
+```bash
+tt agent run "Which model is cheapest for bulk classification?" --tools --max-turns 6
+```
+
+---
+
 ## `tt embed`
 
 Embed text through the gateway's `POST /v1/embeddings` and print a one-line cost
