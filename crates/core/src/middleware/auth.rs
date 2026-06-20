@@ -81,8 +81,11 @@ pub async fn middleware(
     next: Next,
 ) -> Result<Response, ApiError> {
     // Identity resolved below (when the request carries one) so the budget
-    // gate can run against the org before dispatch.
+    // gate can run against the org before dispatch. `api_key_id` is tracked
+    // alongside `org_id` so the pre-flight check can enforce the per-key cap
+    // (P2) against the per-`(org, key)` accumulator.
     let mut org_id: Option<Uuid> = None;
+    let mut api_key_id: Option<Uuid> = None;
 
     if let Some(token) = extract_bearer(&req) {
         // tt_test_* short-circuits to a synthetic sandbox response in the chat
@@ -218,6 +221,7 @@ pub async fn middleware(
                 }
 
                 org_id = Some(ctx.org_id);
+                api_key_id = Some(ctx.key_id);
                 req.extensions_mut().insert(ctx);
             }
         }
@@ -254,12 +258,25 @@ pub async fn middleware(
     let mut spend_remaining: Option<f64> = None;
     if let Some(org) = org_id {
         let decision = if let Some(resolver) = state.tier_resolver.as_ref() {
-            // Tier-aware path: resolve limits for this org and check against
-            // the per-org dynamic enforcer (fail-open on resolver error).
+            // Tier-aware path: resolve org limits AND the per-key cap (P2), then
+            // check against the per-org + per-key dynamic accumulators. The
+            // per-key cap is the tighter-of-org-and-key ceiling, scoped to this
+            // key (fail-open on resolver error; the per-key read is fail-soft to
+            // an empty cap — a missing cap never adds enforcement).
             let resolved = resolve_or_free(resolver.as_ref(), org).await;
-            state
-                .dynamic_budget
-                .check_with_limits(org, &resolved.limits, chrono::Utc::now())
+            // Read the per-key cap only when the request carries a real key id
+            // (dogfood/anon stamps carry the nil key → org-only).
+            let key_cap = match api_key_id {
+                Some(key_id) => resolver.resolve_key_cap(org, key_id).await,
+                None => crate::budget::KeyBudgetCap::default(),
+            };
+            state.dynamic_budget.check_with_limits_keyed(
+                org,
+                api_key_id,
+                &resolved.limits,
+                &key_cap,
+                chrono::Utc::now(),
+            )
         } else if let Some(budget) = state.budget.as_ref() {
             // Legacy path: global limits enforcer.
             budget.check(org, chrono::Utc::now())
@@ -308,6 +325,26 @@ pub async fn middleware(
                     "rate_limit_exceeded",
                     None,
                     Some(retry_after_secs),
+                ));
+            }
+            BudgetDecision::DenyKeySpend => {
+                // P2: this individual API key reached its per-key monthly spend
+                // cap (the org may still have headroom). Key-scoped reason.
+                return Ok(budget_denied_response(
+                    "Monthly spend cap reached for this API key.",
+                    "key_budget_exceeded",
+                    Some(0.0),
+                    None,
+                ));
+            }
+            BudgetDecision::DenyKeyRequests => {
+                // P2: this individual API key reached its per-key monthly
+                // request cap. Key-scoped reason.
+                return Ok(budget_denied_response(
+                    "Monthly request quota reached for this API key.",
+                    "key_quota_exceeded",
+                    None,
+                    None,
                 ));
             }
         }

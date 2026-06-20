@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use tt_shared::CallerTier;
 
-use crate::budget::{tier_budget_limits, BudgetLimits};
+use crate::budget::{tier_budget_limits, BudgetLimits, KeyBudgetCap};
 
 /// Errors from tier resolution. The middleware treats all variants as
 /// fail-open (warn + Free fallback), so the variant detail is for logging.
@@ -90,6 +90,19 @@ pub trait TierResolver: Send + Sync {
     /// The middleware ALWAYS falls back to Free on error — implementors do not
     /// need to handle the fallback themselves.
     async fn resolve(&self, org_id: Uuid) -> Result<ResolvedTier, TierResolverError>;
+
+    /// Return the per-API-key spend cap (P2) for `api_key_id` scoped to
+    /// `org_id`, read from `api_key_budget_caps`. The all-`None`
+    /// [`KeyBudgetCap`] means "no per-key override" (the org cap / tier default
+    /// is the only ceiling).
+    ///
+    /// **Fail-soft, NOT fail-open-to-deny:** any error (table not migrated, DB
+    /// blip) returns the empty cap — a missing/erroring per-key cap table must
+    /// never *add* a cap. The default implementation returns the empty cap so
+    /// resolvers that don't track per-key caps (test stubs) need no change.
+    async fn resolve_key_cap(&self, _org_id: Uuid, _api_key_id: Uuid) -> KeyBudgetCap {
+        KeyBudgetCap::default()
+    }
 }
 
 // ─── CallerTier helpers ─────────────────────────────────────────────────────
@@ -204,6 +217,46 @@ impl PostgresTierResolver {
             }
         }
     }
+
+    /// Best-effort read of the per-API-key budget cap (P2) from
+    /// `api_key_budget_caps`, scoped to `(api_key_id, org_id)` so a cross-org
+    /// key id can't be capped. Mirrors cloud
+    /// `key_budget_caps::get_key_budget_cap`. Returns the gateway-side
+    /// [`KeyBudgetCap`].
+    ///
+    /// **Fail-soft → empty cap:** any error (table not yet migrated, DB blip)
+    /// returns [`KeyBudgetCap::default`] (no per-key cap) and logs `debug`. A
+    /// missing/erroring cap table must never *add* a cap or downgrade enforcement
+    /// — it only ever means "no per-key cap is set." Kept separate from the
+    /// `subscriptions` read for exactly this reason.
+    async fn fetch_key_cap_override(&self, org_id: Uuid, api_key_id: Uuid) -> KeyBudgetCap {
+        // (monthly_cap_usd, monthly_request_cap) — both nullable columns.
+        type CapRow = (Option<f64>, Option<i32>);
+        let row: Result<Option<CapRow>, sqlx::Error> = sqlx::query_as(
+            r#"SELECT monthly_cap_usd, monthly_request_cap
+               FROM api_key_budget_caps WHERE api_key_id = $1 AND org_id = $2"#,
+        )
+        .bind(api_key_id)
+        .bind(org_id)
+        .fetch_optional(&self.pool)
+        .await;
+        match row {
+            Ok(Some((usd, req))) => KeyBudgetCap {
+                // Reject non-finite / negative USD caps (the DB CHECK already
+                // bars negatives, but be defensive on the gateway side too).
+                monthly_cap_usd: usd.filter(|c| c.is_finite() && *c >= 0.0),
+                monthly_request_cap: req.map(|r| r.max(0) as u32),
+            },
+            Ok(None) => KeyBudgetCap::default(),
+            Err(e) => {
+                tracing::debug!(
+                    error = %e, %org_id, %api_key_id,
+                    "per-key budget-cap read failed — no per-key cap applied"
+                );
+                KeyBudgetCap::default()
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for PostgresTierResolver {
@@ -253,6 +306,10 @@ impl TierResolver for PostgresTierResolver {
             limits,
         })
     }
+
+    async fn resolve_key_cap(&self, org_id: Uuid, api_key_id: Uuid) -> KeyBudgetCap {
+        self.fetch_key_cap_override(org_id, api_key_id).await
+    }
 }
 
 // ─── Short-TTL in-process cache ──────────────────────────────────────────────
@@ -280,7 +337,18 @@ pub const TIER_CACHE_TTL_SECS: u64 = 30;
 pub struct CachedTierResolver<R: TierResolver> {
     inner: R,
     cache: DashMap<Uuid, CacheEntry>,
+    /// Per-`(org_id, api_key_id)` cache for per-key caps (P2), same TTL as the
+    /// org-tier cache — a dashboard per-key cap edit propagates within
+    /// [`TIER_CACHE_TTL_SECS`], matching the org-cap propagation window.
+    key_cap_cache: DashMap<(Uuid, Uuid), KeyCapEntry>,
     ttl: Duration,
+}
+
+/// Per-key cap cache entry — the resolved cap plus the instant it was inserted.
+#[derive(Clone)]
+struct KeyCapEntry {
+    cap: KeyBudgetCap,
+    inserted_at: Instant,
 }
 
 impl<R: TierResolver> CachedTierResolver<R> {
@@ -289,6 +357,7 @@ impl<R: TierResolver> CachedTierResolver<R> {
         Self {
             inner,
             cache: DashMap::new(),
+            key_cap_cache: DashMap::new(),
             ttl: Duration::from_secs(TIER_CACHE_TTL_SECS),
         }
     }
@@ -298,6 +367,7 @@ impl<R: TierResolver> CachedTierResolver<R> {
         Self {
             inner,
             cache: DashMap::new(),
+            key_cap_cache: DashMap::new(),
             ttl,
         }
     }
@@ -324,6 +394,25 @@ impl<R: TierResolver> TierResolver for CachedTierResolver<R> {
             },
         );
         Ok(resolved)
+    }
+
+    async fn resolve_key_cap(&self, org_id: Uuid, api_key_id: Uuid) -> KeyBudgetCap {
+        let now = Instant::now();
+        let cache_key = (org_id, api_key_id);
+        if let Some(entry) = self.key_cap_cache.get(&cache_key) {
+            if now.duration_since(entry.inserted_at) <= self.ttl {
+                return entry.cap;
+            }
+        }
+        let cap = self.inner.resolve_key_cap(org_id, api_key_id).await;
+        self.key_cap_cache.insert(
+            cache_key,
+            KeyCapEntry {
+                cap,
+                inserted_at: Instant::now(),
+            },
+        );
+        cap
     }
 }
 
@@ -554,5 +643,71 @@ mod tests {
         assert_eq!(resolved.caller_tier, CallerTier::Free);
         assert!(!resolved.limits.l2_cache);
         assert_eq!(resolved.limits.max_requests_per_min, Some(60));
+    }
+
+    // ── resolve_key_cap: default + caching (P2) ─────────────────────────────
+
+    #[tokio::test]
+    async fn default_resolve_key_cap_is_empty() {
+        // A resolver that doesn't override resolve_key_cap returns the empty
+        // cap — a missing per-key cap source never adds enforcement.
+        let (stub, _counter) = StubResolver::ok(ResolvedTier::free_default());
+        let cap = stub
+            .resolve_key_cap(Uuid::from_u128(1), Uuid::from_u128(2))
+            .await;
+        assert!(cap.is_empty(), "default per-key cap must be empty");
+    }
+
+    /// Counts `resolve_key_cap` calls and returns a fixed non-empty cap.
+    struct KeyCapStub {
+        cap: KeyBudgetCap,
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl TierResolver for KeyCapStub {
+        async fn resolve(&self, _org_id: Uuid) -> Result<ResolvedTier, TierResolverError> {
+            Ok(ResolvedTier::free_default())
+        }
+        async fn resolve_key_cap(&self, _org_id: Uuid, _api_key_id: Uuid) -> KeyBudgetCap {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.cap
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_resolver_caches_per_key_cap() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let stub = KeyCapStub {
+            cap: KeyBudgetCap {
+                monthly_cap_usd: Some(25.0),
+                monthly_request_cap: None,
+            },
+            calls: calls.clone(),
+        };
+        let cached = CachedTierResolver::new(stub);
+        let org = Uuid::from_u128(1);
+        let key = Uuid::from_u128(2);
+
+        let c1 = cached.resolve_key_cap(org, key).await;
+        assert_eq!(c1.monthly_cap_usd, Some(25.0));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second call within TTL → cache hit, inner NOT called again.
+        let c2 = cached.resolve_key_cap(org, key).await;
+        assert_eq!(c2, c1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "per-key cap cache must not re-query inner within TTL"
+        );
+
+        // A different key under the same org is a distinct cache entry.
+        let _ = cached.resolve_key_cap(org, Uuid::from_u128(3)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a different key id must miss the cache"
+        );
     }
 }
