@@ -344,14 +344,30 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
     }
 }
 
+impl InMemoryBudgetEnforcer {
+    /// `(billed, served)` request counts for `org_id` this month: the values
+    /// `settle` advances (`month_request_count`, `served_request_count`).
+    ///
+    /// Introspection only — exposed (rather than `#[cfg(test)]`) so route-level
+    /// integration tests can drive a real request through the handler and assert
+    /// that `settle` fired with the right `cached` flag (the missing settle on
+    /// the streaming cache-hit path was a route-level bug the enforcer unit
+    /// tests could not catch). Not part of the enforcement contract.
+    #[must_use]
+    pub fn monthly_counts(&self, org_id: Uuid) -> (u32, u32) {
+        let guard = self.state.lock().expect("budget state poisoned");
+        guard.get(&org_id).map_or((0, 0), |st| {
+            (st.month_request_count, st.served_request_count)
+        })
+    }
+}
+
 #[cfg(test)]
 impl InMemoryBudgetEnforcer {
-    /// `(billed, served)` request counts for `org_id` this month. Test-only.
+    /// `(billed, served)` request counts for `org_id` this month. Test-only
+    /// alias of [`InMemoryBudgetEnforcer::monthly_counts`].
     fn counts_for_test(&self, org_id: Uuid) -> (u32, u32) {
-        let guard = self.state.lock().expect("budget state poisoned");
-        guard
-            .get(&org_id)
-            .map_or((0, 0), |st| (st.month_request_count, st.served_request_count))
+        self.monthly_counts(org_id)
     }
 }
 
@@ -491,6 +507,19 @@ impl DynamicBudgetEnforcer {
         let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
         st.roll_month(now);
         st.spend_usd += cost_usd.max(0.0);
+    }
+
+    /// `(billed, served)` request counts for `org_id` this month: the values
+    /// `settle_with_limits` advances. Introspection only (mirrors
+    /// [`InMemoryBudgetEnforcer::monthly_counts`]) so route-level integration
+    /// tests driving the tier-aware path can assert `settle` fired with the
+    /// right `cached` flag. Not part of the enforcement contract.
+    #[must_use]
+    pub fn monthly_counts(&self, org_id: Uuid) -> (u32, u32) {
+        let guard = self.state.lock().expect("dynamic budget state poisoned");
+        guard.get(&org_id).map_or((0, 0), |st| {
+            (st.month_request_count, st.served_request_count)
+        })
     }
 }
 

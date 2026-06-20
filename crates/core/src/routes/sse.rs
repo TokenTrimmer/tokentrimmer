@@ -766,10 +766,13 @@ pub fn stream_response(
 
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, cost_usd, Utc::now());
-                // P0-1/P0-3: settle the served request. Streaming always
-                // dispatches to the provider (never a cache hit), so this is a
-                // non-cached settle — advances both the billed and served
-                // counters.
+                // P0-1/P0-3: settle the served request. This DropGuard fires
+                // only on the `Some(log_ctx)` branch, which the streaming chat
+                // handler builds ONLY for the live provider-dispatch path (the
+                // L1 fake-stream cache-hit path passes `None` log_ctx and settles
+                // `cached=true` inline at its return). So a settle reaching here
+                // is always a live dispatch → non-cached → advances both the
+                // billed and served counters.
                 spend_sink.settle(org_id, false, Utc::now());
 
                 // Record OTel GenAI semconv + TokenTrimmer cost attributes onto
