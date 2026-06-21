@@ -10,6 +10,7 @@ pub mod health;
 pub mod messages;
 pub mod metrics;
 pub mod models;
+pub mod panel;
 pub mod preview;
 pub mod ready;
 pub mod responses;
