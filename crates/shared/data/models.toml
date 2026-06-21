@@ -31,6 +31,13 @@ capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_cac
 
 [[model]]
 provider = "openai"
+model = "gpt-5.4-mini"
+max_input_tokens = 200000
+max_output_tokens = 16000
+capabilities = ["text", "vision", "tools", "json_mode", "streaming", "prompt_caching"]
+
+[[model]]
+provider = "openai"
 model = "gpt-4o"
 max_input_tokens = 128000
 max_output_tokens = 16000

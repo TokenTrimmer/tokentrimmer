@@ -110,8 +110,8 @@ mod tests {
     #[test]
     fn embedded_catalog_parses_all_providers() {
         let c = model_catalog();
-        assert_eq!(c.len(), 33, "native (15) + compat (18)");
-        assert_eq!(c.for_provider("openai").len(), 8);
+        assert_eq!(c.len(), 34, "native (16) + compat (18)");
+        assert_eq!(c.for_provider("openai").len(), 9); // + gpt-5.4-mini
         assert_eq!(c.for_provider("anthropic").len(), 4); // + claude-opus-4-8
         assert_eq!(c.for_provider("gemini").len(), 3);
         assert_eq!(c.for_provider("mistral").len(), 5);
