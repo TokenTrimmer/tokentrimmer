@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use chrono::Utc;
 use serde_json::json;
-use tt_telemetry::request_logs::RequestLogRow;
+use tt_telemetry::{panel_legs::PanelLegRow, request_logs::RequestLogRow};
 use uuid::Uuid;
 
 use tt_shared::{
@@ -950,11 +950,13 @@ pub(crate) async fn complete_panel(
     let served = &result.response;
     let trace_id = ctx.trace_id;
     let arbiter_model = cfg.arbiter_model.model.clone();
+    // Hoist the parent id so the per-leg rows can reference it.
+    let parent_id = Uuid::now_v7();
     spawn_request_log(
         state.telemetry_tracker.as_ref(),
         state.request_log_writer.as_ref(),
         RequestLogRow {
-            id: Uuid::now_v7(),
+            id: parent_id,
             org_id: ctx.org_id,
             api_key_id: ctx.api_key_id,
             ts: Utc::now(),
@@ -1004,6 +1006,37 @@ pub(crate) async fn complete_panel(
             retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
         },
     );
+
+    // ── Write per-leg `panel_legs` rows (fire-and-forget, MUST NOT block or
+    //    fail the response). One row per enumeration position (not LegResult
+    //    .leg_index) so the sentinel usize::MAX on the arbiter never appears.
+    if let Some(writer) = state.panel_leg_writer.clone() {
+        let leg_rows: Vec<PanelLegRow> = result
+            .legs
+            .iter()
+            .enumerate()
+            .map(|(i, leg)| PanelLegRow {
+                request_log_id: parent_id,
+                leg_index: i as i32,
+                role: match leg.role {
+                    LegRole::Leg => "leg".to_string(),
+                    LegRole::Arbiter => "arbiter".to_string(),
+                },
+                provider: leg.provider.clone(),
+                model: leg.model.clone(),
+                input_tokens: leg.usage.as_ref().map(|u| u.prompt_tokens as i64),
+                output_tokens: leg.usage.as_ref().map(|u| u.completion_tokens as i64),
+                cached_tokens: leg.usage.as_ref().map(|u| u.cached_tokens as i64),
+                cost_usd: leg.cost_usd,
+                latency_ms: Some(leg.latency_ms as i64),
+                status: leg.status.as_str().to_string(),
+                error_class: None,
+            })
+            .collect();
+        tokio::spawn(async move {
+            let _ = writer.write_legs(leg_rows).await;
+        });
+    }
 
     // Inject the `tokentrimmer.panel` attribution object into the body (merged
     // at the serialization boundary in the handler tail; see `panel_body`).
