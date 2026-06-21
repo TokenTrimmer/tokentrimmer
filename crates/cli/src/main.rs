@@ -359,6 +359,17 @@ enum Command {
         #[arg(long, global = true)]
         tt_api_base: Option<String>,
     },
+    /// Async Batch Lane: submit a JSONL file, list/get/cancel batches, download results.
+    Batch {
+        #[command(subcommand)]
+        action: tt_cli::batch::BatchAction,
+        /// Override the API key (else V0 resolution: env / ~/.tokentrimmer).
+        #[arg(long, global = true)]
+        tt_api_key: Option<String>,
+        /// Override the gateway base URL.
+        #[arg(long, global = true)]
+        tt_api_base: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1184,6 +1195,18 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             }
         },
+        Command::Batch {
+            action,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            tt_cli::batch::run(tt_cli::batch::RunOpts {
+                action,
+                flag_key: tt_api_key,
+                flag_base: tt_api_base,
+            })
+            .await?;
+        }
     }
     Ok(())
 }

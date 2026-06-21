@@ -172,6 +172,11 @@ pub trait BatchStore: Send + Sync {
     /// both 404 at the handler).
     async fn get(&self, org_id: Uuid, id: &str) -> Result<Option<BatchJob>, BatchStoreError>;
 
+    /// List the org's batch rows, newest-first (`created_at DESC`). Strictly
+    /// org-scoped: another org's rows are never returned. An org with no rows
+    /// gets an empty vec.
+    async fn list(&self, org_id: Uuid) -> Result<Vec<BatchJob>, BatchStoreError>;
+
     /// Update an existing org-scoped row's status + file ids + counts +
     /// `updated_at`. No-op (returns `Ok`) when the id isn't the org's.
     async fn update(&self, job: BatchJob) -> Result<(), BatchStoreError>;
@@ -209,6 +214,17 @@ impl BatchStore for InMemoryBatchStore {
             .lock()
             .map_err(|e| BatchStoreError::Storage(e.to_string()))?;
         Ok(g.get(&(org_id, id.to_string())).cloned())
+    }
+
+    async fn list(&self, org_id: Uuid) -> Result<Vec<BatchJob>, BatchStoreError> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|e| BatchStoreError::Storage(e.to_string()))?;
+        let mut rows: Vec<BatchJob> = g.values().filter(|j| j.org_id == org_id).cloned().collect();
+        // Newest-first, mirroring the Postgres `ORDER BY created_at DESC`.
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(rows)
     }
 
     async fn update(&self, job: BatchJob) -> Result<(), BatchStoreError> {
@@ -328,6 +344,18 @@ impl BatchStore for PostgresBatchStore {
         Ok(row.map(row_to_job))
     }
 
+    async fn list(&self, org_id: Uuid) -> Result<Vec<BatchJob>, BatchStoreError> {
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM batch_jobs WHERE org_id = $1 ORDER BY created_at DESC"
+        );
+        let rows: Vec<BatchRow> = sqlx::query_as(&sql)
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| BatchStoreError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(row_to_job).collect())
+    }
+
     async fn update(&self, job: BatchJob) -> Result<(), BatchStoreError> {
         // Org-scoped UPDATE: a row belonging to another org never matches the
         // WHERE, so this is a safe no-op for cross-org ids.
@@ -424,6 +452,41 @@ mod tests {
             still.status, "validating",
             "org_b update must not mutate org_a"
         );
+    }
+
+    #[tokio::test]
+    async fn in_memory_list_is_org_scoped_and_newest_first() {
+        let store = InMemoryBatchStore::new();
+        let org_a = Uuid::now_v7();
+        let org_b = Uuid::now_v7();
+
+        // Two rows for org_a (distinct ids + ascending created_at), one for org_b.
+        let mut a1 = BatchJob::from_batch(org_a, None, "openai", &sample_batch());
+        a1.id = "batch_a1".into();
+        a1.created_at = "2026-01-01T00:00:00Z".parse().unwrap();
+        let mut a2 = BatchJob::from_batch(org_a, None, "openai", &sample_batch());
+        a2.id = "batch_a2".into();
+        a2.created_at = "2026-01-02T00:00:00Z".parse().unwrap();
+        let mut b1 = BatchJob::from_batch(org_b, None, "openai", &sample_batch());
+        b1.id = "batch_b1".into();
+
+        store.insert(a1).await.unwrap();
+        store.insert(a2).await.unwrap();
+        store.insert(b1).await.unwrap();
+
+        // org_a sees exactly its two rows, newest-first (a2 created after a1).
+        let list_a = store.list(org_a).await.unwrap();
+        assert_eq!(list_a.len(), 2);
+        assert_eq!(list_a[0].id, "batch_a2", "newest first");
+        assert_eq!(list_a[1].id, "batch_a1");
+
+        // org_b sees only its one row.
+        let list_b = store.list(org_b).await.unwrap();
+        assert_eq!(list_b.len(), 1);
+        assert_eq!(list_b[0].id, "batch_b1");
+
+        // An unknown org sees nothing (never leaks another org's rows).
+        assert!(store.list(Uuid::now_v7()).await.unwrap().is_empty());
     }
 
     #[tokio::test]

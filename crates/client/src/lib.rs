@@ -28,6 +28,9 @@ pub use tools::{AggregateCost, ToolExecutor, ToolOutcome};
 mod agent;
 pub use agent::{AgentBuilder, AgentOutcome, Run, RunStatus, RunUsage};
 
+mod batch;
+pub use batch::{Batch, BatchCounts};
+
 /// Build a `user` message.
 #[must_use]
 pub fn user(content: impl Into<String>) -> Message {

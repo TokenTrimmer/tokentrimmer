@@ -279,6 +279,99 @@ async fn another_orgs_batch_id_is_404() {
 }
 
 #[tokio::test]
+async fn list_batches_is_org_scoped_and_returns_list_envelope() {
+    let server = MockServer::start();
+    let h = harness(&server.base_url()).await;
+
+    // Create two batches for org A and one for org B. Each create answers from
+    // the same `/batches` mock keyed by the request's input_file_id-independent
+    // id field; here we just return a distinct id per call via separate mocks.
+    let create = |id: &'static str| {
+        server.mock(move |when, then| {
+            when.method(POST).path("/batches").json_body(json!({
+                "input_file_id": id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(batch_body(id, "validating", false));
+        })
+    };
+    let _m_a1 = create("batch_a1");
+    let _m_a2 = create("batch_a2");
+    let _m_b1 = create("batch_b1");
+
+    let submit = |key: &str, id: &str| {
+        req(
+            "POST",
+            "/v1/batches",
+            Some(key),
+            Some(json!({
+                "input_file_id": id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            })),
+        )
+    };
+    for id in ["batch_a1", "batch_a2"] {
+        let r = h.app.clone().oneshot(submit(&h.key, id)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let r = h
+        .app
+        .clone()
+        .oneshot(submit(&h.other_key, "batch_b1"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // org A's list: exactly its two batches, in the OpenAI list envelope. Each
+    // item matches the single-get shape (object:"batch").
+    let r = h
+        .app
+        .clone()
+        .oneshot(req("GET", "/v1/batches", Some(&h.key), None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = body_json(r).await;
+    assert_eq!(v["object"], "list");
+    let data = v["data"].as_array().expect("data array");
+    assert_eq!(data.len(), 2, "org A sees exactly its two batches");
+    let ids: std::collections::HashSet<&str> =
+        data.iter().map(|b| b["id"].as_str().unwrap()).collect();
+    assert!(ids.contains("batch_a1") && ids.contains("batch_a2"));
+    // Items carry the single-get shape (never org B's batch).
+    assert!(data.iter().all(|b| b["object"] == "batch"));
+    assert!(!ids.contains("batch_b1"), "must never leak org B's batch");
+
+    // org B's list: only its one batch.
+    let r = h
+        .app
+        .clone()
+        .oneshot(req("GET", "/v1/batches", Some(&h.other_key), None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = body_json(r).await;
+    assert_eq!(v["data"].as_array().unwrap().len(), 1);
+    assert_eq!(v["data"][0]["id"], "batch_b1");
+}
+
+#[tokio::test]
+async fn unauthenticated_list_batches_is_401() {
+    let server = MockServer::start();
+    let h = harness(&server.base_url()).await;
+    let r = h
+        .app
+        .oneshot(req("GET", "/v1/batches", None, None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn cancel_updates_stored_status() {
     let server = MockServer::start();
     server.mock(|when, then| {
