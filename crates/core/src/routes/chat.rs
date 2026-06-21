@@ -291,7 +291,12 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         | ApiError::NotFound(_)
         | ApiError::ServiceUnavailable(_)
         // Agent-run control-flow signal (not a provider response) — never cache.
-        | ApiError::Conflict(_) => false,
+        | ApiError::Conflict(_)
+        // Panel errors — kill-switch can be toggled, and panel conditions are
+        // runtime-dependent. Never negative-cache any of them.
+        | ApiError::PanelDisabled
+        | ApiError::PanelQuorumUnmet { .. }
+        | ApiError::PanelStrategyUnsupported { .. } => false,
     }
 }
 
@@ -320,6 +325,9 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::NotFound(_) => StatusCode::NOT_FOUND,
         ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         ApiError::Conflict(_) => StatusCode::CONFLICT,
+        ApiError::PanelDisabled => StatusCode::FORBIDDEN,
+        ApiError::PanelQuorumUnmet { .. } => StatusCode::BAD_GATEWAY,
+        ApiError::PanelStrategyUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
     };
     status.as_u16()
 }

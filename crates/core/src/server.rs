@@ -41,6 +41,17 @@ pub(crate) const STREAMING_TIMEOUT_SECS: u64 = 600;
 /// [`STREAMING_TIMEOUT_SECS`].
 pub(crate) const SHORT_TIMEOUT_SECS: u64 = 60;
 
+/// Read the `TT_PANEL_ENABLED` environment variable and return the resolved
+/// kill-switch value for [`AppState::with_panel_enabled`].
+///
+/// Truthy values: `"1"` or any case-insensitive variant of `"true"`.
+/// Absent or any other value → `false` (off by default).
+pub fn panel_enabled_from_env() -> bool {
+    std::env::var("TT_PANEL_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Build the public router. Returns a fully composed `Router` ready to bind.
 ///
 /// Retrieval middleware is activated when `TT_RETRIEVAL_STORE` and

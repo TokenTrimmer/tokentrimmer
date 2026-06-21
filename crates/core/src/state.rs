@@ -311,6 +311,14 @@ pub struct AppState {
     /// endpoints answer 503 (`batch processing is not configured`) — no other
     /// path consults it, so leaving it unset never affects chat/embeddings.
     pub batch_store: Option<Arc<dyn crate::batch_store::BatchStore>>,
+    /// Kill-switch for the deep-research panel feature. **Off by default.**
+    ///
+    /// When `false` (the default), any panel request is rejected immediately
+    /// with [`crate::error::ApiError::PanelDisabled`] — no silent fallback to
+    /// single-model billing. Set to `true` via
+    /// [`AppState::with_panel_enabled`] or the `TT_PANEL_ENABLED` env var
+    /// (`"1"` or case-insensitive `"true"`).
+    pub panel_enabled: bool,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -356,6 +364,7 @@ impl AppState {
             telemetry_tracker: None,
             summary_gate: Arc::new(crate::passes::agentic_budget::summarize_judge::NeverCommitGate),
             batch_store: None,
+            panel_enabled: false,
         }
     }
 
@@ -590,6 +599,16 @@ impl AppState {
     #[must_use]
     pub fn with_batch_store(mut self, store: Arc<dyn crate::batch_store::BatchStore>) -> Self {
         self.batch_store = Some(store);
+        self
+    }
+
+    /// Builder-style: enable or disable the deep-research panel feature. Off by
+    /// default — callers that never call this cannot accidentally enable panel
+    /// dispatch. Production wires `true` when `TT_PANEL_ENABLED=1` or
+    /// `TT_PANEL_ENABLED=true`.
+    #[must_use]
+    pub fn with_panel_enabled(mut self, on: bool) -> Self {
+        self.panel_enabled = on;
         self
     }
 
