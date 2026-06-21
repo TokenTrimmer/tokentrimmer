@@ -69,6 +69,67 @@ pub fn parse_cache_control(
     }
 }
 
+// ---------------------------------------------------------------------------
+// tt_extras.panel types (Phase 1 — deep-research panel)
+// ---------------------------------------------------------------------------
+
+/// Per-request panel overrides from `tt_extras.panel`.
+///
+/// JSON shape:
+/// ```json
+/// {
+///   "panel": {
+///     "members": ["gpt-4o", "claude-3-5-sonnet"],
+///     "arbiter_model": "gpt-4o",
+///     "quorum": 2,
+///     "max_cost_usd": 0.05
+///   }
+/// }
+/// ```
+///
+/// All fields are optional; absent fields fall back to gateway defaults in
+/// [`PanelConfig::resolve`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PanelExtras {
+    /// Explicit list of member model ids to fan out to. Overrides the gateway
+    /// default when non-empty.
+    #[serde(default)]
+    pub members: Vec<String>,
+
+    /// Override the arbiter model for Synthesize / BestOfN strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbiter_model: Option<String>,
+
+    /// Minimum number of legs that must succeed for the panel to return a result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quorum: Option<usize>,
+
+    /// Hard cost ceiling in USD across all legs + arbitration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+}
+
+/// Parse [`PanelExtras`] from a request's `tt_extras` map.
+///
+/// Returns `None` when `tt_extras` does not contain a `"panel"` key.
+/// Returns the default (empty overrides) when the key is present but the value
+/// fails to deserialize — degrades gracefully rather than hard-failing.
+pub fn parse_panel_extras(
+    extras: &HashMap<String, serde_json::Value>,
+) -> Option<PanelExtras> {
+    let val = extras.get("panel")?;
+    match serde_json::from_value::<PanelExtras>(val.clone()) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "tt_extras.panel deserialization failed — treating as no panel extras"
+            );
+            Some(PanelExtras::default())
+        }
+    }
+}
+
 #[cfg(test)]
 mod cache_control_tests {
     use super::*;

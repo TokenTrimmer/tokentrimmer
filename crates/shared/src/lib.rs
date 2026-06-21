@@ -26,9 +26,9 @@ pub use context::{CallerTier, RequestContext};
 pub use dns_guard::{with_guarded_dns, GuardedResolveError, GuardedResolver};
 pub use error::ProviderError;
 pub use messages::{
-    parse_cache_control, CacheControlConfig, CacheMode, ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse, Choice, ContentPart, EmbeddingsRequest, EmbeddingsResponse, Message,
-    MessageContent, Tool, ToolCall, ToolChoice,
+    parse_cache_control, parse_panel_extras, CacheControlConfig, CacheMode, ChatCompletionChunk,
+    ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart, EmbeddingsRequest,
+    EmbeddingsResponse, Message, MessageContent, PanelExtras, Tool, ToolCall, ToolChoice,
 };
 pub use model_catalog::{model_catalog, ModelCatalog};
 pub use pricing::{CacheWriteTier, ModelInfo, ModelPricing};
