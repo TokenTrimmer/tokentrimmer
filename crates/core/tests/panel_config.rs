@@ -126,11 +126,7 @@ fn resolve_extras_members_override_defaults() {
 
 #[test]
 fn resolve_empty_members_after_merge_is_error() {
-    let result = PanelConfig::resolve(
-        ArbiterStrategyKind::Synthesize,
-        None,
-        &empty_defaults(),
-    );
+    let result = PanelConfig::resolve(ArbiterStrategyKind::Synthesize, None, &empty_defaults());
     assert!(
         matches!(result, Err(ApiError::InvalidRequest(_))),
         "expected InvalidRequest, got {result:?}"
@@ -178,4 +174,69 @@ fn parse_panel_extras_members_parsed() {
 fn parse_panel_extras_absent_is_none() {
     let extras: HashMap<String, serde_json::Value> = HashMap::new();
     assert!(parse_panel_extras(&extras).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Member-count cap tests (TT_PANEL_MAX_MEMBERS, default 8)
+// ---------------------------------------------------------------------------
+
+/// Build a PanelDefaults with a single arbiter and no default members.
+fn arbiter_only_defaults() -> PanelDefaults {
+    PanelDefaults {
+        members: vec![],
+        arbiter_model: ModelRef {
+            model: "gpt-4o".to_string(),
+            provider: None,
+        },
+    }
+}
+
+/// Construct a PanelExtras with `n` synthetic member models.
+fn extras_with_n_members(n: usize) -> PanelExtras {
+    PanelExtras {
+        members: (0..n).map(|i| format!("model-{i}")).collect(),
+        arbiter_model: Some("gpt-4o".to_string()),
+        quorum: None,
+        max_cost_usd: None,
+    }
+}
+
+#[test]
+fn resolve_exactly_cap_members_is_ok() {
+    // Default cap is 8; a request with exactly 8 members must succeed.
+    let extras = extras_with_n_members(8);
+    let result = PanelConfig::resolve(
+        ArbiterStrategyKind::Synthesize,
+        Some(&extras),
+        &arbiter_only_defaults(),
+    );
+    assert!(
+        result.is_ok(),
+        "expected Ok for exactly 8 members, got {result:?}"
+    );
+    assert_eq!(result.unwrap().members.len(), 8);
+}
+
+#[test]
+fn resolve_over_cap_members_is_invalid_request() {
+    // Default cap is 8; a request with 9 members must be rejected.
+    let extras = extras_with_n_members(9);
+    let result = PanelConfig::resolve(
+        ArbiterStrategyKind::Synthesize,
+        Some(&extras),
+        &arbiter_only_defaults(),
+    );
+    match result {
+        Err(ApiError::InvalidRequest(msg)) => {
+            assert!(
+                msg.contains("9"),
+                "error message should mention the count (9): {msg}"
+            );
+            assert!(
+                msg.contains("8") || msg.contains("maximum"),
+                "error message should mention the maximum: {msg}"
+            );
+        }
+        other => panic!("expected Err(InvalidRequest), got {other:?}"),
+    }
 }
