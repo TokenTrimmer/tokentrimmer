@@ -368,13 +368,17 @@ pub trait ArbiterStrategy {
     ///
     /// `request` is the original caller request (used as the user prompt
     /// context).  `state` and `ctx` give access to the provider registry and
-    /// the request's credential / deadline context.
+    /// the request's credential / deadline context.  `creds` is the same
+    /// provider-id → credential map passed to `run_panel`; the arbiter
+    /// implementation uses it to substitute the correct credential when the
+    /// arbiter model is on a different provider than `ctx.credentials`.
     async fn arbitrate(
         &self,
         request: &ChatCompletionRequest,
         legs: &[LegResult],
         state: &AppState,
         ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     ) -> Result<ArbiterOutcome, ApiError>;
 }
 
@@ -398,6 +402,7 @@ impl ArbiterStrategy for Synthesize {
         legs: &[LegResult],
         state: &AppState,
         ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     ) -> Result<ArbiterOutcome, ApiError> {
         // Collect the text content of all successful legs.
         let ok_answers: Vec<(usize, String)> = legs
@@ -474,12 +479,23 @@ impl ArbiterStrategy for Synthesize {
                 model: self.arbiter_model.model.clone(),
             })?;
 
+        // Substitute the arbiter provider's credential when present in the creds
+        // map (mirrors the per-member credential substitution in run_panel).
+        let mut arb_ctx_owned;
+        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
+            arb_ctx_owned = ctx.clone();
+            arb_ctx_owned.credentials = c.clone();
+            &arb_ctx_owned
+        } else {
+            ctx
+        };
+
         // Derive the arbiter deadline from the caller's remaining budget when
         // available; otherwise use a bounded default. The outer route
         // TimeoutLayer (60 s) caps all requests regardless.
-        let deadline = ctx.deadline.unwrap_or(Duration::from_secs(120));
+        let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
         let measured =
-            crate::measurement::measured_single_dispatch(&provider, arbiter_req, ctx, deadline)
+            crate::measurement::measured_single_dispatch(&provider, arbiter_req, arb_ctx, deadline)
                 .await
                 .map_err(|e| {
                     ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}"))
@@ -744,7 +760,11 @@ pub async fn run_panel(
 
     // 3. Arbitrate.
     let strategy = strategy_for(cfg)?;
-    let arb = strategy.arbitrate(base_req, &legs_out, state, ctx).await?;
+    let arb_start = std::time::Instant::now();
+    let arb = strategy
+        .arbitrate(base_req, &legs_out, state, ctx, creds)
+        .await?;
+    let arb_latency_ms = arb_start.elapsed().as_millis() as u64;
 
     let arbiter_provider_id = state
         .registry
@@ -760,7 +780,7 @@ pub async fn run_panel(
         status: LegStatus::Ok,
         cost_usd: arb.cost_usd,
         usage: Some(arb.response.usage.clone()),
-        latency_ms: 0,
+        latency_ms: arb_latency_ms,
         response: None,
     };
     crate::metrics::record_panel_leg("arbiter", LegStatus::Ok.as_str());
