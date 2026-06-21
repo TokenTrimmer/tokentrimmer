@@ -11,12 +11,25 @@
 //! - [`PanelConfig`]         — resolved, complete panel configuration
 //! - [`PanelDefaults`]       — gateway-level defaults sourced from env vars
 //! - [`PanelExtras`]         — per-request overrides from `tt_extras.panel`
+//! - [`LegRole`]             — whether a leg is a panel member or the arbiter
+//! - [`LegStatus`]           — outcome of a single leg dispatch
+//! - [`LegResult`]           — full result record for one dispatched leg
+//! - [`ArbiterOutcome`]      — the synthesized / picked response from arbitration
+//! - [`ArbiterStrategy`]     — trait implemented by each arbitration algorithm
+//! - [`Synthesize`]          — the synthesize-a-new-answer arbitration strategy
+//! - [`strategy_for`]        — factory: [`PanelConfig`] → [`Box<dyn ArbiterStrategy>`]
 
+use std::time::Duration;
+
+use async_trait::async_trait;
 use axum::http::HeaderMap;
 
-use tt_shared::messages::PanelExtras;
+use tt_shared::{
+    messages::{ChatCompletionRequest, Message, MessageContent, PanelExtras},
+    ChatCompletionResponse, RequestContext, Usage,
+};
 
-use crate::{ApiError, ApiResult};
+use crate::{ApiError, ApiResult, AppState};
 
 // ---------------------------------------------------------------------------
 // Strategy kind
@@ -219,6 +232,238 @@ pub fn panel_from_header(headers: &HeaderMap) -> Option<ArbiterStrategyKind> {
         .get("x-tokentrimmer-panel")
         .and_then(|v| v.to_str().ok())
         .and_then(ArbiterStrategyKind::parse)
+}
+
+// ---------------------------------------------------------------------------
+// LegRole — panel member vs. arbiter call
+// ---------------------------------------------------------------------------
+
+/// Whether a dispatched leg is a panel member or the arbiter synthesis call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by Tasks 4–7 (not yet wired)
+pub enum LegRole {
+    /// A regular panel member leg (fan-out dispatch).
+    Leg,
+    /// The arbiter model call (synthesis / best-of-N / majority).
+    Arbiter,
+}
+
+// ---------------------------------------------------------------------------
+// LegStatus — outcome of a single leg dispatch
+// ---------------------------------------------------------------------------
+
+/// Terminal status of a single dispatched leg.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by Tasks 4–7 (not yet wired)
+pub enum LegStatus {
+    /// Leg completed successfully.
+    Ok,
+    /// Leg returned an upstream error.
+    Error,
+    /// Leg exceeded its deadline.
+    Timeout,
+    /// Leg was skipped because no provider credential was available.
+    SkippedNoCred,
+}
+
+impl LegStatus {
+    /// Wire-format string for metrics / log attributes.
+    #[allow(dead_code)] // used by Tasks 4–7 (not yet wired)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::SkippedNoCred => "skipped_no_cred",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LegResult — full result record for one dispatched leg
+// ---------------------------------------------------------------------------
+
+/// Full result record for one dispatched leg (member or arbiter).
+#[allow(dead_code)] // fields consumed by Tasks 4–7 (not yet wired)
+pub struct LegResult {
+    /// Zero-based index into [`PanelConfig::members`]; `usize::MAX` for the
+    /// arbiter leg (which has no member index).
+    pub leg_index: usize,
+    /// Whether this is a regular member leg or the arbiter call.
+    pub role: LegRole,
+    /// The model id that was dispatched.
+    pub model: String,
+    /// The provider name used for dispatch.
+    pub provider: String,
+    /// Terminal outcome of this leg.
+    pub status: LegStatus,
+    /// The upstream response; `None` when `status != Ok`.
+    pub response: Option<ChatCompletionResponse>,
+    /// Cost in USD for this leg; `None` when the model has no catalog pricing.
+    pub cost_usd: Option<f64>,
+    /// Token usage reported by the provider; `None` when `status != Ok`.
+    pub usage: Option<Usage>,
+    /// Wall-clock latency of the leg dispatch in milliseconds.
+    pub latency_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// ArbiterOutcome — the response produced by the arbiter
+// ---------------------------------------------------------------------------
+
+/// The final response produced by an [`ArbiterStrategy`].
+pub struct ArbiterOutcome {
+    /// The synthesized / chosen upstream response.
+    pub response: ChatCompletionResponse,
+    /// Cost of the arbiter call itself; `None` when unpriced (see
+    /// [`crate::measurement::MeasuredDispatch::cost_usd`]).
+    pub cost_usd: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// ArbiterStrategy — trait
+// ---------------------------------------------------------------------------
+
+/// Arbitration algorithm executed after all panel legs have been dispatched.
+#[async_trait]
+pub trait ArbiterStrategy {
+    /// Run arbitration over the completed `legs` and return the final answer.
+    ///
+    /// `request` is the original caller request (used as the user prompt
+    /// context).  `state` and `ctx` give access to the provider registry and
+    /// the request's credential / deadline context.
+    async fn arbitrate(
+        &self,
+        request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        ctx: &RequestContext,
+    ) -> Result<ArbiterOutcome, ApiError>;
+}
+
+// ---------------------------------------------------------------------------
+// Synthesize — the only currently-implemented strategy
+// ---------------------------------------------------------------------------
+
+/// The **Synthesize** strategy: collect all successful leg answers, build a
+/// single prompt asking the arbiter model to synthesize one best answer, then
+/// dispatch exactly one [`crate::measurement::measured_single_dispatch`] call.
+pub struct Synthesize {
+    /// The arbiter model (and optional provider pin) to use for synthesis.
+    pub arbiter_model: ModelRef,
+}
+
+#[async_trait]
+impl ArbiterStrategy for Synthesize {
+    async fn arbitrate(
+        &self,
+        request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        ctx: &RequestContext,
+    ) -> Result<ArbiterOutcome, ApiError> {
+        // Collect the text content of all successful legs.
+        let ok_answers: Vec<(usize, String)> = legs
+            .iter()
+            .filter(|l| l.status == LegStatus::Ok && l.role == LegRole::Leg)
+            .filter_map(|l| {
+                let resp = l.response.as_ref()?;
+                let text = resp.choices.first().and_then(|c| match &c.message {
+                    Message::Assistant {
+                        content: Some(MessageContent::Text(t)),
+                        ..
+                    } => Some(t.clone()),
+                    _ => None,
+                })?;
+                Some((l.leg_index, text))
+            })
+            .collect();
+
+        let n = ok_answers.len();
+
+        // Build the arbiter system instruction and append each candidate answer.
+        let system_content = format!(
+            "You are an expert synthesis engine. You have received {n} candidate \
+             answers from different AI models responding to the same user request. \
+             Your task is to synthesize them into one single best answer. \
+             Combine the strongest insights, resolve any contradictions by preferring \
+             the most accurate information, and produce a clear, complete, and \
+             well-structured response. Output only the synthesized answer — no \
+             preamble, no meta-commentary about the synthesis process."
+        );
+
+        let mut messages = request.messages.clone();
+        // Replace any existing system message with the synthesis instruction,
+        // then append each candidate as a separate user turn.
+        messages.retain(|m| !matches!(m, Message::System { .. }));
+        messages.insert(
+            0,
+            Message::System {
+                content: MessageContent::Text(system_content),
+            },
+        );
+        for (i, (_, answer)) in ok_answers.iter().enumerate() {
+            messages.push(Message::User {
+                content: MessageContent::Text(format!(
+                    "Candidate answer {} of {}:\n\n{}",
+                    i + 1,
+                    n,
+                    answer
+                )),
+                name: None,
+            });
+        }
+
+        let arbiter_req = ChatCompletionRequest {
+            model: self.arbiter_model.model.clone(),
+            messages,
+            stream: false,
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+
+        // Resolve the arbiter provider.
+        let provider = state
+            .registry
+            .resolve(&self.arbiter_model.model)
+            .ok_or_else(|| ApiError::ModelNotFound {
+                model: self.arbiter_model.model.clone(),
+            })?;
+
+        // Dispatch exactly one measured call.
+        let deadline = Duration::from_secs(120);
+        let measured =
+            crate::measurement::measured_single_dispatch(&provider, arbiter_req, ctx, deadline)
+                .await
+                .map_err(|e| ApiError::InvalidRequest(format!("arbiter dispatch failed: {e}")))?;
+
+        Ok(ArbiterOutcome {
+            response: measured.response,
+            cost_usd: measured.cost_usd,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// strategy_for — factory
+// ---------------------------------------------------------------------------
+
+/// Instantiate the correct [`ArbiterStrategy`] for the given [`PanelConfig`].
+///
+/// Currently only [`ArbiterStrategyKind::Synthesize`] is implemented.
+/// [`ArbiterStrategyKind::BestOfN`] and [`ArbiterStrategyKind::Majority`]
+/// return [`ApiError::PanelStrategyUnsupported`].
+pub fn strategy_for(
+    cfg: &PanelConfig,
+) -> Result<Box<dyn ArbiterStrategy + Send + Sync>, ApiError> {
+    match cfg.strategy {
+        ArbiterStrategyKind::Synthesize => Ok(Box::new(Synthesize {
+            arbiter_model: cfg.arbiter_model.clone(),
+        })),
+        other => Err(ApiError::PanelStrategyUnsupported {
+            strategy: other.as_str().to_string(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
