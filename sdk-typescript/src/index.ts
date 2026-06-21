@@ -575,6 +575,14 @@ export class Agent {
   }
 }
 
+/**
+ * OpenAI SDK subclass that routes through the TokenTrimmer Gateway.
+ *
+ * Batch + Files (`client.files.*` / `client.batches.*`) are supported via the
+ * INHERITED OpenAI surface — the Gateway's `/v1/files` + `/v1/batches` endpoints
+ * are OpenAI-compatible, so do NOT reimplement them here (that would shadow the
+ * OpenAI typed resources). See `test/batch.test.ts`.
+ */
 export class TokenTrimmer extends OpenAI {
   /**
    * Narrowed type for the inherited `chat` resource: `chat.completions.create`

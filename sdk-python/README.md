@@ -94,6 +94,46 @@ print(f"cost   ${outcome.usage.cost_usd:.4f}")
 print(f"rounds {outcome.resume_rounds}")  # client-side tool_outputs resumes made
 ```
 
+## Batch (50% cheaper, async)
+
+The Gateway's `/v1/files` + `/v1/batches` endpoints are OpenAI-compatible, so the
+**inherited** OpenAI `files` / `batches` resources route through TokenTrimmer
+unchanged — no special methods, just the standard OpenAI batch flow. Provider
+batch jobs are ~50% cheaper than synchronous calls, and TokenTrimmer's poll
+worker books the realized savings server-side as each batch settles (visible in
+your dashboard).
+
+```python
+import time
+
+client = TokenTrimmer(api_key="tt_live_...")
+
+# 1. Upload a JSONL of requests (one chat-completion request per line).
+with open("requests.jsonl", "rb") as fh:
+    f = client.files.create(file=fh, purpose="batch")
+
+# 2. Create the batch.
+batch = client.batches.create(
+    input_file_id=f.id,
+    endpoint="/v1/chat/completions",
+    completion_window="24h",
+)
+
+# 3. Poll until it settles (the Gateway poll worker drives status + savings).
+while batch.status not in ("completed", "failed", "expired", "cancelled"):
+    time.sleep(30)
+    batch = client.batches.retrieve(batch.id)
+
+# 4. Download the results JSONL.
+if batch.status == "completed" and batch.output_file_id:
+    results = client.files.content(batch.output_file_id).read()
+    print(results.decode())
+```
+
+Prefer no code? The [`tt` CLI](https://github.com/TokenTrimmer/tokentrimmer)
+wraps the same flow: `tt batch submit requests.jsonl`, `tt batch get <id>`,
+`tt batch download <output_file_id>`.
+
 ## Self-hosted Gateway
 
 ```python

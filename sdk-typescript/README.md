@@ -105,6 +105,52 @@ console.log(`cost   $${outcome.usage.costUsd.toFixed(4)}`);
 console.log(`rounds ${outcome.resumeRounds}`);      // client-side tool_outputs resumes made
 ```
 
+### Batch (50% cheaper, async)
+
+The Gateway's `/v1/files` + `/v1/batches` endpoints are OpenAI-compatible, so the
+**inherited** OpenAI `files` / `batches` resources route through TokenTrimmer
+unchanged — no special methods, just the standard OpenAI batch flow. Provider
+batch jobs are ~50% cheaper than synchronous calls, and TokenTrimmer's poll
+worker books the realized savings server-side as each batch settles (visible in
+your dashboard).
+
+```ts
+import { createReadStream } from 'node:fs';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+const client = new TokenTrimmer({ apiKey: 'tt_live_...' });
+
+// 1. Upload a JSONL of requests (one chat-completion request per line).
+const file = await client.files.create({
+  file: createReadStream('requests.jsonl'),
+  purpose: 'batch',
+});
+
+// 2. Create the batch.
+let batch = await client.batches.create({
+  input_file_id: file.id,
+  endpoint: '/v1/chat/completions',
+  completion_window: '24h',
+});
+
+// 3. Poll until it settles (the Gateway poll worker drives status + savings).
+const TERMINAL = new Set(['completed', 'failed', 'expired', 'cancelled']);
+while (!TERMINAL.has(batch.status)) {
+  await sleep(30_000);
+  batch = await client.batches.retrieve(batch.id);
+}
+
+// 4. Download the results JSONL.
+if (batch.status === 'completed' && batch.output_file_id) {
+  const results = await client.files.content(batch.output_file_id);
+  console.log(await results.text());
+}
+```
+
+Prefer no code? The [`tt` CLI](https://github.com/TokenTrimmer/tokentrimmer)
+wraps the same flow: `tt batch submit requests.jsonl`, `tt batch get <id>`,
+`tt batch download <output_file_id>`.
+
 ## Self-hosted Gateway
 
 ```ts
