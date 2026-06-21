@@ -1948,6 +1948,12 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         tracing::warn!("no DB pool; routing disabled (chat requests pass through unrouted)");
     }
 
+    // Deep-research panel kill-switch: off by default; set TT_PANEL_ENABLED=1
+    // or TT_PANEL_ENABLED=true to enable. Panel requests are rejected with
+    // `panel_disabled` (403) unless this is set — never a silent single-model
+    // fallback.
+    state = state.with_panel_enabled(tt_core::panel_enabled_from_env());
+
     // Start background catalogue refreshers (OpenRouter's dynamic `GET /models`
     // fetch). Best-effort + non-blocking: it refreshes once shortly after boot
     // and hourly thereafter, so the live 300+ model catalogue + per-model
