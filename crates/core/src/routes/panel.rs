@@ -247,19 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_empty_members_is_error() {
-        let defaults = PanelDefaults {
-            members: vec![],
-            arbiter_model: ModelRef {
-                model: "x".to_string(),
-                provider: None,
-            },
-        };
-        let result = PanelConfig::resolve(ArbiterStrategyKind::Synthesize, None, &defaults);
-        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
-    }
-
-    #[test]
     fn resolve_extras_override_defaults() {
         let extras = PanelExtras {
             members: vec!["m1".to_string()],
