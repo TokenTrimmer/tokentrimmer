@@ -430,6 +430,38 @@ async fn quorum_unmet_returns_502_with_zero_rows() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Metric scraping helpers
+// ---------------------------------------------------------------------------
+
+/// Sum the integer values of all non-comment Prometheus text-format lines
+/// whose metric name matches `name` exactly. Handles both bare names
+/// (`name 42`) and label-set lines (`name{...} 42`).
+///
+/// The global Prometheus recorder accumulates across all tests in the binary;
+/// callers should compute BEFORE/AFTER deltas rather than assert absolute values.
+fn metric_total(rendered: &str, name: &str) -> u64 {
+    rendered
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter(|l| {
+            // Match `name{` (labelled) or `name ` / `name\t` (bare).
+            l.starts_with(&format!("{name}{{")) || {
+                let rest = l.strip_prefix(name).unwrap_or("");
+                rest.starts_with(' ') || rest.starts_with('\t')
+            }
+        })
+        .filter_map(|l| {
+            // The value is the last whitespace-separated token before an
+            // optional timestamp (Prometheus text format).
+            l.split_whitespace()
+                .nth_back(0)
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|f| f as u64)
+        })
+        .sum()
+}
+
 // ============================================================================
 // INVARIANT 5 (7.5 served==rows + tt_panel_legs_total): a happy-path panel
 // through the HTTP router increments tt_requests_served_total by 1 AND writes
@@ -437,8 +469,9 @@ async fn quorum_unmet_returns_502_with_zero_rows() {
 // (2 member legs + 1 arbiter, all successful).
 //
 // Because the global Prometheus recorder is shared across the test binary
-// (counters accumulate across tests), we assert metric PRESENCE with expected
-// labels, not exact absolute values — the same discipline as metrics_endpoint.rs.
+// (counters accumulate across tests), we use MONOTONIC DELTAS: scrape before
+// the request, scrape after drain_rows, assert after >= before + expected_delta.
+// `>=` (not `==`) so tests running concurrently cannot make it flaky.
 //
 // HTTP path note: `record_request_served` is bumped by the chat handler consumer
 // after `complete_panel` returns `CompletionOutcome::Dispatched`. The agent-loop
@@ -449,6 +482,14 @@ async fn quorum_unmet_returns_502_with_zero_rows() {
 #[tokio::test]
 async fn happy_path_served_counter_and_panel_legs_metric_present() {
     let (app, writer, tracker, _calls) = app_single_provider(false, true);
+
+    // Scrape metric baselines BEFORE issuing the request.
+    // `build_router` already installed the recorder; both values may be >0 if
+    // other tests ran first — we only care about the delta this test adds.
+    let metrics_before = tt_core::metrics::render()
+        .expect("Prometheus recorder must be installed after build_router");
+    let before_served = metric_total(&metrics_before, "tt_requests_served_total");
+    let before_legs = metric_total(&metrics_before, "tt_panel_legs_total");
 
     // Drive one happy-path panel request.
     let req = Request::builder()
@@ -475,34 +516,52 @@ async fn happy_path_served_counter_and_panel_legs_metric_present() {
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "happy-path panel must return 200");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "happy-path panel must return 200"
+    );
 
-    // Drain rows.
+    // Assert the response body carries legs == 3 (2 members + 1 arbiter).
+    let body = body_json(resp).await;
+    let panel = &body["tokentrimmer"]["panel"];
+    assert!(
+        panel.is_object(),
+        "response must carry tokentrimmer.panel, got {body}"
+    );
+    assert_eq!(
+        panel["legs"].as_array().unwrap().len(),
+        3,
+        "2 member legs + 1 arbiter leg"
+    );
+
+    // Drain rows — wait for all telemetry writes to flush before the after-scrape.
     let rows = drain_rows(&writer, tracker).await;
+    // rows.len() is an EXACT assertion — isolated per-test via InMemoryRequestLogWriter.
     assert_eq!(rows.len(), 1, "served==rows: exactly ONE request_logs row");
     assert!(!rows[0].cached, "panel row must be cached=false");
     assert_eq!(rows[0].provider, "panel", "panel sentinel provider stamp");
 
-    // Scrape metrics — presence-only (shared recorder accumulates across tests).
-    let metrics_body = tt_core::metrics::render()
+    // Scrape metrics AFTER drain_rows (telemetry is fully flushed).
+    let metrics_after = tt_core::metrics::render()
         .expect("Prometheus recorder must be installed after build_router");
+    let after_served = metric_total(&metrics_after, "tt_requests_served_total");
+    let after_legs = metric_total(&metrics_after, "tt_panel_legs_total");
 
-    // tt_requests_served_total must have a 'chat' path label (HTTP handler path).
+    // Real delta assertions — `>` so concurrent tests cannot cause flakiness.
+    // `after > before` is equivalent to `after >= before + 1` for u64 counters
+    // and is what clippy::int_plus_one recommends.
     assert!(
-        metrics_body
-            .lines()
-            .any(|l| l.starts_with("tt_requests_served_total") && l.contains("path=\"chat\"")),
-        "tt_requests_served_total{{path=\"chat\"}} must be present after a panel dispatch:\n{metrics_body}"
+        after_served > before_served,
+        "tt_requests_served_total must have incremented by at least 1 \
+         (before={before_served}, after={after_served})"
     );
-
-    // tt_panel_legs_total must be present with a 'ok' status label —
-    // the `LegStatus::Ok.as_str()` wire value is "ok" (not "success").
-    // All 3 legs (2 members + 1 arbiter) dispatch and succeed on the happy path.
+    // For legs we need at least +3 (not just +1), so we keep the explicit sum
+    // but use > with before+2 (equivalent to >= before+3, avoids int_plus_one).
     assert!(
-        metrics_body
-            .lines()
-            .any(|l| l.starts_with("tt_panel_legs_total") && l.contains("status=\"ok\"")),
-        "tt_panel_legs_total{{status=\"ok\"}} must be present after a happy-path panel:\n{metrics_body}"
+        after_legs > before_legs + 2,
+        "tt_panel_legs_total must have incremented by at least 3 \
+         (2 member legs + 1 arbiter; before={before_legs}, after={after_legs})"
     );
 }
 
@@ -564,7 +623,11 @@ async fn kill_switch_disabled_panel_returns_403_with_zero_dispatches() {
 
     // Zero rows — no billing on a kill-switch reject.
     let rows = drain_rows(&writer, tracker).await;
-    assert_eq!(rows.len(), 0, "kill-switch reject must write ZERO request_logs rows");
+    assert_eq!(
+        rows.len(),
+        0,
+        "kill-switch reject must write ZERO request_logs rows"
+    );
 }
 
 // ============================================================================
@@ -617,7 +680,15 @@ async fn multi_provider_panel_dispatches_both_and_bills_one_aggregate_row() {
 
     let body = body_json(resp).await;
     let panel = &body["tokentrimmer"]["panel"];
-    assert!(panel.is_object(), "response must carry tokentrimmer.panel, got {body}");
+    assert!(
+        panel.is_object(),
+        "response must carry tokentrimmer.panel, got {body}"
+    );
+    assert_eq!(
+        panel["legs"].as_array().unwrap().len(),
+        3,
+        "2 member legs + 1 arbiter leg"
+    );
 
     // Verify both member providers were dispatched.
     assert!(
@@ -647,11 +718,89 @@ async fn multi_provider_panel_dispatches_both_and_bills_one_aggregate_row() {
         "multi-provider panel must write exactly ONE request_logs row"
     );
     let row = &rows[0];
-    assert_eq!(row.provider, "panel", "aggregate row provider must be the panel sentinel");
+    assert_eq!(
+        row.provider, "panel",
+        "aggregate row provider must be the panel sentinel"
+    );
     assert!(!row.cached, "aggregate row must be cached=false");
     assert!(
         (row.cost_usd - total_cost).abs() < 1e-9,
         "row.cost_usd must equal body total_cost_usd, got {} vs {total_cost}",
         row.cost_usd
+    );
+}
+
+// ============================================================================
+// INVARIANT 8 (unpriceable member — fail-closed): a panel whose member list
+// includes a model not in any registered provider ⇒ `estimate_panel_cost`
+// returns `None` ⇒ `panel_budget_gate` returns `CostLimitExceeded` ⇒ 402
+// BEFORE any dispatch — even with a generous cost ceiling.
+//
+// This is a DISTINCT fail-closed path from the over-budget case (Invariant 3):
+// the budget gate cannot produce an estimate at all, so it rejects regardless
+// of ceiling. The test uses `app_single_provider` (providers: "gpt-4o",
+// "gpt-4o-mini") and names a panel member "no-such-model-zzz" that is not
+// served by any registered mock — `estimate_panel_cost` sees `resolve` return
+// `None` on that model, short-circuits to `None`, and the gate fires.
+// ============================================================================
+
+#[tokio::test]
+async fn unpriceable_member_fails_closed_with_zero_dispatches() {
+    let (app, writer, tracker, calls) = app_single_provider(false, true);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        // Generous ceiling — the reject must be for unpriceable, not over-budget.
+        .header("x-tokentrimmer-cost-limit-usd", "999.0")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "deep question" }],
+                "stream": false,
+                "tt_extras": {
+                    "panel": {
+                        // "no-such-model-zzz" is not served by any registered mock.
+                        "members": ["gpt-4o", "no-such-model-zzz"],
+                        "arbiter_model": "gpt-4o"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    // estimate_panel_cost returns None → panel_budget_gate raises CostLimitExceeded → 402.
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "unpriceable panel member must return 402 PAYMENT_REQUIRED (fail-closed), \
+         even with a generous ceiling"
+    );
+
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["error"]["code"], "cost_limit_exceeded",
+        "error code must be cost_limit_exceeded (unpriceable → fail-closed), got {body}"
+    );
+
+    // CRITICAL: zero upstream calls — the gate fires before any provider dispatch.
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "INVARIANT: unpriceable budget gate must fire BEFORE any provider dispatch (zero calls)"
+    );
+
+    // Zero billing rows — no side effects on early reject.
+    let rows = drain_rows(&writer, tracker).await;
+    assert_eq!(
+        rows.len(),
+        0,
+        "INVARIANT: unpriceable fail-closed reject must write ZERO request_logs rows"
     );
 }
