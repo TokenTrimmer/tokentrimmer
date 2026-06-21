@@ -284,6 +284,7 @@ impl LegStatus {
 // ---------------------------------------------------------------------------
 
 /// Full result record for one dispatched leg (member or arbiter).
+#[derive(Debug)]
 #[allow(dead_code)] // fields consumed by Tasks 4–7 (not yet wired)
 pub struct LegResult {
     /// Zero-based index into [`PanelConfig::members`]; `usize::MAX` for the
@@ -538,6 +539,193 @@ pub fn panel_budget_gate(
         });
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// PanelResult — the outcome of a completed run_panel call
+// ---------------------------------------------------------------------------
+
+/// The outcome of a completed [`run_panel`] call.
+#[derive(Debug)]
+pub struct PanelResult {
+    /// The final synthesized / chosen response to return to the caller.
+    pub response: ChatCompletionResponse,
+    /// Full leg records for all dispatched members plus the arbiter.
+    pub legs: Vec<LegResult>,
+    /// None-aware sum of all leg costs (member legs + arbiter leg).
+    /// `None` only when every leg returned `None` for cost.
+    pub total_cost_usd: Option<f64>,
+    /// Minimum number of member legs that had to succeed.
+    pub quorum_required: usize,
+    /// Number of member legs that actually succeeded.
+    pub quorum_met: usize,
+}
+
+// ---------------------------------------------------------------------------
+// run_panel — concurrent fan-out, quorum, cost aggregation
+// ---------------------------------------------------------------------------
+
+/// Fold an iterator of `Option<f64>` values: accumulate all `Some` values;
+/// return `None` only when every item was `None`.
+fn sum_metered_iter(it: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut total: Option<f64> = None;
+    for x in it.flatten() {
+        total = Some(total.unwrap_or(0.0) + x);
+    }
+    total
+}
+
+/// Fan-out all panel member legs concurrently, enforce quorum, then arbitrate.
+///
+/// `creds` maps **provider id** → credentials for that provider.  Members
+/// whose provider id is absent from `creds` are recorded as
+/// [`LegStatus::SkippedNoCred`] and do not count toward quorum.
+pub async fn run_panel(
+    state: &crate::AppState,
+    ctx: &tt_shared::RequestContext,
+    base_req: &ChatCompletionRequest,
+    creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    cfg: &PanelConfig,
+    deadline: Duration,
+) -> Result<PanelResult, crate::ApiError> {
+    use std::time::Instant;
+    use tokio::task::JoinSet;
+
+    // 1. Resolve legs; skip members with no credential.
+    let mut set: JoinSet<LegResult> = JoinSet::new();
+    let mut legs_out: Vec<LegResult> = Vec::new();
+
+    for (i, m) in cfg.members.iter().enumerate() {
+        let provider = state
+            .registry
+            .resolve(&m.model)
+            .ok_or_else(|| crate::ApiError::ModelNotFound {
+                model: m.model.clone(),
+            })?;
+        let pid = provider.id().to_string();
+
+        if !creds.contains_key(&pid) {
+            crate::metrics::record_panel_leg("leg", LegStatus::SkippedNoCred.as_str());
+            legs_out.push(LegResult {
+                leg_index: i,
+                role: LegRole::Leg,
+                model: m.model.clone(),
+                provider: pid,
+                status: LegStatus::SkippedNoCred,
+                response: None,
+                cost_usd: None,
+                usage: None,
+                latency_ms: 0,
+            });
+            continue;
+        }
+
+        // Build a per-leg request with the correct model.
+        let mut req = base_req.clone();
+        req.model = m.model.clone();
+
+        // Substitute the provider-specific credential into the context.
+        let mut leg_ctx = ctx.clone();
+        if let Some(c) = creds.get(&pid) {
+            leg_ctx.credentials = c.clone();
+        }
+
+        let idx = i;
+        let model_id = m.model.clone();
+        set.spawn(async move {
+            let started = Instant::now();
+            match crate::measurement::measured_single_dispatch(&provider, req, &leg_ctx, deadline)
+                .await
+            {
+                Ok(md) => LegResult {
+                    leg_index: idx,
+                    role: LegRole::Leg,
+                    model: md.response.model.clone(),
+                    provider: pid,
+                    status: LegStatus::Ok,
+                    cost_usd: md.cost_usd,
+                    usage: Some(md.response.usage.clone()),
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    response: Some(md.response),
+                },
+                Err(_) => LegResult {
+                    leg_index: idx,
+                    role: LegRole::Leg,
+                    model: model_id,
+                    provider: pid,
+                    status: LegStatus::Error,
+                    response: None,
+                    cost_usd: None,
+                    usage: None,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                },
+            }
+        });
+    }
+
+    // Collect all completed member legs.
+    while let Some(joined) = set.join_next().await {
+        if let Ok(leg) = joined {
+            crate::metrics::record_panel_leg("leg", leg.status.as_str());
+            legs_out.push(leg);
+        }
+    }
+
+    // 2. Quorum check.
+    let required = cfg.quorum.unwrap_or(match cfg.strategy {
+        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
+        _ => 1,
+    });
+    let met = legs_out
+        .iter()
+        .filter(|l| matches!(l.status, LegStatus::Ok))
+        .count();
+    if met < required {
+        return Err(crate::ApiError::PanelQuorumUnmet { required, met });
+    }
+
+    // 3. Arbitrate.
+    let strategy = strategy_for(cfg)?;
+    let arb = strategy
+        .arbitrate(base_req, &legs_out, state, ctx)
+        .await?;
+
+    let arbiter_provider_id = state
+        .registry
+        .resolve(&cfg.arbiter_model.model)
+        .map(|p| p.id().to_string())
+        .unwrap_or_default();
+
+    let arbiter_leg = LegResult {
+        leg_index: usize::MAX,
+        role: LegRole::Arbiter,
+        model: cfg.arbiter_model.model.clone(),
+        provider: arbiter_provider_id,
+        status: LegStatus::Ok,
+        cost_usd: arb.cost_usd,
+        usage: Some(arb.response.usage.clone()),
+        latency_ms: 0,
+        response: None,
+    };
+    crate::metrics::record_panel_leg("arbiter", LegStatus::Ok.as_str());
+
+    // 4. None-aware cost aggregation: sum all Some values across legs + arbiter.
+    let total_cost_usd = sum_metered_iter(
+        legs_out
+            .iter()
+            .map(|l| l.cost_usd)
+            .chain(std::iter::once(arb.cost_usd)),
+    );
+
+    legs_out.push(arbiter_leg);
+
+    Ok(PanelResult {
+        response: arb.response,
+        legs: legs_out,
+        total_cost_usd,
+        quorum_required: required,
+        quorum_met: met,
+    })
 }
 
 // ---------------------------------------------------------------------------
