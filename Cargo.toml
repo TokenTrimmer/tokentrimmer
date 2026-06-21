@@ -153,7 +153,7 @@ clap = { version = "4", features = ["derive", "env"] }
 sentry = { version = "0.48.2", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 
 # Static analysis (Inspect)
-tree-sitter = "0.24"
+tree-sitter = "0.26"
 tree-sitter-python = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
