@@ -113,6 +113,22 @@ pub struct PanelConfig {
     pub max_cost_usd: Option<f64>,
 }
 
+// ---------------------------------------------------------------------------
+// Member-count cap
+// ---------------------------------------------------------------------------
+
+/// Hard cap on the number of panel members (the arbiter is not counted).
+///
+/// Override with the `TT_PANEL_MAX_MEMBERS` environment variable (must be ≥ 1;
+/// invalid or zero values are silently ignored and the default is used).
+fn panel_max_members() -> usize {
+    std::env::var("TT_PANEL_MAX_MEMBERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(8)
+}
+
 impl PanelConfig {
     /// Resolve a complete [`PanelConfig`] from its three input sources.
     ///
@@ -120,7 +136,8 @@ impl PanelConfig {
     /// 1. `extras` — per-request `tt_extras.panel` overrides
     /// 2. `defaults` — gateway-level defaults from env vars
     ///
-    /// Returns [`ApiError::InvalidRequest`] when the merged member list is empty.
+    /// Returns [`ApiError::InvalidRequest`] when the merged member list is empty
+    /// or exceeds the cap set by `TT_PANEL_MAX_MEMBERS` (default 8).
     pub fn resolve(
         strategy: ArbiterStrategyKind,
         extras: Option<&PanelExtras>,
@@ -147,6 +164,15 @@ impl PanelConfig {
             return Err(ApiError::InvalidRequest(
                 "panel requires at least one member model".to_string(),
             ));
+        }
+
+        let max = panel_max_members();
+        if members.len() > max {
+            return Err(ApiError::InvalidRequest(format!(
+                "panel: {} members exceeds the maximum of {}",
+                members.len(),
+                max
+            )));
         }
 
         // Arbiter: extras override defaults.
