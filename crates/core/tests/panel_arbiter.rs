@@ -36,6 +36,8 @@ fn cfg_for(strategy: ArbiterStrategyKind) -> PanelConfig {
 // ---------------------------------------------------------------------------
 
 #[test]
+// Asserts the Ok path only; the trait object cannot be downcast to verify the
+// concrete type at runtime.
 fn strategy_for_synthesize_returns_synthesize() {
     let cfg = cfg_for(ArbiterStrategyKind::Synthesize);
     let strategy = strategy_for(&cfg);
