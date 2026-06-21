@@ -33,11 +33,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "openai": "^5.0.0 || ^6.0.0"
+    "openai": "^6.44.0"
   },
   "devDependencies": {
     "typescript": "^6.0.3",
-    "vitest": "^4.1.8",
+    "vitest": "^4.1.9",
     "@types/node": "^25.9.3"
   },
   "engines": {
