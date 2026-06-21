@@ -27,10 +27,11 @@ struct Mapping {
 ///
 /// OpenAI — `gpt-5.5` → `gpt-5.4`: the current gpt-5.x flagship down to its
 /// cheaper same-family sibling (both full chat models: 200K context, vision,
-/// tools, json_mode, prompt_caching; $5/M → $2.50/M input). `gpt-5.4` has no
-/// cheaper same-family target *in the ModelCatalog* (gpt-5.4-mini is priced but
-/// absent from models.toml), so it stays a source only via `gpt-5.5`. Also
-/// `gpt-4o` → `gpt-4o-mini` for the legacy 4o flagship.
+/// tools, json_mode, prompt_caching; $5/M → $2.50/M input). And `gpt-5.4` →
+/// `gpt-5.4-mini` ($2.50/M → $0.75/M input) — the same-family mini, now present
+/// in the ModelCatalog, so gpt-5.4 traffic gets a down-route too (one tier per
+/// requested model: a gpt-5.5 request still steps only to gpt-5.4, never on to
+/// the mini). Also `gpt-4o` → `gpt-4o-mini` for the legacy 4o flagship.
 ///
 /// Anthropic — `claude-opus-4-7` / `claude-opus-4-8` / `claude-sonnet-4-6`
 /// flagships → `claude-haiku-4-5`.
@@ -43,6 +44,11 @@ const MAPPINGS: &[Mapping] = &[
         provider: "openai",
         sources: &["gpt-5.5"],
         target: "gpt-5.4",
+    },
+    Mapping {
+        provider: "openai",
+        sources: &["gpt-5.4"],
+        target: "gpt-5.4-mini",
     },
     Mapping {
         provider: "openai",
@@ -170,8 +176,9 @@ mod tests {
     fn covers_current_flagship_families() {
         // (provider, source, expected target) — every pair MUST be present.
         let expected: &[(&str, &str, &str)] = &[
-            // OpenAI: current gpt-5.x flagship + legacy 4o flagship.
+            // OpenAI: current gpt-5.x flagship, its mini step, + legacy 4o.
             ("openai", "gpt-5.5", "gpt-5.4"),
+            ("openai", "gpt-5.4", "gpt-5.4-mini"),
             ("openai", "gpt-4o", "gpt-4o-mini"),
             // Anthropic: every current chat flagship → haiku.
             ("anthropic", "claude-opus-4-8", "claude-haiku-4-5"),
