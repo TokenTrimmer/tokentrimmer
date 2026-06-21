@@ -299,6 +299,9 @@ pub struct LegResult {
     /// Terminal outcome of this leg.
     pub status: LegStatus,
     /// The upstream response; `None` when `status != Ok`.
+    ///
+    /// For the [`LegRole::Arbiter`] leg this is always `None` — the arbiter's
+    /// answer is returned in [`PanelResult::response`] instead.
     pub response: Option<ChatCompletionResponse>,
     /// Cost in USD for this leg; `None` when the model has no catalog pricing.
     pub cost_usd: Option<f64>,
@@ -625,12 +628,12 @@ pub async fn run_panel(
         req.model = m.model.clone();
 
         // Substitute the provider-specific credential into the context.
+        // pid is known-present in creds (checked above); clone defensively.
         let mut leg_ctx = ctx.clone();
         if let Some(c) = creds.get(&pid) {
             leg_ctx.credentials = c.clone();
         }
 
-        let idx = i;
         let model_id = m.model.clone();
         set.spawn(async move {
             let started = Instant::now();
@@ -638,7 +641,7 @@ pub async fn run_panel(
                 .await
             {
                 Ok(md) => LegResult {
-                    leg_index: idx,
+                    leg_index: i,
                     role: LegRole::Leg,
                     model: md.response.model.clone(),
                     provider: pid,
@@ -649,7 +652,7 @@ pub async fn run_panel(
                     response: Some(md.response),
                 },
                 Err(_) => LegResult {
-                    leg_index: idx,
+                    leg_index: i,
                     role: LegRole::Leg,
                     model: model_id,
                     provider: pid,
@@ -665,9 +668,29 @@ pub async fn run_panel(
 
     // Collect all completed member legs.
     while let Some(joined) = set.join_next().await {
-        if let Ok(leg) = joined {
-            crate::metrics::record_panel_leg("leg", leg.status.as_str());
-            legs_out.push(leg);
+        match joined {
+            Ok(leg) => {
+                crate::metrics::record_panel_leg("leg", leg.status.as_str());
+                legs_out.push(leg);
+            }
+            Err(e) => {
+                // A spawned task panicked (or was cancelled). Log, record a
+                // metric, and push a synthetic Error leg so quorum counting
+                // stays accurate — a panicked leg must not silently disappear.
+                tracing::error!(error = %e, "panel leg task panicked");
+                crate::metrics::record_panel_leg("leg", LegStatus::Error.as_str());
+                legs_out.push(LegResult {
+                    leg_index: usize::MAX,
+                    role: LegRole::Leg,
+                    model: String::new(),
+                    provider: String::new(),
+                    status: LegStatus::Error,
+                    response: None,
+                    cost_usd: None,
+                    usage: None,
+                    latency_ms: 0,
+                });
+            }
         }
     }
 
