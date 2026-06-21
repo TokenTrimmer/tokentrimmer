@@ -5221,6 +5221,11 @@ fn record_request_span_attributes(
             traffic_split_pct,
             shadow_model,
             shadow_cost_usd,
+            // Single-model dispatch never involves a panel.
+            panel_strategy: None,
+            panel_leg_count: None,
+            panel_quorum_required: None,
+            panel_quorum_met: None,
         },
     );
 }

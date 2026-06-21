@@ -84,6 +84,19 @@ pub const TT_SHADOW_MODEL: &str = "tokentrimmer.shadow_model";
 /// shadow fired.
 pub const TT_SHADOW_COST_USD: &str = "tokentrimmer.shadow_cost_usd";
 
+/// `tokentrimmer.panel.strategy` — the panel arbitration strategy (e.g.
+/// `"synthesize"`). ADDITIVE: omitted on non-panel requests.
+pub const TT_PANEL_STRATEGY: &str = "tokentrimmer.panel.strategy";
+/// `tokentrimmer.panel.leg_count` — total number of legs (member legs +
+/// arbiter leg). ADDITIVE: omitted on non-panel requests.
+pub const TT_PANEL_LEG_COUNT: &str = "tokentrimmer.panel.leg_count";
+/// `tokentrimmer.panel.quorum_required` — minimum number of member legs that
+/// had to succeed. ADDITIVE: omitted on non-panel requests.
+pub const TT_PANEL_QUORUM_REQUIRED: &str = "tokentrimmer.panel.quorum_required";
+/// `tokentrimmer.panel.quorum_met` — number of member legs that actually
+/// succeeded. ADDITIVE: omitted on non-panel requests.
+pub const TT_PANEL_QUORUM_MET: &str = "tokentrimmer.panel.quorum_met";
+
 /// `tokentrimmer.quality.request_id` — trace/request id of the judged request.
 pub const TT_QUALITY_REQUEST_ID: &str = "tokentrimmer.quality.request_id";
 /// `tokentrimmer.quality.requested_model` — originally-requested (expensive) model.
@@ -221,6 +234,18 @@ pub struct RequestSpanAttributes<'a> {
     /// Cost (USD) of the discarded shadow dispatch → `tokentrimmer.shadow_cost_usd`
     /// (omitted when `None` — kept SEPARATE from the primary cost). ADDITIVE.
     pub shadow_cost_usd: Option<f64>,
+    /// Panel arbitration strategy → `tokentrimmer.panel.strategy` (omitted when
+    /// `None`, i.e. non-panel request). ADDITIVE.
+    pub panel_strategy: Option<&'a str>,
+    /// Total leg count (member + arbiter) → `tokentrimmer.panel.leg_count`
+    /// (omitted when `None`). ADDITIVE.
+    pub panel_leg_count: Option<i64>,
+    /// Minimum member legs required → `tokentrimmer.panel.quorum_required`
+    /// (omitted when `None`). ADDITIVE.
+    pub panel_quorum_required: Option<i64>,
+    /// Member legs that succeeded → `tokentrimmer.panel.quorum_met`
+    /// (omitted when `None`). ADDITIVE.
+    pub panel_quorum_met: Option<i64>,
 }
 
 /// Record the GenAI semantic-convention attributes plus TokenTrimmer cost
@@ -276,6 +301,20 @@ pub fn record_request_attributes(span: &Span, attrs: &RequestSpanAttributes<'_>)
     }
     if let Some(shadow_cost) = attrs.shadow_cost_usd {
         span.set_attribute(TT_SHADOW_COST_USD, shadow_cost);
+    }
+    // Panel attributes are ADDITIVE: each is set only when a panel ran.
+    // Non-panel requests carry none of them (off-by-default invariant).
+    if let Some(strategy) = attrs.panel_strategy {
+        span.set_attribute(TT_PANEL_STRATEGY, strategy.to_string());
+    }
+    if let Some(leg_count) = attrs.panel_leg_count {
+        span.set_attribute(TT_PANEL_LEG_COUNT, leg_count);
+    }
+    if let Some(qr) = attrs.panel_quorum_required {
+        span.set_attribute(TT_PANEL_QUORUM_REQUIRED, qr);
+    }
+    if let Some(qm) = attrs.panel_quorum_met {
+        span.set_attribute(TT_PANEL_QUORUM_MET, qm);
     }
 }
 
@@ -434,6 +473,10 @@ mod tests {
                     traffic_split_pct: Some(30),
                     shadow_model: Some("claude-haiku-4-5"),
                     shadow_cost_usd: Some(0.000_9),
+                    panel_strategy: None,
+                    panel_leg_count: None,
+                    panel_quorum_required: None,
+                    panel_quorum_met: None,
                 },
             );
         });
@@ -507,6 +550,10 @@ mod tests {
                     traffic_split_pct: None,
                     shadow_model: None,
                     shadow_cost_usd: None,
+                    panel_strategy: None,
+                    panel_leg_count: None,
+                    panel_quorum_required: None,
+                    panel_quorum_met: None,
                 },
             );
         });
@@ -668,6 +715,10 @@ mod tests {
                     traffic_split_pct: None,
                     shadow_model: None,
                     shadow_cost_usd: None,
+                    panel_strategy: None,
+                    panel_leg_count: None,
+                    panel_quorum_required: None,
+                    panel_quorum_met: None,
                 },
             );
         });

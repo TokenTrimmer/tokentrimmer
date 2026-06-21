@@ -1058,6 +1058,45 @@ pub(crate) async fn complete_panel(
         });
     }
 
+    // ── Record OTel GenAI semconv + panel span attributes on the current
+    //    `http_request` span.  Uses the same `set_attribute` mechanism as the
+    //    single-model path (`record_request_span_attributes` in chat.rs) so no
+    //    tracing-field pre-declaration is needed.  Panel attrs are ADDITIVE —
+    //    non-panel spans carry none of them (off-by-default invariant).
+    {
+        let served = &result.response;
+        tt_telemetry::gen_ai::record_request_attributes(
+            &tracing::Span::current(),
+            &tt_telemetry::gen_ai::RequestSpanAttributes {
+                // Provider sentinel "panel" mirrors the request_logs row.
+                provider_id: "panel",
+                // The caller's originally-requested model is the arbiter model
+                // for a panel (no pre-panel routing rewrites the top-level model).
+                request_model: &arbiter_model,
+                response_model: &arbiter_model,
+                operation: "chat",
+                cost: tt_telemetry::gen_ai::RequestSpanCost {
+                    input_tokens: served.usage.prompt_tokens,
+                    output_tokens: served.usage.completion_tokens,
+                    cost_usd: cost_breakdown.cost_usd,
+                    baseline_cost_usd: cost_breakdown.baseline_cost_usd,
+                    saved_usd: cost_breakdown.tt_saved_usd(),
+                    provider_cache_saved_usd: cost_breakdown.provider_cache_saved_usd,
+                },
+                cache_outcome: Some("none"),
+                route: prep.route_matched_name.as_deref(),
+                traffic_split_pct: None,
+                shadow_model: None,
+                shadow_cost_usd: None,
+                // Panel-specific additive attributes.
+                panel_strategy: Some(cfg.strategy.as_str()),
+                panel_leg_count: Some(result.legs.len() as i64),
+                panel_quorum_required: Some(result.quorum_required as i64),
+                panel_quorum_met: Some(result.quorum_met as i64),
+            },
+        );
+    }
+
     // Inject the `tokentrimmer.panel` attribution object into the body (merged
     // at the serialization boundary in the handler tail; see `panel_body`).
     let panel_body = build_panel_body(&cfg, &result);
