@@ -9,7 +9,11 @@ use std::sync::Arc;
 use tt_auth::{KeyStore, ProviderCredentialStore};
 use tt_cache::{EmbeddingProvider, L1Cache, L2Cache};
 use tt_routing::CachingRoutingStore;
-use tt_telemetry::{body_capture::BodyCaptureWriter, request_logs::RequestLogWriter};
+use tt_telemetry::{
+    body_capture::BodyCaptureWriter,
+    panel_legs::PanelLegWriter,
+    request_logs::RequestLogWriter,
+};
 
 use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
 use crate::failover::CircuitBreaker;
@@ -136,6 +140,11 @@ pub struct AppState {
     /// fire-and-forget INSERT after every response. `None` skips the
     /// telemetry write (tests, dev mode without a DB).
     pub request_log_writer: Option<Arc<dyn RequestLogWriter>>,
+    /// Optional `panel_legs` writer. The panel handler spawns a
+    /// fire-and-forget INSERT (one row per member leg + arbiter) after every
+    /// panel response. `None` skips the per-leg write (tests, dev mode,
+    /// non-panel requests are unaffected regardless).
+    pub panel_leg_writer: Option<Arc<dyn PanelLegWriter>>,
     /// Optional encrypted request/response body-capture writer. Capture is
     /// still controlled per org by `request_body_capture_settings`; wiring this
     /// writer only arms the best-effort sink. The chat handler consults the
@@ -341,6 +350,7 @@ impl AppState {
             key_store: None,
             credential_store: None,
             request_log_writer: None,
+            panel_leg_writer: None,
             body_capture_writer: None,
             routing_store: None,
             verify_cache: Arc::new(KeyVerifyCache::new()),
@@ -615,6 +625,17 @@ impl AppState {
     /// Builder-style attach: enable per-request telemetry rows.
     pub fn with_request_log_writer(mut self, writer: Arc<dyn RequestLogWriter>) -> Self {
         self.request_log_writer = Some(writer);
+        self
+    }
+
+    /// Builder-style attach: enable per-leg panel telemetry rows.
+    ///
+    /// When set, the panel handler writes one `panel_legs` row per member leg
+    /// and one for the arbiter after every panel response. Non-panel requests
+    /// are unaffected. Leaving this unset (default `None`) silently skips the
+    /// per-leg write (tests, dev mode without a DB).
+    pub fn with_panel_leg_writer(mut self, writer: Arc<dyn PanelLegWriter>) -> Self {
+        self.panel_leg_writer = Some(writer);
         self
     }
 
