@@ -284,6 +284,31 @@ fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "expired" | "cancelled")
 }
 
+// ── GET /v1/batches ────────────────────────────────────────────────────────────
+
+/// `GET /v1/batches` — list the org's `batch_jobs` rows (newest-first) as an
+/// OpenAI-compatible list envelope `{"object":"list","data":[<batch>...]}`. Each
+/// item is the SAME shape `GET /v1/batches/{id}` returns (`to_openai_json`), so
+/// list and single-get agree byte-for-byte. Strictly org-scoped — never another
+/// org's batches. No per-row provider refresh: the slice-3 worker is the durable
+/// poller and a list of N batches must not fan out N upstream round-trips.
+pub async fn list_batches(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+) -> ApiResult<Response> {
+    let (org_id, _api_key_id) = require_org(ctx)?;
+    let store = store(&state)?.clone();
+
+    let jobs = store
+        .list(org_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("listing batch jobs: {e}")))?;
+
+    let data: Vec<serde_json::Value> = jobs.iter().map(BatchJob::to_openai_json).collect();
+    let body = serde_json::json!({ "object": "list", "data": data });
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
 // ── POST /v1/batches/{id}/cancel ──────────────────────────────────────────────
 
 /// `POST /v1/batches/{id}/cancel` — cancel the batch upstream via `cancel_batch`

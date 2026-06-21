@@ -109,7 +109,10 @@ pub fn build_router_with_retrieval(
             "/v1/files/:id/content",
             get(routes::batches::download_file_content),
         )
-        .route("/v1/batches", post(routes::batches::create_batch))
+        .route(
+            "/v1/batches",
+            post(routes::batches::create_batch).get(routes::batches::list_batches),
+        )
         .route("/v1/batches/:id", get(routes::batches::get_batch))
         .route(
             "/v1/batches/:id/cancel",

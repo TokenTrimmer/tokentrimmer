@@ -16,7 +16,10 @@ name = "tt_client"
 
 [dependencies]
 tt-shared.workspace = true
-reqwest.workspace = true
+# `multipart` is enabled here (not in the workspace reqwest) because only the
+# Batch input-file upload (`upload_batch_input`) needs it; the rest of the
+# client uses JSON bodies. Mirrors crates/providers/openai/Cargo.toml.
+reqwest = { workspace = true, features = ["multipart"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
