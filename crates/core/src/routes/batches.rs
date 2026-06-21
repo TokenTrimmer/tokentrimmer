@@ -7,7 +7,8 @@
 //! Endpoints (all behind the gateway's normal API-key auth, org-scoped):
 //!
 //! * `POST /v1/files` — multipart upload (`purpose=batch` JSONL) →
-//!   `upload_batch_input` → `{id, object:"file"}`.
+//!   `upload_batch_input` → a complete OpenAI `FileObject`
+//!   (`{id, object:"file", bytes, created_at, filename, purpose, status}`).
 //! * `POST /v1/batches` — `create_batch` → persist a `batch_jobs` row
 //!   (org-scoped) → return the `Batch`.
 //! * `GET /v1/batches/{id}` — read the org's row (best-effort on-demand provider
@@ -128,8 +129,10 @@ async fn batch_ctx(
 // ── POST /v1/files ──────────────────────────────────────────────────────────
 
 /// `POST /v1/files` — accept the multipart upload (`purpose=batch` JSONL) and
-/// proxy it via `upload_batch_input` to the org's OpenAI provider. Returns the
-/// OpenAI-compatible `{id, object:"file", ...}`.
+/// proxy it via `upload_batch_input` to the org's OpenAI provider. Returns a
+/// complete OpenAI-compatible `FileObject` (`id`, `object`, `bytes`,
+/// `created_at`, `filename`, `purpose`, `status`) so the OpenAI SDK's
+/// `files.create` parses it.
 ///
 /// We read the `file` part's bytes off the multipart body in the gateway and
 /// re-emit a fresh multipart to the upstream (the slice-1 client owns the
@@ -149,6 +152,10 @@ pub async fn upload_file(
     let request_ctx = batch_ctx(&state, org_id, api_key_id, &headers).await?;
 
     let mut file_bytes: Option<Vec<u8>> = None;
+    // The multipart filename of the `file` part, surfaced in the FileObject
+    // response so the OpenAI SDK's `FileObject.filename` (a required field)
+    // round-trips. Defaults to `batch.jsonl` when the client omits one.
+    let mut file_name: Option<String> = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -156,6 +163,9 @@ pub async fn upload_file(
     {
         match field.name() {
             Some("file") => {
+                // Capture the filename BEFORE consuming the field's bytes (the
+                // `bytes()` call below moves `field`).
+                file_name = field.file_name().map(str::to_string);
                 let data = field
                     .bytes()
                     .await
@@ -174,15 +184,28 @@ pub async fn upload_file(
         ApiError::InvalidRequest("multipart upload is missing the 'file' part".into())
     })?;
 
+    // Capture the byte length BEFORE `bytes` is moved into the upload call so we
+    // can report it in the FileObject `bytes` field.
+    let byte_len = bytes.len();
+    let filename = file_name.unwrap_or_else(|| "batch.jsonl".to_string());
+
     let file_id = provider
         .upload_batch_input(bytes, &request_ctx)
         .await
         .map_err(ApiError::from)?;
 
+    // Return a complete OpenAI `FileObject` so the OpenAI SDK's `files.create`
+    // can parse it (it requires id, bytes, created_at, filename, object,
+    // purpose, status). `status: "processed"` is the terminal status for a
+    // successfully stored batch input.
     let body = serde_json::json!({
         "id": file_id,
         "object": "file",
+        "bytes": byte_len as u64,
+        "created_at": chrono::Utc::now().timestamp(),
+        "filename": filename,
         "purpose": "batch",
+        "status": "processed",
     });
     Ok((StatusCode::OK, Json(body)).into_response())
 }

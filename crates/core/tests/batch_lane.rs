@@ -14,7 +14,8 @@
 //!   * `GET /v1/batches/{id}` returns the stored row (with on-demand refresh);
 //!   * another org's batch id → 404 (org-scoping);
 //!   * `POST /v1/batches/{id}/cancel` updates the row's status;
-//!   * `POST /v1/files` proxies the multipart upload → `{id, object:"file"}`;
+//!   * `POST /v1/files` proxies the multipart upload → a complete OpenAI
+//!     `FileObject` (`id, object, bytes, created_at, filename, purpose, status`);
 //!   * `GET /v1/files/{id}/content` proxies the result/error JSONL bytes.
 
 use std::sync::Arc;
@@ -494,8 +495,19 @@ async fn upload_file_proxies_multipart_and_returns_file_id() {
     assert_eq!(r.status(), StatusCode::OK);
     upload_mock.assert();
     let v = body_json(r).await;
+    // The gateway re-emits its OWN complete OpenAI FileObject (not the upstream
+    // body): the id is the upstream file id, but bytes/created_at/filename/status
+    // are filled by the gateway so the OpenAI SDK's `FileObject` parses.
     assert_eq!(v["id"], "file-input123");
     assert_eq!(v["object"], "file");
+    assert_eq!(v["purpose"], "batch");
+    assert_eq!(v["status"], "processed");
+    // `bytes` is the byte length of the uploaded `file` part (the JSONL body).
+    assert_eq!(v["bytes"], data.len());
+    // The multipart filename round-trips into `filename`.
+    assert_eq!(v["filename"], "batch.jsonl");
+    // `created_at` is a unix timestamp (a positive integer).
+    assert!(v["created_at"].as_i64().unwrap() > 0);
 }
 
 #[tokio::test]

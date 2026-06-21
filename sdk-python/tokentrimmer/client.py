@@ -204,6 +204,11 @@ class TokenTrimmer(OpenAI):
 
     All ``openai.OpenAI`` constructor parameters are accepted unchanged.
     ``base_url`` defaults to the hosted gateway; override for self-hosted.
+
+    Batch + Files (``client.files.*`` / ``client.batches.*``) are supported via
+    the INHERITED OpenAI surface — the Gateway's ``/v1/files`` + ``/v1/batches``
+    endpoints are OpenAI-compatible, so do NOT reimplement them here (that would
+    shadow the OpenAI typed resources). See ``tests/test_batch.py``.
     """
 
     def __init__(
