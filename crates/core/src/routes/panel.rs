@@ -478,6 +478,69 @@ pub fn strategy_for(
 }
 
 // ---------------------------------------------------------------------------
+// Budget estimation + gate
+// ---------------------------------------------------------------------------
+
+/// Estimated total cost for all panel legs (members + arbiter), in USD.
+///
+/// Sums `estimate_cost_usd × fee_multiplier()` over every member and the
+/// arbiter model.  Returns `None` (fail-closed) if **any** leg resolves to an
+/// unknown model or to a model with no catalog pricing.
+pub fn estimate_panel_cost(
+    state: &AppState,
+    cfg: &PanelConfig,
+    input_tokens: u32,
+    max_tokens: Option<u32>,
+) -> Option<f64> {
+    let mut total = 0.0_f64;
+    for m in cfg.members.iter().chain(std::iter::once(&cfg.arbiter_model)) {
+        let provider = state.registry.resolve(&m.model)?; // unknown model → fail-closed
+        let pricing = provider.pricing(&m.model)?; // unpriceable → fail-closed
+        total += crate::routes::chat::estimate_cost_usd(&pricing, input_tokens, max_tokens)
+            * provider.fee_multiplier();
+    }
+    Some(total)
+}
+
+/// Gate: reject a panel request when it would exceed the allowed cost ceiling.
+///
+/// `ceiling` takes precedence over `cfg.max_cost_usd`.  If neither is set, the
+/// request is **always** rejected — a panel requires an explicit budget.
+///
+/// Returns `Err(ApiError::CostLimitExceeded)` when:
+/// - neither `ceiling` nor `cfg.max_cost_usd` is set (no budget)
+/// - the estimate is `None` (unpriceable / unknown model — fail-closed)
+/// - the estimate exceeds the effective ceiling
+pub fn panel_budget_gate(
+    state: &AppState,
+    cfg: &PanelConfig,
+    input_tokens: u32,
+    max_tokens: Option<u32>,
+    ceiling: Option<f64>,
+) -> Result<(), ApiError> {
+    let ceiling = ceiling
+        .or(cfg.max_cost_usd)
+        .ok_or(ApiError::CostLimitExceeded {
+            estimated_usd: f64::INFINITY,
+            ceiling_usd: 0.0,
+        })?;
+    let est =
+        estimate_panel_cost(state, cfg, input_tokens, max_tokens).ok_or(
+            ApiError::CostLimitExceeded {
+                estimated_usd: f64::INFINITY,
+                ceiling_usd: ceiling,
+            },
+        )?;
+    if est > ceiling {
+        return Err(ApiError::CostLimitExceeded {
+            estimated_usd: est,
+            ceiling_usd: ceiling,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
