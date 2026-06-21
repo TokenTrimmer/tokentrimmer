@@ -23,12 +23,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
+use chrono::Utc;
+use serde_json::json;
+use tt_telemetry::request_logs::RequestLogRow;
+use uuid::Uuid;
 
 use tt_shared::{
     messages::{ChatCompletionRequest, Message, MessageContent, PanelExtras},
     ChatCompletionResponse, RequestContext, Usage,
 };
 
+use crate::routes::chat::{
+    spawn_request_log, CompletionHeaders, CompletionOutcome, CostBreakdown, Prepared,
+};
 use crate::{ApiError, ApiResult, AppState};
 
 // ---------------------------------------------------------------------------
@@ -468,9 +475,7 @@ impl ArbiterStrategy for Synthesize {
 /// Currently only [`ArbiterStrategyKind::Synthesize`] is implemented.
 /// [`ArbiterStrategyKind::BestOfN`] and [`ArbiterStrategyKind::Majority`]
 /// return [`ApiError::PanelStrategyUnsupported`].
-pub fn strategy_for(
-    cfg: &PanelConfig,
-) -> Result<Box<dyn ArbiterStrategy + Send + Sync>, ApiError> {
+pub fn strategy_for(cfg: &PanelConfig) -> Result<Box<dyn ArbiterStrategy + Send + Sync>, ApiError> {
     match cfg.strategy {
         ArbiterStrategyKind::Synthesize => Ok(Box::new(Synthesize {
             arbiter_model: cfg.arbiter_model.clone(),
@@ -497,7 +502,11 @@ pub fn estimate_panel_cost(
     max_tokens: Option<u32>,
 ) -> Option<f64> {
     let mut total = 0.0_f64;
-    for m in cfg.members.iter().chain(std::iter::once(&cfg.arbiter_model)) {
+    for m in cfg
+        .members
+        .iter()
+        .chain(std::iter::once(&cfg.arbiter_model))
+    {
         let provider = state.registry.resolve(&m.model)?; // unknown model → fail-closed
         let pricing = provider.pricing(&m.model)?; // unpriceable → fail-closed
         total += crate::routes::chat::estimate_cost_usd(&pricing, input_tokens, max_tokens)
@@ -528,13 +537,12 @@ pub fn panel_budget_gate(
             estimated_usd: f64::INFINITY,
             ceiling_usd: 0.0,
         })?;
-    let est =
-        estimate_panel_cost(state, cfg, input_tokens, max_tokens).ok_or(
-            ApiError::CostLimitExceeded {
-                estimated_usd: f64::INFINITY,
-                ceiling_usd: ceiling,
-            },
-        )?;
+    let est = estimate_panel_cost(state, cfg, input_tokens, max_tokens).ok_or(
+        ApiError::CostLimitExceeded {
+            estimated_usd: f64::INFINITY,
+            ceiling_usd: ceiling,
+        },
+    )?;
     if est > ceiling {
         return Err(ApiError::CostLimitExceeded {
             estimated_usd: est,
@@ -599,12 +607,13 @@ pub async fn run_panel(
     let mut legs_out: Vec<LegResult> = Vec::new();
 
     for (i, m) in cfg.members.iter().enumerate() {
-        let provider = state
-            .registry
-            .resolve(&m.model)
-            .ok_or_else(|| crate::ApiError::ModelNotFound {
-                model: m.model.clone(),
-            })?;
+        let provider =
+            state
+                .registry
+                .resolve(&m.model)
+                .ok_or_else(|| crate::ApiError::ModelNotFound {
+                    model: m.model.clone(),
+                })?;
         let pid = provider.id().to_string();
 
         if !creds.contains_key(&pid) {
@@ -709,9 +718,7 @@ pub async fn run_panel(
 
     // 3. Arbitrate.
     let strategy = strategy_for(cfg)?;
-    let arb = strategy
-        .arbitrate(base_req, &legs_out, state, ctx)
-        .await?;
+    let arb = strategy.arbitrate(base_req, &legs_out, state, ctx).await?;
 
     let arbiter_provider_id = state
         .registry
@@ -748,6 +755,249 @@ pub async fn run_panel(
         total_cost_usd,
         quorum_required: required,
         quorum_met: met,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// complete_panel — dispatch + aggregate one-row billing
+// ---------------------------------------------------------------------------
+
+/// Build the `tokentrimmer.panel` attribution object for the response body.
+///
+/// Mirrors spec §6.4 step 9: per-leg breakdown + quorum + a `cost_incomplete`
+/// flag set when any **surviving** (status == Ok) leg reported `None` cost (an
+/// unpriceable model makes the recorded aggregate an honest lower bound).
+fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Value {
+    let legs: Vec<serde_json::Value> = result
+        .legs
+        .iter()
+        .map(|l| {
+            let role = match l.role {
+                LegRole::Leg => "leg",
+                LegRole::Arbiter => "arbiter",
+            };
+            // Token attribution from the leg's recorded usage, when present.
+            let tokens = l.usage.as_ref().map(|u| {
+                json!({
+                    "input_tokens": u.prompt_tokens,
+                    "output_tokens": u.completion_tokens,
+                    "cached_tokens": u.cached_tokens,
+                })
+            });
+            json!({
+                "leg_index": l.leg_index,
+                "role": role,
+                "model": l.model,
+                "provider": l.provider,
+                "cost_usd": l.cost_usd,
+                "status": l.status.as_str(),
+                "tokens": tokens,
+            })
+        })
+        .collect();
+
+    // `cost_incomplete`: any surviving leg with no priced cost ⇒ the recorded
+    // aggregate is a lower bound (spec §6.4 step 8).
+    let cost_incomplete = result
+        .legs
+        .iter()
+        .any(|l| l.status == LegStatus::Ok && l.cost_usd.is_none());
+
+    json!({
+        "strategy": cfg.strategy.as_str(),
+        "legs": legs,
+        "total_cost_usd": result.total_cost_usd,
+        "quorum": {
+            "required": result.quorum_required,
+            "met": result.quorum_met,
+        },
+        "cost_incomplete": cost_incomplete,
+    })
+}
+
+/// Build the aggregate [`CostBreakdown`] for a panel: the summed leg + arbiter
+/// cost is the single billable `cost_usd`. The baseline is set EQUAL to the
+/// realized cost — a panel is the service the caller explicitly opted into, so
+/// no routing/cache saving is claimed (`tt_saved_usd()` == 0), and every other
+/// savings/penalty field is zero. This keeps the row's TT headline honest and
+/// invoice-reconcilable: `cost_usd` is the sum, nothing more, nothing less.
+fn aggregate_cost_breakdown(total_cost_usd: f64) -> CostBreakdown {
+    CostBreakdown {
+        cost_usd: total_cost_usd,
+        baseline_cost_usd: total_cost_usd,
+        provider_cache_saved_usd: 0.0,
+        flex_saved_usd: 0.0,
+        compression_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
+        summarizer_tax_usd: 0.0,
+        batch_forgone_usd: 0.0,
+        minify_saved_est_usd: 0.0,
+        diff_saved_usd: 0.0,
+        format_switch_saved_est_usd: 0.0,
+        diff_failed_cost_usd: 0.0,
+    }
+}
+
+/// Complete a deep-research panel request: fan out via [`run_panel`], aggregate
+/// leg + arbiter cost into ONE billable figure, record it with the EXACT
+/// dispatched-path discipline (spend `record` + `settle(false)` once; ONE
+/// `cached=false` `request_logs` row), inject the `tokentrimmer.panel`
+/// attribution object into the response body, and return the same
+/// [`CompletionOutcome::Dispatched`] shape the single-model path returns.
+///
+/// # Billing discipline (invariants §2.1.3/4/5 — replicates `complete_once`'s
+/// dispatched tail VERBATIM, substituting the aggregate cost + `'panel'` stamp)
+/// - **`record_request_served` exactly once:** NOT called here. The chat
+///   `handler` (and the agent-loop consumer) bumps `record_request_served` once
+///   per `CompletionOutcome::Dispatched` in-band — returning `Dispatched`
+///   therefore yields exactly one served increment, identical to the
+///   single-model path (which also leaves the served bump to the consumer).
+/// - **Realized spend recorded exactly once:** one
+///   `spend_sink().record(cost_usd)` followed by one `settle(false)`, mirroring
+///   `complete_once` lines (record then settle-false). `cost_usd` is the
+///   aggregate `total_cost_usd` — NOT recomputed from the arbiter response (that
+///   would drop the legs) and NOT a per-leg double-count (`run_panel` already
+///   summed legs + arbiter via the None-aware fold).
+/// - **One `request_logs` row, `cached = false`:** a single `spawn_request_log`
+///   with `provider = "panel"` (decision-A sentinel), `model =
+///   cfg.arbiter_model.model`, and `cached: false` — so the cloud overage meter
+///   (`COUNT(*) WHERE NOT cached`) and the gateway month-request accumulator
+///   both count the panel as exactly one billable request.
+///
+/// Panels bypass L1/L2 + single-flight entirely (the caller branches here BEFORE
+/// the cache checks in `complete_once`), so there is no cache insert and no
+/// negative-cache interaction to replicate.
+pub(crate) async fn complete_panel(
+    state: &AppState,
+    ctx: &RequestContext,
+    prep: Prepared,
+    cfg: PanelConfig,
+) -> Result<CompletionOutcome, ApiError> {
+    // Per-leg / arbiter deadline: derive from the caller's per-request upstream
+    // timeout when present, else a bounded default. The outer route
+    // `TimeoutLayer` (60 s) caps the whole request regardless.
+    let deadline = prep
+        .request_timeout
+        .unwrap_or_else(|| Duration::from_secs(120));
+
+    // Fan out + arbitrate. A quorum-unmet / strategy-unsupported / unresolved
+    // error propagates via `?` BEFORE any billing side effect — a failed panel
+    // writes NO billable row and advances NO counter, exactly like a failed
+    // single-model dispatch (which returns before the spend/settle/log block).
+    // Panel member credentials were pre-resolved per-provider in `prepare`
+    // (`panel_creds`, spec §6.4 step 4) — NOT `failover_creds`, which is only
+    // populated on a failover route. A member whose provider id is absent here
+    // is recorded by `run_panel` as `skipped_no_cred` (never dispatched/billed).
+    let result = match run_panel(state, ctx, &prep.req, &prep.panel_creds, &cfg, deadline).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Bounded outcome label for the request-level panel counter.
+            let outcome = match &e {
+                ApiError::PanelQuorumUnmet { .. } => "quorum_unmet",
+                ApiError::PanelStrategyUnsupported { .. } => "strategy_unsupported",
+                _ => "error",
+            };
+            crate::metrics::record_panel_request(cfg.strategy.as_str(), outcome);
+            return Err(e);
+        }
+    };
+    crate::metrics::record_panel_request(cfg.strategy.as_str(), "success");
+
+    // Aggregate cost: the single billable figure (legs + arbiter, already summed
+    // None-aware by `run_panel`). `None` (every leg unpriced) books $0 honestly.
+    let total_cost_usd = result.total_cost_usd.unwrap_or(0.0);
+    let cost_breakdown = aggregate_cost_breakdown(total_cost_usd);
+
+    // ── Record realized spend EXACTLY ONCE (mirrors complete_once's dispatched
+    //    tail: `spend_sink().record(...)` then `settle(..., cached=false, ...)`).
+    state
+        .spend_sink()
+        .record(ctx.org_id, ctx.api_key_id, total_cost_usd, Utc::now());
+    state
+        .spend_sink()
+        .settle(ctx.org_id, ctx.api_key_id, false, Utc::now());
+
+    // ── Write EXACTLY ONE `request_logs` row, `cached = false`. Provider is the
+    //    `'panel'` sentinel (decision A: a multi-provider panel is excluded from
+    //    per-provider drift checks rather than misattributed); model is the
+    //    arbiter model. Token counts come from the served (arbiter) response.
+    let served = &result.response;
+    let trace_id = ctx.trace_id;
+    let arbiter_model = cfg.arbiter_model.model.clone();
+    spawn_request_log(
+        state.telemetry_tracker.as_ref(),
+        state.request_log_writer.as_ref(),
+        RequestLogRow {
+            id: Uuid::now_v7(),
+            org_id: ctx.org_id,
+            api_key_id: ctx.api_key_id,
+            ts: Utc::now(),
+            // Decision-A sentinel: one stamped provider for the aggregate row.
+            provider: "panel".to_string(),
+            model: arbiter_model.clone(),
+            input_tokens: served.usage.prompt_tokens as i32,
+            output_tokens: served.usage.completion_tokens as i32,
+            cached_tokens: served.usage.cached_tokens as i32,
+            cost_usd: total_cost_usd,
+            baseline_cost_usd: total_cost_usd,
+            provider_cache_saved_usd: 0.0,
+            cache_bust_penalty_usd: 0.0,
+            // INVARIANT §2.1.5: every panel row is `cached = false` so the cloud
+            // overage meter + month accumulator both count it.
+            cached: false,
+            cache_layer: None,
+            route_id: prep.matched_route_id,
+            latency_ms: prep
+                .request_started
+                .elapsed()
+                .as_millis()
+                .min(i32::MAX as u128) as i32,
+            upstream_latency_ms: None,
+            status: 200,
+            tag: ctx.tag.clone(),
+            error_class: None,
+            trace_id: Some(trace_id.to_string()),
+            truncated: false,
+            // Panels never run the canary shadow / traffic-split / batch / diff /
+            // minify / format-switch levers — all zero/absent.
+            shadow_model: None,
+            shadow_cost_usd: None,
+            traffic_split_arm: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            batch_eligible: false,
+            batch_forgone_usd: 0.0,
+            route_paused: prep.route_paused,
+            minify_saved_est_usd: 0.0,
+            format_switched: None,
+            format_switch_saved_est_usd: 0.0,
+            diff_applied: false,
+            diff_saved_usd: 0.0,
+            diff_failed: false,
+            diff_failed_cost_usd: 0.0,
+            retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
+        },
+    );
+
+    // Inject the `tokentrimmer.panel` attribution object into the body (merged
+    // at the serialization boundary in the handler tail; see `panel_body`).
+    let panel_body = build_panel_body(&cfg, &result);
+
+    Ok(CompletionOutcome::Dispatched {
+        response: result.response,
+        headers: Box::new(CompletionHeaders {
+            trace_id,
+            provider_id: "panel".to_string(),
+            model_used: arbiter_model,
+            cost_breakdown,
+            cache_state: "none",
+            route_matched_name: prep.route_matched_name,
+            body_captured: false,
+            req: prep.req,
+            provider: prep.provider,
+            warnings: prep.warnings,
+            panel_body: Some(panel_body),
+        }),
     })
 }
 
