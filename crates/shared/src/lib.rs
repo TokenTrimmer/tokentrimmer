@@ -9,6 +9,7 @@ pub mod context;
 pub mod dns_guard;
 pub mod error;
 pub mod messages;
+pub mod model_aliases;
 pub mod model_catalog;
 pub mod pricing;
 pub mod provider;

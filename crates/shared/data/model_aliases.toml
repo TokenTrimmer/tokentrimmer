@@ -1,0 +1,25 @@
+# Asserted-identical model aliases — dated-snapshot → floating-alias pairs that
+# TokenTrimmer asserts produce IDENTICAL outputs for identical inputs, so the
+# L1/L2 cache collapses them onto ONE entry instead of fragmenting across
+# snapshots (a pure cache-hit-rate win, no extra provider calls).
+#
+# ⚠️ CORRECTNESS CONTRACT — read before adding a pair:
+#
+#   A dated snapshot and its floating alias are identical ONLY while the alias
+#   currently points at that exact snapshot. Floating aliases ADVANCE over time:
+#   once a provider moves `gpt-4o` to a newer snapshot, `gpt-4o-2024-08-06` and
+#   `gpt-4o` diverge, and the pair below becomes a correctness BUG — a request
+#   pinning `gpt-4o-2024-08-06` (for reproducibility) would be served the newer
+#   model's cached response.
+#
+#   So: add a pair ONLY when you can assert the two are CURRENTLY identical, and
+#   REMOVE it when the provider advances the alias. When in doubt, leave it out —
+#   the default (no pairs) is always correct, just a lower cache-hit rate. The
+#   `canonical` target MUST be a model present in models.toml (a unit test
+#   enforces this).
+#
+# Ships EMPTY by default — operator-curated. Format (uncomment + edit to add):
+#
+#   [[alias]]
+#   snapshot  = "gpt-4o-2024-08-06"
+#   canonical = "gpt-4o"

@@ -24,7 +24,7 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use tt_cache::{key::cache_key, l2_context_text, CacheEntry, L1Entry};
+use tt_cache::{key::cache_key_with, l2_context_text, AliasMapCanonicalizer, CacheEntry, L1Entry};
 use tt_telemetry::{
     body_capture::{BodyCaptureRecord, BodyCaptureWriter},
     request_logs::{RequestLogRow, RequestLogWriter},
@@ -3528,10 +3528,23 @@ async fn handle_streaming(
     }
 }
 
+/// The process-wide model-alias canonicalizer used for cache-key derivation,
+/// built once from the operator-curated `model_aliases.toml`. The map is EMPTY
+/// by default, so this is byte-for-byte identical to the no-op key derivation
+/// until an asserted-identical snapshot→alias pair is configured — at which point
+/// a dated snapshot and its floating alias share one L1/L2 cache entry instead of
+/// fragmenting (a pure hit-rate win; see the correctness contract in the TOML).
+fn alias_canonicalizer() -> &'static AliasMapCanonicalizer {
+    static CANON: std::sync::OnceLock<AliasMapCanonicalizer> = std::sync::OnceLock::new();
+    CANON.get_or_init(|| {
+        AliasMapCanonicalizer::new(tt_shared::model_aliases::model_aliases().clone())
+    })
+}
+
 /// Per-org namespaced L1 cache key. Prepending `org_id` keeps tenants
 /// isolated within a shared Redis instance.
 fn namespaced_l1_key(org_id: Uuid, req: &ChatCompletionRequest) -> String {
-    format!("{}:{}", org_id, cache_key(req))
+    format!("{}:{}", org_id, cache_key_with(req, alias_canonicalizer()))
 }
 
 /// If `req` asks for `response_format: json_schema` but the routed provider
