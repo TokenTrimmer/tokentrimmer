@@ -101,6 +101,91 @@ impl PanelLegWriter for NoopPanelLegWriter {
     }
 }
 
+// ─── Postgres ──────────────────────────────────────────────────────────────
+
+/// Postgres-backed writer, gated by the `postgres` feature.
+#[cfg(feature = "postgres")]
+pub mod postgres {
+    use super::*;
+    use sqlx::PgPool;
+
+    /// Production writer. INSERTs all rows into `panel_legs` in a single
+    /// multi-row statement (one round-trip per batch).
+    #[derive(Clone)]
+    pub struct PostgresPanelLegWriter {
+        pool: PgPool,
+    }
+
+    impl PostgresPanelLegWriter {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    impl std::fmt::Debug for PostgresPanelLegWriter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PostgresPanelLegWriter")
+                .field("pool", &"PgPool { .. }")
+                .finish()
+        }
+    }
+
+    /// Number of columns per row in the `panel_legs` INSERT.
+    /// Must stay in sync with the `push_values` closure and the table schema.
+    pub const INSERT_COLUMN_COUNT: usize = 12;
+
+    #[async_trait]
+    impl PanelLegWriter for PostgresPanelLegWriter {
+        async fn write_legs(&self, rows: Vec<PanelLegRow>) -> Result<(), RequestLogError> {
+            if rows.is_empty() {
+                return Ok(());
+            }
+
+            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO panel_legs \
+                 (request_log_id, leg_index, role, provider, model, \
+                  input_tokens, output_tokens, cached_tokens, \
+                  cost_usd, latency_ms, status, error_class) ",
+            );
+
+            qb.push_values(rows, |mut b, r| {
+                b.push_bind(r.request_log_id) // request_log_id
+                    .push_bind(r.leg_index) // leg_index
+                    .push_bind(r.role) // role
+                    .push_bind(r.provider) // provider
+                    .push_bind(r.model) // model
+                    .push_bind(r.input_tokens) // input_tokens
+                    .push_bind(r.output_tokens) // output_tokens
+                    .push_bind(r.cached_tokens) // cached_tokens
+                    .push_bind(r.cost_usd) // cost_usd
+                    .push_bind(r.latency_ms) // latency_ms
+                    .push_bind(r.status) // status
+                    .push_bind(r.error_class); // error_class
+            });
+
+            qb.build()
+                .execute(&self.pool)
+                .await
+                .map_err(classify_sqlx_error)?;
+            Ok(())
+        }
+    }
+
+    /// Map a `sqlx::Error` to a [`RequestLogError`], splitting TRANSIENT blips
+    /// from TERMINAL failures (mirrors `request_logs::postgres::classify_sqlx_error`).
+    fn classify_sqlx_error(e: sqlx::Error) -> RequestLogError {
+        let transient = matches!(
+            e,
+            sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_)
+        ) || matches!(&e, sqlx::Error::Tls(_));
+        if transient {
+            RequestLogError::Transient(e.to_string())
+        } else {
+            RequestLogError::Storage(e.to_string())
+        }
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -185,5 +270,34 @@ mod tests {
     fn default_is_empty() {
         let w = InMemoryPanelLegWriter::default();
         assert_eq!(w.rows().len(), 0);
+    }
+
+    /// Guard: `INSERT_COLUMN_COUNT` must equal the number of `.push_bind(`
+    /// calls in `PostgresPanelLegWriter::write_legs`. Scans this file's source
+    /// between the `push_values` opening and its closing `});` marker.
+    ///
+    /// A mismatch causes a runtime panic from the QueryBuilder (wrong number of
+    /// values per row). This test catches it without a live Postgres connection.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn push_values_bind_count_matches_insert_column_count() {
+        use crate::panel_legs::postgres::INSERT_COLUMN_COUNT;
+
+        let source = include_str!("panel_legs.rs");
+        let start = source
+            .find("qb.push_values(rows,")
+            .expect("write_legs() must call push_values");
+        let rest = &source[start..];
+        let end = rest
+            .find("});")
+            .expect("push_values closure must end with `});`");
+        let closure = &rest[..end];
+        let bind_calls = closure.matches(".push_bind(").count();
+        assert_eq!(
+            bind_calls, INSERT_COLUMN_COUNT,
+            "push_values closure has {bind_calls} .push_bind( calls but \
+             INSERT_COLUMN_COUNT is {INSERT_COLUMN_COUNT} — a mismatch causes \
+             a runtime panic for every panel_legs INSERT"
+        );
     }
 }
