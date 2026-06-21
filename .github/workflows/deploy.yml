@@ -109,7 +109,7 @@ jobs:
     steps:
       # Check out the exact commit CI validated (workflow_run.head_sha), not
       # main's tip — for workflow_dispatch this falls back to the dispatched ref.
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
@@ -156,7 +156,7 @@ jobs:
     steps:
       # prod is workflow_dispatch-only, so head_sha is empty here and this falls
       # back to the dispatched ref — kept symmetric with staging.
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
