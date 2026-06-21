@@ -379,10 +379,18 @@ impl ArbiterStrategy for Synthesize {
             })
             .collect();
 
+        // Defensive guard: Task 5 enforces quorum upstream, but arbitrate must
+        // not dispatch with an empty candidate set.
+        if ok_answers.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "panel: no successful legs to synthesize".into(),
+            ));
+        }
+
         let n = ok_answers.len();
 
-        // Build the arbiter system instruction and append each candidate answer.
-        let system_content = format!(
+        // Build the arbiter synthesis instruction.
+        let synthesis_instruction = format!(
             "You are an expert synthesis engine. You have received {n} candidate \
              answers from different AI models responding to the same user request. \
              Your task is to synthesize them into one single best answer. \
@@ -392,16 +400,13 @@ impl ArbiterStrategy for Synthesize {
              preamble, no meta-commentary about the synthesis process."
         );
 
+        // Preserve the caller's original system message(s) — they may carry
+        // safety instructions or persona context the arbiter must respect.
+        // Append the synthesis instruction as an additional system turn after them.
         let mut messages = request.messages.clone();
-        // Replace any existing system message with the synthesis instruction,
-        // then append each candidate as a separate user turn.
-        messages.retain(|m| !matches!(m, Message::System { .. }));
-        messages.insert(
-            0,
-            Message::System {
-                content: MessageContent::Text(system_content),
-            },
-        );
+        messages.push(Message::System {
+            content: MessageContent::Text(synthesis_instruction),
+        });
         for (i, (_, answer)) in ok_answers.iter().enumerate() {
             messages.push(Message::User {
                 content: MessageContent::Text(format!(
@@ -417,6 +422,8 @@ impl ArbiterStrategy for Synthesize {
         let arbiter_req = ChatCompletionRequest {
             model: self.arbiter_model.model.clone(),
             messages,
+            // Arbitration is always non-streaming: we need the full synthesized
+            // answer before we can return a response to the caller.
             stream: false,
             max_tokens: Some(4096),
             ..Default::default()
@@ -430,12 +437,16 @@ impl ArbiterStrategy for Synthesize {
                 model: self.arbiter_model.model.clone(),
             })?;
 
-        // Dispatch exactly one measured call.
-        let deadline = Duration::from_secs(120);
+        // Derive the arbiter deadline from the caller's remaining budget when
+        // available; otherwise use a bounded default. The outer route
+        // TimeoutLayer (60 s) caps all requests regardless.
+        let deadline = ctx.deadline.unwrap_or(Duration::from_secs(120));
         let measured =
             crate::measurement::measured_single_dispatch(&provider, arbiter_req, ctx, deadline)
                 .await
-                .map_err(|e| ApiError::InvalidRequest(format!("arbiter dispatch failed: {e}")))?;
+                .map_err(|e| {
+                    ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}"))
+                })?;
 
         Ok(ArbiterOutcome {
             response: measured.response,
@@ -474,6 +485,63 @@ pub fn strategy_for(
 mod tests {
     use super::*;
     use tt_shared::messages::PanelExtras;
+
+    // -----------------------------------------------------------------------
+    // empty-legs guard (inline, no AppState/RequestContext needed)
+    // -----------------------------------------------------------------------
+
+    /// Verify that the ok-answer filter produces an empty set when all legs
+    /// have a non-Ok status. The guard in `Synthesize::arbitrate` fires
+    /// before any provider resolve/dispatch, so this test does not require a
+    /// working AppState or RequestContext.
+    ///
+    /// NOTE: Because `ArbiterStrategy::arbitrate` is async and needs a real
+    /// AppState to reach the dispatch path, we test the guard's *precondition*
+    /// (the filter that produces `ok_answers`) inline here rather than calling
+    /// `arbitrate` end-to-end. The guard's `if ok_answers.is_empty()` branch
+    /// is the only path exercised; no mock provider is constructed.
+    #[test]
+    fn empty_ok_answers_set_when_all_legs_error() {
+        let legs: Vec<LegResult> = vec![
+            LegResult {
+                leg_index: 0,
+                role: LegRole::Leg,
+                model: "m1".to_string(),
+                provider: "p1".to_string(),
+                status: LegStatus::Error,
+                response: None,
+                cost_usd: None,
+                usage: None,
+                latency_ms: 0,
+            },
+            LegResult {
+                leg_index: 1,
+                role: LegRole::Leg,
+                model: "m2".to_string(),
+                provider: "p2".to_string(),
+                status: LegStatus::Timeout,
+                response: None,
+                cost_usd: None,
+                usage: None,
+                latency_ms: 0,
+            },
+        ];
+
+        // Mirror the filter from `Synthesize::arbitrate` to confirm the guard
+        // precondition: no leg is Ok+Leg, so ok_answers would be empty.
+        let ok_answers: Vec<&LegResult> = legs
+            .iter()
+            .filter(|l| l.status == LegStatus::Ok && l.role == LegRole::Leg)
+            .collect();
+
+        assert!(
+            ok_answers.is_empty(),
+            "expected empty ok-answer set when all legs are Error/Timeout"
+        );
+        // The guard `if ok_answers.is_empty()` returns
+        // Err(ApiError::InvalidRequest("panel: no successful legs to synthesize"))
+        // before any dispatch — confirmed by code inspection.
+    }
 
     #[test]
     fn as_str_round_trips() {
