@@ -218,7 +218,16 @@ async fn both_legs_return_three_legs_and_summed_cost() {
     assert!(result.total_cost_usd.is_some(), "cost should be computed");
 
     let total = result.total_cost_usd.unwrap();
-    assert!(total > 0.0, "total cost must be positive, got {total}");
+
+    // Pin the exact expected cost.  The Mock uses input_price=5.0/M and
+    // output_price=15.0/M with prompt_tokens=10 and completion_tokens=10.
+    // Per leg: (10 * 5.0 + 10 * 15.0) / 1_000_000 = 0.0002.
+    // 3 legs (2 member + 1 arbiter) × 0.0002 = 0.0006.
+    let expected: f64 = 0.0006;
+    assert!(
+        (total - expected).abs() < 1e-9,
+        "expected cost {expected}, got {total}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -347,4 +356,195 @@ async fn member_missing_cred_is_skipped() {
         .iter()
         .find(|l| l.role == LegRole::Leg && matches!(l.status, LegStatus::SkippedNoCred));
     assert!(skipped.is_some(), "expected a SkippedNoCred leg");
+}
+
+// ---------------------------------------------------------------------------
+// MockPanic provider — chat_completion panics to exercise JoinSet JoinError
+// ---------------------------------------------------------------------------
+
+struct MockPanic {
+    id: &'static str,
+    model: &'static str,
+}
+
+#[async_trait]
+impl Provider for MockPanic {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model.into(),
+            provider: self.id.into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 4096,
+            max_output_tokens: 4096,
+        }]
+    }
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        if model == self.model {
+            Some(ModelPricing {
+                input_per_million: 5.0,
+                output_per_million: 15.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+    async fn chat_completion(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        panic!("deliberate leg panic");
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: only-panicking member → quorum unmet (does not hang or propagate)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn panicked_only_leg_returns_quorum_unmet() {
+    // tokio::task::JoinSet catches panics as JoinError — the test process does
+    // NOT abort. run_panel must return Err(PanelQuorumUnmet) rather than
+    // propagating the panic or hanging.
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockPanic {
+        id: "mock-provider-panic",
+        model: "mock-panic",
+    }));
+    registry.register(Arc::new(Mock {
+        id: "mock-provider-arbiter",
+        model: "mock-arbiter",
+        input_price: 5.0,
+        output_price: 15.0,
+        fail: false,
+    }));
+
+    let state = AppState::new(registry);
+    let ctx = test_ctx();
+
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert("mock-provider-panic".to_string(), test_creds("key1"));
+
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Synthesize,
+        members: vec![ModelRef {
+            model: "mock-panic".to_string(),
+            provider: None,
+        }],
+        arbiter_model: ModelRef {
+            model: "mock-arbiter".to_string(),
+            provider: None,
+        },
+        quorum: Some(1),
+        max_cost_usd: None,
+    };
+
+    let err = run_panel(&state, &ctx, &base_req(), &creds, &cfg, Duration::from_secs(10))
+        .await
+        .expect_err("panicked-only leg must yield quorum unmet");
+
+    match err {
+        ApiError::PanelQuorumUnmet { required, met } => {
+            assert_eq!(required, 1, "required quorum should be 1");
+            assert_eq!(met, 0, "met quorum should be 0 (panic counts as error)");
+        }
+        other => panic!("expected PanelQuorumUnmet, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: one good leg + one panicking leg + arbiter → Error entry in legs,
+//          quorum_met counts only the good leg
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn panicked_leg_recorded_as_error_good_leg_counts_for_quorum() {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(Mock {
+        id: "mock-provider-good",
+        model: "mock-good",
+        input_price: 5.0,
+        output_price: 15.0,
+        fail: false,
+    }));
+    registry.register(Arc::new(MockPanic {
+        id: "mock-provider-panic",
+        model: "mock-panic",
+    }));
+    registry.register(Arc::new(Mock {
+        id: "mock-provider-arbiter",
+        model: "mock-arbiter",
+        input_price: 5.0,
+        output_price: 15.0,
+        fail: false,
+    }));
+
+    let state = AppState::new(registry);
+    let ctx = test_ctx();
+
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert("mock-provider-good".to_string(), test_creds("key1"));
+    creds.insert("mock-provider-panic".to_string(), test_creds("key2"));
+
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Synthesize,
+        members: vec![
+            ModelRef {
+                model: "mock-good".to_string(),
+                provider: None,
+            },
+            ModelRef {
+                model: "mock-panic".to_string(),
+                provider: None,
+            },
+        ],
+        arbiter_model: ModelRef {
+            model: "mock-arbiter".to_string(),
+            provider: None,
+        },
+        quorum: Some(1), // 1 survivor is enough
+        max_cost_usd: None,
+    };
+
+    let result = run_panel(&state, &ctx, &base_req(), &creds, &cfg, Duration::from_secs(10))
+        .await
+        .expect("run_panel should succeed — 1 good leg meets quorum=1");
+
+    // 1 good member leg + 1 panicked (Error) member leg + 1 arbiter leg = 3 total
+    assert_eq!(result.legs.len(), 3, "good + panicked + arbiter = 3 legs");
+    assert_eq!(result.quorum_met, 1, "only the good leg counts toward quorum");
+
+    // There must be an Error leg in the member results (from the panic).
+    let error_leg = result.legs.iter().find(|l| {
+        l.role == LegRole::Leg && matches!(l.status, LegStatus::Error)
+    });
+    assert!(
+        error_leg.is_some(),
+        "panicked leg must appear as LegStatus::Error, not be silently dropped"
+    );
 }
