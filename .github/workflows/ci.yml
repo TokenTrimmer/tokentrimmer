@@ -161,7 +161,11 @@ jobs:
           toolchain: stable
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo install --locked cargo-about --features cli
+      # Pin the version: an unpinned cargo-about silently re-rendered the file
+      # on unrelated PRs (THIRD-PARTY-LICENSES drift). Pin it to the version the
+      # committed file was generated with so local + CI are deterministic; bump
+      # in lockstep when regenerating.
+      - run: cargo install --locked cargo-about --version 0.9.0 --features cli
       - run: ./scripts/gen-third-party-licenses.sh --check
 
   cargo-audit:
