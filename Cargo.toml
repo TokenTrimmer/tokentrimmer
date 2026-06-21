@@ -165,7 +165,7 @@ tiktoken-rs = "0.12"
 tera = "1.20"
 include_dir = { version = "0.7", features = ["glob"] }
 dialoguer = "0.12"
-toml = "0.8"
+toml = "1.1"
 
 # Internal crate refs.
 # Every entry carries `version` alongside `path` so `cargo publish` can rewrite
