@@ -345,6 +345,33 @@ pub struct LegResult {
 }
 
 // ---------------------------------------------------------------------------
+// ArbiterDetail — per-strategy metadata surfaced in the response body
+// ---------------------------------------------------------------------------
+
+/// Strategy-specific metadata produced during arbitration.
+///
+/// All fields are `None`/`false` for the [`Synthesize`] strategy.
+/// [`BestOfN`] and [`Majority`] (Tasks 2/3) fill in the relevant fields.
+#[derive(Default, Clone, Debug)]
+pub struct ArbiterDetail {
+    /// `best-of-n`: `leg_index` of the chosen answer.
+    pub chosen_leg: Option<usize>,
+    /// `best-of-n`: judge's one-line reason for the choice.
+    pub reason: Option<String>,
+    /// `best-of-n`: `true` when the judge response was unparseable and we fell
+    /// back to the first surviving leg.
+    pub fell_back: bool,
+    /// `majority`: number of legs in the winning cluster.
+    pub winning_cluster_size: Option<usize>,
+    /// `majority`: total number of distinct clusters found.
+    pub total_clusters: Option<usize>,
+    /// `majority`: `true` when every answer was distinct (no majority found).
+    pub no_majority: bool,
+    /// `majority`: `true` when embedding failed and we fell back to first leg.
+    pub degraded: bool,
+}
+
+// ---------------------------------------------------------------------------
 // ArbiterOutcome — the response produced by the arbiter
 // ---------------------------------------------------------------------------
 
@@ -355,6 +382,50 @@ pub struct ArbiterOutcome {
     /// Cost of the arbiter call itself; `None` when unpriced (see
     /// [`crate::measurement::MeasuredDispatch::cost_usd`]).
     pub cost_usd: Option<f64>,
+    /// Strategy-specific metadata (all `None`/`false` for [`Synthesize`]).
+    pub detail: ArbiterDetail,
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the text answers from all successful member legs, in slice order.
+///
+/// Returns `(position_in_legs_slice, answer_text)` pairs so callers can trace
+/// back to the original [`LegResult`] via `legs[pos]`.  Only legs with
+/// `status == Ok` and `role == Leg` that carry a [`MessageContent::Text`]
+/// assistant message are included.
+pub fn surviving_answers(legs: &[LegResult]) -> Vec<(usize, String)> {
+    legs.iter()
+        .enumerate()
+        .filter(|(_, l)| l.status == LegStatus::Ok && l.role == LegRole::Leg)
+        .filter_map(|(pos, l)| {
+            let resp = l.response.as_ref()?;
+            let text = resp.choices.first().and_then(|c| match &c.message {
+                Message::Assistant {
+                    content: Some(MessageContent::Text(t)),
+                    ..
+                } => Some(t.clone()),
+                _ => None,
+            })?;
+            Some((pos, text))
+        })
+        .collect()
+}
+
+/// Cosine similarity between two vectors.
+///
+/// Returns `0.0` when either vector has zero norm (avoids division by zero).
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,21 +476,7 @@ impl ArbiterStrategy for Synthesize {
         creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     ) -> Result<ArbiterOutcome, ApiError> {
         // Collect the text content of all successful legs.
-        let ok_answers: Vec<(usize, String)> = legs
-            .iter()
-            .filter(|l| l.status == LegStatus::Ok && l.role == LegRole::Leg)
-            .filter_map(|l| {
-                let resp = l.response.as_ref()?;
-                let text = resp.choices.first().and_then(|c| match &c.message {
-                    Message::Assistant {
-                        content: Some(MessageContent::Text(t)),
-                        ..
-                    } => Some(t.clone()),
-                    _ => None,
-                })?;
-                Some((l.leg_index, text))
-            })
-            .collect();
+        let ok_answers = surviving_answers(legs);
 
         // Defensive guard: Task 5 enforces quorum upstream, but arbitrate must
         // not dispatch with an empty candidate set.
@@ -504,6 +561,7 @@ impl ArbiterStrategy for Synthesize {
         Ok(ArbiterOutcome {
             response: measured.response,
             cost_usd: measured.cost_usd,
+            detail: ArbiterDetail::default(),
         })
     }
 }
