@@ -121,9 +121,7 @@ pub async fn post_preview(
         // within_budget: None when no ceiling supplied; false when total is None
         // (fail-closed) or when total exceeds ceiling.
         let within_budget: Option<bool> = ceiling.map(|c| {
-            total_estimated_cost_usd
-                .map(|t| t <= c)
-                .unwrap_or(false) // unpriceable ⇒ false (fail-closed)
+            total_estimated_cost_usd.map(|t| t <= c).unwrap_or(false) // unpriceable ⇒ false (fail-closed)
         });
 
         // Build the panel estimate JSON object.

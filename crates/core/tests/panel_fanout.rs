@@ -724,9 +724,16 @@ async fn arbiter_cross_provider_creds_and_latency() {
         max_cost_usd: None,
     };
 
-    let result = run_panel(&state, &ctx, &base_req(), &creds, &cfg, Duration::from_secs(10))
-        .await
-        .expect("run_panel should succeed with cross-provider arbiter cred");
+    let result = run_panel(
+        &state,
+        &ctx,
+        &base_req(),
+        &creds,
+        &cfg,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("run_panel should succeed with cross-provider arbiter cred");
 
     // (a) Arbiter leg was dispatched — verify it exists and succeeded.
     let arbiter_leg = result
