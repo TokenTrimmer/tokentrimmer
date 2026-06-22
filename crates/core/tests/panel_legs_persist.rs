@@ -274,3 +274,217 @@ async fn happy_panel_writes_one_billing_row_and_three_leg_rows() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// MockPanic provider — panics in chat_completion; JoinSet catches as JoinError
+// ---------------------------------------------------------------------------
+
+/// A mock provider whose `chat_completion` panics unconditionally. The
+/// `tokio::task::JoinSet` in `panel_fanout.rs` catches the panic as a
+/// `JoinError` — the process does NOT abort and the test keeps running.
+struct PanicMock {
+    id: &'static str,
+    model: &'static str,
+}
+
+#[async_trait]
+impl Provider for PanicMock {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model.into(),
+            provider: self.id.into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 4096,
+            max_output_tokens: 4096,
+        }]
+    }
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        if model == self.model {
+            Some(ModelPricing {
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: chrono::Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+    async fn chat_completion(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        panic!("deliberate leg panic in panel_legs_persist");
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App builder for panic test
+// ---------------------------------------------------------------------------
+
+/// Build a router with:
+/// - Panel kill-switch ON.
+/// - Member 0: panicking provider ("vendor-panic" / "model-panic").
+/// - Member 1: normal priced provider ("vendor-ok" / "model-ok") — also
+///   serves as the arbiter so quorum=1 is achievable.
+/// - Both writers wired + a TaskTracker for deterministic draining.
+fn app_with_panic_member() -> (
+    axum::Router,
+    Arc<InMemoryRequestLogWriter>,
+    Arc<InMemoryPanelLegWriter>,
+    TaskTracker,
+) {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(PanicMock {
+        id: "vendor-panic",
+        model: "model-panic",
+    }));
+    registry.register(Arc::new(PricedMock {
+        id: "vendor-ok",
+        model: "model-ok",
+    }));
+    let log_writer = Arc::new(InMemoryRequestLogWriter::new());
+    let leg_writer = Arc::new(InMemoryPanelLegWriter::new());
+    let tracker = TaskTracker::new();
+    let state = AppState::new(registry)
+        .with_panel_enabled(true)
+        .with_request_log_writer(log_writer.clone())
+        .with_panel_leg_writer(leg_writer.clone())
+        .with_telemetry_tracker(tracker.clone());
+    (build_router(state), log_writer, leg_writer, tracker)
+}
+
+// ---------------------------------------------------------------------------
+// Test: panicked member leg — no usize::MAX sentinel leaks into persisted rows
+// ---------------------------------------------------------------------------
+
+/// Guards the invariant that the `usize::MAX` sentinel used internally for a
+/// panicked `LegResult.leg_index` NEVER leaks into the persisted `panel_legs`
+/// rows. The `complete_panel` enumeration loop assigns indices from the output
+/// slice order (`enumerate()`), so every row must have a contiguous i32 index
+/// in `0..N` even when one member panicked.
+///
+/// Panel config: one panicking member + one normal member (quorum=1 met by the
+/// normal leg) + arbiter from the normal provider.  Panel returns 200 OK with
+/// synthesized response.
+#[tokio::test]
+async fn panicked_member_leg_index_is_contiguous_not_sentinel() {
+    let (app, log_writer, leg_writer, tracker) = app_with_panic_member();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        // Generous ceiling so the budget gate passes.
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            json!({
+                "model": "model-ok",
+                "messages": [{ "role": "user", "content": "deep question" }],
+                "stream": false,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["model-panic", "model-ok"],
+                        "arbiter_model": "model-ok"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "panel with one panicking member and quorum=1 must return 200"
+    );
+    // Consume the body.
+    let _ = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+
+    // Drain all fire-and-forget telemetry writes (including the leg write now
+    // routed through the tracker by Fix 1).
+    tracker.close();
+    tracker.wait().await;
+
+    // ── Billing row: exactly one, unchanged ──────────────────────────────────
+    let log_rows = log_writer.rows();
+    assert_eq!(
+        log_rows.len(),
+        1,
+        "INVARIANT: exactly ONE request_logs row per panel request, got {}",
+        log_rows.len()
+    );
+
+    // ── Leg rows: contiguous indices, no sentinel leakage ───────────────────
+    let leg_rows = leg_writer.rows();
+    let n = leg_rows.len() as i32;
+    assert!(n >= 2, "must have at least 2 leg rows (one error + arbiter), got {n}");
+
+    let mut indices: Vec<i32> = leg_rows.iter().map(|r| r.leg_index).collect();
+    indices.sort_unstable();
+    let expected: Vec<i32> = (0..n).collect();
+    assert_eq!(
+        indices, expected,
+        "leg_index values must be contiguous 0..N, got {indices:?}"
+    );
+
+    // Explicitly guard against known sentinel values leaking through.
+    for row in &leg_rows {
+        assert_ne!(
+            row.leg_index,
+            i32::MAX,
+            "i32::MAX sentinel must NOT appear in persisted leg_index (leg role={})",
+            row.role
+        );
+        assert_ne!(
+            row.leg_index, -1,
+            "-1 must NOT appear in persisted leg_index (leg role={})",
+            row.role
+        );
+    }
+
+    // ── There must be exactly one error leg (from the panic) ─────────────────
+    let error_legs: Vec<_> = leg_rows.iter().filter(|r| r.status == "error").collect();
+    assert_eq!(
+        error_legs.len(),
+        1,
+        "panicked member must produce exactly one 'error' leg row, got {}",
+        error_legs.len()
+    );
+
+    // ── There must be exactly one arbiter row ────────────────────────────────
+    let arbiter_legs: Vec<_> = leg_rows.iter().filter(|r| r.role == "arbiter").collect();
+    assert_eq!(
+        arbiter_legs.len(),
+        1,
+        "must have exactly one arbiter row, got {}",
+        arbiter_legs.len()
+    );
+}
