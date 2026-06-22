@@ -10,13 +10,14 @@ use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
 use uuid::Uuid;
 
+use tt_cache::embed::{EmbedError, EmbeddingProvider};
 use tt_core::{
     routes::panel::{
         cosine, strategy_for, surviving_answers, ArbiterDetail, ArbiterStrategy,
-        ArbiterStrategyKind, BestOfN, LegResult, LegRole, LegStatus, ModelRef, PanelConfig,
-        PanelDefaults,
+        ArbiterStrategyKind, BestOfN, LegResult, LegRole, LegStatus, Majority, ModelRef,
+        PanelConfig, PanelDefaults,
     },
-    ApiError, AppState, ProviderRegistry,
+    AppState, ProviderRegistry,
 };
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
@@ -77,14 +78,14 @@ fn strategy_for_best_of_n_returns_ok() {
 }
 
 #[test]
-fn strategy_for_majority_is_unsupported() {
+fn strategy_for_majority_returns_ok() {
     let cfg = cfg_for(ArbiterStrategyKind::Majority);
     let result = strategy_for(&cfg);
-    match result {
-        Err(ApiError::PanelStrategyUnsupported { ref strategy }) if strategy == "majority" => {}
-        Err(e) => panic!("expected PanelStrategyUnsupported(majority), got Err({e:?})"),
-        Ok(_) => panic!("expected Err, got Ok"),
-    }
+    assert!(
+        result.is_ok(),
+        "expected Ok(Majority), got Err: {:?}",
+        result.err()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +394,233 @@ async fn best_of_n_judge_picks_candidate_2() {
     assert!(
         !outcome.detail.fell_back,
         "fell_back must be false when judge response is valid"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mock EmbeddingProvider for Majority tests
+// ---------------------------------------------------------------------------
+
+/// A deterministic embedding mock that maps specific texts to fixed vectors.
+/// Any text not in the map returns an error (configurable via `fail_unknown`).
+struct MapEmbedder {
+    /// Text → embedding vector mapping.
+    map: HashMap<&'static str, Vec<f32>>,
+    /// When `true`, any text not found in `map` returns `EmbedError::EmptyInput`.
+    fail_unknown: bool,
+}
+
+impl MapEmbedder {
+    fn new(entries: Vec<(&'static str, Vec<f32>)>) -> Self {
+        Self {
+            map: entries.into_iter().collect(),
+            fail_unknown: false,
+        }
+    }
+
+    fn always_failing() -> Self {
+        Self {
+            map: HashMap::new(),
+            fail_unknown: true,
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for MapEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        if let Some(v) = self.map.get(text) {
+            Ok(v.clone())
+        } else if self.fail_unknown {
+            Err(EmbedError::EmptyInput)
+        } else {
+            // Return zero vector for unknown texts (deterministic fallback).
+            Err(EmbedError::EmptyInput)
+        }
+    }
+
+    fn model(&self) -> &str {
+        "map-embedder-v1"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Majority tests
+// ---------------------------------------------------------------------------
+
+/// Build an AppState with L2 wired to the given embedder (no real L2 cache
+/// needed for Majority — only the embedder field is consulted).
+fn state_with_embedder(embedder: impl EmbeddingProvider + 'static) -> AppState {
+    use tt_cache::InMemoryL2Cache;
+
+    let registry = ProviderRegistry::new();
+    let l2_cache = Arc::new(InMemoryL2Cache::new());
+    let arc_embedder: Arc<dyn EmbeddingProvider> = Arc::new(embedder);
+    AppState::new(registry).with_l2(l2_cache, arc_embedder, None)
+}
+
+/// 4 legs: A,B,C embed near-identically (cosine ≥ 0.83 to each other),
+/// D is orthogonal. The winning cluster must be {A,B,C}, size == 3,
+/// and the returned response text is one of "Answer A", "Answer B", "Answer C".
+#[tokio::test]
+async fn majority_cluster_of_three_wins() {
+    // Vectors: A,B,C are clustered; D is orthogonal.
+    // cosine([1.0,0.0,0.0],[0.99,0.01,0.0]) ≈ 0.9999
+    // cosine([1.0,0.0,0.0],[0.98,0.0,0.02]) ≈ 0.9998
+    // cosine([0.99,0.01,0.0],[0.98,0.0,0.02]) ≈ 0.9999
+    // All well above 0.83 threshold → same cluster.
+    let embedder = MapEmbedder::new(vec![
+        ("Answer A", vec![1.0_f32, 0.0, 0.0]),
+        ("Answer B", vec![0.99_f32, 0.01, 0.0]),
+        ("Answer C", vec![0.98_f32, 0.0, 0.02]),
+        ("Answer D", vec![0.0_f32, 0.0, 1.0]),
+    ]);
+
+    let state = state_with_embedder(embedder);
+    let ctx = test_ctx();
+    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+
+    let legs = vec![
+        make_ok_leg(0, "Answer A"),
+        make_ok_leg(1, "Answer B"),
+        make_ok_leg(2, "Answer C"),
+        make_ok_leg(3, "Answer D"),
+    ];
+
+    let outcome = Majority
+        .arbitrate(&base_req(), &legs, &state, &ctx, &creds)
+        .await
+        .expect("Majority should succeed with a 3-cluster winner");
+
+    assert_eq!(
+        outcome.detail.winning_cluster_size,
+        Some(3),
+        "winning cluster should have 3 members (A, B, C)"
+    );
+    assert!(
+        !outcome.detail.no_majority,
+        "no_majority must be false when there is a cluster of 3"
+    );
+    assert!(!outcome.detail.degraded, "degraded must be false");
+
+    let returned_text = outcome
+        .response
+        .choices
+        .first()
+        .and_then(|c| match &c.message {
+            Message::Assistant {
+                content: Some(MessageContent::Text(t)),
+                ..
+            } => Some(t.clone()),
+            _ => None,
+        })
+        .expect("Majority must return a response with assistant text");
+
+    assert!(
+        returned_text == "Answer A" || returned_text == "Answer B" || returned_text == "Answer C",
+        "returned text must be from the winning cluster (A, B, or C), got: {returned_text}"
+    );
+}
+
+/// 3 mutually-orthogonal vectors: no two have cosine ≥ 0.83.
+/// All clusters have size 1 → no_majority == true.
+/// The returned response must be a real leg (global medoid, but any is fine
+/// since all sims are zero).
+#[tokio::test]
+async fn majority_no_majority_with_orthogonal_vectors() {
+    let embedder = MapEmbedder::new(vec![
+        ("Answer X", vec![1.0_f32, 0.0, 0.0]),
+        ("Answer Y", vec![0.0_f32, 1.0, 0.0]),
+        ("Answer Z", vec![0.0_f32, 0.0, 1.0]),
+    ]);
+
+    let state = state_with_embedder(embedder);
+    let ctx = test_ctx();
+    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+
+    let legs = vec![
+        make_ok_leg(0, "Answer X"),
+        make_ok_leg(1, "Answer Y"),
+        make_ok_leg(2, "Answer Z"),
+    ];
+
+    let outcome = Majority
+        .arbitrate(&base_req(), &legs, &state, &ctx, &creds)
+        .await
+        .expect("Majority should succeed even with no clear majority");
+
+    assert!(
+        outcome.detail.no_majority,
+        "no_majority must be true when all vectors are orthogonal"
+    );
+    assert_eq!(
+        outcome.detail.winning_cluster_size,
+        Some(1),
+        "winning cluster size must be 1 (all distinct)"
+    );
+    assert!(!outcome.detail.degraded, "degraded must be false");
+
+    // Must return one of the real legs.
+    let returned_text = outcome
+        .response
+        .choices
+        .first()
+        .and_then(|c| match &c.message {
+            Message::Assistant {
+                content: Some(MessageContent::Text(t)),
+                ..
+            } => Some(t.clone()),
+            _ => None,
+        })
+        .expect("Majority must return a response with assistant text even on no-majority");
+
+    assert!(
+        returned_text == "Answer X" || returned_text == "Answer Y" || returned_text == "Answer Z",
+        "returned text must be one of the legs, got: {returned_text}"
+    );
+}
+
+/// When the embedder returns an error, Majority must fall back to the first
+/// leg and set `detail.degraded == true`.
+#[tokio::test]
+async fn majority_embed_error_falls_back_degraded() {
+    let embedder = MapEmbedder::always_failing();
+    let state = state_with_embedder(embedder);
+    let ctx = test_ctx();
+    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+
+    let legs = vec![
+        make_ok_leg(0, "First answer"),
+        make_ok_leg(1, "Second answer"),
+        make_ok_leg(2, "Third answer"),
+    ];
+
+    let outcome = Majority
+        .arbitrate(&base_req(), &legs, &state, &ctx, &creds)
+        .await
+        .expect("Majority should not error on embed failure — it should degrade");
+
+    assert!(
+        outcome.detail.degraded,
+        "degraded must be true when embedding fails"
+    );
+
+    let returned_text = outcome
+        .response
+        .choices
+        .first()
+        .and_then(|c| match &c.message {
+            Message::Assistant {
+                content: Some(MessageContent::Text(t)),
+                ..
+            } => Some(t.clone()),
+            _ => None,
+        })
+        .expect("Majority must return a response even on embed failure");
+
+    assert_eq!(
+        returned_text, "First answer",
+        "must fall back to first surviving leg on embed error"
     );
 }
 

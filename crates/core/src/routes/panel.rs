@@ -729,12 +729,205 @@ impl ArbiterStrategy for BestOfN {
 }
 
 // ---------------------------------------------------------------------------
+// Majority — embedding clustering, returns medoid leg verbatim
+// ---------------------------------------------------------------------------
+
+/// The **Majority** strategy: embed all surviving leg answers, cluster them by
+/// cosine similarity, pick the largest cluster (tie-break: earliest), and return
+/// the cluster's medoid response verbatim — no paraphrasing or synthesis.
+///
+/// When embedding fails, falls back to the first surviving leg and sets
+/// `detail.degraded = true`. When no cluster has more than one member
+/// (all answers are distinct), the global medoid (highest mean cosine to all
+/// others) is returned and `detail.no_majority = true`.
+///
+/// The clustering threshold defaults to `0.83` and can be overridden via the
+/// `TT_PANEL_MAJORITY_THRESHOLD` environment variable (float in `(0.0, 1.0]`).
+pub struct Majority;
+
+#[async_trait]
+impl ArbiterStrategy for Majority {
+    async fn arbitrate(
+        &self,
+        _request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        _ctx: &RequestContext,
+        _creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) -> Result<ArbiterOutcome, ApiError> {
+        let answers = surviving_answers(legs);
+
+        // Empty case — no surviving legs.
+        if answers.is_empty() {
+            return Err(ApiError::InvalidRequest("panel: no successful legs".into()));
+        }
+
+        // Single answer — no clustering needed.
+        if answers.len() == 1 {
+            return Ok(ArbiterOutcome {
+                response: legs[answers[0].0]
+                    .response
+                    .clone()
+                    .expect("surviving_answers guarantees response"),
+                cost_usd: None,
+                detail: ArbiterDetail {
+                    winning_cluster_size: Some(1),
+                    total_clusters: Some(1),
+                    ..Default::default()
+                },
+            });
+        }
+
+        // Resolve the embedder from the L2 config.
+        let embedder = match state.l2.as_ref().map(|l| &l.embedder) {
+            Some(e) => e,
+            None => {
+                // No embedder wired → degrade to first leg.
+                return Ok(ArbiterOutcome {
+                    response: legs[answers[0].0]
+                        .response
+                        .clone()
+                        .expect("surviving_answers guarantees response"),
+                    cost_usd: None,
+                    detail: ArbiterDetail {
+                        degraded: true,
+                        ..Default::default()
+                    },
+                });
+            }
+        };
+
+        // Embed all answers; return on first error (degrade to first leg).
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(answers.len());
+        for (_, text) in &answers {
+            match embedder.embed(text).await {
+                Ok(v) => vecs.push(v),
+                Err(_) => {
+                    return Ok(ArbiterOutcome {
+                        response: legs[answers[0].0]
+                            .response
+                            .clone()
+                            .expect("surviving_answers guarantees response"),
+                        cost_usd: None,
+                        detail: ArbiterDetail {
+                            degraded: true,
+                            ..Default::default()
+                        },
+                    });
+                }
+            }
+        }
+
+        // Threshold (env-overridable, default 0.83).
+        let t = std::env::var("TT_PANEL_MAJORITY_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|x| *x > 0.0 && *x <= 1.0)
+            .unwrap_or(0.83);
+
+        // Greedy clustering: assign each answer to the first cluster whose
+        // representative (first member) has cosine ≥ t with this answer.
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for k in 0..answers.len() {
+            let mut assigned = false;
+            for cluster in &mut clusters {
+                let rep = cluster[0];
+                if cosine(&vecs[k], &vecs[rep]) >= t {
+                    cluster.push(k);
+                    assigned = true;
+                    break;
+                }
+            }
+            if !assigned {
+                clusters.push(vec![k]);
+            }
+        }
+
+        // Winner = largest cluster; tie-break by earliest first-element index
+        // (smallest cluster-creation order = stable, deterministic).
+        let winner_idx = clusters
+            .iter()
+            .enumerate()
+            .max_by(|(ai, a), (bi, b)| {
+                // Larger len wins; on tie prefer smaller cluster index (earlier).
+                a.len().cmp(&b.len()).then_with(|| bi.cmp(ai))
+            })
+            .map(|(i, _)| i)
+            .expect("clusters is non-empty (answers.len() >= 2)");
+
+        let winner = &clusters[winner_idx];
+        let no_majority = winner.len() == 1;
+
+        // Medoid selection:
+        // - no_majority → global medoid (highest mean cosine to ALL others)
+        // - majority    → winner medoid (highest mean cosine to other WINNER members)
+        let medoid = if no_majority {
+            // Global medoid: answer with highest mean cosine to all others.
+            (0..answers.len())
+                .max_by(|&a, &b| {
+                    let mean_cos = |idx: usize| -> f32 {
+                        let others: Vec<f32> = (0..answers.len())
+                            .filter(|&j| j != idx)
+                            .map(|j| cosine(&vecs[idx], &vecs[j]))
+                            .collect();
+                        if others.is_empty() {
+                            0.0
+                        } else {
+                            others.iter().sum::<f32>() / others.len() as f32
+                        }
+                    };
+                    mean_cos(a)
+                        .partial_cmp(&mean_cos(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0)
+        } else if winner.len() == 1 {
+            winner[0]
+        } else {
+            // Winner medoid: highest mean cosine to other winner members.
+            *winner
+                .iter()
+                .max_by(|&&a, &&b| {
+                    let mean_cos = |idx: usize| -> f32 {
+                        let others: Vec<f32> = winner
+                            .iter()
+                            .filter(|&&j| j != idx)
+                            .map(|&j| cosine(&vecs[idx], &vecs[j]))
+                            .collect();
+                        if others.is_empty() {
+                            0.0
+                        } else {
+                            others.iter().sum::<f32>() / others.len() as f32
+                        }
+                    };
+                    mean_cos(a)
+                        .partial_cmp(&mean_cos(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(&winner[0])
+        };
+
+        Ok(ArbiterOutcome {
+            response: legs[answers[medoid].0]
+                .response
+                .clone()
+                .expect("surviving_answers guarantees response"),
+            cost_usd: None,
+            detail: ArbiterDetail {
+                winning_cluster_size: Some(winner.len()),
+                total_clusters: Some(clusters.len()),
+                no_majority,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // strategy_for — factory
 // ---------------------------------------------------------------------------
 
 /// Instantiate the correct [`ArbiterStrategy`] for the given [`PanelConfig`].
-///
-/// [`ArbiterStrategyKind::Majority`] is not yet implemented.
 pub fn strategy_for(cfg: &PanelConfig) -> Result<Box<dyn ArbiterStrategy + Send + Sync>, ApiError> {
     match cfg.strategy {
         ArbiterStrategyKind::Synthesize => Ok(Box::new(Synthesize {
@@ -743,9 +936,7 @@ pub fn strategy_for(cfg: &PanelConfig) -> Result<Box<dyn ArbiterStrategy + Send 
         ArbiterStrategyKind::BestOfN => Ok(Box::new(BestOfN {
             arbiter_model: cfg.arbiter_model.clone(),
         })),
-        other => Err(ApiError::PanelStrategyUnsupported {
-            strategy: other.as_str().to_string(),
-        }),
+        ArbiterStrategyKind::Majority => Ok(Box::new(Majority)),
     }
 }
 
