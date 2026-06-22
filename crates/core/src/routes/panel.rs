@@ -345,6 +345,33 @@ pub struct LegResult {
 }
 
 // ---------------------------------------------------------------------------
+// ArbiterDetail — per-strategy metadata surfaced in the response body
+// ---------------------------------------------------------------------------
+
+/// Strategy-specific metadata produced during arbitration.
+///
+/// All fields are `None`/`false` for the [`Synthesize`] strategy.
+/// [`BestOfN`] and [`Majority`] (Tasks 2/3) fill in the relevant fields.
+#[derive(Default, Clone, Debug)]
+pub struct ArbiterDetail {
+    /// `best-of-n`: `leg_index` of the chosen answer.
+    pub chosen_leg: Option<usize>,
+    /// `best-of-n`: judge's one-line reason for the choice.
+    pub reason: Option<String>,
+    /// `best-of-n`: `true` when the judge response was unparseable and we fell
+    /// back to the first surviving leg.
+    pub fell_back: bool,
+    /// `majority`: number of legs in the winning cluster.
+    pub winning_cluster_size: Option<usize>,
+    /// `majority`: total number of distinct clusters found.
+    pub total_clusters: Option<usize>,
+    /// `majority`: `true` when every answer was distinct (no majority found).
+    pub no_majority: bool,
+    /// `majority`: `true` when embedding failed and we fell back to first leg.
+    pub degraded: bool,
+}
+
+// ---------------------------------------------------------------------------
 // ArbiterOutcome — the response produced by the arbiter
 // ---------------------------------------------------------------------------
 
@@ -355,6 +382,50 @@ pub struct ArbiterOutcome {
     /// Cost of the arbiter call itself; `None` when unpriced (see
     /// [`crate::measurement::MeasuredDispatch::cost_usd`]).
     pub cost_usd: Option<f64>,
+    /// Strategy-specific metadata (all `None`/`false` for [`Synthesize`]).
+    pub detail: ArbiterDetail,
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the text answers from all successful member legs, in slice order.
+///
+/// Returns `(position_in_legs_slice, answer_text)` pairs so callers can trace
+/// back to the original [`LegResult`] via `legs[pos]`.  Only legs with
+/// `status == Ok` and `role == Leg` that carry a [`MessageContent::Text`]
+/// assistant message are included.
+pub fn surviving_answers(legs: &[LegResult]) -> Vec<(usize, String)> {
+    legs.iter()
+        .enumerate()
+        .filter(|(_, l)| l.status == LegStatus::Ok && l.role == LegRole::Leg)
+        .filter_map(|(pos, l)| {
+            let resp = l.response.as_ref()?;
+            let text = resp.choices.first().and_then(|c| match &c.message {
+                Message::Assistant {
+                    content: Some(MessageContent::Text(t)),
+                    ..
+                } => Some(t.clone()),
+                _ => None,
+            })?;
+            Some((pos, text))
+        })
+        .collect()
+}
+
+/// Cosine similarity between two vectors.
+///
+/// Returns `0.0` when either vector has zero norm (avoids division by zero).
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,21 +476,7 @@ impl ArbiterStrategy for Synthesize {
         creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     ) -> Result<ArbiterOutcome, ApiError> {
         // Collect the text content of all successful legs.
-        let ok_answers: Vec<(usize, String)> = legs
-            .iter()
-            .filter(|l| l.status == LegStatus::Ok && l.role == LegRole::Leg)
-            .filter_map(|l| {
-                let resp = l.response.as_ref()?;
-                let text = resp.choices.first().and_then(|c| match &c.message {
-                    Message::Assistant {
-                        content: Some(MessageContent::Text(t)),
-                        ..
-                    } => Some(t.clone()),
-                    _ => None,
-                })?;
-                Some((l.leg_index, text))
-            })
-            .collect();
+        let ok_answers = surviving_answers(legs);
 
         // Defensive guard: Task 5 enforces quorum upstream, but arbitrate must
         // not dispatch with an empty candidate set.
@@ -504,6 +561,364 @@ impl ArbiterStrategy for Synthesize {
         Ok(ArbiterOutcome {
             response: measured.response,
             cost_usd: measured.cost_usd,
+            detail: ArbiterDetail::default(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BestOfN — single-pass LLM judge, returns chosen leg verbatim
+// ---------------------------------------------------------------------------
+
+/// The **BestOfN** strategy: ask the arbiter model to pick the single best
+/// candidate answer by number, then return that leg's original response
+/// verbatim — no paraphrasing or synthesis.
+pub struct BestOfN {
+    /// The arbiter model (and optional provider pin) used as the judge.
+    pub arbiter_model: ModelRef,
+}
+
+#[async_trait]
+impl ArbiterStrategy for BestOfN {
+    async fn arbitrate(
+        &self,
+        request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) -> Result<ArbiterOutcome, ApiError> {
+        // Collect the text content of all successful legs.
+        let answers = surviving_answers(legs);
+
+        // Defensive guard: no successful legs → error.
+        if answers.is_empty() {
+            return Err(ApiError::InvalidRequest("panel: no successful legs".into()));
+        }
+
+        // Single survivor — no judge call needed; return it directly.
+        if answers.len() == 1 {
+            let pos = answers[0].0;
+            return Ok(ArbiterOutcome {
+                response: legs[pos].response.clone().expect("Ok leg has response"),
+                cost_usd: None,
+                detail: ArbiterDetail {
+                    chosen_leg: Some(legs[pos].leg_index),
+                    ..Default::default()
+                },
+            });
+        }
+
+        let n = answers.len();
+
+        // Build the judge prompt.
+        // Preserve caller system messages, then append the judge instruction,
+        // then push numbered candidate messages (mirrors Synthesize's loop).
+        let judge_instruction = format!(
+            "You are selecting the single best of the candidate answers below. \
+             On the FIRST line reply with ONLY the candidate number (1 to {n}). \
+             On the next line, give one sentence explaining why."
+        );
+
+        let mut messages = request.messages.clone();
+        messages.push(Message::System {
+            content: MessageContent::Text(judge_instruction),
+        });
+        for (i, (_, answer)) in answers.iter().enumerate() {
+            messages.push(Message::User {
+                content: MessageContent::Text(format!(
+                    "Candidate {} of {}:\n\n{}",
+                    i + 1,
+                    n,
+                    answer
+                )),
+                name: None,
+            });
+        }
+
+        let arbiter_req = ChatCompletionRequest {
+            model: self.arbiter_model.model.clone(),
+            messages,
+            stream: false,
+            max_tokens: Some(512),
+            ..Default::default()
+        };
+
+        // Resolve the arbiter provider.
+        let provider = state
+            .registry
+            .resolve(&self.arbiter_model.model)
+            .ok_or_else(|| ApiError::ModelNotFound {
+                model: self.arbiter_model.model.clone(),
+            })?;
+
+        // Substitute the arbiter provider's credential when present in the creds
+        // map (mirrors the per-member credential substitution in run_panel).
+        let mut arb_ctx_owned;
+        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
+            arb_ctx_owned = ctx.clone();
+            arb_ctx_owned.credentials = c.clone();
+            &arb_ctx_owned
+        } else {
+            ctx
+        };
+
+        // Derive the arbiter deadline from the caller's remaining budget when
+        // available; otherwise use a bounded default. The outer route
+        // TimeoutLayer (60 s) caps all requests regardless.
+        let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
+        let measured =
+            crate::measurement::measured_single_dispatch(&provider, arbiter_req, arb_ctx, deadline)
+                .await
+                .map_err(|e| {
+                    ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}"))
+                })?;
+
+        // Extract the judge's assistant text.
+        let judge_text = measured
+            .response
+            .choices
+            .first()
+            .and_then(|c| match &c.message {
+                tt_shared::messages::Message::Assistant {
+                    content: Some(tt_shared::messages::MessageContent::Text(t)),
+                    ..
+                } => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        // Parse: first integer token on the first line → candidate number.
+        let first_line = judge_text.lines().next().unwrap_or("").trim();
+        let parsed: Option<usize> = first_line
+            .split_whitespace()
+            .find_map(|tok| tok.parse::<usize>().ok());
+
+        let (chosen, fell_back) = match parsed {
+            Some(p) if p >= 1 && p <= answers.len() => (answers[p - 1].0, false),
+            _ => (answers[0].0, true),
+        };
+
+        // reason = trimmed text after the first line, None if empty.
+        let reason = {
+            let after_first = judge_text
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if after_first.is_empty() {
+                None
+            } else {
+                Some(after_first)
+            }
+        };
+
+        Ok(ArbiterOutcome {
+            response: legs[chosen].response.clone().expect("Ok leg has response"),
+            cost_usd: measured.cost_usd,
+            detail: ArbiterDetail {
+                chosen_leg: Some(legs[chosen].leg_index),
+                reason,
+                fell_back,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Majority — embedding clustering, returns medoid leg verbatim
+// ---------------------------------------------------------------------------
+
+/// The **Majority** strategy: embed all surviving leg answers, cluster them by
+/// cosine similarity, pick the largest cluster (tie-break: earliest), and return
+/// the cluster's medoid response verbatim — no paraphrasing or synthesis.
+///
+/// When embedding fails, falls back to the first surviving leg and sets
+/// `detail.degraded = true`. When no cluster has more than one member
+/// (all answers are distinct), the global medoid (highest mean cosine to all
+/// others) is returned and `detail.no_majority = true`.
+///
+/// The clustering threshold defaults to `0.83` and can be overridden via the
+/// `TT_PANEL_MAJORITY_THRESHOLD` environment variable (float in `(0.0, 1.0]`).
+pub struct Majority;
+
+#[async_trait]
+impl ArbiterStrategy for Majority {
+    async fn arbitrate(
+        &self,
+        _request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        _ctx: &RequestContext,
+        _creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) -> Result<ArbiterOutcome, ApiError> {
+        let answers = surviving_answers(legs);
+
+        // Empty case — no surviving legs.
+        if answers.is_empty() {
+            return Err(ApiError::InvalidRequest("panel: no successful legs".into()));
+        }
+
+        // Single answer — no clustering needed.
+        if answers.len() == 1 {
+            return Ok(ArbiterOutcome {
+                response: legs[answers[0].0]
+                    .response
+                    .clone()
+                    .expect("surviving_answers guarantees response"),
+                cost_usd: None,
+                detail: ArbiterDetail {
+                    winning_cluster_size: Some(1),
+                    total_clusters: Some(1),
+                    ..Default::default()
+                },
+            });
+        }
+
+        // Resolve the embedder from the L2 config.
+        let embedder = match state.l2.as_ref().map(|l| &l.embedder) {
+            Some(e) => e,
+            None => {
+                // No embedder wired → degrade to first leg.
+                return Ok(ArbiterOutcome {
+                    response: legs[answers[0].0]
+                        .response
+                        .clone()
+                        .expect("surviving_answers guarantees response"),
+                    cost_usd: None,
+                    detail: ArbiterDetail {
+                        degraded: true,
+                        ..Default::default()
+                    },
+                });
+            }
+        };
+
+        // Embed all answers; return on first error (degrade to first leg).
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(answers.len());
+        for (_, text) in &answers {
+            match embedder.embed(text).await {
+                Ok(v) => vecs.push(v),
+                Err(_) => {
+                    return Ok(ArbiterOutcome {
+                        response: legs[answers[0].0]
+                            .response
+                            .clone()
+                            .expect("surviving_answers guarantees response"),
+                        cost_usd: None,
+                        detail: ArbiterDetail {
+                            degraded: true,
+                            ..Default::default()
+                        },
+                    });
+                }
+            }
+        }
+
+        // Threshold (env-overridable, default 0.83).
+        let t = std::env::var("TT_PANEL_MAJORITY_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|x| *x > 0.0 && *x <= 1.0)
+            .unwrap_or(0.83);
+
+        // Greedy clustering: assign each answer to the first cluster whose
+        // representative (first member) has cosine ≥ t with this answer.
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for k in 0..answers.len() {
+            let mut assigned = false;
+            for cluster in &mut clusters {
+                let rep = cluster[0];
+                if cosine(&vecs[k], &vecs[rep]) >= t {
+                    cluster.push(k);
+                    assigned = true;
+                    break;
+                }
+            }
+            if !assigned {
+                clusters.push(vec![k]);
+            }
+        }
+
+        // Winner = largest cluster; tie-break by earliest first-element index
+        // (smallest cluster-creation order = stable, deterministic).
+        let winner_idx = clusters
+            .iter()
+            .enumerate()
+            .max_by(|(ai, a), (bi, b)| {
+                // Larger len wins; on tie prefer smaller cluster index (earlier).
+                a.len().cmp(&b.len()).then_with(|| bi.cmp(ai))
+            })
+            .map(|(i, _)| i)
+            .expect("clusters is non-empty (answers.len() >= 2)");
+
+        let winner = &clusters[winner_idx];
+        let no_majority = winner.len() == 1;
+
+        // Medoid selection:
+        // - no_majority → global medoid (highest mean cosine to ALL others)
+        // - majority    → winner medoid (highest mean cosine to other WINNER members)
+        let medoid = if no_majority {
+            // Global medoid: answer with highest mean cosine to all others.
+            (0..answers.len())
+                .max_by(|&a, &b| {
+                    let mean_cos = |idx: usize| -> f32 {
+                        let others: Vec<f32> = (0..answers.len())
+                            .filter(|&j| j != idx)
+                            .map(|j| cosine(&vecs[idx], &vecs[j]))
+                            .collect();
+                        if others.is_empty() {
+                            0.0
+                        } else {
+                            others.iter().sum::<f32>() / others.len() as f32
+                        }
+                    };
+                    mean_cos(a)
+                        .partial_cmp(&mean_cos(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0)
+        } else if winner.len() == 1 {
+            winner[0]
+        } else {
+            // Winner medoid: highest mean cosine to other winner members.
+            *winner
+                .iter()
+                .max_by(|&&a, &&b| {
+                    let mean_cos = |idx: usize| -> f32 {
+                        let others: Vec<f32> = winner
+                            .iter()
+                            .filter(|&&j| j != idx)
+                            .map(|&j| cosine(&vecs[idx], &vecs[j]))
+                            .collect();
+                        if others.is_empty() {
+                            0.0
+                        } else {
+                            others.iter().sum::<f32>() / others.len() as f32
+                        }
+                    };
+                    mean_cos(a)
+                        .partial_cmp(&mean_cos(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(&winner[0])
+        };
+
+        Ok(ArbiterOutcome {
+            response: legs[answers[medoid].0]
+                .response
+                .clone()
+                .expect("surviving_answers guarantees response"),
+            cost_usd: None,
+            detail: ArbiterDetail {
+                winning_cluster_size: Some(winner.len()),
+                total_clusters: Some(clusters.len()),
+                no_majority,
+                ..Default::default()
+            },
         })
     }
 }
@@ -513,18 +928,15 @@ impl ArbiterStrategy for Synthesize {
 // ---------------------------------------------------------------------------
 
 /// Instantiate the correct [`ArbiterStrategy`] for the given [`PanelConfig`].
-///
-/// Currently only [`ArbiterStrategyKind::Synthesize`] is implemented.
-/// [`ArbiterStrategyKind::BestOfN`] and [`ArbiterStrategyKind::Majority`]
-/// return [`ApiError::PanelStrategyUnsupported`].
 pub fn strategy_for(cfg: &PanelConfig) -> Result<Box<dyn ArbiterStrategy + Send + Sync>, ApiError> {
     match cfg.strategy {
         ArbiterStrategyKind::Synthesize => Ok(Box::new(Synthesize {
             arbiter_model: cfg.arbiter_model.clone(),
         })),
-        other => Err(ApiError::PanelStrategyUnsupported {
-            strategy: other.as_str().to_string(),
-        }),
+        ArbiterStrategyKind::BestOfN => Ok(Box::new(BestOfN {
+            arbiter_model: cfg.arbiter_model.clone(),
+        })),
+        ArbiterStrategyKind::Majority => Ok(Box::new(Majority)),
     }
 }
 
@@ -612,6 +1024,8 @@ pub struct PanelResult {
     pub quorum_required: usize,
     /// Number of member legs that actually succeeded.
     pub quorum_met: usize,
+    /// Strategy-specific metadata from the arbiter (surfaced in the response body).
+    pub arbiter_detail: ArbiterDetail,
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +1215,7 @@ pub async fn run_panel(
         total_cost_usd,
         quorum_required: required,
         quorum_met: met,
+        arbiter_detail: arb.detail,
     })
 }
 
@@ -849,6 +1264,41 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
         .iter()
         .any(|l| l.status == LegStatus::Ok && l.cost_usd.is_none());
 
+    // Build the `arbiter` sub-object: base fields + non-default ArbiterDetail fields.
+    let d = &result.arbiter_detail;
+    let mut arbiter = serde_json::Map::new();
+    arbiter.insert("strategy".into(), json!(cfg.strategy.as_str()));
+    // Arbiter leg cost from the legs list (the last leg with role == Arbiter).
+    let arbiter_cost = result
+        .legs
+        .iter()
+        .find(|l| l.role == LegRole::Arbiter)
+        .and_then(|l| l.cost_usd);
+    arbiter.insert("cost_usd".into(), json!(arbiter_cost));
+    // best-of-n detail.
+    if let Some(cl) = d.chosen_leg {
+        arbiter.insert("chosen_leg".into(), json!(cl));
+    }
+    if let Some(ref r) = d.reason {
+        arbiter.insert("reason".into(), json!(r));
+    }
+    if d.fell_back {
+        arbiter.insert("fell_back".into(), json!(true));
+    }
+    // majority detail.
+    if let Some(wcs) = d.winning_cluster_size {
+        arbiter.insert("winning_cluster_size".into(), json!(wcs));
+    }
+    if let Some(tc) = d.total_clusters {
+        arbiter.insert("total_clusters".into(), json!(tc));
+    }
+    if d.no_majority {
+        arbiter.insert("no_majority".into(), json!(true));
+    }
+    if d.degraded {
+        arbiter.insert("degraded".into(), json!(true));
+    }
+
     json!({
         "strategy": cfg.strategy.as_str(),
         "legs": legs,
@@ -858,6 +1308,7 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
             "met": result.quorum_met,
         },
         "cost_incomplete": cost_incomplete,
+        "arbiter": serde_json::Value::Object(arbiter),
     })
 }
 
