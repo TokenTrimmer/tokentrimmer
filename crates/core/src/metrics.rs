@@ -312,6 +312,30 @@ pub fn record_diff(outcome: &'static str, reason: &'static str) {
     metrics::counter!("tt_diff_total", "outcome" => outcome, "reason" => reason).increment(1);
 }
 
+/// Count one deep-research panel request. `strategy` is the panel strategy
+/// name (bounded cardinality — e.g. `"consensus"`, `"best_of"`); `outcome` ∈
+/// `success|quorum_unmet|disabled|strategy_unsupported|error` (bounded).
+pub fn record_panel_request(strategy: &str, outcome: &str) {
+    metrics::counter!(
+        "tt_panel_requests_total",
+        "strategy" => strategy.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+}
+
+/// Count one deep-research panel leg dispatch. `role` ∈ `primary|secondary`
+/// or an ordinal index string (bounded by the panel size, small); `status` ∈
+/// `success|error|timeout` (bounded).
+pub fn record_panel_leg(role: &str, status: &str) {
+    metrics::counter!(
+        "tt_panel_legs_total",
+        "role" => role.to_string(),
+        "status" => status.to_string(),
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::cache_result;
@@ -329,5 +353,15 @@ mod tests {
         assert_eq!(cache_result(None, Some(20)), "miss");
         assert_eq!(cache_result(None, Some(0)), "unreported");
         assert_eq!(cache_result(None, None), "unreported");
+    }
+
+    /// Smoke: `record_panel_request` and `record_panel_leg` do not panic under
+    /// the no-op `metrics` facade (no recorder installed in unit tests).
+    #[test]
+    fn panel_metrics_helpers_do_not_panic() {
+        super::record_panel_request("consensus", "success");
+        super::record_panel_request("best_of", "quorum_unmet");
+        super::record_panel_leg("primary", "success");
+        super::record_panel_leg("secondary", "error");
     }
 }

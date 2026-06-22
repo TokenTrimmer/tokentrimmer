@@ -69,6 +69,66 @@ pub fn parse_cache_control(
     }
 }
 
+// ---------------------------------------------------------------------------
+// tt_extras.panel types (Phase 1 — deep-research panel)
+// ---------------------------------------------------------------------------
+
+/// Per-request panel overrides from `tt_extras.panel`.
+///
+/// JSON shape:
+/// ```json
+/// {
+///   "panel": {
+///     "members": ["gpt-4o", "claude-3-5-sonnet"],
+///     "arbiter_model": "gpt-4o",
+///     "quorum": 2,
+///     "max_cost_usd": 0.05
+///   }
+/// }
+/// ```
+///
+/// All fields are optional; absent fields fall back to gateway defaults in
+/// `PanelConfig::resolve` (defined in `tt-core`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PanelExtras {
+    /// Explicit list of member model ids to fan out to. Overrides the gateway
+    /// default when non-empty.
+    #[serde(default)]
+    pub members: Vec<String>,
+
+    /// Override the arbiter model for Synthesize / BestOfN strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbiter_model: Option<String>,
+
+    /// Minimum number of legs that must succeed for the panel to return a result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quorum: Option<usize>,
+
+    /// Hard cost ceiling in USD across all legs + arbitration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+}
+
+/// Parse [`PanelExtras`] from a request's `tt_extras` map.
+///
+/// Returns `None` when `tt_extras` does not contain a `"panel"` key.
+/// Returns `None` when the key is present but the value fails to deserialize —
+/// the panel is an expensive opt-in path and must fail safe to "no panel" rather
+/// than silently activating panel resolution with empty/default overrides.
+pub fn parse_panel_extras(extras: &HashMap<String, serde_json::Value>) -> Option<PanelExtras> {
+    let val = extras.get("panel")?;
+    match serde_json::from_value::<PanelExtras>(val.clone()) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "tt_extras.panel deserialization failed — treating as no panel extras"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod cache_control_tests {
     use super::*;
@@ -113,6 +173,44 @@ mod cache_control_tests {
     fn malformed_value_falls_back_to_default() {
         let cfg = parse_cache_control(&extras(r#"{"cache":"not-an-object"}"#)).unwrap();
         assert_eq!(cfg.mode, CacheMode::Normal);
+    }
+}
+
+#[cfg(test)]
+mod panel_extras_tests {
+    use super::*;
+
+    fn extras(json: &str) -> HashMap<String, serde_json::Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn absent_panel_key_is_none() {
+        assert!(parse_panel_extras(&extras("{}")).is_none());
+    }
+
+    #[test]
+    fn valid_panel_parses() {
+        let panel = parse_panel_extras(&extras(
+            r#"{"panel":{"members":["gpt-4o","claude-3-5-sonnet"],"quorum":2}}"#,
+        ))
+        .unwrap();
+        assert_eq!(panel.members, vec!["gpt-4o", "claude-3-5-sonnet"]);
+        assert_eq!(panel.quorum, Some(2));
+    }
+
+    #[test]
+    fn malformed_panel_integer_value_is_none() {
+        // panel value is a plain integer — fails to deserialize as PanelExtras.
+        // Must NOT activate panel resolution (fail-safe to None).
+        assert!(parse_panel_extras(&extras(r#"{"panel":42}"#)).is_none());
+    }
+
+    #[test]
+    fn malformed_panel_string_value_is_none() {
+        // panel value is a bare string — fails to deserialize as PanelExtras.
+        // Must NOT activate panel resolution (fail-safe to None).
+        assert!(parse_panel_extras(&extras(r#"{"panel":"not-an-object"}"#)).is_none());
     }
 }
 

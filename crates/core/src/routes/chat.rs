@@ -44,6 +44,7 @@ use crate::{
     middleware::trace::TraceId,
     passes::PassEffects,
     retry::{with_retry, RetryPolicy},
+    routes::panel,
     routes::sse::{self, CacheInsertContext, StreamLogContext, StreamSpanContext},
     single_flight::wait_for_leader,
     state::{L1Config, L2Config, L2VerifyConfig},
@@ -291,7 +292,12 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         | ApiError::NotFound(_)
         | ApiError::ServiceUnavailable(_)
         // Agent-run control-flow signal (not a provider response) — never cache.
-        | ApiError::Conflict(_) => false,
+        | ApiError::Conflict(_)
+        // Panel errors — kill-switch can be toggled, and panel conditions are
+        // runtime-dependent. Never negative-cache any of them.
+        | ApiError::PanelDisabled
+        | ApiError::PanelQuorumUnmet { .. }
+        | ApiError::PanelStrategyUnsupported { .. } => false,
     }
 }
 
@@ -320,6 +326,9 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::NotFound(_) => StatusCode::NOT_FOUND,
         ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         ApiError::Conflict(_) => StatusCode::CONFLICT,
+        ApiError::PanelDisabled => StatusCode::FORBIDDEN,
+        ApiError::PanelQuorumUnmet { .. } => StatusCode::BAD_GATEWAY,
+        ApiError::PanelStrategyUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
     };
     status.as_u16()
 }
@@ -938,6 +947,20 @@ pub(crate) struct Prepared {
     pub judge_source_provider: Option<std::sync::Arc<dyn tt_shared::Provider>>,
     pub judge_source_ctx: Option<RequestContext>,
     pub judge_original_req: Option<ChatCompletionRequest>,
+    /// Resolved deep-research panel config when the request opted in via the
+    /// `X-TokenTrimmer-Panel` header (Phase 1). `None` for every default-path
+    /// request — the off-by-default invariant: an absent panel header leaves the
+    /// single-model path wire-identical (the only added work is parsing one
+    /// absent header + one `None` check at the top of [`complete_once`]). When
+    /// `Some`, [`complete_once`] branches to [`panel::complete_panel`] BEFORE any
+    /// cache / single-flight check (panels are non-deterministic and bypass both).
+    pub panel: Option<panel::PanelConfig>,
+    /// Per-provider credentials for the panel member set, keyed by **provider
+    /// id** (spec §6.4 step 4). Resolved in [`prepare`] alongside `panel` using
+    /// the same store-then-bearer-fallback pattern as the failover pre-resolution
+    /// — `run_panel` records a member whose provider id is absent here as
+    /// `skipped_no_cred`. Empty (and unused) when `panel` is `None`.
+    pub panel_creds: std::collections::HashMap<String, ProviderCredentials>,
 }
 
 /// Cost/route/cache/warning metadata the chat [`handler`] turns into
@@ -968,6 +991,13 @@ pub(crate) struct CompletionHeaders {
     pub provider: std::sync::Arc<dyn tt_shared::Provider>,
     /// Pre-dispatch + dispatch warning tokens (comma-joined into the header).
     pub warnings: Vec<String>,
+    /// Deep-research panel attribution object to merge into the serialized
+    /// response body as `tokentrimmer.panel` (Phase 1). `None` on every
+    /// non-panel dispatch — the handler then serializes the typed response
+    /// byte-identically (off-by-default). `Some(value)` ONLY on the
+    /// [`panel::complete_panel`] path; the handler tail merges it into the
+    /// top-level JSON object before responding.
+    pub panel_body: Option<serde_json::Value>,
 }
 
 /// The result of one non-streaming completion through [`complete_once`].
@@ -1009,8 +1039,20 @@ pub(crate) enum CompletionOutcome {
 pub(crate) async fn complete_once(
     state: &AppState,
     ctx: &RequestContext,
-    prep: Prepared,
+    mut prep: Prepared,
 ) -> ApiResult<CompletionOutcome> {
+    // Deep-research panel branch (Phase 1) — FIRST, before any cache /
+    // single-flight check. Panels are non-deterministic (two same-model legs
+    // must not coalesce) and bill as ONE aggregate row, so they bypass L1/L2 +
+    // single-flight entirely (spec §6.5, invariant §2.1.5). `take()` leaves
+    // `prep.panel = None`; the whole bundle (still owning `req`/`provider`/
+    // `failover_creds`) is moved into `complete_panel`. For the overwhelming
+    // majority of requests `prep.panel` is `None` (no panel header), so this is
+    // a single cheap `Option::take` + `None` check and the path below is
+    // wire-identical to today's single-model completion (off-by-default).
+    if let Some(cfg) = prep.panel.take() {
+        return panel::complete_panel(state, ctx, prep, cfg).await;
+    }
     // Destructure the prepared setup into locals with the exact names + types
     // the carved pipeline (the former handler non-streaming arm) reads, so the
     // body below is byte-for-byte the handler's. `state`/`ctx` are the params;
@@ -1053,6 +1095,11 @@ pub(crate) async fn complete_once(
         judge_source_provider,
         judge_source_ctx,
         judge_original_req,
+        // Already `take`n into the panel branch above (and `None` for the
+        // single-model path that reaches here); bind to `_` to stay exhaustive.
+        panel: _,
+        // Panel-only; the single-model path never reads it.
+        panel_creds: _,
     } = prep;
     // The handler built `ctx.trace_id` from the same trace-id it derived; the
     // carved pipeline reads `trace_id` directly (cache rows, L1 envelopes,
@@ -1964,6 +2011,8 @@ pub(crate) async fn complete_once(
             req,
             provider,
             warnings,
+            // Single-model dispatch never carries a panel body (off-by-default).
+            panel_body: None,
         }),
     })
 }
@@ -2150,7 +2199,11 @@ pub async fn handler(
     // 3. Branch: streaming vs non-streaming. Both arms consume `prep` (the
     //    streaming arm reads the fields it needs; the non-streaming arm hands
     //    the whole bundle to `complete_once`).
-    if prep.req.stream {
+    // A panel-configured request is ALWAYS completed through `complete_once`,
+    // even when `stream == true`: Phase 1 panels are non-streaming (spec §6.5),
+    // so we run the panel and return the buffered arbiter answer rather than
+    // half-implementing a streaming panel. Streaming arbiter UX is Phase 5.
+    if prep.req.stream && prep.panel.is_none() {
         return handle_streaming(&state, &ctx, prep).await;
     }
     // Non-streaming: hand the prepared per-request setup to `complete_once`
@@ -2196,10 +2249,36 @@ pub async fn handler(
                 req,
                 provider,
                 warnings,
+                panel_body,
             } = *headers;
 
             // 5. Serialize body and attach TokenTrimmer extension headers.
-            let mut http_response = Json(response).into_response();
+            //
+            // Panel path (Phase 1): when `panel_body` is `Some`, merge the
+            // `tokentrimmer.panel` attribution object into the top-level
+            // response JSON object before responding. The typed
+            // `ChatCompletionResponse` is a closed struct (no extension field),
+            // so the per-leg breakdown is injected here at the serialization
+            // boundary. `None` on every non-panel dispatch ⇒ the typed response
+            // is serialized byte-identically (off-by-default invariant).
+            let mut http_response = match panel_body {
+                Some(panel_value) => {
+                    // Serialize the typed response, then graft the panel object
+                    // onto the top-level JSON map. A serialization failure falls
+                    // back to the plain typed body (never drops the answer).
+                    match serde_json::to_value(&response) {
+                        Ok(serde_json::Value::Object(mut map)) => {
+                            map.insert(
+                                "tokentrimmer".to_string(),
+                                serde_json::json!({ "panel": panel_value }),
+                            );
+                            Json(serde_json::Value::Object(map)).into_response()
+                        }
+                        _ => Json(response).into_response(),
+                    }
+                }
+                None => Json(response).into_response(),
+            };
             attach_cost_headers(
                 http_response.headers_mut(),
                 trace_id,
@@ -2590,6 +2669,74 @@ pub(crate) async fn prepare(
             req.max_tokens,
         )?;
     }
+
+    // Deep-research panel resolution + fail-closed budget gate (Phase 1, spec
+    // §6.4 steps 1-3). Runs HERE, before `Prepared` is built and before any
+    // dispatch, so an over-budget / unpriceable / kill-switched panel 4xx/402s
+    // with ZERO upstream calls. Off-by-default: an absent `X-TokenTrimmer-Panel`
+    // header (the common case) leaves `panel = None` and the single-model path
+    // wire-identical — the only added work is parsing one absent header.
+    let (panel, panel_creds) = if let Some(strategy) = panel::panel_from_header(headers) {
+        // Kill-switch: an explicit panel request on a panel-disabled gateway is a
+        // hard 403, never a silent fallback to single-model billing (spec §6.5).
+        if !state.panel_enabled {
+            return Err(ApiError::PanelDisabled);
+        }
+        // Resolve the full config from header strategy + tt_extras.panel + env
+        // defaults. An empty member list (no extras, no defaults) errors here.
+        let cfg = panel::PanelConfig::resolve(
+            strategy,
+            tt_shared::messages::parse_panel_extras(&req.tt_extras).as_ref(),
+            &panel::PanelDefaults::from_env(),
+        )?;
+        // Fail-closed budget gate: sums fee-aware estimates over (N members +
+        // arbiter); any unpriceable member or a missing budget ⇒ 402 before any
+        // dispatch. Uses the SAME whole-prompt input-token estimate the
+        // single-model cost ceiling above uses, on the post-routing request.
+        let combined = tt_shared::message_text_for_estimation(req);
+        let panel_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
+        panel::panel_budget_gate(
+            state,
+            &cfg,
+            panel_input_tokens,
+            req.max_tokens,
+            cost_limit_from_header(headers),
+        )?;
+        // Per-member-provider credential pre-resolution (spec §6.4 step 4),
+        // keyed by provider id. Mirrors the failover pre-resolution pattern
+        // (distinct providers, first-seen order, resolve each once): the
+        // raw-Bearer fallback is allowed ONLY for the source provider (the bearer
+        // IS its key); cross-provider members with no stored org credential are
+        // simply absent here and `run_panel` records them as `skipped_no_cred`
+        // (never dispatched, never billed). The arbiter provider is included so
+        // arbitration can dispatch on a member-distinct provider.
+        let mut provider_ids: Vec<String> = Vec::new();
+        for m in cfg
+            .members
+            .iter()
+            .chain(std::iter::once(&cfg.arbiter_model))
+        {
+            if let Some(p) = state.registry.resolve(&m.model) {
+                let pid = p.id().to_string();
+                if !provider_ids.contains(&pid) {
+                    provider_ids.push(pid);
+                }
+            }
+        }
+        let mut creds: std::collections::HashMap<String, ProviderCredentials> =
+            std::collections::HashMap::new();
+        for pid in provider_ids {
+            let allow_bearer = pid == source_provider_id;
+            if let Some(c) =
+                resolve_credentials_for(state, org_id, &pid, &raw_bearer, allow_bearer).await
+            {
+                creds.insert(pid, c);
+            }
+        }
+        (Some(cfg), creds)
+    } else {
+        (None, std::collections::HashMap::new())
+    };
 
     // Normalize the request for the routed provider and collect any pre-dispatch
     // warnings (B2: response_format_downgrade; B3 will add temperature_clamped).
@@ -3093,6 +3240,8 @@ pub(crate) async fn prepare(
         judge_source_provider,
         judge_source_ctx,
         judge_original_req,
+        panel,
+        panel_creds,
     })
 }
 
@@ -3145,6 +3294,12 @@ async fn handle_streaming(
         judge_source_provider: _,
         judge_source_ctx: _,
         judge_original_req: _,
+        // Panels never reach the streaming arm — the handler forces a
+        // panel-configured request through `complete_once` (Phase 1 panels are
+        // non-streaming; the buffered arbiter answer is returned). This is `None`
+        // by construction here.
+        panel: _,
+        panel_creds: _,
     } = prep;
     let trace_id = ctx.trace_id;
     {
@@ -5164,7 +5319,7 @@ pub(crate) async fn resolve_credentials_for(
 /// CALLER's responsibility — it must run IN-BAND (on the request thread),
 /// never inside this spawn, so it is the cheap sync truth to diff against the
 /// async row count.
-fn spawn_request_log(
+pub(crate) fn spawn_request_log(
     tracker: Option<&tokio_util::task::TaskTracker>,
     writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
     row: RequestLogRow,

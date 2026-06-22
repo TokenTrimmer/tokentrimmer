@@ -63,6 +63,20 @@ pub enum ApiError {
     /// run that is not awaiting tool outputs, or already being resumed).
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// The panel feature is disabled (kill-switch). Explicit — never a silent
+    /// fallback to single-model, so a panel caller is not surprised by
+    /// single-model billing.
+    #[error("deep-research panel is disabled")]
+    PanelDisabled,
+
+    /// Too few legs survived to arbitrate.
+    #[error("panel quorum unmet: {met} of {required} legs succeeded")]
+    PanelQuorumUnmet { required: usize, met: usize },
+
+    /// A panel strategy requested but not implemented in this build.
+    #[error("panel strategy not supported: {strategy}")]
+    PanelStrategyUnsupported { strategy: String },
 }
 
 #[derive(Serialize)]
@@ -168,6 +182,24 @@ impl IntoResponse for ApiError {
                 "invalid_request_error",
                 "conflict",
                 m.clone(),
+            ),
+            ApiError::PanelDisabled => (
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "panel_disabled",
+                "The deep-research panel is not enabled on this gateway.".into(),
+            ),
+            ApiError::PanelQuorumUnmet { required, met } => (
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "panel_quorum_unmet",
+                format!("Deep-research panel could not reach quorum: {met} of {required} legs succeeded."),
+            ),
+            ApiError::PanelStrategyUnsupported { strategy } => (
+                StatusCode::NOT_IMPLEMENTED,
+                "invalid_request_error",
+                "panel_strategy_unsupported",
+                format!("Deep-research panel strategy '{strategy}' is not supported yet."),
             ),
         };
 
