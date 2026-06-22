@@ -52,6 +52,7 @@ use serde_json::{json, Value};
 use tokio_util::task::TaskTracker;
 use tower::util::ServiceExt;
 
+use tt_cache::embed::MockEmbedder;
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
     messages::{Choice, Message, MessageContent},
@@ -802,5 +803,257 @@ async fn unpriceable_member_fails_closed_with_zero_dispatches() {
         rows.len(),
         0,
         "INVARIANT: unpriceable fail-closed reject must write ZERO request_logs rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 strategy router tests (Task 4 — best-of-n + majority, 200 not 501)
+// ---------------------------------------------------------------------------
+
+/// Build a router with panel-enabled=true and an L2 embedder wired so that
+/// the `Majority` strategy can embed answers. Uses `MockEmbedder` (fixed
+/// vector = [1.0, 0.0]) so all answers cluster together.
+///
+/// The same two-model layout as `app_single_provider` is used:
+///   "openai"      → "gpt-4o"       (member 1, also the arbiter)
+///   "openai-mini" → "gpt-4o-mini"  (member 2)
+fn app_with_embedder() -> (
+    axum::Router,
+    Arc<InMemoryRequestLogWriter>,
+    TaskTracker,
+    Arc<AtomicUsize>,
+) {
+    use tt_cache::InMemoryL2Cache;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountedMock::new(
+        "openai",
+        "gpt-4o",
+        Arc::clone(&calls),
+    )));
+    registry.register(Arc::new(CountedMock::new(
+        "openai-mini",
+        "gpt-4o-mini",
+        Arc::clone(&calls),
+    )));
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let tracker = TaskTracker::new();
+    // Wire a MockEmbedder (fixed [1.0, 0.0]) so Majority can embed answers.
+    let embedder = Arc::new(MockEmbedder {
+        fixed_vec: vec![1.0, 0.0],
+        model: "mock-embed".to_string(),
+    });
+    let l2_cache = Arc::new(InMemoryL2Cache::new());
+    let state = AppState::new(registry)
+        .with_panel_enabled(true)
+        .with_l2(l2_cache, embedder, None)
+        .with_request_log_writer(writer.clone())
+        .with_telemetry_tracker(tracker.clone());
+    (build_router(state), writer, tracker, calls)
+}
+
+// ============================================================================
+// Phase 4 — best-of-n router integration test.
+//
+// Strategy: `best-of-n`. Two members, generous budget.
+// CountedMock arbiter returns "answer" which fails to parse as a candidate
+// number → `fell_back = true`, but the arbiter DOES return `chosen_leg`
+// (from the fallback to answers[0]).
+// Key assertions: HTTP 200 (NOT 501), `tokentrimmer.panel.arbiter.strategy
+// == "best-of-n"`, and `chosen_leg` field present.
+// ============================================================================
+
+#[tokio::test]
+async fn best_of_n_strategy_returns_200_with_arbiter_body() {
+    let (app, _writer, _tracker, _calls) = app_single_provider(false, true);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "best-of-n")
+        // Generous ceiling — not over-budget.
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "which is best?" }],
+                "stream": false,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["gpt-4o", "gpt-4o-mini"],
+                        "arbiter_model": "gpt-4o"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "best-of-n panel must return 200 OK (NOT 501)"
+    );
+
+    let body = body_json(resp).await;
+    let panel = &body["tokentrimmer"]["panel"];
+    assert!(
+        panel.is_object(),
+        "response must carry tokentrimmer.panel, got {body}"
+    );
+
+    let arbiter = &panel["arbiter"];
+    assert!(
+        arbiter.is_object(),
+        "tokentrimmer.panel.arbiter must be an object, got {panel}"
+    );
+    assert_eq!(
+        arbiter["strategy"], "best-of-n",
+        "arbiter.strategy must be 'best-of-n', got {arbiter}"
+    );
+    // chosen_leg must be present (even on fell_back path: fallback picks answers[0]).
+    assert!(
+        !arbiter["chosen_leg"].is_null(),
+        "arbiter.chosen_leg must be present for best-of-n, got {arbiter}"
+    );
+}
+
+// ============================================================================
+// Phase 4 — majority router integration test.
+//
+// Strategy: `majority`. Two members + MockEmbedder (fixed [1.0, 0.0]).
+// All answers embed identically → cosine == 1.0 >= 0.83 → single cluster of
+// size 2. `winning_cluster_size == 2`.
+// Key assertions: HTTP 200 (NOT 501), `arbiter.strategy == "majority"`,
+// `winning_cluster_size` present.
+// ============================================================================
+
+#[tokio::test]
+async fn majority_strategy_returns_200_with_arbiter_body() {
+    let (app, _writer, _tracker, _calls) = app_with_embedder();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "majority")
+        // Generous ceiling — not over-budget.
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "what is the consensus?" }],
+                "stream": false,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["gpt-4o", "gpt-4o-mini"],
+                        "arbiter_model": "gpt-4o"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "majority panel must return 200 OK (NOT 501)"
+    );
+
+    let body = body_json(resp).await;
+    let panel = &body["tokentrimmer"]["panel"];
+    assert!(
+        panel.is_object(),
+        "response must carry tokentrimmer.panel, got {body}"
+    );
+
+    let arbiter = &panel["arbiter"];
+    assert!(
+        arbiter.is_object(),
+        "tokentrimmer.panel.arbiter must be an object, got {panel}"
+    );
+    assert_eq!(
+        arbiter["strategy"], "majority",
+        "arbiter.strategy must be 'majority', got {arbiter}"
+    );
+    // Both answers embed identically → one cluster of size 2.
+    assert_eq!(
+        arbiter["winning_cluster_size"], 2,
+        "winning_cluster_size must be 2 (both answers cluster together), got {arbiter}"
+    );
+}
+
+// ============================================================================
+// Phase 4 — synthesize regression: existing happy-path body still carries an
+// arbiter object with strategy == "synthesize".
+// ============================================================================
+
+#[tokio::test]
+async fn synthesize_panel_body_still_has_arbiter_object() {
+    let (app, _writer, _tracker, _calls) = app_single_provider(false, true);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "synthesize this" }],
+                "stream": false,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["gpt-4o", "gpt-4o-mini"],
+                        "arbiter_model": "gpt-4o"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "synthesize panel must still return 200 OK"
+    );
+
+    let body = body_json(resp).await;
+    let panel = &body["tokentrimmer"]["panel"];
+    assert!(
+        panel.is_object(),
+        "response must carry tokentrimmer.panel, got {body}"
+    );
+    let arbiter = &panel["arbiter"];
+    assert!(
+        arbiter.is_object(),
+        "tokentrimmer.panel.arbiter must be present for synthesize (regression), got {panel}"
+    );
+    assert_eq!(
+        arbiter["strategy"], "synthesize",
+        "arbiter.strategy must be 'synthesize' for the synthesize strategy, got {arbiter}"
+    );
+    // Synthesize has no chosen_leg/winning_cluster_size — they must be absent.
+    assert!(
+        arbiter["chosen_leg"].is_null(),
+        "synthesize arbiter must NOT have chosen_leg, got {arbiter}"
+    );
+    assert!(
+        arbiter["winning_cluster_size"].is_null(),
+        "synthesize arbiter must NOT have winning_cluster_size, got {arbiter}"
     );
 }

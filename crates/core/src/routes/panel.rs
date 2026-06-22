@@ -1024,6 +1024,8 @@ pub struct PanelResult {
     pub quorum_required: usize,
     /// Number of member legs that actually succeeded.
     pub quorum_met: usize,
+    /// Strategy-specific metadata from the arbiter (surfaced in the response body).
+    pub arbiter_detail: ArbiterDetail,
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,6 +1215,7 @@ pub async fn run_panel(
         total_cost_usd,
         quorum_required: required,
         quorum_met: met,
+        arbiter_detail: arb.detail,
     })
 }
 
@@ -1261,6 +1264,41 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
         .iter()
         .any(|l| l.status == LegStatus::Ok && l.cost_usd.is_none());
 
+    // Build the `arbiter` sub-object: base fields + non-default ArbiterDetail fields.
+    let d = &result.arbiter_detail;
+    let mut arbiter = serde_json::Map::new();
+    arbiter.insert("strategy".into(), json!(cfg.strategy.as_str()));
+    // Arbiter leg cost from the legs list (the last leg with role == Arbiter).
+    let arbiter_cost = result
+        .legs
+        .iter()
+        .find(|l| l.role == LegRole::Arbiter)
+        .and_then(|l| l.cost_usd);
+    arbiter.insert("cost_usd".into(), json!(arbiter_cost));
+    // best-of-n detail.
+    if let Some(cl) = d.chosen_leg {
+        arbiter.insert("chosen_leg".into(), json!(cl));
+    }
+    if let Some(ref r) = d.reason {
+        arbiter.insert("reason".into(), json!(r));
+    }
+    if d.fell_back {
+        arbiter.insert("fell_back".into(), json!(true));
+    }
+    // majority detail.
+    if let Some(wcs) = d.winning_cluster_size {
+        arbiter.insert("winning_cluster_size".into(), json!(wcs));
+    }
+    if let Some(tc) = d.total_clusters {
+        arbiter.insert("total_clusters".into(), json!(tc));
+    }
+    if d.no_majority {
+        arbiter.insert("no_majority".into(), json!(true));
+    }
+    if d.degraded {
+        arbiter.insert("degraded".into(), json!(true));
+    }
+
     json!({
         "strategy": cfg.strategy.as_str(),
         "legs": legs,
@@ -1270,6 +1308,7 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
             "met": result.quorum_met,
         },
         "cost_incomplete": cost_incomplete,
+        "arbiter": serde_json::Value::Object(arbiter),
     })
 }
 
