@@ -585,3 +585,173 @@ async fn panicked_leg_recorded_as_error_good_leg_counts_for_quorum() {
         "panicked leg must appear as LegStatus::Error, not be silently dropped"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MockSleepy provider — chat_completion sleeps briefly to allow latency measurement
+// ---------------------------------------------------------------------------
+
+struct MockSleepy {
+    id: &'static str,
+    model: &'static str,
+    sleep_ms: u64,
+}
+
+#[async_trait]
+impl Provider for MockSleepy {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model.into(),
+            provider: self.id.into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 4096,
+            max_output_tokens: 4096,
+        }]
+    }
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        if model == self.model {
+            Some(ModelPricing {
+                input_per_million: 5.0,
+                output_per_million: 15.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-sleepy".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model.clone(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("sleepy answer".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                total_tokens: 20,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: arbiter cross-provider credentials and real latency (M1 + M3)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn arbiter_cross_provider_creds_and_latency() {
+    // Members are on one mock provider; arbiter is on a DIFFERENT mock provider
+    // that sleeps 3 ms. The creds map includes the arbiter provider's credential.
+    // We assert: (a) arbiter was dispatched (arbiter leg exists and succeeded),
+    // and (b) arbiter_leg.latency_ms >= 1.
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(Mock {
+        id: "mock-provider-member",
+        model: "mock-member",
+        input_price: 5.0,
+        output_price: 15.0,
+        fail: false,
+    }));
+    registry.register(Arc::new(MockSleepy {
+        id: "mock-provider-arb-sleepy",
+        model: "mock-arb-sleepy",
+        sleep_ms: 3,
+    }));
+
+    let state = AppState::new(registry);
+    let ctx = test_ctx();
+
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert("mock-provider-member".to_string(), test_creds("member-key"));
+    // Arbiter is on a DIFFERENT provider — include its credential explicitly.
+    creds.insert(
+        "mock-provider-arb-sleepy".to_string(),
+        test_creds("arb-key"),
+    );
+
+    let cfg = PanelConfig {
+        strategy: ArbiterStrategyKind::Synthesize,
+        members: vec![ModelRef {
+            model: "mock-member".to_string(),
+            provider: None,
+        }],
+        arbiter_model: ModelRef {
+            model: "mock-arb-sleepy".to_string(),
+            provider: None,
+        },
+        quorum: Some(1),
+        max_cost_usd: None,
+    };
+
+    let result = run_panel(
+        &state,
+        &ctx,
+        &base_req(),
+        &creds,
+        &cfg,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("run_panel should succeed with cross-provider arbiter cred");
+
+    // (a) Arbiter leg was dispatched — verify it exists and succeeded.
+    let arbiter_leg = result
+        .legs
+        .iter()
+        .find(|l| l.role == LegRole::Arbiter)
+        .expect("arbiter leg must be present");
+
+    assert_eq!(
+        arbiter_leg.status,
+        LegStatus::Ok,
+        "arbiter leg must succeed when its credential is in the creds map"
+    );
+
+    // (b) Real latency: the arbiter slept 3 ms, so latency_ms must be >= 1.
+    assert!(
+        arbiter_leg.latency_ms >= 1,
+        "arbiter latency must be measured (got {}), not hardcoded 0",
+        arbiter_leg.latency_ms
+    );
+}

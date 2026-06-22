@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use chrono::Utc;
 use serde_json::json;
-use tt_telemetry::request_logs::RequestLogRow;
+use tt_telemetry::{panel_legs::PanelLegRow, request_logs::RequestLogRow};
 use uuid::Uuid;
 
 use tt_shared::{
@@ -368,13 +368,17 @@ pub trait ArbiterStrategy {
     ///
     /// `request` is the original caller request (used as the user prompt
     /// context).  `state` and `ctx` give access to the provider registry and
-    /// the request's credential / deadline context.
+    /// the request's credential / deadline context.  `creds` is the same
+    /// provider-id → credential map passed to `run_panel`; the arbiter
+    /// implementation uses it to substitute the correct credential when the
+    /// arbiter model is on a different provider than `ctx.credentials`.
     async fn arbitrate(
         &self,
         request: &ChatCompletionRequest,
         legs: &[LegResult],
         state: &AppState,
         ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     ) -> Result<ArbiterOutcome, ApiError>;
 }
 
@@ -398,6 +402,7 @@ impl ArbiterStrategy for Synthesize {
         legs: &[LegResult],
         state: &AppState,
         ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     ) -> Result<ArbiterOutcome, ApiError> {
         // Collect the text content of all successful legs.
         let ok_answers: Vec<(usize, String)> = legs
@@ -474,12 +479,23 @@ impl ArbiterStrategy for Synthesize {
                 model: self.arbiter_model.model.clone(),
             })?;
 
+        // Substitute the arbiter provider's credential when present in the creds
+        // map (mirrors the per-member credential substitution in run_panel).
+        let mut arb_ctx_owned;
+        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
+            arb_ctx_owned = ctx.clone();
+            arb_ctx_owned.credentials = c.clone();
+            &arb_ctx_owned
+        } else {
+            ctx
+        };
+
         // Derive the arbiter deadline from the caller's remaining budget when
         // available; otherwise use a bounded default. The outer route
         // TimeoutLayer (60 s) caps all requests regardless.
-        let deadline = ctx.deadline.unwrap_or(Duration::from_secs(120));
+        let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
         let measured =
-            crate::measurement::measured_single_dispatch(&provider, arbiter_req, ctx, deadline)
+            crate::measurement::measured_single_dispatch(&provider, arbiter_req, arb_ctx, deadline)
                 .await
                 .map_err(|e| {
                     ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}"))
@@ -744,7 +760,11 @@ pub async fn run_panel(
 
     // 3. Arbitrate.
     let strategy = strategy_for(cfg)?;
-    let arb = strategy.arbitrate(base_req, &legs_out, state, ctx).await?;
+    let arb_start = std::time::Instant::now();
+    let arb = strategy
+        .arbitrate(base_req, &legs_out, state, ctx, creds)
+        .await?;
+    let arb_latency_ms = arb_start.elapsed().as_millis() as u64;
 
     let arbiter_provider_id = state
         .registry
@@ -760,7 +780,7 @@ pub async fn run_panel(
         status: LegStatus::Ok,
         cost_usd: arb.cost_usd,
         usage: Some(arb.response.usage.clone()),
-        latency_ms: 0,
+        latency_ms: arb_latency_ms,
         response: None,
     };
     crate::metrics::record_panel_leg("arbiter", LegStatus::Ok.as_str());
@@ -950,11 +970,13 @@ pub(crate) async fn complete_panel(
     let served = &result.response;
     let trace_id = ctx.trace_id;
     let arbiter_model = cfg.arbiter_model.model.clone();
+    // Hoist the parent id so the per-leg rows can reference it.
+    let parent_id = Uuid::now_v7();
     spawn_request_log(
         state.telemetry_tracker.as_ref(),
         state.request_log_writer.as_ref(),
         RequestLogRow {
-            id: Uuid::now_v7(),
+            id: parent_id,
             org_id: ctx.org_id,
             api_key_id: ctx.api_key_id,
             ts: Utc::now(),
@@ -1004,6 +1026,84 @@ pub(crate) async fn complete_panel(
             retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
         },
     );
+
+    // ── Write per-leg `panel_legs` rows (fire-and-forget, MUST NOT block or
+    //    fail the response). One row per enumeration position (not LegResult
+    //    .leg_index) so the sentinel usize::MAX on the arbiter never appears.
+    if let Some(writer) = state.panel_leg_writer.clone() {
+        let leg_rows: Vec<PanelLegRow> = result
+            .legs
+            .iter()
+            .enumerate()
+            .map(|(i, leg)| PanelLegRow {
+                request_log_id: parent_id,
+                leg_index: i as i32,
+                role: match leg.role {
+                    LegRole::Leg => "leg".to_string(),
+                    LegRole::Arbiter => "arbiter".to_string(),
+                },
+                provider: leg.provider.clone(),
+                model: leg.model.clone(),
+                input_tokens: leg.usage.as_ref().map(|u| u.prompt_tokens as i64),
+                output_tokens: leg.usage.as_ref().map(|u| u.completion_tokens as i64),
+                cached_tokens: leg.usage.as_ref().map(|u| u.cached_tokens as i64),
+                cost_usd: leg.cost_usd,
+                latency_ms: Some(leg.latency_ms as i64),
+                status: leg.status.as_str().to_string(),
+                error_class: None,
+            })
+            .collect();
+        let fut = async move {
+            let _ = writer.write_legs(leg_rows).await;
+        };
+        match state.telemetry_tracker.as_ref() {
+            Some(t) => {
+                t.spawn(fut);
+            }
+            None => {
+                tokio::spawn(fut);
+            }
+        }
+    }
+
+    // ── Record OTel GenAI semconv + panel span attributes on the current
+    //    `http_request` span.  Uses the same `set_attribute` mechanism as the
+    //    single-model path (`record_request_span_attributes` in chat.rs) so no
+    //    tracing-field pre-declaration is needed.  Panel attrs are ADDITIVE —
+    //    non-panel spans carry none of them (off-by-default invariant).
+    {
+        let served = &result.response;
+        tt_telemetry::gen_ai::record_request_attributes(
+            &tracing::Span::current(),
+            &tt_telemetry::gen_ai::RequestSpanAttributes {
+                // Provider sentinel "panel" mirrors the request_logs row.
+                provider_id: "panel",
+                // The caller's originally-requested model is the arbiter model
+                // for a panel (no pre-panel routing rewrites the top-level model).
+                request_model: &arbiter_model,
+                response_model: &arbiter_model,
+                operation: "chat",
+                cost: tt_telemetry::gen_ai::RequestSpanCost {
+                    input_tokens: served.usage.prompt_tokens,
+                    output_tokens: served.usage.completion_tokens,
+                    cost_usd: cost_breakdown.cost_usd,
+                    baseline_cost_usd: cost_breakdown.baseline_cost_usd,
+                    saved_usd: cost_breakdown.tt_saved_usd(),
+                    provider_cache_saved_usd: cost_breakdown.provider_cache_saved_usd,
+                },
+                cache_outcome: Some("none"),
+                route: prep.route_matched_name.as_deref(),
+                traffic_split_pct: None,
+                shadow_model: None,
+                shadow_cost_usd: None,
+                // Panel-specific additive attributes.
+                panel_strategy: Some(cfg.strategy.as_str()),
+                panel_leg_count: Some(result.legs.len() as i64),
+                panel_quorum_required: Some(result.quorum_required as i64),
+                panel_quorum_met: Some(result.quorum_met as i64),
+            },
+        );
+    }
 
     // Inject the `tokentrimmer.panel` attribution object into the body (merged
     // at the serialization boundary in the handler tail; see `panel_body`).

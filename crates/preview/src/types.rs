@@ -4,6 +4,8 @@
 //! exactly what we need to estimate. The response is the documented
 //! `PreviewResponse` shape from the spec.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -17,6 +19,10 @@ pub struct PreviewRequest {
     /// Honored for tier accounting but ignored for the preview calc itself.
     #[serde(default)]
     pub stream: Option<bool>,
+    /// TokenTrimmer-internal extras (panel overrides, etc.) that augment the
+    /// dry-run estimate. Absent/empty → defaults/env-var config only.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tt_extras: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

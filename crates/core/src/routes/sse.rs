@@ -817,6 +817,11 @@ pub fn stream_response(
                             traffic_split_pct: sc.traffic_split_pct,
                             shadow_model: None,
                             shadow_cost_usd: None,
+                            // Streaming panel dispatch is not supported today.
+                            panel_strategy: None,
+                            panel_leg_count: None,
+                            panel_quorum_required: None,
+                            panel_quorum_met: None,
                         },
                     );
                 }
