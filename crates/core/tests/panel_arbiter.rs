@@ -3,9 +3,7 @@
 //!   cargo test -p tt-core --test panel_arbiter
 
 use tt_core::{
-    routes::panel::{
-        strategy_for, ArbiterStrategyKind, ModelRef, PanelConfig, PanelDefaults,
-    },
+    routes::panel::{strategy_for, ArbiterStrategyKind, ModelRef, PanelConfig, PanelDefaults},
     ApiError,
 };
 

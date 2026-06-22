@@ -13,9 +13,7 @@ use futures::stream::{BoxStream, StreamExt};
 use uuid::Uuid;
 
 use tt_core::{
-    routes::panel::{
-        run_panel, ArbiterStrategyKind, LegRole, LegStatus, ModelRef, PanelConfig,
-    },
+    routes::panel::{run_panel, ArbiterStrategyKind, LegRole, LegStatus, ModelRef, PanelConfig},
     ApiError, AppState, ProviderRegistry,
 };
 use tt_shared::{
@@ -209,9 +207,16 @@ async fn both_legs_return_three_legs_and_summed_cost() {
         max_cost_usd: None,
     };
 
-    let result = run_panel(&state, &ctx, &base_req(), &creds, &cfg, Duration::from_secs(10))
-        .await
-        .expect("run_panel should succeed");
+    let result = run_panel(
+        &state,
+        &ctx,
+        &base_req(),
+        &creds,
+        &cfg,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("run_panel should succeed");
 
     assert_eq!(result.legs.len(), 3, "2 member legs + 1 arbiter leg");
     assert_eq!(result.quorum_met, 2, "both members succeeded");
@@ -273,9 +278,16 @@ async fn all_legs_error_returns_quorum_unmet() {
         max_cost_usd: None,
     };
 
-    let err = run_panel(&state, &ctx, &base_req(), &creds, &cfg, Duration::from_secs(10))
-        .await
-        .expect_err("should fail with quorum unmet");
+    let err = run_panel(
+        &state,
+        &ctx,
+        &base_req(),
+        &creds,
+        &cfg,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect_err("should fail with quorum unmet");
 
     match err {
         ApiError::PanelQuorumUnmet { required, met } => {
@@ -342,9 +354,16 @@ async fn member_missing_cred_is_skipped() {
         max_cost_usd: None,
     };
 
-    let result = run_panel(&state, &ctx, &base_req(), &creds, &cfg, Duration::from_secs(10))
-        .await
-        .expect("run_panel should succeed with 1 survivor");
+    let result = run_panel(
+        &state,
+        &ctx,
+        &base_req(),
+        &creds,
+        &cfg,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("run_panel should succeed with 1 survivor");
 
     // 1 ok leg + 1 skipped leg + 1 arbiter leg = 3 total
     assert_eq!(result.legs.len(), 3, "1 ok + 1 skipped + 1 arbiter");
@@ -464,9 +483,16 @@ async fn panicked_only_leg_returns_quorum_unmet() {
         max_cost_usd: None,
     };
 
-    let err = run_panel(&state, &ctx, &base_req(), &creds, &cfg, Duration::from_secs(10))
-        .await
-        .expect_err("panicked-only leg must yield quorum unmet");
+    let err = run_panel(
+        &state,
+        &ctx,
+        &base_req(),
+        &creds,
+        &cfg,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect_err("panicked-only leg must yield quorum unmet");
 
     match err {
         ApiError::PanelQuorumUnmet { required, met } => {
@@ -531,18 +557,29 @@ async fn panicked_leg_recorded_as_error_good_leg_counts_for_quorum() {
         max_cost_usd: None,
     };
 
-    let result = run_panel(&state, &ctx, &base_req(), &creds, &cfg, Duration::from_secs(10))
-        .await
-        .expect("run_panel should succeed — 1 good leg meets quorum=1");
+    let result = run_panel(
+        &state,
+        &ctx,
+        &base_req(),
+        &creds,
+        &cfg,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("run_panel should succeed — 1 good leg meets quorum=1");
 
     // 1 good member leg + 1 panicked (Error) member leg + 1 arbiter leg = 3 total
     assert_eq!(result.legs.len(), 3, "good + panicked + arbiter = 3 legs");
-    assert_eq!(result.quorum_met, 1, "only the good leg counts toward quorum");
+    assert_eq!(
+        result.quorum_met, 1,
+        "only the good leg counts toward quorum"
+    );
 
     // There must be an Error leg in the member results (from the panic).
-    let error_leg = result.legs.iter().find(|l| {
-        l.role == LegRole::Leg && matches!(l.status, LegStatus::Error)
-    });
+    let error_leg = result
+        .legs
+        .iter()
+        .find(|l| l.role == LegRole::Leg && matches!(l.status, LegStatus::Error));
     assert!(
         error_leg.is_some(),
         "panicked leg must appear as LegStatus::Error, not be silently dropped"
