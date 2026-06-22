@@ -567,17 +567,180 @@ impl ArbiterStrategy for Synthesize {
 }
 
 // ---------------------------------------------------------------------------
+// BestOfN — single-pass LLM judge, returns chosen leg verbatim
+// ---------------------------------------------------------------------------
+
+/// The **BestOfN** strategy: ask the arbiter model to pick the single best
+/// candidate answer by number, then return that leg's original response
+/// verbatim — no paraphrasing or synthesis.
+pub struct BestOfN {
+    /// The arbiter model (and optional provider pin) used as the judge.
+    pub arbiter_model: ModelRef,
+}
+
+#[async_trait]
+impl ArbiterStrategy for BestOfN {
+    async fn arbitrate(
+        &self,
+        request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) -> Result<ArbiterOutcome, ApiError> {
+        // Collect the text content of all successful legs.
+        let answers = surviving_answers(legs);
+
+        // Defensive guard: no successful legs → error.
+        if answers.is_empty() {
+            return Err(ApiError::InvalidRequest("panel: no successful legs".into()));
+        }
+
+        // Single survivor — no judge call needed; return it directly.
+        if answers.len() == 1 {
+            let pos = answers[0].0;
+            return Ok(ArbiterOutcome {
+                response: legs[pos].response.clone().expect("Ok leg has response"),
+                cost_usd: None,
+                detail: ArbiterDetail {
+                    chosen_leg: Some(legs[pos].leg_index),
+                    ..Default::default()
+                },
+            });
+        }
+
+        let n = answers.len();
+
+        // Build the judge prompt.
+        // Preserve caller system messages, then append the judge instruction,
+        // then push numbered candidate messages (mirrors Synthesize's loop).
+        let judge_instruction = format!(
+            "You are selecting the single best of the candidate answers below. \
+             On the FIRST line reply with ONLY the candidate number (1 to {n}). \
+             On the next line, give one sentence explaining why."
+        );
+
+        let mut messages = request.messages.clone();
+        messages.push(Message::System {
+            content: MessageContent::Text(judge_instruction),
+        });
+        for (i, (_, answer)) in answers.iter().enumerate() {
+            messages.push(Message::User {
+                content: MessageContent::Text(format!(
+                    "Candidate {} of {}:\n\n{}",
+                    i + 1,
+                    n,
+                    answer
+                )),
+                name: None,
+            });
+        }
+
+        let arbiter_req = ChatCompletionRequest {
+            model: self.arbiter_model.model.clone(),
+            messages,
+            stream: false,
+            max_tokens: Some(512),
+            ..Default::default()
+        };
+
+        // Resolve the arbiter provider.
+        let provider = state
+            .registry
+            .resolve(&self.arbiter_model.model)
+            .ok_or_else(|| ApiError::ModelNotFound {
+                model: self.arbiter_model.model.clone(),
+            })?;
+
+        // Substitute the arbiter provider's credential when present in the creds
+        // map (mirrors the per-member credential substitution in run_panel).
+        let mut arb_ctx_owned;
+        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
+            arb_ctx_owned = ctx.clone();
+            arb_ctx_owned.credentials = c.clone();
+            &arb_ctx_owned
+        } else {
+            ctx
+        };
+
+        // Derive the arbiter deadline from the caller's remaining budget when
+        // available; otherwise use a bounded default. The outer route
+        // TimeoutLayer (60 s) caps all requests regardless.
+        let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
+        let measured =
+            crate::measurement::measured_single_dispatch(&provider, arbiter_req, arb_ctx, deadline)
+                .await
+                .map_err(|e| {
+                    ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}"))
+                })?;
+
+        // Extract the judge's assistant text.
+        let judge_text = measured
+            .response
+            .choices
+            .first()
+            .and_then(|c| match &c.message {
+                tt_shared::messages::Message::Assistant {
+                    content: Some(tt_shared::messages::MessageContent::Text(t)),
+                    ..
+                } => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        // Parse: first integer token on the first line → candidate number.
+        let first_line = judge_text.lines().next().unwrap_or("").trim();
+        let parsed: Option<usize> = first_line
+            .split_whitespace()
+            .find_map(|tok| tok.parse::<usize>().ok());
+
+        let (chosen, fell_back) = match parsed {
+            Some(p) if p >= 1 && p <= answers.len() => (answers[p - 1].0, false),
+            _ => (answers[0].0, true),
+        };
+
+        // reason = trimmed text after the first line, None if empty.
+        let reason = {
+            let after_first = judge_text
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if after_first.is_empty() {
+                None
+            } else {
+                Some(after_first)
+            }
+        };
+
+        Ok(ArbiterOutcome {
+            response: legs[chosen].response.clone().expect("Ok leg has response"),
+            cost_usd: measured.cost_usd,
+            detail: ArbiterDetail {
+                chosen_leg: Some(legs[chosen].leg_index),
+                reason,
+                fell_back,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // strategy_for — factory
 // ---------------------------------------------------------------------------
 
 /// Instantiate the correct [`ArbiterStrategy`] for the given [`PanelConfig`].
 ///
-/// Currently only [`ArbiterStrategyKind::Synthesize`] is implemented.
-/// [`ArbiterStrategyKind::BestOfN`] and [`ArbiterStrategyKind::Majority`]
-/// return [`ApiError::PanelStrategyUnsupported`].
+/// [`ArbiterStrategyKind::Majority`] is not yet implemented.
 pub fn strategy_for(cfg: &PanelConfig) -> Result<Box<dyn ArbiterStrategy + Send + Sync>, ApiError> {
     match cfg.strategy {
         ArbiterStrategyKind::Synthesize => Ok(Box::new(Synthesize {
+            arbiter_model: cfg.arbiter_model.clone(),
+        })),
+        ArbiterStrategyKind::BestOfN => Ok(Box::new(BestOfN {
             arbiter_model: cfg.arbiter_model.clone(),
         })),
         other => Err(ApiError::PanelStrategyUnsupported {
