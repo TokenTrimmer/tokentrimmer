@@ -547,11 +547,12 @@ fn provider_id_and_models() {
     assert_eq!(p.id(), "openai");
 
     let models = p.models();
-    assert_eq!(models.len(), 8, "expected 8 models (6 chat + 2 embedding)");
+    assert_eq!(models.len(), 9, "expected 9 models (7 chat + 2 embedding)");
 
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert!(ids.contains(&"gpt-5.5"));
     assert!(ids.contains(&"gpt-5.4"));
+    assert!(ids.contains(&"gpt-5.4-mini"));
     assert!(ids.contains(&"gpt-4o"));
     assert!(ids.contains(&"gpt-4o-mini"));
     assert!(ids.contains(&"o3"));
