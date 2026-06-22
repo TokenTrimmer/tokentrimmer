@@ -7,17 +7,31 @@
 //!   priced:   "gpt-4o" (openai, $2.50/$10/M), "gpt-4o-mini" (openai, $0.15/$0.60/M)
 //!   unpriced: "no-such-model-xyz" (not in registry or pricing catalog)
 
-use tt_core::{routes::panel::{estimate_panel_cost, panel_budget_gate, ArbiterStrategyKind, ModelRef, PanelConfig}, AppState, ApiError};
+use tt_core::{
+    routes::panel::{
+        estimate_panel_cost, panel_budget_gate, ArbiterStrategyKind, ModelRef, PanelConfig,
+    },
+    ApiError, AppState,
+};
 
 /// Build a two-member PanelConfig with the given model IDs.
 fn make_cfg(member1: &str, member2: &str, arbiter: &str, max_cost_usd: Option<f64>) -> PanelConfig {
     PanelConfig {
         strategy: ArbiterStrategyKind::Synthesize,
         members: vec![
-            ModelRef { model: member1.to_string(), provider: None },
-            ModelRef { model: member2.to_string(), provider: None },
+            ModelRef {
+                model: member1.to_string(),
+                provider: None,
+            },
+            ModelRef {
+                model: member2.to_string(),
+                provider: None,
+            },
         ],
-        arbiter_model: ModelRef { model: arbiter.to_string(), provider: None },
+        arbiter_model: ModelRef {
+            model: arbiter.to_string(),
+            provider: None,
+        },
         quorum: None,
         max_cost_usd,
     }
@@ -48,7 +62,10 @@ fn estimate_panel_cost_none_when_member_unpriceable() {
     // "no-such-model-xyz" has no pricing
     let cfg = make_cfg("gpt-4o", "no-such-model-xyz", "gpt-4o", None);
     let result = estimate_panel_cost(&state, &cfg, 1000, Some(500));
-    assert!(result.is_none(), "unpriceable member should yield None, got {result:?}");
+    assert!(
+        result.is_none(),
+        "unpriceable member should yield None, got {result:?}"
+    );
 }
 
 /// Estimate within budget → gate returns Ok.
@@ -58,7 +75,10 @@ fn panel_budget_gate_ok_when_within_budget() {
     let cfg = make_cfg("gpt-4o", "gpt-4o-mini", "gpt-4o", None);
     // Use a very high ceiling so any real estimate passes
     let result = panel_budget_gate(&state, &cfg, 100, Some(100), Some(999.0));
-    assert!(result.is_ok(), "should pass gate with high ceiling, got {result:?}");
+    assert!(
+        result.is_ok(),
+        "should pass gate with high ceiling, got {result:?}"
+    );
 }
 
 /// Estimate exceeds ceiling → gate returns Err(CostLimitExceeded).
@@ -106,5 +126,8 @@ fn panel_budget_gate_uses_cfg_max_cost_when_ceiling_arg_is_none() {
     // Set max_cost_usd in cfg to a generous value → should pass
     let cfg = make_cfg("gpt-4o", "gpt-4o-mini", "gpt-4o", Some(999.0));
     let result = panel_budget_gate(&state, &cfg, 100, Some(100), None);
-    assert!(result.is_ok(), "cfg.max_cost_usd should serve as fallback ceiling, got {result:?}");
+    assert!(
+        result.is_ok(),
+        "cfg.max_cost_usd should serve as fallback ceiling, got {result:?}"
+    );
 }

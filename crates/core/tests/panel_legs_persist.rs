@@ -25,9 +25,7 @@ use tt_shared::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
-use tt_telemetry::{
-    panel_legs::InMemoryPanelLegWriter, request_logs::InMemoryRequestLogWriter,
-};
+use tt_telemetry::{panel_legs::InMemoryPanelLegWriter, request_logs::InMemoryRequestLogWriter};
 
 // ---------------------------------------------------------------------------
 // Mock providers
@@ -217,8 +215,14 @@ async fn happy_panel_writes_one_billing_row_and_three_leg_rows() {
         log_rows.len()
     );
     let log_row = &log_rows[0];
-    assert_eq!(log_row.provider, "panel", "billing row must use 'panel' sentinel");
-    assert!(!log_row.cached, "INVARIANT: panel billing row is cached=false");
+    assert_eq!(
+        log_row.provider, "panel",
+        "billing row must use 'panel' sentinel"
+    );
+    assert!(
+        !log_row.cached,
+        "INVARIANT: panel billing row is cached=false"
+    );
 
     // ── Assertion 2: three panel_legs rows ───────────────────────────────────
     let leg_rows = leg_writer.rows();
@@ -445,7 +449,10 @@ async fn panicked_member_leg_index_is_contiguous_not_sentinel() {
     // ── Leg rows: contiguous indices, no sentinel leakage ───────────────────
     let leg_rows = leg_writer.rows();
     let n = leg_rows.len() as i32;
-    assert!(n >= 2, "must have at least 2 leg rows (one error + arbiter), got {n}");
+    assert!(
+        n >= 2,
+        "must have at least 2 leg rows (one error + arbiter), got {n}"
+    );
 
     let mut indices: Vec<i32> = leg_rows.iter().map(|r| r.leg_index).collect();
     indices.sort_unstable();

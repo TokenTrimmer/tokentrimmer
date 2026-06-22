@@ -10,9 +10,7 @@ use tt_auth::{KeyStore, ProviderCredentialStore};
 use tt_cache::{EmbeddingProvider, L1Cache, L2Cache};
 use tt_routing::CachingRoutingStore;
 use tt_telemetry::{
-    body_capture::BodyCaptureWriter,
-    panel_legs::PanelLegWriter,
-    request_logs::RequestLogWriter,
+    body_capture::BodyCaptureWriter, panel_legs::PanelLegWriter, request_logs::RequestLogWriter,
 };
 
 use crate::budget::{BudgetEnforcer, DynamicBudgetEnforcer};
