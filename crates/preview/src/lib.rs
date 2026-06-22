@@ -95,6 +95,7 @@ mod tests {
             max_tokens,
             tools: None,
             stream: None,
+            tt_extras: Default::default(),
         }
     }
 
