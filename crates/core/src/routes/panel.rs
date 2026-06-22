@@ -1053,9 +1053,17 @@ pub(crate) async fn complete_panel(
                 error_class: None,
             })
             .collect();
-        tokio::spawn(async move {
+        let fut = async move {
             let _ = writer.write_legs(leg_rows).await;
-        });
+        };
+        match state.telemetry_tracker.as_ref() {
+            Some(t) => {
+                t.spawn(fut);
+            }
+            None => {
+                tokio::spawn(fut);
+            }
+        }
     }
 
     // ── Record OTel GenAI semconv + panel span attributes on the current
