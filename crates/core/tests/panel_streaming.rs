@@ -773,3 +773,817 @@ async fn panel_terminal_event() {
         rows[0].cost_usd
     );
 }
+
+// ===========================================================================
+// Task 6 — router-level end-to-end streaming-panel suite.
+//
+// These tests build the real `build_router` app (like `panel_engine.rs`) and
+// POST `/v1/chat/completions` with `stream: true` + an `X-TokenTrimmer-Panel`
+// header. They exercise `complete_panel_streaming` + the gate wire-up end to
+// end: the SSE body, the deferred-to-DropGuard aggregate `request_logs` row,
+// the fail-closed quorum-unmet path, and the off-by-default single-model
+// regression.
+// ===========================================================================
+
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio_util::task::TaskTracker;
+use tower::util::ServiceExt;
+use tt_core::build_router;
+
+// ---------------------------------------------------------------------------
+// Router-level mock providers
+// ---------------------------------------------------------------------------
+
+/// A buffered member-leg provider serving one model with a FIXED distinct
+/// answer text, so BestOfN's verbatim replay is observable. When `fail` is
+/// set, `chat_completion` returns a 503 (used to manufacture quorum-unmet).
+struct MemberMock {
+    id: &'static str,
+    model: &'static str,
+    answer: &'static str,
+    calls: Arc<AtomicUsize>,
+    fail: bool,
+}
+
+#[async_trait]
+impl Provider for MemberMock {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model.into(),
+            provider: self.id.into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 8192,
+            max_output_tokens: 8192,
+        }]
+    }
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        if model == self.model {
+            Some(ModelPricing {
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail {
+            return Err(ProviderError::ProviderUpstream {
+                status: 503,
+                message: "mock member failure".into(),
+            });
+        }
+        Ok(ChatCompletionResponse {
+            id: format!("chatcmpl-{}", self.id),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text(self.answer.into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        // Members are dispatched buffered; the stream path is unused here.
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no embeddings".into()))
+    }
+}
+
+/// A judge provider (for BestOfN): `chat_completion` returns a candidate
+/// number on the first line so the strategy picks a deterministic leg.
+struct JudgeMock {
+    id: &'static str,
+    model: &'static str,
+    /// First-line candidate number (1-indexed) + reason.
+    pick: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for JudgeMock {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model.into(),
+            provider: self.id.into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 8192,
+            max_output_tokens: 8192,
+        }]
+    }
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        if model == self.model {
+            Some(ModelPricing {
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-judge".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text(self.pick.into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                total_tokens: 20,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no embeddings".into()))
+    }
+}
+
+/// A streaming arbiter provider (for Synthesize): `chat_completion_stream`
+/// emits a fixed chunk sequence then a clean finish-with-usage chunk.
+struct StreamingArbiterMock {
+    id: &'static str,
+    model: &'static str,
+    chunks: Vec<&'static str>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for StreamingArbiterMock {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model.into(),
+            provider: self.id.into(),
+            capabilities: vec![Capability::Streaming],
+            max_input_tokens: 8192,
+            max_output_tokens: 8192,
+        }]
+    }
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        if model == self.model {
+            Some(ModelPricing {
+                input_per_million: 5.0,
+                output_per_million: 15.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+    async fn chat_completion(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Err(ProviderError::Unsupported("non-streaming not used".into()))
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let model = self.model.to_string();
+        let mut items: Vec<Result<ChatCompletionChunk, ProviderError>> = self
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                Ok(ChatCompletionChunk {
+                    id: format!("chunk-{i}"),
+                    object: "chat.completion.chunk".into(),
+                    created: 0,
+                    model: model.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: if i == 0 {
+                                Some("assistant".into())
+                            } else {
+                                None
+                            },
+                            content: Some(text.to_string()),
+                            tool_calls: vec![],
+                            extra: Default::default(),
+                        },
+                        finish_reason: None,
+                        extra: Default::default(),
+                    }],
+                    usage: None,
+                    extra: Default::default(),
+                })
+            })
+            .collect();
+        // Clean finish chunk with an authoritative usage block.
+        items.push(Ok(ChatCompletionChunk {
+            id: "chunk-fin".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model,
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::default(),
+                finish_reason: Some("stop".into()),
+                extra: Default::default(),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 30,
+                completion_tokens: 40,
+                total_tokens: 70,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            extra: Default::default(),
+        }));
+        Ok(futures::stream::iter(items).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no embeddings".into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router builders
+// ---------------------------------------------------------------------------
+
+/// Build a router whose member legs return DISTINCT answers and whose arbiter
+/// STREAMS (Synthesize). Layout:
+///   "vendor-a" → "model-a"  (member 1, answer "Alpha answer")
+///   "vendor-b" → "model-b"  (member 2, answer "Beta answer")
+///   "vendor-s" → "model-synth" (streaming arbiter)
+fn app_synthesize_stream(
+    fail_members: bool,
+) -> (
+    axum::Router,
+    Arc<InMemoryRequestLogWriter>,
+    TaskTracker,
+    Arc<AtomicUsize>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MemberMock {
+        id: "vendor-a",
+        model: "model-a",
+        answer: "Alpha answer",
+        calls: Arc::clone(&calls),
+        fail: fail_members,
+    }));
+    registry.register(Arc::new(MemberMock {
+        id: "vendor-b",
+        model: "model-b",
+        answer: "Beta answer",
+        calls: Arc::clone(&calls),
+        fail: fail_members,
+    }));
+    registry.register(Arc::new(StreamingArbiterMock {
+        id: "vendor-s",
+        model: "model-synth",
+        chunks: vec!["Synth", "esized"],
+        calls: Arc::clone(&calls),
+    }));
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let tracker = TaskTracker::new();
+    let state = AppState::new(registry)
+        .with_panel_enabled(true)
+        .with_request_log_writer(writer.clone())
+        .with_telemetry_tracker(tracker.clone());
+    (build_router(state), writer, tracker, calls)
+}
+
+/// Build a router for the BestOfN replay path. Layout:
+///   "vendor-a" → "model-a"  (member 1, answer "Alpha answer")
+///   "vendor-b" → "model-b"  (member 2, answer "Beta answer — the best one")
+///   "vendor-j" → "model-judge" (buffered judge, picks candidate 2 = leg 1)
+fn app_best_of_n() -> (
+    axum::Router,
+    Arc<InMemoryRequestLogWriter>,
+    TaskTracker,
+    Arc<AtomicUsize>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MemberMock {
+        id: "vendor-a",
+        model: "model-a",
+        answer: "Alpha answer",
+        calls: Arc::clone(&calls),
+        fail: false,
+    }));
+    registry.register(Arc::new(MemberMock {
+        id: "vendor-b",
+        model: "model-b",
+        answer: "Beta answer — the best one",
+        calls: Arc::clone(&calls),
+        fail: false,
+    }));
+    registry.register(Arc::new(JudgeMock {
+        id: "vendor-j",
+        model: "model-judge",
+        // Pick candidate 2 (1-indexed) → answers[1] → leg "model-b".
+        pick: "2\nmost complete answer",
+        calls: Arc::clone(&calls),
+    }));
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let tracker = TaskTracker::new();
+    let state = AppState::new(registry)
+        .with_panel_enabled(true)
+        .with_request_log_writer(writer.clone())
+        .with_telemetry_tracker(tracker.clone());
+    (build_router(state), writer, tracker, calls)
+}
+
+/// Build a single-model router (no panel members) for the off-by-default
+/// streaming regression: a `stream:true` request with NO panel header must go
+/// down `handle_streaming` unchanged.
+fn app_single_model() -> (axum::Router, Arc<InMemoryRequestLogWriter>, TaskTracker) {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(StreamingArbiterMock {
+        id: "vendor-solo",
+        model: "model-solo",
+        chunks: vec!["Hello", " world"],
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let tracker = TaskTracker::new();
+    let state = AppState::new(registry)
+        .with_panel_enabled(true)
+        .with_request_log_writer(writer.clone())
+        .with_telemetry_tracker(tracker.clone());
+    (build_router(state), writer, tracker)
+}
+
+// ---------------------------------------------------------------------------
+// Router-level SSE helpers
+// ---------------------------------------------------------------------------
+
+/// Drain all spawned telemetry writes, then return the captured rows.
+async fn drain_rows_router(
+    writer: &Arc<InMemoryRequestLogWriter>,
+    tracker: TaskTracker,
+) -> Vec<tt_telemetry::request_logs::RequestLogRow> {
+    tracker.close();
+    tracker.wait().await;
+    writer.rows()
+}
+
+/// Read the SSE body of a router response into a single string.
+async fn router_sse_body(resp: axum::response::Response) -> String {
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+// ===========================================================================
+// Case 1 — Synthesize live ⇒ 200 text/event-stream; arbiter chunks then
+// tokentrimmer.panel then tokentrimmer.usage then [DONE]; one provider='panel'
+// row, cost = Σ legs + arbiter, cached=false.
+// ===========================================================================
+
+// Router-level SSE drains drive the gateway middleware stack (TimeoutLayer,
+// keep-alive) — use a multi-thread runtime so the streamed body and the
+// stream-end DropGuard's spawned telemetry writes both make progress while the
+// test task awaits `to_bytes` (matches `concurrent_sse.rs`). A current-thread
+// runtime deadlocks here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_e2e_synthesize_live_aggregate_row_and_event_order() {
+    let (app, writer, tracker, _calls) = app_synthesize_stream(false);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "model-a",
+                "messages": [{ "role": "user", "content": "deep question" }],
+                "stream": true,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["model-a", "model-b"],
+                        "arbiter_model": "model-synth"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "streaming synthesize panel must return 200"
+    );
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "content-type must be text/event-stream, got {ct}"
+    );
+
+    let body = router_sse_body(resp).await;
+    let events = parse_sse_events(&body);
+    let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+
+    // The arbiter's streamed chunk content must appear in the body (arbiter
+    // chunks come before the terminal panel/usage events).
+    assert!(
+        body.contains("Synth") && body.contains("esized"),
+        "arbiter streamed chunks must be present in the SSE body"
+    );
+
+    let panel_pos = types
+        .iter()
+        .position(|&t| t == "tokentrimmer.panel")
+        .expect("tokentrimmer.panel event must be present");
+    let usage_pos = types
+        .iter()
+        .position(|&t| t == "tokentrimmer.usage")
+        .expect("tokentrimmer.usage event must be present");
+    let done_pos = events
+        .iter()
+        .position(|(_, d)| d == "[DONE]")
+        .expect("[DONE] sentinel must be present");
+
+    assert_eq!(
+        panel_pos + 1,
+        usage_pos,
+        "tokentrimmer.panel must be immediately before tokentrimmer.usage"
+    );
+    assert!(
+        usage_pos < done_pos,
+        "tokentrimmer.usage must come before [DONE]"
+    );
+
+    // Exactly one aggregate request_logs row, provider == 'panel', cached=false.
+    let rows = drain_rows_router(&writer, tracker).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "streaming panel must write exactly ONE aggregate request_logs row"
+    );
+    let row = &rows[0];
+    assert_eq!(
+        row.provider, "panel",
+        "aggregate row provider must be 'panel'"
+    );
+    assert_eq!(
+        row.model, "model-synth",
+        "aggregate row model must be the arbiter model"
+    );
+    assert!(!row.cached, "panel aggregate row must be cached == false");
+    // Σ legs (2 priced @ 100in/50out) + arbiter (Live, streamed 30in/40out) > 0.
+    assert!(
+        row.cost_usd > 0.0,
+        "aggregate cost must be Σ legs + arbiter > 0, got {}",
+        row.cost_usd
+    );
+    // Panel rows claim no saving: baseline == cost.
+    assert!(
+        (row.baseline_cost_usd - row.cost_usd).abs() < 1e-9,
+        "panel baseline must equal cost (no claimed saving)"
+    );
+
+    // The tokentrimmer.usage cost_usd matches the row cost (lock-step).
+    let usage_json: serde_json::Value =
+        serde_json::from_str(&events[usage_pos].1).expect("usage data is JSON");
+    let usage_cost = usage_json["cost_usd"].as_f64().expect("numeric cost_usd");
+    assert!(
+        (usage_cost - row.cost_usd).abs() < 1e-9,
+        "tokentrimmer.usage cost_usd ({usage_cost}) must equal request_logs cost_usd ({})",
+        row.cost_usd
+    );
+}
+
+// ===========================================================================
+// Case 2 — BestOfN replay ⇒ streamed chunks reconstruct the chosen leg
+// verbatim; aggregate cost = Σ legs + judge (NOT + replayed leg).
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_e2e_best_of_n_replays_chosen_leg_verbatim_no_double_count() {
+    let (app, writer, tracker, _calls) = app_best_of_n();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "best-of-n")
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "model-a",
+                "messages": [{ "role": "user", "content": "which is best?" }],
+                "stream": true,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["model-a", "model-b"],
+                        "arbiter_model": "model-judge"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "best-of-n stream must return 200"
+    );
+
+    let body = router_sse_body(resp).await;
+    let events = parse_sse_events(&body);
+
+    // Reconstruct the streamed assistant text from the content chunks (the
+    // `data:` payloads BEFORE the terminal tokentrimmer.* events). The chosen
+    // leg is "model-b" → "Beta answer — the best one"; replay must be verbatim.
+    let mut streamed = String::new();
+    for (etype, data) in &events {
+        if !etype.is_empty() || data == "[DONE]" {
+            continue; // skip tokentrimmer.* + [DONE]
+        }
+        if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
+            if let Some(c) = chunk["choices"][0]["delta"]["content"].as_str() {
+                streamed.push_str(c);
+            }
+        }
+    }
+    assert_eq!(
+        streamed, "Beta answer — the best one",
+        "replayed stream must carry the chosen leg's text verbatim, got {streamed:?}"
+    );
+
+    // Aggregate cost = Σ legs + judge. The Known plan DISCARDS the replayed
+    // (streamed) leg cost, so it is NOT counted twice.
+    //
+    //   each member leg: 100 in @ $1/M + 50 out @ $2/M = $0.0001 + $0.0001 = $0.0002
+    //   two members:                                                      = $0.0004
+    //   judge: 10 in @ $1/M + 10 out @ $2/M = $0.00001 + $0.00002         = $0.00003
+    //   Σ legs + judge                                                    = $0.00043
+    // The replayed leg's streamed tokens would add ANOTHER $0.0002 if double-
+    // counted; the assertion below proves they are not.
+    let rows = drain_rows_router(&writer, tracker).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "best-of-n stream must write ONE aggregate row"
+    );
+    let row = &rows[0];
+    assert_eq!(
+        row.provider, "panel",
+        "aggregate row provider must be 'panel'"
+    );
+    assert!(!row.cached, "panel aggregate row must be cached == false");
+    let expected = 0.0004 + 0.00003;
+    assert!(
+        (row.cost_usd - expected).abs() < 1e-9,
+        "cost must be Σ legs + judge = {expected}, got {} (double-counted replay?)",
+        row.cost_usd
+    );
+}
+
+// ===========================================================================
+// Case 3 — quorum-unmet (all member legs error) ⇒ 502, ZERO request_logs
+// rows, no stream (fail-closed before 200).
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_e2e_quorum_unmet_returns_502_zero_rows_no_stream() {
+    let (app, writer, tracker, _calls) = app_synthesize_stream(true /* fail members */);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "model-a",
+                "messages": [{ "role": "user", "content": "deep question" }],
+                "stream": true,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["model-a", "model-b"],
+                        "arbiter_model": "model-synth"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    // Fail-closed BEFORE any 200/stream: 502 BAD_GATEWAY, NOT text/event-stream.
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "quorum-unmet streaming panel must return 502 BAD_GATEWAY"
+    );
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !ct.starts_with("text/event-stream"),
+        "a fail-closed quorum-unmet must NOT open an SSE stream, got content-type {ct}"
+    );
+
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["error"]["code"], "panel_quorum_unmet",
+        "error code must be panel_quorum_unmet, got {body}"
+    );
+
+    // ZERO request_logs rows — no billing side effect, no stream-end DropGuard.
+    let rows = drain_rows_router(&writer, tracker).await;
+    assert_eq!(
+        rows.len(),
+        0,
+        "INVARIANT: a quorum-unmet streaming panel must write ZERO request_logs rows"
+    );
+}
+
+// ===========================================================================
+// Case 4 — off-by-default: stream:true with NO panel header ⇒ unchanged
+// single-model stream (goes down handle_streaming, single-model row).
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_e2e_off_by_default_single_model_stream_unchanged() {
+    let (app, writer, tracker) = app_single_model();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        // NO x-tokentrimmer-panel header.
+        .body(Body::from(
+            serde_json::json!({
+                "model": "model-solo",
+                "messages": [{ "role": "user", "content": "hello" }],
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "single-model stream must return 200"
+    );
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "content-type must be text/event-stream, got {ct}"
+    );
+
+    let body = router_sse_body(resp).await;
+    let events = parse_sse_events(&body);
+    let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+
+    // The single-model stream carries the provider chunks and NO panel event.
+    assert!(
+        body.contains("Hello") && body.contains("world"),
+        "single-model streamed chunks must be present"
+    );
+    assert!(
+        !types.contains(&"tokentrimmer.panel"),
+        "a non-panel stream must NOT emit a tokentrimmer.panel event (off-by-default)"
+    );
+    assert!(
+        events.iter().any(|(_, d)| d == "[DONE]"),
+        "[DONE] sentinel must be present"
+    );
+
+    // The single-model row is provider='vendor-solo' (NOT 'panel').
+    let rows = drain_rows_router(&writer, tracker).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "single-model stream must write exactly ONE request_logs row"
+    );
+    assert_eq!(
+        rows[0].provider, "vendor-solo",
+        "single-model row provider must be the served provider, not 'panel'"
+    );
+}

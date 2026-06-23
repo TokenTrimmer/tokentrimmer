@@ -2171,7 +2171,7 @@ pub async fn handler(
     //      did (cross-provider credential rebinding, model rewrite, request
     //      shaping); the final `req`/`provider` are moved into the returned
     //      `Prepared`.
-    let prep = prepare(
+    let mut prep = prepare(
         &state,
         &mut ctx,
         &mut req,
@@ -2199,11 +2199,22 @@ pub async fn handler(
     // 3. Branch: streaming vs non-streaming. Both arms consume `prep` (the
     //    streaming arm reads the fields it needs; the non-streaming arm hands
     //    the whole bundle to `complete_once`).
-    // A panel-configured request is ALWAYS completed through `complete_once`,
-    // even when `stream == true`: Phase 1 panels are non-streaming (spec §6.5),
-    // so we run the panel and return the buffered arbiter answer rather than
-    // half-implementing a streaming panel. Streaming arbiter UX is Phase 5.
-    if prep.req.stream && prep.panel.is_none() {
+    // A `stream: true` panel request streams the ARBITER answer over SSE
+    // (Phase 5): take the panel config out of `prep` and hand the bundle to
+    // `complete_panel_streaming`, which fans out the member legs, establishes
+    // the arbiter as a chunk stream, and defers the ONE aggregate
+    // `provider='panel'` row to the stream-end DropGuard. A `stream: true`
+    // request with NO panel header (the overwhelming majority) goes down
+    // `handle_streaming` unchanged — off-by-default.
+    if prep.req.stream {
+        if let Some(cfg) = prep.panel.take() {
+            // `complete_panel_streaming` returns `Result<Response, ApiError>`;
+            // `ApiError` is `IntoResponse`, so a fail-closed error (quorum-unmet
+            // 502, arbiter-establishment failure) becomes a proper non-200
+            // response — and, critically, returns BEFORE any stream is opened
+            // (no 200, no request_logs row).
+            return crate::routes::panel::complete_panel_streaming(&state, &ctx, prep, cfg).await;
+        }
         return handle_streaming(&state, &ctx, prep).await;
     }
     // Non-streaming: hand the prepared per-request setup to `complete_once`

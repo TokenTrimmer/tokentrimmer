@@ -1789,6 +1789,213 @@ pub(crate) async fn complete_panel(
     })
 }
 
+/// Complete a **streaming** deep-research panel request: fan out the member
+/// legs + enforce quorum ([`run_panel_legs_and_quorum`]), establish the arbiter
+/// as a chunk stream ([`ArbiterStrategy::arbitrate_streaming`]), and hand the
+/// arbiter stream to [`crate::routes::sse::stream_response`] with a panel-aware
+/// [`StreamLogContext`](crate::routes::sse::StreamLogContext). Mirrors
+/// [`complete_panel`] but **defers** the single aggregate `request_logs` row,
+/// the realized spend, and the per-leg `panel_legs` rows to the SSE
+/// [`DropGuard`](crate::routes::sse) — those side effects fire only once the
+/// arbiter stream drains (the streamed arbiter answer is not known up front).
+///
+/// # Fail-closed before 200 (invariants §2.1.3/4/5)
+/// A quorum-unmet / strategy-unsupported / unresolved error from
+/// `run_panel_legs_and_quorum`, AND an arbiter-establishment error from
+/// `arbitrate_streaming`, both propagate as `Err(ApiError)` **before**
+/// `stream_response` is ever called — so a failed streaming panel opens NO
+/// stream, writes NO billable row, advances NO counter, exactly like a failed
+/// single-model stream (`handle_streaming` returns before building the SSE body).
+///
+/// # `record_request_served` discipline
+/// NOT called here. `stream_response` bumps `record_request_served("sse",
+/// "dispatch")` exactly once, in-band, before handing back the SSE response —
+/// identical to the single-model streaming path. A fail-closed return reaches
+/// neither, so a rejected panel records nothing (the served counter only
+/// advances on a 200 that actually opened a stream).
+pub(crate) async fn complete_panel_streaming(
+    state: &AppState,
+    ctx: &RequestContext,
+    prep: Prepared,
+    cfg: PanelConfig,
+) -> Result<axum::response::Response, ApiError> {
+    use std::time::Instant;
+
+    // Per-leg / arbiter deadline: mirror `complete_panel`'s derivation.
+    let deadline = prep
+        .request_timeout
+        .unwrap_or_else(|| Duration::from_secs(120));
+
+    // ── Phases 1–2: fan out member legs + enforce quorum. A quorum-unmet (or any
+    //    other) error propagates BEFORE any stream is opened — fail-closed, zero
+    //    rows, mirroring `complete_panel`'s `run_panel` error arm + outcome label.
+    let (mut legs, leg_cost_total) =
+        match run_panel_legs_and_quorum(state, ctx, &prep.req, &prep.panel_creds, &cfg, deadline)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let outcome = match &e {
+                    ApiError::PanelQuorumUnmet { .. } => "quorum_unmet",
+                    ApiError::PanelStrategyUnsupported { .. } => "strategy_unsupported",
+                    _ => "error",
+                };
+                crate::metrics::record_panel_request(cfg.strategy.as_str(), outcome);
+                return Err(e);
+            }
+        };
+
+    // Recompute quorum required/met for the PanelStreamLog span attributes
+    // (legs is already quorum-checked inside the helper).
+    let required = cfg.quorum.unwrap_or(match cfg.strategy {
+        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
+        _ => 1,
+    });
+    let met = legs
+        .iter()
+        .filter(|l| matches!(l.status, LegStatus::Ok))
+        .count();
+
+    // ── Phase 3: establish the arbiter as a chunk stream. An establishment
+    //    error (e.g. no successful legs to synthesize, arbiter dispatch failed)
+    //    returns Err here — a proper non-200, BEFORE `stream_response`.
+    let strategy = strategy_for(&cfg)?;
+    let arb_start = Instant::now();
+    let (arbiter_stream, arbiter_cost_plan, arbiter_detail) = strategy
+        .arbitrate_streaming(&prep.req, &legs, state, ctx, &prep.panel_creds)
+        .await?;
+    let arb_latency_ms = arb_start.elapsed().as_millis() as u64;
+    crate::metrics::record_panel_request(cfg.strategy.as_str(), "success");
+
+    // Resolve the arbiter provider — its pricing drives the streamed
+    // (`Live`) arbiter cost finalize in the DropGuard, and its id stamps the
+    // arbiter leg's `panel_legs` row + the span provider attribute.
+    let arbiter_provider = state
+        .registry
+        .resolve(&cfg.arbiter_model.model)
+        .ok_or_else(|| ApiError::ModelNotFound {
+            model: cfg.arbiter_model.model.clone(),
+        })?;
+    let arbiter_provider_id = arbiter_provider.id().to_string();
+    let arbiter_model = cfg.arbiter_model.model.clone();
+
+    // ── Build the arbiter-leg record so the deferred `panel_legs` persistence
+    //    includes the arbiter leg, mirroring `run_panel`'s `arbiter_leg`.
+    //    `cost_usd` comes from the plan's `Known` value (replay strategies) or
+    //    `None` for `Live` (the Synthesize arbiter cost is finalized in the
+    //    DropGuard from the streamed usage). `usage = None` is acceptable on the
+    //    deferred path (mirrors `PanelStreamLog`'s deferred-cost contract).
+    let arbiter_leg = LegResult {
+        leg_index: usize::MAX,
+        role: LegRole::Arbiter,
+        model: arbiter_model.clone(),
+        provider: arbiter_provider_id.clone(),
+        status: LegStatus::Ok,
+        cost_usd: match &arbiter_cost_plan {
+            ArbiterCostPlan::Known(c) => *c,
+            ArbiterCostPlan::Live => None,
+        },
+        usage: None,
+        latency_ms: arb_latency_ms,
+        response: None,
+    };
+    crate::metrics::record_panel_leg("arbiter", LegStatus::Ok.as_str());
+    legs.push(arbiter_leg);
+
+    // ── PanelStreamLog (Task 4): the panel-specific billing context the
+    //    DropGuard reads to write the ONE aggregate `provider='panel'` row +
+    //    the per-leg `panel_legs` rows at stream end.
+    let panel = std::sync::Arc::new(crate::routes::sse::PanelStreamLog {
+        leg_records: legs,
+        leg_cost_total,
+        strategy: cfg.strategy,
+        quorum_required: required,
+        quorum_met: met,
+        arbiter_detail,
+        arbiter_cost_plan,
+        arbiter_model: arbiter_model.clone(),
+        panel_leg_writer: state.panel_leg_writer.clone(),
+    });
+
+    // Input-token estimate for the streamed row (best-effort; the DropGuard
+    // overwrites the cost with the panel aggregate regardless). Estimated
+    // against the arbiter provider so the tokenizer choice matches the streamed
+    // provider.
+    let estimated_input_tokens = tt_tokenize::estimate_tokens(
+        arbiter_provider.id(),
+        &tt_shared::message_text_for_estimation(&prep.req),
+    ) as i32;
+
+    // Honor `stream_options.include_usage` end-to-end (helper is private to
+    // chat.rs; the probe is inlined here).
+    let include_usage = prep
+        .req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.get("include_usage"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // Arbiter-model pricing drives the `Live` finalize + the terminal usage
+    // event; baseline == pricing (a panel claims no routing/cache saving).
+    let arbiter_pricing = arbiter_provider.pricing(&arbiter_model);
+
+    // OTel span context, provider stamped "panel" to mirror `complete_panel`'s
+    // span (the DropGuard fills the additive panel.* attributes from
+    // PanelStreamLog regardless). Panels never cache, so `cache_outcome = none`.
+    let span_ctx = Some(crate::routes::sse::StreamSpanContext {
+        span: tracing::Span::current(),
+        provider_id: "panel".to_string(),
+        request_model: arbiter_model.clone(),
+        response_model: arbiter_model.clone(),
+        cache_outcome: "none".to_string(),
+        route: prep.route_matched_name.clone(),
+        traffic_split_pct: None,
+    });
+
+    let log_ctx = crate::routes::sse::StreamLogContext {
+        writer: state.request_log_writer.as_ref().map(|w| w.clone()),
+        tracker: state.telemetry_tracker.clone(),
+        org_id: ctx.org_id,
+        api_key_id: ctx.api_key_id,
+        trace_id: ctx.trace_id,
+        // Provider sentinel "panel" — the DropGuard forces the row provider to
+        // "panel" for a panel context anyway; this also picks the tokenizer.
+        provider_id: "panel".to_string(),
+        model: arbiter_model.clone(),
+        input_tokens: estimated_input_tokens,
+        // Panels never cache.
+        cached_tokens: 0,
+        pricing: arbiter_pricing.clone(),
+        baseline_pricing: arbiter_pricing,
+        route_id: prep.matched_route_id,
+        tag: ctx.tag.clone(),
+        request_started: prep.request_started,
+        spend_sink: state.spend_sink(),
+        // Panels run no flex / compression / shaping levers — defaults.
+        fee_multiplier: arbiter_provider.fee_multiplier(),
+        flex_applied: false,
+        pass_effects: crate::passes::PassEffects::default(),
+        retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
+        // Panels never cache.
+        cache_insert: None,
+        include_usage,
+        span_ctx,
+        // Panels never run the canary traffic-split lever.
+        traffic_split_arm: None,
+        route_paused: prep.route_paused,
+        // The panel aggregate-billing context (off-by-default elsewhere).
+        panel: Some(panel),
+    };
+
+    Ok(crate::routes::sse::stream_response(
+        arbiter_stream,
+        &arbiter_provider,
+        ctx.trace_id,
+        Some(log_ctx),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
