@@ -860,6 +860,27 @@ pub fn stream_response(
                 // billed and served counters.
                 spend_sink.settle(org_id, api_key_id, false, Utc::now());
 
+                // Telemetry-parity: for a panel aggregate row, savings/cache
+                // fields must be zeroed to match `complete_panel`'s
+                // `aggregate_cost_breakdown` (cost == baseline ⇒ no savings,
+                // no provider cache credit). For a non-panel stream these keep
+                // the actual `breakdown.*` values — off-by-default.
+                let (
+                    span_saved_usd,
+                    span_prov_cache_saved_usd,
+                    row_prov_cache_saved_usd,
+                    row_cache_bust_usd,
+                ) = if panel.is_some() {
+                    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64)
+                } else {
+                    (
+                        breakdown.tt_saved_usd(),
+                        breakdown.provider_cache_saved_usd,
+                        breakdown.provider_cache_saved_usd,
+                        breakdown.cache_bust_penalty_usd,
+                    )
+                };
+
                 // Record OTel GenAI semconv + TokenTrimmer cost attributes onto
                 // the captured `http_request` span, mirroring the non-streaming
                 // path. Done here (not in the handler) because the cost is only
@@ -880,8 +901,8 @@ pub fn stream_response(
                                 output_tokens: usage.output_tokens.max(0) as u64,
                                 cost_usd,
                                 baseline_cost_usd,
-                                saved_usd: breakdown.tt_saved_usd(),
-                                provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+                                saved_usd: span_saved_usd,
+                                provider_cache_saved_usd: span_prov_cache_saved_usd,
                             },
                             cache_outcome: Some(&sc.cache_outcome),
                             route: sc.route.as_deref(),
@@ -920,10 +941,11 @@ pub fn stream_response(
                     cached_tokens: usage.cached_tokens,
                     cost_usd,
                     baseline_cost_usd,
-                    provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+                    provider_cache_saved_usd: row_prov_cache_saved_usd,
                     // Fee-applied, matching the usage-event/span figure — keeps
                     // the row-derived TT headline equal to `tt_saved_usd()`.
-                    cache_bust_penalty_usd: breakdown.cache_bust_penalty_usd,
+                    // For a panel aggregate, zeroed to match `complete_panel`.
+                    cache_bust_penalty_usd: row_cache_bust_usd,
                     cached: false,
                     cache_layer: None,
                     route_id,
