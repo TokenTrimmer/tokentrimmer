@@ -28,9 +28,10 @@ use serde_json::json;
 use tt_telemetry::{panel_legs::PanelLegRow, request_logs::RequestLogRow};
 use uuid::Uuid;
 
+use futures::stream::BoxStream;
 use tt_shared::{
     messages::{ChatCompletionRequest, Message, MessageContent, PanelExtras},
-    ChatCompletionResponse, RequestContext, Usage,
+    ChatCompletionChunk, ChatCompletionResponse, ProviderError, RequestContext, Usage,
 };
 
 use crate::routes::chat::{
@@ -485,6 +486,33 @@ pub trait ArbiterStrategy {
         ctx: &RequestContext,
         creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     ) -> Result<ArbiterOutcome, ApiError>;
+
+    /// Streaming variant. Default impl runs the buffered `arbitrate` then replays
+    /// the chosen response as a chunk stream (`Known` cost — the replayed tokens
+    /// are already a member leg's, counted in Σ legs; see ArbiterCostPlan). Live
+    /// strategies (Synthesize) override this. (spec §5.3)
+    async fn arbitrate_streaming(
+        &self,
+        request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) -> Result<
+        (
+            BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+            ArbiterCostPlan,
+            ArbiterDetail,
+        ),
+        ApiError,
+    > {
+        let outcome = self.arbitrate(request, legs, state, ctx, creds).await?;
+        Ok((
+            crate::routes::sse::fake_stream_from_response(outcome.response),
+            ArbiterCostPlan::Known(outcome.cost_usd),
+            outcome.detail,
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +625,95 @@ impl ArbiterStrategy for Synthesize {
             cost_usd: measured.cost_usd,
             detail: ArbiterDetail::default(),
         })
+    }
+
+    async fn arbitrate_streaming(
+        &self,
+        request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) -> Result<
+        (
+            BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+            ArbiterCostPlan,
+            ArbiterDetail,
+        ),
+        ApiError,
+    > {
+        // Collect the text content of all successful legs.
+        let ok_answers = surviving_answers(legs);
+
+        // Defensive guard: no successful legs → error.
+        if ok_answers.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "panel: no successful legs to synthesize".into(),
+            ));
+        }
+
+        let n = ok_answers.len();
+
+        // Build the arbiter synthesis instruction (verbatim from `arbitrate`).
+        let synthesis_instruction = format!(
+            "You are an expert synthesis engine. You have received {n} candidate \
+             answers from different AI models responding to the same user request. \
+             Your task is to synthesize them into one single best answer. \
+             Combine the strongest insights, resolve any contradictions by preferring \
+             the most accurate information, and produce a clear, complete, and \
+             well-structured response. Output only the synthesized answer — no \
+             preamble, no meta-commentary about the synthesis process."
+        );
+
+        // Preserve caller system messages; append synthesis instruction + candidates.
+        let mut messages = request.messages.clone();
+        messages.push(Message::System {
+            content: MessageContent::Text(synthesis_instruction),
+        });
+        for (i, (_, answer)) in ok_answers.iter().enumerate() {
+            messages.push(Message::User {
+                content: MessageContent::Text(format!(
+                    "Candidate answer {} of {}:\n\n{}",
+                    i + 1,
+                    n,
+                    answer
+                )),
+                name: None,
+            });
+        }
+
+        let arbiter_req = ChatCompletionRequest {
+            model: self.arbiter_model.model.clone(),
+            messages,
+            stream: true,
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+
+        // Resolve the arbiter provider.
+        let provider = state
+            .registry
+            .resolve(&self.arbiter_model.model)
+            .ok_or_else(|| ApiError::ModelNotFound {
+                model: self.arbiter_model.model.clone(),
+            })?;
+
+        // Substitute the arbiter provider's credential when present in the creds map.
+        let mut arb_ctx_owned;
+        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
+            arb_ctx_owned = ctx.clone();
+            arb_ctx_owned.credentials = c.clone();
+            &arb_ctx_owned
+        } else {
+            ctx
+        };
+
+        let stream = provider
+            .chat_completion_stream(arbiter_req, arb_ctx)
+            .await
+            .map_err(|e| ApiError::ServiceUnavailable(format!("arbiter stream failed: {e}")))?;
+
+        Ok((stream, ArbiterCostPlan::Live, ArbiterDetail::default()))
     }
 }
 
