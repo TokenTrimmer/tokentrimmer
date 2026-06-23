@@ -11,7 +11,7 @@ Add a `panel` effect to `RouteAction` so a matched route triggers + configures t
 ## 2. Key facts (verified in code)
 
 - **`RouteAction`** (`crates/routing/src/lib.rs:135–331`) is a struct of ~19 optional effects (`target_model`, `flex`, `compress`, `agentic_budget: Option<AgenticBudget>`, …). `AgenticBudget` (`:340`) is the precedent for a **self-contained nested struct mirrored across crates**.
-- **`RouteAction` has a field-aligned mirror** `tt_plan_core::RouteAction` (`crates/plan-core/src/types.rs:258+`), kept in lockstep by per-field cross-type wire-compat tests (`route_action_cross_type_wire_compat` `:815`, `…_redact_…`, `…_batch_…`, `…_flex_…`, `…_canary_…`). **Any new field goes in BOTH structs + gets a wire-compat test.**
+- **`tt_plan_core::RouteAction` (`plan-core/src/types.rs:258+`) mirrors only the COST-PROJECTION levers** (`flex`, `batch`, `max_cost_usd`, `traffic_pct`, `shadow_model`, …, each with a per-field wire-compat test like `route_action_cross_type_wire_compat` `:815`). It deliberately **omits runtime-only levers** — `agentic_budget`, `compress`, `redact` exist in `tt_routing::RouteAction` ONLY, not in plan-core. So `agentic_budget` is the precedent for a **routing-only** lever (the plan simulator does not model it). `panel` is a runtime lever ⇒ **routing-only, NOT mirrored in plan-core, no wire-compat test** (the lockstep guard only covers the mirrored cost levers, so a routing-only field is fine — `agentic_budget` proves it compiles/ships).
 - **`validate_route_has_effect`** (`crates/routing/src/validate.rs:201–219`) — `has_effect = then.agentic_budget.is_some() || …`. A panel-only route (no `target_model`, only `panel`) must count as a real effect or it's rejected as a no-op.
 - **Route → gateway flow:** `apply_routing` (`chat.rs:6276`) matches a route and projects `RouteAction` into the in-process `RouteMatch` struct (`chat.rs:6167`); effects are applied across `prepare` (`chat.rs:2410–2900`). `apply_routing` runs at `chat.rs:2400` — **before** the panel-resolution block (`chat.rs:2690`), so the matched `RouteMatch` is available there.
 - **Panel trigger + config today** (`chat.rs:2690–2759`): `panel_from_header(headers)` → strategy; `PanelConfig::resolve(strategy, Option<&PanelExtras>, &PanelDefaults)` (`panel.rs:142`) merges strategy + `tt_extras.panel` + env defaults into a `PanelConfig {strategy, members, arbiter_model, quorum, max_cost_usd}`; then kill-switch (`PanelDisabled`) → entitlement (`Forbidden`) → budget gate (`402`) → per-member cred resolution → `prep.panel = Some(cfg)`. `complete_once` branches to `complete_panel` when `prep.panel` is `Some` (`chat.rs:1053`).
@@ -20,7 +20,7 @@ Add a `panel` effect to `RouteAction` so a matched route triggers + configures t
 
 ## 3. Decisions
 
-- **D1 — `RoutePanel` is a self-contained nested struct (AgenticBudget pattern), mirrored in `tt_routing` + `tt_plan_core`:**
+- **D1 — `RoutePanel` is a self-contained nested struct (AgenticBudget pattern), defined in `tt_routing` ONLY (not mirrored to plan-core — see §2):**
   ```rust
   pub struct RoutePanel {
       pub strategy: String,                  // "synthesize" | "best-of-n" | "majority"
@@ -34,7 +34,7 @@ Add a `panel` effect to `RouteAction` so a matched route triggers + configures t
       pub max_cost_usd: Option<f64>,
   }
   ```
-  `RouteAction.panel: Option<RoutePanel>` (after `agentic_budget`, both crates; `#[serde(default, skip_serializing_if = "Option::is_none")]`).
+  `RouteAction.panel: Option<RoutePanel>` (after `agentic_budget`, **`tt_routing` only**; `#[serde(default, skip_serializing_if = "Option::is_none")]`). `arbiter` is `Option<String>` (a model id); the `ModelRef` lift happens inside `PanelConfig::resolve`, not here.
 - **D2 — Header wins.** In the panel-resolution block, `panel_from_header(headers)` is checked **first**; the route's `panel` is consulted **only when the header is absent**. The header path is byte-for-byte unchanged. (Rationale: explicit per-request intent beats org default; keeps the shipped header behavior intact.)
 - **D3 — Route-triggered panels use the same gates + engine.** A route-sourced panel runs through the identical kill-switch (`panel_enabled`), entitlement (`panel_min_tier`), budget gate, per-member cred resolution, and `complete_panel` path. The route only supplies the *strategy + config* (mapped into a `PanelExtras`); `PanelConfig::resolve` + all gates are unchanged.
 - **D4 — `target_model` is inert when `panel` is set.** If a route sets both `panel` and `target_model`, the panel governs dispatch (`complete_panel` branches before single-model dispatch), so the rewrite never applies. Allowed (not an error) but documented; `validate_route_has_effect` already passes (panel is an effect).
@@ -68,13 +68,14 @@ complete_once (chat.rs:1053): prep.panel.is_some() → complete_panel (Phases 1-
 - Add `RoutePanel` struct (D1) near `AgenticBudget` (`:340`).
 - Add `pub panel: Option<RoutePanel>` to `RouteAction` (after `agentic_budget`, `:330`), same serde attrs.
 
-### 5.2 `tt_plan_core` mirror (`crates/plan-core/src/types.rs`)
-- Mirror `RoutePanel` + `RouteAction.panel` at the matching position (`:403+`).
-- Add `route_action_panel_cross_type_wire_compat` test (mirror `:815`/`:864`): a `RoutePanel`-bearing `RouteAction` serializes byte-identically across both crates; round-trips; omitted when `None`.
+### 5.2 `tt_plan_core` — NO change (panel is routing-only)
+Do **not** add `panel`/`RoutePanel` to `tt_plan_core::RouteAction`. Panel is a runtime lever; plan-core mirrors only cost-projection levers (§2), and `agentic_budget` is the routing-only precedent. No cross-type wire-compat test is added (the lockstep guard covers only the mirrored cost fields). Consequence: the plan/replay simulator treats a panel route as a normal match and does **not** model the fan-out cost — an acceptable known gap (a future enhancement could teach the simulator to estimate N legs + arbiter), consistent with how `agentic_budget` is unmodeled there.
 
-### 5.3 Validation (`crates/routing/src/validate.rs`)
-- `validate_route_has_effect` (`:205`): add `|| then.panel.is_some()` to the `has_effect` chain.
-- New `validate_panel(then: &RouteAction) -> Result<(), ValidationError>`: if `then.panel` is `Some`, require `strategy` parses to an `ArbiterStrategyKind` (reuse the parser) and `members.len() <= TT_PANEL_MAX_MEMBERS`; call it in the route-creation validation chain alongside the others.
+### 5.3 Validation (`crates/routing/src/validate.rs`) — self-contained (no `tt_core` dep)
+- `validate_route_has_effect` (`:205`): add `|| then.panel.is_some()` to the `has_effect` OR-chain (a panel-only route is a valid effect).
+- New `validate_panel(then: &RouteAction) -> Result<(), ValidationError>`: when `then.panel` is `Some`, require `strategy` ∈ a routing-local `pub const PANEL_STRATEGY_VALUES: [&str; 3] = ["synthesize", "best-of-n", "majority"]`. **`ArbiterStrategyKind::parse` is private + lives in `tt_core::routes::panel`, and `tt_routing` cannot depend on `tt_core` (cycle)** — so the strategy check is a self-contained literal-set membership test in the routing crate. Call `validate_panel` in the route-creation validation chain.
+- **Drift guard:** add a test in `tt-core` (which CAN see both) asserting every `tt_routing::PANEL_STRATEGY_VALUES` entry parses via `ArbiterStrategyKind::parse` (catches the two lists diverging).
+- **`members` cap is NOT checked here** — `TT_PANEL_MAX_MEMBERS` is an env value read in `tt_core`, unavailable in `tt_routing`. The cap is enforced at request time by the existing panel budget gate / `PanelConfig::resolve` (same as a header-triggered panel), so an over-cap route fails at request time, not creation.
 
 ### 5.4 Gateway `RouteMatch` + `apply_routing` (`crates/core/src/routes/chat.rs`)
 - Add `pub(crate) panel: Option<tt_routing::RoutePanel>` to `RouteMatch` (`:6167`).
@@ -82,7 +83,7 @@ complete_once (chat.rs:1053): prep.panel.is_some() → complete_panel (Phases 1-
 
 ### 5.5 Panel-resolution merge (`crates/core/src/routes/chat.rs:2690`)
 - Header-wins (D2): keep `panel_from_header(headers)` as the primary trigger; when it returns `None`, fall back to `route_match.panel`. Introduce a small `enum PanelTrigger { Header(ArbiterStrategyKind), Route(RoutePanel) }` (or inline) so the resolve step knows the extras source.
-- For `Route(rp)`: `strategy = ArbiterStrategyKind::parse(&rp.strategy)` (skip the panel entirely if unparseable — defensive, shouldn't happen post-validation); build a `PanelExtras { members: rp.members, arbiter: rp.arbiter, quorum: rp.quorum, max_cost_usd: rp.max_cost_usd }`; call `PanelConfig::resolve(strategy, Some(&extras), &PanelDefaults::from_env())`.
+- For `Route(rp)`: `strategy = ArbiterStrategyKind::parse(&rp.strategy)` (this runs in `tt_core` where the parser lives; if it returns `None` — shouldn't happen post-`validate_panel` — skip the panel defensively, falling through to the single-model path); build `PanelExtras { members: rp.members, arbiter_model: rp.arbiter, quorum: rp.quorum, max_cost_usd: rp.max_cost_usd }` (note the field is `arbiter_model: Option<String>`, fed from `rp.arbiter`); call `PanelConfig::resolve(strategy, Some(&extras), &PanelDefaults::from_env())` — `resolve` performs the `Option<String> → ModelRef` lift for the arbiter and applies the member cap, exactly as for a header-triggered panel.
 - The kill-switch / entitlement / budget gate / cred-resolution that follow are **unchanged** and run identically for both trigger sources.
 
 ### 5.6 Cloud (separate PR, after public merges)
@@ -94,13 +95,14 @@ complete_once (chat.rs:1053): prep.panel.is_some() → complete_panel (Phases 1-
 3. **Same gates.** A route-triggered panel is subject to kill-switch (off ⇒ `403 PanelDisabled`), entitlement (below min ⇒ `403`), and budget (over/unpriceable ⇒ `402`) — a route cannot bypass them.
 4. **Off-by-default.** No header + no matching panel route ⇒ byte-identical single-model path; a route without a `panel` field deserializes to `panel: None` (serde default) and changes nothing.
 5. **Paused route ⇒ no panel.** A paused panel route does not trigger the panel (panel is a cost lever, off when paused).
-6. **Lockstep.** `tt_routing::RouteAction` and `tt_plan_core::RouteAction` serialize identically for the `panel` field (wire-compat test).
+6. **Routing-only.** `panel` lives in `tt_routing::RouteAction` only (not plan-core, like `agentic_budget`); the plan simulator treats a panel route as a normal match without modeling the fan-out cost. `validate_panel`'s `PANEL_STRATEGY_VALUES` is drift-guarded against `ArbiterStrategyKind::parse` by a tt-core test.
 7. **Validation.** A panel-only route (no target_model) is accepted (`has_effect`); a route with an unparseable strategy or too many members is rejected at creation.
 8. **No billing change.** Route-triggered panels bill exactly like header-triggered ones (one `provider='panel'` row, aggregate cost, served once) with `matched_route_id` set.
 
 ## 7. Testing (TDD)
-- **`RoutePanel` wire-compat unit** (plan-core): `route_action_panel_cross_type_wire_compat` — byte-identical serialize across crates; round-trip; omitted when `None`.
-- **`validate_panel` unit** (routing): panel-only route passes `validate_route_has_effect`; unparseable strategy / `members > cap` rejected.
+- **`RouteAction.panel` serde unit** (routing): round-trips; omitted from JSON when `None`; old route JSON without `panel` deserializes to `None`.
+- **Strategy drift-guard unit** (tt-core): every `tt_routing::PANEL_STRATEGY_VALUES` entry parses via `ArbiterStrategyKind::parse` (the two lists can't diverge).
+- **`validate_panel` unit** (routing): a panel-only route (no target_model) passes `validate_route_has_effect`; a route with a strategy not in `PANEL_STRATEGY_VALUES` is rejected at creation. (Member-cap is a request-time check, tested via the gate below, not at creation.)
 - **Route-triggered panel integration** (mirror `panel_engine.rs` + the routing test harness, e.g. `route_header.rs`): a route with `panel: synthesize{members:[mockA,mockB]}` + a matching request (no header) ⇒ 200, `tokentrimmer.panel` with those legs, one `provider='panel'` row, `matched_route_id` set.
 - **Header-wins** integration: a request with `X-TokenTrimmer-Panel: best-of-n` that ALSO matches a `panel: synthesize` route ⇒ the panel runs `best-of-n` (header), not `synthesize` (route); the route's panel is ignored.
 - **Gates on route panels**: kill-switch off ⇒ route panel ⇒ `403`; below-min tier ⇒ `403`; over-budget ⇒ `402` (zero dispatch).
@@ -118,4 +120,5 @@ complete_once (chat.rs:1053): prep.panel.is_some() → complete_panel (Phases 1-
 - **Consistency:** `RoutePanel` follows the `AgenticBudget` self-contained-mirror precedent + the cross-type wire-compat lockstep discipline; route-triggered panels reuse `PanelConfig::resolve` + every gate unchanged; billing/engine untouched.
 - **Scope:** public feature (routing + plan-core + core + validate + tests) is one plan; cloud is a mechanical pin bump (its own small PR after public merges). No migration.
 - **Ambiguity:** richness (D1 full config), precedence (D2 header-wins), gate reuse (D3), target_model interaction (D4), attribution (D5), and validation location (D6) are each pinned to one behavior.
-- **Cross-repo:** public-first (merge → SHA), then cloud bumps all git-dep `rev`s + local DB test + admin-merge; the JSONB column needs no migration and old rows stay valid via serde defaults.
+- **Cross-repo:** public-first (merge → SHA), then cloud bumps all **11** git-dep `rev`s + local DB test + admin-merge; the JSONB column needs no migration and old rows stay valid via serde defaults.
+- **Review hardening (2-lens adversarial pass):** corrected three real issues — (1) `ArbiterStrategyKind::parse` is private + in `tt_core` (unreachable from `tt_routing`), so strategy validation is a self-contained literal-set check in routing with a tt-core drift-guard test (§5.3); (2) plan-core mirrors only cost-projection levers and omits runtime levers (`agentic_budget` is routing-only), so `panel` is **routing-only — no plan-core mirror, no wire-compat test** (this shrank the feature, §2/§5.2); (3) the `PanelExtras` field is `arbiter_model` (not `arbiter`) and `resolve` does the `ModelRef` lift (§5.5). Attribution (`matched_route_id` on the `provider='panel'` row), header-wins, paused⇒panel:None, off-by-default, and the 11-pin cloud bump were all confirmed sound.
