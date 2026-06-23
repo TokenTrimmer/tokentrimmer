@@ -619,7 +619,10 @@ impl TrackedEventStream {
         );
         match serde_json::to_string(&value) {
             Ok(json) => Some(Event::default().event("tokentrimmer.panel").data(json)),
-            Err(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "panel terminal event serialize failed");
+                None
+            }
         }
     }
 

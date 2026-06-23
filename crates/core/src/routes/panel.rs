@@ -708,10 +708,14 @@ impl ArbiterStrategy for Synthesize {
             ctx
         };
 
-        let stream = provider
-            .chat_completion_stream(arbiter_req, arb_ctx)
-            .await
-            .map_err(|e| ApiError::ServiceUnavailable(format!("arbiter stream failed: {e}")))?;
+        let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
+        let stream = tokio::time::timeout(
+            deadline,
+            provider.chat_completion_stream(arbiter_req, arb_ctx),
+        )
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable("arbiter stream establishment timed out".into()))?
+        .map_err(|e| ApiError::ServiceUnavailable(format!("arbiter stream failed: {e}")))?;
 
         Ok((stream, ArbiterCostPlan::Live, ArbiterDetail::default()))
     }
