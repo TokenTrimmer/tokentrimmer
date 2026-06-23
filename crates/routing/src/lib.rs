@@ -28,7 +28,8 @@ pub use store::{
 };
 pub use validate::{
     validate_agentic_budget, validate_auto_pause, validate_capability, validate_output_shaping,
-    validate_route_has_effect, validate_shadow_model, ValidationError,
+    validate_panel, validate_route_has_effect, validate_shadow_model, ValidationError,
+    PANEL_STRATEGY_VALUES,
 };
 
 use serde::{Deserialize, Serialize};
@@ -328,6 +329,34 @@ pub struct RouteAction {
     /// when `None` (back-compat with existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agentic_budget: Option<AgenticBudget>,
+    /// Trigger + configure the deep-research panel for matched requests. None
+    /// (default) ⇒ no panel. A panel route is typically modifier-only
+    /// (target_model None); if target_model is also set, the panel governs
+    /// dispatch and the rewrite is inert (complete_panel branches first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<RoutePanel>,
+}
+
+/// Deep-research panel config for a route-triggered panel (the same panel
+/// engine as the X-TokenTrimmer-Panel header). Self-contained (not a re-export
+/// of tt_shared PanelExtras) to keep the routing wire contract explicit and
+/// avoid a tt_shared coupling in this crate — mirrors the AgenticBudget pattern.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoutePanel {
+    /// "synthesize" | "best-of-n" (or "best_of_n") | "majority". Validated at
+    /// route creation against PANEL_STRATEGY_VALUES; parsed authoritatively at
+    /// request time by tt_core's ArbiterStrategyKind::parse.
+    pub strategy: String,
+    /// Panel member model ids; empty ⇒ gateway env TT_PANEL_DEFAULT_MEMBERS.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    /// Arbiter model id; None ⇒ env TT_PANEL_DEFAULT_ARBITER.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbiter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quorum: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
 }
 
 /// Route-grained agentic context budget — the opt-in shaping mode that brings
@@ -696,6 +725,7 @@ mod tests {
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
+                panel: None,
             },
             paused: false,
         }
@@ -1014,6 +1044,7 @@ mod tests {
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
             agentic_budget: None,
+            panel: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -1056,6 +1087,7 @@ mod tests {
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
             agentic_budget: None,
+            panel: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -1090,6 +1122,7 @@ mod tests {
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
             agentic_budget: None,
+            panel: None,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -2021,6 +2054,43 @@ mod tests {
         assert!(j.contains(r#""not_reasoning_class":true"#));
         let back: RouteConditions = serde_json::from_str(&j).unwrap();
         assert!(back.not_reasoning_class);
+    }
+
+    // --- RoutePanel serde tests ---
+
+    /// A `RouteAction { panel: None, .. }` serializes WITHOUT a "panel" key
+    /// (serde skip_serializing_if = "Option::is_none").
+    #[test]
+    fn route_action_panel_none_omitted_from_json() {
+        let a = RouteAction {
+            target_model: Some("x".into()),
+            panel: None,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(!j.contains("panel"), "panel must be omitted when None: {j}");
+    }
+
+    /// JSON lacking a "panel" key deserializes to `panel: None` (back-compat).
+    #[test]
+    fn route_action_panel_absent_deserializes_to_none() {
+        let a: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert_eq!(a.panel, None);
+    }
+
+    /// A `RoutePanel` round-trips: serialize → deserialize produces an equal value.
+    #[test]
+    fn route_panel_round_trips() {
+        let original = RoutePanel {
+            strategy: "synthesize".into(),
+            members: vec!["gpt-4o".into(), "claude-3-5-haiku".into()],
+            arbiter: Some("gpt-4o".into()),
+            quorum: Some(2),
+            max_cost_usd: Some(0.05),
+        };
+        let j = serde_json::to_string(&original).unwrap();
+        let parsed: RoutePanel = serde_json::from_str(&j).unwrap();
+        assert_eq!(parsed, original);
     }
 
     /// Two different orgs reusing the SAME idempotency-key string get
