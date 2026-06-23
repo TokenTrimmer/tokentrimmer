@@ -920,33 +920,89 @@ async fn truncated_streaming_panel_writes_row_with_truncated_true() {
 }
 
 // ---------------------------------------------------------------------------
-// Task B: cost_incomplete=true streaming-panel reachability
+// Task B: cost_incomplete=false for a normal Synthesize Live streaming panel
 //
 // Background: `panel_body_json` sets `cost_incomplete=true` when any surviving
-// (status==Ok) leg has `cost_usd == None` at the time the terminal
-// `tokentrimmer.panel` SSE event is emitted.
+// (status==Ok) *member* leg has `cost_usd == None` at the time the terminal
+// `tokentrimmer.panel` SSE event is emitted.  The arbiter leg is explicitly
+// excluded from this scan because:
 //
-// For a streaming panel that *reaches the stream phase*, the fail-closed
-// `panel_budget_gate` has already verified pricing for every member and the
-// arbiter via `estimate_panel_cost` (which short-circuits to None → 402 if
-// any member/arbiter is unpriceable).  Member-leg costs come from
-// `measured_single_dispatch`, which calls `provider.pricing(&response.model)`.
-// For a correctly-behaving provider (response.model == requested model), the
-// same pricing entry consulted at gate time is present at dispatch time, so
-// `cost_usd` is always `Some(...)` for Ok legs.
+//   1. Member-leg unpriceability is blocked by the fail-closed
+//      `panel_budget_gate` (returns 402 if any member/arbiter is unpriceable),
+//      which runs before any dispatch — so a streaming panel that reaches the
+//      stream phase always has all member legs priced (covered by
+//      `panel_budget.rs::panel_budget_gate_err_when_unpriceable`).
 //
-// Conclusion: a `cost_incomplete=true` *streaming* panel is NOT reachable
-// via a normal request flow against conforming providers.  The only theoretical
-// path (model-alias mismatch: provider echoes a different model name in the
-// response) is an out-of-spec provider behaviour not represented by any mock
-// in the test suite.  Writing a contrived test for this would test the mock's
-// misbehaviour, not the gateway's billing invariants.
+//   2. For Synthesize Live, the arbiter leg's cost_usd is None in the legs
+//      slice at panel-event emit time (the Live cost is deferred to the
+//      DropGuard at stream end).  If the arbiter leg were included in the scan,
+//      cost_incomplete would incorrectly be set to `true` on every normal
+//      Synthesize stream.  The fix (`l.role != LegRole::Arbiter`) excludes it.
 //
-// The "cost_incomplete" gap flagged in the Phase-5 review therefore resolves
-// as: **the scenario manifests as a pre-dispatch 402** (covered by
-// `panel_budget.rs::panel_budget_gate_err_when_unpriceable`), NOT as a
-// cost_incomplete streaming panel.  No streaming test is added.
+// The test below pins that a normal all-member-priced Synthesize Live stream
+// correctly reports cost_incomplete=false.  It FAILS before the fix (the
+// arbiter's deferred None cost triggered cost_incomplete=true) and PASSES after.
 // ---------------------------------------------------------------------------
+
+/// Synthesize Live streaming panel: all member legs are priced → the terminal
+/// `tokentrimmer.panel` SSE event must report `cost_incomplete == false`.
+///
+/// This pins the fix in `panel_body_json` that excludes the arbiter leg from
+/// the `cost_incomplete` scan.  Without the fix this test would see `true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synthesize_streaming_panel_cost_incomplete_false() {
+    let (app, _writer, _tracker, _calls) = app_synthesize_stream(false);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "model-a",
+                "messages": [{ "role": "user", "content": "cost_incomplete pin" }],
+                "stream": true,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["model-a", "model-b"],
+                        "arbiter_model": "model-synth"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "streaming synthesize panel must return 200"
+    );
+
+    let body = router_sse_body(resp).await;
+    let events = parse_sse_events(&body);
+
+    let panel_pos = events
+        .iter()
+        .position(|(t, _)| t == "tokentrimmer.panel")
+        .expect("tokentrimmer.panel event must be present");
+    let panel_json: serde_json::Value =
+        serde_json::from_str(&events[panel_pos].1).expect("tokentrimmer.panel must be valid JSON");
+
+    let cost_incomplete = panel_json["cost_incomplete"]
+        .as_bool()
+        .expect("tokentrimmer.panel must have a boolean cost_incomplete field");
+
+    assert!(
+        !cost_incomplete,
+        "cost_incomplete must be false for a normal all-member-priced Synthesize Live stream; \
+         got true (arbiter leg's deferred None cost was incorrectly included in the scan)"
+    );
+}
 
 // ===========================================================================
 // Task 6 — router-level end-to-end streaming-panel suite.

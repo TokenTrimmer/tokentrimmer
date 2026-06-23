@@ -1472,11 +1472,14 @@ pub(crate) fn panel_body_json(
         })
         .collect();
 
-    // `cost_incomplete`: any surviving leg with no priced cost ⇒ the recorded
-    // aggregate is a lower bound (spec §6.4 step 8).
+    // `cost_incomplete`: any surviving *member* leg with no priced cost ⇒ the
+    // recorded aggregate is a lower bound (spec §6.4 step 8).
+    // The arbiter leg is explicitly excluded: its cost arrives deferred (Live
+    // plan) or is always measured (Known plan / non-streaming), so including it
+    // would over-set the flag on a normal Synthesize Live stream.
     let cost_incomplete = legs
         .iter()
-        .any(|l| l.status == LegStatus::Ok && l.cost_usd.is_none());
+        .any(|l| l.role != LegRole::Arbiter && l.status == LegStatus::Ok && l.cost_usd.is_none());
 
     // Build the `arbiter` sub-object: base fields + non-default ArbiterDetail fields.
     let d = arbiter_detail;
