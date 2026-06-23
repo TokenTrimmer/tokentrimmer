@@ -258,6 +258,25 @@ fn transcode_sse_response(resp: Response) -> Response {
 /// client sees the failure.
 fn process_openai_frame(frame: &[u8], encoder: &mut AnthropicSseEncoder) -> Option<String> {
     let text = std::str::from_utf8(frame).ok()?;
+
+    // Phase 6: forward TokenTrimmer panel/usage SSE events verbatim. The Phase-5
+    // streaming panel emits frames like `event: tokentrimmer.panel\ndata: {...}`;
+    // the data-line loop below only understands ChatCompletionChunk/error frames and
+    // would drop these. A TT-aware client on /v1/messages reads them (and on streams
+    // they are the ONLY carrier of panel cost — no x-tokentrimmer-* headers on SSE).
+    if text.lines().any(|l| {
+        l.trim_end_matches('\r')
+            .strip_prefix("event:")
+            .map(|s| s.trim().starts_with("tokentrimmer."))
+            .unwrap_or(false)
+    }) {
+        // Emit the frame unchanged, with the blank-line terminator that delimits an
+        // SSE frame on the wire.
+        let mut out = text.trim_end().to_string();
+        out.push_str("\n\n");
+        return Some(out);
+    }
+
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
         let Some(data) = line
@@ -333,5 +352,62 @@ mod tests {
         assert!(out.contains("event: message_start"));
         assert!(out.contains("event: content_block_delta"));
         assert!(out.contains("\"text\":\"Hi\""));
+    }
+
+    // Phase 6: tokentrimmer.* SSE event forwarding tests.
+
+    #[test]
+    fn tokentrimmer_panel_frame_forwarded_verbatim() {
+        let mut enc = AnthropicSseEncoder::new();
+        let frame =
+            b"event: tokentrimmer.panel\ndata: {\"strategy\":\"synthesize\",\"legs\":[]}\n\n";
+        let out = process_openai_frame(frame, &mut enc)
+            .expect("tokentrimmer.panel frame must be forwarded");
+        assert!(
+            out.contains("event: tokentrimmer.panel"),
+            "forwarded frame missing event line: {out}"
+        );
+        assert!(
+            out.contains("\"strategy\":\"synthesize\""),
+            "forwarded frame missing data payload: {out}"
+        );
+        // Must be a well-formed SSE frame (ends with blank-line terminator).
+        assert!(out.ends_with("\n\n"), "frame must end with \\n\\n: {out:?}");
+    }
+
+    #[test]
+    fn tokentrimmer_usage_frame_forwarded_verbatim() {
+        let mut enc = AnthropicSseEncoder::new();
+        let frame = b"event: tokentrimmer.usage\ndata: {\"cost_usd\":0.001}\n\n";
+        let out = process_openai_frame(frame, &mut enc)
+            .expect("tokentrimmer.usage frame must be forwarded");
+        assert!(
+            out.contains("event: tokentrimmer.usage"),
+            "forwarded frame missing event line: {out}"
+        );
+        assert!(
+            out.contains("\"cost_usd\""),
+            "forwarded frame missing data payload: {out}"
+        );
+        assert!(out.ends_with("\n\n"), "frame must end with \\n\\n: {out:?}");
+    }
+
+    #[test]
+    fn unrelated_non_data_non_tt_frame_returns_none() {
+        let mut enc = AnthropicSseEncoder::new();
+        // A comment / keep-alive frame — should still return None.
+        assert!(process_openai_frame(b": keep-alive\n\n", &mut enc).is_none());
+        // An event frame with an unrelated event name — should return None.
+        assert!(process_openai_frame(b"event: ping\ndata: {}\n\n", &mut enc).is_none());
+    }
+
+    #[test]
+    fn normal_chunk_still_transcodes_after_tt_detection_added() {
+        // Regression: adding tt-event detection must NOT break the normal path.
+        let mut enc = AnthropicSseEncoder::new();
+        let frame = b"data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"claude-sonnet-4-6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"World\"},\"finish_reason\":null}]}\n\n";
+        let out = process_openai_frame(frame, &mut enc).expect("normal chunk must produce frames");
+        assert!(out.contains("event: content_block_delta"));
+        assert!(out.contains("\"text\":\"World\""));
     }
 }
