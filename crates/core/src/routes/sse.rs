@@ -544,6 +544,12 @@ struct TrackedEventStream {
     /// Honor `stream_options.include_usage`: emit an OpenAI-native final usage
     /// chunk before the `tokentrimmer.usage` frame when the client asked for it.
     include_usage: bool,
+    /// Panel aggregate-billing context. `Some` enables the `tokentrimmer.panel`
+    /// terminal SSE event and makes `usage_event` emit the AGGREGATE cost
+    /// (Σ legs + arbiter), matching the `request_logs` row written by the
+    /// [`DropGuard`]. `None` leaves single-model behavior byte-for-byte unchanged
+    /// (off-by-default invariant).
+    panel: Option<Arc<PanelStreamLog>>,
     phase: Phase,
 }
 
@@ -568,8 +574,62 @@ impl TrackedEventStream {
         Some(Event::default().data(json))
     }
 
+    /// Build the terminal `tokentrimmer.panel` SSE event from the panel context.
+    /// Returns `None` when `self.panel` is `None` (non-panel streams) or on
+    /// serialization error (fail-soft: drops the metadata, never the answer).
+    fn panel_event(&self) -> Option<Event> {
+        let p = self.panel.as_ref()?;
+        // To match the DropGuard aggregate exactly, compute the same `cost_usd`
+        // the DropGuard writes as `total_cost_usd`:
+        //   - Get the streamed arbiter cost by repricing the accumulated usage.
+        //   - Pass it through `arbiter_cost_plan.finalize` (Known discards it).
+        //   - Sum with `leg_cost_total`.
+        let streamed_arbiter_cost: Option<f64> = if let Some(pricing) = self.pricing.as_ref() {
+            let usage = {
+                let guard = self.inner.lock().expect("tracking stream mutex poisoned");
+                guard.snapshot()
+            };
+            let breakdown = crate::routes::chat::compute_cost_full(
+                &partial_to_usage(&usage),
+                Some(pricing),
+                self.baseline_pricing.as_ref(),
+                self.fee_multiplier,
+                self.flex_applied,
+                false,
+                self.pass_effects,
+                0,
+                crate::shaping::ShapeEffects::default(),
+            );
+            Some(breakdown.cost_usd)
+        } else {
+            None
+        };
+        let arbiter_cost_usd = p.arbiter_cost_plan.finalize(streamed_arbiter_cost);
+        let total_cost_usd = crate::routes::panel::sum_metered_iter(
+            std::iter::once(p.leg_cost_total).chain(std::iter::once(arbiter_cost_usd)),
+        );
+        let value = crate::routes::panel::panel_body_json(
+            p.strategy,
+            &p.leg_records,
+            &p.arbiter_detail,
+            p.quorum_required,
+            p.quorum_met,
+            total_cost_usd,
+            arbiter_cost_usd,
+        );
+        match serde_json::to_string(&value) {
+            Ok(json) => Some(Event::default().event("tokentrimmer.panel").data(json)),
+            Err(_) => None,
+        }
+    }
+
     /// Build the terminal `tokentrimmer.usage` SSE event from the accumulated
     /// usage. Returns `None` when there is no pricing to compute cost from.
+    ///
+    /// When `self.panel.is_some()`, emits the AGGREGATE cost (Σ legs + arbiter),
+    /// matching the `request_logs` row the [`DropGuard`] writes — so the
+    /// streaming client sees the same figure it is billed. The non-panel path
+    /// is byte-for-byte unchanged.
     fn usage_event(&self) -> Option<Event> {
         let pricing = self.pricing.as_ref()?;
         let usage = {
@@ -592,6 +652,30 @@ impl TrackedEventStream {
             // requests, so the streaming path carries zero shape effects.
             crate::shaping::ShapeEffects::default(),
         );
+        // Panel-aware cost: replace the arbiter-only streamed cost with the
+        // aggregate (Σ legs + finalized arbiter), matching the DropGuard row.
+        // Savings/baseline fields follow the same zero-out logic as the DropGuard
+        // (`aggregate_cost_breakdown`: cost == baseline, all savings zero) so the
+        // emitted event is consistent with the row. Non-panel path: pass through
+        // `breakdown` unchanged (byte-for-byte identical to the pre-Task-5 path).
+        let (cost_usd, baseline_cost_usd, saved_usd, prov_cache_saved_usd, cache_bust_usd) =
+            if let Some(p) = self.panel.as_ref() {
+                let arbiter_cost = p.arbiter_cost_plan.finalize(Some(breakdown.cost_usd));
+                let total = crate::routes::panel::sum_metered_iter(
+                    std::iter::once(p.leg_cost_total).chain(std::iter::once(arbiter_cost)),
+                )
+                .unwrap_or(0.0);
+                // Panel: cost == baseline, no savings (mirrors aggregate_cost_breakdown).
+                (total, total, 0.0_f64, 0.0_f64, 0.0_f64)
+            } else {
+                (
+                    breakdown.cost_usd,
+                    breakdown.baseline_cost_usd,
+                    breakdown.tt_saved_usd(),
+                    breakdown.provider_cache_saved_usd,
+                    breakdown.cache_bust_penalty_usd,
+                )
+            };
         // `saved_usd` is strictly TT-attributed; the provider's automatic
         // cache discount rides in its own field (mirrors the response-header
         // split on the non-streaming path). `cache_bust_usd` is the explicit
@@ -599,11 +683,11 @@ impl TrackedEventStream {
         // — surfaced so streaming clients see the bust MAGNITUDE, not just the
         // reduced headline (parity with `x-tokentrimmer-cache-bust-usd`).
         let json = serde_json::json!({
-            "cost_usd": breakdown.cost_usd,
-            "baseline_cost_usd": breakdown.baseline_cost_usd,
-            "saved_usd": breakdown.tt_saved_usd(),
-            "provider_cache_saved_usd": breakdown.provider_cache_saved_usd,
-            "cache_bust_usd": breakdown.cache_bust_penalty_usd,
+            "cost_usd": cost_usd,
+            "baseline_cost_usd": baseline_cost_usd,
+            "saved_usd": saved_usd,
+            "provider_cache_saved_usd": prov_cache_saved_usd,
+            "cache_bust_usd": cache_bust_usd,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_tokens": usage.cached_tokens,
@@ -639,11 +723,15 @@ impl Stream for TrackedEventStream {
             Poll::Ready(None) => {
                 // Clean completion: queue the terminal events in order —
                 //   1. OpenAI-native usage chunk (only when include_usage honored),
-                //   2. the `tokentrimmer.usage` cost frame (always, when priceable),
-                //   3. `[DONE]`.
+                //   2. `tokentrimmer.panel` attribution (only for panel streams),
+                //   3. the `tokentrimmer.usage` cost frame (always, when priceable),
+                //   4. `[DONE]`.
                 let mut queue: std::collections::VecDeque<Event> =
                     std::collections::VecDeque::new();
                 if let Some(ev) = self.include_usage_chunk_event() {
+                    queue.push_back(ev);
+                }
+                if let Some(ev) = self.panel_event() {
                     queue.push_back(ev);
                 }
                 if let Some(ev) = self.usage_event() {
@@ -750,6 +838,11 @@ pub fn stream_response(
             // Honor stream_options.include_usage on the egress.
             let include_usage = ctx.include_usage;
 
+            // Panel aggregate-billing context (None for single-model streams).
+            // Cloned here for the TrackedEventStream (terminal panel SSE event +
+            // aggregate usage_event cost); cloned again below for the DropGuard.
+            let panel = ctx.panel.clone();
+
             let event_stream = TrackedEventStream {
                 inner: Arc::clone(&shared),
                 pricing: pricing.clone(),
@@ -758,6 +851,7 @@ pub fn stream_response(
                 flex_applied,
                 pass_effects,
                 include_usage,
+                panel: panel.clone(),
                 phase: Phase::Streaming,
             };
 
@@ -778,8 +872,6 @@ pub fn stream_response(
             let traffic_split_arm = ctx.traffic_split_arm.clone();
             let route_paused = ctx.route_paused;
             let retrieval_tokens_saved = ctx.retrieval_tokens_saved;
-            // Panel aggregate-billing context (None for single-model streams).
-            let panel = ctx.panel.clone();
 
             let guard = DropGuard::new(move || {
                 let inner = shared_for_guard

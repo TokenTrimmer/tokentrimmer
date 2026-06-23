@@ -646,3 +646,130 @@ async fn panel_aggregate_row_single_provider_panel_no_double_count() {
         "panel baseline must equal cost (no claimed saving)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test D: terminal SSE event order + panel-aware aggregate usage_event (Task 5)
+// ---------------------------------------------------------------------------
+
+/// Collect the raw SSE body as a string so we can inspect event order and data.
+async fn collect_sse_body(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Parse the SSE body into a list of `(event_type, data)` pairs.
+/// Lines starting with `event:` set the current event type.
+/// Lines starting with `data:` carry the payload.
+/// A blank line dispatches the accumulated event.
+fn parse_sse_events(body: &str) -> Vec<(String, String)> {
+    let mut events = Vec::new();
+    let mut current_event: Option<String> = None;
+    let mut current_data: Option<String> = None;
+    for line in body.lines() {
+        if let Some(ev) = line.strip_prefix("event:") {
+            current_event = Some(ev.trim().to_string());
+        } else if let Some(d) = line.strip_prefix("data:") {
+            current_data = Some(d.trim().to_string());
+        } else if line.is_empty() {
+            // dispatch
+            if let Some(data) = current_data.take() {
+                let event_type = current_event.take().unwrap_or_default();
+                events.push((event_type, data));
+            }
+        }
+    }
+    events
+}
+
+/// The `stream_response` terminal sequence for a panel stream must:
+///   1. emit a `tokentrimmer.panel` event immediately before `tokentrimmer.usage`,
+///   2. emit `tokentrimmer.usage` before `[DONE]`,
+///   3. the `tokentrimmer.panel` JSON has `legs` + `arbiter.strategy`,
+///   4. the `tokentrimmer.usage` `cost_usd` equals the AGGREGATE (0.012),
+///      matching the Task-4 `request_logs` row — not the arbiter-only streamed cost.
+#[tokio::test]
+async fn panel_terminal_event() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockEgressProvider) as Arc<dyn Provider>;
+
+    // Same replay stream as the Task-4 test.
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> = vec![
+        Ok(content_chunk("Answer from leg 1 — ")),
+        Ok(content_chunk("the best one")),
+        Ok(finish_chunk(64)),
+    ];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(panel_log_ctx(Arc::clone(&writer))),
+    );
+
+    let body = collect_sse_body(response).await;
+    let events = parse_sse_events(&body);
+
+    // Extract event types in order.
+    let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+
+    // Find positions of the key events.
+    let panel_pos = types
+        .iter()
+        .position(|&t| t == "tokentrimmer.panel")
+        .expect("tokentrimmer.panel event must be present");
+    let usage_pos = types
+        .iter()
+        .position(|&t| t == "tokentrimmer.usage")
+        .expect("tokentrimmer.usage event must be present");
+    let done_pos = events
+        .iter()
+        .position(|(_, d)| d == "[DONE]")
+        .expect("[DONE] sentinel must be present");
+
+    // Order: panel immediately before usage, both before [DONE].
+    assert_eq!(
+        panel_pos + 1,
+        usage_pos,
+        "tokentrimmer.panel must be immediately before tokentrimmer.usage (panel@{panel_pos}, usage@{usage_pos})"
+    );
+    assert!(
+        usage_pos < done_pos,
+        "tokentrimmer.usage must come before [DONE] (usage@{usage_pos}, done@{done_pos})"
+    );
+
+    // Validate tokentrimmer.panel JSON shape: legs array + arbiter.strategy.
+    let panel_json: serde_json::Value = serde_json::from_str(&events[panel_pos].1)
+        .expect("tokentrimmer.panel data must be valid JSON");
+    assert!(
+        panel_json["legs"].is_array(),
+        "tokentrimmer.panel must have a `legs` array"
+    );
+    assert!(
+        panel_json["arbiter"]["strategy"].is_string(),
+        "tokentrimmer.panel must have `arbiter.strategy`"
+    );
+
+    // Validate tokentrimmer.usage cost_usd == aggregate ($0.010 + $0.002 = $0.012).
+    let usage_json: serde_json::Value = serde_json::from_str(&events[usage_pos].1)
+        .expect("tokentrimmer.usage data must be valid JSON");
+    let cost = usage_json["cost_usd"]
+        .as_f64()
+        .expect("tokentrimmer.usage must have numeric cost_usd");
+    assert!(
+        (cost - 0.012).abs() < 1e-9,
+        "tokentrimmer.usage cost_usd must equal aggregate 0.012, got {cost}"
+    );
+
+    // Also verify the request_logs row agrees (Task 4 + Task 5 in lock-step).
+    wait_for_rows(&writer, 1).await;
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1, "exactly one aggregate row expected");
+    assert!(
+        (rows[0].cost_usd - cost).abs() < 1e-9,
+        "request_logs cost_usd ({}) must equal tokentrimmer.usage cost_usd ({cost})",
+        rows[0].cost_usd
+    );
+}

@@ -1400,14 +1400,32 @@ pub async fn run_panel(
 // complete_panel — dispatch + aggregate one-row billing
 // ---------------------------------------------------------------------------
 
-/// Build the `tokentrimmer.panel` attribution object for the response body.
+/// Build the `tokentrimmer.panel` attribution object.
 ///
-/// Mirrors spec §6.4 step 9: per-leg breakdown + quorum + a `cost_incomplete`
-/// flag set when any **surviving** (status == Ok) leg reported `None` cost (an
-/// unpriceable model makes the recorded aggregate an honest lower bound).
-fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Value {
-    let legs: Vec<serde_json::Value> = result
-        .legs
+/// Single source of truth shared by the non-streaming response body
+/// (`build_panel_body`) and the streaming terminal SSE event
+/// (`TrackedEventStream::panel_event` in `sse.rs`).
+///
+/// Parameters:
+/// - `strategy`         — arbitration strategy kind (for top-level + arbiter sub-object).
+/// - `legs`             — all leg records (member + arbiter); rendered in order.
+/// - `arbiter_detail`   — per-strategy metadata (chosen_leg, reason, majority fields…).
+/// - `quorum_required`  — quorum threshold.
+/// - `quorum_met`       — how many legs satisfied quorum.
+/// - `total_cost_usd`   — aggregate cost (Σ legs + arbiter). `None` ⇒ JSON null.
+/// - `arbiter_cost_usd` — the arbiter leg's individual cost for the `arbiter.cost_usd`
+///   field. For non-streaming callers this is extracted from the legs slice; streaming
+///   callers pass in the finalized figure from `ArbiterCostPlan::finalize`.
+pub(crate) fn panel_body_json(
+    strategy: ArbiterStrategyKind,
+    legs: &[LegResult],
+    arbiter_detail: &ArbiterDetail,
+    quorum_required: usize,
+    quorum_met: usize,
+    total_cost_usd: Option<f64>,
+    arbiter_cost_usd: Option<f64>,
+) -> serde_json::Value {
+    let legs_json: Vec<serde_json::Value> = legs
         .iter()
         .map(|l| {
             let role = match l.role {
@@ -1436,22 +1454,15 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
 
     // `cost_incomplete`: any surviving leg with no priced cost ⇒ the recorded
     // aggregate is a lower bound (spec §6.4 step 8).
-    let cost_incomplete = result
-        .legs
+    let cost_incomplete = legs
         .iter()
         .any(|l| l.status == LegStatus::Ok && l.cost_usd.is_none());
 
     // Build the `arbiter` sub-object: base fields + non-default ArbiterDetail fields.
-    let d = &result.arbiter_detail;
+    let d = arbiter_detail;
     let mut arbiter = serde_json::Map::new();
-    arbiter.insert("strategy".into(), json!(cfg.strategy.as_str()));
-    // Arbiter leg cost from the legs list (the last leg with role == Arbiter).
-    let arbiter_cost = result
-        .legs
-        .iter()
-        .find(|l| l.role == LegRole::Arbiter)
-        .and_then(|l| l.cost_usd);
-    arbiter.insert("cost_usd".into(), json!(arbiter_cost));
+    arbiter.insert("strategy".into(), json!(strategy.as_str()));
+    arbiter.insert("cost_usd".into(), json!(arbiter_cost_usd));
     // best-of-n detail.
     if let Some(cl) = d.chosen_leg {
         arbiter.insert("chosen_leg".into(), json!(cl));
@@ -1477,16 +1488,39 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
     }
 
     json!({
-        "strategy": cfg.strategy.as_str(),
-        "legs": legs,
-        "total_cost_usd": result.total_cost_usd,
+        "strategy": strategy.as_str(),
+        "legs": legs_json,
+        "total_cost_usd": total_cost_usd,
         "quorum": {
-            "required": result.quorum_required,
-            "met": result.quorum_met,
+            "required": quorum_required,
+            "met": quorum_met,
         },
         "cost_incomplete": cost_incomplete,
         "arbiter": serde_json::Value::Object(arbiter),
     })
+}
+
+/// Build the `tokentrimmer.panel` attribution object for the response body.
+///
+/// Mirrors spec §6.4 step 9: per-leg breakdown + quorum + a `cost_incomplete`
+/// flag set when any **surviving** (status == Ok) leg reported `None` cost (an
+/// unpriceable model makes the recorded aggregate an honest lower bound).
+fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Value {
+    // Arbiter leg cost from the legs list (the last leg with role == Arbiter).
+    let arbiter_cost_usd = result
+        .legs
+        .iter()
+        .find(|l| l.role == LegRole::Arbiter)
+        .and_then(|l| l.cost_usd);
+    panel_body_json(
+        cfg.strategy,
+        &result.legs,
+        &result.arbiter_detail,
+        result.quorum_required,
+        result.quorum_met,
+        result.total_cost_usd,
+        arbiter_cost_usd,
+    )
 }
 
 /// Build the aggregate [`CostBreakdown`] for a panel: the summed leg + arbiter
