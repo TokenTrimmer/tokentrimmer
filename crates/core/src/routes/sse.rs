@@ -375,6 +375,46 @@ pub struct StreamSpanContext {
     pub traffic_split_pct: Option<u32>,
 }
 
+// ─── PanelStreamLog ─────────────────────────────────────────────────────────
+
+/// Panel-specific billing context attached to a streaming deep-research panel.
+///
+/// When present on a [`StreamLogContext`], the terminal [`DropGuard`] writes ONE
+/// aggregate `request_logs` row (`provider = "panel"`, `cost = Σ legs + arbiter`,
+/// `cached = false`) instead of a single-model row — mirroring the non-streaming
+/// `complete_panel` billing — plus the per-leg `panel_legs` rows. This is the
+/// streaming analogue of the data `complete_panel` holds inline; the streaming
+/// path defers the row to stream-end because the arbiter answer is streamed.
+///
+/// Off-by-default: a `StreamLogContext` with `panel == None` is byte-for-byte the
+/// historical single-model behavior.
+pub struct PanelStreamLog {
+    /// All leg results (member legs + the arbiter leg) for the per-leg
+    /// `panel_legs` rows, written fire-and-forget at stream end.
+    pub leg_records: Vec<crate::routes::panel::LegResult>,
+    /// None-aware sum of member-leg costs (already summed by the panel engine).
+    /// `None` when every surviving leg was unpriced.
+    pub leg_cost_total: Option<f64>,
+    /// Arbitration strategy → `tokentrimmer.panel_strategy` span attribute.
+    pub strategy: crate::routes::panel::ArbiterStrategyKind,
+    /// Quorum required / met → panel span attributes.
+    pub quorum_required: usize,
+    pub quorum_met: usize,
+    /// Strategy-specific arbiter metadata (carried for parity / future use).
+    pub arbiter_detail: crate::routes::panel::ArbiterDetail,
+    /// How to obtain the arbiter's cost contribution at stream end. `Live`
+    /// (Synthesize) prices the streamed answer's usage; `Known` (BestOfN /
+    /// Majority replay) uses a pre-computed cost and DISCARDS the streamed
+    /// figure — the replayed leg is already counted in `leg_cost_total`, so
+    /// repricing the streamed tokens would double-count (invariant 3).
+    pub arbiter_cost_plan: crate::routes::panel::ArbiterCostPlan,
+    /// The arbiter model id → the `request_logs.model` column for the row.
+    pub arbiter_model: String,
+    /// Per-leg telemetry writer. `None` skips the `panel_legs` rows (e.g. dev
+    /// without a DB, or tests focused on the aggregate row).
+    pub panel_leg_writer: Option<Arc<dyn tt_telemetry::panel_legs::PanelLegWriter>>,
+}
+
 // ─── LogContext ───────────────────────────────────────────────────────────────
 
 /// Caller-supplied metadata needed to construct the `request_logs` row when
@@ -461,6 +501,12 @@ pub struct StreamLogContext {
     /// `request_logs.route_paused` marker; `false` for unrouted/unpaused
     /// requests.
     pub route_paused: bool,
+    /// Panel aggregate-billing context. `Some` rewrites the terminal
+    /// [`DropGuard`] to write ONE `provider = "panel"` aggregate row (Σ legs +
+    /// arbiter) plus the per-leg `panel_legs` rows, mirroring `complete_panel`.
+    /// `None` (the default for every non-panel caller) leaves the single-model
+    /// behavior byte-for-byte unchanged (off-by-default invariant).
+    pub panel: Option<Arc<PanelStreamLog>>,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -498,6 +544,12 @@ struct TrackedEventStream {
     /// Honor `stream_options.include_usage`: emit an OpenAI-native final usage
     /// chunk before the `tokentrimmer.usage` frame when the client asked for it.
     include_usage: bool,
+    /// Panel aggregate-billing context. `Some` enables the `tokentrimmer.panel`
+    /// terminal SSE event and makes `usage_event` emit the AGGREGATE cost
+    /// (Σ legs + arbiter), matching the `request_logs` row written by the
+    /// [`DropGuard`]. `None` leaves single-model behavior byte-for-byte unchanged
+    /// (off-by-default invariant).
+    panel: Option<Arc<PanelStreamLog>>,
     phase: Phase,
 }
 
@@ -522,8 +574,65 @@ impl TrackedEventStream {
         Some(Event::default().data(json))
     }
 
+    /// Build the terminal `tokentrimmer.panel` SSE event from the panel context.
+    /// Returns `None` when `self.panel` is `None` (non-panel streams) or on
+    /// serialization error (fail-soft: drops the metadata, never the answer).
+    fn panel_event(&self) -> Option<Event> {
+        let p = self.panel.as_ref()?;
+        // To match the DropGuard aggregate exactly, compute the same `cost_usd`
+        // the DropGuard writes as `total_cost_usd`:
+        //   - Get the streamed arbiter cost by repricing the accumulated usage.
+        //   - Pass it through `arbiter_cost_plan.finalize` (Known discards it).
+        //   - Sum with `leg_cost_total`.
+        let streamed_arbiter_cost: Option<f64> = if let Some(pricing) = self.pricing.as_ref() {
+            let usage = {
+                let guard = self.inner.lock().expect("tracking stream mutex poisoned");
+                guard.snapshot()
+            };
+            let breakdown = crate::routes::chat::compute_cost_full(
+                &partial_to_usage(&usage),
+                Some(pricing),
+                self.baseline_pricing.as_ref(),
+                self.fee_multiplier,
+                self.flex_applied,
+                false,
+                self.pass_effects,
+                0,
+                crate::shaping::ShapeEffects::default(),
+            );
+            Some(breakdown.cost_usd)
+        } else {
+            None
+        };
+        let arbiter_cost_usd = p.arbiter_cost_plan.finalize(streamed_arbiter_cost);
+        let total_cost_usd = crate::routes::panel::sum_metered_iter(
+            std::iter::once(p.leg_cost_total).chain(std::iter::once(arbiter_cost_usd)),
+        );
+        let value = crate::routes::panel::panel_body_json(
+            p.strategy,
+            &p.leg_records,
+            &p.arbiter_detail,
+            p.quorum_required,
+            p.quorum_met,
+            total_cost_usd,
+            arbiter_cost_usd,
+        );
+        match serde_json::to_string(&value) {
+            Ok(json) => Some(Event::default().event("tokentrimmer.panel").data(json)),
+            Err(e) => {
+                tracing::warn!(error = %e, "panel terminal event serialize failed");
+                None
+            }
+        }
+    }
+
     /// Build the terminal `tokentrimmer.usage` SSE event from the accumulated
     /// usage. Returns `None` when there is no pricing to compute cost from.
+    ///
+    /// When `self.panel.is_some()`, emits the AGGREGATE cost (Σ legs + arbiter),
+    /// matching the `request_logs` row the [`DropGuard`] writes — so the
+    /// streaming client sees the same figure it is billed. The non-panel path
+    /// is byte-for-byte unchanged.
     fn usage_event(&self) -> Option<Event> {
         let pricing = self.pricing.as_ref()?;
         let usage = {
@@ -546,6 +655,30 @@ impl TrackedEventStream {
             // requests, so the streaming path carries zero shape effects.
             crate::shaping::ShapeEffects::default(),
         );
+        // Panel-aware cost: replace the arbiter-only streamed cost with the
+        // aggregate (Σ legs + finalized arbiter), matching the DropGuard row.
+        // Savings/baseline fields follow the same zero-out logic as the DropGuard
+        // (`aggregate_cost_breakdown`: cost == baseline, all savings zero) so the
+        // emitted event is consistent with the row. Non-panel path: pass through
+        // `breakdown` unchanged (byte-for-byte identical to the pre-Task-5 path).
+        let (cost_usd, baseline_cost_usd, saved_usd, prov_cache_saved_usd, cache_bust_usd) =
+            if let Some(p) = self.panel.as_ref() {
+                let arbiter_cost = p.arbiter_cost_plan.finalize(Some(breakdown.cost_usd));
+                let total = crate::routes::panel::sum_metered_iter(
+                    std::iter::once(p.leg_cost_total).chain(std::iter::once(arbiter_cost)),
+                )
+                .unwrap_or(0.0);
+                // Panel: cost == baseline, no savings (mirrors aggregate_cost_breakdown).
+                (total, total, 0.0_f64, 0.0_f64, 0.0_f64)
+            } else {
+                (
+                    breakdown.cost_usd,
+                    breakdown.baseline_cost_usd,
+                    breakdown.tt_saved_usd(),
+                    breakdown.provider_cache_saved_usd,
+                    breakdown.cache_bust_penalty_usd,
+                )
+            };
         // `saved_usd` is strictly TT-attributed; the provider's automatic
         // cache discount rides in its own field (mirrors the response-header
         // split on the non-streaming path). `cache_bust_usd` is the explicit
@@ -553,11 +686,11 @@ impl TrackedEventStream {
         // — surfaced so streaming clients see the bust MAGNITUDE, not just the
         // reduced headline (parity with `x-tokentrimmer-cache-bust-usd`).
         let json = serde_json::json!({
-            "cost_usd": breakdown.cost_usd,
-            "baseline_cost_usd": breakdown.baseline_cost_usd,
-            "saved_usd": breakdown.tt_saved_usd(),
-            "provider_cache_saved_usd": breakdown.provider_cache_saved_usd,
-            "cache_bust_usd": breakdown.cache_bust_penalty_usd,
+            "cost_usd": cost_usd,
+            "baseline_cost_usd": baseline_cost_usd,
+            "saved_usd": saved_usd,
+            "provider_cache_saved_usd": prov_cache_saved_usd,
+            "cache_bust_usd": cache_bust_usd,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_tokens": usage.cached_tokens,
@@ -593,11 +726,15 @@ impl Stream for TrackedEventStream {
             Poll::Ready(None) => {
                 // Clean completion: queue the terminal events in order —
                 //   1. OpenAI-native usage chunk (only when include_usage honored),
-                //   2. the `tokentrimmer.usage` cost frame (always, when priceable),
-                //   3. `[DONE]`.
+                //   2. `tokentrimmer.panel` attribution (only for panel streams),
+                //   3. the `tokentrimmer.usage` cost frame (always, when priceable),
+                //   4. `[DONE]`.
                 let mut queue: std::collections::VecDeque<Event> =
                     std::collections::VecDeque::new();
                 if let Some(ev) = self.include_usage_chunk_event() {
+                    queue.push_back(ev);
+                }
+                if let Some(ev) = self.panel_event() {
                     queue.push_back(ev);
                 }
                 if let Some(ev) = self.usage_event() {
@@ -704,6 +841,11 @@ pub fn stream_response(
             // Honor stream_options.include_usage on the egress.
             let include_usage = ctx.include_usage;
 
+            // Panel aggregate-billing context (None for single-model streams).
+            // Cloned here for the TrackedEventStream (terminal panel SSE event +
+            // aggregate usage_event cost); cloned again below for the DropGuard.
+            let panel = ctx.panel.clone();
+
             let event_stream = TrackedEventStream {
                 inner: Arc::clone(&shared),
                 pricing: pricing.clone(),
@@ -712,6 +854,7 @@ pub fn stream_response(
                 flex_applied,
                 pass_effects,
                 include_usage,
+                panel: panel.clone(),
                 phase: Phase::Streaming,
             };
 
@@ -772,6 +915,35 @@ pub fn stream_response(
                 let cost_usd = breakdown.cost_usd;
                 let baseline_cost_usd = breakdown.baseline_cost_usd;
 
+                // Panel aggregate billing (Phase 5 Task 4). `cost_usd` above is
+                // the STREAMED answer's cost. For a panel the billable figure is
+                // `Σ legs + arbiter`:
+                //   - `Live` (Synthesize): the streamed tokens ARE the arbiter's
+                //     fresh work, so keep the streamed cost as the arbiter cost.
+                //   - `Known` (BestOfN / Majority replay): the streamed tokens are
+                //     a replay of a member leg already counted in `leg_cost_total`,
+                //     so the cost plan DISCARDS the streamed figure and substitutes
+                //     the pre-computed arbiter cost — no double-count (invariant 3).
+                // The aggregate baseline EQUALS the cost: a panel is the service
+                // the caller opted into, so no routing/cache saving is claimed
+                // (mirrors `aggregate_cost_breakdown` in the non-streaming path).
+                let (cost_usd, baseline_cost_usd, row_provider, row_model) =
+                    if let Some(p) = panel.as_ref() {
+                        let arbiter_cost = p.arbiter_cost_plan.finalize(Some(cost_usd));
+                        let total = crate::routes::panel::sum_metered_iter(
+                            std::iter::once(p.leg_cost_total).chain(std::iter::once(arbiter_cost)),
+                        )
+                        .unwrap_or(0.0);
+                        (total, total, "panel".to_string(), p.arbiter_model.clone())
+                    } else {
+                        (
+                            cost_usd,
+                            baseline_cost_usd,
+                            provider_id_log.clone(),
+                            model.clone(),
+                        )
+                    };
+
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, api_key_id, cost_usd, Utc::now());
                 // P0-1/P0-3: settle the served request. This DropGuard fires
@@ -782,6 +954,27 @@ pub fn stream_response(
                 // is always a live dispatch → non-cached → advances both the
                 // billed and served counters.
                 spend_sink.settle(org_id, api_key_id, false, Utc::now());
+
+                // Telemetry-parity: for a panel aggregate row, savings/cache
+                // fields must be zeroed to match `complete_panel`'s
+                // `aggregate_cost_breakdown` (cost == baseline ⇒ no savings,
+                // no provider cache credit). For a non-panel stream these keep
+                // the actual `breakdown.*` values — off-by-default.
+                let (
+                    span_saved_usd,
+                    span_prov_cache_saved_usd,
+                    row_prov_cache_saved_usd,
+                    row_cache_bust_usd,
+                ) = if panel.is_some() {
+                    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64)
+                } else {
+                    (
+                        breakdown.tt_saved_usd(),
+                        breakdown.provider_cache_saved_usd,
+                        breakdown.provider_cache_saved_usd,
+                        breakdown.cache_bust_penalty_usd,
+                    )
+                };
 
                 // Record OTel GenAI semconv + TokenTrimmer cost attributes onto
                 // the captured `http_request` span, mirroring the non-streaming
@@ -803,8 +996,8 @@ pub fn stream_response(
                                 output_tokens: usage.output_tokens.max(0) as u64,
                                 cost_usd,
                                 baseline_cost_usd,
-                                saved_usd: breakdown.tt_saved_usd(),
-                                provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+                                saved_usd: span_saved_usd,
+                                provider_cache_saved_usd: span_prov_cache_saved_usd,
                             },
                             cache_outcome: Some(&sc.cache_outcome),
                             route: sc.route.as_deref(),
@@ -817,31 +1010,37 @@ pub fn stream_response(
                             traffic_split_pct: sc.traffic_split_pct,
                             shadow_model: None,
                             shadow_cost_usd: None,
-                            // Streaming panel dispatch is not supported today.
-                            panel_strategy: None,
-                            panel_leg_count: None,
-                            panel_quorum_required: None,
-                            panel_quorum_met: None,
+                            // Panel-specific additive span attributes (Phase 5
+                            // Task 4). `None` for non-panel streams — off-by-default,
+                            // mirroring the non-streaming `complete_panel` span.
+                            panel_strategy: panel.as_ref().map(|p| p.strategy.as_str()),
+                            panel_leg_count: panel.as_ref().map(|p| p.leg_records.len() as i64),
+                            panel_quorum_required: panel.as_ref().map(|p| p.quorum_required as i64),
+                            panel_quorum_met: panel.as_ref().map(|p| p.quorum_met as i64),
                         },
                     );
                 }
 
+                // Hoisted so the per-leg `panel_legs` rows (written below for a
+                // panel stream) can reference this parent `request_logs.id`.
+                let parent_id = Uuid::now_v7();
                 let row = RequestLogRow {
-                    id: Uuid::now_v7(),
+                    id: parent_id,
                     org_id,
                     api_key_id,
                     ts: Utc::now(),
-                    provider: provider_id_log,
-                    model: model.clone(),
+                    provider: row_provider,
+                    model: row_model,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
                     cached_tokens: usage.cached_tokens,
                     cost_usd,
                     baseline_cost_usd,
-                    provider_cache_saved_usd: breakdown.provider_cache_saved_usd,
+                    provider_cache_saved_usd: row_prov_cache_saved_usd,
                     // Fee-applied, matching the usage-event/span figure — keeps
                     // the row-derived TT headline equal to `tt_saved_usd()`.
-                    cache_bust_penalty_usd: breakdown.cache_bust_penalty_usd,
+                    // For a panel aggregate, zeroed to match `complete_panel`.
+                    cache_bust_penalty_usd: row_cache_bust_usd,
                     cached: false,
                     cache_layer: None,
                     route_id,
@@ -937,6 +1136,53 @@ pub fn stream_response(
                         }
                         None => {
                             tokio::spawn(fut);
+                        }
+                    }
+                }
+
+                // Per-leg `panel_legs` rows for a streaming panel (Phase 5 Task 4),
+                // fire-and-forget — MUST NOT block or fail the response. Keyed by
+                // the parent `request_logs.id` (`parent_id`). One row per
+                // enumeration position (NOT `LegResult::leg_index`) so the arbiter
+                // leg's `usize::MAX` sentinel never appears. Mirrors the
+                // non-streaming `complete_panel` per-leg write block verbatim.
+                if let Some(p) = panel.as_ref() {
+                    if let Some(leg_writer) = p.panel_leg_writer.clone() {
+                        let leg_rows: Vec<tt_telemetry::panel_legs::PanelLegRow> = p
+                            .leg_records
+                            .iter()
+                            .enumerate()
+                            .map(|(i, leg)| tt_telemetry::panel_legs::PanelLegRow {
+                                request_log_id: parent_id,
+                                leg_index: i as i32,
+                                role: match leg.role {
+                                    crate::routes::panel::LegRole::Leg => "leg".to_string(),
+                                    crate::routes::panel::LegRole::Arbiter => "arbiter".to_string(),
+                                },
+                                provider: leg.provider.clone(),
+                                model: leg.model.clone(),
+                                input_tokens: leg.usage.as_ref().map(|u| u.prompt_tokens as i64),
+                                output_tokens: leg
+                                    .usage
+                                    .as_ref()
+                                    .map(|u| u.completion_tokens as i64),
+                                cached_tokens: leg.usage.as_ref().map(|u| u.cached_tokens as i64),
+                                cost_usd: leg.cost_usd,
+                                latency_ms: Some(leg.latency_ms as i64),
+                                status: leg.status.as_str().to_string(),
+                                error_class: None,
+                            })
+                            .collect();
+                        let fut = async move {
+                            let _ = leg_writer.write_legs(leg_rows).await;
+                        };
+                        match &tracker {
+                            Some(t) => {
+                                t.spawn(fut);
+                            }
+                            None => {
+                                tokio::spawn(fut);
+                            }
                         }
                     }
                 }

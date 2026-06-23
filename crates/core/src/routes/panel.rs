@@ -28,9 +28,10 @@ use serde_json::json;
 use tt_telemetry::{panel_legs::PanelLegRow, request_logs::RequestLogRow};
 use uuid::Uuid;
 
+use futures::stream::BoxStream;
 use tt_shared::{
     messages::{ChatCompletionRequest, Message, MessageContent, PanelExtras},
-    ChatCompletionResponse, RequestContext, Usage,
+    ChatCompletionChunk, ChatCompletionResponse, ProviderError, RequestContext, Usage,
 };
 
 use crate::routes::chat::{
@@ -387,6 +388,40 @@ pub struct ArbiterOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// ArbiterCostPlan — no-double-count guard for streaming arbiter cost
+// ---------------------------------------------------------------------------
+
+/// How the aggregate billing path obtains the arbiter's cost at stream-end.
+///
+/// Streaming panels defer the single `request_logs` row to the `DropGuard`,
+/// which sees the *streamed* answer's accumulated usage. For `Synthesize`
+/// the streamed tokens are fresh arbiter work and must be priced (`Live`).
+/// For `BestOfN`/`Majority` the streamed tokens are a **replay of a member
+/// leg's answer already counted in `Σ legs`** — repricing them would
+/// double-count, so the cost is fixed up front and the streamed figure is
+/// discarded (`Known`). See spec §5.4 (invariant 3).
+#[derive(Clone, Debug)]
+pub enum ArbiterCostPlan {
+    /// Price the streamed answer's accumulated usage (Synthesize live arbiter).
+    Live,
+    /// Use this pre-computed cost; ignore the streamed usage (replay strategies).
+    Known(Option<f64>),
+}
+
+impl ArbiterCostPlan {
+    /// Resolve the arbiter's contribution to the aggregate.
+    ///
+    /// `streamed_arbiter_cost_usd` is the cost the `DropGuard` computed from
+    /// the streamed answer's accumulated usage. `Known` discards it.
+    pub fn finalize(&self, streamed_arbiter_cost_usd: Option<f64>) -> Option<f64> {
+        match self {
+            ArbiterCostPlan::Live => streamed_arbiter_cost_usd,
+            ArbiterCostPlan::Known(c) => *c,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -451,6 +486,33 @@ pub trait ArbiterStrategy {
         ctx: &RequestContext,
         creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     ) -> Result<ArbiterOutcome, ApiError>;
+
+    /// Streaming variant. Default impl runs the buffered `arbitrate` then replays
+    /// the chosen response as a chunk stream (`Known` cost — the replayed tokens
+    /// are already a member leg's, counted in Σ legs; see ArbiterCostPlan). Live
+    /// strategies (Synthesize) override this. (spec §5.3)
+    async fn arbitrate_streaming(
+        &self,
+        request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) -> Result<
+        (
+            BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+            ArbiterCostPlan,
+            ArbiterDetail,
+        ),
+        ApiError,
+    > {
+        let outcome = self.arbitrate(request, legs, state, ctx, creds).await?;
+        Ok((
+            crate::routes::sse::fake_stream_from_response(outcome.response),
+            ArbiterCostPlan::Known(outcome.cost_usd),
+            outcome.detail,
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +625,99 @@ impl ArbiterStrategy for Synthesize {
             cost_usd: measured.cost_usd,
             detail: ArbiterDetail::default(),
         })
+    }
+
+    async fn arbitrate_streaming(
+        &self,
+        request: &ChatCompletionRequest,
+        legs: &[LegResult],
+        state: &AppState,
+        ctx: &RequestContext,
+        creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    ) -> Result<
+        (
+            BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+            ArbiterCostPlan,
+            ArbiterDetail,
+        ),
+        ApiError,
+    > {
+        // Collect the text content of all successful legs.
+        let ok_answers = surviving_answers(legs);
+
+        // Defensive guard: no successful legs → error.
+        if ok_answers.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "panel: no successful legs to synthesize".into(),
+            ));
+        }
+
+        let n = ok_answers.len();
+
+        // Build the arbiter synthesis instruction (verbatim from `arbitrate`).
+        let synthesis_instruction = format!(
+            "You are an expert synthesis engine. You have received {n} candidate \
+             answers from different AI models responding to the same user request. \
+             Your task is to synthesize them into one single best answer. \
+             Combine the strongest insights, resolve any contradictions by preferring \
+             the most accurate information, and produce a clear, complete, and \
+             well-structured response. Output only the synthesized answer — no \
+             preamble, no meta-commentary about the synthesis process."
+        );
+
+        // Preserve caller system messages; append synthesis instruction + candidates.
+        let mut messages = request.messages.clone();
+        messages.push(Message::System {
+            content: MessageContent::Text(synthesis_instruction),
+        });
+        for (i, (_, answer)) in ok_answers.iter().enumerate() {
+            messages.push(Message::User {
+                content: MessageContent::Text(format!(
+                    "Candidate answer {} of {}:\n\n{}",
+                    i + 1,
+                    n,
+                    answer
+                )),
+                name: None,
+            });
+        }
+
+        let arbiter_req = ChatCompletionRequest {
+            model: self.arbiter_model.model.clone(),
+            messages,
+            stream: true,
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+
+        // Resolve the arbiter provider.
+        let provider = state
+            .registry
+            .resolve(&self.arbiter_model.model)
+            .ok_or_else(|| ApiError::ModelNotFound {
+                model: self.arbiter_model.model.clone(),
+            })?;
+
+        // Substitute the arbiter provider's credential when present in the creds map.
+        let mut arb_ctx_owned;
+        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
+            arb_ctx_owned = ctx.clone();
+            arb_ctx_owned.credentials = c.clone();
+            &arb_ctx_owned
+        } else {
+            ctx
+        };
+
+        let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
+        let stream = tokio::time::timeout(
+            deadline,
+            provider.chat_completion_stream(arbiter_req, arb_ctx),
+        )
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable("arbiter stream establishment timed out".into()))?
+        .map_err(|e| ApiError::ServiceUnavailable(format!("arbiter stream failed: {e}")))?;
+
+        Ok((stream, ArbiterCostPlan::Live, ArbiterDetail::default()))
     }
 }
 
@@ -1034,7 +1189,7 @@ pub struct PanelResult {
 
 /// Fold an iterator of `Option<f64>` values: accumulate all `Some` values;
 /// return `None` only when every item was `None`.
-fn sum_metered_iter(it: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+pub(crate) fn sum_metered_iter(it: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     let mut total: Option<f64> = None;
     for x in it.flatten() {
         total = Some(total.unwrap_or(0.0) + x);
@@ -1042,19 +1197,18 @@ fn sum_metered_iter(it: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     total
 }
 
-/// Fan-out all panel member legs concurrently, enforce quorum, then arbitrate.
-///
-/// `creds` maps **provider id** → credentials for that provider.  Members
-/// whose provider id is absent from `creds` are recorded as
-/// [`LegStatus::SkippedNoCred`] and do not count toward quorum.
-pub async fn run_panel(
+/// Phases 1–2 of a panel run: fan out member legs concurrently, join them, and
+/// enforce quorum. Returns the completed member legs plus the None-aware
+/// **leg-only** cost sum. Shared by `run_panel` (non-streaming) and
+/// `complete_panel_streaming` (Phase 5). The arbiter step lives in the callers.
+pub(crate) async fn run_panel_legs_and_quorum(
     state: &crate::AppState,
     ctx: &tt_shared::RequestContext,
     base_req: &ChatCompletionRequest,
     creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     cfg: &PanelConfig,
     deadline: Duration,
-) -> Result<PanelResult, crate::ApiError> {
+) -> Result<(Vec<LegResult>, Option<f64>), crate::ApiError> {
     use std::time::Instant;
     use tokio::task::JoinSet;
 
@@ -1172,6 +1326,36 @@ pub async fn run_panel(
         return Err(crate::ApiError::PanelQuorumUnmet { required, met });
     }
 
+    let leg_cost_total = sum_metered_iter(legs_out.iter().map(|l| l.cost_usd));
+    Ok((legs_out, leg_cost_total))
+}
+
+/// Fan-out all panel member legs concurrently, enforce quorum, then arbitrate.
+///
+/// `creds` maps **provider id** → credentials for that provider.  Members
+/// whose provider id is absent from `creds` are recorded as
+/// [`LegStatus::SkippedNoCred`] and do not count toward quorum.
+pub async fn run_panel(
+    state: &crate::AppState,
+    ctx: &tt_shared::RequestContext,
+    base_req: &ChatCompletionRequest,
+    creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    cfg: &PanelConfig,
+    deadline: Duration,
+) -> Result<PanelResult, crate::ApiError> {
+    let (mut legs_out, leg_cost_total) =
+        run_panel_legs_and_quorum(state, ctx, base_req, creds, cfg, deadline).await?;
+    let required = cfg.quorum.unwrap_or(match cfg.strategy {
+        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
+        _ => 1,
+    });
+    let met = legs_out
+        .iter()
+        .filter(|l| matches!(l.status, LegStatus::Ok))
+        .count();
+    // (legs_out is already quorum-checked inside the helper; `required`/`met`
+    //  are recomputed here only to populate PanelResult.)
+
     // 3. Arbitrate.
     let strategy = strategy_for(cfg)?;
     let arb_start = std::time::Instant::now();
@@ -1199,13 +1383,10 @@ pub async fn run_panel(
     };
     crate::metrics::record_panel_leg("arbiter", LegStatus::Ok.as_str());
 
-    // 4. None-aware cost aggregation: sum all Some values across legs + arbiter.
-    let total_cost_usd = sum_metered_iter(
-        legs_out
-            .iter()
-            .map(|l| l.cost_usd)
-            .chain(std::iter::once(arb.cost_usd)),
-    );
+    // 4. None-aware cost aggregation: leg_cost_total (already None-aware summed)
+    //    plus the arbiter cost.
+    let total_cost_usd =
+        sum_metered_iter(std::iter::once(leg_cost_total).chain(std::iter::once(arb.cost_usd)));
 
     legs_out.push(arbiter_leg);
 
@@ -1223,14 +1404,32 @@ pub async fn run_panel(
 // complete_panel — dispatch + aggregate one-row billing
 // ---------------------------------------------------------------------------
 
-/// Build the `tokentrimmer.panel` attribution object for the response body.
+/// Build the `tokentrimmer.panel` attribution object.
 ///
-/// Mirrors spec §6.4 step 9: per-leg breakdown + quorum + a `cost_incomplete`
-/// flag set when any **surviving** (status == Ok) leg reported `None` cost (an
-/// unpriceable model makes the recorded aggregate an honest lower bound).
-fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Value {
-    let legs: Vec<serde_json::Value> = result
-        .legs
+/// Single source of truth shared by the non-streaming response body
+/// (`build_panel_body`) and the streaming terminal SSE event
+/// (`TrackedEventStream::panel_event` in `sse.rs`).
+///
+/// Parameters:
+/// - `strategy`         — arbitration strategy kind (for top-level + arbiter sub-object).
+/// - `legs`             — all leg records (member + arbiter); rendered in order.
+/// - `arbiter_detail`   — per-strategy metadata (chosen_leg, reason, majority fields…).
+/// - `quorum_required`  — quorum threshold.
+/// - `quorum_met`       — how many legs satisfied quorum.
+/// - `total_cost_usd`   — aggregate cost (Σ legs + arbiter). `None` ⇒ JSON null.
+/// - `arbiter_cost_usd` — the arbiter leg's individual cost for the `arbiter.cost_usd`
+///   field. For non-streaming callers this is extracted from the legs slice; streaming
+///   callers pass in the finalized figure from `ArbiterCostPlan::finalize`.
+pub(crate) fn panel_body_json(
+    strategy: ArbiterStrategyKind,
+    legs: &[LegResult],
+    arbiter_detail: &ArbiterDetail,
+    quorum_required: usize,
+    quorum_met: usize,
+    total_cost_usd: Option<f64>,
+    arbiter_cost_usd: Option<f64>,
+) -> serde_json::Value {
+    let legs_json: Vec<serde_json::Value> = legs
         .iter()
         .map(|l| {
             let role = match l.role {
@@ -1259,22 +1458,15 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
 
     // `cost_incomplete`: any surviving leg with no priced cost ⇒ the recorded
     // aggregate is a lower bound (spec §6.4 step 8).
-    let cost_incomplete = result
-        .legs
+    let cost_incomplete = legs
         .iter()
         .any(|l| l.status == LegStatus::Ok && l.cost_usd.is_none());
 
     // Build the `arbiter` sub-object: base fields + non-default ArbiterDetail fields.
-    let d = &result.arbiter_detail;
+    let d = arbiter_detail;
     let mut arbiter = serde_json::Map::new();
-    arbiter.insert("strategy".into(), json!(cfg.strategy.as_str()));
-    // Arbiter leg cost from the legs list (the last leg with role == Arbiter).
-    let arbiter_cost = result
-        .legs
-        .iter()
-        .find(|l| l.role == LegRole::Arbiter)
-        .and_then(|l| l.cost_usd);
-    arbiter.insert("cost_usd".into(), json!(arbiter_cost));
+    arbiter.insert("strategy".into(), json!(strategy.as_str()));
+    arbiter.insert("cost_usd".into(), json!(arbiter_cost_usd));
     // best-of-n detail.
     if let Some(cl) = d.chosen_leg {
         arbiter.insert("chosen_leg".into(), json!(cl));
@@ -1300,16 +1492,39 @@ fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Valu
     }
 
     json!({
-        "strategy": cfg.strategy.as_str(),
-        "legs": legs,
-        "total_cost_usd": result.total_cost_usd,
+        "strategy": strategy.as_str(),
+        "legs": legs_json,
+        "total_cost_usd": total_cost_usd,
         "quorum": {
-            "required": result.quorum_required,
-            "met": result.quorum_met,
+            "required": quorum_required,
+            "met": quorum_met,
         },
         "cost_incomplete": cost_incomplete,
         "arbiter": serde_json::Value::Object(arbiter),
     })
+}
+
+/// Build the `tokentrimmer.panel` attribution object for the response body.
+///
+/// Mirrors spec §6.4 step 9: per-leg breakdown + quorum + a `cost_incomplete`
+/// flag set when any **surviving** (status == Ok) leg reported `None` cost (an
+/// unpriceable model makes the recorded aggregate an honest lower bound).
+fn build_panel_body(cfg: &PanelConfig, result: &PanelResult) -> serde_json::Value {
+    // Arbiter leg cost from the legs list (the last leg with role == Arbiter).
+    let arbiter_cost_usd = result
+        .legs
+        .iter()
+        .find(|l| l.role == LegRole::Arbiter)
+        .and_then(|l| l.cost_usd);
+    panel_body_json(
+        cfg.strategy,
+        &result.legs,
+        &result.arbiter_detail,
+        result.quorum_required,
+        result.quorum_met,
+        result.total_cost_usd,
+        arbiter_cost_usd,
+    )
 }
 
 /// Build the aggregate [`CostBreakdown`] for a panel: the summed leg + arbiter
@@ -1578,6 +1793,218 @@ pub(crate) async fn complete_panel(
     })
 }
 
+/// Complete a **streaming** deep-research panel request: fan out the member
+/// legs + enforce quorum ([`run_panel_legs_and_quorum`]), establish the arbiter
+/// as a chunk stream ([`ArbiterStrategy::arbitrate_streaming`]), and hand the
+/// arbiter stream to [`crate::routes::sse::stream_response`] with a panel-aware
+/// [`StreamLogContext`](crate::routes::sse::StreamLogContext). Mirrors
+/// [`complete_panel`] but **defers** the single aggregate `request_logs` row,
+/// the realized spend, and the per-leg `panel_legs` rows to the SSE
+/// [`DropGuard`](crate::routes::sse) — those side effects fire only once the
+/// arbiter stream drains (the streamed arbiter answer is not known up front).
+///
+/// # Fail-closed before 200 (invariants §2.1.3/4/5)
+/// A quorum-unmet / strategy-unsupported / unresolved error from
+/// `run_panel_legs_and_quorum`, AND an arbiter-establishment error from
+/// `arbitrate_streaming`, both propagate as `Err(ApiError)` **before**
+/// `stream_response` is ever called — so a failed streaming panel opens NO
+/// stream, writes NO billable row, advances NO counter, exactly like a failed
+/// single-model stream (`handle_streaming` returns before building the SSE body).
+///
+/// # `record_request_served` discipline
+/// NOT called here. `stream_response` bumps `record_request_served("sse",
+/// "dispatch")` exactly once, in-band, before handing back the SSE response —
+/// identical to the single-model streaming path. A fail-closed return reaches
+/// neither, so a rejected panel records nothing (the served counter only
+/// advances on a 200 that actually opened a stream).
+pub(crate) async fn complete_panel_streaming(
+    state: &AppState,
+    ctx: &RequestContext,
+    prep: Prepared,
+    cfg: PanelConfig,
+) -> Result<axum::response::Response, ApiError> {
+    use std::time::Instant;
+
+    // Per-leg / arbiter deadline: mirror `complete_panel`'s derivation.
+    let deadline = prep
+        .request_timeout
+        .unwrap_or_else(|| Duration::from_secs(120));
+
+    // ── Phases 1–2: fan out member legs + enforce quorum. A quorum-unmet (or any
+    //    other) error propagates BEFORE any stream is opened — fail-closed, zero
+    //    rows, mirroring `complete_panel`'s `run_panel` error arm + outcome label.
+    let (mut legs, leg_cost_total) =
+        match run_panel_legs_and_quorum(state, ctx, &prep.req, &prep.panel_creds, &cfg, deadline)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let outcome = match &e {
+                    ApiError::PanelQuorumUnmet { .. } => "quorum_unmet",
+                    ApiError::PanelStrategyUnsupported { .. } => "strategy_unsupported",
+                    _ => "error",
+                };
+                crate::metrics::record_panel_request(cfg.strategy.as_str(), outcome);
+                return Err(e);
+            }
+        };
+
+    // Recompute quorum required/met for the PanelStreamLog span attributes
+    // (legs is already quorum-checked inside the helper).
+    let required = cfg.quorum.unwrap_or(match cfg.strategy {
+        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
+        _ => 1,
+    });
+    let met = legs
+        .iter()
+        .filter(|l| matches!(l.status, LegStatus::Ok))
+        .count();
+
+    // ── Phase 3: establish the arbiter as a chunk stream. An establishment
+    //    error (e.g. no successful legs to synthesize, arbiter dispatch failed)
+    //    returns Err here — a proper non-200, BEFORE `stream_response`.
+    let strategy = strategy_for(&cfg).inspect_err(|_| {
+        crate::metrics::record_panel_request(cfg.strategy.as_str(), "error");
+    })?;
+    let arb_start = Instant::now();
+    let (arbiter_stream, arbiter_cost_plan, arbiter_detail) = strategy
+        .arbitrate_streaming(&prep.req, &legs, state, ctx, &prep.panel_creds)
+        .await
+        .inspect_err(|_| {
+            crate::metrics::record_panel_request(cfg.strategy.as_str(), "error");
+        })?;
+    let arb_latency_ms = arb_start.elapsed().as_millis() as u64;
+    crate::metrics::record_panel_request(cfg.strategy.as_str(), "success");
+
+    // Resolve the arbiter provider — its pricing drives the streamed
+    // (`Live`) arbiter cost finalize in the DropGuard, and its id stamps the
+    // arbiter leg's `panel_legs` row + the span provider attribute.
+    let arbiter_provider = state
+        .registry
+        .resolve(&cfg.arbiter_model.model)
+        .ok_or_else(|| ApiError::ModelNotFound {
+            model: cfg.arbiter_model.model.clone(),
+        })?;
+    let arbiter_provider_id = arbiter_provider.id().to_string();
+    let arbiter_model = cfg.arbiter_model.model.clone();
+
+    // ── Build the arbiter-leg record so the deferred `panel_legs` persistence
+    //    includes the arbiter leg, mirroring `run_panel`'s `arbiter_leg`.
+    //    `cost_usd` comes from the plan's `Known` value (replay strategies) or
+    //    `None` for `Live` (the Synthesize arbiter cost is finalized in the
+    //    DropGuard from the streamed usage). `usage = None` is acceptable on the
+    //    deferred path (mirrors `PanelStreamLog`'s deferred-cost contract).
+    let arbiter_leg = LegResult {
+        leg_index: usize::MAX,
+        role: LegRole::Arbiter,
+        model: arbiter_model.clone(),
+        provider: arbiter_provider_id.clone(),
+        status: LegStatus::Ok,
+        cost_usd: match &arbiter_cost_plan {
+            ArbiterCostPlan::Known(c) => *c,
+            ArbiterCostPlan::Live => None,
+        },
+        usage: None,
+        latency_ms: arb_latency_ms,
+        response: None,
+    };
+    crate::metrics::record_panel_leg("arbiter", LegStatus::Ok.as_str());
+    legs.push(arbiter_leg);
+
+    // ── PanelStreamLog (Task 4): the panel-specific billing context the
+    //    DropGuard reads to write the ONE aggregate `provider='panel'` row +
+    //    the per-leg `panel_legs` rows at stream end.
+    let panel = std::sync::Arc::new(crate::routes::sse::PanelStreamLog {
+        leg_records: legs,
+        leg_cost_total,
+        strategy: cfg.strategy,
+        quorum_required: required,
+        quorum_met: met,
+        arbiter_detail,
+        arbiter_cost_plan,
+        arbiter_model: arbiter_model.clone(),
+        panel_leg_writer: state.panel_leg_writer.clone(),
+    });
+
+    // Input-token estimate for the streamed row (best-effort; the DropGuard
+    // overwrites the cost with the panel aggregate regardless). Estimated
+    // against the arbiter provider so the tokenizer choice matches the streamed
+    // provider.
+    let estimated_input_tokens = tt_tokenize::estimate_tokens(
+        arbiter_provider.id(),
+        &tt_shared::message_text_for_estimation(&prep.req),
+    ) as i32;
+
+    // Honor `stream_options.include_usage` end-to-end (helper is private to
+    // chat.rs; the probe is inlined here).
+    let include_usage = prep
+        .req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.get("include_usage"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // Arbiter-model pricing drives the `Live` finalize + the terminal usage
+    // event; baseline == pricing (a panel claims no routing/cache saving).
+    let arbiter_pricing = arbiter_provider.pricing(&arbiter_model);
+
+    // OTel span context, provider stamped "panel" to mirror `complete_panel`'s
+    // span (the DropGuard fills the additive panel.* attributes from
+    // PanelStreamLog regardless). Panels never cache, so `cache_outcome = none`.
+    let span_ctx = Some(crate::routes::sse::StreamSpanContext {
+        span: tracing::Span::current(),
+        provider_id: "panel".to_string(),
+        request_model: arbiter_model.clone(),
+        response_model: arbiter_model.clone(),
+        cache_outcome: "none".to_string(),
+        route: prep.route_matched_name.clone(),
+        traffic_split_pct: None,
+    });
+
+    let log_ctx = crate::routes::sse::StreamLogContext {
+        writer: state.request_log_writer.as_ref().map(|w| w.clone()),
+        tracker: state.telemetry_tracker.clone(),
+        org_id: ctx.org_id,
+        api_key_id: ctx.api_key_id,
+        trace_id: ctx.trace_id,
+        // Provider sentinel "panel" — the DropGuard forces the row provider to
+        // "panel" for a panel context anyway; this also picks the tokenizer.
+        provider_id: "panel".to_string(),
+        model: arbiter_model.clone(),
+        input_tokens: estimated_input_tokens,
+        // Panels never cache.
+        cached_tokens: 0,
+        pricing: arbiter_pricing.clone(),
+        baseline_pricing: arbiter_pricing,
+        route_id: prep.matched_route_id,
+        tag: ctx.tag.clone(),
+        request_started: prep.request_started,
+        spend_sink: state.spend_sink(),
+        // Panels run no flex / compression / shaping levers — defaults.
+        fee_multiplier: arbiter_provider.fee_multiplier(),
+        flex_applied: false,
+        pass_effects: crate::passes::PassEffects::default(),
+        retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
+        // Panels never cache.
+        cache_insert: None,
+        include_usage,
+        span_ctx,
+        // Panels never run the canary traffic-split lever.
+        traffic_split_arm: None,
+        route_paused: prep.route_paused,
+        // The panel aggregate-billing context (off-by-default elsewhere).
+        panel: Some(panel),
+    };
+
+    Ok(crate::routes::sse::stream_response(
+        arbiter_stream,
+        &arbiter_provider,
+        ctx.trace_id,
+        Some(log_ctx),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -1685,5 +2112,27 @@ mod tests {
         assert_eq!(cfg.arbiter_model.model, "arbiter-x");
         assert_eq!(cfg.quorum, Some(1));
         assert_eq!(cfg.max_cost_usd, Some(0.10));
+    }
+}
+
+#[cfg(test)]
+mod arbiter_cost_plan_tests {
+    use super::ArbiterCostPlan;
+
+    #[test]
+    fn known_ignores_streamed_cost() {
+        // BestOfN/Majority: the streamed usage is the replayed leg, already in Σ legs.
+        let plan = ArbiterCostPlan::Known(Some(0.0021));
+        assert_eq!(plan.finalize(Some(999.0)), Some(0.0021)); // streamed cost discarded
+        let none = ArbiterCostPlan::Known(None); // Majority: embeddings unmetered
+        assert_eq!(none.finalize(Some(999.0)), None);
+    }
+
+    #[test]
+    fn live_uses_streamed_cost() {
+        // Synthesize: fresh arbiter tokens — price what was streamed.
+        let plan = ArbiterCostPlan::Live;
+        assert_eq!(plan.finalize(Some(0.0042)), Some(0.0042));
+        assert_eq!(plan.finalize(None), None); // unpriceable arbiter model
     }
 }
