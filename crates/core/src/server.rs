@@ -52,6 +52,27 @@ pub fn panel_enabled_from_env() -> bool {
         .unwrap_or(false)
 }
 
+/// Read `TT_PANEL_MIN_TIER` → the minimum `CallerTier` allowed to use the panel.
+/// `"pro"|"team"|"scale"` (case-insensitive) → that tier; absent/unknown → `Free`
+/// (allow-all — the default, so the panel works today behind the kill-switch
+/// until an operator tightens it or cloud injects real tiers).
+pub fn panel_min_tier_from_env() -> tt_shared::CallerTier {
+    use tt_shared::CallerTier::*;
+    match std::env::var("TT_PANEL_MIN_TIER")
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        Ok("pro") => Pro,
+        Ok("team") => Team,
+        Ok("scale") => Scale,
+        Ok("free") | Err(_) => Free,
+        Ok(other) => {
+            tracing::warn!(value = %other, "unknown TT_PANEL_MIN_TIER, defaulting to Free");
+            Free
+        }
+    }
+}
+
 /// Build the public router. Returns a fully composed `Router` ready to bind.
 ///
 /// Retrieval middleware is activated when `TT_RETRIEVAL_STORE` and

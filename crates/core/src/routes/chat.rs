@@ -2693,6 +2693,15 @@ pub(crate) async fn prepare(
         if !state.panel_enabled {
             return Err(ApiError::PanelDisabled);
         }
+        // Entitlement: panel requires `state.panel_min_tier` or higher. `caller_tier`
+        // is the prepare param (None ⇒ Free fallback). Default min Free ⇒ no-op.
+        let caller = caller_tier.unwrap_or(tt_shared::CallerTier::Free);
+        if panel::panel_tier_rank(caller) < panel::panel_tier_rank(state.panel_min_tier) {
+            return Err(ApiError::Forbidden(format!(
+                "panel: requires {:?} tier or higher",
+                state.panel_min_tier
+            )));
+        }
         // Resolve the full config from header strategy + tt_extras.panel + env
         // defaults. An empty member list (no extras, no defaults) errors here.
         let cfg = panel::PanelConfig::resolve(

@@ -253,6 +253,22 @@ impl PanelDefaults {
 }
 
 // ---------------------------------------------------------------------------
+// Entitlement rank
+// ---------------------------------------------------------------------------
+
+/// Entitlement rank for the panel min-tier gate (Free < Pro < Team < Scale).
+/// Panel-local (not a global CallerTier Ord — Pro/Team share a TTL band).
+pub fn panel_tier_rank(t: tt_shared::CallerTier) -> u8 {
+    use tt_shared::CallerTier::*;
+    match t {
+        Free => 0,
+        Pro => 1,
+        Team => 2,
+        Scale => 3,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Header parser
 // ---------------------------------------------------------------------------
 

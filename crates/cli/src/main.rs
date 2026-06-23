@@ -1953,6 +1953,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
     // `panel_disabled` (403) unless this is set — never a silent single-model
     // fallback.
     state = state.with_panel_enabled(tt_core::panel_enabled_from_env());
+    state = state.with_panel_min_tier(tt_core::panel_min_tier_from_env());
 
     // Start background catalogue refreshers (OpenRouter's dynamic `GET /models`
     // fetch). Best-effort + non-blocking: it refreshes once shortly after boot
