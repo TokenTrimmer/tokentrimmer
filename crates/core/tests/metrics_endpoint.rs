@@ -555,6 +555,217 @@ async fn served_counter_recorded_for_embeddings_dispatch() {
     );
 }
 
+/// P2 (agent-loop metering): `tt_requests_served_total{path="agent_run",result="dispatch"}`
+/// must increment ONCE PER DISPATCHED TURN of a server-side agent run.
+///
+/// Strategy: drive a 2-turn `/v1/agent/runs` (turn-1 returns a gateway `find_route_for`
+/// tool call → executed inline → turn-2 returns a final answer), then assert the
+/// `path="agent_run"` served-counter advanced by exactly 2 (one per dispatched turn).
+///
+/// The global recorder is shared across the binary, so we use MONOTONIC DELTAS
+/// (scrape before → scrape after → assert delta == 2) to avoid flakiness from
+/// tests that ran earlier in the binary.
+#[tokio::test]
+async fn served_counter_increments_per_agent_run_turn() {
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use futures::stream::BoxStream;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    };
+    use tt_shared::messages::{Choice, Message, MessageContent, ToolCall, ToolCallFunction};
+    use tt_shared::pricing::Capability;
+    use tt_shared::{
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
+        EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext,
+        Usage,
+    };
+
+    /// A scripted mock provider: call 1 returns a `find_route_for` tool call (a
+    /// read-only gateway tool, executed inline by the loop → forces turn 2);
+    /// call 2 returns a final text answer (no tool calls → run completes).
+    struct ScriptedAgentProvider {
+        call: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedAgentProvider {
+        fn id(&self) -> &'static str {
+            "scripted_agent"
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                id: "sa-1".into(),
+                provider: "scripted_agent".into(),
+                // Turn-2 messages contain an Assistant tool_call + Tool result,
+                // so RequiredCapabilities derives `tools=true` → must declare Tools.
+                capabilities: vec![Capability::Text, Capability::Tools],
+                max_input_tokens: 100_000,
+                max_output_tokens: 8192,
+            }]
+        }
+        fn pricing(&self, _: &str) -> Option<ModelPricing> {
+            Some(ModelPricing {
+                input_per_million: 3.0,
+                output_per_million: 6.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: Utc::now(),
+            })
+        }
+        async fn chat_completion(
+            &self,
+            req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<ChatCompletionResponse, ProviderError> {
+            let call = self.call.fetch_add(1, Ordering::SeqCst);
+            let message = if call == 0 {
+                // Turn 1: request the read-only `find_route_for` gateway tool.
+                // The agent loop executes it inline and appends the result, then
+                // loops back for turn 2 (so this forces exactly one extra turn).
+                Message::Assistant {
+                    content: None,
+                    name: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tc1".into(),
+                        r#type: "function".into(),
+                        function: ToolCallFunction {
+                            name: "find_route_for".into(),
+                            arguments: r#"{"task_description":"summarize my usage"}"#.into(),
+                        },
+                    }],
+                }
+            } else {
+                // Turn 2+: final answer (no tool calls → run completes).
+                Message::Assistant {
+                    content: Some(MessageContent::Text("done".into())),
+                    tool_calls: vec![],
+                    name: None,
+                }
+            };
+            Ok(ChatCompletionResponse {
+                id: "chatcmpl-sa".into(),
+                object: "chat.completion".into(),
+                created: 0,
+                model: req.model,
+                choices: vec![Choice {
+                    index: 0,
+                    message,
+                    finish_reason: Some("stop".into()),
+                }],
+                usage: Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cached_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            })
+        }
+        async fn chat_completion_stream(
+            &self,
+            _req: ChatCompletionRequest,
+            _ctx: &RequestContext,
+        ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>
+        {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+        async fn embeddings(
+            &self,
+            _req: EmbeddingsRequest,
+            _ctx: &RequestContext,
+        ) -> Result<EmbeddingsResponse, ProviderError> {
+            Err(ProviderError::Unsupported("n/a".into()))
+        }
+    }
+
+    /// Sum all `tt_requests_served_total` lines that carry BOTH
+    /// `path="agent_run"` AND `result="dispatch"`. Prometheus text format:
+    /// `tt_requests_served_total{path="agent_run",result="dispatch",...} <val>`.
+    fn agent_run_dispatch_count(rendered: &str) -> u64 {
+        rendered
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter(|l| {
+                l.starts_with("tt_requests_served_total")
+                    && l.contains("path=\"agent_run\"")
+                    && l.contains("result=\"dispatch\"")
+            })
+            .filter_map(|l| {
+                l.split_whitespace()
+                    .nth_back(0)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .map(|f| f as u64)
+            })
+            .sum()
+    }
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(ScriptedAgentProvider {
+        call: AtomicU32::new(0),
+    }));
+    let app = build_router(AppState::new(registry));
+
+    // Baseline scrape BEFORE the run (counter may already be >0 from prior tests).
+    let before = {
+        let (_s, _h, body) = get(app.clone(), "/metrics").await;
+        agent_run_dispatch_count(&body)
+    };
+
+    // POST /v1/agent/runs — 2-turn run (tool call + final answer).
+    let body = serde_json::json!({
+        "model": "sa-1",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_turns": 4
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/agent/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "agent run must return 200");
+
+    // Confirm the run really did complete with 2 turns (1 tool + 1 final).
+    let run_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let run: serde_json::Value = serde_json::from_slice(&run_body).unwrap();
+    assert_eq!(
+        run["status"].as_str(),
+        Some("completed"),
+        "run must be completed: {run}"
+    );
+    assert_eq!(
+        run["turns"].as_u64(),
+        Some(2),
+        "run must have taken exactly 2 turns: {run}"
+    );
+
+    // After scrape — the delta must be exactly 2 (one per dispatched turn).
+    let after = {
+        let (_s, _h, body) = get(app, "/metrics").await;
+        agent_run_dispatch_count(&body)
+    };
+    assert_eq!(
+        after - before,
+        2,
+        "tt_requests_served_total{{path=agent_run,result=dispatch}} must have \
+         incremented by exactly 2 (one per dispatched turn; before={before}, after={after})"
+    );
+}
+
 #[tokio::test]
 async fn provider_and_catalog_metrics_recorded() {
     use std::sync::Arc;

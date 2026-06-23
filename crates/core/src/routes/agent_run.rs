@@ -864,6 +864,7 @@ impl TurnCompleter for GatewayCompleter<'_> {
                     .ok_or_else(|| {
                         ApiError::Internal("agent turn: provider returned no choices".into())
                     })?;
+                crate::metrics::record_request_served("agent_run", "dispatch");
                 Ok((msg, usage))
             }
             // Unreachable in practice — every per-turn request disables the cache
