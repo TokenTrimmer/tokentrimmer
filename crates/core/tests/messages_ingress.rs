@@ -1034,6 +1034,255 @@ async fn messages_non_streaming_upstream_error_is_anthropic_shaped() {
     assert!(v["error"].get("code").is_none(), "got {v}");
 }
 
+// ===========================================================================
+// Phase 6 / Task 3 — tokentrimmer.panel render on /v1/messages
+// ===========================================================================
+
+/// A priced mock provider serving a single model id. Used as panel legs.
+struct SimpleMock {
+    id: &'static str,
+    model: &'static str,
+}
+
+#[async_trait]
+impl Provider for SimpleMock {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model.into(),
+            provider: self.id.into(),
+            capabilities: vec![Capability::Text],
+            max_input_tokens: 8192,
+            max_output_tokens: 8192,
+        }]
+    }
+    fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        if model == self.model {
+            Some(ModelPricing {
+                input_per_million: 1.0,
+                output_per_million: 2.0,
+                cached_input_per_million: None,
+                cache_write_per_million: None,
+                batch_input_per_million: None,
+                batch_output_per_million: None,
+                flex_input_per_million: None,
+                flex_output_per_million: None,
+                prompt_cache_min_tokens: None,
+                effective_at: chrono::Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Ok(ChatCompletionResponse {
+            id: "x".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("answer".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+/// Build a panel-enabled app with two mock providers (`gpt-4o` / `gpt-4o-mini`).
+/// No credential store needed — the `Bearer test` key is used as the raw bearer
+/// fallback (same source provider as the request model, "openai").
+fn build_panel_app() -> axum::Router {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(SimpleMock {
+        id: "openai",
+        model: "gpt-4o",
+    }));
+    registry.register(Arc::new(SimpleMock {
+        id: "openai-mini",
+        model: "gpt-4o-mini",
+    }));
+    build_router(AppState::new(registry).with_panel_enabled(true))
+}
+
+/// Mutex that serialises the two env-var-sensitive panel tests so they don't
+/// clobber `TT_PANEL_DEFAULT_MEMBERS` / `TT_PANEL_DEFAULT_ARBITER` when the
+/// test binary runs tests concurrently.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// A /v1/messages request with `X-TokenTrimmer-Panel: synthesize` (panel enabled,
+/// two mock members, generous budget) MUST return 200 and the Anthropic Messages
+/// body must carry a top-level `tokentrimmer.panel` object with a non-empty `legs`
+/// array and `arbiter.strategy == "synthesize"`.
+//
+// The sync `Mutex` is intentionally held across the `.await` so that concurrent
+// test threads cannot clobber `TT_PANEL_DEFAULT_*` while the server is reading
+// them inside the request handler. `PanelDefaults::from_env()` is called during
+// the `.await`, so the lock must stay live for the full round-trip.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn messages_panel_render_body_has_tokentrimmer_panel() {
+    let app = build_panel_app();
+
+    // Gate the env-var writes behind a binary-wide mutex so concurrent test
+    // threads don't stomp on each other's `TT_PANEL_DEFAULT_*` values.
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("TT_PANEL_DEFAULT_MEMBERS", "gpt-4o,gpt-4o-mini");
+    std::env::set_var("TT_PANEL_DEFAULT_ARBITER", "gpt-4o");
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        // Generous ceiling so the panel budget gate does not fire.
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    // Restore the env before any assertion can panic and skip the cleanup.
+    std::env::remove_var("TT_PANEL_DEFAULT_MEMBERS");
+    std::env::remove_var("TT_PANEL_DEFAULT_ARBITER");
+    drop(_guard);
+
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/v1/messages with panel must return 200; body: {body_str}"
+    );
+
+    let body: serde_json::Value = serde_json::from_str(body_str).expect("body must be valid JSON");
+
+    // The transcoded Anthropic body shape must be present.
+    assert_eq!(
+        body["type"], "message",
+        "body must be Anthropic-shaped: {body_str}"
+    );
+
+    // The graft must have attached tokentrimmer.panel.
+    let panel = body.get("tokentrimmer").and_then(|t| t.get("panel"));
+    assert!(
+        panel.is_some(),
+        "response body must have top-level tokentrimmer.panel; body: {body_str}"
+    );
+    let panel = panel.unwrap();
+
+    // `legs` must be a non-empty array.
+    let legs = panel
+        .get("legs")
+        .expect("tokentrimmer.panel must have a `legs` array");
+    assert!(
+        legs.is_array(),
+        "tokentrimmer.panel.legs must be an array; panel: {panel}"
+    );
+    assert!(
+        !legs.as_array().unwrap().is_empty(),
+        "tokentrimmer.panel.legs must be non-empty; panel: {panel}"
+    );
+
+    // `arbiter.strategy` must equal "synthesize".
+    let arbiter_strategy = panel
+        .get("arbiter")
+        .and_then(|a| a.get("strategy"))
+        .and_then(|s| s.as_str());
+    assert_eq!(
+        arbiter_strategy,
+        Some("synthesize"),
+        "tokentrimmer.panel.arbiter.strategy must be 'synthesize'; panel: {panel}"
+    );
+}
+
+/// Off-by-default: a /v1/messages request WITHOUT `X-TokenTrimmer-Panel` must
+/// NOT carry a `tokentrimmer` key in the response body.
+#[tokio::test]
+async fn messages_no_panel_body_has_no_tokentrimmer_key() {
+    let app = build_panel_app();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/v1/messages without panel must return 200; body: {body_str}"
+    );
+
+    let body: serde_json::Value = serde_json::from_str(body_str).expect("body must be valid JSON");
+
+    assert!(
+        body.get("tokentrimmer").is_none(),
+        "response body must NOT have a `tokentrimmer` key when no panel is requested; body: {body_str}"
+    );
+}
+
 /// A malformed request body (not valid Anthropic JSON) fails at parse time with
 /// `ApiError::InvalidRequest`. That 400 must also emit the Anthropic error envelope,
 /// never reaching axum's OpenAI-style renderer (GW-MSG-ERRSHAPE).

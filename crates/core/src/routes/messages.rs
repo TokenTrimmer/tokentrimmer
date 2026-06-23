@@ -132,7 +132,8 @@ async fn transcode_json_response(resp: Response) -> ApiResult<Response> {
     let chat: tt_shared::ChatCompletionResponse = serde_json::from_slice(&bytes)
         .map_err(|e| ApiError::Internal(format!("failed to parse chat response body: {e}")))?;
 
-    let anthropic = chat_response_to_messages(&chat);
+    let mut anthropic = chat_response_to_messages(&chat);
+    crate::routes::graft_tokentrimmer_panel(&mut anthropic, &bytes);
     let new_body = serde_json::to_vec(&anthropic)
         .map_err(|e| ApiError::Internal(format!("failed to serialize Anthropic response: {e}")))?;
 
