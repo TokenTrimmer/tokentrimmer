@@ -775,6 +775,236 @@ async fn panel_terminal_event() {
 }
 
 // ===========================================================================
+// Task E — truncated streaming panel billing (Phase-5 coverage gap)
+//
+// §D5 truncation discipline for streaming panels: a Synthesize panel whose
+// arbiter stream ends WITHOUT a terminal `finish_reason` chunk (e.g. the
+// client disconnects mid-stream) must still write exactly ONE aggregate
+// `request_logs` row with `provider="panel"`, `truncated=true`,
+// `cached=false`, and a cost that is the partial-but-honest figure
+// (leg costs + tokenizer-estimated arbiter cost).
+// ===========================================================================
+
+/// Build a `StreamLogContext` with `ArbiterCostPlan::Live` (Synthesize
+/// strategy).  Used by the truncation test: the streamed answer's cost IS
+/// the arbiter's cost — no replay, no discard.
+fn panel_log_ctx_live(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
+    let leg_records = vec![
+        make_ok_leg(0, "Answer from leg 0"),
+        make_ok_leg(1, "Answer from leg 1"),
+    ];
+    let panel = PanelStreamLog {
+        leg_records,
+        leg_cost_total: Some(0.010),
+        strategy: ArbiterStrategyKind::Synthesize,
+        quorum_required: 1,
+        quorum_met: 2,
+        arbiter_detail: ArbiterDetail::default(),
+        // Live: the DropGuard uses the streamed usage as the arbiter cost.
+        arbiter_cost_plan: ArbiterCostPlan::Live,
+        arbiter_model: "panel-arbiter".to_string(),
+        panel_leg_writer: None,
+    };
+
+    StreamLogContext {
+        writer: Some(writer),
+        tracker: None,
+        org_id: Uuid::nil(),
+        api_key_id: Uuid::nil(),
+        trace_id: Uuid::nil(),
+        provider_id: "panel".into(),
+        model: "panel-arbiter".into(),
+        // 20 input tokens → nonzero input cost even when output_tokens == 0.
+        input_tokens: 20,
+        cached_tokens: 0,
+        retrieval_tokens_saved: 0,
+        pricing: Some(priced()),
+        baseline_pricing: Some(priced()),
+        route_id: None,
+        tag: None,
+        request_started: std::time::Instant::now(),
+        spend_sink: tt_core::budget::SpendSink::None,
+        fee_multiplier: 1.0,
+        flex_applied: false,
+        pass_effects: tt_core::passes::PassEffects::default(),
+        cache_insert: None,
+        include_usage: false,
+        span_ctx: None,
+        traffic_split_arm: None,
+        route_paused: false,
+        panel: Some(Arc::new(panel)),
+    }
+}
+
+/// §D5 truncation billing for streaming panels:
+///
+/// A Synthesize panel whose arbiter stream ends without a terminal
+/// `finish_reason` chunk must write exactly ONE aggregate `request_logs` row:
+///   - `provider == "panel"`            — panel sentinel, not the arbiter provider
+///   - `truncated == true`              — no finish_reason observed
+///   - `cached == false`                — panels never cache
+///   - `cost_usd > leg_cost_total`      — partial-but-honest: leg costs + nonzero
+///                                        arbiter input cost (20 input tokens * $5/M)
+///
+/// This pins the invariant that truncated streaming panels are billed honestly
+/// (the partial estimate, not zero and not full) and do not suppress the row.
+/// Run this test a few times to confirm the drop-ordering is deterministic
+/// (poll-to-exhaustion via `drain_response` mirrors `sse_partial_cost.rs`'s
+/// `sse_truncated_drop_writes_row_with_truncated_true`).
+#[tokio::test]
+async fn truncated_streaming_panel_writes_row_with_truncated_true() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockEgressProvider) as Arc<dyn Provider>;
+
+    // Content chunks with NO terminal finish_reason — simulates a client
+    // disconnect mid-stream (mirrors the truncation pattern in sse_partial_cost.rs).
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
+        vec![Ok(content_chunk("partial")), Ok(content_chunk(" answer"))];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(panel_log_ctx_live(Arc::clone(&writer))),
+    );
+
+    // Poll the body to exhaustion so the GuardedStream / DropGuard drops,
+    // firing the terminal billing write — mirroring drain_response in
+    // sse_partial_cost.rs (poll-to-exhaustion pattern).
+    drain_response(response).await;
+    wait_for_rows(&writer, 1).await;
+
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1, "exactly one aggregate row expected");
+    let row = &rows[0];
+
+    // §D5 structural invariants.
+    assert_eq!(
+        row.provider, "panel",
+        "aggregate row provider must be 'panel' for a streaming panel"
+    );
+    assert_eq!(
+        row.model, "panel-arbiter",
+        "aggregate row model must be the arbiter model"
+    );
+    assert!(
+        row.truncated,
+        "truncated must be true: no finish_reason chunk was sent"
+    );
+    assert!(
+        !row.cached,
+        "panel aggregate row must be cached == false (panels never cache)"
+    );
+
+    // Partial-but-honest cost: at minimum the leg floor ($0.010) plus nonzero
+    // arbiter input cost (20 tokens * $5/M = $0.0001). The aggregate must
+    // exceed the leg floor, proving the arbiter contribution is included.
+    let leg_floor = 0.010_f64;
+    assert!(
+        row.cost_usd > leg_floor,
+        "cost_usd ({}) must exceed leg_cost_total ({leg_floor}): \
+         arbiter input cost (20 tokens * $5/M) must be added even on truncation",
+        row.cost_usd
+    );
+
+    // Sanity upper bound: 20 input + at most ~50 output tokens at $5/$15/M
+    // → well under $0.012.  Guards against a cost-doubling regression.
+    let sanity_ceiling = 0.012_f64;
+    assert!(
+        row.cost_usd < sanity_ceiling,
+        "cost_usd ({}) exceeded sanity ceiling ({sanity_ceiling}): \
+         only 20 input tokens + a few partial output tokens expected",
+        row.cost_usd
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task B: cost_incomplete=false for a normal Synthesize Live streaming panel
+//
+// Background: `panel_body_json` sets `cost_incomplete=true` when any surviving
+// (status==Ok) *member* leg has `cost_usd == None` at the time the terminal
+// `tokentrimmer.panel` SSE event is emitted.  The arbiter leg is explicitly
+// excluded from this scan because:
+//
+//   1. Member-leg unpriceability is blocked by the fail-closed
+//      `panel_budget_gate` (returns 402 if any member/arbiter is unpriceable),
+//      which runs before any dispatch — so a streaming panel that reaches the
+//      stream phase always has all member legs priced (covered by
+//      `panel_budget.rs::panel_budget_gate_err_when_unpriceable`).
+//
+//   2. For Synthesize Live, the arbiter leg's cost_usd is None in the legs
+//      slice at panel-event emit time (the Live cost is deferred to the
+//      DropGuard at stream end).  If the arbiter leg were included in the scan,
+//      cost_incomplete would incorrectly be set to `true` on every normal
+//      Synthesize stream.  The fix (`l.role != LegRole::Arbiter`) excludes it.
+//
+// The test below pins that a normal all-member-priced Synthesize Live stream
+// correctly reports cost_incomplete=false.  It FAILS before the fix (the
+// arbiter's deferred None cost triggered cost_incomplete=true) and PASSES after.
+// ---------------------------------------------------------------------------
+
+/// Synthesize Live streaming panel: all member legs are priced → the terminal
+/// `tokentrimmer.panel` SSE event must report `cost_incomplete == false`.
+///
+/// This pins the fix in `panel_body_json` that excludes the arbiter leg from
+/// the `cost_incomplete` scan.  Without the fix this test would see `true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synthesize_streaming_panel_cost_incomplete_false() {
+    let (app, _writer, _tracker, _calls) = app_synthesize_stream(false);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "model-a",
+                "messages": [{ "role": "user", "content": "cost_incomplete pin" }],
+                "stream": true,
+                "tt_extras": {
+                    "panel": {
+                        "members": ["model-a", "model-b"],
+                        "arbiter_model": "model-synth"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "streaming synthesize panel must return 200"
+    );
+
+    let body = router_sse_body(resp).await;
+    let events = parse_sse_events(&body);
+
+    let panel_pos = events
+        .iter()
+        .position(|(t, _)| t == "tokentrimmer.panel")
+        .expect("tokentrimmer.panel event must be present");
+    let panel_json: serde_json::Value =
+        serde_json::from_str(&events[panel_pos].1).expect("tokentrimmer.panel must be valid JSON");
+
+    let cost_incomplete = panel_json["cost_incomplete"]
+        .as_bool()
+        .expect("tokentrimmer.panel must have a boolean cost_incomplete field");
+
+    assert!(
+        !cost_incomplete,
+        "cost_incomplete must be false for a normal all-member-priced Synthesize Live stream; \
+         got true (arbiter leg's deferred None cost was incorrectly included in the scan)"
+    );
+}
+
+// ===========================================================================
 // Task 6 — router-level end-to-end streaming-panel suite.
 //
 // These tests build the real `build_router` app (like `panel_engine.rs`) and
