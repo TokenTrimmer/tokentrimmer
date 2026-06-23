@@ -222,3 +222,140 @@ async fn responses_without_tt_extras_still_returns_200() {
         "/v1/responses without tt_extras must still return 200; body: {body_str}"
     );
 }
+
+// ============================================================================
+// Task 2 — panel render: the Responses-API body must carry
+// `tokentrimmer.panel` with `legs` (array) and `arbiter.strategy ==
+// "synthesize"` when a panel is requested. The `x-tokentrimmer-cost-usd`
+// header must also be present (cost rides headers on non-streaming).
+// ============================================================================
+
+#[tokio::test]
+async fn responses_panel_render_body_has_tokentrimmer_panel() {
+    let (app, _calls) = build_app();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .header("x-tokentrimmer-panel", "synthesize")
+        // Generous ceiling so the panel budget gate does not fire.
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "input": [{"role": "user", "content": "hello"}],
+                "tt_extras": {
+                    "panel": {
+                        "members": ["gpt-4o", "gpt-4o-mini"],
+                        "arbiter_model": "gpt-4o"
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    let status = resp.status();
+    // Capture cost header BEFORE consuming the body.
+    let cost_header = resp
+        .headers()
+        .get("x-tokentrimmer-cost-usd")
+        .map(|v| v.to_str().unwrap_or("").to_string());
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/v1/responses with panel must return 200; body: {body_str}"
+    );
+
+    // Parse and assert the panel attribution is present.
+    let body: serde_json::Value = serde_json::from_str(body_str).expect("body must be valid JSON");
+
+    let panel = body.get("tokentrimmer").and_then(|t| t.get("panel"));
+    assert!(
+        panel.is_some(),
+        "response body must have top-level tokentrimmer.panel; body: {body_str}"
+    );
+    let panel = panel.unwrap();
+
+    // `legs` must be a non-empty array.
+    let legs = panel.get("legs");
+    assert!(
+        legs.is_some(),
+        "tokentrimmer.panel must have a `legs` array; panel: {panel}"
+    );
+    assert!(
+        legs.unwrap().is_array(),
+        "tokentrimmer.panel.legs must be an array; panel: {panel}"
+    );
+    assert!(
+        !legs.unwrap().as_array().unwrap().is_empty(),
+        "tokentrimmer.panel.legs must be non-empty; panel: {panel}"
+    );
+
+    // `arbiter.strategy` must equal "synthesize".
+    let arbiter_strategy = panel
+        .get("arbiter")
+        .and_then(|a| a.get("strategy"))
+        .and_then(|s| s.as_str());
+    assert_eq!(
+        arbiter_strategy,
+        Some("synthesize"),
+        "tokentrimmer.panel.arbiter.strategy must be 'synthesize'; panel: {panel}"
+    );
+
+    // Cost header must be present on non-streaming panel responses.
+    assert!(
+        cost_header.is_some(),
+        "x-tokentrimmer-cost-usd header must be present on panel responses"
+    );
+}
+
+// ============================================================================
+// Task 2 — off-by-default: a /v1/responses body WITHOUT panel config must NOT
+// carry a `tokentrimmer` key (the graft is a no-op when absent).
+// ============================================================================
+
+#[tokio::test]
+async fn responses_no_panel_body_has_no_tokentrimmer_key() {
+    let (app, _calls) = build_app();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "input": [{"role": "user", "content": "hello"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/v1/responses without panel must return 200; body: {body_str}"
+    );
+
+    let body: serde_json::Value = serde_json::from_str(body_str).expect("body must be valid JSON");
+
+    assert!(
+        body.get("tokentrimmer").is_none(),
+        "response body must NOT have a `tokentrimmer` key when no panel is requested; body: {body_str}"
+    );
+}

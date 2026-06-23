@@ -639,7 +639,8 @@ async fn transcode_json_response(resp: Response) -> ApiResult<Response> {
 
     let chat: ChatCompletionResponse = serde_json::from_slice(&bytes)
         .map_err(|e| ApiError::Internal(format!("failed to parse chat response body: {e}")))?;
-    let responses = chat_response_to_responses_json(&chat);
+    let mut responses = chat_response_to_responses_json(&chat);
+    crate::routes::graft_tokentrimmer_panel(&mut responses, &bytes);
     let new_body = serde_json::to_vec(&responses)
         .map_err(|e| ApiError::Internal(format!("failed to serialize Responses body: {e}")))?;
 

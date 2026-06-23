@@ -16,3 +16,25 @@ pub mod ready;
 pub mod responses;
 pub mod routes_api;
 pub mod sse;
+
+/// Graft the `tokentrimmer.panel` attribution from a chat-completions response body
+/// onto a transcoded target-shape body. The chat handler grafts `tokentrimmer.panel`
+/// as a top-level key (chat.rs); the transcoders deserialize into the typed
+/// `ChatCompletionResponse` (which drops unknown top-level keys), so we re-extract it
+/// from the raw bytes here and re-attach it to the target body. No-op when absent
+/// (off-by-default) or when `out` is not a JSON object.
+pub(crate) fn graft_tokentrimmer_panel(out: &mut serde_json::Value, chat_body: &[u8]) {
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(chat_body) else {
+        return;
+    };
+    let Some(panel) = val
+        .get("tokentrimmer")
+        .and_then(|t| t.get("panel"))
+        .cloned()
+    else {
+        return;
+    };
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("tokentrimmer".into(), serde_json::json!({ "panel": panel }));
+    }
+}
