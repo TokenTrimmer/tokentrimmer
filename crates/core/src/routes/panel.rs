@@ -1076,19 +1076,18 @@ fn sum_metered_iter(it: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     total
 }
 
-/// Fan-out all panel member legs concurrently, enforce quorum, then arbitrate.
-///
-/// `creds` maps **provider id** → credentials for that provider.  Members
-/// whose provider id is absent from `creds` are recorded as
-/// [`LegStatus::SkippedNoCred`] and do not count toward quorum.
-pub async fn run_panel(
+/// Phases 1–2 of a panel run: fan out member legs concurrently, join them, and
+/// enforce quorum. Returns the completed member legs plus the None-aware
+/// **leg-only** cost sum. Shared by `run_panel` (non-streaming) and
+/// `complete_panel_streaming` (Phase 5). The arbiter step lives in the callers.
+pub(crate) async fn run_panel_legs_and_quorum(
     state: &crate::AppState,
     ctx: &tt_shared::RequestContext,
     base_req: &ChatCompletionRequest,
     creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
     cfg: &PanelConfig,
     deadline: Duration,
-) -> Result<PanelResult, crate::ApiError> {
+) -> Result<(Vec<LegResult>, Option<f64>), crate::ApiError> {
     use std::time::Instant;
     use tokio::task::JoinSet;
 
@@ -1206,6 +1205,36 @@ pub async fn run_panel(
         return Err(crate::ApiError::PanelQuorumUnmet { required, met });
     }
 
+    let leg_cost_total = sum_metered_iter(legs_out.iter().map(|l| l.cost_usd));
+    Ok((legs_out, leg_cost_total))
+}
+
+/// Fan-out all panel member legs concurrently, enforce quorum, then arbitrate.
+///
+/// `creds` maps **provider id** → credentials for that provider.  Members
+/// whose provider id is absent from `creds` are recorded as
+/// [`LegStatus::SkippedNoCred`] and do not count toward quorum.
+pub async fn run_panel(
+    state: &crate::AppState,
+    ctx: &tt_shared::RequestContext,
+    base_req: &ChatCompletionRequest,
+    creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+    cfg: &PanelConfig,
+    deadline: Duration,
+) -> Result<PanelResult, crate::ApiError> {
+    let (mut legs_out, leg_cost_total) =
+        run_panel_legs_and_quorum(state, ctx, base_req, creds, cfg, deadline).await?;
+    let required = cfg.quorum.unwrap_or(match cfg.strategy {
+        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
+        _ => 1,
+    });
+    let met = legs_out
+        .iter()
+        .filter(|l| matches!(l.status, LegStatus::Ok))
+        .count();
+    // (legs_out is already quorum-checked inside the helper; `required`/`met`
+    //  are recomputed here only to populate PanelResult.)
+
     // 3. Arbitrate.
     let strategy = strategy_for(cfg)?;
     let arb_start = std::time::Instant::now();
@@ -1233,13 +1262,10 @@ pub async fn run_panel(
     };
     crate::metrics::record_panel_leg("arbiter", LegStatus::Ok.as_str());
 
-    // 4. None-aware cost aggregation: sum all Some values across legs + arbiter.
-    let total_cost_usd = sum_metered_iter(
-        legs_out
-            .iter()
-            .map(|l| l.cost_usd)
-            .chain(std::iter::once(arb.cost_usd)),
-    );
+    // 4. None-aware cost aggregation: leg_cost_total (already None-aware summed)
+    //    plus the arbiter cost.
+    let total_cost_usd =
+        sum_metered_iter(std::iter::once(leg_cost_total).chain(std::iter::once(arb.cost_usd)));
 
     legs_out.push(arbiter_leg);
 
