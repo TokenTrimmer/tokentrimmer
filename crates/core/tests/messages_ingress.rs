@@ -1146,21 +1146,21 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// two mock members, generous budget) MUST return 200 and the Anthropic Messages
 /// body must carry a top-level `tokentrimmer.panel` object with a non-empty `legs`
 /// array and `arbiter.strategy == "synthesize"`.
-//
-// The sync `Mutex` is intentionally held across the `.await` so that concurrent
-// test threads cannot clobber `TT_PANEL_DEFAULT_*` while the server is reading
-// them inside the request handler. `PanelDefaults::from_env()` is called during
-// the `.await`, so the lock must stay live for the full round-trip.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn messages_panel_render_body_has_tokentrimmer_panel() {
     let app = build_panel_app();
 
     // Gate the env-var writes behind a binary-wide mutex so concurrent test
     // threads don't stomp on each other's `TT_PANEL_DEFAULT_*` values.
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var("TT_PANEL_DEFAULT_MEMBERS", "gpt-4o,gpt-4o-mini");
-    std::env::set_var("TT_PANEL_DEFAULT_ARBITER", "gpt-4o");
+    // The guard is dropped BEFORE the `.await` to avoid holding a std Mutex
+    // across an await point. The env vars remain set in the process (they are
+    // process-global) so `PanelDefaults::from_env()` inside the handler still
+    // reads them. Only this test writes these two vars, so dropping early is safe.
+    {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TT_PANEL_DEFAULT_MEMBERS", "gpt-4o,gpt-4o-mini");
+        std::env::set_var("TT_PANEL_DEFAULT_ARBITER", "gpt-4o");
+    } // guard dropped here; env vars remain set
 
     let req = Request::builder()
         .method("POST")
@@ -1182,10 +1182,9 @@ async fn messages_panel_render_body_has_tokentrimmer_panel() {
 
     let resp = app.oneshot(req).await.unwrap();
 
-    // Restore the env before any assertion can panic and skip the cleanup.
+    // Clean up the env vars after the await completes.
     std::env::remove_var("TT_PANEL_DEFAULT_MEMBERS");
     std::env::remove_var("TT_PANEL_DEFAULT_ARBITER");
-    drop(_guard);
 
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
