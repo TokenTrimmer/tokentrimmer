@@ -1,6 +1,6 @@
 # Deep Research Panel — Phase 6 (transcoder rendering) Design Spec
 
-> Status: DRAFT (awaiting user review). Date: 2026-06-23. Repo: public. Branch: `feat/panel-phase6-transcoders`.
+> Status: IMPLEMENTED (Phase 6 — branch feat/panel-phase6-transcoders). Date: 2026-06-23. Repo: public. Branch: `feat/panel-phase6-transcoders`.
 > Builds on Phases 1–5. Master spec: `2026-06-21-deep-research-panel-design.md` (roadmap row 6: "Render panel + per-leg attribution on `/v1/messages` + `/v1/responses`; fix `/v1/responses` `tt_extras` passthrough; verify `/v1/messages`").
 
 ## 1. Goal
@@ -23,7 +23,7 @@ Phase 6 surfaces the panel attribution on both endpoints and fixes the `/v1/resp
 - **`/v1/responses` streaming:** rejected entirely (`responses.rs:validate_supported`, ~`:183`: "streaming /v1/responses is not supported yet"). Out of scope for streaming.
 - **`/v1/messages` streaming:** `transcode_sse_response` (`messages.rs:198`) rebuilds the stream frame-by-frame; `process_openai_frame` (`messages.rs:258`) only recognizes `ChatCompletionChunk` + error frames and **silently drops** everything else — including the Phase-5 `tokentrimmer.panel` and `tokentrimmer.usage` SSE events.
 
-## 3. Decisions (awaiting user approval)
+## 3. Decisions (approved)
 
 - **D1 — Render `tokentrimmer.panel` as a top-level vendor key** in BOTH transcoded JSON bodies, identical in shape to `/v1/chat/completions` (`{ "tokentrimmer": { "panel": <panel_body_json> } }`). Uniform cross-endpoint contract: a TT-aware client reads the same shape everywhere. **This mirrors what `/v1/chat/completions` already does today** (it grafts the same top-level `tokentrimmer` key), so it introduces no *new* contract risk — clients that already tolerate TT's chat-completions responses tolerate this. The major Anthropic/OpenAI SDKs ignore unknown response fields; a client configured with strict `deny_unknown_fields` would need to disable it (documented as a client requirement, same as for chat completions). (Alt: re-shape per API-native conventions — rejected, YAGNI, no consumer needs a translated shape and it forks the contract.)
 - **D2 — Extract-before-parse, no `chat::handler` change.** Each non-streaming transcoder parses the buffered chat body once as `serde_json::Value`, plucks `["tokentrimmer"]["panel"]` (if present), runs the existing shape conversion, then grafts the plucked panel back as the top-level `tokentrimmer.panel` key on the new body. Localized to the transcoders; the body is already buffered for transcoding, so no extra cost beyond one `Value` parse. (Alt: a new wrapper type returned from `chat::handler` so transcoders receive `panel_body` typed — rejected as too invasive for the gain.)
