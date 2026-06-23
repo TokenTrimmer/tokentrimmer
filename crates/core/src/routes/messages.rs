@@ -410,4 +410,24 @@ mod tests {
         assert!(out.contains("event: content_block_delta"));
         assert!(out.contains("\"text\":\"World\""));
     }
+
+    /// M-1 negative: `tokentrimmer.panel` that appears only *inside* a `data:` JSON
+    /// payload must NOT be force-forwarded — it is NOT an `event: tokentrimmer.*`
+    /// frame, so the guard does not match and it goes through the normal
+    /// ChatCompletionChunk parse path (returning None here since the data isn't a
+    /// valid chunk). Documents the no-false-positive invariant.
+    #[test]
+    fn tokentrimmer_panel_in_data_payload_not_force_forwarded() {
+        let mut enc = AnthropicSseEncoder::new();
+        // A `data:` line whose JSON value happens to contain the string
+        // "event: tokentrimmer.panel" — the guard must NOT match this.
+        let frame = b"data: {\"x\":\"event: tokentrimmer.panel\"}\n\n";
+        // This is not a valid ChatCompletionChunk and not a recognized error, so the
+        // normal path returns None — it does NOT get force-forwarded as a TT event.
+        let out = process_openai_frame(frame, &mut enc);
+        assert!(
+            out.is_none(),
+            "tokentrimmer.panel inside a data: payload must not be force-forwarded; got: {out:?}"
+        );
+    }
 }

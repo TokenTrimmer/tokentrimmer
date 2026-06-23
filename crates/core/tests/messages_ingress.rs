@@ -438,6 +438,21 @@ async fn messages_streaming_yields_anthropic_sse_frames() {
         !body.contains("data: [DONE]"),
         "Anthropic SSE must not emit the OpenAI [DONE] sentinel"
     );
+
+    // Phase 6 review I-1 — cost-transparency parity: a non-panel /v1/messages stream
+    // MUST forward `event: tokentrimmer.usage` (the only cost channel on streaming
+    // SSE, since `attach_sse_headers` emits no x-tokentrimmer-cost-* headers).
+    // This is parity with /v1/chat/completions; before Phase 6 the transcoder dropped it.
+    assert!(
+        body.contains("event: tokentrimmer.usage"),
+        "non-panel /v1/messages stream must contain `event: tokentrimmer.usage` \
+         (cost-transparency parity with /v1/chat/completions); body:\n{body}"
+    );
+    // Panel attribution must NOT appear on a non-panel stream (off-by-default).
+    assert!(
+        !body.contains("event: tokentrimmer.panel"),
+        "non-panel /v1/messages stream must NOT contain `event: tokentrimmer.panel`; body:\n{body}"
+    );
 }
 
 #[tokio::test]
