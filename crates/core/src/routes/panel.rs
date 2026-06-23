@@ -387,6 +387,40 @@ pub struct ArbiterOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// ArbiterCostPlan — no-double-count guard for streaming arbiter cost
+// ---------------------------------------------------------------------------
+
+/// How the aggregate billing path obtains the arbiter's cost at stream-end.
+///
+/// Streaming panels defer the single `request_logs` row to the `DropGuard`,
+/// which sees the *streamed* answer's accumulated usage. For `Synthesize`
+/// the streamed tokens are fresh arbiter work and must be priced (`Live`).
+/// For `BestOfN`/`Majority` the streamed tokens are a **replay of a member
+/// leg's answer already counted in `Σ legs`** — repricing them would
+/// double-count, so the cost is fixed up front and the streamed figure is
+/// discarded (`Known`). See spec §5.4 (invariant 3).
+#[derive(Clone, Debug)]
+pub enum ArbiterCostPlan {
+    /// Price the streamed answer's accumulated usage (Synthesize live arbiter).
+    Live,
+    /// Use this pre-computed cost; ignore the streamed usage (replay strategies).
+    Known(Option<f64>),
+}
+
+impl ArbiterCostPlan {
+    /// Resolve the arbiter's contribution to the aggregate.
+    ///
+    /// `streamed_arbiter_cost_usd` is the cost the `DropGuard` computed from
+    /// the streamed answer's accumulated usage. `Known` discards it.
+    pub fn finalize(&self, streamed_arbiter_cost_usd: Option<f64>) -> Option<f64> {
+        match self {
+            ArbiterCostPlan::Live => streamed_arbiter_cost_usd,
+            ArbiterCostPlan::Known(c) => *c,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -1685,5 +1719,27 @@ mod tests {
         assert_eq!(cfg.arbiter_model.model, "arbiter-x");
         assert_eq!(cfg.quorum, Some(1));
         assert_eq!(cfg.max_cost_usd, Some(0.10));
+    }
+}
+
+#[cfg(test)]
+mod arbiter_cost_plan_tests {
+    use super::ArbiterCostPlan;
+
+    #[test]
+    fn known_ignores_streamed_cost() {
+        // BestOfN/Majority: the streamed usage is the replayed leg, already in Σ legs.
+        let plan = ArbiterCostPlan::Known(Some(0.0021));
+        assert_eq!(plan.finalize(Some(999.0)), Some(0.0021)); // streamed cost discarded
+        let none = ArbiterCostPlan::Known(None); // Majority: embeddings unmetered
+        assert_eq!(none.finalize(Some(999.0)), None);
+    }
+
+    #[test]
+    fn live_uses_streamed_cost() {
+        // Synthesize: fresh arbiter tokens — price what was streamed.
+        let plan = ArbiterCostPlan::Live;
+        assert_eq!(plan.finalize(Some(0.0042)), Some(0.0042));
+        assert_eq!(plan.finalize(None), None); // unpriceable arbiter model
     }
 }
