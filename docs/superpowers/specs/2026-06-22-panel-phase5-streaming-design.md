@@ -1,6 +1,6 @@
 # Deep Research Panel — Phase 5 (streaming panel UX) Design Spec
 
-> Status: DRAFT (awaiting user review). Date: 2026-06-22. Repo: public. Branch: `feat/panel-phase5-streaming`.
+> Status: IMPLEMENTED (Phase 5 — branch feat/panel-phase5-streaming). Date: 2026-06-22. Repo: public. Branch: `feat/panel-phase5-streaming`.
 > Builds on Phases 1–4. Master spec: `2026-06-21-deep-research-panel-design.md` (roadmap row 5: "Legs non-streaming; arbiter streams token-by-token to client").
 > Hardened against a 4-lens adversarial design review (billing / lifecycle / contract / surface) — the money-path and feasibility blockers it surfaced are resolved inline below.
 
@@ -21,7 +21,7 @@ Member legs remain non-streaming — quorum requires every leg fully buffered be
 - **Panels bypass cache + single-flight** (`complete_once` branches to panel *before* any cache check, `chat.rs:1053`). Non-deterministic → must never be cached.
 - **Only `Synthesize` produces fresh arbiter tokens.** `BestOfN` dispatches a judge call that only *selects*, returns the chosen leg's **original buffered response** verbatim (`panel.rs:582`). `Majority` does embedding clustering with **no dispatch**, returns the medoid leg's **buffered response** verbatim and `cost_usd: None` (`panel.rs:750`, `:915` — embeddings unmetered today).
 
-## 3. Decisions (awaiting user approval)
+## 3. Decisions (approved)
 
 - **D1 — Trigger: auto-stream, no new header.** `stream: true` + panel opted-in (`prep.panel.is_some()`) ⇒ the arbiter streams. No `X-TokenTrimmer-Panel-Streaming` flag. Honoring the existing `stream` field is the least-surprising contract.
 - **D2 — All three strategies honor `stream: true`; only Synthesize streams *live*.** Synthesize dispatches the arbiter with `stream: true` and pipes live upstream tokens. BestOfN/Majority do their (non-streaming) selection, then **chunk-replay the verbatim selected leg answer** via `fake_stream_from_response`. One uniform client contract — `stream: true` ⇒ SSE, always. (Alt considered: only Synthesize streams, others fall back to JSON — rejected: a strategy-dependent response *medium* is a leaky contract.)
