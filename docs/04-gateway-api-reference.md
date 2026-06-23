@@ -1364,6 +1364,14 @@ The Deep Research Panel is an opt-in feature that fans out a single request to N
 
 The panel is **kill-switched off** at the process level. `TT_PANEL_ENABLED` must be set to `1` (or `true`) for any panel request to be accepted. Until then, a request with the panel header receives `403 panel disabled`.
 
+A second gate is **entitlement**: `TT_PANEL_MIN_TIER` (default `Free` = allow-all) is the minimum caller tier (`Free` < `Pro` < `Team` < `Scale`) allowed to use the panel. A panel request from a caller below the configured minimum is rejected — **before any dispatch or billing** — with `403`:
+
+```json
+{ "error": { "type": "permission_error", "code": "operation_not_permitted", "message": "panel: requires Pro tier or higher" } }
+```
+
+Both gates are evaluated in order **kill-switch → entitlement → budget**, all before the panel runs.
+
 Once enabled, trigger the panel on **any of the three ingresses** by adding:
 
 ```http
