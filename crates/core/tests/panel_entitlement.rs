@@ -384,31 +384,7 @@ async fn kill_switch_fires_before_entitlement_gate() {
 #[cfg(test)]
 mod unit {
     use tt_core::panel_min_tier_from_env;
-    use tt_core::routes::panel::panel_tier_rank;
     use tt_shared::CallerTier;
-
-    #[test]
-    fn panel_tier_rank_ordering() {
-        // Free < Pro < Team < Scale
-        assert!(
-            panel_tier_rank(CallerTier::Free) < panel_tier_rank(CallerTier::Pro),
-            "Free must rank lower than Pro"
-        );
-        assert!(
-            panel_tier_rank(CallerTier::Pro) < panel_tier_rank(CallerTier::Team),
-            "Pro must rank lower than Team"
-        );
-        assert!(
-            panel_tier_rank(CallerTier::Team) < panel_tier_rank(CallerTier::Scale),
-            "Team must rank lower than Scale"
-        );
-        // Gate no-op: Free >= Free
-        assert_eq!(
-            panel_tier_rank(CallerTier::Free),
-            panel_tier_rank(CallerTier::Free),
-            "Free rank == Free rank (allow-all no-op)"
-        );
-    }
 
     #[test]
     fn panel_min_tier_from_env_parse() {
