@@ -1416,7 +1416,7 @@ On `/v1/chat/completions` and `/v1/responses`, you can fine-tune the panel by in
 - `majority` strategy: `floor(members / 2) + 1`
 - all other strategies: `1`
 
-If fewer legs succeed than the quorum threshold, the panel fails with `503` and no billing row is written.
+If fewer legs succeed than the quorum threshold, the panel fails with `502` and no billing row is written.
 
 **Arbitration:**
 - `synthesize` — the arbiter model is called with all surviving leg answers and asked to synthesize one best answer. When `stream: true`, the arbiter call streams back to the caller.
@@ -1442,8 +1442,8 @@ On a successful non-streaming panel request the response body is the standard ch
     "panel": {
       "strategy": "synthesize",
       "total_cost_usd": 0.00341,
-      "cost_incomplete": false,
       "quorum": { "required": 1, "met": 3 },
+      "cost_incomplete": false,
       "legs": [
         {
           "leg_index": 0,
@@ -1495,7 +1495,7 @@ On a **streaming** panel request the same object is emitted as a trailing SSE ev
 
 ```
 event: tokentrimmer.panel
-data: {"strategy":"synthesize","total_cost_usd":0.00341,"cost_incomplete":false,"quorum":{"required":1,"met":3},"legs":[...],"arbiter":{"strategy":"synthesize","cost_usd":0.00131}}
+data: {"strategy":"synthesize","total_cost_usd":0.00341,"quorum":{"required":1,"met":3},"cost_incomplete":false,"legs":[...],"arbiter":{"strategy":"synthesize","cost_usd":0.00131}}
 
 event: tokentrimmer.usage
 data: {"cost_usd":0.00341,"baseline_cost_usd":0.00341,"saved_usd":0.0,...}

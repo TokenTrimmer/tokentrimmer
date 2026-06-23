@@ -42,7 +42,7 @@ TT_PANEL_ENABLED=1
 Truthy values: `1` or `true` (case-insensitive). All other values (including absent) leave the panel disabled. Panel requests on a disabled gateway receive:
 
 ```json
-{ "error": { "message": "panel: panel is disabled on this gateway", "type": "permission_denied", "code": "panel_disabled" } }
+{ "error": { "message": "The deep-research panel is not enabled on this gateway.", "type": "permission_error", "code": "panel_disabled" } }
 ```
 HTTP status `403`.
 
