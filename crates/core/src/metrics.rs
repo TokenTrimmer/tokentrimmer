@@ -58,7 +58,7 @@ pub fn uptime_seconds() -> f64 {
 /// is the alertable signal that billing writes are being lost (transient DB
 /// failure, an undrained SIGTERM, etc.). It is NOT itself a billing record.
 ///
-/// `path` ∈ `chat|sse|embeddings` (the served endpoint family); `result` ∈
+/// `path` ∈ `chat|sse|embeddings|agent_run` (the served endpoint family); `result` ∈
 /// `cache_hit|dispatch` (whether TokenTrimmer served from cache or dispatched
 /// upstream). Both label sets are bounded, matching the discipline of the other
 /// counters in this module.

@@ -253,6 +253,22 @@ impl PanelDefaults {
 }
 
 // ---------------------------------------------------------------------------
+// Entitlement rank
+// ---------------------------------------------------------------------------
+
+/// Entitlement rank for the panel min-tier gate (Free < Pro < Team < Scale).
+/// Panel-local (not a global CallerTier Ord — Pro/Team share a TTL band).
+pub(crate) fn panel_tier_rank(t: tt_shared::CallerTier) -> u8 {
+    use tt_shared::CallerTier::*;
+    match t {
+        Free => 0,
+        Pro => 1,
+        Team => 2,
+        Scale => 3,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Header parser
 // ---------------------------------------------------------------------------
 
@@ -2085,6 +2101,30 @@ mod tests {
             Some(ArbiterStrategyKind::Synthesize)
         ));
         assert!(ArbiterStrategyKind::parse("bogus").is_none());
+    }
+
+    #[test]
+    fn panel_tier_rank_ordering() {
+        use tt_shared::CallerTier;
+        // Free < Pro < Team < Scale
+        assert!(
+            panel_tier_rank(CallerTier::Free) < panel_tier_rank(CallerTier::Pro),
+            "Free must rank lower than Pro"
+        );
+        assert!(
+            panel_tier_rank(CallerTier::Pro) < panel_tier_rank(CallerTier::Team),
+            "Pro must rank lower than Team"
+        );
+        assert!(
+            panel_tier_rank(CallerTier::Team) < panel_tier_rank(CallerTier::Scale),
+            "Team must rank lower than Scale"
+        );
+        // Gate no-op: Free >= Free
+        assert_eq!(
+            panel_tier_rank(CallerTier::Free),
+            panel_tier_rank(CallerTier::Free),
+            "Free rank == Free rank (allow-all no-op)"
+        );
     }
 
     #[test]

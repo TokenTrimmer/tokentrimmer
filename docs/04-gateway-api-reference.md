@@ -1356,7 +1356,245 @@ Change `base_url` and `api_key`. Both OpenRouter and Helicone use OpenAI-compati
 
 ---
 
-## 21. Audit log integrity
+## 21. Deep Research Panel
+
+The Deep Research Panel is an opt-in feature that fans out a single request to N member models concurrently, then passes all responses to an arbiter model that synthesizes or selects the best answer. The panel is **off by default** — a request without the trigger header is handled identically to any other request, with zero overhead.
+
+### 21.1 Enabling and trigger
+
+The panel is **kill-switched off** at the process level. `TT_PANEL_ENABLED` must be set to `1` (or `true`) for any panel request to be accepted. Until then, a request with the panel header receives `403 panel disabled`.
+
+A second gate is **entitlement**: `TT_PANEL_MIN_TIER` (default `Free` = allow-all) is the minimum caller tier (`Free` < `Pro` < `Team` < `Scale`) allowed to use the panel. A panel request from a caller below the configured minimum is rejected — **before any dispatch or billing** — with `403`:
+
+```json
+{ "error": { "type": "permission_error", "code": "operation_not_permitted", "message": "panel: requires Pro tier or higher" } }
+```
+
+Both gates are evaluated in order **kill-switch → entitlement → budget**, all before the panel runs.
+
+Once enabled, trigger the panel on **any of the three ingresses** by adding:
+
+```http
+X-TokenTrimmer-Panel: synthesize
+```
+
+Accepted values (case-insensitive):
+
+| Value | Strategy |
+|---|---|
+| `synthesize` | Arbiter model synthesizes a new answer from all legs |
+| `best-of-n` | Arbiter model judges and picks the single best leg verbatim |
+| `majority` | Embedding clustering picks the medoid of the largest cluster (no arbiter LLM call) |
+
+An unknown or absent value is silently treated as "no panel" — it never errors.
+
+### 21.2 Per-request configuration (`tt_extras.panel`)
+
+On `/v1/chat/completions` and `/v1/responses`, you can fine-tune the panel by including a `tt_extras.panel` object in the request body. All fields are optional:
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [{ "role": "user", "content": "..." }],
+  "tt_extras": {
+    "panel": {
+      "members": ["gpt-4o", "claude-3-5-sonnet", "google/gemini-1.5-pro"],
+      "arbiter_model": "gpt-4o",
+      "quorum": 2,
+      "max_cost_usd": 0.10
+    }
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `members` | string[] | gateway default (`TT_PANEL_DEFAULT_MEMBERS`) | Model ids to fan out to. Overrides the gateway default entirely when non-empty. |
+| `arbiter_model` | string | gateway default (`TT_PANEL_DEFAULT_ARBITER`) | Model used for arbitration (Synthesize/BestOfN). |
+| `quorum` | integer | see §21.3 | Minimum legs that must succeed before arbitration. |
+| `max_cost_usd` | float | none | Per-request hard cost ceiling (USD); see §21.5. |
+
+`/v1/messages` (Anthropic wire) accepts the `X-TokenTrimmer-Panel` header but does **not** accept `tt_extras.panel` — header-only trigger on that ingress.
+
+### 21.3 Behavior
+
+**Fan-out:** all member legs are dispatched concurrently (non-streaming, regardless of the caller's `stream` flag on the legs). Each leg targets the assigned member model and provider.
+
+**Quorum:** the minimum number of legs that must succeed before arbitration. Default (when not set in `tt_extras.panel.quorum`):
+- `majority` strategy: `floor(members / 2) + 1`
+- all other strategies: `1`
+
+If fewer legs succeed than the quorum threshold, the panel fails with `502` and no billing row is written.
+
+**Arbitration:**
+- `synthesize` — the arbiter model is called with all surviving leg answers and asked to synthesize one best answer. When `stream: true`, the arbiter call streams back to the caller.
+- `best-of-n` — the arbiter model is called as a judge to pick the single best leg by number; that leg's original response is returned verbatim (no paraphrase). When `stream: true`, the chosen leg is fake-streamed.
+- `majority` — surviving answers are embedded and clustered by cosine similarity (threshold `TT_PANEL_MAJORITY_THRESHOLD`, default `0.83`). The medoid of the largest cluster is returned verbatim; no arbiter LLM call is made. When embedding is unavailable or fails, falls back to the first surviving leg and sets `arbiter.degraded: true`.
+
+**Streaming behavior:**
+- `/v1/chat/completions` with `stream: true`: member legs always run non-streaming; the arbiter answer streams back as standard chat completion chunks. A trailing `event: tokentrimmer.panel` SSE frame carries the per-leg attribution (same shape as the non-streaming body key; see §21.4).
+- `/v1/messages`: forwards the arbiter's Anthropic-wire SSE events verbatim, including the `tokentrimmer.panel` and `tokentrimmer.usage` frames at the end.
+- `/v1/responses`: always non-streaming (the responses bridge sets `stream: false`).
+
+### 21.4 Response
+
+On a successful non-streaming panel request the response body is the standard chat completion (or Anthropic Messages / Responses) shape, with one additional top-level key:
+
+```json
+{
+  "id": "chatcmpl-abc",
+  "object": "chat.completion",
+  "choices": [...],
+  "usage": { "prompt_tokens": 14, "completion_tokens": 203, "total_tokens": 217, "cached_tokens": 0 },
+  "tokentrimmer": {
+    "panel": {
+      "strategy": "synthesize",
+      "total_cost_usd": 0.00341,
+      "quorum": { "required": 1, "met": 3 },
+      "cost_incomplete": false,
+      "legs": [
+        {
+          "leg_index": 0,
+          "role": "leg",
+          "model": "gpt-4o",
+          "provider": "openai",
+          "cost_usd": 0.00080,
+          "status": "ok",
+          "tokens": { "input_tokens": 14, "output_tokens": 87, "cached_tokens": 0 }
+        },
+        {
+          "leg_index": 1,
+          "role": "leg",
+          "model": "claude-3-5-sonnet-20241022",
+          "provider": "anthropic",
+          "cost_usd": 0.00109,
+          "status": "ok",
+          "tokens": { "input_tokens": 14, "output_tokens": 91, "cached_tokens": 0 }
+        },
+        {
+          "leg_index": 2,
+          "role": "leg",
+          "model": "gemini-1.5-pro",
+          "provider": "google",
+          "cost_usd": 0.00021,
+          "status": "ok",
+          "tokens": { "input_tokens": 14, "output_tokens": 78, "cached_tokens": 0 }
+        },
+        {
+          "leg_index": 3,
+          "role": "arbiter",
+          "model": "gpt-4o",
+          "provider": "openai",
+          "cost_usd": 0.00131,
+          "status": "ok",
+          "tokens": { "input_tokens": 294, "output_tokens": 203, "cached_tokens": 0 }
+        }
+      ],
+      "arbiter": {
+        "strategy": "synthesize",
+        "cost_usd": 0.00131
+      }
+    }
+  }
+}
+```
+
+On a **streaming** panel request the same object is emitted as a trailing SSE event before `[DONE]`:
+
+```
+event: tokentrimmer.panel
+data: {"strategy":"synthesize","total_cost_usd":0.00341,"quorum":{"required":1,"met":3},"cost_incomplete":false,"legs":[...],"arbiter":{"strategy":"synthesize","cost_usd":0.00131}}
+
+event: tokentrimmer.usage
+data: {"cost_usd":0.00341,"baseline_cost_usd":0.00341,"saved_usd":0.0,...}
+
+data: [DONE]
+```
+
+**`tokentrimmer.panel` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `strategy` | string | `"synthesize"`, `"best-of-n"`, or `"majority"` |
+| `total_cost_usd` | float\|null | Aggregate cost (Σ member legs + arbiter). `null` only when every leg was unpriced. |
+| `cost_incomplete` | boolean | `true` when any surviving leg reported no catalog price (aggregate is a lower bound). |
+| `quorum.required` | integer | Minimum legs required to succeed. |
+| `quorum.met` | integer | Legs that actually succeeded. |
+| `legs[]` | array | One entry per dispatched leg (members + arbiter), in dispatch order. |
+| `legs[].leg_index` | integer | Zero-based index into the member list; arbiter entry uses a sentinel value. |
+| `legs[].role` | string | `"leg"` for a panel member, `"arbiter"` for the arbitration call. |
+| `legs[].model` | string | Model id dispatched for this leg. |
+| `legs[].provider` | string | Provider id used for dispatch. |
+| `legs[].cost_usd` | float\|null | Cost for this leg; `null` when the model is unpriced. |
+| `legs[].status` | string | `"ok"`, `"error"`, `"timeout"`, or `"skipped_no_cred"`. |
+| `legs[].tokens` | object\|null | `{ input_tokens, output_tokens, cached_tokens }`; `null` on non-ok legs. |
+| `arbiter.strategy` | string | Strategy name. |
+| `arbiter.cost_usd` | float\|null | Cost of the arbiter call alone; `null` for `majority` (no LLM call). |
+| `arbiter.chosen_leg` | integer | (`best-of-n` only) leg_index of the chosen answer. |
+| `arbiter.reason` | string | (`best-of-n` only) Judge's one-sentence rationale. |
+| `arbiter.fell_back` | boolean | (`best-of-n` only) `true` when the judge response was unparseable; fell back to first leg. |
+| `arbiter.winning_cluster_size` | integer | (`majority` only) Members in the winning cluster. |
+| `arbiter.total_clusters` | integer | (`majority` only) Total distinct clusters found. |
+| `arbiter.no_majority` | boolean | (`majority` only) `true` when all answers were distinct (global medoid returned). |
+| `arbiter.degraded` | boolean | (`majority` only) `true` when embedding failed; fell back to first leg. |
+
+The `tokentrimmer.panel` shape is **identical across all three ingresses** — `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` all carry or emit the same object.
+
+### 21.5 Budget gate (required)
+
+A panel request **requires an explicit cost ceiling**. Provide one via:
+- `X-TokenTrimmer-Cost-Limit-Usd` request header (e.g. `0.10`), OR
+- `tt_extras.panel.max_cost_usd` in the body.
+
+The gateway estimates the total cost (Σ all members + arbiter, including fee multipliers) **before any dispatch**. If no ceiling is provided, or if any member model is unpriced, or if the estimate exceeds the ceiling, the request is rejected with `402` before any leg is dispatched. This is fail-closed — a panel can never exceed its declared budget and a budget-less panel is always rejected.
+
+### 21.6 Billing
+
+A panel request generates **one** `request_logs` row:
+
+| Field | Value |
+|---|---|
+| `provider` | `"panel"` (sentinel; not a real provider id) |
+| `model` | the arbiter model |
+| `cost_usd` | Σ all member leg costs + arbiter cost |
+| `cached` | `false` (always) |
+
+Per-leg detail is written to the `panel_legs` table (one row per leg, including the arbiter), referenced by the parent `request_logs` row id. Panels bypass the L1/L2 cache entirely and are never cache-hits.
+
+From the billing and overage meter perspective a panel counts as **one request** — `cached=false` ensures the cloud overage meter and the monthly request accumulator both count it once.
+
+`X-TokenTrimmer-Saved-Usd` is `0.0` for panel requests: the panel is the service the caller opted into, so no routing or cache savings are claimed. `X-TokenTrimmer-Cost-Usd` reflects the full aggregate (Σ legs + arbiter).
+
+### 21.7 Controls (env vars)
+
+| Env var | Default | Description |
+|---|---|---|
+| `TT_PANEL_ENABLED` | `""` (off) | Kill-switch. Set to `1` or `true` to enable. Absent or any other value → disabled. Panel requests receive `403` when disabled. |
+| `TT_PANEL_MIN_TIER` | `"Free"` (allow-all) | Minimum caller tier required to use the panel. Accepted values: `Free`, `Pro`, `Team`, `Scale` (case-insensitive). Unknown values log a warning and fall back to `Free`. Below-tier requests receive `403`. |
+| `TT_PANEL_MAX_MEMBERS` | `8` | Hard cap on the number of panel members (arbiter not counted). A request specifying more members than the cap receives `400`. Must be ≥ 1; invalid or zero values are ignored. |
+| `TT_PANEL_MAJORITY_THRESHOLD` | `0.83` | Cosine-similarity threshold for the `majority` strategy's embedding clustering. Float in `(0.0, 1.0]`; invalid/out-of-range values are ignored and the default is used. |
+| `TT_PANEL_DEFAULT_MEMBERS` | `""` (empty) | Comma-separated default member model ids used when `tt_extras.panel.members` is absent. Absent → panel requires per-request members. |
+| `TT_PANEL_DEFAULT_ARBITER` | `""` (empty) | Default arbiter model id when `tt_extras.panel.arbiter_model` is absent. Absent → panel requires per-request arbiter. |
+
+**OTel span attributes** (additive; present only on panel requests):
+
+| Attribute | Description |
+|---|---|
+| `tokentrimmer.panel_strategy` | The strategy name (`synthesize`, `best-of-n`, `majority`) |
+| `tokentrimmer.panel_leg_count` | Total dispatched legs (members + arbiter) |
+| `tokentrimmer.panel_quorum_required` | Quorum threshold |
+| `tokentrimmer.panel_quorum_met` | Legs that succeeded |
+
+**Prometheus metrics** (additional counters on panel traffic):
+
+| Metric | Labels | Description |
+|---|---|---|
+| `panel_requests_total` | `strategy`, `outcome` (`success`/`quorum_unmet`/`strategy_unsupported`/`error`) | One increment per panel request attempt |
+| `panel_legs_total` | `role` (`leg`/`arbiter`), `status` (`ok`/`error`/`timeout`/`skipped_no_cred`) | One increment per dispatched leg |
+
+---
+
+## 22. Audit log integrity
 
 The Gateway records every request as a hash-chained, Ed25519-signed audit entry. Operators can export and verify the chain with:
 

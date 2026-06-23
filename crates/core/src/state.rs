@@ -326,6 +326,13 @@ pub struct AppState {
     /// [`AppState::with_panel_enabled`] or the `TT_PANEL_ENABLED` env var
     /// (`"1"` or case-insensitive `"true"`).
     pub panel_enabled: bool,
+    /// Minimum [`tt_shared::CallerTier`] required to use the deep-research panel.
+    ///
+    /// Defaults to `CallerTier::Free` (allow-all — the gate is a no-op until an
+    /// operator tightens it). Production wires `panel_min_tier_from_env()`.
+    /// Callers below this tier receive a 403 `operation_not_permitted`; the
+    /// kill-switch (`panel_enabled`) is checked first.
+    pub panel_min_tier: tt_shared::CallerTier,
 }
 
 /// Default deadline for a discarded shadow dispatch (2s). Short by design: the
@@ -373,6 +380,7 @@ impl AppState {
             summary_gate: Arc::new(crate::passes::agentic_budget::summarize_judge::NeverCommitGate),
             batch_store: None,
             panel_enabled: false,
+            panel_min_tier: tt_shared::CallerTier::Free,
         }
     }
 
@@ -617,6 +625,14 @@ impl AppState {
     #[must_use]
     pub fn with_panel_enabled(mut self, on: bool) -> Self {
         self.panel_enabled = on;
+        self
+    }
+
+    /// Builder: minimum CallerTier allowed to use the panel. `Free` (default) =
+    /// allow-all. Production wires `panel_min_tier_from_env()`.
+    #[must_use]
+    pub fn with_panel_min_tier(mut self, tier: tt_shared::CallerTier) -> Self {
+        self.panel_min_tier = tier;
         self
     }
 
