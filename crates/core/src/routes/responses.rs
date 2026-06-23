@@ -127,11 +127,25 @@ impl ResponsesRequest {
             ));
         }
 
+        // Special-case tt_extras (TokenTrimmer panel/lever config) BEFORE the generic
+        // passthrough loop, mirroring the `metadata` special-case above: move it into the
+        // typed tt_extras field rather than rejecting it as an unsupported field.
+        let mut self_extra = self.extra;
+        let tt_extras: std::collections::HashMap<String, serde_json::Value> =
+            match self_extra.remove("tt_extras") {
+                Some(serde_json::Value::Object(map)) => map.into_iter().collect(),
+                Some(other) if !other.is_null() => {
+                    tracing::warn!("ignoring non-object tt_extras on /v1/responses");
+                    std::collections::HashMap::new()
+                }
+                _ => std::collections::HashMap::new(),
+            };
+
         let mut extra = HashMap::new();
         if let Some(metadata) = self.metadata {
             extra.insert("metadata".to_string(), metadata);
         }
-        for (key, value) in self.extra {
+        for (key, value) in self_extra {
             if is_chat_passthrough_field(&key) {
                 extra.insert(key, value);
             } else if !value.is_null() {
@@ -174,7 +188,7 @@ impl ResponsesRequest {
             reasoning_effort: self
                 .reasoning_effort
                 .or_else(|| reasoning_effort(self.reasoning)),
-            tt_extras: HashMap::new(),
+            tt_extras,
             extra,
         })
     }
