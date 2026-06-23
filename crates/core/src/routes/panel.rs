@@ -1859,11 +1859,16 @@ pub(crate) async fn complete_panel_streaming(
     // ── Phase 3: establish the arbiter as a chunk stream. An establishment
     //    error (e.g. no successful legs to synthesize, arbiter dispatch failed)
     //    returns Err here — a proper non-200, BEFORE `stream_response`.
-    let strategy = strategy_for(&cfg)?;
+    let strategy = strategy_for(&cfg).inspect_err(|_| {
+        crate::metrics::record_panel_request(cfg.strategy.as_str(), "error");
+    })?;
     let arb_start = Instant::now();
     let (arbiter_stream, arbiter_cost_plan, arbiter_detail) = strategy
         .arbitrate_streaming(&prep.req, &legs, state, ctx, &prep.panel_creds)
-        .await?;
+        .await
+        .inspect_err(|_| {
+            crate::metrics::record_panel_request(cfg.strategy.as_str(), "error");
+        })?;
     let arb_latency_ms = arb_start.elapsed().as_millis() as u64;
     crate::metrics::record_panel_request(cfg.strategy.as_str(), "success");
 

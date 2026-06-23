@@ -1401,8 +1401,7 @@ async fn streaming_e2e_best_of_n_replays_chosen_leg_verbatim_no_double_count() {
     let events = parse_sse_events(&body);
 
     // Reconstruct the streamed assistant text from the content chunks (the
-    // `data:` payloads BEFORE the terminal tokentrimmer.* events). The chosen
-    // leg is "model-b" → "Beta answer — the best one"; replay must be verbatim.
+    // `data:` payloads BEFORE the terminal tokentrimmer.* events).
     let mut streamed = String::new();
     for (etype, data) in &events {
         if !etype.is_empty() || data == "[DONE]" {
@@ -1414,9 +1413,59 @@ async fn streaming_e2e_best_of_n_replays_chosen_leg_verbatim_no_double_count() {
             }
         }
     }
+
+    // Cross-check the stream against the tokentrimmer.panel event to verify
+    // verbatim replay of the ACTUALLY chosen leg — order-independent, since
+    // JoinSet completes legs in non-deterministic order.
+    //
+    // The known model→answer mapping for this test's mock providers:
+    //   "model-a" → "Alpha answer"
+    //   "model-b" → "Beta answer — the best one"
+    let model_answers: std::collections::HashMap<&str, &str> = [
+        ("model-a", "Alpha answer"),
+        ("model-b", "Beta answer — the best one"),
+    ]
+    .into();
+
+    // Parse the tokentrimmer.panel event to read chosen_leg + legs[].
+    let panel_pos = events
+        .iter()
+        .position(|(t, _)| t == "tokentrimmer.panel")
+        .expect("tokentrimmer.panel event must be present");
+    let panel_json: serde_json::Value =
+        serde_json::from_str(&events[panel_pos].1).expect("tokentrimmer.panel data must be JSON");
+
+    // arbiter.chosen_leg is the leg_index the judge selected.
+    let chosen_leg_index = panel_json["arbiter"]["chosen_leg"]
+        .as_u64()
+        .expect("tokentrimmer.panel must have arbiter.chosen_leg")
+        as usize;
+
+    // Find the leg in legs[] with that leg_index to learn the model.
+    let chosen_model = panel_json["legs"]
+        .as_array()
+        .expect("tokentrimmer.panel must have legs array")
+        .iter()
+        .find(|l| l["leg_index"].as_u64() == Some(chosen_leg_index as u64))
+        .and_then(|l| l["model"].as_str())
+        .expect("chosen leg must appear in legs array with a model field");
+
+    // Look up the expected answer for the chosen model.
+    let expected_answer = model_answers
+        .get(chosen_model)
+        .unwrap_or_else(|| panic!("unknown chosen model {chosen_model:?} in test mapping"));
+
+    // The reconstructed stream must exactly match the chosen leg's known text.
     assert_eq!(
-        streamed, "Beta answer — the best one",
-        "replayed stream must carry the chosen leg's text verbatim, got {streamed:?}"
+        &streamed, expected_answer,
+        "replayed stream must carry the chosen leg ({chosen_model:?}) text verbatim, got {streamed:?}"
+    );
+
+    // Additionally, the stream must be exactly one of the two known member answers
+    // (proves it is a verbatim replay of some surviving leg, not a synthesis).
+    assert!(
+        model_answers.values().any(|&a| a == streamed),
+        "streamed text must be verbatim one of the known member answers, got {streamed:?}"
     );
 
     // Aggregate cost = Σ legs + judge. The Known plan DISCARDS the replayed
