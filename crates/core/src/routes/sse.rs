@@ -375,6 +375,46 @@ pub struct StreamSpanContext {
     pub traffic_split_pct: Option<u32>,
 }
 
+// ─── PanelStreamLog ─────────────────────────────────────────────────────────
+
+/// Panel-specific billing context attached to a streaming deep-research panel.
+///
+/// When present on a [`StreamLogContext`], the terminal [`DropGuard`] writes ONE
+/// aggregate `request_logs` row (`provider = "panel"`, `cost = Σ legs + arbiter`,
+/// `cached = false`) instead of a single-model row — mirroring the non-streaming
+/// `complete_panel` billing — plus the per-leg `panel_legs` rows. This is the
+/// streaming analogue of the data `complete_panel` holds inline; the streaming
+/// path defers the row to stream-end because the arbiter answer is streamed.
+///
+/// Off-by-default: a `StreamLogContext` with `panel == None` is byte-for-byte the
+/// historical single-model behavior.
+pub struct PanelStreamLog {
+    /// All leg results (member legs + the arbiter leg) for the per-leg
+    /// `panel_legs` rows, written fire-and-forget at stream end.
+    pub leg_records: Vec<crate::routes::panel::LegResult>,
+    /// None-aware sum of member-leg costs (already summed by the panel engine).
+    /// `None` when every surviving leg was unpriced.
+    pub leg_cost_total: Option<f64>,
+    /// Arbitration strategy → `tokentrimmer.panel_strategy` span attribute.
+    pub strategy: crate::routes::panel::ArbiterStrategyKind,
+    /// Quorum required / met → panel span attributes.
+    pub quorum_required: usize,
+    pub quorum_met: usize,
+    /// Strategy-specific arbiter metadata (carried for parity / future use).
+    pub arbiter_detail: crate::routes::panel::ArbiterDetail,
+    /// How to obtain the arbiter's cost contribution at stream end. `Live`
+    /// (Synthesize) prices the streamed answer's usage; `Known` (BestOfN /
+    /// Majority replay) uses a pre-computed cost and DISCARDS the streamed
+    /// figure — the replayed leg is already counted in `leg_cost_total`, so
+    /// repricing the streamed tokens would double-count (invariant 3).
+    pub arbiter_cost_plan: crate::routes::panel::ArbiterCostPlan,
+    /// The arbiter model id → the `request_logs.model` column for the row.
+    pub arbiter_model: String,
+    /// Per-leg telemetry writer. `None` skips the `panel_legs` rows (e.g. dev
+    /// without a DB, or tests focused on the aggregate row).
+    pub panel_leg_writer: Option<Arc<dyn tt_telemetry::panel_legs::PanelLegWriter>>,
+}
+
 // ─── LogContext ───────────────────────────────────────────────────────────────
 
 /// Caller-supplied metadata needed to construct the `request_logs` row when
@@ -461,6 +501,12 @@ pub struct StreamLogContext {
     /// `request_logs.route_paused` marker; `false` for unrouted/unpaused
     /// requests.
     pub route_paused: bool,
+    /// Panel aggregate-billing context. `Some` rewrites the terminal
+    /// [`DropGuard`] to write ONE `provider = "panel"` aggregate row (Σ legs +
+    /// arbiter) plus the per-leg `panel_legs` rows, mirroring `complete_panel`.
+    /// `None` (the default for every non-panel caller) leaves the single-model
+    /// behavior byte-for-byte unchanged (off-by-default invariant).
+    pub panel: Option<Arc<PanelStreamLog>>,
 }
 
 // ─── TrackedEventStream ───────────────────────────────────────────────────────
@@ -732,6 +778,8 @@ pub fn stream_response(
             let traffic_split_arm = ctx.traffic_split_arm.clone();
             let route_paused = ctx.route_paused;
             let retrieval_tokens_saved = ctx.retrieval_tokens_saved;
+            // Panel aggregate-billing context (None for single-model streams).
+            let panel = ctx.panel.clone();
 
             let guard = DropGuard::new(move || {
                 let inner = shared_for_guard
@@ -771,6 +819,35 @@ pub fn stream_response(
                 );
                 let cost_usd = breakdown.cost_usd;
                 let baseline_cost_usd = breakdown.baseline_cost_usd;
+
+                // Panel aggregate billing (Phase 5 Task 4). `cost_usd` above is
+                // the STREAMED answer's cost. For a panel the billable figure is
+                // `Σ legs + arbiter`:
+                //   - `Live` (Synthesize): the streamed tokens ARE the arbiter's
+                //     fresh work, so keep the streamed cost as the arbiter cost.
+                //   - `Known` (BestOfN / Majority replay): the streamed tokens are
+                //     a replay of a member leg already counted in `leg_cost_total`,
+                //     so the cost plan DISCARDS the streamed figure and substitutes
+                //     the pre-computed arbiter cost — no double-count (invariant 3).
+                // The aggregate baseline EQUALS the cost: a panel is the service
+                // the caller opted into, so no routing/cache saving is claimed
+                // (mirrors `aggregate_cost_breakdown` in the non-streaming path).
+                let (cost_usd, baseline_cost_usd, row_provider, row_model) =
+                    if let Some(p) = panel.as_ref() {
+                        let arbiter_cost = p.arbiter_cost_plan.finalize(Some(cost_usd));
+                        let total = crate::routes::panel::sum_metered_iter(
+                            std::iter::once(p.leg_cost_total).chain(std::iter::once(arbiter_cost)),
+                        )
+                        .unwrap_or(0.0);
+                        (total, total, "panel".to_string(), p.arbiter_model.clone())
+                    } else {
+                        (
+                            cost_usd,
+                            baseline_cost_usd,
+                            provider_id_log.clone(),
+                            model.clone(),
+                        )
+                    };
 
                 // Record realized streamed spend into the same enforcer the check uses.
                 spend_sink.record(org_id, api_key_id, cost_usd, Utc::now());
@@ -817,22 +894,27 @@ pub fn stream_response(
                             traffic_split_pct: sc.traffic_split_pct,
                             shadow_model: None,
                             shadow_cost_usd: None,
-                            // Streaming panel dispatch is not supported today.
-                            panel_strategy: None,
-                            panel_leg_count: None,
-                            panel_quorum_required: None,
-                            panel_quorum_met: None,
+                            // Panel-specific additive span attributes (Phase 5
+                            // Task 4). `None` for non-panel streams — off-by-default,
+                            // mirroring the non-streaming `complete_panel` span.
+                            panel_strategy: panel.as_ref().map(|p| p.strategy.as_str()),
+                            panel_leg_count: panel.as_ref().map(|p| p.leg_records.len() as i64),
+                            panel_quorum_required: panel.as_ref().map(|p| p.quorum_required as i64),
+                            panel_quorum_met: panel.as_ref().map(|p| p.quorum_met as i64),
                         },
                     );
                 }
 
+                // Hoisted so the per-leg `panel_legs` rows (written below for a
+                // panel stream) can reference this parent `request_logs.id`.
+                let parent_id = Uuid::now_v7();
                 let row = RequestLogRow {
-                    id: Uuid::now_v7(),
+                    id: parent_id,
                     org_id,
                     api_key_id,
                     ts: Utc::now(),
-                    provider: provider_id_log,
-                    model: model.clone(),
+                    provider: row_provider,
+                    model: row_model,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
                     cached_tokens: usage.cached_tokens,
@@ -937,6 +1019,53 @@ pub fn stream_response(
                         }
                         None => {
                             tokio::spawn(fut);
+                        }
+                    }
+                }
+
+                // Per-leg `panel_legs` rows for a streaming panel (Phase 5 Task 4),
+                // fire-and-forget — MUST NOT block or fail the response. Keyed by
+                // the parent `request_logs.id` (`parent_id`). One row per
+                // enumeration position (NOT `LegResult::leg_index`) so the arbiter
+                // leg's `usize::MAX` sentinel never appears. Mirrors the
+                // non-streaming `complete_panel` per-leg write block verbatim.
+                if let Some(p) = panel.as_ref() {
+                    if let Some(leg_writer) = p.panel_leg_writer.clone() {
+                        let leg_rows: Vec<tt_telemetry::panel_legs::PanelLegRow> = p
+                            .leg_records
+                            .iter()
+                            .enumerate()
+                            .map(|(i, leg)| tt_telemetry::panel_legs::PanelLegRow {
+                                request_log_id: parent_id,
+                                leg_index: i as i32,
+                                role: match leg.role {
+                                    crate::routes::panel::LegRole::Leg => "leg".to_string(),
+                                    crate::routes::panel::LegRole::Arbiter => "arbiter".to_string(),
+                                },
+                                provider: leg.provider.clone(),
+                                model: leg.model.clone(),
+                                input_tokens: leg.usage.as_ref().map(|u| u.prompt_tokens as i64),
+                                output_tokens: leg
+                                    .usage
+                                    .as_ref()
+                                    .map(|u| u.completion_tokens as i64),
+                                cached_tokens: leg.usage.as_ref().map(|u| u.cached_tokens as i64),
+                                cost_usd: leg.cost_usd,
+                                latency_ms: Some(leg.latency_ms as i64),
+                                status: leg.status.as_str().to_string(),
+                                error_class: None,
+                            })
+                            .collect();
+                        let fut = async move {
+                            let _ = leg_writer.write_legs(leg_rows).await;
+                        };
+                        match &tracker {
+                            Some(t) => {
+                                t.spawn(fut);
+                            }
+                            None => {
+                                tokio::spawn(fut);
+                            }
                         }
                     }
                 }

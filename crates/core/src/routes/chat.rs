@@ -3642,6 +3642,9 @@ async fn handle_streaming(
                 traffic_split_arm: traffic_split_arm_owned.clone(),
                 // Paused-route passthrough marker for the streamed row.
                 route_paused,
+                // Single-model streaming dispatch carries no panel context; the
+                // streaming-panel path (Phase 5 Task 6) sets this. Off-by-default.
+                panel: None,
             })
         } else {
             None

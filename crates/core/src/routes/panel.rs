@@ -1185,7 +1185,7 @@ pub struct PanelResult {
 
 /// Fold an iterator of `Option<f64>` values: accumulate all `Some` values;
 /// return `None` only when every item was `None`.
-fn sum_metered_iter(it: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+pub(crate) fn sum_metered_iter(it: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     let mut total: Option<f64> = None;
     for x in it.flatten() {
         total = Some(total.unwrap_or(0.0) + x);

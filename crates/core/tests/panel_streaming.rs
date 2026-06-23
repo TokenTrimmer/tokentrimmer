@@ -19,9 +19,10 @@ use uuid::Uuid;
 
 use tt_core::{
     routes::panel::{
-        ArbiterCostPlan, ArbiterStrategy, BestOfN, LegResult, LegRole, LegStatus, ModelRef,
-        Synthesize,
+        ArbiterCostPlan, ArbiterDetail, ArbiterStrategy, ArbiterStrategyKind, BestOfN, LegResult,
+        LegRole, LegStatus, ModelRef, Synthesize,
     },
+    routes::sse::{stream_response, PanelStreamLog, StreamLogContext},
     AppState, ProviderRegistry,
 };
 use tt_shared::{
@@ -31,6 +32,7 @@ use tt_shared::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
+use tt_telemetry::request_logs::InMemoryRequestLogWriter;
 
 // ---------------------------------------------------------------------------
 // Helpers shared by both tests
@@ -94,6 +96,54 @@ fn make_ok_leg(leg_index: usize, answer: &str) -> LegResult {
         cost_usd: None,
         usage: None,
         latency_ms: 0,
+    }
+}
+
+/// A streaming content chunk carrying `text` as `delta.content`.
+fn content_chunk(text: &str) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: "id".into(),
+        object: "chat.completion.chunk".into(),
+        created: 0,
+        model: "panel-arbiter".into(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta {
+                role: None,
+                content: Some(text.into()),
+                tool_calls: vec![],
+                extra: Default::default(),
+            },
+            finish_reason: None,
+            extra: Default::default(),
+        }],
+        usage: None,
+        extra: Default::default(),
+    }
+}
+
+/// A finish chunk with an authoritative usage block (clean completion).
+fn finish_chunk(completion_tokens: u64) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: "id".into(),
+        object: "chat.completion.chunk".into(),
+        created: 0,
+        model: "panel-arbiter".into(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta::default(),
+            finish_reason: Some("stop".into()),
+            extra: Default::default(),
+        }],
+        usage: Some(Usage {
+            prompt_tokens: 20,
+            completion_tokens,
+            total_tokens: 20 + completion_tokens,
+            cached_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        }),
+        extra: Default::default(),
     }
 }
 
@@ -405,5 +455,194 @@ async fn synthesize_streaming_yields_live_plan_and_streamed_chunks() {
     assert_eq!(
         text, "Synthesized",
         "streamed text must equal the concatenation of the mock arbiter's chunks"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test C: DropGuard aggregate panel billing (Task 4)
+// ---------------------------------------------------------------------------
+
+/// A minimal provider whose only role here is to give `stream_response` a
+/// provider id; the stream it serves is supplied directly to `stream_response`.
+struct MockEgressProvider;
+
+#[async_trait]
+impl Provider for MockEgressProvider {
+    fn id(&self) -> &'static str {
+        "panel"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![]
+    }
+    fn pricing(&self, _model: &str) -> Option<ModelPricing> {
+        None
+    }
+    async fn chat_completion(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Err(ProviderError::Unsupported("n/a".into()))
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no embeddings".into()))
+    }
+}
+
+/// Poll the SSE response body to exhaustion so the guarded stream (and its
+/// `DropGuard`) is dropped, firing the terminal billing write.
+async fn drain_response(response: axum::response::Response) {
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+}
+
+/// Wait up to 500ms for the writer to accumulate at least `n` rows.
+async fn wait_for_rows(writer: &InMemoryRequestLogWriter, n: usize) {
+    for _ in 0..50 {
+        if writer.rows().len() >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Replay-strategy pricing: the model is priced, so the streamed answer's own
+/// `cost_usd` would be > 0. The `ArbiterCostPlan::Known` path MUST discard that
+/// streamed figure (it is the chosen leg's cost, already counted in
+/// `leg_cost_total`) and use the pre-computed `Known` value instead — proving
+/// the replayed leg is not double-counted.
+fn priced() -> ModelPricing {
+    ModelPricing {
+        input_per_million: 5.0,
+        output_per_million: 15.0,
+        cached_input_per_million: None,
+        cache_write_per_million: None,
+        batch_input_per_million: None,
+        batch_output_per_million: None,
+        flex_input_per_million: None,
+        flex_output_per_million: None,
+        prompt_cache_min_tokens: None,
+        effective_at: Utc::now(),
+    }
+}
+
+/// Build a `StreamLogContext` whose `panel` field is populated with a BestOfN
+/// replay plan: `leg_cost_total = $0.010`, `ArbiterCostPlan::Known($0.002)`.
+fn panel_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
+    let leg_records = vec![
+        make_ok_leg(0, "Answer from leg 0"),
+        make_ok_leg(1, "Answer from leg 1 — the best one"),
+    ];
+    let panel = PanelStreamLog {
+        leg_records,
+        leg_cost_total: Some(0.010),
+        strategy: ArbiterStrategyKind::BestOfN,
+        quorum_required: 1,
+        quorum_met: 2,
+        arbiter_detail: ArbiterDetail {
+            chosen_leg: Some(1),
+            ..Default::default()
+        },
+        arbiter_cost_plan: ArbiterCostPlan::Known(Some(0.002)),
+        arbiter_model: "panel-arbiter".to_string(),
+        // Fire-and-forget panel_legs writer is exercised by panel_legs_persist.rs;
+        // here we focus on the aggregate request_logs row, so leave it None.
+        panel_leg_writer: None,
+    };
+
+    StreamLogContext {
+        writer: Some(writer),
+        tracker: None,
+        org_id: Uuid::nil(),
+        api_key_id: Uuid::nil(),
+        trace_id: Uuid::nil(),
+        provider_id: "panel".into(),
+        model: "panel-arbiter".into(),
+        input_tokens: 20,
+        cached_tokens: 0,
+        retrieval_tokens_saved: 0,
+        // Priced so the streamed cost is nonzero — the Known plan must discard it.
+        pricing: Some(priced()),
+        baseline_pricing: Some(priced()),
+        route_id: None,
+        tag: None,
+        request_started: std::time::Instant::now(),
+        spend_sink: tt_core::budget::SpendSink::None,
+        fee_multiplier: 1.0,
+        flex_applied: false,
+        pass_effects: tt_core::passes::PassEffects::default(),
+        cache_insert: None,
+        include_usage: false,
+        span_ctx: None,
+        traffic_split_arm: None,
+        route_paused: false,
+        panel: Some(Arc::new(panel)),
+    }
+}
+
+/// The streaming panel `DropGuard` writes ONE aggregate `request_logs` row:
+/// `provider == "panel"`, `cached == false`, `model == arbiter`, and
+/// `cost_usd == Σ legs + arbiter`. With a BestOfN replay plan
+/// (`ArbiterCostPlan::Known`), the streamed answer's own cost is discarded — so
+/// the total is `leg_cost_total ($0.010) + Known arbiter ($0.002) = $0.012`,
+/// NOT `$0.012 + replayed-leg-cost`.
+#[tokio::test]
+async fn panel_aggregate_row_single_provider_panel_no_double_count() {
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let provider = Arc::new(MockEgressProvider) as Arc<dyn Provider>;
+
+    // A small replay stream: content chunks + a clean finish with usage. The
+    // streamed usage is what `compute_cost_full` would price — but the Known
+    // plan must throw that away.
+    let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> = vec![
+        Ok(content_chunk("Answer from leg 1 — ")),
+        Ok(content_chunk("the best one")),
+        Ok(finish_chunk(64)),
+    ];
+    let stream = futures::stream::iter(chunks).boxed();
+
+    let response = stream_response(
+        stream,
+        &provider,
+        Uuid::nil(),
+        Some(panel_log_ctx(Arc::clone(&writer))),
+    );
+
+    drain_response(response).await;
+    wait_for_rows(&writer, 1).await;
+
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1, "exactly one aggregate row expected");
+    let row = &rows[0];
+    assert_eq!(
+        row.provider, "panel",
+        "aggregate row provider must be 'panel'"
+    );
+    assert_eq!(
+        row.model, "panel-arbiter",
+        "aggregate row model must be the arbiter model"
+    );
+    assert!(!row.cached, "panel aggregate row must be cached == false");
+    // Σ legs ($0.010) + Known arbiter ($0.002) = $0.012. The replayed leg's
+    // streamed cost is NOT added (no double-count under ArbiterCostPlan::Known).
+    assert!(
+        (row.cost_usd - 0.012).abs() < 1e-9,
+        "cost_usd must be Σ legs + Known arbiter = 0.012, got {}",
+        row.cost_usd
+    );
+    // Panel rows claim no saving: baseline == cost.
+    assert!(
+        (row.baseline_cost_usd - row.cost_usd).abs() < 1e-9,
+        "panel baseline must equal cost (no claimed saving)"
     );
 }
