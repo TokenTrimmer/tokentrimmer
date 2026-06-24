@@ -2477,6 +2477,10 @@ pub(crate) async fn prepare(
     // compression, just before dispatch (see the wiring point below). Off by
     // default is LOAD-BEARING: the default request path must be byte-identical.
     let route_agentic_budget = route_match.as_ref().and_then(|m| m.agentic_budget.clone());
+    // The matched route's panel trigger (header-wins: consulted only when the
+    // caller sent no `X-TokenTrimmer-Panel` header). `None` for the
+    // overwhelming majority of routes — the single-model path is untouched.
+    let route_panel = route_match.as_ref().and_then(|m| m.panel.clone());
     // Redaction × judge sampling: the judge captures above hold the
     // PRE-redaction request — the judge job re-dispatches it verbatim to the
     // source provider for the baseline reference AND embeds its text in the
@@ -2687,7 +2691,22 @@ pub(crate) async fn prepare(
     // with ZERO upstream calls. Off-by-default: an absent `X-TokenTrimmer-Panel`
     // header (the common case) leaves `panel = None` and the single-model path
     // wire-identical — the only added work is parsing one absent header.
-    let (panel, panel_creds) = if let Some(strategy) = panel::panel_from_header(headers) {
+    // Header-wins (D2): an explicit `X-TokenTrimmer-Panel` header beats a
+    // matched route's `then.panel`. The header is consulted first; the route is
+    // the fallback trigger only when the header is absent. Both feed the SAME
+    // kill-switch / entitlement / budget gate / credential-resolution blocks
+    // below (D3) — a route-triggered panel never bypasses a gate.
+    enum PanelTrigger {
+        /// Explicit `X-TokenTrimmer-Panel` header — extras come from `tt_extras.panel`.
+        Header(panel::ArbiterStrategyKind),
+        /// Matched route's `then.panel` — extras come from the `RoutePanel` fields.
+        Route(tt_routing::RoutePanel),
+    }
+    let panel_trigger = match panel::panel_from_header(headers) {
+        Some(strategy) => Some(PanelTrigger::Header(strategy)),
+        None => route_panel.map(PanelTrigger::Route),
+    };
+    let (panel, panel_creds) = if let Some(trigger) = panel_trigger {
         // Kill-switch: an explicit panel request on a panel-disabled gateway is a
         // hard 403, never a silent fallback to single-model billing (spec §6.5).
         if !state.panel_enabled {
@@ -2702,58 +2721,105 @@ pub(crate) async fn prepare(
                 state.panel_min_tier
             )));
         }
-        // Resolve the full config from header strategy + tt_extras.panel + env
-        // defaults. An empty member list (no extras, no defaults) errors here.
-        let cfg = panel::PanelConfig::resolve(
-            strategy,
-            tt_shared::messages::parse_panel_extras(&req.tt_extras).as_ref(),
-            &panel::PanelDefaults::from_env(),
-        )?;
-        // Fail-closed budget gate: sums fee-aware estimates over (N members +
-        // arbiter); any unpriceable member or a missing budget ⇒ 402 before any
-        // dispatch. Uses the SAME whole-prompt input-token estimate the
-        // single-model cost ceiling above uses, on the post-routing request.
-        let combined = tt_shared::message_text_for_estimation(req);
-        let panel_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
-        panel::panel_budget_gate(
-            state,
-            &cfg,
-            panel_input_tokens,
-            req.max_tokens,
-            cost_limit_from_header(headers),
-        )?;
-        // Per-member-provider credential pre-resolution (spec §6.4 step 4),
-        // keyed by provider id. Mirrors the failover pre-resolution pattern
-        // (distinct providers, first-seen order, resolve each once): the
-        // raw-Bearer fallback is allowed ONLY for the source provider (the bearer
-        // IS its key); cross-provider members with no stored org credential are
-        // simply absent here and `run_panel` records them as `skipped_no_cred`
-        // (never dispatched, never billed). The arbiter provider is included so
-        // arbitration can dispatch on a member-distinct provider.
-        let mut provider_ids: Vec<String> = Vec::new();
-        for m in cfg
-            .members
-            .iter()
-            .chain(std::iter::once(&cfg.arbiter_model))
-        {
-            if let Some(p) = state.registry.resolve(&m.model) {
-                let pid = p.id().to_string();
-                if !provider_ids.contains(&pid) {
-                    provider_ids.push(pid);
+        // Resolve the full config from the trigger source + env defaults. The
+        // HEADER path reads `tt_extras.panel` for overrides (unchanged); the
+        // ROUTE path maps the `RoutePanel` fields into a `PanelExtras`. An empty
+        // member list (no extras, no defaults) errors here. `resolve` does the
+        // ModelRef lift + member cap for both branches identically.
+        //
+        // `Option` so the route branch can DEFENSIVELY skip (yield `None`) when
+        // its strategy string fails to parse at request time — which should
+        // never happen post-`validate_panel`, but must fall through to the
+        // single-model path, NEVER panic.
+        let cfg: Option<panel::PanelConfig> = match trigger {
+            PanelTrigger::Header(strategy) => Some(panel::PanelConfig::resolve(
+                strategy,
+                tt_shared::messages::parse_panel_extras(&req.tt_extras).as_ref(),
+                &panel::PanelDefaults::from_env(),
+            )?),
+            PanelTrigger::Route(rp) => {
+                // Authoritative request-time parse of the route's strategy
+                // string. `validate_panel` already rejected unknown values at
+                // route creation, so this should always parse — but a defensive
+                // skip (fall through to single-model) is correct, NEVER a panic.
+                match panel::ArbiterStrategyKind::parse(&rp.strategy) {
+                    Some(strategy) => {
+                        let extras = tt_shared::messages::PanelExtras {
+                            members: rp.members,
+                            arbiter_model: rp.arbiter,
+                            quorum: rp.quorum,
+                            max_cost_usd: rp.max_cost_usd,
+                        };
+                        Some(panel::PanelConfig::resolve(
+                            strategy,
+                            Some(&extras),
+                            &panel::PanelDefaults::from_env(),
+                        )?)
+                    }
+                    None => {
+                        tracing::warn!(
+                            strategy = %rp.strategy,
+                            "route panel strategy failed to parse at request time \
+                             (should have been caught by validate_panel) — skipping panel"
+                        );
+                        None
+                    }
                 }
             }
-        }
-        let mut creds: std::collections::HashMap<String, ProviderCredentials> =
-            std::collections::HashMap::new();
-        for pid in provider_ids {
-            let allow_bearer = pid == source_provider_id;
-            if let Some(c) =
-                resolve_credentials_for(state, org_id, &pid, &raw_bearer, allow_bearer).await
-            {
-                creds.insert(pid, c);
+        };
+        match cfg {
+            // Defensive skip (route strategy unparseable): no panel, no gates,
+            // no creds — the request continues on the single-model path.
+            None => (None, std::collections::HashMap::new()),
+            Some(cfg) => {
+                // Fail-closed budget gate: sums fee-aware estimates over (N members +
+                // arbiter); any unpriceable member or a missing budget ⇒ 402 before any
+                // dispatch. Uses the SAME whole-prompt input-token estimate the
+                // single-model cost ceiling above uses, on the post-routing request.
+                let combined = tt_shared::message_text_for_estimation(req);
+                let panel_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
+                panel::panel_budget_gate(
+                    state,
+                    &cfg,
+                    panel_input_tokens,
+                    req.max_tokens,
+                    cost_limit_from_header(headers),
+                )?;
+                // Per-member-provider credential pre-resolution (spec §6.4 step 4),
+                // keyed by provider id. Mirrors the failover pre-resolution pattern
+                // (distinct providers, first-seen order, resolve each once): the
+                // raw-Bearer fallback is allowed ONLY for the source provider (the bearer
+                // IS its key); cross-provider members with no stored org credential are
+                // simply absent here and `run_panel` records them as `skipped_no_cred`
+                // (never dispatched, never billed). The arbiter provider is included so
+                // arbitration can dispatch on a member-distinct provider.
+                let mut provider_ids: Vec<String> = Vec::new();
+                for m in cfg
+                    .members
+                    .iter()
+                    .chain(std::iter::once(&cfg.arbiter_model))
+                {
+                    if let Some(p) = state.registry.resolve(&m.model) {
+                        let pid = p.id().to_string();
+                        if !provider_ids.contains(&pid) {
+                            provider_ids.push(pid);
+                        }
+                    }
+                }
+                let mut creds: std::collections::HashMap<String, ProviderCredentials> =
+                    std::collections::HashMap::new();
+                for pid in provider_ids {
+                    let allow_bearer = pid == source_provider_id;
+                    if let Some(c) =
+                        resolve_credentials_for(state, org_id, &pid, &raw_bearer, allow_bearer)
+                            .await
+                    {
+                        creds.insert(pid, c);
+                    }
+                }
+                (Some(cfg), creds)
             }
         }
-        (Some(cfg), creds)
     } else {
         (None, std::collections::HashMap::new())
     };
@@ -6251,6 +6317,14 @@ pub(crate) struct RouteMatch {
     /// planner is never constructed on the un-opted path, so that path is
     /// byte-identical (off by default, load-bearing).
     pub(crate) agentic_budget: Option<tt_routing::AgenticBudget>,
+    /// The matched route's opt-in **deep-research panel** trigger
+    /// (`RouteAction::panel`). `Some(_)` makes a matched request fan out across
+    /// the panel members + arbiter — but only when the caller did NOT send an
+    /// explicit `X-TokenTrimmer-Panel` header (the header wins; the route is the
+    /// fallback trigger, resolved in `prepare`). A COST lever: forced to `None`
+    /// on a paused route (no panel on a paused route), and `None` by default so
+    /// the un-opted single-model path is byte-identical.
+    pub(crate) panel: Option<tt_routing::RoutePanel>,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -6396,6 +6470,10 @@ pub(crate) async fn apply_routing(
             // elision / routing for savings) — suppressed on a paused route,
             // exactly like compress/flex/format_switch above.
             agentic_budget: None,
+            // The deep-research panel is a COST lever (it fans out across N
+            // members + an arbiter) — suppressed on a paused route, so a paused
+            // panel route flows to the originally-requested single model.
+            panel: None,
             // SAFETY/privacy levers stay ON (pausing a quality gate must never
             // disable a privacy guardrail):
             disable_cache: m.then.disable_cache,
@@ -6497,6 +6575,10 @@ pub(crate) async fn apply_routing(
         reasoning_max_effort,
         reasoning_budget_tokens,
         agentic_budget,
+        // Active route's panel trigger (header-wins fallback, resolved in
+        // `prepare`). `m.then.panel` is `None` for the overwhelming majority of
+        // routes (no panel), so this clone is a cheap `None`.
+        panel: m.then.panel.clone(),
     }))
 }
 

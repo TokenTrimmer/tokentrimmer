@@ -239,6 +239,7 @@ fn diff_action() -> RouteAction {
         auto_pause: false,
         pause_floor_pass_rate: None,
         pause_min_verdicts: None,
+        panel: None,
     }
 }
 

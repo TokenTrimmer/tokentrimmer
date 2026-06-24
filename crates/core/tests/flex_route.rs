@@ -307,6 +307,7 @@ async fn app_with_flex_route(
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );

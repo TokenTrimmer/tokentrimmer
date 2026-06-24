@@ -177,6 +177,7 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );

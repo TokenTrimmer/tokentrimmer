@@ -166,6 +166,7 @@ fn route(name: &str, priority: u32, tag: Option<&str>, target: &str) -> Route {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            panel: None,
         },
     }
 }

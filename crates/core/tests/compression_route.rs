@@ -202,6 +202,7 @@ async fn app_with_compress_route(
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );

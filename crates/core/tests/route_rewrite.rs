@@ -212,6 +212,7 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );
@@ -303,6 +304,7 @@ async fn routed_request_reports_savings_against_original_model() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );
@@ -426,6 +428,7 @@ async fn route_for_other_org_does_not_match() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );
@@ -494,6 +497,7 @@ async fn route_skipped_when_no_resolvable_org() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );
@@ -592,6 +596,7 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );
@@ -745,6 +750,7 @@ async fn not_reasoning_class_route_skips_reasoning_requests() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );
@@ -842,6 +848,7 @@ async fn not_reasoning_class_route_skips_reasoning_requests() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );
