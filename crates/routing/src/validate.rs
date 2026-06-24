@@ -40,6 +40,8 @@ pub enum ValidationError {
     InvalidKeepRecentPairs,
     #[error("route has neither a target_model nor any then-effect (no-op route)")]
     EmptyRoute,
+    #[error("panel.strategy `{0}` is not a recognized strategy (expected one of: synthesize, best-of-n, best_of_n, majority)")]
+    InvalidPanelStrategy(String),
 }
 
 /// Reject malformed auto-pause config at route-creation time: a
@@ -159,6 +161,22 @@ pub fn validate_agentic_budget(
     Ok(())
 }
 
+/// Accepted RouteAction.panel strategy strings. MUST stay a subset of what
+/// tt_core's ArbiterStrategyKind::parse accepts (drift-guarded by a tt-core
+/// test). tt_routing cannot depend on tt_core, so this is the routing-local
+/// source of truth for route-creation validation.
+pub const PANEL_STRATEGY_VALUES: [&str; 4] = ["synthesize", "best-of-n", "best_of_n", "majority"];
+
+/// Reject a route whose panel.strategy is not a recognized strategy.
+pub fn validate_panel(then: &RouteAction) -> Result<(), ValidationError> {
+    if let Some(p) = &then.panel {
+        if !PANEL_STRATEGY_VALUES.contains(&p.strategy.as_str()) {
+            return Err(ValidationError::InvalidPanelStrategy(p.strategy.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// When the route requires image or audio input, the target must be
 /// `Vision`-capable (the runtime guard sets `vision=true` for both). An unknown
 /// target (`lookup` returns `None`) is permissive, matching the runtime guard.
@@ -203,6 +221,7 @@ pub fn validate_route_has_effect(then: &RouteAction) -> Result<(), ValidationErr
         return Ok(());
     }
     let has_effect = then.agentic_budget.is_some()
+        || then.panel.is_some()
         || then.disable_cache
         || then.flex
         || then.batch
@@ -226,7 +245,7 @@ pub fn validate_route_has_effect(then: &RouteAction) -> Result<(), ValidationErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgenticBudget, RouteAction, RouteConditions};
+    use crate::{AgenticBudget, RouteAction, RouteConditions, RoutePanel};
     use tt_shared::pricing::{Capability, ModelInfo};
 
     fn action(target: &str) -> RouteAction {
@@ -250,6 +269,7 @@ mod tests {
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
             agentic_budget: None,
+            panel: None,
         }
     }
     fn vision_model(id: &str) -> ModelInfo {
@@ -543,6 +563,57 @@ mod tests {
     fn agentic_budget_none_validates_trivially() {
         let resolves = |_: &str| false;
         assert!(validate_agentic_budget(&action("gpt-4o"), resolves).is_ok());
+    }
+
+    /// A panel-only `RouteAction` (no target_model, panel Some) passes
+    /// `validate_route_has_effect` — the panel IS the effect.
+    #[test]
+    fn route_has_effect_panel_only_passes() {
+        let mut a = action("ignored");
+        a.target_model = None;
+        a.panel = Some(RoutePanel {
+            strategy: "synthesize".into(),
+            ..Default::default()
+        });
+        assert!(
+            validate_route_has_effect(&a).is_ok(),
+            "panel-only route must pass validate_route_has_effect"
+        );
+    }
+
+    /// `validate_panel` accepts each of the 4 valid strategy strings and rejects
+    /// an unrecognized string with `InvalidPanelStrategy`.
+    #[test]
+    fn validate_panel_accepts_valid_strategies_and_rejects_bogus() {
+        for strategy in ["synthesize", "best-of-n", "best_of_n", "majority"] {
+            let mut a = action("m");
+            a.panel = Some(RoutePanel {
+                strategy: strategy.into(),
+                ..Default::default()
+            });
+            assert!(
+                validate_panel(&a).is_ok(),
+                "strategy {strategy:?} must be accepted"
+            );
+        }
+        let mut bad = action("m");
+        bad.panel = Some(RoutePanel {
+            strategy: "bogus".into(),
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                validate_panel(&bad),
+                Err(ValidationError::InvalidPanelStrategy(ref s)) if s == "bogus"
+            ),
+            "strategy 'bogus' must be rejected with InvalidPanelStrategy"
+        );
+    }
+
+    /// No panel on the route → `validate_panel` is a trivial no-op.
+    #[test]
+    fn validate_panel_none_is_noop() {
+        assert!(validate_panel(&action("m")).is_ok());
     }
 
     /// A modifier-only route (`target_model: None`) has no rewrite target to

@@ -220,6 +220,7 @@ async fn app_with_redact_route_and_cache_min(
                 redact: redact_flag,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );

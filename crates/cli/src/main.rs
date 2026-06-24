@@ -1931,6 +1931,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     redact: false,
                     traffic_pct: None,
                     shadow_model: None,
+                    panel: None,
                 },
             }],
         );

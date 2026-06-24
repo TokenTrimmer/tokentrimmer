@@ -66,7 +66,12 @@ impl ArbiterStrategyKind {
 
     /// Parse a strategy from its wire-format string (case-insensitive).
     /// Returns `None` for unknown values — callers should treat that as "no panel".
-    fn parse(s: &str) -> Option<Self> {
+    ///
+    /// `pub(crate)` so the gateway-wiring in `chat.rs` can authoritatively parse
+    /// a route's `then.panel.strategy` string at request time (header-wins
+    /// fallback) and the drift-guard test can assert every
+    /// `tt_routing::PANEL_STRATEGY_VALUES` value parses.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "synthesize" => Some(Self::Synthesize),
             "best-of-n" | "best_of_n" => Some(Self::BestOfN),
@@ -2104,6 +2109,22 @@ mod tests {
             Some(ArbiterStrategyKind::Synthesize)
         ));
         assert!(ArbiterStrategyKind::parse("bogus").is_none());
+    }
+
+    /// Drift guard (Task 2): every wire value `tt_routing::validate_panel`
+    /// accepts at route creation MUST be parseable by `ArbiterStrategyKind::parse`
+    /// at request time. If the routing crate adds a strategy alias without a
+    /// matching parse arm here, a route would validate at creation then silently
+    /// fall through (defensive skip) at dispatch — this test fails the build first.
+    #[test]
+    fn every_validated_strategy_parses() {
+        for s in tt_routing::PANEL_STRATEGY_VALUES {
+            assert!(
+                ArbiterStrategyKind::parse(s).is_some(),
+                "PANEL_STRATEGY_VALUES contains {s:?} which ArbiterStrategyKind::parse rejects \
+                 — validate_panel and parse have drifted"
+            );
+        }
     }
 
     #[test]

@@ -378,6 +378,7 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     auto_pause: false,
                     pause_floor_pass_rate: None,
                     pause_min_verdicts: None,
+                    panel: None,
                 },
             }],
         );
@@ -418,6 +419,7 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     redact: opts.redact_route,
                     traffic_pct: None,
                     shadow_model: None,
+                    panel: None,
                 },
             }],
         );
@@ -1433,6 +1435,7 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );

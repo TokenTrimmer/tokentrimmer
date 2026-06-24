@@ -1044,6 +1044,8 @@ mod tests {
             // not mirrored (route-grained shaping mode, not a replay-projected
             // effect) — `None` is omitted from the wire, keeping byte-identity.
             agentic_budget: None,
+            // not mirrored (panel is a UI-only concept, not projected by replay).
+            panel: None,
         };
         let gateway_json = serde_json::to_string(&gateway).unwrap();
 

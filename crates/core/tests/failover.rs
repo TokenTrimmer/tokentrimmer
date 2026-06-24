@@ -165,6 +165,7 @@ fn failover_routing_store() -> Arc<CachingRoutingStore> {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );

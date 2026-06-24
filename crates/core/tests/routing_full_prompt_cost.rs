@@ -212,6 +212,7 @@ async fn cost_condition_counts_full_prompt() {
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
+                panel: None,
             },
         }],
     );

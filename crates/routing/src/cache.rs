@@ -183,6 +183,7 @@ mod tests {
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
+                panel: None,
             },
             paused: false,
         }
@@ -354,6 +355,7 @@ mod tests {
                         reasoning_max_effort: None,
                         reasoning_budget_tokens: None,
                         agentic_budget: None,
+                        panel: None,
                     },
                 },
             )

@@ -276,6 +276,7 @@ async fn shadow_mode_dispatches_candidate_and_records_cost_separately() {
         // shadow with no traffic_pct = 100% shadow, primary still serves.
         traffic_pct: None,
         shadow_model: Some(SHADOW_MODEL.into()),
+        panel: None,
     };
     let (app, key, models_called, calls, log_writer) = app_with_route(then).await;
 
@@ -370,6 +371,7 @@ async fn no_shadow_when_route_does_not_opt_in() {
         redact: false,
         traffic_pct: None,
         shadow_model: None,
+        panel: None,
     };
     let (app, key, _models, calls, log_writer) = app_with_route(then).await;
 
@@ -416,6 +418,7 @@ async fn canary_split_records_arm() {
         redact: false,
         traffic_pct: Some(100),
         shadow_model: None,
+        panel: None,
     };
     let (app, key, _models, _calls, log_writer) = app_with_route(then).await;
 
@@ -461,6 +464,7 @@ async fn zero_pct_split_serves_control_arm() {
         redact: false,
         traffic_pct: Some(0),
         shadow_model: None,
+        panel: None,
     };
     let (app, key, models_called, _calls, log_writer) = app_with_route(then).await;
 
