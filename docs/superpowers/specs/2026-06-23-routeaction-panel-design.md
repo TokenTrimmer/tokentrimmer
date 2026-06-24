@@ -1,6 +1,6 @@
 # `RouteAction.panel` — org-configurable panel routes Design Spec
 
-> Status: DRAFT (awaiting user review). Date: 2026-06-23. Repo: public (feature) + cloud (pin bump). Branch: `feat/routeaction-panel`.
+> Status: IMPLEMENTED (public on feat/routeaction-panel; cloud pin-bump pending). Date: 2026-06-23. Repo: public (feature) + cloud (pin bump). Branch: `feat/routeaction-panel`.
 > The deferred deep-research-panel follow-up (un-deferred 2026-06-23). Lets an org trigger + configure the deep-research panel via a routing rule, not just the `X-TokenTrimmer-Panel` header. Master spec: `2026-06-21-deep-research-panel-design.md` (opt-in surface row: "`RouteAction.panel` org config").
 > **Decisions (user-approved 2026-06-23):** (1) **full panel config in the route** — `RouteAction.panel = { strategy, members?, arbiter?, quorum?, max_cost_usd? }`; (2) **header wins** — an explicit `X-TokenTrimmer-Panel` header overrides a matched route's panel.
 
