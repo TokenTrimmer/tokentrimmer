@@ -50,6 +50,10 @@ pub struct RunUsage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub cost_usd: f64,
+    /// Per-turn served cost (USD) for each server-side turn of the run.
+    /// Empty when the server does not include this field (older versions).
+    #[serde(default)]
+    pub per_turn_cost_usd: Vec<f64>,
 }
 
 /// A run record returned by `POST /v1/agent/runs` and the resume endpoint — the
@@ -68,6 +72,12 @@ pub struct Run {
     /// into `usage.cost_usd`. `None` when unmetered / no summarization.
     #[serde(default)]
     pub summarizer_tax_usd: Option<f64>,
+    /// Why the run stopped: `"max_turns"` when the server-side turn cap was
+    /// reached, `"budget_exhausted"` when `max_cost_usd` was hit, or `None`
+    /// when the run completed normally. Plain `String` for forward-compatibility
+    /// with future gateway stop reasons.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
 }
 
 impl Run {
@@ -148,6 +158,10 @@ pub struct AgentBuilder<'a> {
     /// Server-side per-run turn cap; `None` ⇒ the gateway default. Forwarded as
     /// the request's `max_turns` (the gateway clamps it to `[1, 32]`).
     max_turns: Option<u32>,
+    /// Hard ceiling (USD) on the run's total served cost. Sent in the POST body
+    /// as `max_cost_usd`. Distinct from `cost_limit` (the per-turn estimate
+    /// header `X-TokenTrimmer-Cost-Limit-Usd`).
+    max_cost_usd: Option<f64>,
     tag: Option<String>,
     cost_limit: Option<f64>,
     interactive: bool,
@@ -165,6 +179,7 @@ impl<'a> AgentBuilder<'a> {
             messages: Vec::new(),
             tools: Vec::new(),
             max_turns: None,
+            max_cost_usd: None,
             tag: None,
             cost_limit: None,
             interactive: false,
@@ -200,6 +215,13 @@ impl<'a> AgentBuilder<'a> {
     #[must_use]
     pub fn max_turns(mut self, n: u32) -> Self {
         self.max_turns = Some(n);
+        self
+    }
+    /// Hard ceiling (USD) on the run's total served cost. The gateway stops the
+    /// run before a turn that would breach it (`stop_reason = budget_exhausted`).
+    #[must_use]
+    pub fn max_cost_usd(mut self, usd: f64) -> Self {
+        self.max_cost_usd = Some(usd);
         self
     }
     /// `X-TokenTrimmer-Tag` — free-form cost-attribution tag, forwarded on the
@@ -294,6 +316,9 @@ impl<'a> AgentBuilder<'a> {
         }
         if let Some(mt) = self.max_turns {
             body["max_turns"] = serde_json::json!(mt);
+        }
+        if let Some(c) = self.max_cost_usd {
+            body["max_cost_usd"] = serde_json::json!(c);
         }
         let url = format!("{}/v1/agent/runs", self.client.base);
         self.send_run(url, body).await
@@ -609,6 +634,45 @@ mod tests {
             .run(&Canned("x"))
             .await;
         assert!(matches!(result, Err(Error::Status { status: 503, .. })));
+    }
+
+    #[tokio::test]
+    async fn agent_builder_sends_max_cost_usd_in_body() {
+        // Mirrors `run_forwards_tag_and_max_turns`: httpmock asserts the POST
+        // body contains the new field alongside the existing `max_turns`.
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/agent/runs")
+                .body_includes("\"max_cost_usd\":0.5")
+                .body_includes("\"max_turns\":4");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "z", "status": "completed", "turns": 1,
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "cost_usd": 0.0 },
+                    "messages": [{ "role": "assistant", "content": "ok" }]
+                }));
+        });
+        let client = Client::new(server.base_url(), "k");
+        client
+            .agent()
+            .model("gpt-4o-mini")
+            .message(user("hi"))
+            .max_turns(4)
+            .max_cost_usd(0.50)
+            .run(&Canned("x"))
+            .await
+            .unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn client_run_usage_deserializes_per_turn_cost_and_stop_reason() {
+        let json = r#"{"id":"r","status":"incomplete","messages":[],"turns":2,"usage":{"prompt_tokens":1,"completion_tokens":1,"cost_usd":0.5,"per_turn_cost_usd":[0.25,0.25]},"stop_reason":"budget_exhausted"}"#;
+        let run: Run = serde_json::from_str(json).unwrap();
+        assert_eq!(run.usage.per_turn_cost_usd, vec![0.25, 0.25]);
+        assert_eq!(run.stop_reason.as_deref(), Some("budget_exhausted"));
     }
 
     #[tokio::test]
