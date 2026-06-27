@@ -3,9 +3,9 @@
 //! Kept out of the oversized `agent_run.rs` (ADR-011). All functions are pure
 //! and unit-tested here; the loop in `agent_run.rs` calls them.
 //!
-//! `dead_code` is suppressed at the module level: all pub(crate) items here are
-//! called by the loop in `agent_run.rs` (wired in Task 2); the lint fires now
-//! only because that wiring doesn't exist yet.
+//! `dead_code` is suppressed at the module level: `would_exceed` and
+//! `estimate_next_turn_cost` are reserved for Task 3 (pre-flight estimate) and
+//! are unused until then.
 #![allow(dead_code)]
 
 use tt_shared::messages::{Message, MessageContent};
@@ -13,7 +13,7 @@ use tt_shared::messages::{Message, MessageContent};
 /// A non-success terminal cause for a run, recorded on `Run.stop_reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum StopReason {
+pub enum StopReason {
     /// The loop hit `max_turns`.
     MaxTurns,
     /// The run's accumulated served cost reached `max_cost_usd`.

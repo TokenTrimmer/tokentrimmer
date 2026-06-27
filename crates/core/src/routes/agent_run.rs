@@ -28,7 +28,10 @@ use crate::{
     middleware::trace::TraceId,
     passes::agentic_budget::summarize_judge::SummarizeCall,
     quality_sample::{self, GatewayLlmJudge},
-    routes::chat::{self, CompletionOutcome},
+    routes::{
+        agent_run_budget::{budget_reached, StopReason},
+        chat::{self, CompletionOutcome},
+    },
     ApiResult, AppState,
 };
 
@@ -85,6 +88,10 @@ pub struct Run {
     /// cost — a measurement tax, like the quality-judge tax.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summarizer_tax_usd: Option<f64>,
+    /// Why a non-`Completed`/`Failed` run terminated (machine-readable). `None`
+    /// for completed/failed runs and for legacy stored runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
 }
 
 /// One server-sent event from a streaming agent run (slice 3b). TT-native,
@@ -313,6 +320,7 @@ pub(crate) async fn run_loop_core(
     mut messages: Vec<Message>,
     tools: Vec<tt_shared::messages::Tool>,
     max_turns: u32,
+    max_cost_usd: Option<f64>,
     turns_done: u32,
     mut summarized_upto: u32,
     mut usage: RunUsage,
@@ -332,6 +340,21 @@ pub(crate) async fn run_loop_core(
     // accumulator at `Some(0.0)` so each turn's tax folds in via `sum_metered`.
     let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0);
     while turn < max_turns {
+        if budget_reached(usage.cost_usd, max_cost_usd) {
+            return LoopOutcome::Terminal(Run {
+                id,
+                status: RunStatus::Incomplete,
+                messages,
+                turns: turn,
+                usage,
+                note: Some(format!(
+                    "run cost cap ${:.4} reached",
+                    max_cost_usd.unwrap_or_default()
+                )),
+                summarizer_tax_usd: summarizer_tax,
+                stop_reason: Some(StopReason::BudgetExhausted),
+            });
+        }
         emit(RunEvent::Turn { turn: turn + 1 }); // 1-indexed
         if let Some(s) = summarizer {
             let tax = s
@@ -362,6 +385,7 @@ pub(crate) async fn run_loop_core(
                     usage,
                     note: Some(format!("turn {turn} failed: {e}")),
                     summarizer_tax_usd: summarizer_tax,
+                    stop_reason: None,
                 });
             }
         };
@@ -386,6 +410,7 @@ pub(crate) async fn run_loop_core(
                 usage,
                 note: None,
                 summarizer_tax_usd: summarizer_tax,
+                stop_reason: None,
             });
         }
 
@@ -442,6 +467,7 @@ pub(crate) async fn run_loop_core(
         usage,
         note: Some("max_turns reached".into()),
         summarizer_tax_usd: summarizer_tax,
+        stop_reason: Some(StopReason::MaxTurns),
     })
 }
 
@@ -466,8 +492,9 @@ pub async fn run_loop(
         messages,
         tools,
         max_turns,
-        0, /*turns_done*/
-        0, /*summarized_upto*/
+        None, /*max_cost_usd*/
+        0,    /*turns_done*/
+        0,    /*summarized_upto*/
         RunUsage::default(),
         None, /*summarizer*/
         None, /*events*/
@@ -497,6 +524,7 @@ pub async fn run_loop(
                 usage,
                 note: Some(format!("client tool '{name}' requires slice-1b round-trip")),
                 summarizer_tax_usd,
+                stop_reason: None,
             }
         }
     }
@@ -557,6 +585,14 @@ pub(crate) struct StoredRun {
     /// The run's pinned summarize policy (turn-0 route). `None` ⇒ summarize off.
     #[serde(default)]
     pub summarize: Option<SummarizeConfig>,
+    /// Hard cost ceiling (USD) carried across pause so resume applies the same
+    /// cap. `#[serde(default)]` for cross-deploy back-compat.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
+    /// Terminal stop reason; `None` for paused (requires_action) runs.
+    /// `#[serde(default)]` for cross-deploy back-compat.
+    #[serde(default)]
+    pub stop_reason: Option<StopReason>,
 }
 
 /// L1 key for a run record, scoped by org so a fetch with the wrong org misses.
@@ -576,6 +612,7 @@ impl StoredRun {
             usage: self.usage.clone(),
             note: None,
             summarizer_tax_usd: self.summarizer_tax_usd,
+            stop_reason: self.stop_reason,
         }
     }
 }
@@ -893,6 +930,11 @@ pub struct CreateRunRequest {
     /// Turn cap; clamped to `[1, 32]`. Defaults to [`DEFAULT_MAX_TURNS`].
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// Hard ceiling on the run's accumulated served cost (USD). When set, the
+    /// loop terminates as `Incomplete` with `stop_reason = budget_exhausted`
+    /// before starting a turn that would breach it. None => no cost cap.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
     /// When true, `POST /v1/agent/runs` streams run events as SSE (slice 3b)
     /// instead of returning a single JSON `Run`. Default false.
     #[serde(default)]
@@ -910,6 +952,7 @@ async fn drive_run_loop(
     messages: Vec<Message>,
     tools: Vec<tt_shared::messages::Tool>,
     max_turns: u32,
+    max_cost_usd: Option<f64>,
     summarize_cfg: Option<SummarizeConfig>,
     events: Option<&tokio::sync::mpsc::UnboundedSender<RunEvent>>,
 ) -> LoopOutcome {
@@ -939,6 +982,7 @@ async fn drive_run_loop(
         messages,
         tools,
         max_turns,
+        max_cost_usd,
         0,
         0,
         RunUsage::default(),
@@ -961,6 +1005,7 @@ async fn persist_paused(
     messages: Vec<Message>,
     tools: Vec<tt_shared::messages::Tool>,
     max_turns: u32,
+    max_cost_usd: Option<f64>,
     turns_done: u32,
     usage: RunUsage,
     pending_tool_calls: Vec<tt_shared::messages::ToolCall>,
@@ -978,6 +1023,7 @@ async fn persist_paused(
                 messages,
                 tools,
                 max_turns,
+                max_cost_usd,
                 turns_done,
                 usage,
                 pending_tool_calls,
@@ -985,6 +1031,7 @@ async fn persist_paused(
                 summarized_upto,
                 summarizer_tax_usd,
                 summarize: summarize_cfg,
+                stop_reason: None,
             };
             store_run(l1.cache.as_ref(), &stored).await?;
             Ok(stored.to_run())
@@ -1004,6 +1051,7 @@ async fn persist_paused(
                     "client tool '{name}' requires Redis to pause/resume (none configured)"
                 )),
                 summarizer_tax_usd,
+                stop_reason: None,
             })
         }
     }
@@ -1033,6 +1081,7 @@ pub async fn create_run(
     let model = req.model.clone();
     let tools = req.tools.clone();
     let max_turns = req.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
+    let max_cost_usd = req.max_cost_usd;
 
     // Resolve the run's summarize policy ONCE from the turn-0 route, then build
     // the production summarizer. Done BEFORE `identity` is moved into the
@@ -1058,6 +1107,7 @@ pub async fn create_run(
                 messages,
                 tools.clone(),
                 max_turns,
+                max_cost_usd,
                 summarize_cfg.clone(),
                 Some(&tx),
             )
@@ -1088,6 +1138,7 @@ pub async fn create_run(
                         messages,
                         tools,
                         max_turns,
+                        max_cost_usd,
                         turns_done,
                         usage,
                         pending_tool_calls,
@@ -1117,6 +1168,7 @@ pub async fn create_run(
                                     usage: RunUsage::default(),
                                     note: Some(format!("persist failed: {e}")),
                                     summarizer_tax_usd: None,
+                                    stop_reason: None,
                                 },
                             });
                         }
@@ -1146,6 +1198,7 @@ pub async fn create_run(
         req.messages,
         tools.clone(),
         max_turns,
+        max_cost_usd,
         summarize_cfg.clone(),
         None,
     )
@@ -1169,6 +1222,7 @@ pub async fn create_run(
                 messages,
                 tools,
                 max_turns,
+                max_cost_usd,
                 turns_done,
                 usage,
                 pending_tool_calls,
@@ -1360,6 +1414,7 @@ pub async fn submit_tool_outputs(
         std::mem::take(&mut stored.messages),
         stored.tools.clone(),
         stored.max_turns,
+        stored.max_cost_usd,
         stored.turns_done,
         stored.summarized_upto,
         stored.usage.clone(),
@@ -1980,6 +2035,7 @@ mod tests {
             vec![],
             vec![],
             8,
+            None, /*max_cost_usd*/
             0,
             0, /*summarized_upto*/
             RunUsage::default(),
@@ -2022,6 +2078,7 @@ mod tests {
             resumed_messages,
             vec![],
             8,
+            None, /*max_cost_usd*/
             1,
             0, /*summarized_upto*/
             RunUsage::default(),
@@ -2055,6 +2112,7 @@ mod tests {
             vec![],
             vec![],
             8,
+            None, /*max_cost_usd*/
             0,
             0, /*summarized_upto*/
             RunUsage::default(),
@@ -2151,6 +2209,8 @@ mod tests {
             summarized_upto: 0,
             summarizer_tax_usd: None,
             summarize: None,
+            max_cost_usd: None,
+            stop_reason: None,
         };
         store_run(&cache, &run).await.unwrap();
         let got = fetch_run(&cache, org, run.id)
@@ -2198,6 +2258,8 @@ mod tests {
             summarized_upto: 0,
             summarizer_tax_usd: None,
             summarize: None,
+            max_cost_usd: None,
+            stop_reason: None,
         };
         store_run(&cache, &stored).await.unwrap();
         assert_eq!(
@@ -2239,6 +2301,8 @@ mod tests {
             summarized_upto: 0,
             summarizer_tax_usd: None,
             summarize: None,
+            max_cost_usd: None,
+            stop_reason: None,
         };
         store_run(&cache, &stored).await.unwrap();
         assert!(fetch_run(&cache, uuid::Uuid::new_v4(), id)
@@ -2295,6 +2359,8 @@ mod tests {
             summarized_upto: 0,
             summarizer_tax_usd: None,
             summarize: None,
+            max_cost_usd: None,
+            stop_reason: None,
         };
         store_run(&cache, &stored).await.unwrap();
         let got = fetch_run(&cache, org, id).await.unwrap().expect("present");
@@ -2344,6 +2410,8 @@ mod tests {
             summarized_upto: 3,
             summarizer_tax_usd: Some(0.0004),
             summarize: None,
+            max_cost_usd: None,
+            stop_reason: None,
         };
         assert_eq!(sr.to_run().summarizer_tax_usd, Some(0.0004));
     }
@@ -2505,6 +2573,7 @@ mod tests {
             vec![],
             vec![],
             8,
+            None, /*max_cost_usd*/
             0,
             0,
             RunUsage::default(),
@@ -2544,6 +2613,7 @@ mod tests {
             vec![],
             vec![],
             8,
+            None, /*max_cost_usd*/
             0,
             0,
             RunUsage::default(),
@@ -2595,6 +2665,7 @@ mod tests {
             vec![],
             vec![],
             8,
+            None, /*max_cost_usd*/
             0,
             0,
             RunUsage::default(),
@@ -2624,6 +2695,7 @@ mod tests {
             vec![],
             vec![],
             8,
+            None, /*max_cost_usd*/
             0,
             0,
             RunUsage::default(),
@@ -2703,8 +2775,9 @@ mod tests {
             vec![],
             vec![],
             8,
-            0, // turns_done
-            0, // summarized_upto
+            None, // max_cost_usd
+            0,    // turns_done
+            0,    // summarized_upto
             RunUsage {
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -2721,6 +2794,90 @@ mod tests {
     }
 
     // ----- RunEvent enum (slice 3b Task 1) -----
+
+    // ----- Budget cap + stop_reason (W0a Task 2) -----
+
+    /// Test helper: drive the loop from scratch with an explicit cost cap.
+    async fn run_loop_capped(
+        completer: &dyn TurnCompleter,
+        id: uuid::Uuid,
+        model: String,
+        messages: Vec<Message>,
+        tools: Vec<tt_shared::messages::Tool>,
+        max_turns: u32,
+        max_cost_usd: Option<f64>,
+    ) -> Run {
+        match run_loop_core(
+            completer, id, model, messages, tools, max_turns, max_cost_usd, 0, 0,
+            RunUsage::default(), None, None,
+        )
+        .await
+        {
+            LoopOutcome::Terminal(run) => run,
+            LoopOutcome::Paused { .. } => panic!("unexpected pause in capped test"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_stops_when_accrued_cost_reaches_cap() {
+        // Each turn costs 0.25; cap is 0.40. After turn 1 (0.25) the loop runs
+        // turn 2 (0.50 >= 0.40), then refuses turn 3 -> Incomplete/BudgetExhausted.
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_toolcall("find_route_for"),
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.25,
+        };
+        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, Some(0.40)).await;
+        assert_eq!(run.status, RunStatus::Incomplete);
+        assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted));
+        assert_eq!(run.turns, 2);
+        assert_eq!(run.usage.cost_usd, 0.50);
+    }
+
+    #[tokio::test]
+    async fn loop_without_cap_is_unchanged() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.25,
+        };
+        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, None).await;
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.stop_reason, None);
+        assert_eq!(run.turns, 2);
+        assert_eq!(run.usage.cost_usd, 0.50);
+    }
+
+    #[tokio::test]
+    async fn loop_max_turns_sets_stop_reason() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_toolcall("find_route_for"),
+            ]),
+            cost_per_turn: 0.0,
+        };
+        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 2, None).await;
+        assert_eq!(run.status, RunStatus::Incomplete);
+        assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::MaxTurns));
+        assert_eq!(run.turns, 2);
+    }
+
+    #[test]
+    fn stored_run_deserializes_without_max_cost_usd() {
+        // A StoredRun JSON written by a prior deploy (no max_cost_usd/stop_reason)
+        // must still deserialize (fields default to None).
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","org_id":"00000000-0000-0000-0000-000000000000","status":"requires_action","model":"m","messages":[],"tools":[],"max_turns":8,"turns_done":1,"usage":{"prompt_tokens":1,"completion_tokens":1},"pending_tool_calls":[],"routing":{"provider_pin":null,"forced_route":null,"tag":null}}"#;
+        let sr: StoredRun = serde_json::from_str(json).expect("legacy StoredRun must deserialize");
+        assert_eq!(sr.max_cost_usd, None);
+        assert_eq!(sr.stop_reason, None);
+    }
 
     #[test]
     fn run_event_serializes_with_type_tag_and_event_name() {
