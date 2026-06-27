@@ -3,11 +3,6 @@
 //! Kept out of the oversized `agent_run.rs` (ADR-011). All functions are pure
 //! and unit-tested here; the loop in `agent_run.rs` calls them.
 //!
-//! `dead_code` is suppressed at the module level: `would_exceed` and
-//! `estimate_next_turn_cost` are reserved for Task 3 (pre-flight estimate) and
-//! are unused until then.
-#![allow(dead_code)]
-
 use tt_shared::messages::{Message, MessageContent};
 
 /// A non-success terminal cause for a run, recorded on `Run.stop_reason`.
@@ -18,12 +13,6 @@ pub enum StopReason {
     MaxTurns,
     /// The run's accumulated served cost reached `max_cost_usd`.
     BudgetExhausted,
-}
-
-/// True iff a cap is set and the accrued served cost has reached it.
-/// The hard guarantee: never *start* another turn once accrued >= cap.
-pub(crate) fn budget_reached(accrued_usd: f64, cap: Option<f64>) -> bool {
-    matches!(cap, Some(c) if accrued_usd >= c)
 }
 
 /// True iff a cap is set and `accrued + best-effort next-turn estimate` reaches
@@ -86,18 +75,6 @@ fn content_text(c: &MessageContent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn budget_reached_is_false_without_a_cap() {
-        assert!(!budget_reached(100.0, None));
-    }
-
-    #[test]
-    fn budget_reached_is_true_at_or_above_cap() {
-        assert!(!budget_reached(0.39, Some(0.40)));
-        assert!(budget_reached(0.40, Some(0.40)));
-        assert!(budget_reached(0.41, Some(0.40)));
-    }
 
     #[test]
     fn would_exceed_uses_accrued_plus_estimate_when_estimate_present() {

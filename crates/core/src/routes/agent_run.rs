@@ -29,7 +29,7 @@ use crate::{
     passes::agentic_budget::summarize_judge::SummarizeCall,
     quality_sample::{self, GatewayLlmJudge},
     routes::{
-        agent_run_budget::{budget_reached, StopReason},
+        agent_run_budget::{estimate_next_turn_cost, would_exceed, StopReason},
         chat::{self, CompletionOutcome},
     },
     ApiResult, AppState,
@@ -340,7 +340,13 @@ pub(crate) async fn run_loop_core(
     // accumulator at `Some(0.0)` so each turn's tax folds in via `sum_metered`.
     let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0);
     while turn < max_turns {
-        if budget_reached(usage.cost_usd, max_cost_usd) {
+        let est_next = if max_cost_usd.is_some() {
+            estimate_next_turn_cost(&model, &messages)
+        } else {
+            None
+        };
+        if would_exceed(usage.cost_usd, est_next, max_cost_usd) {
+            let accrued = usage.cost_usd;
             return LoopOutcome::Terminal(Run {
                 id,
                 status: RunStatus::Incomplete,
@@ -348,8 +354,10 @@ pub(crate) async fn run_loop_core(
                 turns: turn,
                 usage,
                 note: Some(format!(
-                    "run cost cap ${:.4} reached",
-                    max_cost_usd.unwrap_or_default()
+                    "run cost cap ${:.4} would be exceeded (accrued ${:.4} + est ${:.4})",
+                    max_cost_usd.unwrap_or_default(),
+                    accrued,
+                    est_next.unwrap_or(0.0)
                 )),
                 summarizer_tax_usd: summarizer_tax,
                 stop_reason: Some(StopReason::BudgetExhausted),
@@ -2836,6 +2844,26 @@ mod tests {
         assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted));
         assert_eq!(run.turns, 2);
         assert_eq!(run.usage.cost_usd, 0.50);
+    }
+
+    #[tokio::test]
+    async fn loop_stops_before_a_turn_that_would_exceed_cap() {
+        // A real catalog model so estimate_next_turn_cost returns Some(>0).
+        // cap is tiny (0.0001) so accrued(0) + est >= cap on the FIRST turn:
+        // the loop must stop with 0 turns run.
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![assistant_final()]),
+            cost_per_turn: 0.25,
+        };
+        let msgs = vec![Message::User {
+            content: MessageContent::Text("estimate me".into()),
+            name: None,
+        }];
+        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "gpt-4o-mini".into(), msgs, vec![], 8, Some(0.0001)).await;
+        assert_eq!(run.status, RunStatus::Incomplete);
+        assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted));
+        assert_eq!(run.turns, 0);
+        assert_eq!(run.usage.cost_usd, 0.0);
     }
 
     #[tokio::test]
