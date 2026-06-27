@@ -70,6 +70,10 @@ pub struct RunUsage {
     /// `summarizer_tax_usd` (the 2c-2 measurement tax).
     #[serde(default)]
     pub cost_usd: f64,
+    /// Served cost (USD) of each completed turn, in order. Lets a caller see
+    /// where the spend went without per-turn headers (the run is body-returned).
+    #[serde(default)]
+    pub per_turn_cost_usd: Vec<f64>,
 }
 
 /// The result of running the agent loop. The full message transcript is
@@ -400,6 +404,7 @@ pub(crate) async fn run_loop_core(
         usage.prompt_tokens += turn_usage.prompt_tokens;
         usage.completion_tokens += turn_usage.completion_tokens;
         usage.cost_usd += turn_usage.cost_usd; // served cost across turns (and resume, via the carried usage)
+        usage.per_turn_cost_usd.push(turn_usage.cost_usd);
         messages.push(assistant.clone());
         emit(RunEvent::Message {
             message: assistant.clone(),
@@ -900,6 +905,7 @@ impl TurnCompleter for GatewayCompleter<'_> {
                     prompt_tokens: response.usage.prompt_tokens,
                     completion_tokens: response.usage.completion_tokens,
                     cost_usd: headers.cost_breakdown.cost_usd, // served cost (x-tokentrimmer-cost-usd)
+                    ..Default::default()
                 };
                 let msg = response
                     .choices
@@ -1826,6 +1832,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     cost_usd: 0.0,
+                    ..Default::default()
                 },
             ))
         }
@@ -1853,6 +1860,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     cost_usd: 0.0,
+                    ..Default::default()
                 },
             ))
         }
@@ -2207,6 +2215,7 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 cost_usd: 0.0,
+                ..Default::default()
             },
             pending_tool_calls: vec![],
             routing: StoredRouting {
@@ -2747,6 +2756,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     cost_usd: self.cost_per_turn,
+                    ..Default::default()
                 },
             ))
         }
@@ -2790,6 +2800,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 cost_usd: 1.0,
+                ..Default::default()
             }, // restored carry-in
             None, // summarizer
             None, // events
@@ -2905,6 +2916,27 @@ mod tests {
         let sr: StoredRun = serde_json::from_str(json).expect("legacy StoredRun must deserialize");
         assert_eq!(sr.max_cost_usd, None);
         assert_eq!(sr.stop_reason, None);
+    }
+
+    #[tokio::test]
+    async fn run_records_per_turn_cost() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.25,
+        };
+        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, None).await;
+        assert_eq!(run.usage.per_turn_cost_usd, vec![0.25, 0.25]);
+        assert_eq!(run.usage.cost_usd, 0.50);
+    }
+
+    #[test]
+    fn run_usage_deserializes_without_per_turn_cost_usd() {
+        let json = r#"{"prompt_tokens":1,"completion_tokens":1,"cost_usd":0.5}"#;
+        let u: RunUsage = serde_json::from_str(json).expect("legacy RunUsage must deserialize");
+        assert!(u.per_turn_cost_usd.is_empty());
     }
 
     #[test]
