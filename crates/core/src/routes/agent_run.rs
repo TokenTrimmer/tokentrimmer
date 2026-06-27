@@ -105,6 +105,14 @@ pub struct Run {
 pub enum RunEvent {
     #[serde(rename = "run.turn")]
     Turn { turn: u32 },
+    #[serde(rename = "run.turn_cost")]
+    TurnCost {
+        turn: u32,
+        turn_cost_usd: f64,
+        run_cost_usd: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        budget_remaining_usd: Option<f64>,
+    },
     #[serde(rename = "run.message")]
     Message {
         message: tt_shared::messages::Message,
@@ -131,6 +139,7 @@ impl RunEvent {
     fn event_name(&self) -> &'static str {
         match self {
             RunEvent::Turn { .. } => "run.turn",
+            RunEvent::TurnCost { .. } => "run.turn_cost",
             RunEvent::Message { .. } => "run.message",
             RunEvent::ToolResult { .. } => "run.tool_result",
             RunEvent::RequiresAction { .. } => "run.requires_action",
@@ -405,6 +414,12 @@ pub(crate) async fn run_loop_core(
         usage.completion_tokens += turn_usage.completion_tokens;
         usage.cost_usd += turn_usage.cost_usd; // served cost across turns (and resume, via the carried usage)
         usage.per_turn_cost_usd.push(turn_usage.cost_usd);
+        emit(RunEvent::TurnCost {
+            turn: turn + 1,
+            turn_cost_usd: turn_usage.cost_usd,
+            run_cost_usd: usage.cost_usd,
+            budget_remaining_usd: max_cost_usd.map(|c| (c - usage.cost_usd).max(0.0)),
+        });
         messages.push(assistant.clone());
         emit(RunEvent::Message {
             message: assistant.clone(),
@@ -2609,13 +2624,44 @@ mod tests {
             names,
             vec![
                 "run.turn",
+                "run.turn_cost",
                 "run.message",
                 "run.tool_result",
                 "run.turn",
+                "run.turn_cost",
                 "run.message"
             ]
         );
         assert!(matches!(evs[0], RunEvent::Turn { turn: 1 })); // 1-indexed
+    }
+
+    #[tokio::test]
+    async fn loop_emits_turn_cost_events() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.25,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let out = run_loop_core(
+            &stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, Some(1.0), 0, 0,
+            RunUsage::default(), None, Some(&tx),
+        )
+        .await;
+        assert!(matches!(out, LoopOutcome::Terminal(_)));
+        drop(tx);
+        let mut costs = vec![];
+        while let Some(ev) = rx.recv().await {
+            if let RunEvent::TurnCost { turn, turn_cost_usd, run_cost_usd, budget_remaining_usd } = ev {
+                costs.push((turn, turn_cost_usd, run_cost_usd, budget_remaining_usd));
+            }
+        }
+        assert_eq!(
+            costs,
+            vec![(1, 0.25, 0.25, Some(0.75)), (2, 0.25, 0.50, Some(0.50))]
+        );
     }
 
     #[tokio::test]
