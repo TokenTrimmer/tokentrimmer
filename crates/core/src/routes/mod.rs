@@ -2,6 +2,7 @@
 //! the 800-line cap enforced by pre-edit-guard.
 
 pub mod agent_run;
+pub(crate) mod agent_run_budget;
 pub mod batches;
 pub mod chat;
 pub mod embeddings;
