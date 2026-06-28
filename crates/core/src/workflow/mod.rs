@@ -6,6 +6,7 @@
 
 pub mod engine;
 pub mod estimate;
+pub(crate) mod events;
 pub mod executor;
 pub mod store;
 pub mod types;
