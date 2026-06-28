@@ -1855,6 +1855,299 @@ The run's total **served cost** (sum of `x-tokentrimmer-cost-usd` across all tur
 
 ---
 
+## 24. Workflow Engine
+
+The workflow engine lets you define and execute multi-step, multi-node AI pipelines as a DAG of typed nodes. Each node is an LLM call, an agentic loop, a conditional branch, a deterministic transform, or an output collector. Workflows are versioned: every `POST /v1/workflows` stores a new immutable version; reads always return the latest.
+
+**Authentication:** a real `tt_live_*` key in `Authorization: Bearer …`. Dogfood keys and anonymous callers receive `401`. Requires Postgres; returns `503` when the pool is absent.
+
+**Execution model:** synchronous, bounded by the gateway's 60-second timeout. Async/queued execution is a future phase.
+
+### 24.1 Workflow definition shape
+
+A workflow definition is a JSON object with the following top-level fields:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | string (UUID) | no | Client-supplied workflow id. A new UUIDv4 is generated when omitted. |
+| `version` | integer | no | Ignored on create; the store computes the next version atomically. Returned on reads. |
+| `name` | string | yes | Human-readable workflow name. |
+| `nodes` | array | yes | Ordered list of DAG nodes (see node kinds below). |
+| `edges` | array | yes | Directed edges connecting nodes. |
+| `inputs` | object | no | Freeform input schema / defaults passed to the trigger node. |
+| `budget` | object | no | Run-level cost cap (see §24.6). |
+
+Each edge:
+
+```json
+{ "from": "<node_id>", "to": "<node_id>", "map": "<optional jq expr>" }
+```
+
+`map` is an optional jq-style expression applied to the source node's output before passing it to the destination.
+
+### 24.2 Node kinds
+
+Each node carries an `id` (string, unique within the workflow) and a `type` discriminant plus kind-specific fields:
+
+#### `trigger`
+
+Entry-point; receives the workflow's external `inputs`. No additional fields.
+
+```json
+{ "id": "start", "type": "trigger" }
+```
+
+#### `model`
+
+Single LLM call.
+
+```json
+{
+  "id": "summarise",
+  "type": "model",
+  "selection": { "type": "route", "route_ref": "my-route" },
+  "prompt": "Summarise: {{input}}"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `selection` | object | yes | Which model to use (see §24.3). |
+| `prompt` | string | yes | Prompt template; `{{input}}` is replaced with the node's input value. |
+| `max_cost_usd` | number | no | Per-node USD ceiling. |
+
+#### `agent`
+
+Multi-turn agentic loop with tool access.
+
+```json
+{
+  "id": "researcher",
+  "type": "agent",
+  "selection": { "type": "model", "model": "claude-3-5-haiku-20241022" },
+  "prompt": "Research: {{input}}",
+  "max_turns": 5,
+  "tools": []
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `selection` | object | yes | Which model to use (see §24.3). |
+| `prompt` | string | yes | Prompt template. |
+| `max_turns` | integer | no | Turn cap for the agent loop. Defaults to 8. |
+| `max_cost_usd` | number | no | Per-node USD ceiling. |
+| `tools` | array | no | Tool definitions advertised to the model. Defaults to `[]`. |
+
+#### `transform`
+
+Deterministic expression evaluated on the input; no LLM call.
+
+```json
+{ "id": "upcase", "type": "transform", "expr": ".output | ascii_upcase" }
+```
+
+#### `branch`
+
+Conditional; evaluates `cond` and follows exactly one outgoing edge.
+
+```json
+{
+  "id": "gate",
+  "type": "branch",
+  "cond": ".score > 0.5",
+  "when_true": "pass_node",
+  "when_false": "fail_node"
+}
+```
+
+#### `output`
+
+Terminal node; collects the workflow's final output. No additional fields.
+
+```json
+{ "id": "done", "type": "output" }
+```
+
+> **Note:** HTTP and API call nodes are not yet supported in this release.
+
+### 24.3 Model selection (`selection`)
+
+The `selection` field on `model` and `agent` nodes determines how the model is resolved:
+
+| `type` | Additional field | Description |
+|---|---|---|
+| `"model"` | `"model": "<model_id>"` | Pin a specific model (e.g. `"claude-3-5-haiku-20241022"`). |
+| `"route"` | `"route_ref": "<route_name>"` | Use a named TokenTrimmer route (resolved at run time). |
+| `"auto"` | — | Automatic model selection. **Not yet supported at run time in this release** — pin a model or route_ref instead. |
+
+### 24.4 Endpoints
+
+#### `POST /v1/workflows` — create / update a workflow definition
+
+Validates and stores a workflow definition. If the `id` is new, version 1 is created. If the `id` already exists (for the same org), the next version is computed atomically.
+
+**Request body:** a workflow definition object (§24.1).
+
+**Response (`201 Created`):**
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "version": 1,
+  "content_hash": "a1b2c3d4..."
+}
+```
+
+**Error codes:** `400` with a list of validation errors (e.g. cycle detected, unknown model); `503` when Postgres is unavailable.
+
+---
+
+#### `GET /v1/workflows` — list workflow definitions
+
+Returns the latest version of each workflow definition owned by the authenticated org (up to 100).
+
+**Response:**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "My Pipeline",
+      "version": 3,
+      "created_at": "2026-06-28T12:00:00Z"
+    }
+  ]
+}
+```
+
+---
+
+#### `GET /v1/workflows/:id` — get latest workflow definition
+
+Returns the full workflow definition for the latest version of the given id, scoped to the authenticated org. Returns `404` when the id does not exist or belongs to another org. The returned `version` field reflects the authoritative DB version.
+
+---
+
+#### `POST /v1/workflows/:id/estimate` — pre-run cost projection
+
+Returns a static cost projection for the workflow's latest definition. No model calls are made.
+
+**Request body:**
+
+```json
+{ "inputs": {} }
+```
+
+**Response:**
+
+```json
+{
+  "projected_cost_usd": 0.0012,
+  "per_node": [
+    { "node_id": "summarise", "model": "claude-3-5-haiku-20241022", "cost_usd": 0.0008 },
+    { "node_id": "researcher", "model": null, "cost_usd": null }
+  ],
+  "warnings": ["node 'researcher': selection type 'auto' is not yet resolvable at estimate time"]
+}
+```
+
+`cost_usd: null` on a node means the estimate is unavailable (e.g. `auto` selection or unknown route). `warnings` lists any nodes that could not be estimated and why.
+
+---
+
+#### `POST /v1/workflows/:id/runs` — run a workflow
+
+Executes the workflow synchronously and returns the result. Bounded by the 60-second gateway timeout.
+
+**Request body:**
+
+```json
+{
+  "inputs": { "text": "Summarise this document…" },
+  "max_cost_usd": 0.05
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `inputs` | object | no | Input values passed to the trigger node. |
+| `max_cost_usd` | number | no | Run-level USD cap. Superseded by `def.budget.max_cost_usd` when that is set. |
+
+**Response:**
+
+```json
+{
+  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "completed",
+  "cost_usd": 0.00312,
+  "node_outputs": [
+    {
+      "node_id": "summarise",
+      "content": "The document discusses…",
+      "cost_usd": 0.00312
+    }
+  ]
+}
+```
+
+**`status` values:**
+
+| Value | Meaning |
+|---|---|
+| `"completed"` | All nodes executed successfully. |
+| `"failed"` | A node returned an error; the run was aborted. |
+| `"budget_exhausted"` | The run-level `max_cost_usd` budget was reached before a node could execute; the run was stopped. |
+
+### 24.5 Full example
+
+```json
+{
+  "name": "Summarise and score",
+  "nodes": [
+    { "id": "start", "type": "trigger" },
+    {
+      "id": "summarise",
+      "type": "model",
+      "selection": { "type": "model", "model": "claude-3-5-haiku-20241022" },
+      "prompt": "Summarise this in one sentence: {{input}}"
+    },
+    {
+      "id": "score",
+      "type": "model",
+      "selection": { "type": "model", "model": "claude-3-5-haiku-20241022" },
+      "prompt": "Rate the quality of this summary 0–1: {{input}}"
+    },
+    { "id": "done", "type": "output" }
+  ],
+  "edges": [
+    { "from": "start", "to": "summarise" },
+    { "from": "summarise", "to": "score" },
+    { "from": "score", "to": "done" }
+  ],
+  "budget": { "max_cost_usd": 0.10, "on_exceed": "stop" }
+}
+```
+
+### 24.6 Budget policy
+
+The `budget` field on a workflow definition sets a hard run-level USD ceiling:
+
+```json
+{ "max_cost_usd": 0.10, "on_exceed": "stop" }
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `max_cost_usd` | number | none | Maximum USD cost for the entire run. |
+| `on_exceed` | string | `"stop"` | Action when the cap is reached. Only `"stop"` is supported. The run stops before the node that would breach the budget, with status `"budget_exhausted"`. |
+
+A `max_cost_usd` can also be supplied per-run in the `POST /v1/workflows/:id/runs` request body. The definition-level budget (`def.budget.max_cost_usd`) takes precedence when both are set.
+
+---
+
 **End of API reference.**
 
 Companion docs:

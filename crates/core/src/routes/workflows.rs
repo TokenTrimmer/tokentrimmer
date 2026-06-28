@@ -260,9 +260,13 @@ pub async fn get(
     let org = require_org(ctx)?;
     let pool = db_pool(&state)?;
 
-    let (def, _version) = store::get_definition(pool, org, id)
+    let (mut def, _version) = store::get_definition(pool, org, id)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))?;
+
+    // Patch the JSONB-deserialized version (which may be 0 if the client
+    // omitted it when creating) with the authoritative DB version.
+    def.version = _version as u32;
 
     Ok(Json(def))
 }
