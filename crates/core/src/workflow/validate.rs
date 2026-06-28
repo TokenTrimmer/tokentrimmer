@@ -125,11 +125,11 @@ pub fn validate(
     // ------------------------------------------------------------------
     // 6. No cycles — Kahn's algorithm (topological sort).
     //
-    // We build an adjacency list over *edge* connections only.  Branch
-    // `when_true`/`when_false` are structural targets already verified above
-    // (they don't need separate cycle-detection edges; the runtime always
-    // follows exactly one branch arm, but at the definition level both must
-    // be DAG-reachable without cycles).
+    // The execution graph is the union of def.edges AND Branch arm targets:
+    // a Branch node's when_true/when_false are outgoing edges the engine
+    // will follow, so a cycle routed through a Branch arm is just as
+    // infinite-loop-inducing as one through def.edges.  We treat both as
+    // directed arcs in the adjacency map.
     // ------------------------------------------------------------------
     check_cycles(def, &mut errors);
 
@@ -162,6 +162,30 @@ fn check_cycles(def: &WorkflowDefinition, errors: &mut Vec<String>) {
         ) {
             from_adj.push(edge.to.as_str());
             *in_deg += 1;
+        }
+    }
+
+    // Add Branch arm targets as directed edges (branch_id → when_true,
+    // branch_id → when_false).  These are the arcs the engine follows at
+    // runtime; omitting them makes cycles routed through a Branch arm
+    // invisible to Kahn's algorithm.  Apply the same unknown-node-skip
+    // safety as above.
+    for node in &def.nodes {
+        if let NodeKind::Branch {
+            when_true,
+            when_false,
+            ..
+        } = &node.kind
+        {
+            for target in [when_true.as_str(), when_false.as_str()] {
+                // adj and in_degree are separate maps — simultaneous get_mut is fine.
+                let has_from = adj.contains_key(node.id.as_str());
+                let has_to = in_degree.contains_key(target);
+                if has_from && has_to {
+                    adj.get_mut(node.id.as_str()).unwrap().push(target);
+                    *in_degree.get_mut(target).unwrap() += 1;
+                }
+            }
         }
     }
 
@@ -586,6 +610,207 @@ mod tests {
         assert!(
             combined.contains("missing_yes"),
             "expected error about missing when_true node; got: {combined}"
+        );
+    }
+
+    /// A converging diamond routed through a Branch MUST be valid (not a cycle).
+    /// Topology: Trigger → Branch; Branch.when_true="a", when_false="b";
+    /// edges: a→merge, b→merge, merge→o; plus Trigger→Branch edge.
+    #[test]
+    fn valid_branch_diamond_ok() {
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "diamond".to_string(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "br".into(),
+                    kind: NodeKind::Branch {
+                        cond: ".score > 0.5".into(),
+                        when_true: "a".into(),
+                        when_false: "b".into(),
+                    },
+                },
+                Node {
+                    id: "a".into(),
+                    kind: NodeKind::Transform {
+                        expr: "identity".into(),
+                    },
+                },
+                Node {
+                    id: "b".into(),
+                    kind: NodeKind::Transform {
+                        expr: "identity".into(),
+                    },
+                },
+                Node {
+                    id: "merge".into(),
+                    kind: NodeKind::Transform {
+                        expr: "identity".into(),
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "br".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "a".into(),
+                    to: "merge".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "b".into(),
+                    to: "merge".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "merge".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+        };
+        assert!(
+            validate(&def, &any_model).is_ok(),
+            "converging diamond is a valid DAG and must not be reported as a cycle"
+        );
+    }
+
+    /// A cycle routed through a Branch arm (a→br, br.when_true="a") must be detected.
+    /// This proves Fix 1: without branch arms in the adjacency map this cycle is invisible.
+    #[test]
+    fn branch_routed_cycle_is_error() {
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "branch-cycle".to_string(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "a".into(),
+                    kind: NodeKind::Transform {
+                        expr: "identity".into(),
+                    },
+                },
+                Node {
+                    id: "br".into(),
+                    kind: NodeKind::Branch {
+                        cond: ".score > 0.5".into(),
+                        // when_true loops back to "a" — this is the cycle
+                        when_true: "a".into(),
+                        when_false: "o".into(),
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "a".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "a".into(),
+                    to: "br".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+        };
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("cycle"),
+            "expected cycle error for branch-arm loop a→br→(when_true)→a; got: {combined}"
+        );
+    }
+
+    /// A three-node cycle (a→b→c→a) within an otherwise-valid workflow must be detected.
+    #[test]
+    fn three_node_cycle_is_error() {
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "three-cycle".to_string(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "a".into(),
+                    kind: NodeKind::Transform {
+                        expr: "identity".into(),
+                    },
+                },
+                Node {
+                    id: "b".into(),
+                    kind: NodeKind::Transform {
+                        expr: "identity".into(),
+                    },
+                },
+                Node {
+                    id: "c".into(),
+                    kind: NodeKind::Transform {
+                        expr: "identity".into(),
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "a".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "a".into(),
+                    to: "b".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "b".into(),
+                    to: "c".into(),
+                    map: None,
+                },
+                // back-edge closes the cycle
+                Edge {
+                    from: "c".into(),
+                    to: "a".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+        };
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("cycle"),
+            "expected cycle error for three-node cycle a→b→c→a; got: {combined}"
         );
     }
 
