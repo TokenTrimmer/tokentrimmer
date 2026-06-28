@@ -5,6 +5,7 @@
 //! submodules.
 
 pub mod engine;
+pub mod estimate;
 pub mod executor;
 pub mod store;
 pub mod types;
