@@ -429,9 +429,14 @@ pub async fn create_run(
 
     // Collect journal entries synchronously (no async-in-closure needed).
     let mut journal_entries: Vec<engine::NodeJournalEntry> = Vec::new();
-    let result = engine::run_workflow(&executor, &def, &body.inputs, run_max_cost, |entry| {
-        journal_entries.push(entry)
-    })
+    let result = engine::run_workflow(
+        &executor,
+        &def,
+        &body.inputs,
+        run_max_cost,
+        |entry| journal_entries.push(entry),
+        None, // Task 3 wires Some(tx) for SSE streaming
+    )
     .await;
 
     // --- Persist node runs (best-effort, after run returns) ------------------
