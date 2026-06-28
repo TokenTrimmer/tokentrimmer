@@ -1143,6 +1143,20 @@ pub async fn create_run(
     // Stamp the run id onto the identity so each turn's RequestContext carries it.
     identity.run_id = id;
 
+    // W0b Task 5: insert a "running" row in agent_runs (best-effort; pool
+    // absence ⇒ skip, mirroring the l1/Redis optional guard pattern).
+    if let Some(pool) = state.db_pool.as_ref() {
+        let rec = crate::routes::agent_run_store::AgentRunRecord::new_running(
+            id,
+            org_id,
+            model.clone(),
+            Some(max_turns),
+            max_cost_usd,
+            identity.tag.clone(),
+        );
+        crate::routes::agent_run_store::insert_agent_run(pool, &rec).await;
+    }
+
     if req.stream {
         let owned_state = state.clone(); // cheap Arcs; 'static for the spawned task
         let messages = req.messages;
@@ -1163,6 +1177,21 @@ pub async fn create_run(
             .await;
             match outcome {
                 LoopOutcome::Terminal(run) => {
+                    // W0b Task 5: finalize agent_runs row (best-effort).
+                    // Copy fields before `run` is moved into the SSE event below
+                    // (all of id/status/turns/cost_usd/stop_reason are Copy).
+                    if let Some(pool) = owned_state.db_pool.as_ref() {
+                        crate::routes::agent_run_store::finish_agent_run(
+                            pool,
+                            run.id,
+                            org_id,
+                            run.status,
+                            run.turns,
+                            run.usage.cost_usd,
+                            run.stop_reason,
+                        )
+                        .await;
+                    }
                     let _ = tx.send(match run.status {
                         RunStatus::Completed => RunEvent::Completed { run },
                         RunStatus::Failed => RunEvent::Failed { run },
@@ -1253,7 +1282,22 @@ pub async fn create_run(
     )
     .await;
     match outcome {
-        LoopOutcome::Terminal(run) => Ok(Json(run).into_response()),
+        LoopOutcome::Terminal(run) => {
+            // W0b Task 5: finalize agent_runs row (best-effort; pool absence ⇒ skip).
+            if let Some(pool) = state.db_pool.as_ref() {
+                crate::routes::agent_run_store::finish_agent_run(
+                    pool,
+                    run.id,
+                    org_id,
+                    run.status,
+                    run.turns,
+                    run.usage.cost_usd,
+                    run.stop_reason,
+                )
+                .await;
+            }
+            Ok(Json(run).into_response())
+        }
         LoopOutcome::Paused {
             messages,
             turns_done,
@@ -1489,6 +1533,21 @@ pub async fn submit_tool_outputs(
             stored.summarizer_tax_usd = cumulative;
             stored.pending_tool_calls = Vec::new();
             store_run(l1.cache.as_ref(), &stored).await?;
+            // W0b Task 5: finalize agent_runs row (best-effort; pool absence ⇒ skip).
+            // run.id/status/turns/cost_usd/stop_reason are all Copy so they survive
+            // the borrow used for the Redis store above.
+            if let Some(pool) = state.db_pool.as_ref() {
+                crate::routes::agent_run_store::finish_agent_run(
+                    pool,
+                    run.id,
+                    stored.org_id,
+                    run.status,
+                    run.turns,
+                    run.usage.cost_usd,
+                    run.stop_reason,
+                )
+                .await;
+            }
             run.summarizer_tax_usd = cumulative; // return the TOTAL across segments
             Ok(Json(run))
         }
