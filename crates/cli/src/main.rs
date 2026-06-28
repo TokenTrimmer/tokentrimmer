@@ -398,6 +398,8 @@ enum AgentAction {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// List recent agent runs for the authenticated org (newest first, up to 50).
+    Runs,
 }
 
 #[derive(Subcommand)]
@@ -1198,6 +1200,9 @@ async fn main() -> anyhow::Result<()> {
                     flag_base: tt_api_base,
                 })
                 .await?;
+            }
+            AgentAction::Runs => {
+                tt_cli::agent::list_runs(tt_api_key, tt_api_base).await?;
             }
         },
         Command::Batch {

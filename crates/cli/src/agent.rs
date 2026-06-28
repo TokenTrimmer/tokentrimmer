@@ -82,6 +82,47 @@ impl tt_client::ToolExecutor for DeclineExecutor {
     }
 }
 
+/// `tt agent runs` entry point: fetch and print the caller's recent agent runs as
+/// a simple table (id · status · model · turns · cost).
+pub async fn list_runs(flag_key: Option<String>, flag_base: Option<String>) -> anyhow::Result<()> {
+    let ctx = ResolvedContext::load(flag_key, flag_base)?;
+    let key = ctx
+        .api_key_string()
+        .context("no API key — run `tt login` or set TT_API_KEY")?;
+    let base = ctx.base_url.trim_end_matches('/').to_string();
+    let client = tt_client::Client::new(base, key);
+
+    let _spin = ui::spinner("fetching runs…");
+    let runs = client
+        .list_runs()
+        .await
+        .map_err(|e| anyhow::anyhow!("list runs failed: {e}"))?;
+    drop(_spin);
+
+    if runs.is_empty() {
+        ui::note("no agent runs found");
+        return Ok(());
+    }
+
+    let color = console::colors_enabled();
+    let mut t = ui::table(&["ID", "STATUS", "MODEL", "TURNS", "COST (USD)"], color);
+    for r in &runs {
+        t.add_row(vec![
+            r.id.clone(),
+            r.status.clone(),
+            r.model.clone(),
+            r.turns.to_string(),
+            format!("${:.6}", r.cost_usd),
+        ]);
+    }
+    println!(
+        "{}\n{}",
+        ui::format_heading(&format!("AGENT RUNS {} {}", ui::BULLET, runs.len())),
+        t
+    );
+    Ok(())
+}
+
 /// Options for [`run`], mirroring the `Command::Agent { Run { .. } }` clap args.
 pub struct RunOpts {
     pub prompt: String,
