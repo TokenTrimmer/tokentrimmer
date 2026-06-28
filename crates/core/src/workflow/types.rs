@@ -147,10 +147,15 @@ pub enum OnExceed {
 // Node output (runtime; not persisted in the definition itself)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NodeOutput {
     pub content: serde_json::Value,
     pub cost_usd: f64,
+    /// Baseline (unoptimized) cost for this node's LLM call(s), sourced from
+    /// `RunUsage.baseline_cost_usd`. Zero for non-LLM nodes (Trigger, Transform,
+    /// Branch, Output).  `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub baseline_cost_usd: f64,
     pub model_used: Option<String>,
 }
 

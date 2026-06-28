@@ -144,6 +144,7 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
                 Ok(NodeOutput {
                     content: json!(last_text),
                     cost_usd: run.usage.cost_usd,
+                    baseline_cost_usd: run.usage.baseline_cost_usd,
                     model_used: None,
                 })
             }
@@ -165,6 +166,38 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
 mod tests {
     use super::*;
     use crate::workflow::types::ModelSelection;
+
+    // ---- Task 3: NodeOutput.baseline_cost_usd is threaded from RunUsage -----
+
+    /// Verify the `baseline_cost_usd` field exists on `NodeOutput` and round-trips
+    /// through serde correctly (incl. `#[serde(default)]` back-compat).
+    #[test]
+    fn node_output_baseline_cost_usd_field_and_roundtrip() {
+        // Direct construction with a non-zero baseline.
+        let out = NodeOutput {
+            content: serde_json::json!("hello"),
+            cost_usd: 0.10,
+            baseline_cost_usd: 0.15,
+            model_used: None,
+        };
+        assert!(
+            (out.baseline_cost_usd - 0.15).abs() < 1e-9,
+            "field must carry the assigned value"
+        );
+
+        // Serde round-trip preserves the value.
+        let json = serde_json::to_string(&out).unwrap();
+        let back: NodeOutput = serde_json::from_str(&json).unwrap();
+        assert!((back.baseline_cost_usd - 0.15).abs() < 1e-9);
+
+        // Old JSON without the field deserializes to 0.0 (serde default).
+        let old_json = r#"{"content":"hi","cost_usd":0.05,"model_used":null}"#;
+        let old: NodeOutput = serde_json::from_str(old_json).unwrap();
+        assert_eq!(
+            old.baseline_cost_usd, 0.0,
+            "missing field must default to 0"
+        );
+    }
 
     #[test]
     fn selection_to_model_route_explicit_model() {

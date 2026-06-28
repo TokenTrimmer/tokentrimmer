@@ -77,6 +77,12 @@ pub(crate) enum WfStatus {
 pub(crate) struct WorkflowRunResult {
     pub status: WfStatus,
     pub cost_usd: f64,
+    /// Sum of each executed node's `NodeOutput.baseline_cost_usd` — what this
+    /// run would have cost without TokenTrimmer optimization.
+    pub baseline_cost_usd: f64,
+    /// `(baseline_cost_usd - cost_usd).max(0.0)`: USD saved by routing.
+    /// Reported for all terminal paths (Succeeded, Failed, BudgetExhausted).
+    pub saved_usd: f64,
     /// Named outputs collected from Output nodes (node_id, NodeOutput).
     pub node_outputs: Vec<(String, NodeOutput)>,
     pub error: Option<String>,
@@ -131,6 +137,8 @@ pub(crate) async fn run_workflow(
             return WorkflowRunResult {
                 status: WfStatus::Failed,
                 cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
                 node_outputs: vec![],
                 error: Some("workflow has no Trigger node".into()),
             };
@@ -147,6 +155,8 @@ pub(crate) async fn run_workflow(
             return WorkflowRunResult {
                 status: WfStatus::Failed,
                 cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
                 node_outputs: vec![],
                 error: Some(e),
             };
@@ -160,6 +170,7 @@ pub(crate) async fn run_workflow(
     let mut outputs: HashMap<String, NodeOutput> = HashMap::new();
     let mut collected_outputs: Vec<(String, NodeOutput)> = Vec::new();
     let mut accrued: f64 = 0.0;
+    let mut accrued_baseline: f64 = 0.0;
     // Nodes reachable along taken edges from Trigger.
     let mut reachable: HashSet<String> = HashSet::new();
     reachable.insert(trigger_id.clone());
@@ -181,6 +192,7 @@ pub(crate) async fn run_workflow(
                 let out = NodeOutput {
                     content: inputs.clone(),
                     cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
                     model_used: None,
                 };
                 outputs.insert(node_id.clone(), out);
@@ -194,6 +206,7 @@ pub(crate) async fn run_workflow(
                 let out = NodeOutput {
                     content: serde_json::Value::String(value.clone()),
                     cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
                     model_used: None,
                 };
                 journal(NodeJournalEntry {
@@ -243,6 +256,8 @@ pub(crate) async fn run_workflow(
                     return WorkflowRunResult {
                         status: WfStatus::BudgetExhausted,
                         cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd: (accrued_baseline - accrued).max(0.0),
                         node_outputs: collected_outputs,
                         error: None,
                     };
@@ -253,6 +268,8 @@ pub(crate) async fn run_workflow(
                     return WorkflowRunResult {
                         status: WfStatus::Failed,
                         cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd: (accrued_baseline - accrued).max(0.0),
                         node_outputs: collected_outputs,
                         error: Some(
                             "Auto model selection is not supported in W1a; \
@@ -276,12 +293,15 @@ pub(crate) async fn run_workflow(
                         return WorkflowRunResult {
                             status: WfStatus::Failed,
                             cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd: (accrued_baseline - accrued).max(0.0),
                             node_outputs: collected_outputs,
                             error: Some(format!("node \"{node_id}\" failed: {e}")),
                         };
                     }
                     Ok(out) => {
                         accrued += out.cost_usd;
+                        accrued_baseline += out.baseline_cost_usd;
                         journal(NodeJournalEntry {
                             node_id: node_id.clone(),
                             status: "completed".into(),
@@ -309,6 +329,8 @@ pub(crate) async fn run_workflow(
                     return WorkflowRunResult {
                         status: WfStatus::BudgetExhausted,
                         cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd: (accrued_baseline - accrued).max(0.0),
                         node_outputs: collected_outputs,
                         error: None,
                     };
@@ -319,6 +341,8 @@ pub(crate) async fn run_workflow(
                     return WorkflowRunResult {
                         status: WfStatus::Failed,
                         cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd: (accrued_baseline - accrued).max(0.0),
                         node_outputs: collected_outputs,
                         error: Some(
                             "Auto model selection is not supported in W1a; \
@@ -342,12 +366,15 @@ pub(crate) async fn run_workflow(
                         return WorkflowRunResult {
                             status: WfStatus::Failed,
                             cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd: (accrued_baseline - accrued).max(0.0),
                             node_outputs: collected_outputs,
                             error: Some(format!("node \"{node_id}\" failed: {e}")),
                         };
                     }
                     Ok(out) => {
                         accrued += out.cost_usd;
+                        accrued_baseline += out.baseline_cost_usd;
                         journal(NodeJournalEntry {
                             node_id: node_id.clone(),
                             status: "completed".into(),
@@ -382,6 +409,8 @@ pub(crate) async fn run_workflow(
     WorkflowRunResult {
         status: WfStatus::Succeeded,
         cost_usd: accrued,
+        baseline_cost_usd: accrued_baseline,
+        saved_usd: (accrued_baseline - accrued).max(0.0),
         node_outputs: collected_outputs,
         error: None,
     }
@@ -873,6 +902,7 @@ mod tests {
                 NodeOutput {
                     content: json!("response_1"),
                     cost_usd: 0.10,
+                    baseline_cost_usd: 0.0,
                     model_used: Some("haiku".into()),
                 },
             ),
@@ -881,6 +911,7 @@ mod tests {
                 NodeOutput {
                     content: json!("response_2"),
                     cost_usd: 0.15,
+                    baseline_cost_usd: 0.0,
                     model_used: Some("haiku".into()),
                 },
             ),
@@ -919,6 +950,7 @@ mod tests {
                 NodeOutput {
                     content: json!("r1"),
                     cost_usd: 0.25,
+                    baseline_cost_usd: 0.0,
                     model_used: None,
                 },
             ),
@@ -927,6 +959,7 @@ mod tests {
                 NodeOutput {
                     content: json!("r2"),
                     cost_usd: 0.25,
+                    baseline_cost_usd: 0.0,
                     model_used: None,
                 },
             ),
@@ -965,6 +998,7 @@ mod tests {
                 NodeOutput {
                     content: json!("yes_out"),
                     cost_usd: 0.05,
+                    baseline_cost_usd: 0.0,
                     model_used: None,
                 },
             ),
@@ -973,6 +1007,7 @@ mod tests {
                 NodeOutput {
                     content: json!("no_out"),
                     cost_usd: 0.05,
+                    baseline_cost_usd: 0.0,
                     model_used: None,
                 },
             ),
@@ -1007,6 +1042,7 @@ mod tests {
             NodeOutput {
                 content: json!("model_out"),
                 cost_usd: 0.10,
+                baseline_cost_usd: 0.0,
                 model_used: None,
             },
         )]);
@@ -1037,8 +1073,7 @@ mod tests {
             "t".into(),
             NodeOutput {
                 content: json!("world"),
-                cost_usd: 0.0,
-                model_used: None,
+                ..Default::default()
             },
         );
         assert_eq!(substitute("hello {{input}}", "t", &outputs), "hello world");
@@ -1051,8 +1086,7 @@ mod tests {
             "n1".into(),
             NodeOutput {
                 content: json!({"answer": "42"}),
-                cost_usd: 0.0,
-                model_used: None,
+                ..Default::default()
             },
         );
         assert_eq!(substitute("{{n1.answer}}", "t", &outputs), "42");
@@ -1071,8 +1105,7 @@ mod tests {
             "t".into(),
             NodeOutput {
                 content: json!("yes"),
-                cost_usd: 0.0,
-                model_used: None,
+                ..Default::default()
             },
         );
         assert!(eval_cond(r#"{{input}} == "yes""#, "t", &outputs));
@@ -1085,8 +1118,7 @@ mod tests {
             "t".into(),
             NodeOutput {
                 content: json!("no"),
-                cost_usd: 0.0,
-                model_used: None,
+                ..Default::default()
             },
         );
         assert!(!eval_cond(r#"{{input}} == "yes""#, "t", &outputs));
@@ -1099,8 +1131,7 @@ mod tests {
             "t".into(),
             NodeOutput {
                 content: json!("something"),
-                cost_usd: 0.0,
-                model_used: None,
+                ..Default::default()
             },
         );
         assert!(eval_cond("{{input}}", "t", &outputs));
@@ -1113,10 +1144,92 @@ mod tests {
             "t".into(),
             NodeOutput {
                 content: json!(""),
-                cost_usd: 0.0,
-                model_used: None,
+                ..Default::default()
             },
         );
         assert!(!eval_cond("{{input}}", "t", &outputs));
+    }
+
+    // ---- Task 4: engine sums baseline + computes saved ----------------------
+
+    /// sequential run with non-zero baseline: assert baseline_cost_usd sums
+    /// both nodes' baselines, and saved_usd = (baseline - cost).max(0.0).
+    #[tokio::test]
+    async fn test_sequential_run_baseline_and_saved() {
+        let def = make_sequential_def();
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("r1"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.20,
+                    model_used: None,
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("r2"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.15,
+                    model_used: None,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}).await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        // cost: 0.10 + 0.05 = 0.15
+        assert!(
+            (result.cost_usd - 0.15).abs() < 1e-9,
+            "cost_usd expected 0.15, got {}",
+            result.cost_usd
+        );
+        // baseline: 0.20 + 0.15 = 0.35
+        assert!(
+            (result.baseline_cost_usd - 0.35).abs() < 1e-9,
+            "baseline_cost_usd expected 0.35, got {}",
+            result.baseline_cost_usd
+        );
+        // saved: (0.35 - 0.15).max(0.0) = 0.20
+        assert!(
+            (result.saved_usd - 0.20).abs() < 1e-9,
+            "saved_usd expected 0.20, got {}",
+            result.saved_usd
+        );
+    }
+
+    /// When cost >= baseline, saved_usd must be 0.0 (no negative savings).
+    #[tokio::test]
+    async fn test_saved_usd_never_negative() {
+        let def = make_sequential_def();
+        // cost > baseline (pathological but must not produce negative saved)
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("r1"),
+                    cost_usd: 0.30,
+                    baseline_cost_usd: 0.10,
+                    model_used: None,
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("r2"),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(&stub, &def, &json!("x"), None, |_| {}).await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        assert_eq!(result.saved_usd, 0.0, "saved_usd must not go negative");
     }
 }
