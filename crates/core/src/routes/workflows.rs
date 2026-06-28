@@ -19,17 +19,18 @@
 //! `Vec` inside the sync closure, then loop + `await` each one **after**
 //! `run_workflow` returns. Best-effort: a DB error never fails the run response.
 //!
-//! # 60-second gateway timeout
-//!
-//! `create_run` is mounted on the `short` router group (60 s ceiling). W1a
-//! workflow definitions must complete within that budget. W1c will move
-//! long-running workflows to an async/queued path.
+//! # Timeouts: non-streaming runs use the 60 s `short` group; `stream=true` uses 600 s `streaming`.
 
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Extension, Json,
 };
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tt_auth::ApiKeyContext;
 use uuid::Uuid;
@@ -40,6 +41,7 @@ use crate::{
         self,
         engine::{self, WfStatus},
         estimate,
+        events::WfEvent,
         executor::GatewayNodeExecutor,
         store::{self, WorkflowRunRecord},
         types::content_hash,
@@ -148,6 +150,10 @@ pub struct CreateRunRequest {
     /// `def.budget.max_cost_usd` when that is set.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
+    /// When `true`, return a `text/event-stream` of [`WfEvent`]s instead of a
+    /// single JSON response. Back-compat default is `false`.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// Response from `POST /v1/workflows/:id/runs`.
@@ -325,35 +331,69 @@ pub async fn estimate(
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/workflows/:id/runs — synchronous workflow execution
+// POST /v1/workflows/:id/runs — synchronous + streaming execution
 // ---------------------------------------------------------------------------
 
-/// `POST /v1/workflows/:id/runs` — execute the workflow synchronously.
+/// Persist node-run journal entries + finalize the run record (best-effort).
+/// Returns the status string (`"completed"` / `"failed"` / `"budget_exhausted"`).
+/// Called from both the sync and streaming `create_run` paths.
+async fn persist_run_results(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    org: Uuid,
+    journal: Vec<engine::NodeJournalEntry>,
+    result: &engine::WorkflowRunResult,
+) -> &'static str {
+    for entry in journal {
+        store::insert_node_run(
+            pool,
+            run_id,
+            &entry.node_id,
+            &entry.status,
+            entry.output,
+            entry.cost_usd,
+            entry.model_used.as_deref(),
+            entry.error.as_deref(),
+        )
+        .await;
+    }
+    let status = match result.status {
+        WfStatus::Succeeded => "completed",
+        WfStatus::Failed => "failed",
+        WfStatus::BudgetExhausted => "budget_exhausted",
+    };
+    store::finish_run(
+        pool,
+        run_id,
+        org,
+        status,
+        result.cost_usd,
+        result.baseline_cost_usd,
+        result.saved_usd,
+        result.error.as_deref(),
+    )
+    .await;
+    status
+}
+
+/// `POST /v1/workflows/:id/runs` — execute the workflow.
 ///
-/// # Identity extraction
+/// When `stream=false` (default), returns a single JSON response after the
+/// run completes. When `stream=true`, returns a `text/event-stream` of
+/// [`WfEvent`]s. Both paths persist node-runs + finalize the run record
+/// with full baseline/saved savings (W2a) — the streaming path does so
+/// inside the spawned task.
 ///
-/// The caller's `api_key_id`, `caller_tier`, `l2_allowed`, and `raw_bearer`
+/// Identity fields (`api_key_id`, `caller_tier`, `l2_allowed`, `raw_bearer`)
 /// are derived from the `ApiKeyContext` extension and the `Authorization`
 /// header, mirroring `agent_run::RunIdentity::from_request`.
-///
-/// # Journal → node runs
-///
-/// `run_workflow` takes a synchronous journal callback so no async-in-closure
-/// complexity is needed.  Node-run journal entries are collected into a `Vec`
-/// during the run, then persisted in a sequential `await` loop afterwards.
-/// Persistence is best-effort: a DB error never fails the HTTP response.
-///
-/// # Timeout
-///
-/// Mounted on the `short` group (60 s gateway ceiling).  W1a definitions must
-/// complete within that budget.
 pub async fn create_run(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(body): Json<CreateRunRequest>,
-) -> ApiResult<Json<CreateRunResponse>> {
+) -> ApiResult<Response> {
     // --- Auth: extract org + all identity fields in one match arm -----------
     // We cannot call `require_org(ctx)` (which consumes ctx) and then re-use
     // ctx for api_key_id / caller_tier.  Extract everything at once instead,
@@ -396,6 +436,7 @@ pub async fn create_run(
     // --- Insert initial run record (status = "running") ----------------------
     let run_id = Uuid::new_v4();
     let run_max_cost = def.budget.max_cost_usd.or(body.max_cost_usd);
+    let inputs = body.inputs; // extract for ownership — moved/borrowed per branch below
     store::insert_run(
         pool,
         &WorkflowRunRecord {
@@ -404,7 +445,7 @@ pub async fn create_run(
             version,
             org_id: org,
             status: "running".to_string(),
-            inputs: Some(body.inputs.clone()),
+            inputs: Some(inputs.clone()),
             cost_usd: 0.0,
             max_cost_usd: run_max_cost,
             baseline_cost_usd: 0.0,
@@ -416,78 +457,90 @@ pub async fn create_run(
     )
     .await;
 
-    // --- Execute -------------------------------------------------------------
-    let executor = GatewayNodeExecutor {
-        state: &state,
-        org_id: org,
-        api_key_id,
-        caller_tier,
-        l2_allowed,
-        raw_bearer,
-        run_id,
-    };
-
-    // Collect journal entries synchronously (no async-in-closure needed).
-    let mut journal_entries: Vec<engine::NodeJournalEntry> = Vec::new();
-    let result = engine::run_workflow(
-        &executor,
-        &def,
-        &body.inputs,
-        run_max_cost,
-        |entry| journal_entries.push(entry),
-        None, // Task 3 wires Some(tx) for SSE streaming
-    )
-    .await;
-
-    // --- Persist node runs (best-effort, after run returns) ------------------
-    for entry in journal_entries {
-        store::insert_node_run(
-            pool,
+    if !body.stream {
+        // --- Synchronous path ------------------------------------------------
+        let executor = GatewayNodeExecutor {
+            state: &state,
+            org_id: org,
+            api_key_id,
+            caller_tier,
+            l2_allowed,
+            raw_bearer,
             run_id,
-            &entry.node_id,
-            &entry.status,
-            entry.output,
-            entry.cost_usd,
-            entry.model_used.as_deref(),
-            entry.error.as_deref(),
+        };
+        let mut journal_entries: Vec<engine::NodeJournalEntry> = Vec::new();
+        let result = engine::run_workflow(
+            &executor,
+            &def,
+            &inputs,
+            run_max_cost,
+            |entry| journal_entries.push(entry),
+            None,
         )
         .await;
+        let status_str = persist_run_results(pool, run_id, org, journal_entries, &result).await;
+        Ok(Json(CreateRunResponse {
+            run_id,
+            status: status_str.to_string(),
+            cost_usd: result.cost_usd,
+            baseline_cost_usd: result.baseline_cost_usd,
+            saved_usd: result.saved_usd,
+            node_outputs: result
+                .node_outputs
+                .into_iter()
+                .map(|(node_id, out)| NodeOutputView {
+                    node_id,
+                    content: out.content,
+                    cost_usd: out.cost_usd,
+                })
+                .collect(),
+        })
+        .into_response())
+    } else {
+        // --- Streaming path: spawn the engine + return SSE -------------------
+        // `owned_state` is cloned (cheap Arc bump) so the spawned 'static task
+        // can own it; the executor borrows &owned_state from within the block.
+        let owned_state = state.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
+        tokio::spawn(async move {
+            let executor = GatewayNodeExecutor {
+                state: &owned_state,
+                org_id: org,
+                api_key_id,
+                caller_tier,
+                l2_allowed,
+                raw_bearer,
+                run_id,
+            };
+            let mut journal_entries: Vec<engine::NodeJournalEntry> = Vec::new();
+            let result = engine::run_workflow(
+                &executor,
+                &def,
+                &inputs,
+                run_max_cost,
+                |entry| journal_entries.push(entry),
+                Some(&tx),
+            )
+            .await;
+            // Persist node runs + finalize (best-effort, mirrors sync path).
+            // run_workflow already emitted WfEvent::RunDone; no double-send needed.
+            if let Some(pool) = owned_state.db_pool.as_ref() {
+                persist_run_results(pool, run_id, org, journal_entries, &result).await;
+            }
+            // tx drops here → unfold stream sees None → stream ends → [DONE]
+        });
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|ev| (Ok::<_, std::convert::Infallible>(ev.to_sse()), rx))
+        })
+        .chain(futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
+        }));
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
     }
-
-    // --- Finalize run --------------------------------------------------------
-    let status_str = match result.status {
-        WfStatus::Succeeded => "completed",
-        WfStatus::Failed => "failed",
-        WfStatus::BudgetExhausted => "budget_exhausted",
-    };
-    store::finish_run(
-        pool,
-        run_id,
-        org,
-        status_str,
-        result.cost_usd,
-        result.baseline_cost_usd,
-        result.saved_usd,
-        result.error.as_deref(),
-    )
-    .await;
-
-    Ok(Json(CreateRunResponse {
-        run_id,
-        status: status_str.to_string(),
-        cost_usd: result.cost_usd,
-        baseline_cost_usd: result.baseline_cost_usd,
-        saved_usd: result.saved_usd,
-        node_outputs: result
-            .node_outputs
-            .into_iter()
-            .map(|(node_id, out)| NodeOutputView {
-                node_id,
-                content: out.content,
-                cost_usd: out.cost_usd,
-            })
-            .collect(),
-    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +782,7 @@ mod tests {
         let body = CreateRunRequest {
             inputs: serde_json::Value::Null,
             max_cost_usd: None,
+            stream: false,
         };
         let result = create_run(
             State(test_state()),
