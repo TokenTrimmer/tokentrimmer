@@ -1891,9 +1891,11 @@ pub(crate) async fn complete_once(
             diff_failed,
             diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
             retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
-            // run_id/node_id stamped in Task 4 (agentic loop context).
-            run_id: None,
-            node_id: None,
+            // Agent-run grain (W0b Task 4): inherit from ctx so every row
+            // produced under an agent run carries the run's id. `None` for
+            // standalone (non-agent) requests.
+            run_id: ctx.run_id,
+            node_id: ctx.node_id,
         },
     );
 
@@ -9320,6 +9322,50 @@ mod telemetry_drain_tests {
             inner.rows().len(),
             1,
             "transient-then-success must persist exactly one row (no double-insert)"
+        );
+    }
+
+    /// W0b Task 4: when `complete_once` copies `ctx.run_id` into the
+    /// `RequestLogRow`, the writer spy must capture that run id. This test
+    /// validates the writer-spy plumbing for the run_id field; it mirrors the
+    /// pattern used in `complete_once` after the Task 4 change
+    /// (`run_id: ctx.run_id` instead of `run_id: None`).
+    ///
+    /// Note: `complete_once` itself cannot be called without a real provider,
+    /// so this test validates the mapping pattern (ctx.run_id → row.run_id →
+    /// writer) using the existing InMemoryRequestLogWriter harness.
+    #[tokio::test]
+    async fn request_log_row_run_id_propagates_through_writer_spy() {
+        let run_id = Uuid::new_v4();
+        let writer = Arc::new(InMemoryRequestLogWriter::new());
+        let tracker = TaskTracker::new();
+        let writer_arc: Arc<dyn tt_telemetry::request_logs::RequestLogWriter> = writer.clone();
+
+        // Simulate `complete_once`'s RequestLogRow construction after Task 4:
+        //   run_id: ctx.run_id,   ← was `None` before the change
+        //   node_id: ctx.node_id, ← was `None` and remains `None`
+        let ctx_run_id: Option<Uuid> = Some(run_id);
+        let ctx_node_id: Option<Uuid> = None;
+        let mut row = sample_row();
+        row.run_id = ctx_run_id;
+        row.node_id = ctx_node_id;
+
+        spawn_request_log(Some(&tracker), Some(&writer_arc), row);
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
+            .await
+            .expect("drain must complete");
+
+        let rows = writer.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].run_id,
+            Some(run_id),
+            "run_id from ctx must be stamped on the request_log row"
+        );
+        assert_eq!(
+            rows[0].node_id, None,
+            "node_id remains None (no workflow nodes yet)"
         );
     }
 }

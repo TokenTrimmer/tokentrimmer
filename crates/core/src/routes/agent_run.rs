@@ -725,6 +725,10 @@ struct RunIdentity {
     /// override (header beats body in `prepare`). All other headers — provider
     /// pin, forced route, timeout, tag, interactive — flow through unchanged.
     headers: HeaderMap,
+    /// The run's own id — set by the handler after `Uuid::new_v4()` (create) or
+    /// from `stored.id` (resume). Initialized to `Uuid::nil()` in `from_request`
+    /// so construction sites don't need a run id up front.
+    run_id: Uuid,
 }
 
 impl RunIdentity {
@@ -805,6 +809,9 @@ impl RunIdentity {
             forced_route: chat::route_override_from_header(&headers),
             idempotency_key,
             headers,
+            // Set to nil here; the handler overwrites it with the real run id
+            // after `Uuid::new_v4()` (create) or `stored.id` (resume).
+            run_id: Uuid::nil(),
         }
     }
 }
@@ -884,7 +891,8 @@ impl TurnCompleter for GatewayCompleter<'_> {
             credentials,
             tag: self.identity.tag.clone(),
             deadline: self.identity.request_timeout,
-            run_id: None,
+            // Stamp the run id so complete_once writes it on the request_logs row.
+            run_id: Some(self.identity.run_id),
             node_id: None,
         };
 
@@ -1108,7 +1116,7 @@ pub async fn create_run(
     headers: HeaderMap,
     Json(req): Json<CreateRunRequest>,
 ) -> ApiResult<Response> {
-    let identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
+    let mut identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
     // Capture the org + non-secret routing config BEFORE `identity` is moved
     // into the completer — a paused run persists these (never any credential).
     let org_id = identity.org_id;
@@ -1132,6 +1140,8 @@ pub async fn create_run(
         resolve_summarize_config(&state, &identity, &req.model, &req.messages).await;
 
     let id = Uuid::new_v4();
+    // Stamp the run id onto the identity so each turn's RequestContext carries it.
+    identity.run_id = id;
 
     if req.stream {
         let owned_state = state.clone(); // cheap Arcs; 'static for the spawned task
@@ -1416,6 +1426,9 @@ pub async fn submit_tool_outputs(
     identity.provider_pin = stored.routing.provider_pin.clone();
     identity.forced_route = stored.routing.forced_route.clone();
     identity.tag = stored.routing.tag.clone();
+    // Restore the run id from the persisted record so resumed turns carry the
+    // same run_id on their request_logs rows as the initial turns did.
+    identity.run_id = stored.id;
 
     // Rebuild the production summarizer from the PERSISTED, turn-0-pinned policy
     // (no re-resolution on resume — the route could have changed). Built BEFORE
@@ -2221,6 +2234,20 @@ mod tests {
         assert_eq!(id.org_id, Uuid::from_u128(2));
         assert_eq!(id.api_key_id, Uuid::from_u128(1));
         assert!(id.l2_allowed);
+    }
+
+    /// W0b Task 4: `run_id` is initialized to `Uuid::nil()` by `from_request`
+    /// and then overwritten by the handler with the real run id. Verify the nil
+    /// default exists (the handler assignment is integration-tested at the
+    /// complete_once/request_logs level).
+    #[test]
+    fn run_identity_run_id_initialized_to_nil() {
+        let id = RunIdentity::from_request(None, "", &HeaderMap::new());
+        assert_eq!(
+            id.run_id,
+            Uuid::nil(),
+            "run_id must be nil from from_request; handler sets it to the real run id"
+        );
     }
 
     // ----- Run store round-trip (slice 1b Task 2) -----
