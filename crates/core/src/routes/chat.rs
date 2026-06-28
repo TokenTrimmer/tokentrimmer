@@ -1022,6 +1022,17 @@ pub(crate) enum CompletionOutcome {
     CacheHit(Response),
 }
 
+/// Stamp run/node attribution from the request context onto a log row.
+///
+/// Called from [`complete_once`] after the [`RequestLogRow`] is constructed so
+/// the attribution is applied in one place that is independently unit-testable.
+/// If the call is ever accidentally removed the `attribute_run_copies_run_and_node_id`
+/// test in `telemetry_drain_tests` catches it.
+pub(crate) fn attribute_run(row: &mut RequestLogRow, ctx: &tt_shared::RequestContext) {
+    row.run_id = ctx.run_id;
+    row.node_id = ctx.node_id;
+}
+
 /// Run one routed, metered, cached **non-streaming** completion: the L1/L2
 /// (and negative-cache) lookups, single-flight coalescing, provider dispatch
 /// (single + `dispatch_with_failover`), response-side output shaping, cost
@@ -1830,73 +1841,79 @@ pub(crate) async fn complete_once(
         .as_ref()
         .filter(|s| s.succeeded)
         .map(|s| s.cost_usd);
+    let mut log_row = RequestLogRow {
+        id: Uuid::now_v7(),
+        org_id: ctx.org_id,
+        api_key_id: ctx.api_key_id,
+        ts: Utc::now(),
+        provider: provider_id.clone(),
+        model: model_used.clone(),
+        input_tokens: response.usage.prompt_tokens as i32,
+        output_tokens: response.usage.completion_tokens as i32,
+        cached_tokens: response.usage.cached_tokens as i32,
+        cost_usd,
+        baseline_cost_usd,
+        provider_cache_saved_usd,
+        // Fee-applied, matching the header/span figure — keeps the
+        // row-derived TT headline equal to `tt_saved_usd()`.
+        cache_bust_penalty_usd: cost_breakdown.cache_bust_penalty_usd,
+        cached: false,
+        cache_layer: None,
+        route_id: matched_route_id,
+        latency_ms: request_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
+        upstream_latency_ms: None,
+        status: 200,
+        tag: ctx.tag.clone(),
+        error_class: None,
+        trace_id: Some(trace_id.to_string()),
+        truncated: false,
+        shadow_model: shadow_model_logged.clone(),
+        shadow_cost_usd: shadow_cost_logged,
+        traffic_split_arm: traffic_split_arm_owned.clone(),
+        // Raw provider prompt-cache counts (research Phase 0.2):
+        // None (NULL) when the provider didn't report the field,
+        // Some(0) when it explicitly reported zero. The shadow
+        // dispatch is discarded — only the SERVED response's cache
+        // telemetry is recorded (shadow cost has its own columns).
+        cache_read_input_tokens: opt_tokens_i32(response.usage.cache_read_input_tokens),
+        cache_creation_input_tokens: opt_tokens_i32(response.usage.cache_creation_input_tokens),
+        // Advisory batch-eligibility marker (research Phase 2.1).
+        // `batch_eligible` records route INTENT (the marker survived
+        // the hard-ineligibility gate); `batch_forgone_usd` is the
+        // PRICED claim — 0.0 when failover served a model with no
+        // catalog batch tier, while `batch_eligible` stays true so the
+        // route's intent remains auditable.
+        batch_eligible: batch_marked,
+        batch_forgone_usd: cost_breakdown.batch_forgone_usd,
+        route_paused,
+        // ESTIMATED minify saving — own column (migration 0020),
+        // never folded into cost/baseline/saved.
+        minify_saved_est_usd: cost_breakdown.minify_saved_est_usd,
+        // Output shaping (research Phase 3.3 + 3.4). `format_switched`
+        // is set ONLY on a VALIDATED switch; the est/saved/failed-cost
+        // figures come from the same breakdown the headers carry.
+        format_switched: format_switch_outcome.map(str::to_string),
+        format_switch_saved_est_usd: cost_breakdown.format_switch_saved_est_usd,
+        diff_applied,
+        diff_saved_usd: cost_breakdown.diff_saved_usd,
+        diff_failed,
+        diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
+        retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
+        // Agent-run grain (W0b Task 4): stamped via `attribute_run` below
+        // so the ctx→row mapping is independently unit-testable.
+        run_id: None,
+        node_id: None,
+    };
+    // Agent-run grain (W0b Task 4): inherit run_id/node_id from ctx so every
+    // row produced under an agent run carries the run's id.  `None` for
+    // standalone (non-agent) requests.  Extracted into `attribute_run` so the
+    // mapping can be verified by the `attribute_run_copies_run_and_node_id`
+    // unit test without needing a live provider.
+    attribute_run(&mut log_row, ctx);
     spawn_request_log(
         state.telemetry_tracker.as_ref(),
         state.request_log_writer.as_ref(),
-        RequestLogRow {
-            id: Uuid::now_v7(),
-            org_id: ctx.org_id,
-            api_key_id: ctx.api_key_id,
-            ts: Utc::now(),
-            provider: provider_id.clone(),
-            model: model_used.clone(),
-            input_tokens: response.usage.prompt_tokens as i32,
-            output_tokens: response.usage.completion_tokens as i32,
-            cached_tokens: response.usage.cached_tokens as i32,
-            cost_usd,
-            baseline_cost_usd,
-            provider_cache_saved_usd,
-            // Fee-applied, matching the header/span figure — keeps the
-            // row-derived TT headline equal to `tt_saved_usd()`.
-            cache_bust_penalty_usd: cost_breakdown.cache_bust_penalty_usd,
-            cached: false,
-            cache_layer: None,
-            route_id: matched_route_id,
-            latency_ms: request_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
-            upstream_latency_ms: None,
-            status: 200,
-            tag: ctx.tag.clone(),
-            error_class: None,
-            trace_id: Some(trace_id.to_string()),
-            truncated: false,
-            shadow_model: shadow_model_logged.clone(),
-            shadow_cost_usd: shadow_cost_logged,
-            traffic_split_arm: traffic_split_arm_owned.clone(),
-            // Raw provider prompt-cache counts (research Phase 0.2):
-            // None (NULL) when the provider didn't report the field,
-            // Some(0) when it explicitly reported zero. The shadow
-            // dispatch is discarded — only the SERVED response's cache
-            // telemetry is recorded (shadow cost has its own columns).
-            cache_read_input_tokens: opt_tokens_i32(response.usage.cache_read_input_tokens),
-            cache_creation_input_tokens: opt_tokens_i32(response.usage.cache_creation_input_tokens),
-            // Advisory batch-eligibility marker (research Phase 2.1).
-            // `batch_eligible` records route INTENT (the marker survived
-            // the hard-ineligibility gate); `batch_forgone_usd` is the
-            // PRICED claim — 0.0 when failover served a model with no
-            // catalog batch tier, while `batch_eligible` stays true so the
-            // route's intent remains auditable.
-            batch_eligible: batch_marked,
-            batch_forgone_usd: cost_breakdown.batch_forgone_usd,
-            route_paused,
-            // ESTIMATED minify saving — own column (migration 0020),
-            // never folded into cost/baseline/saved.
-            minify_saved_est_usd: cost_breakdown.minify_saved_est_usd,
-            // Output shaping (research Phase 3.3 + 3.4). `format_switched`
-            // is set ONLY on a VALIDATED switch; the est/saved/failed-cost
-            // figures come from the same breakdown the headers carry.
-            format_switched: format_switch_outcome.map(str::to_string),
-            format_switch_saved_est_usd: cost_breakdown.format_switch_saved_est_usd,
-            diff_applied,
-            diff_saved_usd: cost_breakdown.diff_saved_usd,
-            diff_failed,
-            diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
-            retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
-            // Agent-run grain (W0b Task 4): inherit from ctx so every row
-            // produced under an agent run carries the run's id. `None` for
-            // standalone (non-agent) requests.
-            run_id: ctx.run_id,
-            node_id: ctx.node_id,
-        },
+        log_row,
     );
 
     // Whether this trace's body was actually handed to the capture sink for
@@ -9366,6 +9383,67 @@ mod telemetry_drain_tests {
         assert_eq!(
             rows[0].node_id, None,
             "node_id remains None (no workflow nodes yet)"
+        );
+    }
+
+    /// W0b Task 4 (review fix): `attribute_run` is the pure helper called by
+    /// `complete_once` to copy `ctx.run_id`/`ctx.node_id` onto the log row.
+    /// This test directly exercises the helper — if the body of `attribute_run`
+    /// is ever reverted to a no-op (or the call in `complete_once` is removed),
+    /// this test FAILS because the row fields stay `None`.
+    ///
+    /// Scenario A: both ids present → both copied.
+    /// Scenario B: both ids absent → both remain None.
+    #[test]
+    fn attribute_run_copies_run_and_node_id() {
+        use tt_shared::{
+            context::{ProviderCredentials, SecretString},
+            RequestContext,
+        };
+
+        fn make_ctx(run_id: Option<Uuid>, node_id: Option<Uuid>) -> RequestContext {
+            RequestContext {
+                trace_id: Uuid::nil(),
+                org_id: Uuid::nil(),
+                api_key_id: Uuid::nil(),
+                credentials: ProviderCredentials {
+                    api_key: SecretString::new("test"),
+                    base_url: None,
+                    extra_headers: vec![],
+                },
+                tag: None,
+                deadline: None,
+                run_id,
+                node_id,
+            }
+        }
+
+        // Scenario A: both fields present → attribute_run must copy them.
+        let run = Uuid::new_v4();
+        let node = Uuid::new_v4();
+        let mut row = sample_row();
+        attribute_run(&mut row, &make_ctx(Some(run), Some(node)));
+        assert_eq!(
+            row.run_id,
+            Some(run),
+            "attribute_run must copy ctx.run_id onto the row"
+        );
+        assert_eq!(
+            row.node_id,
+            Some(node),
+            "attribute_run must copy ctx.node_id onto the row"
+        );
+
+        // Scenario B: both fields absent → row stays None.
+        let mut row2 = sample_row();
+        attribute_run(&mut row2, &make_ctx(None, None));
+        assert_eq!(
+            row2.run_id, None,
+            "attribute_run must leave run_id None when ctx has None"
+        );
+        assert_eq!(
+            row2.node_id, None,
+            "attribute_run must leave node_id None when ctx has None"
         );
     }
 }
