@@ -109,7 +109,10 @@ mod tests {
             name: None,
         }];
         let est = estimate_next_turn_cost("gpt-4o-mini", &msgs);
-        assert!(est.is_some(), "gpt-4o-mini should resolve in the bundled catalog");
+        assert!(
+            est.is_some(),
+            "gpt-4o-mini should resolve in the bundled catalog"
+        );
         assert!(est.unwrap() > 0.0);
     }
 }

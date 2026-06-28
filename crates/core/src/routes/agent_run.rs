@@ -2654,15 +2654,31 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
         let out = run_loop_core(
-            &stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, Some(1.0), 0, 0,
-            RunUsage::default(), None, Some(&tx),
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            Some(1.0),
+            0,
+            0,
+            RunUsage::default(),
+            None,
+            Some(&tx),
         )
         .await;
         assert!(matches!(out, LoopOutcome::Terminal(_)));
         drop(tx);
         let mut costs = vec![];
         while let Some(ev) = rx.recv().await {
-            if let RunEvent::TurnCost { turn, turn_cost_usd, run_cost_usd, budget_remaining_usd } = ev {
+            if let RunEvent::TurnCost {
+                turn,
+                turn_cost_usd,
+                run_cost_usd,
+                budget_remaining_usd,
+            } = ev
+            {
                 costs.push((turn, turn_cost_usd, run_cost_usd, budget_remaining_usd));
             }
         }
@@ -2881,8 +2897,18 @@ mod tests {
         max_cost_usd: Option<f64>,
     ) -> Run {
         match run_loop_core(
-            completer, id, model, messages, tools, max_turns, max_cost_usd, 0, 0,
-            RunUsage::default(), None, None,
+            completer,
+            id,
+            model,
+            messages,
+            tools,
+            max_turns,
+            max_cost_usd,
+            0,
+            0,
+            RunUsage::default(),
+            None,
+            None,
         )
         .await
         {
@@ -2904,9 +2930,21 @@ mod tests {
             ]),
             cost_per_turn: 0.25,
         };
-        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, Some(0.40)).await;
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            Some(0.40),
+        )
+        .await;
         assert_eq!(run.status, RunStatus::Incomplete);
-        assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted));
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted)
+        );
         assert_eq!(run.turns, 2);
         assert_eq!(run.usage.cost_usd, 0.50);
     }
@@ -2919,7 +2957,10 @@ mod tests {
             script: std::sync::Mutex::new(vec![assistant_final()]),
             cost_per_turn: 0.25,
         };
-        let carried = RunUsage { cost_usd: 0.45, ..Default::default() };
+        let carried = RunUsage {
+            cost_usd: 0.45,
+            ..Default::default()
+        };
         let out = run_loop_core(
             &stub,
             uuid::Uuid::nil(),
@@ -2938,7 +2979,10 @@ mod tests {
         match out {
             LoopOutcome::Terminal(run) => {
                 assert_eq!(run.status, RunStatus::Incomplete);
-                assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted));
+                assert_eq!(
+                    run.stop_reason,
+                    Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted)
+                );
                 assert_eq!(run.turns, 2); // unchanged — no new turn ran
                 assert_eq!(run.usage.cost_usd, 0.45); // unchanged
             }
@@ -2959,9 +3003,21 @@ mod tests {
             content: MessageContent::Text("estimate me".into()),
             name: None,
         }];
-        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "gpt-4o-mini".into(), msgs, vec![], 8, Some(0.0001)).await;
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "gpt-4o-mini".into(),
+            msgs,
+            vec![],
+            8,
+            Some(0.0001),
+        )
+        .await;
         assert_eq!(run.status, RunStatus::Incomplete);
-        assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted));
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted)
+        );
         assert_eq!(run.turns, 0);
         assert_eq!(run.usage.cost_usd, 0.0);
     }
@@ -2975,7 +3031,16 @@ mod tests {
             ]),
             cost_per_turn: 0.25,
         };
-        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, None).await;
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            None,
+        )
+        .await;
         assert_eq!(run.status, RunStatus::Completed);
         assert_eq!(run.stop_reason, None);
         assert_eq!(run.turns, 2);
@@ -2991,9 +3056,21 @@ mod tests {
             ]),
             cost_per_turn: 0.0,
         };
-        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 2, None).await;
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            2,
+            None,
+        )
+        .await;
         assert_eq!(run.status, RunStatus::Incomplete);
-        assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::MaxTurns));
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::MaxTurns)
+        );
         assert_eq!(run.turns, 2);
     }
 
@@ -3016,7 +3093,16 @@ mod tests {
             ]),
             cost_per_turn: 0.25,
         };
-        let run = run_loop_capped(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8, None).await;
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            None,
+        )
+        .await;
         assert_eq!(run.usage.per_turn_cost_usd, vec![0.25, 0.25]);
         assert_eq!(run.usage.cost_usd, 0.50);
     }
