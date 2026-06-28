@@ -70,6 +70,12 @@ pub struct RunUsage {
     /// `summarizer_tax_usd` (the 2c-2 measurement tax).
     #[serde(default)]
     pub cost_usd: f64,
+    /// Accumulated BASELINE cost (USD) across the run's turns — what each turn
+    /// would have cost unoptimized (originally-requested model, full input price,
+    /// no cache discount). Sourced from `CostBreakdown.baseline_cost_usd` per turn.
+    /// `#[serde(default)]` for back-compat with stored runs written before W2a Task 2.
+    #[serde(default)]
+    pub baseline_cost_usd: f64,
     /// Served cost (USD) of each completed turn, in order. Lets a caller see
     /// where the spend went without per-turn headers (the run is body-returned).
     #[serde(default)]
@@ -421,6 +427,7 @@ pub(crate) async fn run_loop_core(
         usage.prompt_tokens += turn_usage.prompt_tokens;
         usage.completion_tokens += turn_usage.completion_tokens;
         usage.cost_usd += turn_usage.cost_usd; // served cost across turns (and resume, via the carried usage)
+        usage.baseline_cost_usd += turn_usage.baseline_cost_usd; // baseline (unoptimized) cost across turns (W2a)
         usage.per_turn_cost_usd.push(turn_usage.cost_usd);
         emit(RunEvent::TurnCost {
             turn: turn + 1,
@@ -1047,6 +1054,7 @@ impl TurnCompleter for GatewayCompleter<'_> {
                     prompt_tokens: response.usage.prompt_tokens,
                     completion_tokens: response.usage.completion_tokens,
                     cost_usd: headers.cost_breakdown.cost_usd, // served cost (x-tokentrimmer-cost-usd)
+                    baseline_cost_usd: headers.cost_breakdown.baseline_cost_usd, // unoptimized baseline (W2a)
                     ..Default::default()
                 };
                 let msg = response
@@ -3035,6 +3043,7 @@ mod tests {
                 assistant_final(),
             ]),
             cost_per_turn: 0.25,
+            baseline_per_turn: 0.0,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
         let out = run_loop_core(
@@ -3191,11 +3200,13 @@ mod tests {
         assert_eq!(ru.cost_usd, 0.0);
     }
 
-    /// A completer that returns a fixed per-turn served cost (+ a scripted message),
-    /// so a test can assert the loop accumulates `usage.cost_usd` across turns.
+    /// A completer that returns a fixed per-turn served cost and baseline cost (+
+    /// a scripted message), so a test can assert the loop accumulates
+    /// `usage.cost_usd` and `usage.baseline_cost_usd` across turns.
     struct CostStub {
         script: std::sync::Mutex<Vec<Message>>,
         cost_per_turn: f64,
+        baseline_per_turn: f64,
     }
     #[async_trait]
     impl TurnCompleter for CostStub {
@@ -3210,6 +3221,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     cost_usd: self.cost_per_turn,
+                    baseline_cost_usd: self.baseline_per_turn,
                     ..Default::default()
                 },
             ))
@@ -3224,6 +3236,7 @@ mod tests {
                 assistant_final(),
             ]),
             cost_per_turn: 0.25,
+            baseline_per_turn: 0.0,
         };
         let run = run_loop(&stub, uuid::Uuid::nil(), "m".into(), vec![], vec![], 8).await;
         assert_eq!(run.status, RunStatus::Completed);
@@ -3239,6 +3252,7 @@ mod tests {
                 assistant_final(),
             ]),
             cost_per_turn: 0.5,
+            baseline_per_turn: 0.0,
         };
         let out = run_loop_core(
             &stub,
@@ -3313,6 +3327,7 @@ mod tests {
                 assistant_final(),
             ]),
             cost_per_turn: 0.25,
+            baseline_per_turn: 0.0,
         };
         let run = run_loop_capped(
             &stub,
@@ -3340,6 +3355,7 @@ mod tests {
         let stub = CostStub {
             script: std::sync::Mutex::new(vec![assistant_final()]),
             cost_per_turn: 0.25,
+            baseline_per_turn: 0.0,
         };
         let carried = RunUsage {
             cost_usd: 0.45,
@@ -3382,6 +3398,7 @@ mod tests {
         let stub = CostStub {
             script: std::sync::Mutex::new(vec![assistant_final()]),
             cost_per_turn: 0.25,
+            baseline_per_turn: 0.0,
         };
         let msgs = vec![Message::User {
             content: MessageContent::Text("estimate me".into()),
@@ -3414,6 +3431,7 @@ mod tests {
                 assistant_final(),
             ]),
             cost_per_turn: 0.25,
+            baseline_per_turn: 0.0,
         };
         let run = run_loop_capped(
             &stub,
@@ -3439,6 +3457,7 @@ mod tests {
                 assistant_toolcall("find_route_for"),
             ]),
             cost_per_turn: 0.0,
+            baseline_per_turn: 0.0,
         };
         let run = run_loop_capped(
             &stub,
@@ -3476,6 +3495,7 @@ mod tests {
                 assistant_final(),
             ]),
             cost_per_turn: 0.25,
+            baseline_per_turn: 0.0,
         };
         let run = run_loop_capped(
             &stub,
@@ -3517,5 +3537,44 @@ mod tests {
             content: "r".into(),
         };
         assert_eq!(tr.event_name(), "run.tool_result");
+    }
+
+    // ----- RunUsage.baseline_cost_usd accrual (W2a Task 2) -----
+
+    #[tokio::test]
+    async fn loop_accumulates_baseline_cost_across_turns() {
+        // Two turns: tool-call then final. Each costs 0.25 served / 0.60 baseline.
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.25,
+            baseline_per_turn: 0.60,
+        };
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            None,
+        )
+        .await;
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.turns, 2);
+        assert_eq!(run.usage.cost_usd, 0.50); // 2 * 0.25, exact in f64
+        assert_eq!(run.usage.baseline_cost_usd, 1.20); // 2 * 0.60, exact in f64
+    }
+
+    #[test]
+    fn run_usage_deserializes_without_baseline_cost_usd() {
+        // A RunUsage JSON written before W2a Task 2 (no baseline_cost_usd key)
+        // must still deserialize — the field defaults to 0.0 via #[serde(default)].
+        let json = r#"{"prompt_tokens":1,"completion_tokens":1,"cost_usd":0.5}"#;
+        let u: RunUsage = serde_json::from_str(json).expect("legacy RunUsage must deserialize");
+        assert_eq!(u.cost_usd, 0.5);
+        assert_eq!(u.baseline_cost_usd, 0.0);
     }
 }

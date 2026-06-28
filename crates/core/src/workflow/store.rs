@@ -37,6 +37,12 @@ pub(crate) struct WorkflowRunRecord {
     pub inputs: Option<serde_json::Value>,
     pub cost_usd: f64,
     pub max_cost_usd: Option<f64>,
+    /// Sum of per-node baseline costs (what the run would have cost without
+    /// routing). Added in W2a Task 5 (migration 0029).
+    pub baseline_cost_usd: f64,
+    /// `(baseline_cost_usd - cost_usd).max(0.0)`: USD saved by routing.
+    /// Added in W2a Task 5 (migration 0029).
+    pub saved_usd: f64,
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -111,7 +117,7 @@ ON CONFLICT (id) DO NOTHING";
 /// org's run.
 pub(crate) const FINISH_RUN_SQL: &str = "\
 UPDATE workflow_runs \
-SET status = $3, cost_usd = $4, error = $5, finished_at = now() \
+SET status = $3, cost_usd = $4, baseline_cost_usd = $5, saved_usd = $6, error = $7, finished_at = now() \
 WHERE id = $1 AND org_id = $2";
 
 /// SELECT a single run scoped by `(id, org_id)`.
@@ -121,6 +127,8 @@ WHERE id = $1 AND org_id = $2";
 pub(crate) const GET_RUN_SQL: &str = "\
 SELECT id, workflow_id, version, org_id, status, inputs, \
        cost_usd::float8 AS cost_usd, max_cost_usd::float8 AS max_cost_usd, \
+       baseline_cost_usd::float8 AS baseline_cost_usd, \
+       saved_usd::float8 AS saved_usd, \
        error, started_at, finished_at \
 FROM workflow_runs \
 WHERE id = $1 AND org_id = $2";
@@ -132,6 +140,8 @@ WHERE id = $1 AND org_id = $2";
 pub(crate) const LIST_RUNS_SQL: &str = "\
 SELECT id, workflow_id, version, org_id, status, inputs, \
        cost_usd::float8 AS cost_usd, max_cost_usd::float8 AS max_cost_usd, \
+       baseline_cost_usd::float8 AS baseline_cost_usd, \
+       saved_usd::float8 AS saved_usd, \
        error, started_at, finished_at \
 FROM workflow_runs \
 WHERE org_id = $1 \
@@ -165,6 +175,8 @@ fn run_record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRunRecord,
         inputs: row.try_get("inputs")?,
         cost_usd: row.try_get("cost_usd")?,
         max_cost_usd: row.try_get("max_cost_usd")?,
+        baseline_cost_usd: row.try_get("baseline_cost_usd")?,
+        saved_usd: row.try_get("saved_usd")?,
         error: row.try_get("error")?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
@@ -308,20 +320,25 @@ pub(crate) async fn insert_run(pool: &PgPool, rec: &WorkflowRunRecord) {
 
 /// Update a workflow run to its terminal state (`finished_at = now()`).
 /// Scoped by `(id, org_id)`. Awaited; errors are warn-and-swallowed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_run(
     pool: &PgPool,
     id: Uuid,
     org_id: Uuid,
     status: &str,
     cost_usd: f64,
+    baseline_cost_usd: f64,
+    saved_usd: f64,
     error: Option<&str>,
 ) {
     let result = sqlx::query(FINISH_RUN_SQL)
-        .bind(id) // $1 id       UUID
-        .bind(org_id) // $2 org_id   UUID
-        .bind(status) // $3 status   TEXT
-        .bind(cost_usd) // $4 cost_usd NUMERIC
-        .bind(error) // $5 error    TEXT
+        .bind(id) // $1 id                UUID
+        .bind(org_id) // $2 org_id            UUID
+        .bind(status) // $3 status            TEXT
+        .bind(cost_usd) // $4 cost_usd          NUMERIC
+        .bind(baseline_cost_usd) // $5 baseline_cost_usd  NUMERIC
+        .bind(saved_usd) // $6 saved_usd          NUMERIC
+        .bind(error) // $7 error             TEXT
         .execute(pool)
         .await;
     if let Err(e) = result {
@@ -455,12 +472,16 @@ mod tests {
             inputs: None,
             cost_usd: 0.0,
             max_cost_usd: None,
+            baseline_cost_usd: 0.0,
+            saved_usd: 0.0,
             error: None,
             started_at: Utc::now(),
             finished_at: None,
         };
         assert_eq!(rec.status, "running");
         assert_eq!(rec.cost_usd, 0.0);
+        assert_eq!(rec.baseline_cost_usd, 0.0);
+        assert_eq!(rec.saved_usd, 0.0);
         assert!(rec.finished_at.is_none());
         assert!(rec.error.is_none());
         assert!(rec.max_cost_usd.is_none());
@@ -477,12 +498,16 @@ mod tests {
             inputs: Some(serde_json::json!({"prompt": "hello"})),
             cost_usd: 0.05,
             max_cost_usd: Some(1.0),
+            baseline_cost_usd: 0.10,
+            saved_usd: 0.05,
             error: None,
             started_at: Utc::now(),
             finished_at: Some(Utc::now()),
         };
         assert_eq!(rec.status, "completed");
         assert!((rec.cost_usd - 0.05).abs() < 1e-9);
+        assert!((rec.baseline_cost_usd - 0.10).abs() < 1e-9);
+        assert!((rec.saved_usd - 0.05).abs() < 1e-9);
         assert_eq!(rec.version, 2);
         assert!(rec.finished_at.is_some());
     }
@@ -585,6 +610,22 @@ mod tests {
     }
 
     #[test]
+    fn finish_run_sql_sets_baseline_and_saved() {
+        assert!(
+            FINISH_RUN_SQL.contains("baseline_cost_usd = $5"),
+            "FINISH_RUN_SQL must set baseline_cost_usd at bind position $5"
+        );
+        assert!(
+            FINISH_RUN_SQL.contains("saved_usd = $6"),
+            "FINISH_RUN_SQL must set saved_usd at bind position $6"
+        );
+        assert!(
+            FINISH_RUN_SQL.contains("error = $7"),
+            "FINISH_RUN_SQL must set error at bind position $7 (after baseline/saved)"
+        );
+    }
+
+    #[test]
     fn get_run_sql_scopes_by_org_and_id() {
         assert!(
             GET_RUN_SQL.contains("WHERE id = $1 AND org_id = $2"),
@@ -629,12 +670,28 @@ mod tests {
             "GET_RUN_SQL must cast max_cost_usd to float8"
         );
         assert!(
+            GET_RUN_SQL.contains("baseline_cost_usd::float8"),
+            "GET_RUN_SQL must cast baseline_cost_usd to float8"
+        );
+        assert!(
+            GET_RUN_SQL.contains("saved_usd::float8"),
+            "GET_RUN_SQL must cast saved_usd to float8"
+        );
+        assert!(
             LIST_RUNS_SQL.contains("cost_usd::float8"),
             "LIST_RUNS_SQL must cast cost_usd to float8"
         );
         assert!(
             LIST_RUNS_SQL.contains("max_cost_usd::float8"),
             "LIST_RUNS_SQL must cast max_cost_usd to float8"
+        );
+        assert!(
+            LIST_RUNS_SQL.contains("baseline_cost_usd::float8"),
+            "LIST_RUNS_SQL must cast baseline_cost_usd to float8"
+        );
+        assert!(
+            LIST_RUNS_SQL.contains("saved_usd::float8"),
+            "LIST_RUNS_SQL must cast saved_usd to float8"
         );
     }
 
