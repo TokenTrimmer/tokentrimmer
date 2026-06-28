@@ -112,7 +112,15 @@ pub fn build_router_with_retrieval(
         .route("/metrics", get(routes::metrics::handler))
         .route("/v1/models", get(routes::models::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))
-        .route("/v1/agent/runs", post(routes::agent_run::create_run))
+        // POST creates a new run; GET lists the caller's runs (org-scoped,
+        // newest-first, durable Postgres view — no transcript). The bare list
+        // route must appear BEFORE the parameterized :id route so axum's router
+        // does not mistake "runs" as an id; in practice axum differentiates by
+        // segment count, so ordering here is just for clarity.
+        .route(
+            "/v1/agent/runs",
+            post(routes::agent_run::create_run).get(routes::agent_run::list_runs),
+        )
         .route("/v1/agent/runs/:id", get(routes::agent_run::get_run))
         .route(
             "/v1/agent/runs/:id/tool_outputs",

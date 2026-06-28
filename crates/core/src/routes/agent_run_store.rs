@@ -148,6 +148,40 @@ UPDATE agent_runs \
 SET status = $3, turns = $4, cost_usd = $5, stop_reason = $6, finished_at = now() \
 WHERE id = $1 AND org_id = $2";
 
+/// SELECT the most-recent runs for an org (list path, Task 6).
+///
+/// `NUMERIC(12,6)` columns are cast to `::float8` so sqlx can decode them as
+/// `f64` without a `rust_decimal` dependency (the postgres driver supports
+/// FLOAT8 ↔ f64 natively).
+pub(crate) const LIST_SQL: &str = "\
+SELECT id, org_id, status, model, turns, max_turns, \
+       max_cost_usd::float8 AS max_cost_usd, cost_usd::float8 AS cost_usd, \
+       stop_reason, tag \
+FROM agent_runs \
+WHERE org_id=$1 \
+ORDER BY started_at DESC \
+LIMIT $2";
+
+/// SELECT a single run scoped by `(id, org_id)` (get path, Task 6).
+///
+/// `NUMERIC(12,6)` columns are cast to `::float8` for the same reason as
+/// [`LIST_SQL`].
+pub(crate) const GET_SQL: &str = "\
+SELECT id, org_id, status, model, turns, max_turns, \
+       max_cost_usd::float8 AS max_cost_usd, cost_usd::float8 AS cost_usd, \
+       stop_reason, tag \
+FROM agent_runs \
+WHERE id=$1 AND org_id=$2";
+
+/// Best-effort UPDATE that marks a paused run as `requires_action` (Task 6
+/// paused-status fix). Called at both `LoopOutcome::Paused` sites so a run
+/// whose Redis TTL expires reads as `requires_action` (not `running`) in the
+/// durable store.
+pub(crate) const MARK_REQUIRES_ACTION_SQL: &str = "\
+UPDATE agent_runs \
+SET status='requires_action' \
+WHERE id=$1 AND org_id=$2";
+
 // ---------------------------------------------------------------------------
 // Public store functions
 // ---------------------------------------------------------------------------
@@ -213,6 +247,104 @@ pub(crate) async fn finish_agent_run(
 }
 
 // ---------------------------------------------------------------------------
+// Read helpers (Task 6)
+// ---------------------------------------------------------------------------
+
+/// Map a Postgres row to [`AgentRunRecord`]. The NUMERIC columns are cast to
+/// `::float8` in the query so `try_get::<f64, _>` succeeds without a
+/// `rust_decimal` dependency.
+fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<AgentRunRecord, sqlx::Error> {
+    use sqlx::Row;
+    Ok(AgentRunRecord {
+        id: row.try_get("id")?,
+        org_id: row.try_get("org_id")?,
+        status: row.try_get("status")?,
+        model: row.try_get("model")?,
+        turns: row.try_get("turns")?,
+        max_turns: row.try_get("max_turns")?,
+        max_cost_usd: row.try_get("max_cost_usd")?,
+        cost_usd: row.try_get("cost_usd")?,
+        stop_reason: row.try_get("stop_reason")?,
+        tag: row.try_get("tag")?,
+    })
+}
+
+/// Return up to `limit` runs for `org_id`, ordered most-recent first.
+///
+/// **Best-effort**: any DB error is logged at WARN and swallowed (returns an
+/// empty `Vec`). Mirrors the tolerance of [`insert_agent_run`] and
+/// [`finish_agent_run`] — a DB outage must never fail the caller's request.
+pub(crate) async fn list_agent_runs(
+    pool: &PgPool,
+    org_id: Uuid,
+    limit: i64,
+) -> Vec<AgentRunRecord> {
+    let result = sqlx::query(LIST_SQL)
+        .bind(org_id) // $1 org_id UUID
+        .bind(limit) //  $2 limit  BIGINT
+        .fetch_all(pool)
+        .await;
+    match result {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|row| record_from_row(row).ok())
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                %org_id,
+                error = %e,
+                "agent_runs LIST failed (best-effort, returning empty)"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Fetch a single run scoped by `(id, org_id)`. Returns `None` when the row
+/// is absent or when the DB errors (best-effort; the caller sees a miss either
+/// way and will proceed to 404).
+pub(crate) async fn get_agent_run(pool: &PgPool, id: Uuid, org_id: Uuid) -> Option<AgentRunRecord> {
+    let result = sqlx::query(GET_SQL)
+        .bind(id) //     $1 id     UUID
+        .bind(org_id) // $2 org_id UUID
+        .fetch_optional(pool)
+        .await;
+    match result {
+        Ok(Some(row)) => record_from_row(&row).ok(),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                run_id = %id,
+                error = %e,
+                "agent_runs GET failed (best-effort, returning None)"
+            );
+            None
+        }
+    }
+}
+
+/// Best-effort UPDATE that sets a paused run's status to `requires_action`.
+///
+/// Called at both `LoopOutcome::Paused` sites so a stale paused run (whose
+/// Redis TTL expired) reads as `requires_action` rather than `running` in the
+/// durable Postgres store. Scoped by `(id, org_id)` — matches [`FINISH_SQL`]'s
+/// scope so a wrong-org caller cannot corrupt another org's row.
+pub(crate) async fn mark_run_requires_action(pool: &PgPool, id: Uuid, org_id: Uuid) {
+    let result = sqlx::query(MARK_REQUIRES_ACTION_SQL)
+        .bind(id) //     $1 id     UUID
+        .bind(org_id) // $2 org_id UUID
+        .execute(pool)
+        .await;
+    if let Err(e) = result {
+        tracing::warn!(
+            run_id = %id,
+            error = %e,
+            "agent_runs UPDATE (requires_action) failed (best-effort, run not affected)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests — pure (no DB required)
 // ---------------------------------------------------------------------------
 
@@ -223,7 +355,7 @@ mod tests {
     use crate::routes::agent_run::RunStatus;
     use crate::routes::agent_run_budget::StopReason;
 
-    use super::AgentRunRecord;
+    use super::{AgentRunRecord, GET_SQL, LIST_SQL, MARK_REQUIRES_ACTION_SQL};
 
     // Brief-prescribed test (the canonical TDD anchor).
     #[test]
@@ -312,6 +444,69 @@ mod tests {
                 "StopReason::{reason:?}"
             );
         }
+    }
+
+    // ----- Task 6: read-path SQL query-shape tests (written first, TDD) -----
+
+    #[test]
+    fn list_sql_contains_expected_clauses() {
+        // The query must scope by org, order most-recent first, and accept a LIMIT.
+        assert!(
+            LIST_SQL.contains("WHERE org_id=$1"),
+            "LIST_SQL must filter by org_id"
+        );
+        assert!(
+            LIST_SQL.contains("ORDER BY started_at DESC"),
+            "LIST_SQL must order by started_at DESC"
+        );
+        assert!(
+            LIST_SQL.contains("LIMIT $2"),
+            "LIST_SQL must apply a LIMIT parameter"
+        );
+        assert!(
+            LIST_SQL.contains("FROM agent_runs"),
+            "LIST_SQL must query the agent_runs table"
+        );
+    }
+
+    #[test]
+    fn get_sql_scopes_by_org_and_id() {
+        // Org-scoping is essential: a wrong-org caller must never retrieve
+        // another org's run (WHERE id=$1 AND org_id=$2 is the gate).
+        assert!(
+            GET_SQL.contains("WHERE id=$1 AND org_id=$2"),
+            "GET_SQL must scope by (id, org_id)"
+        );
+        assert!(
+            GET_SQL.contains("FROM agent_runs"),
+            "GET_SQL must query the agent_runs table"
+        );
+    }
+
+    #[test]
+    fn mark_requires_action_sql_sets_correct_status_and_scopes_org() {
+        assert!(
+            MARK_REQUIRES_ACTION_SQL.contains("status='requires_action'"),
+            "MARK_REQUIRES_ACTION_SQL must set status to requires_action"
+        );
+        assert!(
+            MARK_REQUIRES_ACTION_SQL.contains("WHERE id=$1 AND org_id=$2"),
+            "MARK_REQUIRES_ACTION_SQL must scope by (id, org_id)"
+        );
+    }
+
+    #[test]
+    fn list_and_get_sql_cast_numeric_to_float8() {
+        // NUMERIC(12,6) columns must be cast to ::float8 so sqlx can decode
+        // them as f64 without a rust_decimal dependency.
+        assert!(
+            LIST_SQL.contains("::float8"),
+            "LIST_SQL must cast NUMERIC columns to float8"
+        );
+        assert!(
+            GET_SQL.contains("::float8"),
+            "GET_SQL must cast NUMERIC columns to float8"
+        );
     }
 
     #[test]
