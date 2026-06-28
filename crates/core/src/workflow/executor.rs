@@ -4,10 +4,6 @@
 //! `GatewayNodeExecutor` is the production impl that delegates each node to
 //! `agent_run::drive_workflow_node` (= the proven W0a/W0b per-turn loop).
 //!
-//! NOTE: this module is unused until Task 6 (the engine). Dead-code allows are
-//! removed at Task 8.
-#![allow(dead_code)]
-
 use async_trait::async_trait;
 use serde_json::json;
 use uuid::Uuid;

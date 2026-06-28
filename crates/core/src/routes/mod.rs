@@ -18,6 +18,7 @@ pub mod ready;
 pub mod responses;
 pub mod routes_api;
 pub mod sse;
+pub mod workflows;
 
 /// Graft the `tokentrimmer.panel` attribution from a chat-completions response body
 /// onto a transcoded target-shape body. The chat handler grafts `tokentrimmer.panel`

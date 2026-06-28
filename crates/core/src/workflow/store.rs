@@ -8,11 +8,6 @@
 //! - Best-effort writes for node-run journaling (warn-and-continue, no `?`-propagate)
 //! - `WHERE id=$1 AND org_id=$2` / `WHERE org_id=$1` org-scope on every query
 
-// W1a buildup: these fns/consts are consumed by the engine (Task 6) + the
-// /v1/workflows handlers (Task 8). REMOVE this allow in Task 8 once every fn is
-// wired (mirrors the W0a agent_run_budget pattern), then confirm `clippy -D warnings`.
-#![allow(dead_code)]
-
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -26,6 +21,11 @@ use super::types::WorkflowDefinition;
 /// A row destined for (or read from) `workflow_runs`. Enums are stored as
 /// their snake_case wire strings; numeric types match the DB schema
 /// (`NUMERIC(12,6)`). Timestamps are read directly from the DB.
+///
+/// `error`, `started_at`, and `finished_at` are populated by `run_record_from_row`
+/// (used in `get_run`/`list_runs`) but not directly read by the Task-8 handlers.
+/// Wired in W1c dashboard. Narrow allow kept here rather than a file-level blanket.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct WorkflowRunRecord {
     pub id: Uuid,
@@ -351,6 +351,9 @@ pub(crate) async fn finish_run(
 
 /// Fetch a single run scoped by `(id, org_id)`. Returns `None` on miss or
 /// DB error (best-effort).
+///
+/// Wired in W1c dashboard (GET /v1/workflows/:id/runs/:run_id).
+#[allow(dead_code)]
 pub(crate) async fn get_run(pool: &PgPool, id: Uuid, org_id: Uuid) -> Option<WorkflowRunRecord> {
     let result = sqlx::query(GET_RUN_SQL)
         .bind(id) // $1 id     UUID
@@ -373,6 +376,9 @@ pub(crate) async fn get_run(pool: &PgPool, id: Uuid, org_id: Uuid) -> Option<Wor
 
 /// Return up to `limit` runs for `org_id`, ordered most-recent first.
 /// Returns an empty `Vec` on DB error (best-effort).
+///
+/// Wired in W1c dashboard (GET /v1/workflows/runs or per-workflow run history).
+#[allow(dead_code)]
 pub(crate) async fn list_runs(pool: &PgPool, org_id: Uuid, limit: i64) -> Vec<WorkflowRunRecord> {
     let result = sqlx::query(LIST_RUNS_SQL)
         .bind(org_id) // $1 org_id UUID

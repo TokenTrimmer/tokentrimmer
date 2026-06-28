@@ -54,9 +54,6 @@
 //! - The topo order is defensive: if validate somehow missed a cycle the engine
 //!   returns `WfStatus::Failed` rather than looping.
 
-// Removed at Task 8 once every pub(crate) symbol is used.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::routes::agent_run_budget::budget_reached;

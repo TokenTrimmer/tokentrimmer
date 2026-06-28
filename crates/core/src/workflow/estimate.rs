@@ -1,6 +1,3 @@
-// Remove at Task 8 once every pub(crate) symbol is used from routes/workflows.rs.
-#![allow(dead_code)]
-
 //! Pre-run cost projection for a [`WorkflowDefinition`] (W1a Task 7).
 //!
 //! `estimate_workflow` walks all nodes in definition order and, for each
