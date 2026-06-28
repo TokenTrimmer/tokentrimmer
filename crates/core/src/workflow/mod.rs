@@ -5,6 +5,7 @@
 //! submodules.
 
 pub mod types;
+pub mod validate;
 
 pub use types::{
     content_hash, BudgetPolicy, Edge, ModelSelection, Node, NodeKind, NodeOutput, OnExceed,
