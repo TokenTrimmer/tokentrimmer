@@ -391,6 +391,9 @@ enum AgentAction {
         /// Server-side per-run turn cap (the gateway clamps to 1..=32).
         #[arg(long)]
         max_turns: Option<u32>,
+        /// Hard ceiling (USD) on the run's total served cost.
+        #[arg(long = "max-cost")]
+        max_cost: Option<f64>,
         /// X-TokenTrimmer-Tag cost-attribution tag.
         #[arg(long)]
         tag: Option<String>,
@@ -1180,6 +1183,7 @@ async fn main() -> anyhow::Result<()> {
                 system,
                 tools,
                 max_turns,
+                max_cost,
                 tag,
             } => {
                 tt_cli::agent::run(tt_cli::agent::RunOpts {
@@ -1188,6 +1192,7 @@ async fn main() -> anyhow::Result<()> {
                     system,
                     tools,
                     max_turns,
+                    max_cost,
                     tag,
                     flag_key: tt_api_key,
                     flag_base: tt_api_base,
