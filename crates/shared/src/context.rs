@@ -96,7 +96,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_context_defaults_run_id_none() {
+    fn request_context_has_run_id_node_id_fields() {
+        // construction itself is the gate; this asserts the fields exist + accept Option<Uuid>
         let ctx = RequestContext {
             trace_id: Uuid::nil(),
             org_id: Uuid::nil(),

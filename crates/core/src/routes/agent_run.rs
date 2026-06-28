@@ -1486,10 +1486,14 @@ pub async fn get_run(
 
     // (1) Try Redis first — richer view (includes the live transcript).
     if let Some(l1) = state.l1.as_ref() {
-        if let Ok(Some(stored)) = fetch_run(l1.cache.as_ref(), org, id).await {
-            return Ok(Json(stored.to_run()));
+        match fetch_run(l1.cache.as_ref(), org, id).await {
+            Ok(Some(stored)) => return Ok(Json(stored.to_run())),
+            Ok(None) => {} // key absent → fall through to Postgres
+            Err(e) => {
+                tracing::warn!(run_id = %id, error = %e, "agent run Redis fetch failed; falling back to Postgres");
+                // fall through to Postgres
+            }
         }
-        // Redis error (logged inside fetch_run) or key absent → fall through to Postgres.
     }
 
     // (2) Postgres fallback — durable identity + terminal state, no transcript.
