@@ -25,6 +25,7 @@ pub(crate) mod shaping;
 pub mod single_flight;
 pub mod state;
 pub mod tier_resolver;
+pub mod workflow;
 
 pub use batch_store::{
     BatchJob, BatchStore, BatchStoreError, InMemoryBatchStore, PostgresBatchStore,
