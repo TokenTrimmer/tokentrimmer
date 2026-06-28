@@ -1891,6 +1891,9 @@ pub(crate) async fn complete_once(
             diff_failed,
             diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
             retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
+            // run_id/node_id stamped in Task 4 (agentic loop context).
+            run_id: None,
+            node_id: None,
         },
     );
 
@@ -6144,6 +6147,9 @@ fn request_log_for_l1_hit(
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved,
+        // run_id/node_id stamped in Task 4 (agentic loop context).
+        run_id: None,
+        node_id: None,
     }
 }
 
@@ -6212,6 +6218,9 @@ fn request_log_for_l2_hit(
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved,
+        // run_id/node_id stamped in Task 4 (agentic loop context).
+        run_id: None,
+        node_id: None,
     }
 }
 
@@ -9158,6 +9167,8 @@ mod telemetry_drain_tests {
             diff_failed: false,
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: 0,
+            run_id: None,
+            node_id: None,
         }
     }
 

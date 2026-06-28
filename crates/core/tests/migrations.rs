@@ -342,6 +342,8 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved: 0,
+        run_id: None,
+        node_id: None,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");
@@ -452,6 +454,8 @@ async fn request_log_insert_round_trips_batch_columns() {
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved: 0,
+        run_id: None,
+        node_id: None,
     };
     let marked_id = marked.id;
     writer.write(marked.clone()).await.expect("insert marked");
@@ -561,6 +565,8 @@ async fn request_logs_insert_round_trips_against_postgres() {
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved: 0,
+        run_id: None,
+        node_id: None,
     };
     let id = row.id;
     writer
@@ -649,6 +655,8 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         diff_failed: true,
         diff_failed_cost_usd: 0.0007,
         retrieval_tokens_saved: 0,
+        run_id: None,
+        node_id: None,
     };
     let shaped_id = shaped.id;
     writer.write(shaped.clone()).await.expect("insert shaped");

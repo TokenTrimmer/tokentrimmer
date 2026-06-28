@@ -1714,6 +1714,9 @@ pub(crate) async fn complete_panel(
             diff_failed: false,
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
+            // Panels never run agentic loops; run_id/node_id stay None.
+            run_id: None,
+            node_id: None,
         },
     );
 

@@ -1079,6 +1079,9 @@ pub fn stream_response(
                     diff_failed: false,
                     diff_failed_cost_usd: 0.0,
                     retrieval_tokens_saved,
+                    // run_id/node_id stamped in Task 4 (agentic loop context).
+                    run_id: None,
+                    node_id: None,
                 };
 
                 // Per-route provider-cache counters on cleanly completed
