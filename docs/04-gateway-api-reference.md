@@ -1880,10 +1880,10 @@ A workflow definition is a JSON object with the following top-level fields:
 Each edge:
 
 ```json
-{ "from": "<node_id>", "to": "<node_id>", "map": "<optional jq expr>" }
+{ "from": "<node_id>", "to": "<node_id>" }
 ```
 
-`map` is an optional jq-style expression applied to the source node's output before passing it to the destination.
+`map` is an optional field parsed by the schema but **not yet applied by the engine in W1a** (reserved for a future release). Omit it.
 
 ### 24.2 Node kinds
 
@@ -1941,25 +1941,43 @@ Multi-turn agentic loop with tool access.
 
 #### `transform`
 
-Deterministic expression evaluated on the input; no LLM call.
+Deterministic template substitution; no LLM call. The `expr` field is a
+`{{ref}}`-template string (same syntax as `prompt` on Model/Agent nodes).
 
 ```json
-{ "id": "upcase", "type": "transform", "expr": ".output | ascii_upcase" }
+{ "id": "relay", "type": "transform", "expr": "{{summarise}}" }
 ```
+
+`{{input}}` expands to the trigger payload; `{{node_id}}` expands to that node's
+full output; `{{node_id.field}}` extracts a top-level JSON field. Unclosed `{{`
+is passed through as-is. jq-style expressions (e.g. `.output | ascii_upcase`) are
+**not** supported — use template refs only.
 
 #### `branch`
 
-Conditional; evaluates `cond` and follows exactly one outgoing edge.
+Conditional; evaluates `cond` and routes to exactly one of `when_true` or
+`when_false`.
 
 ```json
 {
   "id": "gate",
   "type": "branch",
-  "cond": ".score > 0.5",
+  "cond": "{{score}} == \"pass\"",
   "when_true": "pass_node",
   "when_false": "fail_node"
 }
 ```
+
+`cond` supports three forms:
+
+| Form | Example | Meaning |
+|---|---|---|
+| `{{ref}} == "literal"` | `{{score}} == "pass"` | String equality after template resolution. |
+| `{{ref}} != "literal"` | `{{label}} != "skip"` | String inequality. |
+| `{{ref}}` | `{{flag}}` | Truthiness: true unless the resolved value is empty, `"false"`, `"null"`, or `"0"`. |
+
+Literals may be single- or double-quoted. Numeric comparisons (e.g. `.score > 0.5`)
+are **not** supported in W1a — coerce to a string label from the model output instead.
 
 #### `output`
 
@@ -1979,7 +1997,7 @@ The `selection` field on `model` and `agent` nodes determines how the model is r
 |---|---|---|
 | `"model"` | `"model": "<model_id>"` | Pin a specific model (e.g. `"claude-3-5-haiku-20241022"`). |
 | `"route"` | `"route_ref": "<route_name>"` | Use a named TokenTrimmer route (resolved at run time). |
-| `"auto"` | — | Automatic model selection. **Not yet supported at run time in this release** — pin a model or route_ref instead. |
+| `"auto"` | — | Automatic model selection. **Rejected at definition create/validate time in W1a** — pin a model or route_ref instead. |
 
 ### 24.4 Endpoints
 
@@ -1999,7 +2017,7 @@ Validates and stores a workflow definition. If the `id` is new, version 1 is cre
 }
 ```
 
-**Error codes:** `400` with a list of validation errors (e.g. cycle detected, unknown model); `503` when Postgres is unavailable.
+**Error codes:** `400` with a list of validation errors (e.g. cycle detected, unknown model, Auto selection); `409` on a concurrent-insert version conflict (retry); `500` on a DB write error; `503` when Postgres is unavailable.
 
 ---
 

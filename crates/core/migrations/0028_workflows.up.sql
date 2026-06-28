@@ -5,9 +5,10 @@ CREATE TABLE IF NOT EXISTS workflow_definitions (
   definition   JSONB NOT NULL,
   content_hash TEXT NOT NULL,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (id, version)
+  PRIMARY KEY (org_id, id, version)
 );
-CREATE INDEX IF NOT EXISTS workflow_definitions_org ON workflow_definitions (org_id, id);
+-- workflow_definitions_org index omitted: (org_id, id) is a strict prefix of
+-- the PRIMARY KEY (org_id, id, version) and would be redundant.
 
 CREATE TABLE IF NOT EXISTS workflow_runs (
   id           UUID PRIMARY KEY,

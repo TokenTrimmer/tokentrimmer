@@ -203,7 +203,22 @@ pub async fn create(
     let pool = db_pool(&state)?;
 
     let hash = content_hash(&def);
-    let version = store::insert_definition(pool, org, &def, &hash).await;
+    let version = store::insert_definition(pool, org, &def, &hash)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                workflow_id = %def.id,
+                error = %e,
+                "workflow_definitions INSERT failed"
+            );
+            ApiError::Internal(format!("failed to store workflow definition: {e}"))
+        })?
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "workflow id {} version conflict: a concurrent insert won the race; retry",
+                def.id
+            ))
+        })?;
 
     Ok((
         StatusCode::CREATED,

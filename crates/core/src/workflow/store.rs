@@ -62,7 +62,8 @@ pub(crate) struct WorkflowDefMeta {
 
 /// INSERT a new definition version, computing the next version atomically as
 /// `COALESCE(MAX(version), 0) + 1` for the `(id, org_id)` pair.
-/// `ON CONFLICT (id, version) DO NOTHING` guards against concurrent races.
+/// `ON CONFLICT (org_id, id, version) DO NOTHING` guards against concurrent races
+/// and matches the `PRIMARY KEY (org_id, id, version)` from migration 0028.
 /// Returns the inserted version via `RETURNING version`.
 pub(crate) const INSERT_DEFINITION_SQL: &str = "\
 WITH next_v AS (\
@@ -72,7 +73,7 @@ WITH next_v AS (\
 ) \
 INSERT INTO workflow_definitions (id, org_id, version, definition, content_hash) \
 SELECT $1, $2, v, $3, $4 FROM next_v \
-ON CONFLICT (id, version) DO NOTHING \
+ON CONFLICT (org_id, id, version) DO NOTHING \
 RETURNING version";
 
 /// SELECT the latest version of a definition, scoped by `(id, org_id)`.
@@ -176,53 +177,36 @@ fn run_record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRunRecord,
 
 /// Insert a new version of a workflow definition. Computes the next version
 /// atomically (COALESCE(MAX(version), 0) + 1 for the `(id, org_id)` pair).
-/// Returns the new version number, or `0` on error (best-effort; warns on
-/// failure so a DB outage never fails the caller's request).
+///
+/// Returns:
+/// - `Ok(Some(version))` — row inserted; `version` is the atomically computed version.
+/// - `Ok(None)` — ON CONFLICT fired (another insert of the same `(org_id, id, version)` won the race).
+/// - `Err(e)` — Postgres error.
 pub(crate) async fn insert_definition(
     pool: &PgPool,
     org_id: Uuid,
     def: &WorkflowDefinition,
     content_hash: &str,
-) -> i32 {
-    let definition_json = match serde_json::to_value(def) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                workflow_id = %def.id,
-                error = %e,
-                "workflow_definitions INSERT: failed to serialize definition (best-effort)"
-            );
-            return 0;
-        }
-    };
-    let result = sqlx::query(INSERT_DEFINITION_SQL)
+) -> Result<Option<i32>, sqlx::Error> {
+    let definition_json = serde_json::to_value(def).map_err(|e| {
+        sqlx::Error::Protocol(format!(
+            "workflow_definitions INSERT: failed to serialize definition: {e}"
+        ))
+    })?;
+    let row = sqlx::query(INSERT_DEFINITION_SQL)
         .bind(def.id) // $1 id           UUID
         .bind(org_id) // $2 org_id        UUID
         .bind(definition_json) // $3 definition    JSONB
         .bind(content_hash) // $4 content_hash  TEXT
         .fetch_optional(pool)
-        .await;
-    match result {
-        Ok(Some(row)) => {
+        .await?;
+    match row {
+        Some(r) => {
             use sqlx::Row;
-            row.try_get::<i32, _>("version").unwrap_or(0)
+            let v = r.try_get::<i32, _>("version")?;
+            Ok(Some(v))
         }
-        Ok(None) => {
-            // ON CONFLICT DO NOTHING fired (concurrent insert of same version).
-            tracing::warn!(
-                workflow_id = %def.id,
-                "workflow_definitions INSERT: conflict on (id, version), returning 0"
-            );
-            0
-        }
-        Err(e) => {
-            tracing::warn!(
-                workflow_id = %def.id,
-                error = %e,
-                "workflow_definitions INSERT failed (best-effort)"
-            );
-            0
-        }
+        None => Ok(None),
     }
 }
 
@@ -523,8 +507,8 @@ mod tests {
             "INSERT_DEFINITION_SQL must RETURN the inserted version"
         );
         assert!(
-            INSERT_DEFINITION_SQL.contains("ON CONFLICT (id, version) DO NOTHING"),
-            "INSERT_DEFINITION_SQL must guard against concurrent inserts"
+            INSERT_DEFINITION_SQL.contains("ON CONFLICT (org_id, id, version) DO NOTHING"),
+            "INSERT_DEFINITION_SQL must guard against concurrent inserts with the org_id PK"
         );
         assert!(
             INSERT_DEFINITION_SQL.contains("INSERT INTO workflow_definitions"),

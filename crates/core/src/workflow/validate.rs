@@ -18,8 +18,9 @@ use super::types::{ModelSelection, NodeKind, WorkflowDefinition};
 ///
 /// `model_exists(model_id)` should return `true` when the given model id is
 /// known to the gateway (i.e. `registry.resolve(model_id).is_some()`).  Only
-/// [`ModelSelection::Model`] nodes are checked; `Route` and `Auto` selections
-/// are accepted without a model lookup.
+/// [`ModelSelection::Model`] nodes are checked against the registry; `Route`
+/// selections are accepted without a lookup.  [`ModelSelection::Auto`] is
+/// rejected with an error — callers must pin a model or `route_ref` for W1a.
 ///
 /// Returns `Ok(())` when the definition is valid, or `Err(errors)` where
 /// `errors` is a **complete** list of all violations found.
@@ -104,7 +105,9 @@ pub fn validate(
     }
 
     // ------------------------------------------------------------------
-    // 5. Model/Agent nodes with a pinned model id pass `model_exists`.
+    // 5. Model/Agent nodes:
+    //    a. Auto selection is rejected at validate-time (W1a contract: must pin).
+    //    b. Pinned model ids must pass `model_exists`.
     // ------------------------------------------------------------------
     for node in &def.nodes {
         let selection = match &node.kind {
@@ -112,13 +115,23 @@ pub fn validate(
             NodeKind::Agent { selection, .. } => Some(selection),
             _ => None,
         };
-        if let Some(ModelSelection::Model { model }) = selection {
-            if !model_exists(model) {
+        match selection {
+            Some(ModelSelection::Auto) => {
                 errors.push(format!(
-                    "node \"{}\" references unknown model \"{}\"",
-                    node.id, model
+                    "node {}: Auto model selection is not supported in W1a; \
+                     pin a model or route_ref",
+                    node.id
                 ));
             }
+            Some(ModelSelection::Model { model }) => {
+                if !model_exists(model) {
+                    errors.push(format!(
+                        "node \"{}\" references unknown model \"{}\"",
+                        node.id, model
+                    ));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -315,14 +328,19 @@ mod tests {
         assert!(validate(&def, &no_model).is_ok());
     }
 
-    /// An Auto selection also skips the model-existence check.
+    /// An Auto selection is rejected at validate-time (W1a contract).
     #[test]
-    fn auto_selection_skips_model_check() {
+    fn auto_selection_is_error() {
         let mut def = linear_def("ignored");
         if let NodeKind::Model { selection, .. } = &mut def.nodes[1].kind {
             *selection = ModelSelection::Auto;
         }
-        assert!(validate(&def, &no_model).is_ok());
+        let errs = validate(&def, &no_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("Auto"),
+            "expected error about Auto selection; got: {combined}"
+        );
     }
 
     /// An edge pointing at a missing node should produce an error naming that id.
@@ -476,6 +494,28 @@ mod tests {
         assert!(
             combined.contains("definitely-not-a-model"),
             "expected error to mention the bad model id; got: {combined}"
+        );
+    }
+
+    /// An Auto selection on an Agent node is also rejected at validate-time.
+    #[test]
+    fn auto_selection_on_agent_node_is_error() {
+        let mut def = linear_def("gpt-4o");
+        def.nodes[1] = Node {
+            id: "m".into(),
+            kind: NodeKind::Agent {
+                selection: ModelSelection::Auto,
+                prompt: "go".into(),
+                max_turns: None,
+                max_cost_usd: None,
+                tools: vec![],
+            },
+        };
+        let errs = validate(&def, &|m| m == "gpt-4o").unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("Auto"),
+            "expected Auto error for Agent node; got: {combined}"
         );
     }
 
