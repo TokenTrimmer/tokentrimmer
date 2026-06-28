@@ -21,11 +21,11 @@ pub mod route_autopause;
 pub mod route_savings;
 pub mod routes;
 pub mod server;
-pub mod workflow;
 pub(crate) mod shaping;
 pub mod single_flight;
 pub mod state;
 pub mod tier_resolver;
+pub mod workflow;
 
 pub use batch_store::{
     BatchJob, BatchStore, BatchStoreError, InMemoryBatchStore, PostgresBatchStore,

@@ -37,6 +37,8 @@ pub struct WorkflowDefinition {
 /// `#[serde(flatten)]` spreads `NodeKind`'s fields (including the `"type"`
 /// tag) into the parent JSON object.  Combined with the internally-tagged
 /// `NodeKind`, this round-trips cleanly for JSON.
+///
+/// NOTE: #[serde(flatten)] + internal tag works only with self-describing formats (JSON); do not serialize with CBOR/MessagePack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
@@ -65,8 +67,9 @@ pub enum NodeKind {
     Agent {
         selection: ModelSelection,
         prompt: String,
+        /// Turn cap for the agent loop; None => the engine's default (DEFAULT_MAX_TURNS = 8, matching CreateRunRequest).
         #[serde(default)]
-        max_turns: u32,
+        max_turns: Option<u32>,
         #[serde(default)]
         max_cost_usd: Option<f64>,
         #[serde(default)]
@@ -94,7 +97,7 @@ pub enum NodeKind {
 /// Determines which model (or routing rule) a `Model`/`Agent` node uses.
 /// Serialised with a `"type"` discriminant matching the variant name in
 /// snake_case.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelSelection {
     /// A specific model id (e.g. `"claude-3-5-haiku-20241022"`).
@@ -109,7 +112,7 @@ pub enum ModelSelection {
 // Edges
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Edge {
     pub from: String,
     pub to: String,
@@ -122,7 +125,7 @@ pub struct Edge {
 // Budget policy
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BudgetPolicy {
     /// Hard USD cap for the entire workflow run.
     #[serde(default)]
@@ -134,7 +137,7 @@ pub struct BudgetPolicy {
 
 /// Action taken when a budget limit is hit.  Only `Stop` is implemented in
 /// W1a; warn/throttle/etc. are deferred.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum OnExceed {
     #[default]
     Stop,
@@ -144,7 +147,7 @@ pub enum OnExceed {
 // Node output (runtime; not persisted in the definition itself)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeOutput {
     pub content: serde_json::Value,
     pub cost_usd: f64,
@@ -224,7 +227,7 @@ mod tests {
                         route_ref: "my-route".into(),
                     },
                     prompt: "act".into(),
-                    max_turns: 5,
+                    max_turns: Some(5),
                     max_cost_usd: Some(0.10),
                     tools: vec![],
                 },

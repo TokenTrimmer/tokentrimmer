@@ -7,6 +7,6 @@
 pub mod types;
 
 pub use types::{
-    BudgetPolicy, Edge, ModelSelection, Node, NodeKind, NodeOutput, OnExceed,
-    WorkflowDefinition, content_hash,
+    content_hash, BudgetPolicy, Edge, ModelSelection, Node, NodeKind, NodeOutput, OnExceed,
+    WorkflowDefinition,
 };
