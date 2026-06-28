@@ -16,7 +16,7 @@ pub enum StopReason {
 }
 
 /// True iff a cap is set and `accrued + best-effort next-turn estimate` reaches
-/// it. When no estimate is available, falls back to [`budget_reached`].
+/// it. When no estimate is available (`est_next_usd == None`), this reduces to the pure `accrued >= cap` check.
 pub(crate) fn would_exceed(accrued_usd: f64, est_next_usd: Option<f64>, cap: Option<f64>) -> bool {
     match cap {
         None => false,
