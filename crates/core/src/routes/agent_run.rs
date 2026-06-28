@@ -360,18 +360,26 @@ pub(crate) async fn run_loop_core(
         };
         if would_exceed(usage.cost_usd, est_next, max_cost_usd) {
             let accrued = usage.cost_usd;
+            let note = match est_next {
+                Some(e) => format!(
+                    "run cost cap ${:.4} would be exceeded (accrued ${:.4} + est ${:.4})",
+                    max_cost_usd.unwrap_or_default(),
+                    accrued,
+                    e
+                ),
+                None => format!(
+                    "run cost cap ${:.4} reached (accrued ${:.4})",
+                    max_cost_usd.unwrap_or_default(),
+                    accrued
+                ),
+            };
             return LoopOutcome::Terminal(Run {
                 id,
                 status: RunStatus::Incomplete,
                 messages,
                 turns: turn,
                 usage,
-                note: Some(format!(
-                    "run cost cap ${:.4} would be exceeded (accrued ${:.4} + est ${:.4})",
-                    max_cost_usd.unwrap_or_default(),
-                    accrued,
-                    est_next.unwrap_or(0.0)
-                )),
+                note: Some(note),
                 summarizer_tax_usd: summarizer_tax,
                 stop_reason: Some(StopReason::BudgetExhausted),
             });
@@ -1146,7 +1154,7 @@ pub async fn create_run(
                     let _ = tx.send(match run.status {
                         RunStatus::Completed => RunEvent::Completed { run },
                         RunStatus::Failed => RunEvent::Failed { run },
-                        _ => RunEvent::Incomplete { run }, // max_turns
+                        _ => RunEvent::Incomplete { run }, // max_turns or budget_exhausted (both Incomplete; stop_reason disambiguates)
                     });
                 }
                 LoopOutcome::Paused {
@@ -2901,6 +2909,41 @@ mod tests {
         assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted));
         assert_eq!(run.turns, 2);
         assert_eq!(run.usage.cost_usd, 0.50);
+    }
+
+    #[tokio::test]
+    async fn resume_with_carried_cost_stops_immediately_when_over_cap() {
+        // A resumed run that already accrued 0.45 under a 0.40 cap must stop on the
+        // first loop iteration with BudgetExhausted, running ZERO new turns.
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![assistant_final()]),
+            cost_per_turn: 0.25,
+        };
+        let carried = RunUsage { cost_usd: 0.45, ..Default::default() };
+        let out = run_loop_core(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            Some(0.40),
+            /* turns_done */ 2,
+            /* summarized_upto */ 0,
+            carried,
+            None,
+            None,
+        )
+        .await;
+        match out {
+            LoopOutcome::Terminal(run) => {
+                assert_eq!(run.status, RunStatus::Incomplete);
+                assert_eq!(run.stop_reason, Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted));
+                assert_eq!(run.turns, 2); // unchanged — no new turn ran
+                assert_eq!(run.usage.cost_usd, 0.45); // unchanged
+            }
+            LoopOutcome::Paused { .. } => panic!("unexpected pause"),
+        }
     }
 
     #[tokio::test]

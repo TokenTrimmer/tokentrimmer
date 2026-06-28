@@ -1745,20 +1745,35 @@ The terminal event's embedded `run` object has the same shape as the non-streami
 The `tokentrimmer-client` crate exposes agent runs via `AgentBuilder`:
 
 ```rust
-use tt_client::{user, system, Client};
+use tt_client::{async_trait, user, system, Client, ToolExecutor};
+
+// A no-op executor for runs that use only server-side (gateway) tools.
+struct NoTools;
+
+#[async_trait]
+impl ToolExecutor for NoTools {
+    async fn call(
+        &self,
+        _name: &str,
+        _arguments: &str,
+    ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(String::new())
+    }
+}
 
 let client = Client::new("https://api.tokentrimmer.com", "");
 
-let run = client
+let outcome = client
     .agent()
     .model("gpt-4o-mini")
     .message(system("You are a helpful assistant."))
     .message(user("Summarize the TokenTrimmer README"))
     .max_turns(5)
     .max_cost_usd(0.05)   // hard cost ceiling
-    .run()
+    .run(&NoTools)
     .await?;
 
+let run = &outcome.run;
 println!("status: {:?}", run.status);
 println!("turns: {}", run.turns);
 println!("total cost: ${:.5}", run.usage.cost_usd);

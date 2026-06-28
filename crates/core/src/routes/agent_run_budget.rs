@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn would_exceed_falls_back_to_accrued_when_estimate_absent() {
-        // no estimate -> behaves like budget_reached(accrued, cap)
+        // no estimate -> reduces to the pure accrued >= cap check
         assert!(would_exceed(0.40, None, Some(0.40)));
         assert!(!would_exceed(0.39, None, Some(0.40)));
     }
