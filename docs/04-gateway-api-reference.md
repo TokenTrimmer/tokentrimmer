@@ -2101,6 +2101,8 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
   "run_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "completed",
   "cost_usd": 0.00312,
+  "baseline_cost_usd": 0.00480,
+  "saved_usd": 0.00168,
   "node_outputs": [
     {
       "node_id": "summarise",
@@ -2110,6 +2112,15 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
   ]
 }
 ```
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | string (UUID) | The run's unique identifier. |
+| `status` | string | Terminal status of the run (see values below). |
+| `cost_usd` | number | Total served cost (USD) across all nodes in this run. |
+| `baseline_cost_usd` | number | What the run would have cost without routing — sum of per-node baseline costs (the default/first-ranked model's price). Zero when no model nodes executed. |
+| `saved_usd` | number | `baseline_cost_usd − cost_usd`, floored at 0. Positive values indicate routing saved money; 0 when cost ≥ baseline (e.g. the route was unchanged). Note: this is the run-level indicative figure; a signed/netted authoritative receipt will be minted per-run in a forthcoming release. |
+| `node_outputs` | array | Per-node output and cost (see below). |
 
 **`status` values:**
 

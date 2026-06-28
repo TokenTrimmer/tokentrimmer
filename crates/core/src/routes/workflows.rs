@@ -156,6 +156,8 @@ pub struct CreateRunResponse {
     pub run_id: Uuid,
     pub status: String,
     pub cost_usd: f64,
+    pub baseline_cost_usd: f64,
+    pub saved_usd: f64,
     pub node_outputs: Vec<NodeOutputView>,
 }
 
@@ -405,6 +407,8 @@ pub async fn create_run(
             inputs: Some(body.inputs.clone()),
             cost_usd: 0.0,
             max_cost_usd: run_max_cost,
+            baseline_cost_usd: 0.0,
+            saved_usd: 0.0,
             error: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
@@ -457,6 +461,8 @@ pub async fn create_run(
         org,
         status_str,
         result.cost_usd,
+        result.baseline_cost_usd,
+        result.saved_usd,
         result.error.as_deref(),
     )
     .await;
@@ -465,6 +471,8 @@ pub async fn create_run(
         run_id,
         status: status_str.to_string(),
         cost_usd: result.cost_usd,
+        baseline_cost_usd: result.baseline_cost_usd,
+        saved_usd: result.saved_usd,
         node_outputs: result
             .node_outputs
             .into_iter()
