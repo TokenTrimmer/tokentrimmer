@@ -1784,6 +1784,75 @@ for (i, cost) in run.usage.per_turn_cost_usd.iter().enumerate() {
 
 From the CLI: `tt agent run --model gpt-4o-mini --max-cost 0.05 "Summarize the README"`.
 
+### 23.6 Durable run list and get
+
+Agent runs are persisted durably to Postgres (`agent_runs` table). Identity and terminal state survive beyond the Redis TTL; the message transcript does not.
+
+#### `GET /v1/agent/runs` — list runs
+
+Returns up to 50 of the authenticated org's agent runs, newest first. Requires Postgres (503 if absent) and a real authenticated org (401 for anonymous callers).
+
+```
+GET /v1/agent/runs
+Authorization: Bearer tt_live_*
+```
+
+Response:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "status": "completed",
+      "model": "gpt-4o-mini",
+      "turns": 3,
+      "max_turns": 8,
+      "cost_usd": 0.00214,
+      "stop_reason": null,
+      "tag": "feature=research"
+    }
+  ]
+}
+```
+
+**Data item fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string (UUID) | Unique run identifier. |
+| `status` | string | `"running"`, `"completed"`, `"incomplete"`, `"failed"`, or `"requires_action"`. |
+| `model` | string | Model id used for this run. |
+| `turns` | integer | Number of model turns completed so far. |
+| `max_turns` | integer \| null | Turn cap supplied at run creation, if any. |
+| `cost_usd` | number | Accumulated served cost (USD) across all completed turns. |
+| `stop_reason` | string \| null | `"max_turns"` or `"budget_exhausted"` on incomplete runs; `null` otherwise. |
+| `tag` | string \| null | Cost-attribution tag from `X-TokenTrimmer-Tag` at run creation, if supplied. |
+
+From the CLI: `tt agent runs`.
+
+#### `GET /v1/agent/runs/:id` — get a run
+
+Fetches the current state of a run. Look-up order:
+
+1. **Redis (L1)** — if configured and the run is still within its TTL. Returns the full run including the live message transcript.
+2. **Postgres fallback** — on a Redis miss or when no Redis is configured. Returns durable identity and terminal state; `messages: []` and a note explaining the absence of the transcript.
+3. **404** — if neither store holds the run for the authenticated org.
+
+**Durable view note:** once the Redis TTL expires (1 hour after the last write), only the durable Postgres record is available. The Postgres record carries identity and terminal state (`id`, `status`, `turns`, `cost_usd`, `stop_reason`) but not the message transcript. The response in that case has `messages: []` and a `note` field explaining the absence.
+
+```
+GET /v1/agent/runs/:id
+Authorization: Bearer tt_live_*
+```
+
+### 23.7 Request-log attribution (`run_id`)
+
+Every `request_logs` row produced during an agent run carries the run's `id` in the `run_id` column, enabling complete per-run cost attribution in the request log. This includes turns that dispatch the quality judge or a shadow model — all sub-dispatches within the run are attributed to the same `run_id`.
+
+The run's total **served cost** (sum of `x-tokentrimmer-cost-usd` across all turns) is also stored as `agent_runs.cost_usd` and surfaced in the list and get responses as `cost_usd`. Use `agent_runs.cost_usd` when you want the run-level total without summing `request_logs` rows; use `request_logs` with `WHERE run_id = $1` when you want per-turn or per-sub-dispatch detail.
+
 ---
 
 **End of API reference.**

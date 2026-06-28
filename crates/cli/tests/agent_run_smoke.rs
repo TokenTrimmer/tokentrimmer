@@ -25,6 +25,27 @@ fn run_agent(base: &str, args: &[&str]) -> std::process::Output {
         .expect("run tt agent run")
 }
 
+/// Run `tt agent runs` against `base`.
+fn run_agent_runs(base: &str) -> std::process::Output {
+    let home = tempfile::tempdir().unwrap();
+    Command::new(env!("CARGO_BIN_EXE_tt"))
+        .args([
+            "agent",
+            "runs",
+            "--tt-api-key",
+            "tt_test_smoke",
+            "--tt-api-base",
+            base,
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("TT_API_KEY")
+        .env_remove("TT_API_BASE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tt agent runs")
+}
+
 #[test]
 fn agent_run_drives_loop_and_prints_answer() {
     let server = MockServer::start();
@@ -111,4 +132,67 @@ fn agent_run_with_tools_advertises_gateway_tools() {
         "stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn agent_runs_lists_returned_runs() {
+    let server = MockServer::start();
+    let list = server.mock(|when, then| {
+        when.method(GET).path("/v1/agent/runs");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "aaaaaaaa-0000-0000-0000-000000000001",
+                        "status": "completed",
+                        "model": "gpt-4o-mini",
+                        "turns": 3,
+                        "cost_usd": 0.0012
+                    }
+                ]
+            }));
+    });
+
+    let out = run_agent_runs(&server.base_url());
+    list.assert();
+
+    assert!(
+        out.status.success(),
+        "tt agent runs exited non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "panic; stderr:\n{stderr}");
+    // The run id and status should appear in the table output.
+    assert!(
+        stdout.contains("aaaaaaaa-0000-0000-0000-000000000001"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("completed"), "stdout:\n{stdout}");
+    assert!(stdout.contains("gpt-4o-mini"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn agent_runs_empty_list_prints_note() {
+    let server = MockServer::start();
+    let list = server.mock(|when, then| {
+        when.method(GET).path("/v1/agent/runs");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({ "object": "list", "data": [] }));
+    });
+
+    let out = run_agent_runs(&server.base_url());
+    list.assert();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Empty state message goes to stderr (via ui::note).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no agent runs found"), "stderr:\n{stderr}");
 }

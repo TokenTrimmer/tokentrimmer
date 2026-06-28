@@ -126,6 +126,8 @@ impl EmbeddingProvider for OpenAIEmbedder {
             credentials: self.credentials.clone(),
             tag: None,
             deadline: None,
+            run_id: None,
+            node_id: None,
         };
 
         let req = EmbeddingsRequest {

@@ -135,6 +135,8 @@ fn test_ctx() -> RequestContext {
         credentials: test_creds("test-key"),
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     }
 }
 

@@ -207,6 +207,17 @@ pub struct RequestLogRow {
     /// for the request, and is the default for rows predating migration 0023.
     #[serde(default)]
     pub retrieval_tokens_saved: i64,
+    /// UUID of the durable agent run this request belongs to (W0b migration
+    /// 0027). `None` for single-turn (non-agentic) requests and for rows
+    /// written before the agent-run grain shipped. Stamped by the agentic
+    /// loop in tt-core (Task 4); `None` at all non-agent call sites.
+    #[serde(default)]
+    pub run_id: Option<Uuid>,
+    /// UUID of the specific plan node / tool-call step within the agent run.
+    /// `None` for single-turn requests and for rows written before migration
+    /// 0027. Stamped alongside `run_id` by the agentic loop (Task 4).
+    #[serde(default)]
+    pub node_id: Option<Uuid>,
 }
 
 /// `skip_serializing_if` helper: the minify estimate column is omitted from
@@ -393,7 +404,8 @@ pub mod postgres {
                       format_switched, format_switch_saved_est_usd,
                       diff_applied, diff_saved_usd,
                       diff_failed, diff_failed_cost_usd,
-                      retrieval_tokens_saved)
+                      retrieval_tokens_saved,
+                      run_id, node_id)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -411,11 +423,12 @@ pub mod postgres {
                       $33, $34,
                       $35, $36,
                       $37, $38,
-                      $39)"#;
+                      $39,
+                      $40, $41)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 39;
+    pub const INSERT_BIND_COUNT: usize = 41;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -460,6 +473,8 @@ pub mod postgres {
                 .bind(row.diff_failed) // $37
                 .bind(row.diff_failed_cost_usd) // $38
                 .bind(row.retrieval_tokens_saved) // $39
+                .bind(row.run_id) // $40
+                .bind(row.node_id) // $41
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -575,6 +590,8 @@ mod tests {
             diff_failed: false,
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: 0,
+            run_id: None,
+            node_id: None,
         }
     }
 
@@ -948,6 +965,20 @@ mod tests {
         assert_eq!(row.diff_failed_cost_usd, 0.0);
         let j = serde_json::to_string(&row).unwrap();
         assert!(!j.contains("format_switched"), "{j}");
+    }
+
+    /// Back-compat: legacy JSON (rows serialized before W0b migration 0027)
+    /// deserializes with both `run_id` and `node_id` defaulting to `None`.
+    /// The new fields must carry `#[serde(default)]` so no existing persisted
+    /// row breaks on deserialization.
+    #[test]
+    fn request_log_row_carries_run_and_node_id() {
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","org_id":"00000000-0000-0000-0000-000000000000","api_key_id":"00000000-0000-0000-0000-000000000000","ts":"2026-06-27T00:00:00Z","provider":"openai","model":"m","input_tokens":1,"output_tokens":1,"cached_tokens":0,"cost_usd":0.0,"baseline_cost_usd":0.0,"cached":false,"cache_layer":null,"route_id":null,"latency_ms":1,"upstream_latency_ms":null,"status":200,"tag":null,"error_class":null,"trace_id":null}"#;
+        // Legacy row (no run_id/node_id) must still deserialize to None.
+        let row: RequestLogRow =
+            serde_json::from_str(json).expect("legacy RequestLogRow must deserialize");
+        assert_eq!(row.run_id, None);
+        assert_eq!(row.node_id, None);
     }
 
     /// Retrieval substitution accounting is token-denominated and can be

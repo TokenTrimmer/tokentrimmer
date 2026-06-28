@@ -276,6 +276,8 @@ mod tests {
             },
             tag: None,
             deadline: None,
+            run_id: None,
+            node_id: None,
         }
     }
 

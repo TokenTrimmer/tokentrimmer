@@ -123,6 +123,8 @@ async fn batch_ctx(
         credentials,
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     })
 }
 

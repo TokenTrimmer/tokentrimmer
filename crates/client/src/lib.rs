@@ -26,7 +26,7 @@ pub use async_trait::async_trait;
 pub use tools::{AggregateCost, ToolExecutor, ToolOutcome};
 
 mod agent;
-pub use agent::{AgentBuilder, AgentOutcome, Run, RunStatus, RunUsage};
+pub use agent::{AgentBuilder, AgentOutcome, AgentRunRecord, Run, RunStatus, RunUsage};
 
 mod batch;
 pub use batch::{Batch, BatchCounts};

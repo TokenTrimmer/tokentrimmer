@@ -122,6 +122,64 @@ impl Run {
     }
 }
 
+/// A run summary returned by `GET /v1/agent/runs` — the org-scoped list view.
+/// Mirrors the gateway's `DurableRunView` (no transcript — only durable state).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentRunRecord {
+    pub id: String,
+    pub status: String,
+    pub model: String,
+    pub turns: i32,
+    #[serde(default)]
+    pub max_turns: Option<i32>,
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+/// Response envelope for `GET /v1/agent/runs` (`{"object":"list","data":[…]}`).
+#[derive(Debug, Deserialize)]
+struct ListRunsBody {
+    data: Vec<AgentRunRecord>,
+}
+
+impl Client {
+    /// `GET /v1/agent/runs` — list up to 50 of the caller's agent runs,
+    /// newest first. Returns durable identity + terminal state (no transcript).
+    /// Requires a real authenticated org (401 for anonymous callers) and a
+    /// Postgres pool server-side (503 if absent).
+    ///
+    /// # Errors
+    /// [`Error::Request`] on transport failure, [`Error::Status`] on a non-2xx
+    /// response, [`Error::Decode`] if the body is not a valid list envelope.
+    pub async fn list_runs(&self) -> Result<Vec<AgentRunRecord>> {
+        let url = format!("{}/v1/agent/runs", self.base);
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.key)
+            .send()
+            .await
+            .map_err(Error::Request)?;
+        let cost = crate::parse_cost(resp.headers());
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Status {
+                status: status.as_u16(),
+                body,
+                cost: Box::new(cost),
+            });
+        }
+        resp.json::<ListRunsBody>()
+            .await
+            .map_err(Error::Decode)
+            .map(|b| b.data)
+    }
+}
+
 /// The result of driving an agent run to a terminal state (or hitting the
 /// client-side resume cap).
 #[derive(Debug, Clone)]
@@ -363,6 +421,86 @@ mod tests {
     use crate::{async_trait, system, tool, user, Client};
     use httpmock::prelude::*;
     use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // list_runs tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_runs_deserializes_data_envelope() {
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/v1/agent/runs");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "00000000-0000-0000-0000-000000000001",
+                            "status": "completed",
+                            "model": "gpt-4o-mini",
+                            "turns": 3,
+                            "max_turns": 8,
+                            "cost_usd": 0.0012,
+                            "stop_reason": null,
+                            "tag": "proj-a"
+                        },
+                        {
+                            "id": "00000000-0000-0000-0000-000000000002",
+                            "status": "failed",
+                            "model": "gpt-4o",
+                            "turns": 1,
+                            "cost_usd": 0.0003
+                        }
+                    ]
+                }));
+        });
+
+        let client = Client::new(server.base_url(), "k");
+        let runs = client.list_runs().await.unwrap();
+        m.assert();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(runs[0].status, "completed");
+        assert_eq!(runs[0].model, "gpt-4o-mini");
+        assert_eq!(runs[0].turns, 3);
+        assert_eq!(runs[0].max_turns, Some(8));
+        assert!((runs[0].cost_usd - 0.0012).abs() < 1e-9);
+        assert_eq!(runs[0].tag.as_deref(), Some("proj-a"));
+        assert!(runs[0].stop_reason.is_none());
+        assert_eq!(runs[1].id, "00000000-0000-0000-0000-000000000002");
+        assert_eq!(runs[1].status, "failed");
+        assert_eq!(runs[1].max_turns, None);
+        assert_eq!(runs[1].tag, None);
+    }
+
+    #[tokio::test]
+    async fn list_runs_empty_data_returns_empty_vec() {
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/v1/agent/runs");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({ "object": "list", "data": [] }));
+        });
+        let client = Client::new(server.base_url(), "k");
+        let runs = client.list_runs().await.unwrap();
+        m.assert();
+        assert!(runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_runs_surfaces_401_as_status_error() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/agent/runs");
+            then.status(401).body("unauthorized");
+        });
+        let client = Client::new(server.base_url(), "k");
+        let result = client.list_runs().await;
+        assert!(matches!(result, Err(Error::Status { status: 401, .. })));
+    }
 
     /// A canned client-tool executor returning a fixed string.
     struct Canned(&'static str);

@@ -151,6 +151,8 @@ pub async fn handler(
             .and_then(|v| v.to_str().ok())
             .map(String::from),
         deadline: timeout_ms_from_header(&headers).map(std::time::Duration::from_millis),
+        run_id: None,
+        node_id: None,
     };
 
     // 4. Baseline pricing on the ORIGINAL model, before routing rewrites it.

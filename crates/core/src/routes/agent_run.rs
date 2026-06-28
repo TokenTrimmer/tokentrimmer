@@ -688,6 +688,115 @@ pub(crate) async fn fetch_run(
 }
 
 // ---------------------------------------------------------------------------
+// Durable-record view types + `GET /v1/agent/runs` list (W0b Task 6)
+// ---------------------------------------------------------------------------
+
+/// Lightweight durable summary of a run — only the fields persisted in
+/// Postgres. The transcript (`messages`) is NOT included; it only lives in
+/// Redis while the run is in-flight. Callers that need the transcript should
+/// `GET /v1/agent/runs/:id` while the run is still within its Redis TTL.
+#[derive(Debug, serde::Serialize)]
+pub struct DurableRunView {
+    pub id: uuid::Uuid,
+    /// Snake-case status string from the DB: `running`, `completed`,
+    /// `incomplete`, `failed`, or `requires_action`.
+    pub status: String,
+    pub model: String,
+    pub turns: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<i32>,
+    pub cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+}
+
+/// Response body for `GET /v1/agent/runs` — an OpenAI-style `list` envelope.
+#[derive(Debug, serde::Serialize)]
+pub struct ListRunsResponse {
+    pub object: &'static str,
+    pub data: Vec<DurableRunView>,
+}
+
+/// Map a durable [`AgentRunRecord`] (read from Postgres) to a full [`Run`]
+/// view for `GET /v1/agent/runs/:id` Postgres fallback.
+///
+/// The transcript (`messages`) is NOT durable; only available while the run
+/// is in Redis. This returns `messages: vec![]` and a `note` explaining the
+/// absence. All identity + terminal-state fields are carried over.
+fn durable_record_to_run(rec: &crate::routes::agent_run_store::AgentRunRecord) -> Run {
+    let status = match rec.status.as_str() {
+        "completed" => RunStatus::Completed,
+        "incomplete" => RunStatus::Incomplete,
+        "failed" => RunStatus::Failed,
+        "requires_action" => RunStatus::RequiresAction,
+        // "running" or unknown: the run never reached a terminal state (e.g.
+        // it crashed without a `finish_agent_run` call). Map to Incomplete so
+        // the caller sees a coherent non-running status.
+        _ => RunStatus::Incomplete,
+    };
+    let stop_reason = rec.stop_reason.as_deref().and_then(|s| match s {
+        "max_turns" => Some(crate::routes::agent_run_budget::StopReason::MaxTurns),
+        "budget_exhausted" => Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted),
+        _ => None,
+    });
+    Run {
+        id: rec.id,
+        status,
+        messages: vec![],
+        turns: rec.turns as u32,
+        usage: RunUsage {
+            cost_usd: rec.cost_usd,
+            ..Default::default()
+        },
+        note: Some(
+            "durable view: transcript not available (Redis TTL expired or run in-flight)".into(),
+        ),
+        summarizer_tax_usd: None,
+        stop_reason,
+    }
+}
+
+/// `GET /v1/agent/runs` — list up to 50 of the caller's agent runs, newest
+/// first. Returns durable identity + terminal state only (no transcript —
+/// that only lives in Redis). Requires Postgres (503 if absent) and a real
+/// authenticated org (401 for anonymous / dogfood callers).
+pub async fn list_runs(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+) -> ApiResult<Json<ListRunsResponse>> {
+    let org = match ctx {
+        Some(Extension(c)) if c.org_id != crate::DOGFOOD_ORG_ID => c.org_id,
+        _ => return Err(ApiError::Unauthorized),
+    };
+    let pool = state.db_pool.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "agent run list requires a Postgres pool (none configured)".into(),
+        )
+    })?;
+    const LIST_LIMIT: i64 = 50;
+    let records = crate::routes::agent_run_store::list_agent_runs(pool, org, LIST_LIMIT).await;
+    let data = records
+        .into_iter()
+        .map(|r| DurableRunView {
+            id: r.id,
+            status: r.status,
+            model: r.model,
+            turns: r.turns,
+            max_turns: r.max_turns,
+            cost_usd: r.cost_usd,
+            stop_reason: r.stop_reason,
+            tag: r.tag,
+        })
+        .collect();
+    Ok(Json(ListRunsResponse {
+        object: "list",
+        data,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Production completer + `POST /v1/agent/runs` endpoint (slice 1a Task 4)
 // ---------------------------------------------------------------------------
 
@@ -725,6 +834,10 @@ struct RunIdentity {
     /// override (header beats body in `prepare`). All other headers — provider
     /// pin, forced route, timeout, tag, interactive — flow through unchanged.
     headers: HeaderMap,
+    /// The run's own id — set by the handler after `Uuid::new_v4()` (create) or
+    /// from `stored.id` (resume). Initialized to `Uuid::nil()` in `from_request`
+    /// so construction sites don't need a run id up front.
+    run_id: Uuid,
 }
 
 impl RunIdentity {
@@ -805,6 +918,9 @@ impl RunIdentity {
             forced_route: chat::route_override_from_header(&headers),
             idempotency_key,
             headers,
+            // Set to nil here; the handler overwrites it with the real run id
+            // after `Uuid::new_v4()` (create) or `stored.id` (resume).
+            run_id: Uuid::nil(),
         }
     }
 }
@@ -884,6 +1000,9 @@ impl TurnCompleter for GatewayCompleter<'_> {
             credentials,
             tag: self.identity.tag.clone(),
             deadline: self.identity.request_timeout,
+            // Stamp the run id so complete_once writes it on the request_logs row.
+            run_id: Some(self.identity.run_id),
+            node_id: None,
         };
 
         let request_started = std::time::Instant::now();
@@ -1106,7 +1225,7 @@ pub async fn create_run(
     headers: HeaderMap,
     Json(req): Json<CreateRunRequest>,
 ) -> ApiResult<Response> {
-    let identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
+    let mut identity = RunIdentity::from_request(auth_ctx.as_deref(), trace.0.as_str(), &headers);
     // Capture the org + non-secret routing config BEFORE `identity` is moved
     // into the completer — a paused run persists these (never any credential).
     let org_id = identity.org_id;
@@ -1130,6 +1249,22 @@ pub async fn create_run(
         resolve_summarize_config(&state, &identity, &req.model, &req.messages).await;
 
     let id = Uuid::new_v4();
+    // Stamp the run id onto the identity so each turn's RequestContext carries it.
+    identity.run_id = id;
+
+    // W0b Task 5: insert a "running" row in agent_runs (best-effort; pool
+    // absence ⇒ skip, mirroring the l1/Redis optional guard pattern).
+    if let Some(pool) = state.db_pool.as_ref() {
+        let rec = crate::routes::agent_run_store::AgentRunRecord::new_running(
+            id,
+            org_id,
+            model.clone(),
+            Some(max_turns),
+            max_cost_usd,
+            identity.tag.clone(),
+        );
+        crate::routes::agent_run_store::insert_agent_run(pool, &rec).await;
+    }
 
     if req.stream {
         let owned_state = state.clone(); // cheap Arcs; 'static for the spawned task
@@ -1151,6 +1286,21 @@ pub async fn create_run(
             .await;
             match outcome {
                 LoopOutcome::Terminal(run) => {
+                    // W0b Task 5: finalize agent_runs row (best-effort).
+                    // Copy fields before `run` is moved into the SSE event below
+                    // (all of id/status/turns/cost_usd/stop_reason are Copy).
+                    if let Some(pool) = owned_state.db_pool.as_ref() {
+                        crate::routes::agent_run_store::finish_agent_run(
+                            pool,
+                            run.id,
+                            org_id,
+                            run.status,
+                            run.turns,
+                            run.usage.cost_usd,
+                            run.stop_reason,
+                        )
+                        .await;
+                    }
                     let _ = tx.send(match run.status {
                         RunStatus::Completed => RunEvent::Completed { run },
                         RunStatus::Failed => RunEvent::Failed { run },
@@ -1186,6 +1336,16 @@ pub async fn create_run(
                     .await
                     {
                         Ok(run) => {
+                            // W0b Task 6 paused-status fix (streaming path):
+                            // same best-effort mark as the non-streaming path.
+                            if run.status == RunStatus::RequiresAction {
+                                if let Some(pool) = owned_state.db_pool.as_ref() {
+                                    crate::routes::agent_run_store::mark_run_requires_action(
+                                        pool, id, org_id,
+                                    )
+                                    .await;
+                                }
+                            }
                             let _ = tx.send(match run.status {
                                 RunStatus::RequiresAction => RunEvent::RequiresAction {
                                     run,
@@ -1241,7 +1401,22 @@ pub async fn create_run(
     )
     .await;
     match outcome {
-        LoopOutcome::Terminal(run) => Ok(Json(run).into_response()),
+        LoopOutcome::Terminal(run) => {
+            // W0b Task 5: finalize agent_runs row (best-effort; pool absence ⇒ skip).
+            if let Some(pool) = state.db_pool.as_ref() {
+                crate::routes::agent_run_store::finish_agent_run(
+                    pool,
+                    run.id,
+                    org_id,
+                    run.status,
+                    run.turns,
+                    run.usage.cost_usd,
+                    run.stop_reason,
+                )
+                .await;
+            }
+            Ok(Json(run).into_response())
+        }
         LoopOutcome::Paused {
             messages,
             turns_done,
@@ -1268,16 +1443,35 @@ pub async fn create_run(
                 summarize_cfg,
             )
             .await?;
+            // W0b Task 6 paused-status fix: mark the durable row as
+            // `requires_action` so a stale paused run (Redis TTL expired)
+            // reads correctly rather than orphaned as `running`. Best-effort.
+            if run.status == RunStatus::RequiresAction {
+                if let Some(pool) = state.db_pool.as_ref() {
+                    crate::routes::agent_run_store::mark_run_requires_action(pool, id, org_id)
+                        .await;
+                }
+            }
             Ok(Json(run).into_response())
         }
     }
 }
 
-/// `GET /v1/agent/runs/:id` — fetch a persisted run's current state. Org is
-/// derived from the authenticated key (a real key is required; anonymous /
-/// dogfood callers get 401) and embedded in the store key, so a fetch with the
-/// wrong org cleanly misses (404). Requires the L1/Redis store; without it the
-/// run was never persisted, so the handler returns 503.
+/// `GET /v1/agent/runs/:id` — fetch a persisted run's current state.
+///
+/// Org is derived from the authenticated key (a real key is required;
+/// anonymous / dogfood callers get 401). Look-up order:
+///
+/// 1. **Redis (L1)** — if configured. A hit returns the FULL run including the
+///    live transcript (messages).
+/// 2. **Postgres fallback** (W0b Task 6) — on a Redis miss (key absent/expired)
+///    or when no Redis is configured, the durable `agent_runs` row is returned.
+///    The transcript is NOT persisted to Postgres; the response has
+///    `messages: []` and a note explaining the absence.
+/// 3. **404** — if neither store holds the run for the caller's org.
+///
+/// Org-scoping is preserved on both paths: Redis keys include the org id; the
+/// Postgres query has `WHERE id=$1 AND org_id=$2`.
 pub async fn get_run(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,
@@ -1289,15 +1483,28 @@ pub async fn get_run(
         Some(Extension(c)) if c.org_id != crate::DOGFOOD_ORG_ID => c.org_id,
         _ => return Err(ApiError::Unauthorized),
     };
-    let l1 = state.l1.as_ref().ok_or_else(|| {
-        ApiError::ServiceUnavailable(
-            "agent runs require the L1/Redis store (none configured)".into(),
-        )
-    })?;
-    let stored = fetch_run(l1.cache.as_ref(), org, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("no run with id {id}")))?;
-    Ok(Json(stored.to_run()))
+
+    // (1) Try Redis first — richer view (includes the live transcript).
+    if let Some(l1) = state.l1.as_ref() {
+        match fetch_run(l1.cache.as_ref(), org, id).await {
+            Ok(Some(stored)) => return Ok(Json(stored.to_run())),
+            Ok(None) => {} // key absent → fall through to Postgres
+            Err(e) => {
+                tracing::warn!(run_id = %id, error = %e, "agent run Redis fetch failed; falling back to Postgres");
+                // fall through to Postgres
+            }
+        }
+    }
+
+    // (2) Postgres fallback — durable identity + terminal state, no transcript.
+    if let Some(pool) = state.db_pool.as_ref() {
+        if let Some(rec) = crate::routes::agent_run_store::get_agent_run(pool, id, org).await {
+            return Ok(Json(durable_record_to_run(&rec)));
+        }
+    }
+
+    // (3) Neither store holds a run for this (org, id).
+    Err(ApiError::NotFound(format!("no run with id {id}")))
 }
 
 /// One tool result the caller submits to resume a paused run: the id of the
@@ -1414,6 +1621,9 @@ pub async fn submit_tool_outputs(
     identity.provider_pin = stored.routing.provider_pin.clone();
     identity.forced_route = stored.routing.forced_route.clone();
     identity.tag = stored.routing.tag.clone();
+    // Restore the run id from the persisted record so resumed turns carry the
+    // same run_id on their request_logs rows as the initial turns did.
+    identity.run_id = stored.id;
 
     // Rebuild the production summarizer from the PERSISTED, turn-0-pinned policy
     // (no re-resolution on resume — the route could have changed). Built BEFORE
@@ -1474,6 +1684,21 @@ pub async fn submit_tool_outputs(
             stored.summarizer_tax_usd = cumulative;
             stored.pending_tool_calls = Vec::new();
             store_run(l1.cache.as_ref(), &stored).await?;
+            // W0b Task 5: finalize agent_runs row (best-effort; pool absence ⇒ skip).
+            // run.id/status/turns/cost_usd/stop_reason are all Copy so they survive
+            // the borrow used for the Redis store above.
+            if let Some(pool) = state.db_pool.as_ref() {
+                crate::routes::agent_run_store::finish_agent_run(
+                    pool,
+                    run.id,
+                    stored.org_id,
+                    run.status,
+                    run.turns,
+                    run.usage.cost_usd,
+                    run.stop_reason,
+                )
+                .await;
+            }
             run.summarizer_tax_usd = cumulative; // return the TOTAL across segments
             Ok(Json(run))
         }
@@ -1495,6 +1720,17 @@ pub async fn submit_tool_outputs(
             stored.summarizer_tax_usd = sum_metered(stored.summarizer_tax_usd, summarizer_tax_usd);
             stored.pending_tool_calls = pending_tool_calls;
             store_run(l1.cache.as_ref(), &stored).await?;
+            // W0b Task 6 paused-status fix (submit_tool_outputs re-pause):
+            // mark durable row as requires_action so a stale re-paused run
+            // reads correctly after its Redis TTL expires. Best-effort.
+            if let Some(pool) = state.db_pool.as_ref() {
+                crate::routes::agent_run_store::mark_run_requires_action(
+                    pool,
+                    stored.id,
+                    stored.org_id,
+                )
+                .await;
+            }
             Ok(Json(stored.to_run()))
         }
     }
@@ -1828,6 +2064,8 @@ fn base_request_context(identity: &RunIdentity) -> RequestContext {
         },
         tag: identity.tag.clone(),
         deadline: identity.request_timeout,
+        run_id: None,
+        node_id: None,
     }
 }
 
@@ -1944,6 +2182,66 @@ mod tests {
             content: tt_shared::messages::MessageContent::Text("r".into()),
             tool_call_id: id.into(),
         }
+    }
+
+    // ----- Task 6: durable_record_to_run mapping (written first, TDD) -----
+
+    #[test]
+    fn durable_record_to_run_maps_status_and_stop_reason() {
+        use crate::routes::agent_run_store::AgentRunRecord;
+        let mut rec = AgentRunRecord {
+            id: Uuid::nil(),
+            org_id: Uuid::nil(),
+            status: "completed".into(),
+            model: "gpt-4o".into(),
+            turns: 3,
+            max_turns: Some(8),
+            max_cost_usd: Some(1.0),
+            cost_usd: 0.42,
+            stop_reason: None,
+            tag: None,
+        };
+        let run = durable_record_to_run(&rec);
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.turns, 3);
+        assert!((run.usage.cost_usd - 0.42).abs() < 1e-9, "cost preserved");
+        assert!(run.messages.is_empty(), "no transcript in durable view");
+        assert!(run.note.is_some(), "note explains absent transcript");
+        assert!(run.stop_reason.is_none());
+
+        // incomplete + budget_exhausted
+        rec.status = "incomplete".into();
+        rec.stop_reason = Some("budget_exhausted".into());
+        let run = durable_record_to_run(&rec);
+        assert_eq!(run.status, RunStatus::Incomplete);
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted)
+        );
+
+        // max_turns stop reason
+        rec.stop_reason = Some("max_turns".into());
+        let run = durable_record_to_run(&rec);
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::MaxTurns)
+        );
+
+        // orphaned "running" row → Incomplete fallback
+        rec.status = "running".into();
+        rec.stop_reason = None;
+        let run = durable_record_to_run(&rec);
+        assert_eq!(run.status, RunStatus::Incomplete);
+
+        // requires_action maps correctly
+        rec.status = "requires_action".into();
+        let run = durable_record_to_run(&rec);
+        assert_eq!(run.status, RunStatus::RequiresAction);
+
+        // failed maps correctly
+        rec.status = "failed".into();
+        let run = durable_record_to_run(&rec);
+        assert_eq!(run.status, RunStatus::Failed);
     }
 
     // ----- is_mechanical_continuation detection (slice 2a Task 1) -----
@@ -2217,6 +2515,20 @@ mod tests {
         assert_eq!(id.org_id, Uuid::from_u128(2));
         assert_eq!(id.api_key_id, Uuid::from_u128(1));
         assert!(id.l2_allowed);
+    }
+
+    /// W0b Task 4: `run_id` is initialized to `Uuid::nil()` by `from_request`
+    /// and then overwritten by the handler with the real run id. Verify the nil
+    /// default exists (the handler assignment is integration-tested at the
+    /// complete_once/request_logs level).
+    #[test]
+    fn run_identity_run_id_initialized_to_nil() {
+        let id = RunIdentity::from_request(None, "", &HeaderMap::new());
+        assert_eq!(
+            id.run_id,
+            Uuid::nil(),
+            "run_id must be nil from from_request; handler sets it to the real run id"
+        );
     }
 
     // ----- Run store round-trip (slice 1b Task 2) -----
