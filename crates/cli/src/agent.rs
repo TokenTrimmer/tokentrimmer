@@ -89,6 +89,7 @@ pub struct RunOpts {
     pub system: Option<String>,
     pub tools: bool,
     pub max_turns: Option<u32>,
+    pub max_cost: Option<f64>,
     pub tag: Option<String>,
     pub flag_key: Option<String>,
     pub flag_base: Option<String>,
@@ -117,6 +118,9 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
     }
     if let Some(mt) = opts.max_turns {
         builder = builder.max_turns(mt);
+    }
+    if let Some(c) = opts.max_cost {
+        builder = builder.max_cost_usd(c);
     }
     if let Some(tag) = opts.tag {
         builder = builder.tag(tag);

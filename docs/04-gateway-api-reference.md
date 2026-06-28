@@ -1617,6 +1617,175 @@ The verifying key is embedded in the export preamble automatically; pass `--key-
 
 ---
 
+## 23. Agent Runs
+
+The agent-run endpoint drives a server-side model→tool→model loop without client round-trips. The loop repeats until the model returns a final (non-tool-calling) answer, `max_turns` is reached, or — when `max_cost_usd` is set — the accumulated served cost would breach the budget. All gateway tools (e.g. `tt_search`, `tt_read`) execute server-side; client-defined tools that are not gateway tools surface as a `requires_action` event/status.
+
+### 23.1 Endpoint
+
+```
+POST /v1/agent/runs
+```
+
+Authenticate the same way as chat completions (§2): a TokenTrimmer key in `Authorization: Bearer …`.
+
+### 23.2 Request body
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `model` | string | yes | Model id for every turn. Routing may rewrite it per turn. |
+| `messages` | array | yes | Initial transcript — system/user messages in OpenAI format. |
+| `tools` | array | no | Tool definitions advertised to the model. Defaults to `[]`. |
+| `max_turns` | integer | no | Turn cap; clamped to `[1, 32]`. Default: 10. |
+| `max_cost_usd` | number | no | Hard ceiling on the run's total accumulated served cost (USD). The run stops as `incomplete` with `stop_reason: "budget_exhausted"` before starting a turn that would breach it. A best-effort next-turn estimate is used to tighten the check before each turn when the model is in the pricing catalog. |
+| `stream` | boolean | no | When `true`, the response is a stream of SSE run events (see §23.4). Default `false`. |
+
+### 23.3 Response (non-streaming)
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "completed",
+  "messages": ["..."],
+  "turns": 3,
+  "usage": {
+    "prompt_tokens": 520,
+    "completion_tokens": 210,
+    "cost_usd": 0.00214,
+    "per_turn_cost_usd": [0.00063, 0.00091, 0.00060]
+  }
+}
+```
+
+An `incomplete` run that hit the budget cap looks like:
+
+```json
+{
+  "id": "...",
+  "status": "incomplete",
+  "turns": 2,
+  "usage": {
+    "prompt_tokens": 340,
+    "completion_tokens": 130,
+    "cost_usd": 0.00091,
+    "per_turn_cost_usd": [0.00063, 0.00028]
+  },
+  "stop_reason": "budget_exhausted"
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string (UUID) | Unique run identifier. |
+| `status` | string | `"completed"` — model returned a final answer; `"incomplete"` — loop stopped without a final answer (turn cap or budget); `"failed"` — a turn errored. |
+| `messages` | array | Full message transcript (request messages plus model/tool exchanges). |
+| `turns` | integer | Number of model turns completed. |
+| `usage.prompt_tokens` | integer | Accumulated prompt tokens across all turns. |
+| `usage.completion_tokens` | integer | Accumulated completion tokens across all turns. |
+| `usage.cost_usd` | number | Total accumulated served cost (USD) across all turns. |
+| `usage.per_turn_cost_usd` | number[] | Served cost (USD) of each completed turn, in turn order. Lets callers see where spend accumulated without per-turn headers. |
+| `stop_reason` | string \| null | Machine-readable termination cause — `"max_turns"` (turn cap reached) or `"budget_exhausted"` (`max_cost_usd` would have been exceeded). Omitted on `completed` and `failed` runs. |
+| `note` | string | (optional) Human-readable note on why the run ended early. |
+
+### 23.4 Response (streaming, `stream: true`)
+
+When `stream: true`, the response is an SSE stream of named run events. Events are emitted as they occur; the stream closes after the terminal event (`run.completed`, `run.incomplete`, or `run.failed`).
+
+**Event types:**
+
+| Event name | When emitted | Data fields |
+|---|---|---|
+| `run.turn` | Start of each model turn | `{ type, turn }` |
+| `run.turn_cost` | After each completed turn | `{ type, turn, turn_cost_usd, run_cost_usd, budget_remaining_usd? }` |
+| `run.message` | After each assistant message | `{ type, message }` |
+| `run.tool_result` | After each gateway tool call completes | `{ type, tool_call_id, content }` |
+| `run.completed` | Terminal — model returned a final answer | `{ type, run }` |
+| `run.incomplete` | Terminal — run stopped without a final answer | `{ type, run }` |
+| `run.failed` | Terminal — a turn errored | `{ type, run }` |
+
+**`run.turn_cost` event — fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `turn` | integer | 1-based turn index. |
+| `turn_cost_usd` | number | Served cost (USD) for this turn alone. |
+| `run_cost_usd` | number | Accumulated served cost (USD) across all turns so far, including this turn. |
+| `budget_remaining_usd` | number | (optional) Remaining budget (`max_cost_usd − run_cost_usd`). Present only when `max_cost_usd` was set on the request. |
+
+Example stream excerpt (budget-capped run, `max_cost_usd: 0.10`):
+
+```
+event: run.turn
+data: {"type":"run.turn","turn":1}
+
+event: run.message
+data: {"type":"run.message","message":{"role":"assistant","content":null,"tool_calls":[...]}}
+
+event: run.tool_result
+data: {"type":"run.tool_result","tool_call_id":"call_abc","content":"..."}
+
+event: run.turn_cost
+data: {"type":"run.turn_cost","turn":1,"turn_cost_usd":0.00063,"run_cost_usd":0.00063,"budget_remaining_usd":0.09937}
+
+event: run.turn
+data: {"type":"run.turn","turn":2}
+
+...
+
+event: run.completed
+data: {"type":"run.completed","run":{"id":"...","status":"completed","turns":3,"usage":{"prompt_tokens":520,"completion_tokens":210,"cost_usd":0.00214,"per_turn_cost_usd":[0.00063,0.00091,0.00060]}}}
+```
+
+The terminal event's embedded `run` object has the same shape as the non-streaming response (§23.3).
+
+### 23.5 Rust client (`tt-client`)
+
+The `tokentrimmer-client` crate exposes agent runs via `AgentBuilder`:
+
+```rust
+use tt_client::{async_trait, user, system, Client, ToolExecutor};
+
+// A no-op executor for runs that use only server-side (gateway) tools.
+struct NoTools;
+
+#[async_trait]
+impl ToolExecutor for NoTools {
+    async fn call(
+        &self,
+        _name: &str,
+        _arguments: &str,
+    ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(String::new())
+    }
+}
+
+let client = Client::new("https://api.tokentrimmer.com", "");
+
+let outcome = client
+    .agent()
+    .model("gpt-4o-mini")
+    .message(system("You are a helpful assistant."))
+    .message(user("Summarize the TokenTrimmer README"))
+    .max_turns(5)
+    .max_cost_usd(0.05)   // hard cost ceiling
+    .run(&NoTools)
+    .await?;
+
+let run = &outcome.run;
+println!("status: {:?}", run.status);
+println!("turns: {}", run.turns);
+println!("total cost: ${:.5}", run.usage.cost_usd);
+for (i, cost) in run.usage.per_turn_cost_usd.iter().enumerate() {
+    println!("  turn {}: ${:.5}", i + 1, cost);
+}
+```
+
+From the CLI: `tt agent run --model gpt-4o-mini --max-cost 0.05 "Summarize the README"`.
+
+---
+
 **End of API reference.**
 
 Companion docs:

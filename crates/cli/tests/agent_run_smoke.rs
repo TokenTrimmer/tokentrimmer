@@ -63,6 +63,26 @@ fn agent_run_drives_loop_and_prints_answer() {
 }
 
 #[test]
+fn agent_run_forwards_max_cost_to_body() {
+    let server = MockServer::start();
+    let create = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/agent/runs")
+            .body_includes("\"max_cost_usd\":0.5");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({
+                "id": "00000000-0000-0000-0000-000000000000",
+                "status": "completed", "messages": [], "turns": 1,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost_usd": 0.1}
+            }));
+    });
+    let out = run_agent(&server.base_url(), &["say hi", "--max-cost", "0.5"]);
+    create.assert();
+    assert!(out.status.success());
+}
+
+#[test]
 fn agent_run_with_tools_advertises_gateway_tools() {
     let server = MockServer::start();
     // Assert the four read-only gateway tools are advertised when --tools is set.
