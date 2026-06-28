@@ -4,6 +4,7 @@
 //! tasks (W1a Tasks 3–9) will add validate, store, engine, and route
 //! submodules.
 
+pub mod engine;
 pub mod executor;
 pub mod store;
 pub mod types;

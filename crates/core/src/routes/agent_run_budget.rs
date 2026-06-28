@@ -15,6 +15,14 @@ pub enum StopReason {
     BudgetExhausted,
 }
 
+/// True iff the accrued cost has reached the cap (no estimate — pure threshold check).
+///
+/// Used by the workflow engine before each intelligence node.  Returns `false`
+/// when no cap is set.
+pub(crate) fn budget_reached(accrued_usd: f64, cap: Option<f64>) -> bool {
+    would_exceed(accrued_usd, None, cap)
+}
+
 /// True iff a cap is set and `accrued + best-effort next-turn estimate` reaches
 /// it. When no estimate is available (`est_next_usd == None`), this reduces to the pure `accrued >= cap` check.
 pub(crate) fn would_exceed(accrued_usd: f64, est_next_usd: Option<f64>, cap: Option<f64>) -> bool {
