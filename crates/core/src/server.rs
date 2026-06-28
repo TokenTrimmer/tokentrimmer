@@ -101,6 +101,12 @@ pub fn build_router_with_retrieval(
         .route("/v1/chat/completions", post(routes::chat::handler))
         .route("/v1/messages", post(routes::messages::handler))
         .route("/v1/responses", post(routes::responses::handler))
+        // Workflow runs may stream a long-lived SSE response (W3c Task 3);
+        // moved from the `short` (60 s) group to the `streaming` (600 s) group.
+        .route(
+            "/v1/workflows/:id/runs",
+            post(routes::workflows::create_run),
+        )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             std::time::Duration::from_secs(STREAMING_TIMEOUT_SECS),
@@ -158,17 +164,13 @@ pub fn build_router_with_retrieval(
             "/v1/batches/:id/cancel",
             post(routes::batches::cancel_batch),
         )
-        // Workflow engine (W1a): CRUD + synchronous run + cost estimate.
-        // Mounted on the short group (60 s ceiling); W1c will add async runs.
+        // Workflow engine: CRUD + cost estimate on short (60 s); runs moved to
+        // the streaming (600 s) group above so streaming callers aren't capped.
         .route(
             "/v1/workflows",
             post(routes::workflows::create).get(routes::workflows::list),
         )
         .route("/v1/workflows/:id", get(routes::workflows::get))
-        .route(
-            "/v1/workflows/:id/runs",
-            post(routes::workflows::create_run),
-        )
         .route(
             "/v1/workflows/:id/estimate",
             post(routes::workflows::estimate),

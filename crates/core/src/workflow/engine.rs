@@ -57,6 +57,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::routes::agent_run_budget::budget_reached;
+use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{IntelligenceSpec, NodeExecutor};
 use crate::workflow::types::{ModelSelection, Node, NodeKind, NodeOutput, WorkflowDefinition};
 
@@ -73,7 +74,7 @@ pub(crate) enum WfStatus {
 }
 
 /// Returned by [`run_workflow`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WorkflowRunResult {
     pub status: WfStatus,
     pub cost_usd: f64,
@@ -119,13 +120,24 @@ const DEFAULT_MAX_TURNS: u32 = 8;
 /// for the stop decision; node caps are still passed to the executor for its
 /// own per-node guard).
 /// `journal` is called synchronously after every executed node.
+/// `events` is an optional channel sink; when `Some`, the engine emits
+/// [`WfEvent::NodeStart`] / [`WfEvent::NodeDone`] for every executed node and
+/// a terminal [`WfEvent::RunDone`] before returning.  When `None` the sync
+/// path is byte-identical.
 pub(crate) async fn run_workflow(
     executor: &dyn NodeExecutor,
     def: &WorkflowDefinition,
     inputs: &serde_json::Value,
     run_max_cost_usd: Option<f64>,
     mut journal: impl FnMut(NodeJournalEntry),
+    events: Option<&tokio::sync::mpsc::UnboundedSender<WfEvent>>,
 ) -> WorkflowRunResult {
+    // No-op when events is None; Option<&T> is Copy so captured by value.
+    let emit = |ev: WfEvent| {
+        if let Some(tx) = events {
+            let _ = tx.send(ev);
+        }
+    };
     // ---- 1. Find the Trigger node -----------------------------------------
     let trigger_id = match def
         .nodes
@@ -134,6 +146,12 @@ pub(crate) async fn run_workflow(
     {
         Some(n) => n.id.clone(),
         None => {
+            emit(WfEvent::RunDone {
+                status: "failed".to_string(),
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+            });
             return WorkflowRunResult {
                 status: WfStatus::Failed,
                 cost_usd: 0.0,
@@ -152,6 +170,12 @@ pub(crate) async fn run_workflow(
     let topo_order = match topo_sort(def, &adj) {
         Ok(order) => order,
         Err(e) => {
+            emit(WfEvent::RunDone {
+                status: "failed".to_string(),
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+            });
             return WorkflowRunResult {
                 status: WfStatus::Failed,
                 cost_usd: 0.0,
@@ -186,6 +210,12 @@ pub(crate) async fn run_workflow(
             None => continue, // shouldn't happen in a validated definition
         };
 
+        // Emit NodeStart for every reachable node (including Trigger, which is
+        // not journaled — this is the GOTCHA the brief warns about).
+        emit(WfEvent::NodeStart {
+            node_id: node_id.clone(),
+        });
+
         match &node.kind {
             // ------------------------------------------------------------------
             NodeKind::Trigger => {
@@ -198,6 +228,14 @@ pub(crate) async fn run_workflow(
                 outputs.insert(node_id.clone(), out);
                 propagate_edges(node_id, def, &mut reachable);
                 // Trigger is not journaled (no model/cost).
+                emit(WfEvent::NodeDone {
+                    node_id: node_id.clone(),
+                    cost_usd: 0.0,
+                    run_cost_usd: accrued,
+                    baseline_cost_usd: accrued_baseline,
+                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                });
             }
 
             // ------------------------------------------------------------------
@@ -219,6 +257,14 @@ pub(crate) async fn run_workflow(
                 });
                 outputs.insert(node_id.clone(), out);
                 propagate_edges(node_id, def, &mut reachable);
+                emit(WfEvent::NodeDone {
+                    node_id: node_id.clone(),
+                    cost_usd: 0.0,
+                    run_cost_usd: accrued,
+                    baseline_cost_usd: accrued_baseline,
+                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                });
             }
 
             // ------------------------------------------------------------------
@@ -243,6 +289,14 @@ pub(crate) async fn run_workflow(
                 // Chosen arm + any unconditional explicit edges from this node.
                 reachable.insert(taken.clone());
                 propagate_edges(node_id, def, &mut reachable);
+                emit(WfEvent::NodeDone {
+                    node_id: node_id.clone(),
+                    cost_usd: 0.0,
+                    run_cost_usd: accrued,
+                    baseline_cost_usd: accrued_baseline,
+                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                });
             }
 
             // ------------------------------------------------------------------
@@ -253,6 +307,12 @@ pub(crate) async fn run_workflow(
             } => {
                 // Budget check BEFORE calling the executor.
                 if budget_reached(accrued, run_max_cost_usd) {
+                    emit(WfEvent::RunDone {
+                        status: "budget_exhausted".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd: (accrued_baseline - accrued).max(0.0),
+                    });
                     return WorkflowRunResult {
                         status: WfStatus::BudgetExhausted,
                         cost_usd: accrued,
@@ -265,6 +325,12 @@ pub(crate) async fn run_workflow(
 
                 // Auto is not supported in W1a.
                 if matches!(selection, ModelSelection::Auto) {
+                    emit(WfEvent::RunDone {
+                        status: "failed".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd: (accrued_baseline - accrued).max(0.0),
+                    });
                     return WorkflowRunResult {
                         status: WfStatus::Failed,
                         cost_usd: accrued,
@@ -290,6 +356,12 @@ pub(crate) async fn run_workflow(
 
                 match executor.run_intelligence(node_id, &spec).await {
                     Err(e) => {
+                        emit(WfEvent::RunDone {
+                            status: "failed".to_string(),
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd: (accrued_baseline - accrued).max(0.0),
+                        });
                         return WorkflowRunResult {
                             status: WfStatus::Failed,
                             cost_usd: accrued,
@@ -302,6 +374,7 @@ pub(crate) async fn run_workflow(
                     Ok(out) => {
                         accrued += out.cost_usd;
                         accrued_baseline += out.baseline_cost_usd;
+                        let node_cost_usd = out.cost_usd; // f64 is Copy; captured before move
                         journal(NodeJournalEntry {
                             node_id: node_id.clone(),
                             status: "completed".into(),
@@ -312,6 +385,14 @@ pub(crate) async fn run_workflow(
                         });
                         outputs.insert(node_id.clone(), out);
                         propagate_edges(node_id, def, &mut reachable);
+                        emit(WfEvent::NodeDone {
+                            node_id: node_id.clone(),
+                            cost_usd: node_cost_usd,
+                            run_cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                            budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                        });
                     }
                 }
             }
@@ -326,6 +407,12 @@ pub(crate) async fn run_workflow(
             } => {
                 // Budget check BEFORE calling the executor.
                 if budget_reached(accrued, run_max_cost_usd) {
+                    emit(WfEvent::RunDone {
+                        status: "budget_exhausted".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd: (accrued_baseline - accrued).max(0.0),
+                    });
                     return WorkflowRunResult {
                         status: WfStatus::BudgetExhausted,
                         cost_usd: accrued,
@@ -338,6 +425,12 @@ pub(crate) async fn run_workflow(
 
                 // Auto is not supported in W1a.
                 if matches!(selection, ModelSelection::Auto) {
+                    emit(WfEvent::RunDone {
+                        status: "failed".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd: (accrued_baseline - accrued).max(0.0),
+                    });
                     return WorkflowRunResult {
                         status: WfStatus::Failed,
                         cost_usd: accrued,
@@ -363,6 +456,12 @@ pub(crate) async fn run_workflow(
 
                 match executor.run_intelligence(node_id, &spec).await {
                     Err(e) => {
+                        emit(WfEvent::RunDone {
+                            status: "failed".to_string(),
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd: (accrued_baseline - accrued).max(0.0),
+                        });
                         return WorkflowRunResult {
                             status: WfStatus::Failed,
                             cost_usd: accrued,
@@ -375,6 +474,7 @@ pub(crate) async fn run_workflow(
                     Ok(out) => {
                         accrued += out.cost_usd;
                         accrued_baseline += out.baseline_cost_usd;
+                        let node_cost_usd = out.cost_usd; // f64 is Copy; captured before move
                         journal(NodeJournalEntry {
                             node_id: node_id.clone(),
                             status: "completed".into(),
@@ -385,6 +485,14 @@ pub(crate) async fn run_workflow(
                         });
                         outputs.insert(node_id.clone(), out);
                         propagate_edges(node_id, def, &mut reachable);
+                        emit(WfEvent::NodeDone {
+                            node_id: node_id.clone(),
+                            cost_usd: node_cost_usd,
+                            run_cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                            budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                        });
                     }
                 }
             }
@@ -402,15 +510,30 @@ pub(crate) async fn run_workflow(
                 // Output nodes can theoretically have outgoing edges (to another
                 // Output that aggregates); propagate for completeness.
                 propagate_edges(node_id, def, &mut reachable);
+                emit(WfEvent::NodeDone {
+                    node_id: node_id.clone(),
+                    cost_usd: 0.0,
+                    run_cost_usd: accrued,
+                    baseline_cost_usd: accrued_baseline,
+                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                });
             }
         }
     }
 
+    let saved_usd = (accrued_baseline - accrued).max(0.0);
+    emit(WfEvent::RunDone {
+        status: "completed".to_string(),
+        cost_usd: accrued,
+        baseline_cost_usd: accrued_baseline,
+        saved_usd,
+    });
     WorkflowRunResult {
         status: WfStatus::Succeeded,
         cost_usd: accrued,
         baseline_cost_usd: accrued_baseline,
-        saved_usd: (accrued_baseline - accrued).max(0.0),
+        saved_usd,
         node_outputs: collected_outputs,
         error: None,
     }
@@ -918,9 +1041,14 @@ mod tests {
         ]);
 
         let mut journal_entries: Vec<NodeJournalEntry> = Vec::new();
-        let result = run_workflow(&stub, &def, &json!("hello"), None, |e| {
-            journal_entries.push(e)
-        })
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hello"),
+            None,
+            |e| journal_entries.push(e),
+            None,
+        )
         .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
@@ -968,9 +1096,14 @@ mod tests {
         let mut journal_entries: Vec<NodeJournalEntry> = Vec::new();
         // cap = 0.20: before m1 accrued=0.0 < 0.20 → runs; after m1 accrued=0.25 >= 0.20
         // → before m2 budget_reached=true → BudgetExhausted.
-        let result = run_workflow(&stub, &def, &json!("hi"), Some(0.20), |e| {
-            journal_entries.push(e)
-        })
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hi"),
+            Some(0.20),
+            |e| journal_entries.push(e),
+            None,
+        )
         .await;
 
         assert_eq!(result.status, WfStatus::BudgetExhausted);
@@ -1015,9 +1148,14 @@ mod tests {
 
         // Input "yes" → cond `{{input}} == "yes"` is true → when_true = m_yes.
         let mut journal_entries: Vec<NodeJournalEntry> = Vec::new();
-        let result = run_workflow(&stub, &def, &json!("yes"), None, |e| {
-            journal_entries.push(e)
-        })
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("yes"),
+            None,
+            |e| journal_entries.push(e),
+            None,
+        )
         .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
@@ -1048,9 +1186,14 @@ mod tests {
         )]);
 
         let mut journal_entries: Vec<NodeJournalEntry> = Vec::new();
-        let result = run_workflow(&stub, &def, &json!("hello"), None, |e| {
-            journal_entries.push(e)
-        })
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hello"),
+            None,
+            |e| journal_entries.push(e),
+            None,
+        )
         .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
@@ -1178,7 +1321,7 @@ mod tests {
             ),
         ]);
 
-        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}).await;
+        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}, None).await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
         // cost: 0.10 + 0.05 = 0.15
@@ -1227,9 +1370,195 @@ mod tests {
             ),
         ]);
 
-        let result = run_workflow(&stub, &def, &json!("x"), None, |_| {}).await;
+        let result = run_workflow(&stub, &def, &json!("x"), None, |_| {}, None).await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
         assert_eq!(result.saved_usd, 0.0, "saved_usd must not go negative");
+    }
+
+    // ---- Task 2: optional event sink ----------------------------------------
+
+    /// Event sink emits NodeStart + NodeDone for every executed node (including
+    /// Trigger and Output which are not journaled) and exactly one terminal
+    /// RunDone whose cost_usd / saved_usd match the WorkflowRunResult.
+    #[tokio::test]
+    async fn run_workflow_emits_node_and_run_events() {
+        // Sequential def: t → m1 → m2 → o (4 reachable nodes)
+        let def = make_sequential_def();
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("r1"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.20,
+                    model_used: Some("haiku".into()),
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("r2"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.15,
+                    model_used: Some("haiku".into()),
+                },
+            ),
+        ]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
+        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}, Some(&tx)).await;
+        drop(tx); // close the channel so try_recv returns Disconnected when drained
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+
+        // Drain all events.
+        let mut events: Vec<WfEvent> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Expect: NodeStart(t), NodeDone(t), NodeStart(m1), NodeDone(m1),
+        //         NodeStart(m2), NodeDone(m2), NodeStart(o), NodeDone(o), RunDone
+        assert_eq!(
+            events.len(),
+            9,
+            "expected 9 events (4 nodes × 2 + RunDone); got {events:?}"
+        );
+
+        // Pair each NodeStart with the following NodeDone for expected node_ids.
+        let node_order = ["t", "m1", "m2", "o"];
+        for (i, expected_id) in node_order.iter().enumerate() {
+            let start_idx = i * 2;
+            let done_idx = start_idx + 1;
+            match &events[start_idx] {
+                WfEvent::NodeStart { node_id } => {
+                    assert_eq!(node_id, expected_id, "NodeStart[{i}] wrong node_id")
+                }
+                other => panic!("events[{start_idx}] expected NodeStart, got {other:?}"),
+            }
+            match &events[done_idx] {
+                WfEvent::NodeDone { node_id, .. } => {
+                    assert_eq!(node_id, expected_id, "NodeDone[{i}] wrong node_id")
+                }
+                other => panic!("events[{done_idx}] expected NodeDone, got {other:?}"),
+            }
+        }
+
+        // Final event must be RunDone matching WorkflowRunResult.
+        match &events[8] {
+            WfEvent::RunDone {
+                status,
+                cost_usd,
+                baseline_cost_usd,
+                saved_usd,
+            } => {
+                assert_eq!(status, "completed");
+                assert!(
+                    (cost_usd - result.cost_usd).abs() < 1e-9,
+                    "RunDone cost_usd {cost_usd} != result {}",
+                    result.cost_usd
+                );
+                assert!(
+                    (baseline_cost_usd - result.baseline_cost_usd).abs() < 1e-9,
+                    "RunDone baseline_cost_usd mismatch"
+                );
+                assert!(
+                    (saved_usd - result.saved_usd).abs() < 1e-9,
+                    "RunDone saved_usd {saved_usd} != result {}",
+                    result.saved_usd
+                );
+            }
+            other => panic!("events[8] expected RunDone, got {other:?}"),
+        }
+
+        // Verify burndown in NodeDone(m1): run_cost=0.10, saved_so_far=0.10 (0.20-0.10).
+        if let WfEvent::NodeDone {
+            run_cost_usd,
+            saved_usd_so_far,
+            ..
+        } = &events[3]
+        {
+            assert!(
+                (run_cost_usd - 0.10).abs() < 1e-9,
+                "m1 NodeDone run_cost_usd expected 0.10, got {run_cost_usd}"
+            );
+            assert!(
+                (saved_usd_so_far - 0.10).abs() < 1e-9,
+                "m1 NodeDone saved_usd_so_far expected 0.10, got {saved_usd_so_far}"
+            );
+        } else {
+            panic!("events[3] not NodeDone");
+        }
+    }
+
+    /// With events=None the returned WorkflowRunResult is byte-identical to
+    /// the Some(&tx) run — the event sink does not affect the sync result path.
+    #[tokio::test]
+    async fn run_workflow_none_events_is_sync_identical() {
+        let def = make_sequential_def();
+        let responses = vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("r1"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.20,
+                    model_used: Some("haiku".into()),
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("r2"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.15,
+                    model_used: Some("haiku".into()),
+                },
+            ),
+        ];
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
+        let result_with_events = run_workflow(
+            &StubExecutor::new(responses.clone()),
+            &def,
+            &json!("hi"),
+            None,
+            |_| {},
+            Some(&tx),
+        )
+        .await;
+        drop(tx);
+
+        let result_none = run_workflow(
+            &StubExecutor::new(responses),
+            &def,
+            &json!("hi"),
+            None,
+            |_| {},
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result_with_events.status, result_none.status,
+            "status must be identical"
+        );
+        assert!(
+            (result_with_events.cost_usd - result_none.cost_usd).abs() < 1e-9,
+            "cost_usd must be identical"
+        );
+        assert!(
+            (result_with_events.baseline_cost_usd - result_none.baseline_cost_usd).abs() < 1e-9,
+            "baseline_cost_usd must be identical"
+        );
+        assert!(
+            (result_with_events.saved_usd - result_none.saved_usd).abs() < 1e-9,
+            "saved_usd must be identical"
+        );
+        assert_eq!(
+            result_with_events.error, result_none.error,
+            "error must be identical"
+        );
     }
 }
