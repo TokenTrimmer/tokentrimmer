@@ -1148,6 +1148,78 @@ async fn drive_run_loop(
     .await
 }
 
+/// Drive ONE workflow node through the gateway agent path.
+///
+/// Model nodes should pass `max_turns = 1`; Agent nodes pass their configured
+/// cap.  Builds a per-node [`RunIdentity`] — the workflow's `run_id` is stamped
+/// on every request_log row for billing attribution; `trace_id` and
+/// `idempotency_key` are fresh per invocation.
+///
+/// # node_id
+/// `node_id` is accepted for future attribution: in W1a it is NOT threaded into
+/// `request_logs` (the `RunIdentity` has no `node_id` field; the ctx seam that
+/// carries it exists but is always `None` today).  The `run_id` attribution is
+/// the load-bearing part for billing.  Node-level logging is a W2 follow-up.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drive_workflow_node(
+    state: &AppState,
+    org_id: Uuid,
+    api_key_id: Uuid,
+    caller_tier: Option<tt_shared::CallerTier>,
+    l2_allowed: bool,
+    raw_bearer: String,
+    run_id: Uuid,
+    node_id: String,
+    model: String,
+    messages: Vec<Message>,
+    tools: Vec<tt_shared::messages::Tool>,
+    max_turns: u32,
+    max_cost_usd: Option<f64>,
+    route_ref: Option<String>,
+    tag: Option<String>,
+) -> LoopOutcome {
+    // node_id: not yet threaded to request_logs in W1a (see doc comment).
+    let _ = node_id;
+
+    let identity = RunIdentity {
+        org_id,
+        api_key_id,
+        caller_tier,
+        l2_allowed,
+        raw_bearer,
+        // Fresh trace + idempotency per node invocation — a workflow run may
+        // invoke many nodes concurrently in later tasks; per-node traces keep
+        // them distinguishable in the request_logs table.
+        trace_id: Uuid::new_v4(),
+        tag,
+        // No per-node request timeout — the workflow engine owns deadline mgmt.
+        request_timeout: None,
+        // No provider pin — let routing / forced_route drive provider selection.
+        provider_pin: None,
+        // route_ref → forced_route: the node's ModelSelection::Route variant
+        // sets this so the per-turn routing step picks the right named route.
+        forced_route: route_ref,
+        idempotency_key: Uuid::new_v4().to_string(),
+        // No incoming HTTP headers for a workflow node; the per-turn completer
+        // resolves everything from the identity fields above.
+        headers: HeaderMap::new(),
+        run_id,
+    };
+    drive_run_loop(
+        state,
+        identity,
+        run_id,
+        model,
+        messages,
+        tools,
+        max_turns,
+        max_cost_usd,
+        None, // no summarizer in W1a workflow nodes
+        None, // no SSE event sink
+    )
+    .await
+}
+
 /// Handle a paused run: Redis present ⇒ persist a `RequiresAction` `StoredRun`
 /// (returns its `Run` view); no Redis ⇒ the 1a `Incomplete` fallback `Run`. The
 /// returned `Run.status` discriminates the two for the caller.
