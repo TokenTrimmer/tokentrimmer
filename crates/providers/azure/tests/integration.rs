@@ -30,6 +30,8 @@ fn make_ctx(base_url: &str) -> RequestContext {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     }
 }
 
@@ -193,6 +195,8 @@ async fn missing_base_url_errors_before_network() {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     };
     let err = provider()
         .chat_completion(request("gpt-4o"), &ctx)

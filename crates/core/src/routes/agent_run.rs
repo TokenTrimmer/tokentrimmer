@@ -884,6 +884,8 @@ impl TurnCompleter for GatewayCompleter<'_> {
             credentials,
             tag: self.identity.tag.clone(),
             deadline: self.identity.request_timeout,
+            run_id: None,
+            node_id: None,
         };
 
         let request_started = std::time::Instant::now();
@@ -1828,6 +1830,8 @@ fn base_request_context(identity: &RunIdentity) -> RequestContext {
         },
         tag: identity.tag.clone(),
         deadline: identity.request_timeout,
+        run_id: None,
+        node_id: None,
     }
 }
 

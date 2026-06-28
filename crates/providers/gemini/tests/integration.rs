@@ -34,6 +34,8 @@ fn make_ctx(base_url: &str) -> RequestContext {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     }
 }
 
@@ -464,6 +466,8 @@ async fn request_uses_api_key_header() {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     };
 
     let resp = provider()
@@ -526,6 +530,8 @@ async fn ssrf_guard_rejects_link_local_base_url() {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     };
 
     // Non-streaming path must be blocked before any HTTP dispatch.
@@ -570,6 +576,8 @@ async fn ssrf_guard_rejects_loopback_when_not_allow_local() {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     };
 
     let err = prod_provider

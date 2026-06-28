@@ -35,6 +35,8 @@ fn make_ctx(base_url: &str) -> RequestContext {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     }
 }
 

@@ -55,6 +55,12 @@ pub struct RequestContext {
     pub tag: Option<String>,
     /// Deadline for the entire request. Adapters should respect this.
     pub deadline: Option<Duration>,
+    /// Agent run ID — set when this request belongs to an agent run loop
+    /// (W0b durable-run-grain). `None` for standalone (non-agent) requests.
+    pub run_id: Option<Uuid>,
+    /// Agent node/step ID within the run — set alongside `run_id`.
+    /// `None` for standalone requests.
+    pub node_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,5 +88,30 @@ impl SecretString {
 impl std::fmt::Debug for SecretString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SecretString(****)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_context_defaults_run_id_none() {
+        let ctx = RequestContext {
+            trace_id: Uuid::nil(),
+            org_id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            credentials: ProviderCredentials {
+                api_key: SecretString::new("test"),
+                base_url: None,
+                extra_headers: Vec::new(),
+            },
+            tag: None,
+            deadline: None,
+            run_id: None,
+            node_id: None,
+        };
+        assert_eq!(ctx.run_id, None);
+        assert_eq!(ctx.node_id, None);
     }
 }

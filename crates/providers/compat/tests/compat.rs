@@ -33,6 +33,8 @@ fn make_ctx(base_url: &str) -> RequestContext {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     }
 }
 
@@ -433,6 +435,8 @@ async fn extra_headers_denylist_drops_auth_and_host() {
         },
         tag: None,
         deadline: None,
+        run_id: None,
+        node_id: None,
     };
 
     // The mock asserts that Authorization = "Bearer test-key" (not "Bearer evil")

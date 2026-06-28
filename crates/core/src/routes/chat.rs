@@ -2164,6 +2164,8 @@ pub async fn handler(
             .and_then(|v| v.to_str().ok())
             .map(String::from),
         deadline: request_timeout,
+        run_id: None,
+        node_id: None,
     };
 
     // 2c+. Shared per-request setup (routing → route-action capture → redaction

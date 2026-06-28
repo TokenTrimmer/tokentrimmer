@@ -898,6 +898,8 @@ mod tests {
             },
             tag: tag.map(String::from),
             deadline: None,
+            run_id: None,
+            node_id: None,
         }
     }
 
