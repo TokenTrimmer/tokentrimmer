@@ -135,6 +135,7 @@ const MAX_SUBWORKFLOW_DEPTH: u32 = 5;
 /// Public entry point — accepts any `impl FnMut + Send + 'a`.
 /// Boxes the journal to type-erase it before delegating to
 /// [`run_workflow_boxed`], which is the concrete (non-generic) recursive impl.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_workflow<'a>(
     executor: &'a dyn NodeExecutor,
     def: &'a WorkflowDefinition,
@@ -164,6 +165,7 @@ pub(crate) fn run_workflow<'a>(
 /// erases at code-gen.  That gives the monomorphiser a single concrete version of
 /// the function, breaking the infinite-instantiation chain that an
 /// `impl FnMut + Send` generic parameter would produce.
+#[allow(clippy::too_many_arguments)]
 fn run_workflow_boxed<'a>(
     executor: &'a dyn NodeExecutor,
     def: &'a WorkflowDefinition,
