@@ -261,6 +261,76 @@ tt advise ./my-app --describe "a customer-support chatbot"
 
 ---
 
+## `tt workflow check`
+
+Validate a `WorkflowDefinition` JSON file offline, project its cost, and
+optionally diff against a prior estimate baseline. **Fully offline — no network
+call, no API key required.**
+
+`tt workflow check` does three things in order:
+
+1. **Validate** — parses and structurally validates the definition (DAG shape,
+   node references, model resolution). `ModelSelection::Auto` is always rejected
+   at this stage — every model node must pin a concrete model id or a
+   `route_ref`. All other pinned model ids are accepted without a registry call.
+2. **Estimate** — projects the cost with a per-node breakdown. The estimate is a
+   **linear upper-bound projection**: a Branch node counts the cost of *all* its
+   arms (not just one); a Loop node is *not* multiplied by `max_iters`. Treat the
+   total as a conservative ceiling, not an exact prediction. Nodes using a
+   `Route` selection (unresolvable offline) get `cost_usd = null` and surface a
+   warning instead of a hard error.
+3. **Diff** (optional) — if `--baseline` is given, prints a per-node delta and a
+   net `▲`/`▼` summary against a prior estimate dump.
+
+### Synopsis
+
+```
+tt workflow check <file.json> [--inputs <json>] [--output <path>] \
+                               [--baseline <prior.json>] [--fail-on-cost-increase]
+```
+
+### Flags
+
+- `<file.json>` **(required)** — path to the `WorkflowDefinition` JSON file.
+- `--inputs <json>` — JSON string substituted for `{{input}}` in node prompts
+  during estimation. Use this to simulate a realistic trigger payload and get
+  a more accurate token count.
+- `--output <path>` — write the current `WorkflowEstimate` as JSON to this
+  path. The resulting file is the format consumed by `--baseline`.
+- `--baseline <prior.json>` — path to a prior estimate dump (written by
+  `--output`). Prints a per-node cost diff and a net delta.
+- `--fail-on-cost-increase` — exit non-zero when the projected cost exceeds the
+  baseline. Requires `--baseline`. Intended for CI cost-regression gates.
+- `--no-color` — disable colored/ANSI output.
+
+### Caveats
+
+- `ModelSelection::Auto` is rejected by validation — this is a hard error. Pin a
+  model id (`"type": "model", "model": "gpt-4o-mini"`) or a named route ref
+  before running the check.
+- The cost estimate is a **linear sum**: a Branch counts all arms; a Loop's body
+  is counted once regardless of `max_iters`. Use the result as a per-run ceiling
+  when deciding whether a workflow is cost-safe, not as an exact runtime figure.
+
+### CI cost-gate example
+
+```yaml
+# .github/workflows/cost-gate.yml
+- name: Check workflow cost
+  run: |
+    tt workflow check flows/summarise.json \
+      --baseline flows/summarise.baseline.json \
+      --fail-on-cost-increase
+```
+
+```bash
+# Capture today's estimate as the new baseline after an approved cost increase:
+tt workflow check flows/summarise.json --output flows/summarise.baseline.json
+git add flows/summarise.baseline.json && git commit -m "chore: update cost baseline"
+```
+
+---
+
 ## `tt route`
 
 Manage per-org routing rules on the gateway (list / show / add / rm). Routing is
