@@ -48,7 +48,8 @@
 //!
 //! # Limitations (W1a MVP)
 //!
-//! - Strictly sequential execution within topological order (no parallelism).
+//! - Model/Agent nodes in the same wave run concurrently (W3a-1 Task 2);
+//!   control nodes (Trigger, Transform, Branch, Output) are always sequential.
 //! - A single explicit `def.edges` arc from a Branch node is treated as
 //!   unconditional; avoid adding explicit outgoing edges from Branch nodes.
 //! - The topo order is defensive: if validate somehow missed a cycle the engine
@@ -59,6 +60,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::routes::agent_run_budget::budget_reached;
 use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{IntelligenceSpec, NodeExecutor};
+use crate::workflow::schedule;
 use crate::workflow::types::{ModelSelection, Node, NodeKind, NodeOutput, WorkflowDefinition};
 
 // ---------------------------------------------------------------------------
@@ -199,328 +201,357 @@ pub(crate) async fn run_workflow(
     let mut reachable: HashSet<String> = HashSet::new();
     reachable.insert(trigger_id.clone());
 
-    // ---- 6. Execute in topological order ------------------------------------
-    for node_id in &topo_order {
-        if !reachable.contains(node_id) {
-            continue; // not-taken branch arm or orphan
+    // ---- 6. Build wavefront scheduling data --------------------------------
+    let topo_index: HashMap<String, usize> = topo_order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), i))
+        .collect();
+    let pred = schedule::build_rev_adj(&adj);
+    let mut done: HashSet<String> = HashSet::new();
+
+    // ---- 7. Execute via wavefront (concurrent within each wave) ---------------
+    loop {
+        let mut wave = schedule::ready_nodes(&reachable, &done, &pred);
+        if wave.is_empty() {
+            break;
         }
+        // Stable topo order ensures deterministic fold and event ordering.
+        wave.sort_by_key(|id| topo_index.get(id).copied().unwrap_or(usize::MAX));
 
-        let node = match node_map.get(node_id.as_str()) {
-            Some(n) => n,
-            None => continue, // shouldn't happen in a validated definition
-        };
+        // Partition into Model/Agent (concurrent async) and Control (sequential).
+        // Control nodes run AFTER the Model/Agent batch so any model outputs in
+        // the same wave are available to them (mixed waves are rare but handled
+        // deterministically).
+        let (model_agent_wave, control_wave): (Vec<String>, Vec<String>) =
+            wave.into_iter().partition(|id| {
+                matches!(
+                    node_map.get(id.as_str()).map(|n| &n.kind),
+                    Some(NodeKind::Model { .. }) | Some(NodeKind::Agent { .. })
+                )
+            });
 
-        // Emit NodeStart for every reachable node (including Trigger, which is
-        // not journaled — this is the GOTCHA the brief warns about).
-        emit(WfEvent::NodeStart {
-            node_id: node_id.clone(),
-        });
-
-        match &node.kind {
-            // ------------------------------------------------------------------
-            NodeKind::Trigger => {
-                let out = NodeOutput {
-                    content: inputs.clone(),
-                    cost_usd: 0.0,
-                    baseline_cost_usd: 0.0,
-                    model_used: None,
-                };
-                outputs.insert(node_id.clone(), out);
-                propagate_edges(node_id, def, &mut reachable);
-                // Trigger is not journaled (no model/cost).
-                emit(WfEvent::NodeDone {
-                    node_id: node_id.clone(),
-                    cost_usd: 0.0,
-                    run_cost_usd: accrued,
+        // ==============================================================
+        // A. Concurrent Model/Agent batch
+        // ==============================================================
+        if !model_agent_wave.is_empty() {
+            // HARD BUDGET GATE — checked once before launching any node in the wave.
+            //
+            // GUARANTEE: no Model/Agent node is ever LAUNCHED when accrued >= cap.
+            // OVERSHOOT BOUND: if the gate passes (accrued < cap), ALL nodes in
+            // the wave launch concurrently. Their individual costs are unknown
+            // pre-launch, so accrued may overshoot the cap by up to
+            // sum(launched-node costs) before the gate is re-checked at the start
+            // of the next wave. Per-node cost reservation is not attempted (costs
+            // are unknown until completion). This is the endorsed bound for
+            // concurrent execution; the guarantee is "never launch past cap".
+            if budget_reached(accrued, run_max_cost_usd) {
+                let saved_usd = (accrued_baseline - accrued).max(0.0);
+                emit(WfEvent::RunDone {
+                    status: "budget_exhausted".to_string(),
+                    cost_usd: accrued,
                     baseline_cost_usd: accrued_baseline,
-                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
-                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                    saved_usd,
                 });
-            }
-
-            // ------------------------------------------------------------------
-            NodeKind::Transform { expr } => {
-                let value = substitute(expr, &trigger_id, &outputs);
-                let out = NodeOutput {
-                    content: serde_json::Value::String(value.clone()),
-                    cost_usd: 0.0,
-                    baseline_cost_usd: 0.0,
-                    model_used: None,
-                };
-                journal(NodeJournalEntry {
-                    node_id: node_id.clone(),
-                    status: "completed".into(),
-                    output: Some(serde_json::Value::String(value)),
-                    cost_usd: 0.0,
-                    model_used: None,
+                return WorkflowRunResult {
+                    status: WfStatus::BudgetExhausted,
+                    cost_usd: accrued,
+                    baseline_cost_usd: accrued_baseline,
+                    saved_usd,
+                    node_outputs: collected_outputs,
                     error: None,
-                });
-                outputs.insert(node_id.clone(), out);
-                propagate_edges(node_id, def, &mut reachable);
-                emit(WfEvent::NodeDone {
-                    node_id: node_id.clone(),
-                    cost_usd: 0.0,
-                    run_cost_usd: accrued,
-                    baseline_cost_usd: accrued_baseline,
-                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
-                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
-                });
+                };
             }
 
-            // ------------------------------------------------------------------
-            NodeKind::Branch {
-                cond,
-                when_true,
-                when_false,
-            } => {
-                let taken = if eval_cond(cond, &trigger_id, &outputs) {
-                    when_true.clone()
-                } else {
-                    when_false.clone()
+            // Build IntelligenceSpecs sequentially — reads `outputs` and
+            // `trigger_id` which are not touched by the concurrent futures.
+            let mut specs: Vec<(String, IntelligenceSpec)> = Vec::new();
+            for node_id in &model_agent_wave {
+                let node = match node_map.get(node_id.as_str()) {
+                    Some(n) => n,
+                    None => {
+                        done.insert(node_id.clone());
+                        continue;
+                    }
                 };
-                journal(NodeJournalEntry {
-                    node_id: node_id.clone(),
-                    status: "completed".into(),
-                    output: Some(serde_json::Value::String(taken.clone())),
-                    cost_usd: 0.0,
-                    model_used: None,
-                    error: None,
-                });
-                // Chosen arm + any unconditional explicit edges from this node.
-                reachable.insert(taken.clone());
-                propagate_edges(node_id, def, &mut reachable);
-                emit(WfEvent::NodeDone {
-                    node_id: node_id.clone(),
-                    cost_usd: 0.0,
-                    run_cost_usd: accrued,
-                    baseline_cost_usd: accrued_baseline,
-                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
-                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
-                });
+                match &node.kind {
+                    NodeKind::Model {
+                        selection,
+                        prompt,
+                        max_cost_usd: node_cap,
+                    } => {
+                        if matches!(selection, ModelSelection::Auto) {
+                            let saved_usd = (accrued_baseline - accrued).max(0.0);
+                            emit(WfEvent::RunDone {
+                                status: "failed".to_string(),
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                            });
+                            return WorkflowRunResult {
+                                status: WfStatus::Failed,
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                                node_outputs: collected_outputs,
+                                error: Some(
+                                    "Auto model selection is not supported in W1a; \
+                                     pin a model or route_ref"
+                                        .into(),
+                                ),
+                            };
+                        }
+                        specs.push((
+                            node_id.clone(),
+                            IntelligenceSpec {
+                                selection: selection.clone(),
+                                prompt: substitute(prompt, &trigger_id, &outputs),
+                                tools: vec![],
+                                max_turns: 1,
+                                max_cost_usd: *node_cap,
+                            },
+                        ));
+                    }
+                    NodeKind::Agent {
+                        selection,
+                        prompt,
+                        max_turns,
+                        max_cost_usd: node_cap,
+                        tools,
+                    } => {
+                        if matches!(selection, ModelSelection::Auto) {
+                            let saved_usd = (accrued_baseline - accrued).max(0.0);
+                            emit(WfEvent::RunDone {
+                                status: "failed".to_string(),
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                            });
+                            return WorkflowRunResult {
+                                status: WfStatus::Failed,
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                                node_outputs: collected_outputs,
+                                error: Some(
+                                    "Auto model selection is not supported in W1a; \
+                                     pin a model or route_ref"
+                                        .into(),
+                                ),
+                            };
+                        }
+                        specs.push((
+                            node_id.clone(),
+                            IntelligenceSpec {
+                                selection: selection.clone(),
+                                prompt: substitute(prompt, &trigger_id, &outputs),
+                                tools: tools.clone(),
+                                max_turns: max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+                                max_cost_usd: *node_cap,
+                            },
+                        ));
+                    }
+                    _ => unreachable!("partitioned into model_agent_wave above"),
+                }
             }
 
-            // ------------------------------------------------------------------
-            NodeKind::Model {
-                selection,
-                prompt,
-                max_cost_usd: node_cap,
-            } => {
-                // Budget check BEFORE calling the executor.
-                if budget_reached(accrued, run_max_cost_usd) {
-                    emit(WfEvent::RunDone {
-                        status: "budget_exhausted".to_string(),
-                        cost_usd: accrued,
-                        baseline_cost_usd: accrued_baseline,
-                        saved_usd: (accrued_baseline - accrued).max(0.0),
-                    });
-                    return WorkflowRunResult {
-                        status: WfStatus::BudgetExhausted,
-                        cost_usd: accrued,
-                        baseline_cost_usd: accrued_baseline,
-                        saved_usd: (accrued_baseline - accrued).max(0.0),
-                        node_outputs: collected_outputs,
-                        error: None,
-                    };
-                }
+            // Fix #4: emit NodeStart for all concurrent nodes BEFORE launch
+            // so streaming clients see every node start before any NodeDone.
+            for (node_id, _) in &specs {
+                emit(WfEvent::NodeStart {
+                    node_id: node_id.clone(),
+                });
+            }
+            // Run all specs concurrently; results returned in stable topo order.
+            let results = schedule::run_concurrent_model_wave(executor, &specs).await;
 
-                // Auto is not supported in W1a.
-                if matches!(selection, ModelSelection::Auto) {
-                    emit(WfEvent::RunDone {
-                        status: "failed".to_string(),
-                        cost_usd: accrued,
-                        baseline_cost_usd: accrued_baseline,
-                        saved_usd: (accrued_baseline - accrued).max(0.0),
-                    });
-                    return WorkflowRunResult {
-                        status: WfStatus::Failed,
-                        cost_usd: accrued,
-                        baseline_cost_usd: accrued_baseline,
-                        saved_usd: (accrued_baseline - accrued).max(0.0),
-                        node_outputs: collected_outputs,
-                        error: Some(
-                            "Auto model selection is not supported in W1a; \
-                             pin a model or route_ref"
-                                .into(),
-                        ),
-                    };
-                }
-
-                let subst_prompt = substitute(prompt, &trigger_id, &outputs);
-                let spec = IntelligenceSpec {
-                    selection: selection.clone(),
-                    prompt: subst_prompt,
-                    tools: vec![],
-                    max_turns: 1,
-                    max_cost_usd: *node_cap,
-                };
-
-                match executor.run_intelligence(node_id, &spec).await {
+            // DETERMINISTIC FOLD: NodeDone events + journal entries emitted
+            // in stable topo order, never inside the concurrent futures.
+            // Fix #1: drain the whole vec before bailing so successful
+            // siblings' costs always accrue even on partial wave failure.
+            let mut wave_error: Option<String> = None;
+            for schedule::ConcurrentNodeResult { node_id, outcome } in results {
+                match outcome {
                     Err(e) => {
-                        emit(WfEvent::RunDone {
-                            status: "failed".to_string(),
-                            cost_usd: accrued,
-                            baseline_cost_usd: accrued_baseline,
-                            saved_usd: (accrued_baseline - accrued).max(0.0),
-                        });
-                        return WorkflowRunResult {
-                            status: WfStatus::Failed,
-                            cost_usd: accrued,
-                            baseline_cost_usd: accrued_baseline,
-                            saved_usd: (accrued_baseline - accrued).max(0.0),
-                            node_outputs: collected_outputs,
-                            error: Some(format!("node \"{node_id}\" failed: {e}")),
-                        };
-                    }
-                    Ok(out) => {
-                        accrued += out.cost_usd;
-                        accrued_baseline += out.baseline_cost_usd;
-                        let node_cost_usd = out.cost_usd; // f64 is Copy; captured before move
-                        journal(NodeJournalEntry {
-                            node_id: node_id.clone(),
-                            status: "completed".into(),
-                            output: Some(out.content.clone()),
-                            cost_usd: out.cost_usd,
-                            model_used: out.model_used.clone(),
-                            error: None,
-                        });
-                        outputs.insert(node_id.clone(), out);
-                        propagate_edges(node_id, def, &mut reachable);
-                        emit(WfEvent::NodeDone {
-                            node_id: node_id.clone(),
-                            cost_usd: node_cost_usd,
-                            run_cost_usd: accrued,
-                            baseline_cost_usd: accrued_baseline,
-                            saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
-                            budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
-                        });
-                    }
-                }
-            }
-
-            // ------------------------------------------------------------------
-            NodeKind::Agent {
-                selection,
-                prompt,
-                max_turns,
-                max_cost_usd: node_cap,
-                tools,
-            } => {
-                // Budget check BEFORE calling the executor.
-                if budget_reached(accrued, run_max_cost_usd) {
-                    emit(WfEvent::RunDone {
-                        status: "budget_exhausted".to_string(),
-                        cost_usd: accrued,
-                        baseline_cost_usd: accrued_baseline,
-                        saved_usd: (accrued_baseline - accrued).max(0.0),
-                    });
-                    return WorkflowRunResult {
-                        status: WfStatus::BudgetExhausted,
-                        cost_usd: accrued,
-                        baseline_cost_usd: accrued_baseline,
-                        saved_usd: (accrued_baseline - accrued).max(0.0),
-                        node_outputs: collected_outputs,
-                        error: None,
-                    };
-                }
-
-                // Auto is not supported in W1a.
-                if matches!(selection, ModelSelection::Auto) {
-                    emit(WfEvent::RunDone {
-                        status: "failed".to_string(),
-                        cost_usd: accrued,
-                        baseline_cost_usd: accrued_baseline,
-                        saved_usd: (accrued_baseline - accrued).max(0.0),
-                    });
-                    return WorkflowRunResult {
-                        status: WfStatus::Failed,
-                        cost_usd: accrued,
-                        baseline_cost_usd: accrued_baseline,
-                        saved_usd: (accrued_baseline - accrued).max(0.0),
-                        node_outputs: collected_outputs,
-                        error: Some(
-                            "Auto model selection is not supported in W1a; \
-                             pin a model or route_ref"
-                                .into(),
-                        ),
-                    };
-                }
-
-                let subst_prompt = substitute(prompt, &trigger_id, &outputs);
-                let spec = IntelligenceSpec {
-                    selection: selection.clone(),
-                    prompt: subst_prompt,
-                    tools: tools.clone(),
-                    max_turns: max_turns.unwrap_or(DEFAULT_MAX_TURNS),
-                    max_cost_usd: *node_cap,
-                };
-
-                match executor.run_intelligence(node_id, &spec).await {
-                    Err(e) => {
-                        emit(WfEvent::RunDone {
-                            status: "failed".to_string(),
-                            cost_usd: accrued,
-                            baseline_cost_usd: accrued_baseline,
-                            saved_usd: (accrued_baseline - accrued).max(0.0),
-                        });
-                        return WorkflowRunResult {
-                            status: WfStatus::Failed,
-                            cost_usd: accrued,
-                            baseline_cost_usd: accrued_baseline,
-                            saved_usd: (accrued_baseline - accrued).max(0.0),
-                            node_outputs: collected_outputs,
-                            error: Some(format!("node \"{node_id}\" failed: {e}")),
-                        };
-                    }
-                    Ok(out) => {
-                        accrued += out.cost_usd;
-                        accrued_baseline += out.baseline_cost_usd;
-                        let node_cost_usd = out.cost_usd; // f64 is Copy; captured before move
-                        journal(NodeJournalEntry {
-                            node_id: node_id.clone(),
-                            status: "completed".into(),
-                            output: Some(out.content.clone()),
-                            cost_usd: out.cost_usd,
-                            model_used: out.model_used.clone(),
-                            error: None,
-                        });
-                        outputs.insert(node_id.clone(), out);
-                        propagate_edges(node_id, def, &mut reachable);
-                        emit(WfEvent::NodeDone {
-                            node_id: node_id.clone(),
-                            cost_usd: node_cost_usd,
-                            run_cost_usd: accrued,
-                            baseline_cost_usd: accrued_baseline,
-                            saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
-                            budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
-                        });
-                    }
-                }
-            }
-
-            // ------------------------------------------------------------------
-            NodeKind::Output => {
-                // Collect the last output from each incoming edge's source.
-                for edge in &def.edges {
-                    if edge.to == *node_id {
-                        if let Some(src_out) = outputs.get(&edge.from) {
-                            collected_outputs.push((node_id.clone(), src_out.clone()));
+                        if wave_error.is_none() {
+                            wave_error = Some(format!("node \"{node_id}\" failed: {e}"));
                         }
                     }
+                    Ok(out) => {
+                        accrued += out.cost_usd;
+                        accrued_baseline += out.baseline_cost_usd;
+                        let node_cost_usd = out.cost_usd; // f64 is Copy; captured before move
+                        journal(NodeJournalEntry {
+                            node_id: node_id.clone(),
+                            status: "completed".into(),
+                            output: Some(out.content.clone()),
+                            cost_usd: out.cost_usd,
+                            model_used: out.model_used.clone(),
+                            error: None,
+                        });
+                        outputs.insert(node_id.clone(), out);
+                        propagate_edges(&node_id, def, &mut reachable);
+                        emit(WfEvent::NodeDone {
+                            node_id: node_id.clone(),
+                            cost_usd: node_cost_usd,
+                            run_cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                            budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                        });
+                    }
                 }
-                // Output nodes can theoretically have outgoing edges (to another
-                // Output that aggregates); propagate for completeness.
-                propagate_edges(node_id, def, &mut reachable);
-                emit(WfEvent::NodeDone {
-                    node_id: node_id.clone(),
-                    cost_usd: 0.0,
-                    run_cost_usd: accrued,
+                done.insert(node_id.clone());
+            }
+            if let Some(error) = wave_error {
+                let saved_usd = (accrued_baseline - accrued).max(0.0);
+                emit(WfEvent::RunDone {
+                    status: "failed".to_string(),
+                    cost_usd: accrued,
                     baseline_cost_usd: accrued_baseline,
-                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
-                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                    saved_usd,
                 });
+                return WorkflowRunResult {
+                    status: WfStatus::Failed,
+                    cost_usd: accrued,
+                    baseline_cost_usd: accrued_baseline,
+                    saved_usd,
+                    node_outputs: collected_outputs,
+                    error: Some(error),
+                };
             }
         }
-    }
+
+        // ==============================================================
+        // B. Sequential Control nodes (Trigger, Transform, Branch, Output)
+        // ==============================================================
+        for node_id in &control_wave {
+            let node = match node_map.get(node_id.as_str()) {
+                Some(n) => n,
+                None => {
+                    done.insert(node_id.clone());
+                    continue;
+                }
+            };
+
+            emit(WfEvent::NodeStart {
+                node_id: node_id.clone(),
+            });
+
+            match &node.kind {
+                // ---------------------------------------------------------------
+                NodeKind::Trigger => {
+                    let out = NodeOutput {
+                        content: inputs.clone(),
+                        cost_usd: 0.0,
+                        baseline_cost_usd: 0.0,
+                        model_used: None,
+                    };
+                    outputs.insert(node_id.clone(), out);
+                    propagate_edges(node_id, def, &mut reachable);
+                    // Trigger is not journaled (no model/cost).
+                    emit(WfEvent::NodeDone {
+                        node_id: node_id.clone(),
+                        cost_usd: 0.0,
+                        run_cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                        budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                    });
+                }
+
+                // ---------------------------------------------------------------
+                NodeKind::Transform { expr } => {
+                    let value = substitute(expr, &trigger_id, &outputs);
+                    let out = NodeOutput {
+                        content: serde_json::Value::String(value.clone()),
+                        cost_usd: 0.0,
+                        baseline_cost_usd: 0.0,
+                        model_used: None,
+                    };
+                    journal(NodeJournalEntry {
+                        node_id: node_id.clone(),
+                        status: "completed".into(),
+                        output: Some(serde_json::Value::String(value)),
+                        cost_usd: 0.0,
+                        model_used: None,
+                        error: None,
+                    });
+                    outputs.insert(node_id.clone(), out);
+                    propagate_edges(node_id, def, &mut reachable);
+                    emit(WfEvent::NodeDone {
+                        node_id: node_id.clone(),
+                        cost_usd: 0.0,
+                        run_cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                        budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                    });
+                }
+
+                // ---------------------------------------------------------------
+                NodeKind::Branch {
+                    cond,
+                    when_true,
+                    when_false,
+                } => {
+                    let taken = if eval_cond(cond, &trigger_id, &outputs) {
+                        when_true.clone()
+                    } else {
+                        when_false.clone()
+                    };
+                    journal(NodeJournalEntry {
+                        node_id: node_id.clone(),
+                        status: "completed".into(),
+                        output: Some(serde_json::Value::String(taken.clone())),
+                        cost_usd: 0.0,
+                        model_used: None,
+                        error: None,
+                    });
+                    // Chosen arm + any unconditional explicit edges from this node.
+                    reachable.insert(taken.clone());
+                    propagate_edges(node_id, def, &mut reachable);
+                    emit(WfEvent::NodeDone {
+                        node_id: node_id.clone(),
+                        cost_usd: 0.0,
+                        run_cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                        budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                    });
+                }
+
+                // ---------------------------------------------------------------
+                NodeKind::Output => {
+                    // Collect the last output from each incoming edge's source.
+                    for edge in &def.edges {
+                        if edge.to == *node_id {
+                            if let Some(src_out) = outputs.get(&edge.from) {
+                                collected_outputs.push((node_id.clone(), src_out.clone()));
+                            }
+                        }
+                    }
+                    // Output nodes can theoretically have outgoing edges (to another
+                    // Output that aggregates); propagate for completeness.
+                    propagate_edges(node_id, def, &mut reachable);
+                    emit(WfEvent::NodeDone {
+                        node_id: node_id.clone(),
+                        cost_usd: 0.0,
+                        run_cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                        budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                    });
+                }
+
+                NodeKind::Model { .. } | NodeKind::Agent { .. } => {
+                    unreachable!("partitioned into model_agent_wave above")
+                }
+            }
+
+            done.insert(node_id.clone());
+        } // for node_id in &control_wave
+    } // loop
 
     let saved_usd = (accrued_baseline - accrued).max(0.0);
     emit(WfEvent::RunDone {
@@ -1559,6 +1590,720 @@ mod tests {
         assert_eq!(
             result_with_events.error, result_none.error,
             "error must be identical"
+        );
+    }
+
+    // ---- Wavefront parity tests (W3a-1 Task 1) --------------------------------
+
+    /// Diamond: t → {mb, mc} → out  (trigger fans out to two parallel model
+    /// nodes, both converge on a single output node).
+    fn make_diamond_def() -> WorkflowDefinition {
+        WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "diamond".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "mb".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub-model".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "mc".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub-model".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "out".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "mb".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "t".into(),
+                    to: "mc".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "mb".into(),
+                    to: "out".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "mc".into(),
+                    to: "out".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+        }
+    }
+
+    /// Parity: 4-node chain (trigger → m1 → m2 → output) must produce the
+    /// same WorkflowRunResult as the former linear topo pass.
+    #[tokio::test]
+    async fn wavefront_linear_chain_matches_expected() {
+        let def = make_sequential_def();
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("r1"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.20,
+                    model_used: None,
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("r2"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.15,
+                    model_used: None,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}, None).await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        assert!(
+            (result.cost_usd - 0.15).abs() < 1e-9,
+            "cost_usd expected 0.15, got {}",
+            result.cost_usd
+        );
+        assert!(
+            (result.baseline_cost_usd - 0.35).abs() < 1e-9,
+            "baseline_cost_usd expected 0.35, got {}",
+            result.baseline_cost_usd
+        );
+        assert!(
+            (result.saved_usd - 0.20).abs() < 1e-9,
+            "saved_usd expected 0.20, got {}",
+            result.saved_usd
+        );
+        assert_eq!(
+            stub.called_nodes(),
+            vec!["m1", "m2"],
+            "m1 then m2 in topo order"
+        );
+        // Output node collects m2's result.
+        assert_eq!(result.node_outputs.len(), 1, "one output collected");
+        assert_eq!(result.node_outputs[0].0, "o");
+        assert_eq!(result.node_outputs[0].1.content, json!("r2"));
+    }
+
+    /// Diamond (t → {mb, mc} → out): all four nodes must execute; mb before mc
+    /// (stable topo order); running three times yields identical results.
+    #[tokio::test]
+    async fn wavefront_diamond_executes_all_and_is_deterministic() {
+        let def = make_diamond_def();
+
+        let make_stub = || {
+            StubExecutor::new(vec![
+                (
+                    "mb",
+                    NodeOutput {
+                        content: json!("mb_out"),
+                        cost_usd: 0.05,
+                        baseline_cost_usd: 0.10,
+                        model_used: None,
+                    },
+                ),
+                (
+                    "mc",
+                    NodeOutput {
+                        content: json!("mc_out"),
+                        cost_usd: 0.07,
+                        baseline_cost_usd: 0.12,
+                        model_used: None,
+                    },
+                ),
+            ])
+        };
+
+        // First run: verify both models called in topo order, output collected.
+        let stub1 = make_stub();
+        let r1 = run_workflow(&stub1, &def, &json!("go"), None, |_| {}, None).await;
+        assert_eq!(r1.status, WfStatus::Succeeded);
+        let called = stub1.called_nodes();
+        assert_eq!(called, vec!["mb", "mc"], "mb before mc (stable topo order)");
+        // Output node has two incoming edges (mb→out, mc→out); both collected.
+        assert_eq!(
+            r1.node_outputs.len(),
+            2,
+            "output node collects from both branches"
+        );
+        assert!(
+            (r1.cost_usd - 0.12).abs() < 1e-9,
+            "cost_usd expected 0.12, got {}",
+            r1.cost_usd
+        );
+
+        // Three runs must yield byte-identical results.
+        let mut costs: Vec<f64> = Vec::new();
+        for _ in 0..3 {
+            let r = run_workflow(&make_stub(), &def, &json!("go"), None, |_| {}, None).await;
+            assert_eq!(r.status, WfStatus::Succeeded);
+            costs.push(r.cost_usd);
+        }
+        assert!(
+            costs.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-9),
+            "results must be identical across runs: {costs:?}"
+        );
+    }
+
+    /// Skipped branch arm + merge node: Branch takes `m_yes`; `m_no` is
+    /// unreachable.  The merge output node (`o`) has incoming edges from BOTH
+    /// arms but must still execute, because its only *reachable* predecessor
+    /// (`m_yes`) is done — wavefront readiness = reachable-preds, not raw
+    /// in-degree.
+    #[tokio::test]
+    async fn wavefront_skipped_branch_merge_still_reachable() {
+        let def = make_branch_def(); // t → br(cond={{input}}=="yes") → {m_yes, m_no} → o
+        let stub = StubExecutor::new(vec![
+            (
+                "m_yes",
+                NodeOutput {
+                    content: json!("yes_out"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+            (
+                "m_no",
+                NodeOutput {
+                    content: json!("no_out"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+        ]);
+
+        // Input "yes" → branch takes m_yes arm; m_no is skipped.
+        let result = run_workflow(&stub, &def, &json!("yes"), None, |_| {}, None).await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        let called = stub.called_nodes();
+        assert!(
+            called.contains(&"m_yes".to_string()),
+            "m_yes must run; called: {called:?}"
+        );
+        assert!(
+            !called.contains(&"m_no".to_string()),
+            "m_no must NOT run; called: {called:?}"
+        );
+        // The merge output node must have executed and collected m_yes's result.
+        assert_eq!(
+            result.node_outputs.len(),
+            1,
+            "merge output node must execute (reachable-preds readiness)"
+        );
+        assert_eq!(result.node_outputs[0].0, "o");
+        assert_eq!(result.node_outputs[0].1.content, json!("yes_out"));
+    }
+
+    // ---- W3a-1 Task 2: concurrent wave tests -----------------------------------
+
+    /// Proof-of-parallelism: mb and mc in the diamond must run concurrently.
+    ///
+    /// A stub that increments an AtomicUsize on entry, records the peak
+    /// in-flight count via fetch_max, then yields before decrementing lets us
+    /// observe overlap: when join_all polls mb (yield → pending), it then polls
+    /// mc, bringing in_flight to 2 before either completes.
+    #[tokio::test]
+    async fn concurrent_wave_runs_nodes_in_parallel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct ParallelProbe {
+            in_flight: Arc<AtomicUsize>,
+            max_in_flight: Arc<AtomicUsize>,
+            responses: HashMap<String, NodeOutput>,
+        }
+
+        #[async_trait]
+        impl NodeExecutor for ParallelProbe {
+            async fn run_intelligence(
+                &self,
+                node_id: &str,
+                _spec: &IntelligenceSpec,
+            ) -> Result<NodeOutput, ApiError> {
+                // Increment in-flight and record the peak BEFORE yielding so
+                // that both mb and mc have incremented before either returns.
+                let prev = self.in_flight.fetch_add(1, Ordering::SeqCst);
+                self.max_in_flight.fetch_max(prev + 1, Ordering::SeqCst);
+                // Yield control so the runtime can poll the other futures in
+                // the wave; on the second poll we decrement and return.
+                tokio::task::yield_now().await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                self.responses
+                    .get(node_id)
+                    .cloned()
+                    .ok_or_else(|| ApiError::Internal(format!("no response for {node_id}")))
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let stub = ParallelProbe {
+            in_flight: Arc::clone(&in_flight),
+            max_in_flight: Arc::clone(&max_in_flight),
+            responses: [
+                (
+                    "mb".to_string(),
+                    NodeOutput {
+                        content: json!("b"),
+                        cost_usd: 0.05,
+                        baseline_cost_usd: 0.0,
+                        model_used: None,
+                    },
+                ),
+                (
+                    "mc".to_string(),
+                    NodeOutput {
+                        content: json!("c"),
+                        cost_usd: 0.05,
+                        baseline_cost_usd: 0.0,
+                        model_used: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let def = make_diamond_def(); // t → {mb, mc} → out
+        let result = run_workflow(&stub, &def, &json!("go"), None, |_| {}, None).await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        let peak = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "mb and mc must overlap in-flight (max_in_flight = {peak})"
+        );
+    }
+
+    /// Hard-budget gate under concurrency.
+    ///
+    /// A "prior" node brings accrued to exactly the cap (1.0).  The next wave
+    /// contains 3 Model nodes each costing 0.40.  The gate fires BEFORE
+    /// launching any of them, so none are called and status is BudgetExhausted.
+    ///
+    /// # Gate guarantee
+    /// No Model/Agent node is ever launched when `accrued >= run_max_cost_usd`.
+    /// Overshoot is bounded by the costs of nodes launched while `accrued < cap`
+    /// (pre-launch costs are unknown, so all-or-nothing per wave is enforced).
+    #[tokio::test]
+    async fn hard_budget_under_concurrency() {
+        // Workflow: t → prior → {n1, n2, n3} → out
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "budget_gate".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "prior".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model { model: "s".into() },
+                        prompt: "p".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "n1".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model { model: "s".into() },
+                        prompt: "1".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "n2".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model { model: "s".into() },
+                        prompt: "2".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "n3".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model { model: "s".into() },
+                        prompt: "3".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "out".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "prior".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "prior".into(),
+                    to: "n1".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "prior".into(),
+                    to: "n2".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "prior".into(),
+                    to: "n3".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "n1".into(),
+                    to: "out".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "n2".into(),
+                    to: "out".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "n3".into(),
+                    to: "out".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+        };
+
+        let stub = StubExecutor::new(vec![
+            (
+                "prior",
+                NodeOutput {
+                    content: json!("p"),
+                    cost_usd: 1.0,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+            (
+                "n1",
+                NodeOutput {
+                    content: json!("n1"),
+                    cost_usd: 0.40,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+            (
+                "n2",
+                NodeOutput {
+                    content: json!("n2"),
+                    cost_usd: 0.40,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+            (
+                "n3",
+                NodeOutput {
+                    content: json!("n3"),
+                    cost_usd: 0.40,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+        ]);
+
+        // cap = 1.0.  prior: accrued(0.0) < 1.0 → launches, costs 1.0 → accrued=1.0.
+        // Wave {n1,n2,n3}: budget_reached(1.0, Some(1.0)) = true → NONE launched.
+        let result = run_workflow(&stub, &def, &json!("x"), Some(1.0), |_| {}, None).await;
+
+        assert_eq!(result.status, WfStatus::BudgetExhausted);
+        assert!(
+            (result.cost_usd - 1.0).abs() < 1e-9,
+            "only prior's cost must be accrued; got {}",
+            result.cost_usd
+        );
+        let called = stub.called_nodes();
+        assert_eq!(
+            called,
+            vec!["prior"],
+            "n1/n2/n3 must NOT be launched (hard budget gate fired); called: {called:?}"
+        );
+    }
+
+    /// Determinism: running the diamond 5× must yield identical results.
+    ///
+    /// The post-join fold in stable topo-index order guarantees determinism
+    /// regardless of which concurrent future completes first.
+    #[tokio::test]
+    async fn concurrent_result_is_deterministic() {
+        let make_stub = || {
+            StubExecutor::new(vec![
+                (
+                    "mb",
+                    NodeOutput {
+                        content: json!("b"),
+                        cost_usd: 0.05,
+                        baseline_cost_usd: 0.10,
+                        model_used: None,
+                    },
+                ),
+                (
+                    "mc",
+                    NodeOutput {
+                        content: json!("c"),
+                        cost_usd: 0.07,
+                        baseline_cost_usd: 0.12,
+                        model_used: None,
+                    },
+                ),
+            ])
+        };
+
+        let def = make_diamond_def();
+        let mut results = Vec::new();
+        for _ in 0..5 {
+            let r = run_workflow(&make_stub(), &def, &json!("go"), None, |_| {}, None).await;
+            results.push(r);
+        }
+
+        let first = &results[0];
+        assert_eq!(first.status, WfStatus::Succeeded);
+        for r in &results[1..] {
+            assert_eq!(
+                r.status, first.status,
+                "status must be identical across runs"
+            );
+            assert!(
+                (r.cost_usd - first.cost_usd).abs() < 1e-9,
+                "cost_usd must be identical across runs"
+            );
+            assert!(
+                (r.baseline_cost_usd - first.baseline_cost_usd).abs() < 1e-9,
+                "baseline_cost_usd must be identical across runs"
+            );
+            assert!(
+                (r.saved_usd - first.saved_usd).abs() < 1e-9,
+                "saved_usd must be identical across runs"
+            );
+            assert_eq!(
+                r.node_outputs.len(),
+                first.node_outputs.len(),
+                "node_output count must match"
+            );
+        }
+    }
+
+    // ---- W3a-1 review: Fix #1 + Fix #4 guard tests ----------------------------
+
+    /// Guards Fix #1 (drain-all cost on partial wave failure).
+    ///
+    /// In the diamond (t → {mb, mc} → out), mb is first in topo order and
+    /// errors (no stub response); mc succeeds with cost 0.15.  Before Fix #1
+    /// the fold returns on mb's error, so mc's cost is never accrued →
+    /// cost_usd == 0.0, not 0.15.  After Fix #1 the fold drains the entire
+    /// wave before bailing: mc accrues, result is Failed with cost_usd 0.15.
+    #[tokio::test]
+    async fn partial_wave_failure_reports_full_cost() {
+        let def = make_diamond_def(); // t → {mb, mc} → out
+                                      // mb has no stub response → Err; mc succeeds.
+        let stub = StubExecutor::new(vec![(
+            "mc",
+            NodeOutput {
+                content: json!("c"),
+                cost_usd: 0.15,
+                baseline_cost_usd: 0.30,
+                model_used: None,
+            },
+        )]);
+
+        let result = run_workflow(&stub, &def, &json!("go"), None, |_| {}, None).await;
+
+        assert_eq!(result.status, WfStatus::Failed, "run must be Failed");
+        assert!(
+            (result.cost_usd - 0.15).abs() < 1e-9,
+            "cost_usd must include mc's cost (0.15) even though mb failed first; got {}",
+            result.cost_usd
+        );
+        assert!(
+            (result.baseline_cost_usd - 0.30).abs() < 1e-9,
+            "baseline_cost_usd must include mc's baseline (0.30); got {}",
+            result.baseline_cost_usd
+        );
+        assert!(result.error.is_some(), "error field must be set");
+        assert!(
+            result.error.as_deref().unwrap().contains("mb"),
+            "error must name the failing node (mb); got {:?}",
+            result.error
+        );
+    }
+
+    /// Guards Fix #4 (NodeStart emitted before concurrent launch).
+    ///
+    /// In the diamond (t → {mb, mc} → out), all wave-node NodeStart events
+    /// must appear before any NodeDone for those nodes.  Before Fix #4 the
+    /// fold emits NodeStart then NodeDone for each node in sequence; after
+    /// Fix #4 all NodeStarts are pre-emitted and only NodeDones appear in
+    /// the fold → all starts precede all dones.
+    #[tokio::test]
+    async fn concurrent_nodes_emit_nodestart_before_completion() {
+        let def = make_diamond_def();
+        let stub = StubExecutor::new(vec![
+            (
+                "mb",
+                NodeOutput {
+                    content: json!("b"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+            (
+                "mc",
+                NodeOutput {
+                    content: json!("c"),
+                    cost_usd: 0.07,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+        ]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
+        let result = run_workflow(&stub, &def, &json!("go"), None, |_| {}, Some(&tx)).await;
+        drop(tx);
+        assert_eq!(result.status, WfStatus::Succeeded);
+
+        let mut events: Vec<WfEvent> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Keep only NodeStart / NodeDone events for the concurrent wave nodes.
+        let wave_events: Vec<&WfEvent> = events
+            .iter()
+            .filter(|ev| match ev {
+                WfEvent::NodeStart { node_id } => node_id == "mb" || node_id == "mc",
+                WfEvent::NodeDone { node_id, .. } => node_id == "mb" || node_id == "mc",
+                _ => false,
+            })
+            .collect();
+
+        assert_eq!(
+            wave_events.len(),
+            4,
+            "expected 4 wave events (2×NodeStart + 2×NodeDone); got {wave_events:?}"
+        );
+
+        let start_positions: Vec<usize> = wave_events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| matches!(ev, WfEvent::NodeStart { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let done_positions: Vec<usize> = wave_events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| matches!(ev, WfEvent::NodeDone { .. }))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(start_positions.len(), 2, "must have 2 NodeStart events");
+        assert_eq!(done_positions.len(), 2, "must have 2 NodeDone events");
+
+        let last_start = *start_positions.iter().max().unwrap();
+        let first_done = *done_positions.iter().min().unwrap();
+
+        assert!(
+            last_start < first_done,
+            "all wave NodeStart events must precede all wave NodeDone events; \
+             starts={start_positions:?} dones={done_positions:?}"
+        );
+    }
+
+    /// Regression: a purely sequential chain (waves of size 1) must produce
+    /// the same result as the former sequential implementation — no regression
+    /// from the concurrent-wave refactor.
+    #[tokio::test]
+    async fn concurrent_linear_chain_parity() {
+        let def = make_sequential_def();
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("r1"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.20,
+                    model_used: Some("haiku".into()),
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("r2"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.15,
+                    model_used: Some("haiku".into()),
+                },
+            ),
+        ]);
+
+        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}, None).await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        assert!(
+            (result.cost_usd - 0.15).abs() < 1e-9,
+            "cost_usd expected 0.15, got {}",
+            result.cost_usd
+        );
+        assert!(
+            (result.baseline_cost_usd - 0.35).abs() < 1e-9,
+            "baseline_cost_usd expected 0.35, got {}",
+            result.baseline_cost_usd
+        );
+        assert!(
+            (result.saved_usd - 0.20).abs() < 1e-9,
+            "saved_usd expected 0.20, got {}",
+            result.saved_usd
+        );
+        assert_eq!(
+            stub.called_nodes(),
+            vec!["m1", "m2"],
+            "m1 then m2 in sequential (topo) order"
         );
     }
 }
