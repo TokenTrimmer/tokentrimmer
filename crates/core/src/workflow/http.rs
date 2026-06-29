@@ -91,6 +91,12 @@ pub(crate) enum HttpError {
     /// The response body exceeded the byte cap.
     #[error("response body exceeded the {0}-byte cap")]
     ResponseTooLarge(usize),
+
+    /// The URL was rejected by the SSRF guard (blocked scheme, private/loopback/
+    /// link-local IP literal, or blocked hostname). The URL and secret values are
+    /// NOT included in this error message.
+    #[error("url rejected by SSRF guard (blocked scheme or private/internal address)")]
+    BlockedUrl,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +218,18 @@ pub(crate) async fn run_http(
     if !allowed_hosts.iter().any(|h| h == &host) {
         return Err(HttpError::HostNotAllowed(host));
     }
+
+    // ---- 1b. Run-time SSRF re-assertion (defense-in-depth) ------------------
+    // reqwest/hyper connect DIRECTLY to IP-literal hosts, bypassing any custom
+    // DNS resolver. `with_guarded_dns` only intercepts DNS-resolved addresses,
+    // so a URL like `http://127.0.0.1/` slips past it. Re-assert the full SSRF
+    // guard here: https-only scheme + hostname denylist + literal-IP block +
+    // best-effort DNS-resolved-IP block.
+    //
+    // Note: `spec.url` has already had `{{...}}` tokens substituted (concrete
+    // URL). If a resolved URL still contains template remnants, `validate_provider_url`
+    // will fail to parse it — that's a bug we want surfaced, not hidden.
+    tt_shared::validate_provider_url(&spec.url, false).map_err(|_| HttpError::BlockedUrl)?;
 
     // ---- 2. Build the guarded client ----------------------------------------
     let client = tt_shared::with_guarded_dns(
@@ -454,6 +472,73 @@ mod tests {
         assert!(
             !err_str.contains("?token="),
             "error must not contain URL query string; got: {err_str}"
+        );
+    }
+
+    // ---- run_http: run-time SSRF IP/scheme re-assertion (W3b security review) --
+
+    /// IP-literal loopback (`127.0.0.1`) must be rejected even when it appears
+    /// in `allowed_hosts`, proving the SSRF guard (not the allowlist) blocks it.
+    /// FAILS before fix: allowlist passes + no IP guard → attempt connect.
+    #[tokio::test]
+    async fn run_http_rejects_ip_literal_private() {
+        let spec = HttpReqSpec {
+            method: "GET".into(),
+            url: "http://127.0.0.1/".into(),
+            headers: vec![],
+            body: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        };
+        // IP is explicitly in allowed_hosts — rejection must come from the SSRF guard.
+        let err = run_http(spec, &["127.0.0.1".to_string()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::BlockedUrl),
+            "expected BlockedUrl for loopback IP literal, got: {err}"
+        );
+    }
+
+    /// AWS/GCP metadata endpoint via IP literal must be rejected at run time.
+    /// FAILS before fix: allowlist passes + no IP guard → attempt connect.
+    #[tokio::test]
+    async fn run_http_rejects_metadata_ip() {
+        let spec = HttpReqSpec {
+            method: "GET".into(),
+            url: "http://169.254.169.254/latest/meta-data/".into(),
+            headers: vec![],
+            body: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        };
+        // IP is explicitly in allowed_hosts — rejection must come from the SSRF guard.
+        let err = run_http(spec, &["169.254.169.254".to_string()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::BlockedUrl),
+            "expected BlockedUrl for metadata IP literal, got: {err}"
+        );
+    }
+
+    /// Plain-HTTP URLs must be rejected at run time even when the host is in
+    /// `allowed_hosts`, re-asserting the https-only constraint.
+    /// FAILS before fix: allowlist passes + no scheme guard → attempt connect.
+    #[tokio::test]
+    async fn run_http_rejects_non_https_at_run() {
+        let spec = HttpReqSpec {
+            method: "GET".into(),
+            url: "http://allowed.example.com/".into(),
+            headers: vec![],
+            body: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        };
+        // Host is in allowed_hosts — rejection must come from the https scheme guard.
+        let err = run_http(spec, &["allowed.example.com".to_string()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HttpError::BlockedUrl),
+            "expected BlockedUrl for non-https url, got: {err}"
         );
     }
 
