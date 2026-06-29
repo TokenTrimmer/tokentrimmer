@@ -57,9 +57,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use tt_shared::context::SecretString;
+
 use crate::routes::agent_run_budget::budget_reached;
 use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{IntelligenceSpec, NodeExecutor};
+use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
 use crate::workflow::schedule;
 use crate::workflow::types::{ModelSelection, Node, NodeKind, NodeOutput, WorkflowDefinition};
 
@@ -133,6 +136,7 @@ pub(crate) async fn run_workflow(
     run_max_cost_usd: Option<f64>,
     mut journal: impl FnMut(NodeJournalEntry),
     events: Option<&tokio::sync::mpsc::UnboundedSender<WfEvent>>,
+    secrets: &HashMap<String, SecretString>,
 ) -> WorkflowRunResult {
     // No-op when events is None; Option<&T> is Copy so captured by value.
     let emit = |ev: WfEvent| {
@@ -547,6 +551,98 @@ pub(crate) async fn run_workflow(
                 NodeKind::Model { .. } | NodeKind::Agent { .. } => {
                     unreachable!("partitioned into model_agent_wave above")
                 }
+
+                // Http node: guarded outbound HTTP call (W3b Task 3).
+                NodeKind::Http {
+                    method,
+                    url,
+                    headers,
+                    body,
+                    max_response_bytes,
+                } => {
+                    // SECURITY: Substitute templates using substitute_with_secrets so
+                    // {{secrets.NAME}} refs resolve to real values on the wire spec.
+                    // The resulting HttpReqSpec may contain secret values and MUST NOT
+                    // be written to any journal, NodeOutput.content, or error string.
+                    let sub_url =
+                        wf_http::substitute_with_secrets(url, &trigger_id, &outputs, secrets);
+                    let sub_headers: Vec<(String, String)> = headers
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                wf_http::substitute_with_secrets(v, &trigger_id, &outputs, secrets),
+                            )
+                        })
+                        .collect();
+                    let sub_body = body.as_ref().map(|b| {
+                        wf_http::substitute_with_secrets(b, &trigger_id, &outputs, secrets)
+                    });
+
+                    let spec = HttpReqSpec {
+                        method: method.clone(),
+                        url: sub_url,
+                        headers: sub_headers,
+                        body: sub_body,
+                        max_response_bytes: max_response_bytes
+                            .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
+                    };
+
+                    match wf_http::run_http(spec, &def.allowed_hosts).await {
+                        Ok(resp) => {
+                            // SECURITY CHOKEPOINT: journal + output = RESPONSE ONLY.
+                            // NEVER include the substituted url/headers/body (they may
+                            // contain secrets). Http is zero-cost (no model call).
+                            // Include status so downstream nodes can branch on it.
+                            let resp_content = serde_json::json!({
+                                "status": resp.status,
+                                "body": resp.body,
+                            });
+                            let out = NodeOutput {
+                                content: resp_content.clone(),
+                                cost_usd: 0.0,
+                                baseline_cost_usd: 0.0,
+                                model_used: None,
+                            };
+                            journal(NodeJournalEntry {
+                                node_id: node_id.clone(),
+                                status: "completed".into(),
+                                output: Some(resp_content),
+                                cost_usd: 0.0,
+                                model_used: None,
+                                error: None,
+                            });
+                            outputs.insert(node_id.clone(), out);
+                            propagate_edges(node_id, def, &mut reachable);
+                            emit(WfEvent::NodeDone {
+                                node_id: node_id.clone(),
+                                cost_usd: 0.0,
+                                run_cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                                budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                            });
+                        }
+                        Err(e) => {
+                            // SECURITY: HttpError strings are sanitized (no url/headers/secrets).
+                            let saved_usd = (accrued_baseline - accrued).max(0.0);
+                            emit(WfEvent::RunDone {
+                                status: "failed".to_string(),
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                            });
+                            return WorkflowRunResult {
+                                status: WfStatus::Failed,
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                                node_outputs: collected_outputs,
+                                error: Some(format!("node \"{node_id}\": http error: {e}")),
+                            };
+                        }
+                    }
+                }
             }
 
             done.insert(node_id.clone());
@@ -707,12 +803,24 @@ fn substitute(template: &str, trigger_id: &str, outputs: &HashMap<String, NodeOu
 /// - `"input"` → the trigger node's content.
 /// - `"node_id"` → the full content of that node.
 /// - `"node_id.field"` → a top-level JSON object field of that node's content.
+/// - `"secrets.*"` → **always** `"***"` (redaction marker, never the real value).
+///   Secrets are resolved exclusively in `wf_http::substitute_with_secrets` so
+///   that Model/Agent prompts, Transform exprs, and Branch conditions are always
+///   secret-free.
 fn resolve_ref(ref_str: &str, trigger_id: &str, outputs: &HashMap<String, NodeOutput>) -> String {
     // Split on the first `.` to allow `node.field`.
     let (node_part, field_part) = match ref_str.find('.') {
         Some(pos) => (&ref_str[..pos], Some(&ref_str[pos + 1..])),
         None => (ref_str, None),
     };
+
+    // SECURITY: `{{secrets.*}}` / `{{secrets}}` must never return a real secret
+    // value from the shared substitution path. Return an explicit redaction
+    // marker so callers see "***" rather than "" (which could be confused with
+    // "the secret is an empty string").
+    if node_part == "secrets" {
+        return "***".to_string();
+    }
 
     // `{{input}}` is an alias for the Trigger node.
     let node_key = if node_part == "input" {
@@ -802,6 +910,7 @@ fn is_truthy(s: &str) -> bool {
 mod tests {
     use async_trait::async_trait;
     use serde_json::json;
+    use tt_shared::context::SecretString;
     use uuid::Uuid;
 
     use super::*;
@@ -920,6 +1029,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -986,6 +1096,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -1040,6 +1151,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -1079,6 +1191,7 @@ mod tests {
             None,
             |e| journal_entries.push(e),
             None,
+            &HashMap::new(),
         )
         .await;
 
@@ -1134,6 +1247,7 @@ mod tests {
             Some(0.20),
             |e| journal_entries.push(e),
             None,
+            &HashMap::new(),
         )
         .await;
 
@@ -1186,6 +1300,7 @@ mod tests {
             None,
             |e| journal_entries.push(e),
             None,
+            &HashMap::new(),
         )
         .await;
 
@@ -1224,6 +1339,7 @@ mod tests {
             None,
             |e| journal_entries.push(e),
             None,
+            &HashMap::new(),
         )
         .await;
 
@@ -1352,7 +1468,16 @@ mod tests {
             ),
         ]);
 
-        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}, None).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hi"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
         // cost: 0.10 + 0.05 = 0.15
@@ -1401,7 +1526,16 @@ mod tests {
             ),
         ]);
 
-        let result = run_workflow(&stub, &def, &json!("x"), None, |_| {}, None).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("x"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
         assert_eq!(result.saved_usd, 0.0, "saved_usd must not go negative");
@@ -1438,7 +1572,16 @@ mod tests {
         ]);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
-        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}, Some(&tx)).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hi"),
+            None,
+            |_| {},
+            Some(&tx),
+            &HashMap::new(),
+        )
+        .await;
         drop(tx); // close the channel so try_recv returns Disconnected when drained
 
         assert_eq!(result.status, WfStatus::Succeeded);
@@ -1557,6 +1700,7 @@ mod tests {
             None,
             |_| {},
             Some(&tx),
+            &HashMap::new(),
         )
         .await;
         drop(tx);
@@ -1568,6 +1712,7 @@ mod tests {
             None,
             |_| {},
             None,
+            &HashMap::new(),
         )
         .await;
 
@@ -1656,6 +1801,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -1685,7 +1831,16 @@ mod tests {
             ),
         ]);
 
-        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}, None).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hi"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
         assert!(
@@ -1745,7 +1900,16 @@ mod tests {
 
         // First run: verify both models called in topo order, output collected.
         let stub1 = make_stub();
-        let r1 = run_workflow(&stub1, &def, &json!("go"), None, |_| {}, None).await;
+        let r1 = run_workflow(
+            &stub1,
+            &def,
+            &json!("go"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
         assert_eq!(r1.status, WfStatus::Succeeded);
         let called = stub1.called_nodes();
         assert_eq!(called, vec!["mb", "mc"], "mb before mc (stable topo order)");
@@ -1764,7 +1928,16 @@ mod tests {
         // Three runs must yield byte-identical results.
         let mut costs: Vec<f64> = Vec::new();
         for _ in 0..3 {
-            let r = run_workflow(&make_stub(), &def, &json!("go"), None, |_| {}, None).await;
+            let r = run_workflow(
+                &make_stub(),
+                &def,
+                &json!("go"),
+                None,
+                |_| {},
+                None,
+                &HashMap::new(),
+            )
+            .await;
             assert_eq!(r.status, WfStatus::Succeeded);
             costs.push(r.cost_usd);
         }
@@ -1804,7 +1977,16 @@ mod tests {
         ]);
 
         // Input "yes" → branch takes m_yes arm; m_no is skipped.
-        let result = run_workflow(&stub, &def, &json!("yes"), None, |_| {}, None).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("yes"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
         let called = stub.called_nodes();
@@ -1898,7 +2080,16 @@ mod tests {
         };
 
         let def = make_diamond_def(); // t → {mb, mc} → out
-        let result = run_workflow(&stub, &def, &json!("go"), None, |_| {}, None).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
         let peak = max_in_flight.load(Ordering::SeqCst);
@@ -2006,6 +2197,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
 
         let stub = StubExecutor::new(vec![
@@ -2049,7 +2241,16 @@ mod tests {
 
         // cap = 1.0.  prior: accrued(0.0) < 1.0 → launches, costs 1.0 → accrued=1.0.
         // Wave {n1,n2,n3}: budget_reached(1.0, Some(1.0)) = true → NONE launched.
-        let result = run_workflow(&stub, &def, &json!("x"), Some(1.0), |_| {}, None).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("x"),
+            Some(1.0),
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(result.status, WfStatus::BudgetExhausted);
         assert!(
@@ -2097,7 +2298,16 @@ mod tests {
         let def = make_diamond_def();
         let mut results = Vec::new();
         for _ in 0..5 {
-            let r = run_workflow(&make_stub(), &def, &json!("go"), None, |_| {}, None).await;
+            let r = run_workflow(
+                &make_stub(),
+                &def,
+                &json!("go"),
+                None,
+                |_| {},
+                None,
+                &HashMap::new(),
+            )
+            .await;
             results.push(r);
         }
 
@@ -2151,7 +2361,16 @@ mod tests {
             },
         )]);
 
-        let result = run_workflow(&stub, &def, &json!("go"), None, |_| {}, None).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(result.status, WfStatus::Failed, "run must be Failed");
         assert!(
@@ -2204,7 +2423,16 @@ mod tests {
         ]);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
-        let result = run_workflow(&stub, &def, &json!("go"), None, |_| {}, Some(&tx)).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            None,
+            |_| {},
+            Some(&tx),
+            &HashMap::new(),
+        )
+        .await;
         drop(tx);
         assert_eq!(result.status, WfStatus::Succeeded);
 
@@ -2282,7 +2510,16 @@ mod tests {
             ),
         ]);
 
-        let result = run_workflow(&stub, &def, &json!("hi"), None, |_| {}, None).await;
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hi"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(result.status, WfStatus::Succeeded);
         assert!(
@@ -2305,5 +2542,137 @@ mod tests {
             vec!["m1", "m2"],
             "m1 then m2 in sequential (topo) order"
         );
+    }
+
+    // ---- W3b Task 3: security guard tests -----------------------------------
+
+    /// Verifies that the shared `substitute`/`resolve_ref` path NEVER returns a
+    /// real secret value for `{{secrets.*}}` refs.  This ensures Model/Agent
+    /// prompts, Transform exprs, and Branch conditions are always secret-free.
+    #[test]
+    fn shared_substitute_is_secret_free() {
+        let outputs = HashMap::new();
+
+        // `{{secrets.K}}` → "***" (explicit redaction marker, not the secret).
+        let result = substitute("text {{secrets.K}} more", "t", &outputs);
+        assert_eq!(
+            result, "text *** more",
+            "shared substitute must redact secrets.* refs; got: {result}"
+        );
+
+        // `{{secrets}}` (no dot) → "***".
+        let result2 = substitute("{{secrets}}", "t", &outputs);
+        assert_eq!(
+            result2, "***",
+            "shared substitute must redact bare {{secrets}}; got: {result2}"
+        );
+
+        // Confirm it is NOT the real secret value (belt-and-suspenders).
+        assert_ne!(result, "sekret-value");
+        assert_ne!(result2, "sekret-value");
+    }
+
+    /// THE REDACTION GUARD: asserts that a secret value NEVER appears in any
+    /// observable output field after running a workflow with an Http node whose
+    /// header references `{{secrets.K}}`.
+    ///
+    /// The Http node uses `allowed_hosts: ["other-host.com"]` but the URL host
+    /// is `api.example.com` → `HostNotAllowed` fires immediately (no network
+    /// call), giving us a deterministic pure-unit test.
+    #[tokio::test]
+    async fn http_node_never_journals_secret() {
+        let secret_value = "sekret-value";
+        let mut secrets = HashMap::new();
+        secrets.insert("K".to_string(), SecretString::new(secret_value.to_string()));
+
+        // Workflow: t → h (Http node referencing secret in header).
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "redaction_test".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "h".into(),
+                    kind: NodeKind::Http {
+                        method: "GET".into(),
+                        url: "https://api.example.com/x".into(),
+                        // x-auth-token is not in DENIED_HEADERS so it passes filter_extra_headers.
+                        headers: vec![("x-auth-token".into(), "Bearer {{secrets.K}}".into())],
+                        body: None,
+                        max_response_bytes: None,
+                    },
+                },
+            ],
+            edges: vec![Edge {
+                from: "t".into(),
+                to: "h".into(),
+                map: None,
+            }],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            // "other-host.com" is in allowed_hosts, but URL host is "api.example.com"
+            // → HostNotAllowed fires immediately without any network call.
+            allowed_hosts: vec!["other-host.com".to_string()],
+        };
+
+        let stub = StubExecutor::new(vec![]);
+        let mut journal_entries: Vec<NodeJournalEntry> = Vec::new();
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("input"),
+            None,
+            |e| journal_entries.push(e),
+            None,
+            &secrets,
+        )
+        .await;
+
+        // The run must have failed (Http node got HostNotAllowed).
+        assert_eq!(
+            result.status,
+            WfStatus::Failed,
+            "run should fail due to HostNotAllowed"
+        );
+
+        // ---- SECURITY INVARIANT: "sekret-value" must NOT appear anywhere ----
+
+        // 1. result.error must not contain the secret.
+        if let Some(ref err_str) = result.error {
+            assert!(
+                !err_str.contains(secret_value),
+                "secret leaked into result.error: {err_str}"
+            );
+        }
+
+        // 2. Journal entries (output + error fields) must not contain the secret.
+        for entry in &journal_entries {
+            let output_str = format!("{:?}", entry.output);
+            assert!(
+                !output_str.contains(secret_value),
+                "secret leaked into journal output for {}: {output_str}",
+                entry.node_id
+            );
+            if let Some(ref entry_err) = entry.error {
+                assert!(
+                    !entry_err.contains(secret_value),
+                    "secret leaked into journal error for {}: {entry_err}",
+                    entry.node_id
+                );
+            }
+        }
+
+        // 3. Collected node outputs must not contain the secret.
+        for (nid, out) in &result.node_outputs {
+            let content_str = format!("{:?}", out.content);
+            assert!(
+                !content_str.contains(secret_value),
+                "secret leaked into node_outputs[{nid}]: {content_str}"
+            );
+        }
     }
 }

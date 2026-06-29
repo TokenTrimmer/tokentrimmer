@@ -43,6 +43,7 @@ use crate::{
         estimate,
         events::WfEvent,
         executor::GatewayNodeExecutor,
+        secrets::{is_valid_secret_name, load_secrets, master_key_from_env, store_secret},
         store::{self, WorkflowRunRecord},
         types::content_hash,
         validate,
@@ -90,6 +91,9 @@ pub struct CreateWorkflowRequest {
     pub inputs: serde_json::Value,
     #[serde(default)]
     pub budget: workflow::types::BudgetPolicy,
+    /// Per-workflow egress allowlist forwarded to `WorkflowDefinition::allowed_hosts`.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Response from `POST /v1/workflows`.
@@ -175,6 +179,14 @@ pub struct NodeOutputView {
     pub cost_usd: f64,
 }
 
+/// `POST /v1/workflows/secrets` request body.
+#[derive(Debug, Deserialize)]
+pub struct SetWorkflowSecretRequest {
+    pub name: String,
+    /// The plaintext secret value. Encrypted at rest; **never returned**.
+    pub value: String,
+}
+
 // ---------------------------------------------------------------------------
 // POST /v1/workflows — create / update a workflow definition
 // ---------------------------------------------------------------------------
@@ -200,6 +212,7 @@ pub async fn create(
         edges: body.edges,
         inputs: body.inputs,
         budget: body.budget,
+        allowed_hosts: body.allowed_hosts,
     };
 
     // Validate first — returns 400 with the full error list before any DB call.
@@ -457,6 +470,14 @@ pub async fn create_run(
     )
     .await;
 
+    // --- Load org secrets once (both sync + streaming paths) -----------------
+    // Empty map when TT_MASTER_KEY is absent — Http nodes without secrets work,
+    // {{secrets.*}} refs just resolve to "".
+    let secrets = match master_key_from_env() {
+        Some(master) => load_secrets(pool, org, &master).await,
+        None => std::collections::HashMap::new(),
+    };
+
     if !body.stream {
         // --- Synchronous path ------------------------------------------------
         let executor = GatewayNodeExecutor {
@@ -476,6 +497,7 @@ pub async fn create_run(
             run_max_cost,
             |entry| journal_entries.push(entry),
             None,
+            &secrets,
         )
         .await;
         let status_str = persist_run_results(pool, run_id, org, journal_entries, &result).await;
@@ -500,6 +522,7 @@ pub async fn create_run(
         // --- Streaming path: spawn the engine + return SSE -------------------
         // `owned_state` is cloned (cheap Arc bump) so the spawned 'static task
         // can own it; the executor borrows &owned_state from within the block.
+        // `secrets` was loaded before the branch so both paths share one DB call.
         let owned_state = state.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
         tokio::spawn(async move {
@@ -520,6 +543,7 @@ pub async fn create_run(
                 run_max_cost,
                 |entry| journal_entries.push(entry),
                 Some(&tx),
+                &secrets,
             )
             .await;
             // Persist node runs + finalize (best-effort, mirrors sync path).
@@ -541,6 +565,47 @@ pub async fn create_run(
             .keep_alive(KeepAlive::default())
             .into_response())
     }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/workflows/secrets — store (or rotate) a per-org secret
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/workflows/secrets` — encrypt and upsert a named secret for the
+/// caller's org.
+///
+/// * `name` must match `^[A-Z0-9_]{1,64}$` (the charset used by
+///   `{{secrets.NAME}}` template references in Http nodes) → 400 otherwise.
+/// * Returns 503 when `TT_MASTER_KEY` is absent (secret storage not configured).
+/// * Returns 204 on success. **The value is never echoed in any response or log.**
+pub async fn set_workflow_secret(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Json(body): Json<SetWorkflowSecretRequest>,
+) -> ApiResult<StatusCode> {
+    let org = require_org(ctx)?;
+    if !is_valid_secret_name(&body.name) {
+        return Err(ApiError::InvalidRequest(
+            "secret name must match ^[A-Z0-9_]{1,64}$ \
+             (uppercase letters, digits, and underscore only)"
+                .into(),
+        ));
+    }
+    let master = master_key_from_env().ok_or_else(|| {
+        ApiError::ServiceUnavailable("secret storage not configured (TT_MASTER_KEY absent)".into())
+    })?;
+    let pool = db_pool(&state)?;
+    store_secret(pool, org, &body.name, &master, &body.value)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                secret_name = %body.name,
+                error = %e,
+                "workflow_secrets UPSERT failed"
+            );
+            ApiError::Internal(format!("failed to store secret: {e}"))
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +686,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -647,6 +713,7 @@ mod tests {
             }],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -770,6 +837,69 @@ mod tests {
         assert!(
             matches!(result, Err(ApiError::Unauthorized)),
             "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `set_workflow_secret` — name-validation + handler-shape tests
+    // ------------------------------------------------------------------
+
+    /// Directly exercises the name-validation predicate: lowercase, spaces,
+    /// hyphens, empty, and >64-char names must all be rejected.
+    #[test]
+    fn set_secret_rejects_bad_name() {
+        assert!(!is_valid_secret_name("lowercase"));
+        assert!(!is_valid_secret_name("HAS SPACE"));
+        assert!(!is_valid_secret_name("MY-KEY"));
+        assert!(!is_valid_secret_name(""));
+        assert!(!is_valid_secret_name(&"A".repeat(65)));
+        // Valid names must pass.
+        assert!(is_valid_secret_name("MY_API_KEY"));
+        assert!(is_valid_secret_name("KEY_123"));
+    }
+
+    #[tokio::test]
+    async fn set_workflow_secret_anon_returns_unauthorized() {
+        let body = SetWorkflowSecretRequest {
+            name: "MY_KEY".into(),
+            value: "s3cr3t".into(),
+        };
+        let result = set_workflow_secret(State(test_state()), None, Json(body)).await;
+        assert!(
+            matches!(result, Err(ApiError::Unauthorized)),
+            "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    /// A bad name (lowercase) is rejected with 400 before any DB or key check.
+    #[tokio::test]
+    async fn set_workflow_secret_bad_name_returns_invalid_request() {
+        let org = Uuid::new_v4();
+        let body = SetWorkflowSecretRequest {
+            name: "bad-name".into(),
+            value: "s3cr3t".into(),
+        };
+        let result = set_workflow_secret(State(test_state()), real_org_ctx(org), Json(body)).await;
+        assert!(
+            matches!(result, Err(ApiError::InvalidRequest(_))),
+            "expected InvalidRequest for bad name, got {result:?}"
+        );
+    }
+
+    /// With a valid name but no TT_MASTER_KEY the handler returns 503.
+    #[tokio::test]
+    async fn set_workflow_secret_no_master_key_returns_503() {
+        // Ensure the env var is absent for this test.
+        std::env::remove_var("TT_MASTER_KEY");
+        let org = Uuid::new_v4();
+        let body = SetWorkflowSecretRequest {
+            name: "MY_KEY".into(),
+            value: "s3cr3t".into(),
+        };
+        let result = set_workflow_secret(State(test_state()), real_org_ctx(org), Json(body)).await;
+        assert!(
+            matches!(result, Err(ApiError::ServiceUnavailable(_))),
+            "expected ServiceUnavailable when TT_MASTER_KEY absent, got {result:?}"
         );
     }
 

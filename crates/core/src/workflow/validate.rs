@@ -136,7 +136,98 @@ pub fn validate(
     }
 
     // ------------------------------------------------------------------
-    // 6. No cycles — Kahn's algorithm (topological sort).
+    // 6. Http nodes: allowed_hosts (default-deny), https-only, denied headers.
+    // ------------------------------------------------------------------
+    for node in &def.nodes {
+        if let NodeKind::Http { url, headers, .. } = &node.kind {
+            let node_id = &node.id;
+
+            // Extract the authority (everything after scheme://, before the first
+            // '/') as a simple string operation so it succeeds even when the URL
+            // contains curly braces (e.g. templated paths).
+            let authority: &str = {
+                let after_scheme = url
+                    .find("://")
+                    .map(|i| &url[i + 3..])
+                    .unwrap_or(url.as_str());
+                after_scheme.split('/').next().unwrap_or(after_scheme)
+            };
+
+            // ---- a-0. Reject userinfo in authority (SSRF allowlist-bypass) ----
+            // A URL like `https://user:pass@host/` encodes credentials in the
+            // authority.  The naive port-stripping extractor below would split on
+            // ':' first, producing e.g. "allowed.example.com" from the authority
+            // "allowed.example.com:@evil.com", which falsely passes the allowlist
+            // while reqwest actually connects to evil.com.  Reject any URL whose
+            // authority contains '@'.  Credentials must flow via
+            // `{{secrets.NAME}}` Authorization headers instead.
+            if authority.contains('@') {
+                errors.push(format!(
+                    "node \"{node_id}\": Http url must not contain userinfo \
+                     ('@' in authority); pass credentials via a \
+                     {{{{secrets.NAME}}}} header instead"
+                ));
+                continue;
+            }
+
+            // Strip port from the authority to get the raw hostname
+            // (e.g. "api.example.com:8080" → "api.example.com").
+            let raw_host: &str = authority.split(':').next().unwrap_or(authority);
+
+            // ---- a. Reject templated hosts ----
+            // Only the path / query-string / headers / body may contain
+            // `{{...}}` template tokens.  The host must be a static literal so
+            // the allowlist is unambiguous.
+            if raw_host.contains("{{") {
+                errors.push(format!(
+                    "node \"{node_id}\": Http url host must be a literal hostname; \
+                     templated hosts are not allowlistable \
+                     (only path/query/headers/body may use {{{{...}}}} templates)"
+                ));
+                // Skip the allowlist + url-guard — they'd both fail on the same
+                // malformed URL, producing redundant noise.
+                continue;
+            }
+
+            // ---- b. Default-deny allowlist ----
+            // Empty `allowed_hosts` ⇒ all Http nodes are rejected.
+            if !def.allowed_hosts.iter().any(|h| h == raw_host) {
+                errors.push(format!(
+                    "node \"{node_id}\": Http url host \"{raw_host}\" is not in \
+                     workflow allowed_hosts (default-deny); \
+                     add the host to the workflow's allowed_hosts list"
+                ));
+            }
+
+            // ---- c. validate_provider_url: https-only + IP/hostname denylist ----
+            // Validate the static URL prefix (everything before the first `{{`)
+            // so that scheme + host pass the guard even when the path is templated.
+            let static_url = url.split("{{").next().unwrap_or(url.as_str());
+            // Ensure the trimmed string ends with '/' so it parses as a valid URL.
+            let static_url_owned;
+            let check_url: &str = if static_url.contains("://") && !static_url.contains('/') {
+                // e.g. "https://api.example.com" (host-only, no path slash yet)
+                static_url_owned = format!("{static_url}/");
+                &static_url_owned
+            } else {
+                static_url
+            };
+            if let Err(e) = tt_shared::url_guard::validate_provider_url(check_url, false) {
+                errors.push(format!("node \"{node_id}\": Http url rejected: {e}"));
+            }
+
+            // ---- d. Denied headers ----
+            if let Some(denied) = tt_shared::url_guard::find_denied_header(headers) {
+                errors.push(format!(
+                    "node \"{node_id}\": Http header \"{denied}\" is not allowed \
+                     (denied headers list)"
+                ));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 7. No cycles — Kahn's algorithm (topological sort).
     //
     // The execution graph is the union of def.edges AND Branch arm targets:
     // a Branch node's when_true/when_false are outgoing edges the engine
@@ -301,6 +392,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -424,6 +516,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -476,6 +569,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -557,6 +651,7 @@ mod tests {
             edges: vec![],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -596,6 +691,7 @@ mod tests {
             edges: vec![],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -644,6 +740,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -722,6 +819,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         assert!(
             validate(&def, &any_model).is_ok(),
@@ -776,6 +874,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -845,6 +944,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -885,6 +985,7 @@ mod tests {
             }],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
         let errs = validate(&def, &|m| m == "gpt-4o").unwrap_err();
         assert!(
@@ -892,6 +993,181 @@ mod tests {
             "expected ≥3 errors (no trigger, bad edge src, bad model), got {}: {:?}",
             errs.len(),
             errs
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Http node validation tests (W3b Task 2 — written TDD-first)
+    // ------------------------------------------------------------------
+
+    /// Build a minimal Trigger → Http → Output workflow for Http validation tests.
+    fn http_def(
+        url: &str,
+        allowed_hosts: Vec<String>,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+    ) -> WorkflowDefinition {
+        WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "http-test".to_string(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "h".into(),
+                    kind: NodeKind::Http {
+                        method: "GET".to_string(),
+                        url: url.to_string(),
+                        headers,
+                        body,
+                        max_response_bytes: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "h".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "h".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts,
+        }
+    }
+
+    /// An Http node with an empty allowed_hosts list must be rejected (default-deny).
+    /// With the url host in allowed_hosts, validation must pass.
+    #[test]
+    fn http_url_host_must_be_in_allowed_hosts() {
+        // Empty allowed_hosts → every Http url host is denied.
+        let def = http_def("https://api.example.com/x", vec![], vec![], None);
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("allowed_hosts")
+                || combined.contains("allowlist")
+                || combined.contains("not in"),
+            "expected allowlist error; got: {combined}"
+        );
+
+        // With the host in allowed_hosts → passes (no errors).
+        let def2 = http_def(
+            "https://api.example.com/x",
+            vec!["api.example.com".to_string()],
+            vec![],
+            None,
+        );
+        assert!(
+            validate(&def2, &any_model).is_ok(),
+            "host in allowed_hosts should pass validation"
+        );
+    }
+
+    /// An Http node with an http:// (non-https) url must be rejected.
+    #[test]
+    fn http_rejects_non_https() {
+        let def = http_def(
+            "http://api.example.com/path",
+            vec!["api.example.com".to_string()],
+            vec![],
+            None,
+        );
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("https")
+                || combined.contains("insecure")
+                || combined.contains("scheme"),
+            "expected https-only error; got: {combined}"
+        );
+    }
+
+    /// An Http node whose url host is a template token must be rejected.
+    /// Only path/query/headers/body may be templated; the host must be literal.
+    #[test]
+    fn http_rejects_templated_host() {
+        let def = http_def("https://{{inputs.host}}/x", vec![], vec![], None);
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("template")
+                || combined.contains("literal")
+                || combined.contains("allowlistable"),
+            "expected templated-host error; got: {combined}"
+        );
+    }
+
+    /// An Http node with a denied header (e.g. `authorization`) must be rejected.
+    #[test]
+    fn http_rejects_denied_header() {
+        let def = http_def(
+            "https://api.example.com/path",
+            vec!["api.example.com".to_string()],
+            vec![("authorization".to_string(), "Bearer token".to_string())],
+            None,
+        );
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("authorization") || combined.contains("denied header"),
+            "expected denied-header error; got: {combined}"
+        );
+    }
+
+    /// Http url with userinfo (`user:pass@host`) must be rejected regardless of
+    /// allowed_hosts.  This guards the SSRF allowlist-bypass class:
+    /// `https://allowed.example.com:@evil.com/` looks like host=allowed.example.com
+    /// to the naive port-stripping parser (splits on ':' first, so `allowed.example.com`
+    /// is extracted), yet reqwest actually connects to `evil.com`.  Before the fix this
+    /// test FAILS (no error is returned because the naive check wrongly passes); after
+    /// the fix the '@'-in-authority check rejects the url before the allowlist check.
+    #[test]
+    fn http_rejects_userinfo_in_url() {
+        // `https://allowed.example.com:@evil.com/path`:
+        //   username = "allowed.example.com", password = "", real host = "evil.com".
+        // The naive raw_host extractor splits on ':' and gets "allowed.example.com",
+        // which IS in allowed_hosts — so it would wrongly pass before the fix.
+        let def = http_def(
+            "https://allowed.example.com:@evil.com/path",
+            vec!["allowed.example.com".to_string()],
+            vec![],
+            None,
+        );
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("userinfo") || combined.contains('@'),
+            "expected userinfo rejection error; got: {combined}"
+        );
+    }
+
+    /// An Http node with a templated path and templated body (but a literal host
+    /// in allowed_hosts) must pass validation — only the host must be literal.
+    #[test]
+    fn http_allows_templated_path_and_body() {
+        let def = http_def(
+            "https://api.example.com/{{inputs.id}}",
+            vec!["api.example.com".to_string()],
+            vec![("X-Custom".to_string(), "value".to_string())],
+            Some("{{trigger.data}}".to_string()),
+        );
+        assert!(
+            validate(&def, &any_model).is_ok(),
+            "templated path + body with literal host in allowed_hosts must pass"
         );
     }
 }

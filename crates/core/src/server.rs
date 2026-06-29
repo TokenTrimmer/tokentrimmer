@@ -170,6 +170,13 @@ pub fn build_router_with_retrieval(
             "/v1/workflows",
             post(routes::workflows::create).get(routes::workflows::list),
         )
+        // Literal `/secrets` segment must come before the parameterised `:id`
+        // route so the path is unambiguous (axum prefers literals, but explicit
+        // ordering documents intent).
+        .route(
+            "/v1/workflows/secrets",
+            post(routes::workflows::set_workflow_secret),
+        )
         .route("/v1/workflows/:id", get(routes::workflows::get))
         .route(
             "/v1/workflows/:id/estimate",
