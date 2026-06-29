@@ -2081,6 +2081,42 @@ already incurred by the child is included in the parent's reported `cost_usd`.
 workflow's `node_outputs` array serialized as JSON.  Downstream nodes can
 reference it with `{{enrich}}` (the node id).
 
+---
+
+#### `loop`
+
+Execute a stored body workflow repeatedly while a condition holds (while-semantics: the condition is checked _before_ each iteration).  Iteration count is bounded by a hard cap to guarantee termination.
+
+```json
+{
+  "id": "retry",
+  "type": "loop",
+  "body_workflow_id": "c3d4e5f6-0000-0000-0000-000000000002",
+  "cond": "{{retry}} == \"\"",
+  "max_iters": 5
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `body_workflow_id` | string (UUID) | yes | Id of the body workflow to run each iteration. Must be owned by the same org. |
+| `cond` | string | yes | Branch-style condition evaluated before each iteration (while-semantics). Same syntax as `branch` nodes: `{{ref}} == "literal"`, `{{ref}} != "literal"`, or a bare `{{ref}}` (truthy check). Falsy values: empty string, `"false"`, `"null"`, `"0"`. |
+| `max_iters` | integer | yes | Hard termination cap. Must be in `1..=100`. The loop stops after at most this many body executions, regardless of whether the condition is still true. Guarantees the loop always terminates. |
+
+**While-semantics (cond before body).** The condition is evaluated at the start of each iteration, _before_ the body runs.  If the condition is false on the first check the body runs zero times and the loop node is a no-op (status `Succeeded`, zero cost).
+
+**`max_iters` hard cap (1–100).** Passing `max_iters: 0` or `max_iters > 100` is a validation error.  The cap is the definitive termination guarantee: even an always-true condition cannot cause an infinite loop.
+
+**Budget stop.** At the start of each iteration, if `accrued_cost + loop_cost_so_far >= run_max_cost_usd`, the loop exits early (the condition is not re-evaluated).  The loop node itself still returns `Succeeded`; the budget is tracked at the parent run level.
+
+**Per-iteration output threading.** After each iteration the body's `node_outputs` array is serialized as JSON and stored under the loop node's id in the output map.  The next iteration's condition evaluation and the body's trigger input both receive this value, so downstream cond expressions (e.g. `{{retry}} != "STOP"`) can react to what the body last produced.
+
+**Cost and savings rollup.** The body's `cost_usd` and `baseline_cost_usd` accumulate across iterations and are folded into the parent run's totals on loop exit.  The body's `saved_usd` is **not** added directly — savings are always re-derived as `(accrued_baseline − accrued_cost)` to prevent double-counting.
+
+**Child failure stops the loop.** If any body iteration ends with `Failed` or `BudgetExhausted`, the loop stops immediately and the parent run ends with the same status.  Any cost already incurred is included in the parent's reported `cost_usd`.
+
+**Depth and cycle guards.** The same `MAX_SUBWORKFLOW_DEPTH = 5` nesting cap and cycle-detection logic that apply to `sub_workflow` nodes also apply to `loop` body workflows.
+
 ### 24.3 Model selection (`selection`)
 
 The `selection` field on `model` and `agent` nodes determines how the model is resolved:

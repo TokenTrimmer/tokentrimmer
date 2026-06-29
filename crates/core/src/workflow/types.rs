@@ -126,6 +126,16 @@ pub enum NodeKind {
         #[serde(default)]
         version: Option<u32>,
     },
+
+    /// Bounded loop — runs the body sub-workflow up to `max_iters` times,
+    /// re-checking `cond` (Branch syntax) before each iteration.
+    /// Termination GUARANTEED by `max_iters`; `cond` is early-exit.
+    Loop {
+        body_workflow_id: Uuid,
+        cond: String,
+        #[serde(default)]
+        max_iters: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
