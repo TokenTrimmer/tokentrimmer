@@ -547,6 +547,31 @@ pub(crate) async fn run_workflow(
                 NodeKind::Model { .. } | NodeKind::Agent { .. } => {
                     unreachable!("partitioned into model_agent_wave above")
                 }
+
+                // Http execution is implemented in W3b Task 3.
+                // This stub makes the match exhaustive and returns an error so
+                // workflows containing Http nodes cannot be run until Task 3
+                // wires the executor (validate already blocks Http nodes from
+                // being saved without a valid allowed_hosts entry).
+                NodeKind::Http { .. } => {
+                    let saved_usd = (accrued_baseline - accrued).max(0.0);
+                    emit(WfEvent::RunDone {
+                        status: "failed".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                    });
+                    return WorkflowRunResult {
+                        status: WfStatus::Failed,
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                        node_outputs: collected_outputs,
+                        error: Some(format!(
+                            "node \"{node_id}\": Http execution not yet implemented (W3b Task 3)"
+                        )),
+                    };
+                }
             }
 
             done.insert(node_id.clone());
@@ -920,6 +945,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -986,6 +1012,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -1040,6 +1067,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -1656,6 +1684,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -2006,6 +2035,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         };
 
         let stub = StubExecutor::new(vec![

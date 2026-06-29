@@ -24,6 +24,13 @@ pub struct WorkflowDefinition {
     /// Budget guard applied to the whole workflow run.
     #[serde(default)]
     pub budget: BudgetPolicy,
+    /// Per-workflow egress allowlist for Http nodes (default-deny).
+    ///
+    /// An Http node whose url host is not an exact member of this list is
+    /// rejected at save-time by `validate`.  Empty (the default) means all
+    /// Http nodes are rejected — populate this list to enable Http calls.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +95,24 @@ pub enum NodeKind {
 
     /// Terminal output-collection node.
     Output,
+
+    /// Outbound HTTP call to an allowlisted external API.
+    ///
+    /// The `url` host must be a literal hostname that appears in
+    /// `WorkflowDefinition::allowed_hosts` (default-deny).  Only the
+    /// path, query-string, headers, and body may contain `{{template}}`
+    /// tokens; the host must be a static literal so the allowlist is
+    /// unambiguous.
+    Http {
+        method: String,
+        url: String,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        max_response_bytes: Option<usize>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +279,16 @@ mod tests {
             Node {
                 id: "output".into(),
                 kind: NodeKind::Output,
+            },
+            Node {
+                id: "http".into(),
+                kind: NodeKind::Http {
+                    method: "POST".into(),
+                    url: "https://api.example.com/v1".into(),
+                    headers: vec![("X-Custom".into(), "value".into())],
+                    body: Some("{{input}}".into()),
+                    max_response_bytes: Some(65536),
+                },
             },
         ];
 

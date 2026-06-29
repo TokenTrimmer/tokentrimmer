@@ -90,6 +90,9 @@ pub struct CreateWorkflowRequest {
     pub inputs: serde_json::Value,
     #[serde(default)]
     pub budget: workflow::types::BudgetPolicy,
+    /// Per-workflow egress allowlist forwarded to `WorkflowDefinition::allowed_hosts`.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Response from `POST /v1/workflows`.
@@ -200,6 +203,7 @@ pub async fn create(
         edges: body.edges,
         inputs: body.inputs,
         budget: body.budget,
+        allowed_hosts: body.allowed_hosts,
     };
 
     // Validate first — returns 400 with the full error list before any DB call.
@@ -621,6 +625,7 @@ mod tests {
             ],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
@@ -647,6 +652,7 @@ mod tests {
             }],
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
         }
     }
 
