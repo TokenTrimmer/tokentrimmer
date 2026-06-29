@@ -13,7 +13,7 @@ use tt_shared::messages::{Message, MessageContent, Tool};
 use crate::{
     error::ApiError,
     routes::agent_run::{self, LoopOutcome},
-    workflow::types::{ModelSelection, NodeOutput},
+    workflow::types::{ModelSelection, NodeOutput, WorkflowDefinition},
     AppState,
 };
 
@@ -45,6 +45,13 @@ pub(crate) trait NodeExecutor: Send + Sync {
         node_id: &str,
         spec: &IntelligenceSpec,
     ) -> Result<NodeOutput, ApiError>;
+
+    /// Load the latest version of a child workflow definition scoped to the
+    /// same org as this executor.  Returns [`ApiError::NotFound`] if no
+    /// workflow with that id exists for the org, or
+    /// [`ApiError::ServiceUnavailable`] if the backing store is unavailable.
+    #[allow(dead_code)]
+    async fn load_subworkflow(&self, id: uuid::Uuid) -> Result<WorkflowDefinition, ApiError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +94,18 @@ fn selection_to_model_route(selection: &ModelSelection) -> (String, Option<Strin
 
 #[async_trait]
 impl NodeExecutor for GatewayNodeExecutor<'_> {
+    async fn load_subworkflow(&self, id: uuid::Uuid) -> Result<WorkflowDefinition, ApiError> {
+        let pool = self
+            .state
+            .db_pool
+            .as_ref()
+            .ok_or_else(|| ApiError::ServiceUnavailable("workflow store unavailable".into()))?;
+        crate::workflow::store::get_definition(pool, self.org_id, id)
+            .await
+            .map(|(def, _version)| def)
+            .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))
+    }
+
     async fn run_intelligence(
         &self,
         node_id: &str,

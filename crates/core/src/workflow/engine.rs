@@ -927,6 +927,8 @@ mod tests {
         responses: HashMap<String, NodeOutput>,
         /// Append-only call log: (node_id, prompt).
         calls: std::sync::Mutex<Vec<(String, String)>>,
+        /// workflow_id → WorkflowDefinition registry for sub-workflow loading tests.
+        subworkflows: HashMap<Uuid, WorkflowDefinition>,
     }
 
     impl StubExecutor {
@@ -937,6 +939,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v))
                     .collect(),
                 calls: std::sync::Mutex::new(Vec::new()),
+                subworkflows: HashMap::new(),
             }
         }
 
@@ -969,6 +972,13 @@ mod tests {
                 .get(node_id)
                 .cloned()
                 .ok_or_else(|| ApiError::Internal(format!("stub: no response for {node_id}")))
+        }
+
+        async fn load_subworkflow(&self, id: Uuid) -> Result<WorkflowDefinition, ApiError> {
+            self.subworkflows
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| ApiError::NotFound(format!("stub: no subworkflow with id {id}")))
         }
     }
 
@@ -2047,6 +2057,12 @@ mod tests {
                     .cloned()
                     .ok_or_else(|| ApiError::Internal(format!("no response for {node_id}")))
             }
+
+            async fn load_subworkflow(&self, id: Uuid) -> Result<WorkflowDefinition, ApiError> {
+                Err(ApiError::NotFound(format!(
+                    "ParallelProbe stub: no subworkflow {id}"
+                )))
+            }
         }
 
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -2674,5 +2690,56 @@ mod tests {
                 "secret leaked into node_outputs[{nid}]: {content_str}"
             );
         }
+    }
+
+    // ---- Task 1 (W3a-3): StubExecutor::load_subworkflow registry ----------------
+
+    /// Registering a WorkflowDefinition in StubExecutor and calling
+    /// `load_subworkflow` returns a clone of it; an unregistered id returns
+    /// `Err(ApiError::NotFound)`.
+    #[tokio::test]
+    async fn stub_load_subworkflow_returns_registered_def() {
+        let child_id = Uuid::new_v4();
+        let child_def = WorkflowDefinition {
+            id: child_id,
+            version: 1,
+            name: "child-wf".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![Edge {
+                from: "t".into(),
+                to: "o".into(),
+                map: None,
+            }],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        let mut stub = StubExecutor::new(vec![]);
+        stub.subworkflows.insert(child_id, child_def.clone());
+
+        // Registered id → Ok with the same definition.
+        let result = stub.load_subworkflow(child_id).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let loaded = result.unwrap();
+        assert_eq!(loaded.id, child_id);
+        assert_eq!(loaded.name, "child-wf");
+
+        // Unregistered id → Err(NotFound).
+        let unknown_id = Uuid::new_v4();
+        let miss = stub.load_subworkflow(unknown_id).await;
+        assert!(
+            matches!(miss, Err(ApiError::NotFound(_))),
+            "expected NotFound for unknown id, got {miss:?}"
+        );
     }
 }
