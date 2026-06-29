@@ -396,7 +396,7 @@ enum WorkflowAction {
         baseline: Option<PathBuf>,
         /// Exit non-zero when the current projected cost exceeds the baseline.
         /// Requires `--baseline`.
-        #[arg(long)]
+        #[arg(long, requires = "baseline")]
         fail_on_cost_increase: bool,
         /// Write the WorkflowEstimate JSON to this path (a baseline dump for
         /// future `--baseline` comparisons).
