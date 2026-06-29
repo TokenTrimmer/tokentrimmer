@@ -70,6 +70,14 @@ pub(crate) enum HttpError {
     #[error("host not in allowed_hosts: {0}")]
     HostNotAllowed(String),
 
+    /// The URL contains inline userinfo (`user:pass@host`). Credentials must be
+    /// passed via `{{secrets.NAME}}` Authorization headers instead.
+    #[error(
+        "url must not contain userinfo ('@' in host); \
+         pass credentials via a {{{{secrets.NAME}}}} header instead"
+    )]
+    UrlContainsUserinfo,
+
     /// The URL could not be parsed (details redacted to avoid leaking secrets
     /// that may appear in the url string).
     #[error("invalid url (details redacted)")]
@@ -279,8 +287,14 @@ pub(crate) async fn run_http(
 // ---------------------------------------------------------------------------
 
 fn extract_host(url: &str) -> Result<String, HttpError> {
-    reqwest::Url::parse(url)
-        .map_err(|_| HttpError::InvalidUrl)?
+    let parsed = reqwest::Url::parse(url).map_err(|_| HttpError::InvalidUrl)?;
+    // Reject inline userinfo — credentials must flow via {{secrets.NAME}} headers.
+    // Defense-in-depth: save-time validation also rejects '@' in the authority,
+    // but a workflow def could in principle reach run_http bypassing that check.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HttpError::UrlContainsUserinfo);
+    }
+    parsed
         .host_str()
         .map(|h| h.to_string())
         .ok_or(HttpError::InvalidUrl)
@@ -349,6 +363,36 @@ mod tests {
         let result =
             substitute_with_secrets("{{input}} + {{secrets.KEY}}", "t", &outputs, &secrets);
         assert_eq!(result, "hello + s3cr3t");
+    }
+
+    // ---- run_http: userinfo rejection ---------------------------------------
+
+    /// `run_http` must reject a url that embeds userinfo even when BOTH the
+    /// spoofed and real host are in allowed_hosts — proving it is the USERINFO
+    /// check (not the allowlist) doing the rejecting.
+    /// Before the fix: `extract_host` returns the real host "evil.com", which IS
+    /// in allowed_hosts → no error → test FAILS.
+    /// After the fix: `extract_host` detects non-empty username → UrlContainsUserinfo.
+    #[tokio::test]
+    async fn run_http_rejects_userinfo() {
+        let spec = HttpReqSpec {
+            method: "GET".into(),
+            url: "https://allowed.example.com@evil.com/".into(),
+            headers: vec![],
+            body: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        };
+        // Both listed so the allowlist would pass — rejection must come from userinfo check.
+        let err = run_http(
+            spec,
+            &["allowed.example.com".to_string(), "evil.com".to_string()],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, HttpError::UrlContainsUserinfo),
+            "expected UrlContainsUserinfo, got: {err}"
+        );
     }
 
     // ---- run_http: allowlist re-check ---------------------------------------

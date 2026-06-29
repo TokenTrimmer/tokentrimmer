@@ -142,22 +142,37 @@ pub fn validate(
         if let NodeKind::Http { url, headers, .. } = &node.kind {
             let node_id = &node.id;
 
-            // Extract the raw host from the URL string (before any template token
-            // or path component). Works even when the path contains `{{...}}`.
-            //
-            // Algorithm: strip "scheme://", take up to the first '/', then strip
-            // any port suffix (after the first ':').  This is intentionally a
-            // simple string operation so it succeeds even when the url crate would
-            // reject the URL (e.g. curly braces in the host).
-            let raw_host: &str = {
+            // Extract the authority (everything after scheme://, before the first
+            // '/') as a simple string operation so it succeeds even when the URL
+            // contains curly braces (e.g. templated paths).
+            let authority: &str = {
                 let after_scheme = url
                     .find("://")
                     .map(|i| &url[i + 3..])
                     .unwrap_or(url.as_str());
-                let before_path = after_scheme.split('/').next().unwrap_or(after_scheme);
-                // Strip port (e.g. "api.example.com:8080" → "api.example.com").
-                before_path.split(':').next().unwrap_or(before_path)
+                after_scheme.split('/').next().unwrap_or(after_scheme)
             };
+
+            // ---- a-0. Reject userinfo in authority (SSRF allowlist-bypass) ----
+            // A URL like `https://user:pass@host/` encodes credentials in the
+            // authority.  The naive port-stripping extractor below would split on
+            // ':' first, producing e.g. "allowed.example.com" from the authority
+            // "allowed.example.com:@evil.com", which falsely passes the allowlist
+            // while reqwest actually connects to evil.com.  Reject any URL whose
+            // authority contains '@'.  Credentials must flow via
+            // `{{secrets.NAME}}` Authorization headers instead.
+            if authority.contains('@') {
+                errors.push(format!(
+                    "node \"{node_id}\": Http url must not contain userinfo \
+                     ('@' in authority); pass credentials via a \
+                     {{{{secrets.NAME}}}} header instead"
+                ));
+                continue;
+            }
+
+            // Strip port from the authority to get the raw hostname
+            // (e.g. "api.example.com:8080" → "api.example.com").
+            let raw_host: &str = authority.split(':').next().unwrap_or(authority);
 
             // ---- a. Reject templated hosts ----
             // Only the path / query-string / headers / body may contain
@@ -1110,6 +1125,33 @@ mod tests {
         assert!(
             combined.contains("authorization") || combined.contains("denied header"),
             "expected denied-header error; got: {combined}"
+        );
+    }
+
+    /// Http url with userinfo (`user:pass@host`) must be rejected regardless of
+    /// allowed_hosts.  This guards the SSRF allowlist-bypass class:
+    /// `https://allowed.example.com:@evil.com/` looks like host=allowed.example.com
+    /// to the naive port-stripping parser (splits on ':' first, so `allowed.example.com`
+    /// is extracted), yet reqwest actually connects to `evil.com`.  Before the fix this
+    /// test FAILS (no error is returned because the naive check wrongly passes); after
+    /// the fix the '@'-in-authority check rejects the url before the allowlist check.
+    #[test]
+    fn http_rejects_userinfo_in_url() {
+        // `https://allowed.example.com:@evil.com/path`:
+        //   username = "allowed.example.com", password = "", real host = "evil.com".
+        // The naive raw_host extractor splits on ':' and gets "allowed.example.com",
+        // which IS in allowed_hosts — so it would wrongly pass before the fix.
+        let def = http_def(
+            "https://allowed.example.com:@evil.com/path",
+            vec!["allowed.example.com".to_string()],
+            vec![],
+            None,
+        );
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("userinfo") || combined.contains('@'),
+            "expected userinfo rejection error; got: {combined}"
         );
     }
 
