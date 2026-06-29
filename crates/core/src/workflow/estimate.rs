@@ -21,8 +21,8 @@ use tt_shared::messages::{Message, MessageContent};
 // ---------------------------------------------------------------------------
 
 /// Cost estimate for a single Model or Agent node.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct NodeEstimate {
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NodeEstimate {
     pub node_id: String,
     /// The model id that would be used, if statically determinable.
     pub model: Option<String>,
@@ -32,8 +32,8 @@ pub(crate) struct NodeEstimate {
 }
 
 /// Top-level pre-run cost projection.
-#[derive(Debug, Clone)]
-pub(crate) struct WorkflowEstimate {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowEstimate {
     /// Sum of all `Some(cost_usd)` per-node values (MVP: linear sum).
     pub projected_cost_usd: f64,
     /// One entry per Model/Agent node in definition order.
@@ -55,10 +55,7 @@ pub(crate) struct WorkflowEstimate {
 ///   a warning.
 ///
 /// Trigger / Transform / Branch / Output nodes are skipped (zero model cost).
-pub(crate) fn estimate_workflow(
-    def: &WorkflowDefinition,
-    inputs: &serde_json::Value,
-) -> WorkflowEstimate {
+pub fn estimate_workflow(def: &WorkflowDefinition, inputs: &serde_json::Value) -> WorkflowEstimate {
     let mut per_node: Vec<NodeEstimate> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut projected_cost_usd = 0.0f64;
@@ -398,5 +395,55 @@ mod tests {
     fn substitute_input_null_inputs_is_empty_string() {
         let result = substitute_input("{{input}}", &serde_json::Value::Null);
         assert_eq!(result, "");
+    }
+
+    // ---- serde round-trip --------------------------------------------------
+
+    /// WorkflowEstimate + NodeEstimate serialize and deserialize successfully.
+    /// Confirms that the pub + Serialize/Deserialize derives work end-to-end so
+    /// the CLI can dump/read estimate JSON.
+    #[test]
+    fn workflow_estimate_serializes() {
+        let def = pinned_two_model_def();
+        let est = estimate_workflow(&def, &json!("hello"));
+
+        // Serialize to JSON string.
+        let json_str = serde_json::to_string(&est).expect("WorkflowEstimate must serialize");
+
+        // Required top-level fields are present.
+        assert!(
+            json_str.contains("projected_cost_usd"),
+            "expected 'projected_cost_usd' in JSON; got: {json_str}"
+        );
+        assert!(
+            json_str.contains("per_node"),
+            "expected 'per_node' in JSON; got: {json_str}"
+        );
+        assert!(
+            json_str.contains("warnings"),
+            "expected 'warnings' in JSON; got: {json_str}"
+        );
+
+        // Round-trip: deserialize back and check equality.
+        let round_tripped: WorkflowEstimate =
+            serde_json::from_str(&json_str).expect("WorkflowEstimate must deserialize");
+
+        assert!(
+            (round_tripped.projected_cost_usd - est.projected_cost_usd).abs() < 1e-12,
+            "projected_cost_usd round-trip mismatch"
+        );
+        assert_eq!(
+            round_tripped.per_node.len(),
+            est.per_node.len(),
+            "per_node length round-trip mismatch"
+        );
+        assert_eq!(
+            round_tripped.per_node[0].node_id, est.per_node[0].node_id,
+            "per_node[0].node_id round-trip mismatch"
+        );
+        assert_eq!(
+            round_tripped.warnings, est.warnings,
+            "warnings round-trip mismatch"
+        );
     }
 }
