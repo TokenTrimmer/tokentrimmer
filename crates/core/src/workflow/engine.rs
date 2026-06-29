@@ -355,36 +355,27 @@ pub(crate) async fn run_workflow(
                 }
             }
 
-            // Run all specs concurrently; results returned in submission
-            // (= stable topo) order.
-            let results = schedule::run_concurrent_model_wave(executor, &specs).await;
-
-            // DETERMINISTIC FOLD: iterate in stable topo order and drain into
-            // shared state single-threadedly. NodeStart, journal entries, and
-            // NodeDone events are emitted here — never inside the concurrent
-            // futures — so event and journal ordering is deterministic regardless
-            // of task-completion order.
-            for schedule::ConcurrentNodeResult { node_id, outcome } in results {
+            // Fix #4: emit NodeStart for all concurrent nodes BEFORE launch
+            // so streaming clients see every node start before any NodeDone.
+            for (node_id, _) in &specs {
                 emit(WfEvent::NodeStart {
                     node_id: node_id.clone(),
                 });
+            }
+            // Run all specs concurrently; results returned in stable topo order.
+            let results = schedule::run_concurrent_model_wave(executor, &specs).await;
+
+            // DETERMINISTIC FOLD: NodeDone events + journal entries emitted
+            // in stable topo order, never inside the concurrent futures.
+            // Fix #1: drain the whole vec before bailing so successful
+            // siblings' costs always accrue even on partial wave failure.
+            let mut wave_error: Option<String> = None;
+            for schedule::ConcurrentNodeResult { node_id, outcome } in results {
                 match outcome {
                     Err(e) => {
-                        let saved_usd = (accrued_baseline - accrued).max(0.0);
-                        emit(WfEvent::RunDone {
-                            status: "failed".to_string(),
-                            cost_usd: accrued,
-                            baseline_cost_usd: accrued_baseline,
-                            saved_usd,
-                        });
-                        return WorkflowRunResult {
-                            status: WfStatus::Failed,
-                            cost_usd: accrued,
-                            baseline_cost_usd: accrued_baseline,
-                            saved_usd,
-                            node_outputs: collected_outputs,
-                            error: Some(format!("node \"{node_id}\" failed: {e}")),
-                        };
+                        if wave_error.is_none() {
+                            wave_error = Some(format!("node \"{node_id}\" failed: {e}"));
+                        }
                     }
                     Ok(out) => {
                         accrued += out.cost_usd;
@@ -411,6 +402,23 @@ pub(crate) async fn run_workflow(
                     }
                 }
                 done.insert(node_id.clone());
+            }
+            if let Some(error) = wave_error {
+                let saved_usd = (accrued_baseline - accrued).max(0.0);
+                emit(WfEvent::RunDone {
+                    status: "failed".to_string(),
+                    cost_usd: accrued,
+                    baseline_cost_usd: accrued_baseline,
+                    saved_usd,
+                });
+                return WorkflowRunResult {
+                    status: WfStatus::Failed,
+                    cost_usd: accrued,
+                    baseline_cost_usd: accrued_baseline,
+                    saved_usd,
+                    node_outputs: collected_outputs,
+                    error: Some(error),
+                };
             }
         }
 
@@ -2118,6 +2126,133 @@ mod tests {
                 "node_output count must match"
             );
         }
+    }
+
+    // ---- W3a-1 review: Fix #1 + Fix #4 guard tests ----------------------------
+
+    /// Guards Fix #1 (drain-all cost on partial wave failure).
+    ///
+    /// In the diamond (t → {mb, mc} → out), mb is first in topo order and
+    /// errors (no stub response); mc succeeds with cost 0.15.  Before Fix #1
+    /// the fold returns on mb's error, so mc's cost is never accrued →
+    /// cost_usd == 0.0, not 0.15.  After Fix #1 the fold drains the entire
+    /// wave before bailing: mc accrues, result is Failed with cost_usd 0.15.
+    #[tokio::test]
+    async fn partial_wave_failure_reports_full_cost() {
+        let def = make_diamond_def(); // t → {mb, mc} → out
+                                      // mb has no stub response → Err; mc succeeds.
+        let stub = StubExecutor::new(vec![(
+            "mc",
+            NodeOutput {
+                content: json!("c"),
+                cost_usd: 0.15,
+                baseline_cost_usd: 0.30,
+                model_used: None,
+            },
+        )]);
+
+        let result = run_workflow(&stub, &def, &json!("go"), None, |_| {}, None).await;
+
+        assert_eq!(result.status, WfStatus::Failed, "run must be Failed");
+        assert!(
+            (result.cost_usd - 0.15).abs() < 1e-9,
+            "cost_usd must include mc's cost (0.15) even though mb failed first; got {}",
+            result.cost_usd
+        );
+        assert!(
+            (result.baseline_cost_usd - 0.30).abs() < 1e-9,
+            "baseline_cost_usd must include mc's baseline (0.30); got {}",
+            result.baseline_cost_usd
+        );
+        assert!(result.error.is_some(), "error field must be set");
+        assert!(
+            result.error.as_deref().unwrap().contains("mb"),
+            "error must name the failing node (mb); got {:?}",
+            result.error
+        );
+    }
+
+    /// Guards Fix #4 (NodeStart emitted before concurrent launch).
+    ///
+    /// In the diamond (t → {mb, mc} → out), all wave-node NodeStart events
+    /// must appear before any NodeDone for those nodes.  Before Fix #4 the
+    /// fold emits NodeStart then NodeDone for each node in sequence; after
+    /// Fix #4 all NodeStarts are pre-emitted and only NodeDones appear in
+    /// the fold → all starts precede all dones.
+    #[tokio::test]
+    async fn concurrent_nodes_emit_nodestart_before_completion() {
+        let def = make_diamond_def();
+        let stub = StubExecutor::new(vec![
+            (
+                "mb",
+                NodeOutput {
+                    content: json!("b"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+            (
+                "mc",
+                NodeOutput {
+                    content: json!("c"),
+                    cost_usd: 0.07,
+                    baseline_cost_usd: 0.0,
+                    model_used: None,
+                },
+            ),
+        ]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
+        let result = run_workflow(&stub, &def, &json!("go"), None, |_| {}, Some(&tx)).await;
+        drop(tx);
+        assert_eq!(result.status, WfStatus::Succeeded);
+
+        let mut events: Vec<WfEvent> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Keep only NodeStart / NodeDone events for the concurrent wave nodes.
+        let wave_events: Vec<&WfEvent> = events
+            .iter()
+            .filter(|ev| match ev {
+                WfEvent::NodeStart { node_id } => node_id == "mb" || node_id == "mc",
+                WfEvent::NodeDone { node_id, .. } => node_id == "mb" || node_id == "mc",
+                _ => false,
+            })
+            .collect();
+
+        assert_eq!(
+            wave_events.len(),
+            4,
+            "expected 4 wave events (2×NodeStart + 2×NodeDone); got {wave_events:?}"
+        );
+
+        let start_positions: Vec<usize> = wave_events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| matches!(ev, WfEvent::NodeStart { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let done_positions: Vec<usize> = wave_events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| matches!(ev, WfEvent::NodeDone { .. }))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(start_positions.len(), 2, "must have 2 NodeStart events");
+        assert_eq!(done_positions.len(), 2, "must have 2 NodeDone events");
+
+        let last_start = *start_positions.iter().max().unwrap();
+        let first_done = *done_positions.iter().min().unwrap();
+
+        assert!(
+            last_start < first_done,
+            "all wave NodeStart events must precede all wave NodeDone events; \
+             starts={start_positions:?} dones={done_positions:?}"
+        );
     }
 
     /// Regression: a purely sequential chain (waves of size 1) must produce
