@@ -37,6 +37,11 @@ tt-provider-local.workspace = true
 
 sqlx.workspace = true
 blake3.workspace = true
+# Workflow secret cipher (W3b Task 1): XChaCha20-Poly1305 encryption + SHA-256
+# KDF for the per-org encrypted secret store (workflow/secrets.rs).
+chacha20poly1305.workspace = true
+sha2.workspace = true
+hex.workspace = true
 # Redaction guardrail (passes/redaction.rs) — secret/PII pattern matching,
 # ported from the Tier-1 inspect secret rule plus email/SSN matchers.
 regex.workspace = true

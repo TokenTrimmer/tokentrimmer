@@ -9,6 +9,7 @@ pub mod estimate;
 pub(crate) mod events;
 pub mod executor;
 pub(crate) mod schedule;
+pub(crate) mod secrets;
 pub mod store;
 pub mod types;
 pub mod validate;
