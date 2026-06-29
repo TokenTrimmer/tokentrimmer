@@ -498,6 +498,8 @@ pub async fn create_run(
             |entry| journal_entries.push(entry),
             None,
             &secrets,
+            0,
+            &[],
         )
         .await;
         let status_str = persist_run_results(pool, run_id, org, journal_entries, &result).await;
@@ -544,6 +546,8 @@ pub async fn create_run(
                 |entry| journal_entries.push(entry),
                 Some(&tx),
                 &secrets,
+                0,
+                &[],
             )
             .await;
             // Persist node runs + finalize (best-effort, mirrors sync path).

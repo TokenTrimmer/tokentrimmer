@@ -1,6 +1,9 @@
 //! TokenTrimmer Gateway core: HTTP server, routing, middleware, provider registry.
 //!
 //! See `docs/04-gateway-api-reference.md` for the public API contract.
+// Raise recursion limit for trait-solver overflow caused by Box::pin on the
+// recursive run_workflow async fn (SubWorkflow node, W3a-3 Task 2).
+#![recursion_limit = "256"]
 
 pub mod batch_store;
 pub mod budget;

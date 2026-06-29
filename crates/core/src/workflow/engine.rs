@@ -58,6 +58,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tt_shared::context::SecretString;
+use uuid::Uuid;
 
 use crate::routes::agent_run_budget::budget_reached;
 use crate::workflow::events::WfEvent;
@@ -112,6 +113,7 @@ pub(crate) struct NodeJournalEntry {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_TURNS: u32 = 8;
+const MAX_SUBWORKFLOW_DEPTH: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -134,9 +136,11 @@ pub(crate) async fn run_workflow(
     def: &WorkflowDefinition,
     inputs: &serde_json::Value,
     run_max_cost_usd: Option<f64>,
-    mut journal: impl FnMut(NodeJournalEntry),
+    mut journal: impl FnMut(NodeJournalEntry) + Send,
     events: Option<&tokio::sync::mpsc::UnboundedSender<WfEvent>>,
     secrets: &HashMap<String, SecretString>,
+    depth: u32,
+    ancestors: &[Uuid],
 ) -> WorkflowRunResult {
     // No-op when events is None; Option<&T> is Copy so captured by value.
     let emit = |ev: WfEvent| {
@@ -642,6 +646,169 @@ pub(crate) async fn run_workflow(
                             };
                         }
                     }
+                }
+
+                // SubWorkflow: recursive child execution (W3a-3 Task 2).
+                NodeKind::SubWorkflow {
+                    workflow_id,
+                    version: _,
+                } => {
+                    // a. Budget gate — re-check before async work.
+                    if budget_reached(accrued, run_max_cost_usd) {
+                        let saved_usd = (accrued_baseline - accrued).max(0.0);
+                        emit(WfEvent::RunDone {
+                            status: "budget_exhausted".to_string(),
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd,
+                        });
+                        return WorkflowRunResult {
+                            status: WfStatus::BudgetExhausted,
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd,
+                            node_outputs: collected_outputs,
+                            error: None,
+                        };
+                    }
+                    // b. Depth guard — BEFORE loading or recursing.
+                    if depth >= MAX_SUBWORKFLOW_DEPTH {
+                        let saved_usd = (accrued_baseline - accrued).max(0.0);
+                        emit(WfEvent::RunDone {
+                            status: "failed".to_string(),
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd,
+                        });
+                        return WorkflowRunResult {
+                            status: WfStatus::Failed,
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd,
+                            node_outputs: collected_outputs,
+                            error: Some(format!(
+                                "sub-workflow nesting exceeds max depth \
+                                 {MAX_SUBWORKFLOW_DEPTH}"
+                            )),
+                        };
+                    }
+                    // c. Cycle guard — BEFORE recursing.
+                    if *workflow_id == def.id || ancestors.contains(workflow_id) {
+                        let saved_usd = (accrued_baseline - accrued).max(0.0);
+                        emit(WfEvent::RunDone {
+                            status: "failed".to_string(),
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd,
+                        });
+                        return WorkflowRunResult {
+                            status: WfStatus::Failed,
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd,
+                            node_outputs: collected_outputs,
+                            error: Some("sub-workflow cycle detected".into()),
+                        };
+                    }
+                    // d. Load child definition.
+                    let child_def = match executor.load_subworkflow(*workflow_id).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let saved_usd = (accrued_baseline - accrued).max(0.0);
+                            emit(WfEvent::RunDone {
+                                status: "failed".to_string(),
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                            });
+                            return WorkflowRunResult {
+                                status: WfStatus::Failed,
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                                node_outputs: collected_outputs,
+                                error: Some(format!(
+                                    "node \"{node_id}\": \
+                                     load_subworkflow error: {e}"
+                                )),
+                            };
+                        }
+                    };
+                    // e-f. Remaining budget; child inputs = parent inputs (MVP).
+                    let remaining = run_max_cost_usd.map(|m| (m - accrued).max(0.0));
+                    // g. Ancestors for child: parent ancestors + this workflow id.
+                    let child_ancestors: Vec<Uuid> = [ancestors, &[def.id]].concat();
+                    // Box::pin is REQUIRED for async self-recursion.
+                    let child = Box::pin(run_workflow(
+                        executor,
+                        &child_def,
+                        inputs,
+                        remaining,
+                        |e| journal(e),
+                        events,
+                        secrets,
+                        depth + 1,
+                        &child_ancestors,
+                    ))
+                    .await;
+                    // h. Propagate child failure with partial spend.
+                    if child.status != WfStatus::Succeeded {
+                        accrued += child.cost_usd;
+                        accrued_baseline += child.baseline_cost_usd;
+                        let saved_usd = (accrued_baseline - accrued).max(0.0);
+                        let status_str = if child.status == WfStatus::BudgetExhausted {
+                            "budget_exhausted"
+                        } else {
+                            "failed"
+                        };
+                        emit(WfEvent::RunDone {
+                            status: status_str.to_string(),
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd,
+                        });
+                        return WorkflowRunResult {
+                            status: child.status,
+                            cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd,
+                            node_outputs: collected_outputs,
+                            error: child.error,
+                        };
+                    }
+                    // i. Success: fold child cost+baseline into accrued.
+                    //    DO NOT add child.saved_usd — saved derives from
+                    //    accrued_baseline-accrued at run end, adding child.saved
+                    //    would double-count.
+                    let child_cost = child.cost_usd;
+                    let child_baseline = child.baseline_cost_usd;
+                    let out = NodeOutput {
+                        content: serde_json::to_value(&child.node_outputs)
+                            .unwrap_or(serde_json::Value::Null),
+                        cost_usd: child_cost,
+                        baseline_cost_usd: child_baseline,
+                        model_used: None,
+                    };
+                    accrued += out.cost_usd;
+                    accrued_baseline += out.baseline_cost_usd;
+                    journal(NodeJournalEntry {
+                        node_id: node_id.clone(),
+                        status: "completed".into(),
+                        output: Some(out.content.clone()),
+                        cost_usd: out.cost_usd,
+                        model_used: None,
+                        error: None,
+                    });
+                    outputs.insert(node_id.clone(), out);
+                    propagate_edges(node_id, def, &mut reachable);
+                    emit(WfEvent::NodeDone {
+                        node_id: node_id.clone(),
+                        cost_usd: child_cost,
+                        run_cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                        budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                    });
                 }
             }
 
@@ -1202,6 +1369,8 @@ mod tests {
             |e| journal_entries.push(e),
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -1258,6 +1427,8 @@ mod tests {
             |e| journal_entries.push(e),
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -1311,6 +1482,8 @@ mod tests {
             |e| journal_entries.push(e),
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -1350,6 +1523,8 @@ mod tests {
             |e| journal_entries.push(e),
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -1486,6 +1661,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -1544,6 +1721,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -1590,6 +1769,8 @@ mod tests {
             |_| {},
             Some(&tx),
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
         drop(tx); // close the channel so try_recv returns Disconnected when drained
@@ -1711,6 +1892,8 @@ mod tests {
             |_| {},
             Some(&tx),
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
         drop(tx);
@@ -1723,6 +1906,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -1849,6 +2034,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -1918,6 +2105,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
         assert_eq!(r1.status, WfStatus::Succeeded);
@@ -1946,6 +2135,8 @@ mod tests {
                 |_| {},
                 None,
                 &HashMap::new(),
+                0,
+                &[],
             )
             .await;
             assert_eq!(r.status, WfStatus::Succeeded);
@@ -1995,6 +2186,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -2104,6 +2297,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -2265,6 +2460,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -2322,6 +2519,8 @@ mod tests {
                 |_| {},
                 None,
                 &HashMap::new(),
+                0,
+                &[],
             )
             .await;
             results.push(r);
@@ -2385,6 +2584,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -2447,6 +2648,8 @@ mod tests {
             |_| {},
             Some(&tx),
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
         drop(tx);
@@ -2534,6 +2737,8 @@ mod tests {
             |_| {},
             None,
             &HashMap::new(),
+            0,
+            &[],
         )
         .await;
 
@@ -2645,6 +2850,8 @@ mod tests {
             |e| journal_entries.push(e),
             None,
             &secrets,
+            0,
+            &[],
         )
         .await;
 
@@ -2740,6 +2947,158 @@ mod tests {
         assert!(
             matches!(miss, Err(ApiError::NotFound(_))),
             "expected NotFound for unknown id, got {miss:?}"
+        );
+    }
+
+    // ---- W3a-3 Task 2: SubWorkflow node + cost rollup -------------------------
+
+    /// A parent workflow with a SubWorkflow node pointing at a child def;
+    /// the child runs one Model node costing 0.05 (baseline 0.10).
+    /// Assert: parent status Succeeded, cost_usd == 0.05 (child's model cost),
+    /// baseline_cost_usd == 0.10, saved_usd == 0.05, node_outputs contains the
+    /// SubWorkflow node's content (serialized child node_outputs).
+    #[tokio::test]
+    async fn subworkflow_runs_child_and_rolls_up_cost() {
+        let child_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+
+        // Child: t → m1 (costs 0.05 / baseline 0.10) → o
+        let child_def = WorkflowDefinition {
+            id: child_id,
+            version: 1,
+            name: "child-wf".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "m1".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "m1".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "m1".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        // Parent: t → sw (SubWorkflow → child_id) → o
+        let parent_def = WorkflowDefinition {
+            id: parent_id,
+            version: 1,
+            name: "parent-wf".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "sw".into(),
+                    kind: NodeKind::SubWorkflow {
+                        workflow_id: child_id,
+                        version: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "sw".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "sw".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        let mut stub = StubExecutor::new(vec![(
+            "m1",
+            NodeOutput {
+                content: json!("child_response"),
+                cost_usd: 0.05,
+                baseline_cost_usd: 0.10,
+                model_used: Some("haiku".into()),
+            },
+        )]);
+        stub.subworkflows.insert(child_id, child_def);
+
+        let result = run_workflow(
+            &stub,
+            &parent_def,
+            &json!("hello"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        // Status: Succeeded
+        assert_eq!(result.status, WfStatus::Succeeded, "parent must Succeed");
+        // Cost rollup: child's model cost 0.05
+        assert!(
+            (result.cost_usd - 0.05).abs() < 1e-9,
+            "cost_usd expected 0.05, got {}",
+            result.cost_usd
+        );
+        // Baseline rollup: child's baseline 0.10
+        assert!(
+            (result.baseline_cost_usd - 0.10).abs() < 1e-9,
+            "baseline_cost_usd expected 0.10, got {}",
+            result.baseline_cost_usd
+        );
+        // Saved = baseline - cost = 0.05 (no double-count)
+        assert!(
+            (result.saved_usd - 0.05).abs() < 1e-9,
+            "saved_usd expected 0.05, got {}",
+            result.saved_usd
+        );
+        // Output node collected sw's content (the child's node_outputs serialized)
+        assert_eq!(result.node_outputs.len(), 1, "one output node collected");
+        assert_eq!(result.node_outputs[0].0, "o");
+        assert!(
+            !result.node_outputs[0].1.content.is_null(),
+            "SubWorkflow output content must not be null"
+        );
+        // The content is the child's node_outputs serialized as JSON
+        let content = &result.node_outputs[0].1.content;
+        assert!(
+            content.is_array(),
+            "SubWorkflow output content must be an array (child node_outputs); got {content}"
         );
     }
 }
