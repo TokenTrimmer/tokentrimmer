@@ -43,6 +43,7 @@ use crate::{
         estimate,
         events::WfEvent,
         executor::GatewayNodeExecutor,
+        secrets::{load_secrets, master_key_from_env},
         store::{self, WorkflowRunRecord},
         types::content_hash,
         validate,
@@ -461,6 +462,14 @@ pub async fn create_run(
     )
     .await;
 
+    // --- Load org secrets once (both sync + streaming paths) -----------------
+    // Empty map when TT_MASTER_KEY is absent — Http nodes without secrets work,
+    // {{secrets.*}} refs just resolve to "".
+    let secrets = match master_key_from_env() {
+        Some(master) => load_secrets(pool, org, &master).await,
+        None => std::collections::HashMap::new(),
+    };
+
     if !body.stream {
         // --- Synchronous path ------------------------------------------------
         let executor = GatewayNodeExecutor {
@@ -480,6 +489,7 @@ pub async fn create_run(
             run_max_cost,
             |entry| journal_entries.push(entry),
             None,
+            &secrets,
         )
         .await;
         let status_str = persist_run_results(pool, run_id, org, journal_entries, &result).await;
@@ -504,6 +514,7 @@ pub async fn create_run(
         // --- Streaming path: spawn the engine + return SSE -------------------
         // `owned_state` is cloned (cheap Arc bump) so the spawned 'static task
         // can own it; the executor borrows &owned_state from within the block.
+        // `secrets` was loaded before the branch so both paths share one DB call.
         let owned_state = state.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
         tokio::spawn(async move {
@@ -524,6 +535,7 @@ pub async fn create_run(
                 run_max_cost,
                 |entry| journal_entries.push(entry),
                 Some(&tx),
+                &secrets,
             )
             .await;
             // Persist node runs + finalize (best-effort, mirrors sync path).

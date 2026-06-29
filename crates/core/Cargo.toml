@@ -84,6 +84,8 @@ zeroize.workspace = true
 # `inspect_diff` gateway tool writes proposed content to a temp file to scan it
 # (routes/gateway_tools.rs), mirroring the MCP tool.
 tempfile.workspace = true
+# Guarded outbound HTTP client for workflow Http nodes (W3b Task 3).
+reqwest.workspace = true
 
 [dev-dependencies]
 argon2.workspace = true
