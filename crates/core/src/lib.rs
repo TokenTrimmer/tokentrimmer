@@ -1,7 +1,6 @@
 //! TokenTrimmer Gateway core: HTTP server, routing, middleware, provider registry.
 //!
 //! See `docs/04-gateway-api-reference.md` for the public API contract.
-
 pub mod batch_store;
 pub mod budget;
 pub mod cache_volatility;

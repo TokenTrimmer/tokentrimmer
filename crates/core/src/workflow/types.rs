@@ -113,6 +113,19 @@ pub enum NodeKind {
         #[serde(default)]
         max_response_bytes: Option<usize>,
     },
+
+    /// Execute another stored workflow as a nested child (W3a-3).
+    ///
+    /// `version` is accepted for forward-compatibility but UNUSED at MVP —
+    /// `load_subworkflow` always returns the latest version.
+    /// The parent's remaining budget cap is passed to the child; cost and
+    /// baseline roll up into the parent totals so `saved_usd` derives
+    /// correctly without double-counting.
+    SubWorkflow {
+        workflow_id: Uuid,
+        #[serde(default)]
+        version: Option<u32>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +301,13 @@ mod tests {
                     headers: vec![("X-Custom".into(), "value".into())],
                     body: Some("{{input}}".into()),
                     max_response_bytes: Some(65536),
+                },
+            },
+            Node {
+                id: "sub_workflow".into(),
+                kind: NodeKind::SubWorkflow {
+                    workflow_id: Uuid::nil(),
+                    version: None,
                 },
             },
         ];
