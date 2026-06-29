@@ -43,7 +43,7 @@ use crate::{
         estimate,
         events::WfEvent,
         executor::GatewayNodeExecutor,
-        secrets::{load_secrets, master_key_from_env},
+        secrets::{is_valid_secret_name, load_secrets, master_key_from_env, store_secret},
         store::{self, WorkflowRunRecord},
         types::content_hash,
         validate,
@@ -177,6 +177,14 @@ pub struct NodeOutputView {
     pub node_id: String,
     pub content: serde_json::Value,
     pub cost_usd: f64,
+}
+
+/// `POST /v1/workflows/secrets` request body.
+#[derive(Debug, Deserialize)]
+pub struct SetWorkflowSecretRequest {
+    pub name: String,
+    /// The plaintext secret value. Encrypted at rest; **never returned**.
+    pub value: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +568,47 @@ pub async fn create_run(
 }
 
 // ---------------------------------------------------------------------------
+// POST /v1/workflows/secrets — store (or rotate) a per-org secret
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/workflows/secrets` — encrypt and upsert a named secret for the
+/// caller's org.
+///
+/// * `name` must match `^[A-Z0-9_]{1,64}$` (the charset used by
+///   `{{secrets.NAME}}` template references in Http nodes) → 400 otherwise.
+/// * Returns 503 when `TT_MASTER_KEY` is absent (secret storage not configured).
+/// * Returns 204 on success. **The value is never echoed in any response or log.**
+pub async fn set_workflow_secret(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Json(body): Json<SetWorkflowSecretRequest>,
+) -> ApiResult<StatusCode> {
+    let org = require_org(ctx)?;
+    if !is_valid_secret_name(&body.name) {
+        return Err(ApiError::InvalidRequest(
+            "secret name must match ^[A-Z0-9_]{1,64}$ \
+             (uppercase letters, digits, and underscore only)"
+                .into(),
+        ));
+    }
+    let master = master_key_from_env().ok_or_else(|| {
+        ApiError::ServiceUnavailable("secret storage not configured (TT_MASTER_KEY absent)".into())
+    })?;
+    let pool = db_pool(&state)?;
+    store_secret(pool, org, &body.name, &master, &body.value)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                secret_name = %body.name,
+                error = %e,
+                "workflow_secrets UPSERT failed"
+            );
+            ApiError::Internal(format!("failed to store secret: {e}"))
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -788,6 +837,69 @@ mod tests {
         assert!(
             matches!(result, Err(ApiError::Unauthorized)),
             "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `set_workflow_secret` — name-validation + handler-shape tests
+    // ------------------------------------------------------------------
+
+    /// Directly exercises the name-validation predicate: lowercase, spaces,
+    /// hyphens, empty, and >64-char names must all be rejected.
+    #[test]
+    fn set_secret_rejects_bad_name() {
+        assert!(!is_valid_secret_name("lowercase"));
+        assert!(!is_valid_secret_name("HAS SPACE"));
+        assert!(!is_valid_secret_name("MY-KEY"));
+        assert!(!is_valid_secret_name(""));
+        assert!(!is_valid_secret_name(&"A".repeat(65)));
+        // Valid names must pass.
+        assert!(is_valid_secret_name("MY_API_KEY"));
+        assert!(is_valid_secret_name("KEY_123"));
+    }
+
+    #[tokio::test]
+    async fn set_workflow_secret_anon_returns_unauthorized() {
+        let body = SetWorkflowSecretRequest {
+            name: "MY_KEY".into(),
+            value: "s3cr3t".into(),
+        };
+        let result = set_workflow_secret(State(test_state()), None, Json(body)).await;
+        assert!(
+            matches!(result, Err(ApiError::Unauthorized)),
+            "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    /// A bad name (lowercase) is rejected with 400 before any DB or key check.
+    #[tokio::test]
+    async fn set_workflow_secret_bad_name_returns_invalid_request() {
+        let org = Uuid::new_v4();
+        let body = SetWorkflowSecretRequest {
+            name: "bad-name".into(),
+            value: "s3cr3t".into(),
+        };
+        let result = set_workflow_secret(State(test_state()), real_org_ctx(org), Json(body)).await;
+        assert!(
+            matches!(result, Err(ApiError::InvalidRequest(_))),
+            "expected InvalidRequest for bad name, got {result:?}"
+        );
+    }
+
+    /// With a valid name but no TT_MASTER_KEY the handler returns 503.
+    #[tokio::test]
+    async fn set_workflow_secret_no_master_key_returns_503() {
+        // Ensure the env var is absent for this test.
+        std::env::remove_var("TT_MASTER_KEY");
+        let org = Uuid::new_v4();
+        let body = SetWorkflowSecretRequest {
+            name: "MY_KEY".into(),
+            value: "s3cr3t".into(),
+        };
+        let result = set_workflow_secret(State(test_state()), real_org_ctx(org), Json(body)).await;
+        assert!(
+            matches!(result, Err(ApiError::ServiceUnavailable(_))),
+            "expected ServiceUnavailable when TT_MASTER_KEY absent, got {result:?}"
         );
     }
 

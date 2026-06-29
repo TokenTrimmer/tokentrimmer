@@ -196,6 +196,16 @@ pub(crate) async fn store_secret(
     Ok(())
 }
 
+/// Return `true` when `name` matches `^[A-Z0-9_]{1,64}$` — the charset used
+/// in `{{secrets.NAME}}` template references in Http nodes.
+pub(crate) fn is_valid_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// Load and decrypt all secrets for `org_id`. Rows that fail to decrypt
 /// (stale key, tampered blob) are silently skipped — callers get a best-effort
 /// map rather than a hard error, so a single bad row doesn't block execution.
@@ -241,6 +251,27 @@ mod tests {
 
     fn master() -> [u8; 32] {
         [0x42u8; 32]
+    }
+
+    /// `is_valid_secret_name` rejects names with lowercase letters, spaces,
+    /// hyphens, empty strings, and names longer than 64 characters.
+    #[test]
+    fn secret_name_rejects_bad_names() {
+        assert!(!is_valid_secret_name("lowercase"));
+        assert!(!is_valid_secret_name("HAS SPACE"));
+        assert!(!is_valid_secret_name("MY-KEY"));
+        assert!(!is_valid_secret_name(""));
+        assert!(!is_valid_secret_name(&"A".repeat(65)));
+    }
+
+    /// `is_valid_secret_name` accepts uppercase-letter / digit / underscore
+    /// names up to 64 characters.
+    #[test]
+    fn secret_name_accepts_valid_names() {
+        assert!(is_valid_secret_name("MY_API_KEY"));
+        assert!(is_valid_secret_name("A"));
+        assert!(is_valid_secret_name("KEY_123"));
+        assert!(is_valid_secret_name(&"A".repeat(64)));
     }
 
     /// Round-trip: encrypt then decrypt recovers the original plaintext.

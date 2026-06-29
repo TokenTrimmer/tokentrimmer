@@ -1876,6 +1876,7 @@ A workflow definition is a JSON object with the following top-level fields:
 | `edges` | array | yes | Directed edges connecting nodes. |
 | `inputs` | object | no | Freeform input schema / defaults passed to the trigger node. |
 | `budget` | object | no | Run-level cost cap (see §24.6). |
+| `allowed_hosts` | array of strings | no | Per-workflow egress allowlist for Http nodes (default-deny: `[]`). Each entry is a bare hostname (e.g. `"api.example.com"`). Http nodes whose URL host is not an exact member of this list are rejected at definition-save time and again at run time. |
 
 Each edge:
 
@@ -1987,7 +1988,44 @@ Terminal node; collects the workflow's final output. No additional fields.
 { "id": "done", "type": "output" }
 ```
 
-> **Note:** HTTP and API call nodes are not yet supported in this release.
+#### `http`
+
+Outbound HTTP request. The URL host must appear in the workflow definition's
+`allowed_hosts` list (default-deny); the definition is rejected at save time
+and again at run time if the host is not allowlisted.
+
+```json
+{
+  "id": "fetch",
+  "type": "http",
+  "method": "POST",
+  "url": "https://api.example.com/v1/classify",
+  "headers": [
+    ["Authorization", "Bearer {{secrets.EXAMPLE_API_KEY}}"],
+    ["Content-Type", "application/json"]
+  ],
+  "body": "{\"text\": \"{{summarise}}\"}",
+  "max_response_bytes": 65536
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | yes | HTTP method (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`). |
+| `url` | string | yes | Full URL. The host must be a static literal in `allowed_hosts`; path, query, headers, and body may use `{{template}}` tokens. |
+| `headers` | array of `[name, value]` pairs | no | Request headers. Values may contain `{{secrets.NAME}}` tokens. |
+| `body` | string | no | Request body (raw string). May contain `{{template}}` and `{{secrets.NAME}}` tokens. |
+| `max_response_bytes` | integer | no | Maximum response body size in bytes. Default: 1 MiB (1 048 576). Responses exceeding this cap are truncated and the node returns an error. |
+
+**Secret references** — embed a per-org secret as `{{secrets.NAME}}` in any
+`headers` value or `body` string. At run time the gateway substitutes the
+decrypted value before the request is made. The secret value never appears in
+logs, the node journal, or any API response. Store secrets with
+`POST /v1/workflows/secrets` (see §24.7).
+
+**Allowlist enforcement** is applied at definition-save time (`POST /v1/workflows`)
+and again at run time. A workflow with an `http` node whose host is absent from
+`allowed_hosts` will fail validation at save time with a 400 error.
 
 ### 24.3 Model selection (`selection`)
 
@@ -2174,6 +2212,84 @@ The `budget` field on a workflow definition sets a hard run-level USD ceiling:
 | `on_exceed` | string | `"stop"` | Action when the cap is reached. Only `"stop"` is supported. The run stops before the node that would breach the budget, with status `"budget_exhausted"`. |
 
 A `max_cost_usd` can also be supplied per-run in the `POST /v1/workflows/:id/runs` request body. The definition-level budget (`def.budget.max_cost_usd`) takes precedence when both are set.
+
+### 24.7 HTTP node secrets
+
+#### `POST /v1/workflows/secrets` — store or rotate a per-org secret
+
+Encrypts the supplied value with XChaCha20-Poly1305 (per-row derived key,
+AAD-bound to `(org_id, name)`) and upserts it into the `workflow_secrets`
+table. On conflict the ciphertext is rotated in-place. **The value is never
+returned in any response or log.**
+
+**Request body:**
+
+```json
+{ "name": "EXAMPLE_API_KEY", "value": "sk-live-abc123..." }
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | yes | Secret name. Must match `^[A-Z0-9_]{1,64}$` (uppercase letters, digits, and underscore). |
+| `value` | string | yes | Plaintext secret value. Encrypted before storage; never echoed. |
+
+**Status codes:**
+
+| Code | Meaning |
+|---|---|
+| `204 No Content` | Secret stored (or rotated) successfully. |
+| `400 Bad Request` | `name` does not match `^[A-Z0-9_]{1,64}$`. |
+| `401 Unauthorized` | Missing or invalid bearer token, or dogfood key. |
+| `503 Service Unavailable` | `TT_MASTER_KEY` not configured on this gateway instance. |
+
+**Example:**
+
+```bash
+curl -X POST https://gateway.tokentrimmer.com/v1/workflows/secrets \
+  -H "Authorization: Bearer tt_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{"name": "EXAMPLE_API_KEY", "value": "sk-live-abc123"}'
+# → 204 No Content
+```
+
+Secrets are scoped to the authenticated org. Each org's secrets are isolated:
+a secret named `MY_KEY` for org A cannot be read or decrypted by org B.
+
+#### Using secrets in Http nodes
+
+Reference a stored secret in any `headers` value or `body` string using
+`{{secrets.NAME}}`:
+
+```json
+{
+  "headers": [["Authorization", "Bearer {{secrets.EXAMPLE_API_KEY}}"]],
+  "body": "{\"api_key\": \"{{secrets.EXAMPLE_API_KEY}}\"}"
+}
+```
+
+At run time the gateway resolves `{{secrets.NAME}}` to the decrypted value
+before making the HTTP request. If a referenced secret has not been stored,
+the token resolves to an empty string (the request is still made; the
+downstream service will likely reject it).
+
+#### Security model
+
+- **Guarded egress.** Http nodes use an internal HTTP client configured with
+  `redirect=none` and a per-request timeout. Redirects are not followed.
+- **Allowlist default-deny.** An Http node can only reach hosts explicitly
+  listed in the workflow's `allowed_hosts`. The check is enforced at
+  definition-save time (400 on violation) and again at run time (node fails
+  without making the request). Template tokens in the URL host position are
+  rejected at save time — only static literals may appear in the host.
+- **Response-byte cap.** Responses are truncated at `max_response_bytes`
+  (default 1 MiB). The `Content-Length` header is not trusted; the cap is
+  enforced while streaming the body.
+- **Secrets never logged.** Secret values are not written to the node journal,
+  the run record, the request log, or any error message. The `{{secrets.NAME}}`
+  tokens are substituted in-memory immediately before the HTTP call.
+- **AAD-bound ciphertext.** Each secret's ciphertext is bound to `(org_id, name)`
+  via AEAD additional-data; copying a ciphertext row to a different org or
+  renaming the secret causes a decryption failure rather than a silent decrypt.
 
 ---
 
