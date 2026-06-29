@@ -227,6 +227,20 @@ pub fn validate(
     }
 
     // ------------------------------------------------------------------
+    // 6b. Loop nodes: max_iters must be 1..=100.
+    // ------------------------------------------------------------------
+    for node in &def.nodes {
+        if let NodeKind::Loop { max_iters, .. } = &node.kind {
+            if *max_iters == 0 || *max_iters > 100 {
+                errors.push(format!(
+                    "node \"{}\": loop max_iters must be 1..=100",
+                    node.id
+                ));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 7. No cycles — Kahn's algorithm (topological sort).
     //
     // The execution graph is the union of def.edges AND Branch arm targets:

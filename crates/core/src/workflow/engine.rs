@@ -690,6 +690,183 @@ fn run_workflow_boxed<'a>(
                         }
                     }
 
+                    // Loop: bounded iteration over a body sub-workflow (W3a-2 Task 1).
+                    NodeKind::Loop {
+                        body_workflow_id,
+                        cond,
+                        max_iters,
+                    } => {
+                        // a. Depth guard — BEFORE loading or recursing.
+                        if depth >= MAX_SUBWORKFLOW_DEPTH {
+                            let saved_usd = (accrued_baseline - accrued).max(0.0);
+                            emit(WfEvent::RunDone {
+                                status: "failed".to_string(),
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                            });
+                            return WorkflowRunResult {
+                                status: WfStatus::Failed,
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                                node_outputs: collected_outputs,
+                                error: Some(format!(
+                                    "loop body nesting exceeds max depth \
+                                     {MAX_SUBWORKFLOW_DEPTH}"
+                                )),
+                            };
+                        }
+                        // b. Cycle guard — BEFORE loading or recursing.
+                        if *body_workflow_id == def.id || ancestors.contains(body_workflow_id) {
+                            let saved_usd = (accrued_baseline - accrued).max(0.0);
+                            emit(WfEvent::RunDone {
+                                status: "failed".to_string(),
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                            });
+                            return WorkflowRunResult {
+                                status: WfStatus::Failed,
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                                node_outputs: collected_outputs,
+                                error: Some("loop body cycle detected".into()),
+                            };
+                        }
+                        // c. Load body once (stable across iterations).
+                        let child_def = match executor.load_subworkflow(*body_workflow_id).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                let saved_usd = (accrued_baseline - accrued).max(0.0);
+                                emit(WfEvent::RunDone {
+                                    status: "failed".to_string(),
+                                    cost_usd: accrued,
+                                    baseline_cost_usd: accrued_baseline,
+                                    saved_usd,
+                                });
+                                return WorkflowRunResult {
+                                    status: WfStatus::Failed,
+                                    cost_usd: accrued,
+                                    baseline_cost_usd: accrued_baseline,
+                                    saved_usd,
+                                    node_outputs: collected_outputs,
+                                    error: Some(format!(
+                                        "node \"{node_id}\": \
+                                         load_subworkflow error: {e}"
+                                    )),
+                                };
+                            }
+                        };
+                        let child_ancestors: Vec<Uuid> = [ancestors, &[def.id]].concat();
+                        // d. Loop state.
+                        let mut iter_input = inputs.clone();
+                        let mut loop_cost = 0.0_f64;
+                        let mut loop_baseline = 0.0_f64;
+                        let mut last_content = serde_json::Value::Null;
+                        let mut failed: Option<(WfStatus, Option<String>)> = None;
+
+                        for _i in 0..*max_iters {
+                            // Budget stop — re-check each iteration.
+                            if budget_reached(accrued + loop_cost, run_max_cost_usd) {
+                                break;
+                            }
+                            // Cond checked BEFORE body (while-semantics).
+                            if !eval_cond(cond, &trigger_id, &outputs) {
+                                break;
+                            }
+                            let remaining =
+                                run_max_cost_usd.map(|m| (m - accrued - loop_cost).max(0.0));
+                            // Pass None for events: per-iteration child run.done
+                            // events must not flood the parent stream.
+                            let child = run_workflow_boxed(
+                                executor,
+                                &child_def,
+                                &iter_input,
+                                remaining,
+                                Box::new(|e: NodeJournalEntry| journal(e)),
+                                None,
+                                secrets,
+                                depth + 1,
+                                &child_ancestors,
+                            )
+                            .await;
+                            loop_cost += child.cost_usd;
+                            loop_baseline += child.baseline_cost_usd;
+                            if child.status != WfStatus::Succeeded {
+                                failed = Some((child.status, child.error.clone()));
+                                break;
+                            }
+                            // Thread outputs forward for the next eval_cond + downstream.
+                            last_content = serde_json::to_value(&child.node_outputs)
+                                .unwrap_or(serde_json::Value::Null);
+                            iter_input = last_content.clone();
+                            outputs.insert(
+                                node_id.clone(),
+                                NodeOutput {
+                                    content: last_content.clone(),
+                                    cost_usd: child.cost_usd,
+                                    baseline_cost_usd: child.baseline_cost_usd,
+                                    model_used: None,
+                                },
+                            );
+                        }
+
+                        // e. Fold loop totals into run accruals.
+                        accrued += loop_cost;
+                        accrued_baseline += loop_baseline;
+
+                        if let Some((child_status, child_error)) = failed {
+                            let saved_usd = (accrued_baseline - accrued).max(0.0);
+                            let status_str = if child_status == WfStatus::BudgetExhausted {
+                                "budget_exhausted"
+                            } else {
+                                "failed"
+                            };
+                            emit(WfEvent::RunDone {
+                                status: status_str.to_string(),
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                            });
+                            return WorkflowRunResult {
+                                status: child_status,
+                                cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd,
+                                node_outputs: collected_outputs,
+                                error: child_error,
+                            };
+                        }
+
+                        // f. Success: finalize with accumulated totals.
+                        let final_out = NodeOutput {
+                            content: last_content.clone(),
+                            cost_usd: loop_cost,
+                            baseline_cost_usd: loop_baseline,
+                            model_used: None,
+                        };
+                        outputs.insert(node_id.clone(), final_out);
+                        journal(NodeJournalEntry {
+                            node_id: node_id.clone(),
+                            status: "completed".into(),
+                            output: Some(last_content),
+                            cost_usd: loop_cost,
+                            model_used: None,
+                            error: None,
+                        });
+                        propagate_edges(node_id, def, &mut reachable);
+                        emit(WfEvent::NodeDone {
+                            node_id: node_id.clone(),
+                            cost_usd: loop_cost,
+                            run_cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                            budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                        });
+                    }
+
                     // SubWorkflow: recursive child execution (W3a-3 Task 2).
                     NodeKind::SubWorkflow {
                         workflow_id,
@@ -3744,6 +3921,158 @@ mod tests {
             WfStatus::BudgetExhausted,
             "child BudgetExhausted must propagate to parent; got {:?}",
             result.status
+        );
+    }
+
+    // ---- W3a-2 Task 1: Loop node -------------------------------------------
+
+    /// A parent workflow with a Loop node whose body runs a single Model node
+    /// costing 0.05 (baseline 0.10).  With max_iters=3 and an always-truthy
+    /// cond (`"{{input}}"` with input="hello"), the body runs exactly 3 times.
+    /// Assert: status Succeeded, cost_usd==0.15 (3×0.05), baseline==0.30,
+    /// saved==0.15, body model called 3 times.
+    #[tokio::test]
+    async fn loop_runs_body_n_times() {
+        let body_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+
+        // Body: t → m1 (costs 0.05 / baseline 0.10) → o
+        let body_def = WorkflowDefinition {
+            id: body_id,
+            version: 1,
+            name: "body-wf".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "m1".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "m1".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "m1".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        // Parent: t → lp (Loop → body_id, max_iters=3, cond="{{input}}") → o
+        // cond "{{input}}" resolves to "hello" (truthy) throughout all iters.
+        let parent_def = WorkflowDefinition {
+            id: parent_id,
+            version: 1,
+            name: "parent-wf".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "lp".into(),
+                    kind: NodeKind::Loop {
+                        body_workflow_id: body_id,
+                        cond: "{{input}}".into(),
+                        max_iters: 3,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "lp".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "lp".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        let mut stub = StubExecutor::new(vec![(
+            "m1",
+            NodeOutput {
+                content: json!("body_response"),
+                cost_usd: 0.05,
+                baseline_cost_usd: 0.10,
+                model_used: Some("stub-model".into()),
+            },
+        )]);
+        stub.subworkflows.insert(body_id, body_def);
+
+        let result = run_workflow(
+            &stub,
+            &parent_def,
+            &json!("hello"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        // Status: Succeeded
+        assert_eq!(
+            result.status,
+            WfStatus::Succeeded,
+            "Loop parent must Succeed"
+        );
+        // Cost rollup: 3 iterations × 0.05
+        assert!(
+            (result.cost_usd - 0.15).abs() < 1e-9,
+            "cost_usd expected 0.15 (3×0.05), got {}",
+            result.cost_usd
+        );
+        // Baseline rollup: 3 iterations × 0.10
+        assert!(
+            (result.baseline_cost_usd - 0.30).abs() < 1e-9,
+            "baseline_cost_usd expected 0.30, got {}",
+            result.baseline_cost_usd
+        );
+        // Saved = baseline − cost = 0.15 (no double-count)
+        assert!(
+            (result.saved_usd - 0.15).abs() < 1e-9,
+            "saved_usd expected 0.15, got {}",
+            result.saved_usd
+        );
+        // Body model called exactly 3 times
+        let calls = stub.called_nodes();
+        assert_eq!(
+            calls.iter().filter(|id| *id == "m1").count(),
+            3,
+            "body model node must be called 3 times; calls: {calls:?}"
         );
     }
 }
