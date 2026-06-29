@@ -3144,4 +3144,604 @@ mod tests {
             "SubWorkflow output content must be an array (child node_outputs); got {content}"
         );
     }
+
+    // ---- W3a-3 Task 3: recursion-guard + budget-rollup suite -----------------
+
+    /// Helper: build a leaf WorkflowDefinition (Trigger → Output) with the
+    /// given id.  No model nodes, so it costs nothing and always succeeds.
+    fn make_leaf_def(id: Uuid) -> WorkflowDefinition {
+        WorkflowDefinition {
+            id,
+            version: 1,
+            name: format!("leaf-{id}"),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![Edge {
+                from: "t".into(),
+                to: "o".into(),
+                map: None,
+            }],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        }
+    }
+
+    /// Helper: build a workflow with `id` whose single node (after Trigger) is
+    /// a SubWorkflow pointing at `child_id`, then an Output node.
+    fn make_subwf_def(id: Uuid, child_id: Uuid) -> WorkflowDefinition {
+        WorkflowDefinition {
+            id,
+            version: 1,
+            name: format!("wf-{id}"),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "sw".into(),
+                    kind: NodeKind::SubWorkflow {
+                        workflow_id: child_id,
+                        version: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "sw".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "sw".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        }
+    }
+
+    /// GUARD TEST 1 — Self-cycle: a workflow whose SubWorkflow node points at
+    /// its own id must be rejected immediately with status Failed + "cycle" in
+    /// the error message.  The test completing proves termination (no hang /
+    /// stack overflow).
+    #[tokio::test]
+    async fn subworkflow_self_cycle_rejected() {
+        let wf_id = Uuid::new_v4();
+        // W points at itself.
+        let def = make_subwf_def(wf_id, wf_id);
+
+        // No child registered — the cycle guard must fire BEFORE load_subworkflow.
+        let stub = StubExecutor::new(vec![]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hello"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            WfStatus::Failed,
+            "self-cycle must produce Failed; got {:?}",
+            result.status
+        );
+        let err = result
+            .error
+            .expect("self-cycle must produce an error string");
+        assert!(
+            err.contains("cycle"),
+            "error must mention 'cycle'; got: {err}"
+        );
+    }
+
+    /// GUARD TEST 2 — Indirect cycle: A → B → A must be rejected with Failed +
+    /// "cycle".  The test completing proves termination.
+    #[tokio::test]
+    async fn subworkflow_indirect_cycle_rejected() {
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        // A points at B; B points back at A → indirect cycle.
+        let def_a = make_subwf_def(id_a, id_b);
+        let def_b = make_subwf_def(id_b, id_a);
+
+        let mut stub = StubExecutor::new(vec![]);
+        stub.subworkflows.insert(id_a, def_a.clone());
+        stub.subworkflows.insert(id_b, def_b);
+
+        let result = run_workflow(
+            &stub,
+            &def_a,
+            &json!("hello"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            WfStatus::Failed,
+            "indirect A→B→A cycle must produce Failed; got {:?}",
+            result.status
+        );
+        let err = result
+            .error
+            .expect("indirect cycle must produce an error string");
+        assert!(
+            err.contains("cycle"),
+            "error must mention 'cycle'; got: {err}"
+        );
+    }
+
+    /// GUARD TEST 3 — Depth cap: chain A→B→C→D→E→F→G (7 workflows, 6
+    /// SubWorkflow hops, each distinct UUID so it's depth — not cycle — that
+    /// trips).  MAX_SUBWORKFLOW_DEPTH=5 means the guard fires when a workflow
+    /// running at depth=5 tries to call a SubWorkflow (`5 >= 5`).  The test
+    /// completing proves termination.
+    ///
+    /// Depth accounting:
+    ///   ids[0] runs at depth 0, calls ids[1]
+    ///   ids[1] runs at depth 1, calls ids[2]
+    ///   ids[2] runs at depth 2, calls ids[3]
+    ///   ids[3] runs at depth 3, calls ids[4]
+    ///   ids[4] runs at depth 4, calls ids[5]
+    ///   ids[5] runs at depth 5, tries to call ids[6] → guard `5 >= 5` → FAIL
+    #[tokio::test]
+    async fn subworkflow_depth_cap_rejected() {
+        // 7 distinct ids: ids[0..5] are SubWorkflow defs, ids[6] is a leaf.
+        let ids: Vec<Uuid> = (0..7).map(|_| Uuid::new_v4()).collect();
+
+        // Build defs: ids[0]→ids[1]→…→ids[5] (SubWorkflow) + ids[6] (leaf)
+        let mut defs: Vec<WorkflowDefinition> = Vec::new();
+        for i in 0..6 {
+            defs.push(make_subwf_def(ids[i], ids[i + 1]));
+        }
+        defs.push(make_leaf_def(ids[6]));
+
+        let mut stub = StubExecutor::new(vec![]);
+        for def in &defs {
+            stub.subworkflows.insert(def.id, def.clone());
+        }
+
+        // Run starting at A (ids[0]).
+        let result = run_workflow(
+            &stub,
+            &defs[0],
+            &json!("hello"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            WfStatus::Failed,
+            "depth-6 chain must produce Failed; got {:?}",
+            result.status
+        );
+        let err = result
+            .error
+            .expect("depth cap must produce an error string");
+        // The error message is "sub-workflow nesting exceeds max depth 5"
+        assert!(
+            err.contains("depth") || err.contains("nesting"),
+            "error must mention 'depth' or 'nesting'; got: {err}"
+        );
+    }
+
+    /// ROLLUP TEST — No-double-count: a child costing 0.30 / baseline 0.50
+    /// (saved = 0.20) wrapped by a parent whose only real work is the
+    /// SubWorkflow node.  After rollup:
+    ///   parent.cost_usd       == 0.30
+    ///   parent.baseline_cost  == 0.50
+    ///   parent.saved_usd      == 0.20   (NOT 0.40 — the no-double-count guard)
+    #[tokio::test]
+    async fn subworkflow_budget_rolls_up_no_double_count() {
+        let child_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+
+        // Child: t → m1 (cost=0.30, baseline=0.50) → o
+        let child_def = WorkflowDefinition {
+            id: child_id,
+            version: 1,
+            name: "child-wf".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "m1".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "m1".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "m1".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        let parent_def = make_subwf_def(parent_id, child_id);
+
+        let mut stub = StubExecutor::new(vec![(
+            "m1",
+            NodeOutput {
+                content: json!("child_response"),
+                cost_usd: 0.30,
+                baseline_cost_usd: 0.50,
+                model_used: Some("haiku".into()),
+            },
+        )]);
+        stub.subworkflows.insert(child_id, child_def);
+
+        let result = run_workflow(
+            &stub,
+            &parent_def,
+            &json!("input"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Succeeded, "parent must Succeed");
+
+        // cost_usd must equal the child's model cost (0.30 — not 0.60)
+        assert!(
+            (result.cost_usd - 0.30).abs() < 1e-9,
+            "cost_usd expected 0.30 (child cost once), got {}",
+            result.cost_usd
+        );
+        // baseline_cost_usd must equal child's baseline (0.50 — not 1.00)
+        assert!(
+            (result.baseline_cost_usd - 0.50).abs() < 1e-9,
+            "baseline_cost_usd expected 0.50 (child baseline once), got {}",
+            result.baseline_cost_usd
+        );
+        // saved_usd == baseline - cost == 0.20  (NOT 0.40 — the double-count would be 0.40)
+        assert!(
+            (result.saved_usd - 0.20).abs() < 1e-9,
+            "saved_usd expected 0.20 (no double-count); got {} — double-count would be 0.40",
+            result.saved_usd
+        );
+    }
+
+    /// OUTPUT MAPPING TEST — the child's node_outputs are serialized into the
+    /// SubWorkflow node's `content` in the parent; the content must be a
+    /// non-null, non-empty array.
+    #[tokio::test]
+    async fn subworkflow_output_mapped() {
+        let child_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+
+        // Child: t → m1 → o
+        let child_def = WorkflowDefinition {
+            id: child_id,
+            version: 1,
+            name: "child-wf".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "m1".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "m1".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "m1".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        // Parent: t → sw → o  (output node collects sw's content)
+        let parent_def = make_subwf_def(parent_id, child_id);
+
+        let mut stub = StubExecutor::new(vec![(
+            "m1",
+            NodeOutput {
+                content: json!("child_payload"),
+                cost_usd: 0.01,
+                baseline_cost_usd: 0.02,
+                model_used: Some("haiku".into()),
+            },
+        )]);
+        stub.subworkflows.insert(child_id, child_def);
+
+        let result = run_workflow(
+            &stub,
+            &parent_def,
+            &json!("hi"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        // The parent's output node ("o") collects the SubWorkflow node ("sw") content.
+        assert_eq!(result.node_outputs.len(), 1);
+        assert_eq!(result.node_outputs[0].0, "o");
+        let content = &result.node_outputs[0].1.content;
+        assert!(
+            !content.is_null(),
+            "SubWorkflow output content must not be null"
+        );
+        assert!(
+            content.is_array(),
+            "SubWorkflow output content must be an array (child node_outputs); got {content}"
+        );
+        // The array must contain the child's Output node entry.
+        let arr = content.as_array().unwrap();
+        assert!(
+            !arr.is_empty(),
+            "SubWorkflow output array must be non-empty; child had an Output node"
+        );
+        // Each element is a [node_id, NodeOutput] tuple — verify child output is present.
+        let has_child_output = arr.iter().any(|entry| {
+            entry
+                .as_array()
+                .and_then(|pair| pair.first())
+                .and_then(|v| v.as_str())
+                == Some("o")
+        });
+        assert!(
+            has_child_output,
+            "child Output node 'o' must appear in the SubWorkflow content; got {content}"
+        );
+    }
+
+    /// CHILD FAILURE PROPAGATION TEST — a child that fails (stub returns an
+    /// error for its model node) causes the parent run to fail too; the parent
+    /// status is Failed and an error message is present.
+    #[tokio::test]
+    async fn subworkflow_child_failure_propagates() {
+        let child_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+
+        // Child has a Model node "m1" — but the stub has NO response for "m1",
+        // so the stub returns ApiError::Internal → child run Fails.
+        let child_def = WorkflowDefinition {
+            id: child_id,
+            version: 1,
+            name: "failing-child".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "m1".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "m1".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "m1".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        let parent_def = make_subwf_def(parent_id, child_id);
+
+        // No model responses → stub.run_intelligence("m1", ...) returns Err.
+        let mut stub = StubExecutor::new(vec![]);
+        stub.subworkflows.insert(child_id, child_def);
+
+        let result = run_workflow(
+            &stub,
+            &parent_def,
+            &json!("input"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            WfStatus::Failed,
+            "child failure must propagate to parent as Failed; got {:?}",
+            result.status
+        );
+        assert!(
+            result.error.is_some(),
+            "parent must report an error when the child fails"
+        );
+    }
+
+    /// BUDGET EXHAUSTION IN CHILD — a child with a model node, run with a
+    /// budget so small that the pre-node budget gate fires before any model
+    /// call.  The child must return BudgetExhausted, which propagates to the
+    /// parent.
+    ///
+    /// The pre-node gate fires when `accrued >= run_max_cost_usd`.  We set
+    /// `run_max_cost_usd = Some(0.0)` on the parent (passed down to the child
+    /// as `remaining = 0.0`).  With 0 remaining the child's budget gate fires
+    /// before the model node runs → child BudgetExhausted → parent BudgetExhausted.
+    #[tokio::test]
+    async fn subworkflow_budget_exhaustion_in_child() {
+        let child_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+
+        // Child has a Model node that would cost 0.10, but we'll exhaust budget before it runs.
+        let child_def = WorkflowDefinition {
+            id: child_id,
+            version: 1,
+            name: "budget-child".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "m1".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "m1".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "m1".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+        };
+
+        let parent_def = make_subwf_def(parent_id, child_id);
+
+        let mut stub = StubExecutor::new(vec![(
+            "m1",
+            NodeOutput {
+                content: json!("should_not_run"),
+                cost_usd: 0.10,
+                baseline_cost_usd: 0.20,
+                model_used: Some("haiku".into()),
+            },
+        )]);
+        stub.subworkflows.insert(child_id, child_def);
+
+        // Budget of 0.0 — even the first Model node is blocked.
+        let result = run_workflow(
+            &stub,
+            &parent_def,
+            &json!("input"),
+            Some(0.0),
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            WfStatus::BudgetExhausted,
+            "child BudgetExhausted must propagate to parent; got {:?}",
+            result.status
+        );
+    }
 }

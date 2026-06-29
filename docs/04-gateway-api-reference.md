@@ -2027,6 +2027,60 @@ logs, the node journal, or any API response. Store secrets with
 and again at run time. A workflow with an `http` node whose host is absent from
 `allowed_hosts` will fail validation at save time with a 400 error.
 
+#### `sub_workflow`
+
+Invoke another stored workflow as a child step.  The child runs synchronously
+inside the parent run; its cost and baseline cost roll up into the parent's
+totals.  The child must belong to the same org.
+
+```json
+{
+  "id": "enrich",
+  "type": "sub_workflow",
+  "workflow_id": "c3d4e5f6-0000-0000-0000-000000000001"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `workflow_id` | string (UUID) | yes | Id of the child workflow definition to invoke. Must be owned by the same org. |
+| `version` | integer | no | Accepted but currently ignored — the latest version is always loaded. |
+
+**Same-org scoping.** The child definition is loaded from the authenticated org's
+workflow store.  A `workflow_id` that does not exist or belongs to another org
+produces a `Failed` run with a `404`-class error.
+
+**Nesting depth cap — `MAX_SUBWORKFLOW_DEPTH = 5`.** The engine tracks the current
+recursion depth.  When a `sub_workflow` node would start a child at depth 6 or
+greater the run is immediately failed with:
+
+```
+sub-workflow nesting exceeds max depth 5
+```
+
+**Cycle rejection.** Both self-cycles (a workflow whose `sub_workflow` node points
+at its own `workflow_id`) and indirect cycles (A → B → A) are detected before
+any recursive call is made.  The guard maintains an ancestors list; if the child's
+`workflow_id` matches the current workflow id or any ancestor the run fails with:
+
+```
+sub-workflow cycle detected
+```
+
+**Budget rollup.** The parent passes its remaining run budget down to the child.
+On child success the child's `cost_usd` and `baseline_cost_usd` are folded into
+the parent's running totals.  The child's `saved_usd` is **not** added directly
+— savings are always re-derived as `(accrued_baseline − accrued_cost)` at the
+end of the parent run to prevent double-counting.
+
+**Child failure propagates.** If the child run ends with `Failed` or
+`BudgetExhausted`, the parent run also ends with the same status.  Any cost
+already incurred by the child is included in the parent's reported `cost_usd`.
+
+**Output mapping.** The SubWorkflow node's output `content` is the child
+workflow's `node_outputs` array serialized as JSON.  Downstream nodes can
+reference it with `{{enrich}}` (the node id).
+
 ### 24.3 Model selection (`selection`)
 
 The `selection` field on `model` and `agent` nodes determines how the model is resolved:
