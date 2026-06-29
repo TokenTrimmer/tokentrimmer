@@ -1,4 +1,4 @@
-//! Wavefront scheduling helpers for the workflow engine (W3a-1 Task 1).
+//! Wavefront scheduling helpers for the workflow engine (W3a-1 Tasks 1 & 2).
 //!
 //! A node is "ready" when it is reachable, not yet done, and every reachable
 //! predecessor is already done.  This "reachable-predecessor" readiness rule
@@ -6,8 +6,17 @@
 //! skipped arm leaves a phantom incoming edge at a merge node: the merge node's
 //! only *reachable* predecessor is the taken arm, so it becomes ready as soon
 //! as that arm completes.
+//!
+//! Task 2 adds [`run_concurrent_model_wave`] which fans out a wave's
+//! Model/Agent nodes concurrently via [`futures::future::join_all`].
 
 use std::collections::{HashMap, HashSet};
+
+use futures::future::join_all;
+
+use crate::error::ApiError;
+use crate::workflow::executor::{IntelligenceSpec, NodeExecutor};
+use crate::workflow::types::NodeOutput;
 
 /// Build a reverse adjacency map (predecessors) from a forward adjacency map.
 ///
@@ -51,4 +60,49 @@ pub(crate) fn ready_nodes(
         })
         .cloned()
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent execution helper (W3a-1 Task 2)
+// ---------------------------------------------------------------------------
+
+/// Result from one concurrently-executed Model/Agent node.
+pub(crate) struct ConcurrentNodeResult {
+    pub node_id: String,
+    pub outcome: Result<NodeOutput, ApiError>,
+}
+
+/// Run a set of pre-built Model/Agent specs concurrently via [`join_all`].
+///
+/// Specs must be in stable topo order; results are returned in the same
+/// submission order, preserving determinism for the caller's fold step.
+///
+/// # Concurrency model
+///
+/// `executor: &dyn NodeExecutor` is `Send + Sync`; references are `Copy`, so
+/// each `async move` block captures its own copy of the shared reference
+/// without extending its lifetime. All futures complete (via the `join_all`
+/// `.await`) before this function returns, so the borrows on `executor` and
+/// `specs` remain valid throughout.
+///
+/// Journal entries and `WfEvent`s are NOT emitted here. The engine folds
+/// results single-threadedly in stable topo order after the join — that fold
+/// is the sole source of ordering for journal entries and events, which
+/// guarantees determinism independent of task-completion order.
+pub(crate) async fn run_concurrent_model_wave(
+    executor: &dyn NodeExecutor,
+    specs: &[(String, IntelligenceSpec)],
+) -> Vec<ConcurrentNodeResult> {
+    // &dyn NodeExecutor is Copy (it's a fat pointer / reference), so each
+    // async-move block captures its own copy — no Arc required.
+    let futs: Vec<_> = specs
+        .iter()
+        .map(|(node_id, spec)| async move {
+            ConcurrentNodeResult {
+                node_id: node_id.clone(),
+                outcome: executor.run_intelligence(node_id.as_str(), spec).await,
+            }
+        })
+        .collect();
+    join_all(futs).await
 }
