@@ -11,6 +11,40 @@ git clone https://github.com/TokenTrimmer/tokentrimmer.git
 npm install ./tokentrimmer/sdk-typescript
 ```
 
+## Try it in 30 seconds — no account, no provider key, $0
+
+A `tt_test_*` **sandbox key** short-circuits inside the Gateway to a deterministic
+synthetic response: it never contacts a provider, never verifies against a key
+store, and costs nothing — ideal for wiring up an integration before you have an
+account. Start a local Gateway (one `docker run`, no provider keys), then call it:
+
+```bash
+docker run -p 8080:8080 \
+  -e TT_BIND_ADDR=0.0.0.0 -e TT_ALLOW_UNAUTHENTICATED_PUBLIC_BIND=1 \
+  ghcr.io/tokentrimmer/tt-cli:latest
+```
+
+```ts
+import { TokenTrimmer } from '@tokentrimmer/client';
+
+// Sandbox: any tt_test_ token works — no account, no provider key, $0.
+const client = new TokenTrimmer({ apiKey: 'tt_test_demo', baseURL: 'http://localhost:8080/v1' });
+
+const response = await client.chat.completions.create({
+  model: 'claude-sonnet-4-6',
+  messages: [{ role: 'user', content: 'Hello' }],
+});
+console.log(response.choices[0].message.content);
+// → [sandbox] TokenTrimmer test response for model=claude-sonnet-4-6
+console.log(`cost $${response.tt.costUsd?.toFixed(4)}  cache ${response.tt.cache}`);
+// → cost $0.0000  cache sandbox   (no provider was called)
+```
+
+## Real usage
+
+Point at a live Gateway with a verified `tt_live_*` key for real routing, cost, and
+cache metadata.
+
 > **Hosted gateway launching soon** *(as of 2026-06-10)* — `new TokenTrimmer({ apiKey })`
 > defaults to `https://api.tokentrimmer.com`, which is not live yet. Self-host with
 > Docker today and pass `baseURL: 'http://localhost:8080/v1'` (see "Self-hosted
