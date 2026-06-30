@@ -350,6 +350,73 @@ pub fn filter_extra_headers(headers: &[(String, String)]) -> Vec<(String, String
 }
 
 // ---------------------------------------------------------------------------
+// Outbound header filter (workflow HTTP nodes)
+// ---------------------------------------------------------------------------
+
+/// Outbound headers denied for workflow HTTP nodes calling external APIs.
+///
+/// An outbound workflow HTTP call to an allowlisted external API legitimately
+/// carries the user's own `Authorization`, `x-api-key`, or `content-type`
+/// headers — those are required for authenticating to OpenAI, Anthropic, etc.
+/// Only `host` (request-smuggling / routing override) and hop-by-hop framing
+/// headers are dangerous and must be stripped.
+///
+/// This is intentionally narrower than `DENIED_HEADERS`, which is the strict
+/// provider-proxy policy (the gateway sets provider auth itself).
+const OUTBOUND_DENIED_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "proxy-authorization",
+    "transfer-encoding",
+    "upgrade",
+    "te",
+    "trailer",
+    "keep-alive",
+    "proxy-connection",
+];
+
+/// Returns the first header name from `headers` that is denied for outbound
+/// workflow HTTP calls, or `None` if all headers are permitted.
+///
+/// Mirrors [`find_denied_header`] but uses the narrower
+/// [`OUTBOUND_DENIED_HEADERS`] policy: `authorization`, `x-api-key`, and
+/// `content-type` are **allowed** (the user needs these for external API auth);
+/// only `host` and hop-by-hop framing headers are rejected.
+pub fn find_outbound_denied_header(headers: &[(String, String)]) -> Option<&str> {
+    for (name, _) in headers {
+        let lower = name.to_lowercase();
+        if OUTBOUND_DENIED_HEADERS.iter().any(|&d| d == lower) {
+            return OUTBOUND_DENIED_HEADERS
+                .iter()
+                .find(|&&d| d == lower.as_str())
+                .copied();
+        }
+    }
+    None
+}
+
+/// Filters outbound headers for workflow HTTP nodes.
+///
+/// Removes headers listed in [`OUTBOUND_DENIED_HEADERS`] (`host`, hop-by-hop)
+/// and logs a warning for each dropped header. Unlike [`filter_extra_headers`],
+/// this permits `authorization`, `x-api-key`, and `content-type` so the HTTP
+/// node can authenticate to external APIs.
+pub fn filter_outbound_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let lower = name.to_lowercase();
+            let denied = OUTBOUND_DENIED_HEADERS.iter().any(|&d| d == lower);
+            if denied {
+                tracing::warn!(header = %name, "dropping denied outbound header");
+            }
+            !denied
+        })
+        .cloned()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -595,5 +662,42 @@ mod tests {
         // A normal public v6 must NOT be blocked.
         let public: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap(); // Cloudflare DNS
         assert!(!is_blocked_v6(public));
+    }
+
+    // -- find_outbound_denied_header / filter_outbound_headers --
+
+    #[test]
+    fn outbound_allows_auth_headers() {
+        let headers = vec![
+            ("authorization".to_string(), "Bearer x".to_string()),
+            ("x-api-key".to_string(), "k".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+        assert_eq!(find_outbound_denied_header(&headers), None);
+    }
+
+    #[test]
+    fn outbound_blocks_host_and_hop_by_hop() {
+        let host = vec![("host".to_string(), "evil.com".to_string())];
+        assert!(find_outbound_denied_header(&host).is_some());
+        let conn = vec![("connection".to_string(), "keep-alive".to_string())];
+        assert!(find_outbound_denied_header(&conn).is_some());
+        let te = vec![("transfer-encoding".to_string(), "chunked".to_string())];
+        assert!(find_outbound_denied_header(&te).is_some());
+    }
+
+    #[test]
+    fn filter_outbound_keeps_auth_drops_host() {
+        let headers = vec![
+            ("authorization".to_string(), "Bearer token".to_string()),
+            ("host".to_string(), "evil.com".to_string()),
+            ("connection".to_string(), "close".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+        let filtered = filter_outbound_headers(&headers);
+        assert!(filtered.iter().any(|(k, _)| k == "authorization"));
+        assert!(filtered.iter().any(|(k, _)| k == "content-type"));
+        assert!(!filtered.iter().any(|(k, _)| k == "host"));
+        assert!(!filtered.iter().any(|(k, _)| k == "connection"));
     }
 }

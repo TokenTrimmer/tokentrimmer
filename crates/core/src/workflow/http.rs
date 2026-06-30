@@ -25,7 +25,7 @@ use futures::StreamExt as _;
 use thiserror::Error;
 use tracing::warn;
 use tt_shared::context::SecretString;
-use tt_shared::filter_extra_headers;
+use tt_shared::filter_outbound_headers;
 
 use crate::workflow::types::NodeOutput;
 
@@ -244,7 +244,7 @@ pub(crate) async fn run_http(
     .map_err(|e| HttpError::Request(e.without_url().to_string()))?;
 
     // ---- 3. Filter headers --------------------------------------------------
-    let filtered = filter_extra_headers(&spec.headers);
+    let filtered = filter_outbound_headers(&spec.headers);
 
     // ---- 4. Build the request -----------------------------------------------
     let method = reqwest::Method::from_bytes(spec.method.to_uppercase().as_bytes())
@@ -472,6 +472,38 @@ mod tests {
         assert!(
             !err_str.contains("?token="),
             "error must not contain URL query string; got: {err_str}"
+        );
+    }
+
+    // ---- run_http: auth header is not dropped by outbound filter ---------------
+
+    /// `filter_outbound_headers` must keep `authorization` and `x-api-key` so
+    /// HTTP nodes can authenticate to external APIs (regression guard).
+    #[tokio::test]
+    async fn run_http_auth_header_not_dropped_by_filter() {
+        // Use the empty allowlist path — we only care that HostNotAllowed fires,
+        // not BlockedUrl, which would indicate the filter never saw the headers.
+        // The key assertion is that headers containing `authorization` survive
+        // `filter_outbound_headers` and reach the allowlist check.
+        let spec = HttpReqSpec {
+            method: "GET".into(),
+            url: "https://api.example.com/".into(),
+            headers: vec![
+                (
+                    "authorization".to_string(),
+                    "Bearer secret-token".to_string(),
+                ),
+                ("x-api-key".to_string(), "sk-test".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+            body: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        };
+        // Host not in allowlist → fails at allowlist check (not at header filter).
+        let err = run_http(spec, &[]).await.unwrap_err();
+        assert!(
+            matches!(err, HttpError::HostNotAllowed(_)),
+            "expected HostNotAllowed (auth headers survived the filter), got: {err}"
         );
     }
 
