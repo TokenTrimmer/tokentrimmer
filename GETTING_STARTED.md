@@ -357,6 +357,15 @@ TT_RETRIEVAL_STORE=memory TT_OPENAI_EMBED_KEY=sk-... tt gateway
 
 Thin OpenAI subclasses that route through the Gateway and surface cost/cache metadata on `.tt`.
 
+**Try it first with no account, no provider key, $0.** Point either SDK at a local
+Gateway (the one-line `docker run … ghcr.io/tokentrimmer/tt-cli:latest` from the
+[Self-host path](#self-host-path-docker) above) and use any `tt_test_*` **sandbox
+key** — the Gateway short-circuits to a deterministic synthetic response without
+contacting a provider or verifying against a key store. In both examples below,
+swap `api_key="tt_live_..."` → `api_key="tt_test_demo"` and add
+`base_url="http://localhost:8080/v1"` (`baseURL` in TS); the call returns
+`[sandbox] TokenTrimmer test response …` at `cost_usd=0`, `cache=sandbox`.
+
 > **Not yet on PyPI/npm** — published packages land at launch. Until then, install from git:
 > `pip install "git+https://github.com/TokenTrimmer/tokentrimmer.git#subdirectory=sdk-python"`.
 > For TypeScript (npm cannot install a git subdirectory directly): clone the repo, run
