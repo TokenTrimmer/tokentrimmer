@@ -26,6 +26,14 @@ inputs:
       cost increase is detected. Set to `false` to report only.
     required: false
     default: 'true'
+  budget-file:
+    description: >-
+      Path to a `.tokentrimmer/budgets.toml` (relative to the repo root)
+      declaring per-glob `max_call_usd` ceilings + a global `max_pr_delta_usd`
+      cap. When set, the check ALSO fails on any budget violation (in addition
+      to `fail-on-cost-increase`). Leave empty to disable budget gating.
+    required: false
+    default: ''
   comment:
     description: >-
       When `true` (and the event is a pull request), post or update a sticky PR
@@ -86,6 +94,7 @@ runs:
         BASE_REF_INPUT: ${{ inputs.base-ref }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         FAIL_ON_INCREASE: ${{ inputs.fail-on-cost-increase }}
+        BUDGET_FILE: ${{ inputs.budget-file }}
       run: |
         set -euo pipefail
 
@@ -100,19 +109,37 @@ runs:
         report="$(mktemp -t tt-cost-diff.XXXXXX.md)"
         echo "report-file=$report" >> "$GITHUB_OUTPUT"
 
-        # Always generate the report WITHOUT --fail-on-cost-increase so that a
-        # genuine setup error (e.g. base ref not fetched, git missing) fails
-        # this step loudly and unambiguously — rather than being mistaken for a
-        # cost increase. Markdown goes to stdout; human notices go to stderr.
-        tt inspect "$SCAN_PATH" --cost-diff --base "$base" --no-color > "$report"
-
-        # Derive the gate from the report content. The markdown verdict line
-        # contains "Projected cost increase" iff the net per-call cost rose.
-        if [ "$FAIL_ON_INCREASE" = "true" ] && grep -q "Projected cost increase" "$report"; then
-          echo "cost-gate=failed" >> "$GITHUB_OUTPUT"
-        else
-          echo "cost-gate=passed" >> "$GITHUB_OUTPUT"
+        # Budget gating is opt-in: pass --budget-file only when one is configured.
+        budget_args=()
+        if [ -n "$BUDGET_FILE" ]; then
+          budget_args=(--budget-file "$BUDGET_FILE")
         fi
+
+        # Generate the report. We DON'T use tt's exit code to gate (it is
+        # non-zero on a budget violation), so capture it without aborting and
+        # tell a real crash (bad base ref, git missing) from a gate-exit by the
+        # presence of the report's own header — a genuine run always emits it.
+        set +e
+        tt inspect "$SCAN_PATH" --cost-diff --base "$base" "${budget_args[@]}" --no-color > "$report"
+        rc=$?
+        set -e
+        if ! grep -q "TokenTrimmer cost-diff" "$report"; then
+          echo "::error::tt inspect --cost-diff failed (exit $rc) — check the base ref is fetched and git is available" >&2
+          cat "$report" >&2 || true
+          exit 1
+        fi
+
+        # Derive the gate from the report content: "Projected cost increase" iff
+        # the net per-call cost rose; "Budget exceeded" iff a budgets.toml ceiling
+        # was tripped (budgets always gate when a budget file is set).
+        gate=passed
+        if [ "$FAIL_ON_INCREASE" = "true" ] && grep -q "Projected cost increase" "$report"; then
+          gate=failed
+        fi
+        if grep -q "Budget exceeded" "$report"; then
+          gate=failed
+        fi
+        echo "cost-gate=$gate" >> "$GITHUB_OUTPUT"
 
         # Mirror the report into the job step summary.
         if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
@@ -164,11 +191,11 @@ runs:
           echo "::warning::TokenTrimmer cost gate could not post the PR comment (the token is likely read-only, e.g. a fork-contributor PR). The cost report is still in the job step summary and the gate verdict is unaffected."
         fi
 
-    - name: Fail the check on projected cost increase
+    - name: Fail the check on cost increase or budget violation
       if: ${{ steps.run.outputs.cost-gate == 'failed' }}
       shell: bash
       run: |
-        echo "::error::TokenTrimmer cost gate: a projected per-call cost increase was detected."
+        echo "::error::TokenTrimmer cost gate: a projected per-call cost increase and/or a budgets.toml violation was detected — see the cost-diff report."
         exit 1
 
     # ---------------------------------------------------------------------

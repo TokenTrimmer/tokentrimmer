@@ -5,6 +5,7 @@ pub mod account;
 pub mod advise;
 pub mod agent;
 pub mod batch;
+pub mod budgets;
 pub mod catalog;
 pub mod chat;
 pub mod context;
