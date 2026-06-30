@@ -151,6 +151,9 @@ pub fn build_router_with_retrieval(
         // org derived from the authenticated tt_live_ key. Backs the MCP
         // cost-control tools.
         .route("/v1/spend", get(routes::spend_api::get_spend))
+        // Tenant-facing cap write: set/clear the org's (or a key's) monthly spend
+        // cap. Same auth seam; backs the MCP `set_cost_limit` tool.
+        .route("/v1/spend/limit", post(routes::spend_api::set_spend_limit))
         // Batch Lane (slice 2): OpenAI-compatible submit/status + file proxy.
         // Non-streaming, so the short timeout tier. The slice-3 worker owns
         // long-running polling; these handlers only proxy + persist.

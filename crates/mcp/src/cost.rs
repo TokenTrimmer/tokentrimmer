@@ -162,16 +162,15 @@ impl CostControlBackend for UnconfiguredBackend {
     }
 }
 
-/// Hosted backend: reads the org's spend from the gateway's tenant-authed
-/// `GET /v1/spend` endpoint, presenting the bound `tt_live_*` key. The gateway
-/// re-derives the org from the key, so the figures are always the key's own
-/// org's — a caller cannot read another org's spend.
+/// Hosted backend: talks to the gateway's tenant-authed spend endpoints,
+/// presenting the bound `tt_live_*` key. The gateway re-derives the org from the
+/// key, so reads always return the key's own org's figures and a cap write only
+/// ever touches the caller's org (or its own keys) — a caller cannot read or
+/// mutate another org's cost state.
 ///
-/// The WRITE half (`set_cost_limit`) is **not yet wired**: the cap tables
-/// (`org_budget_caps` / `api_key_budget_caps`) are owned by the cloud schema, so
-/// a tenant-authed cap write belongs on a cloud surface (a follow-up). Until
-/// then `set_cost_limit` returns `applied: false`, honestly signalling that
-/// nothing was persisted (same contract as [`UnconfiguredBackend`] for writes).
+/// * `spend_today` / `budget_remaining` → `GET /v1/spend`.
+/// * `set_cost_limit` → `POST /v1/spend/limit` (org cap, or a key cap that the
+///   gateway ownership-gates) → `applied: true` on success.
 pub struct HttpCostBackend {
     /// Gateway base URL, e.g. `https://api.tokentrimmer.com`. GETs `{base}/v1/spend`.
     pub gateway_base: String,
@@ -228,6 +227,33 @@ impl HttpCostBackend {
             .await
             .map_err(|e| McpError::Internal(format!("decode gateway spend response: {e}")))
     }
+
+    /// POST the cap to `/v1/spend/limit`. `key_id: None` ⇒ org-wide;
+    /// `monthly_cap_usd: None` ⇒ clear. The gateway scopes the write to the
+    /// authed org (and ownership-gates a key cap → 404 if the key isn't theirs).
+    async fn set_limit(
+        &self,
+        key_id: Option<Uuid>,
+        monthly_cap_usd: Option<f64>,
+    ) -> Result<(), McpError> {
+        let body = serde_json::json!({ "monthly_cap_usd": monthly_cap_usd, "key_id": key_id });
+        let resp = self
+            .http
+            .post(format!(
+                "{}/v1/spend/limit",
+                self.gateway_base.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| McpError::Internal(format!("gateway set-limit request failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_spend_error(status));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -258,18 +284,18 @@ impl CostControlBackend for HttpCostBackend {
         scope: LimitScope,
         monthly_cap_usd: Option<f64>,
     ) -> Result<CostLimitSet, McpError> {
-        // WRITE half not yet wired — the cloud-owned cap tables need a
-        // tenant-authed write endpoint (a follow-up). Report honestly that the
-        // change was not persisted, exactly like the unconfigured default.
         let key_id = match scope {
             LimitScope::Org => None,
             LimitScope::Key(k) => Some(k),
         };
+        // Persist via the gateway's tenant-authed write; a non-2xx (e.g. a
+        // foreign key → 404) surfaces as an McpError rather than a false success.
+        self.set_limit(key_id, monthly_cap_usd).await?;
         Ok(CostLimitSet {
             org_id,
             key_id,
             monthly_cap_usd,
-            applied: false,
+            applied: true,
         })
     }
 }
@@ -434,15 +460,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_set_cost_limit_reports_not_applied() {
-        // The WRITE half is a cloud follow-up; the HTTP backend must not claim
-        // persistence (no network call is even made).
+    async fn http_set_org_cost_limit_posts_and_reports_applied() {
+        let server = MockServer::start_async().await;
         let org = Uuid::now_v7();
-        let r = http_backend("http://gateway.invalid".into())
+        let m = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/spend/limit")
+                    .header("authorization", "Bearer tt_live_operator")
+                    .json_body_includes(r#"{"monthly_cap_usd":25.0}"#.to_string());
+                then.status(200).json_body(json!({
+                    "org_id": org.to_string(),
+                    "key_id": null,
+                    "monthly_cap_usd": 25.0,
+                    "applied": true
+                }));
+            })
+            .await;
+        let r = http_backend(server.base_url())
             .set_cost_limit(org, LimitScope::Org, Some(25.0))
             .await
             .unwrap();
-        assert!(!r.applied, "write half not wired → applied must be false");
+        m.assert_async().await;
+        assert!(r.applied, "a 2xx write → applied: true");
         assert_eq!(r.monthly_cap_usd, Some(25.0));
+        assert_eq!(r.key_id, None);
+    }
+
+    #[tokio::test]
+    async fn http_set_key_cost_limit_sends_key_id() {
+        let server = MockServer::start_async().await;
+        let org = Uuid::now_v7();
+        let key = Uuid::now_v7();
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/spend/limit")
+                    .json_body_includes(format!(r#"{{"key_id":"{key}"}}"#));
+                then.status(200).json_body(json!({ "applied": true }));
+            })
+            .await;
+        let r = http_backend(server.base_url())
+            .set_cost_limit(org, LimitScope::Key(key), Some(3.0))
+            .await
+            .unwrap();
+        assert!(r.applied);
+        assert_eq!(r.key_id, Some(key));
+    }
+
+    #[tokio::test]
+    async fn http_set_cost_limit_404_surfaces_error_not_false_success() {
+        // A foreign key → gateway 404 must propagate as an error, never a
+        // silent applied:false (which would mislead the agent into thinking it
+        // set a cap it didn't).
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/spend/limit");
+                then.status(404);
+            })
+            .await;
+        let err = http_backend(server.base_url())
+            .set_cost_limit(Uuid::now_v7(), LimitScope::Key(Uuid::now_v7()), Some(1.0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::Internal(_)));
     }
 }
