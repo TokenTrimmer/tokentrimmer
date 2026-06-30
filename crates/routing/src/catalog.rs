@@ -3,8 +3,15 @@
 //! a deterministic reserved name so `tt route catalog disable` removes exactly
 //! these routes (no DB marker). Chat flagships only — pure-reasoning o-series
 //! models are intentionally excluded from v1.
+//!
+//! Each catalog route also default-ons the LOSSLESS agentic-context levers
+//! (`agentic_budget.cache_prefix` + `elide_stale_tools`) so the same flagship
+//! traffic that down-routes also gets cache-prefix annotation + stale-tool-result
+//! field-drop on real agent loops — both are intrinsic no-ops on plain single-turn
+//! chat, so non-agentic traffic stays byte-identical. The lossy / expectation-value
+//! levers stay off (see `every_catalog_route_enables_lossless_agentic_levers`).
 use crate::store::NewRoute;
-use crate::{RouteAction, RouteConditions};
+use crate::{AgenticBudget, RouteAction, RouteConditions};
 
 pub const CATALOG_NAME_PREFIX: &str = "catalog:";
 const CATALOG_PAUSE_FLOOR: f64 = 0.92;
@@ -95,6 +102,20 @@ pub fn catalog_routes() -> Vec<NewRoute> {
                 auto_pause: true,
                 pause_floor_pass_rate: Some(CATALOG_PAUSE_FLOOR),
                 pause_min_verdicts: Some(CATALOG_PAUSE_MIN_VERDICTS),
+                // Default-on the LOSSLESS agentic-context levers alongside the
+                // down-route. Both are intrinsic no-ops on non-agentic single-turn
+                // chat and lossless + token-true-gated on real agent loops, so the
+                // same flagship traffic that down-routes also gets cache-prefix
+                // annotation + stale-tool-result field-drop for free. The lossy /
+                // expectation-value levers (`route_mechanical_to`,
+                // `semantic_substep_cache`) stay OFF — the catalog is the safe
+                // default set. These ride the route's `auto_pause` seam: a paused
+                // route suppresses every cost lever, including these.
+                agentic_budget: Some(AgenticBudget {
+                    cache_prefix: true,
+                    elide_stale_tools: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         })
@@ -116,6 +137,52 @@ mod tests {
             assert!(r.when.not_reasoning_class);
             assert!(!r.when.model_in.is_empty());
             assert_eq!(r.priority, CATALOG_PRIORITY);
+        }
+    }
+
+    /// Every catalog route enables the LOSSLESS agentic-context levers
+    /// (`cache_prefix` + `elide_stale_tools`) and ONLY those — never the lossy /
+    /// expectation-value levers (`route_mechanical_to`, `semantic_substep_cache`).
+    /// The two enabled levers are intrinsic no-ops on plain single-turn chat
+    /// (cache_prefix annotates framing only; elide scans for `Message::Tool`
+    /// blocks that a non-agentic request lacks) and lossless + token-true-gated on
+    /// real agent loops, so attaching them to the down-route entries shapes
+    /// obviously-agentic flagship traffic for free while leaving every other
+    /// request byte-identical. They ride the same `auto_pause` seam as the model
+    /// down-route (a paused route suppresses ALL cost levers, including these).
+    #[test]
+    fn every_catalog_route_enables_lossless_agentic_levers() {
+        for r in catalog_routes() {
+            let ab =
+                r.then.agentic_budget.as_ref().unwrap_or_else(|| {
+                    panic!("catalog route {} must carry agentic_budget", r.name)
+                });
+            assert!(ab.cache_prefix, "{}: cache_prefix (lossless) on", r.name);
+            assert!(
+                ab.elide_stale_tools,
+                "{}: elide_stale_tools (lossless field-drop + judge-gated summary) on",
+                r.name
+            );
+            // Lossy / expectation-value levers stay OFF — the catalog is the
+            // safe default-on set; route_mechanical_to is a client signal and
+            // semantic_substep_cache's serve path is intentionally deferred
+            // (net-negative until an expensive read-only gateway tool exists).
+            assert!(
+                ab.route_mechanical_to.is_none(),
+                "{}: route_mechanical_to must stay off in the catalog",
+                r.name
+            );
+            assert!(
+                !ab.semantic_substep_cache,
+                "{}: semantic_substep_cache must stay off in the catalog",
+                r.name
+            );
+            // Keep-recent blast-radius bound is the validated default.
+            assert!(
+                ab.keep_recent_pairs >= 1,
+                "{}: keep_recent_pairs >= 1",
+                r.name
+            );
         }
     }
 
