@@ -363,7 +363,7 @@ Thin OpenAI subclasses that route through the Gateway and surface cost/cache met
 > `npm install && npm run build` in `sdk-typescript/`, then `npm install <path-to-clone>/sdk-typescript`
 > from your project.
 
-**Python** (package `tokentrimmer`, requires Python ≥ 3.9, `openai>=1.0,<2`):
+**Python** (package `tokentrimmer`, requires Python ≥ 3.9, `openai>=1.70.0,<3.0.0`):
 
 ```python
 from tokentrimmer import TokenTrimmer
@@ -376,7 +376,7 @@ resp = client.chat.completions.create(
 print(resp.tt.cost_usd, resp.tt.cache, resp.tt.trace_id)
 ```
 
-**TypeScript** (package `@tokentrimmer/client`, peer dep `openai ^4 || ^5`):
+**TypeScript** (package `@tokentrimmer/client`, requires `openai ^6.44.0`):
 
 ```ts
 import { TokenTrimmer } from '@tokentrimmer/client';
