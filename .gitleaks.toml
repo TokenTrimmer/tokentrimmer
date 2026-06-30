@@ -17,6 +17,9 @@ regexes = [
   '''\$\{[A-Za-z_][A-Za-z0-9_]*\}''',
   # Documentation placeholder API key used in code samples.
   '''tt_live_abc123''',
+  # `tt connect` unit-test fixture: an obviously-sequential fake key
+  # (`tt_live_abcdefghij123456`) used to assert masking/snippet rendering.
+  '''tt_live_abcdefghij123456''',
   # Benchmark harness mock-upstream placeholder: the mock accepts any bearer
   # token, so scripts/benchmarks/* send a literal `sk-mock-anything` — not a
   # real credential.
