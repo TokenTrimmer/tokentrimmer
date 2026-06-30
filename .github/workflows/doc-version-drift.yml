@@ -1,0 +1,33 @@
+name: Doc version drift
+
+# Asserts that GETTING_STARTED.md contains the exact openai version strings
+# pinned in sdk-python/pyproject.toml and sdk-typescript/package.json.
+# Fails loudly if the doc drifts from the manifests so broken install
+# instructions can't reach users. Pure grep/parse — no build needed.
+
+on:
+  pull_request:
+    paths:
+      - 'GETTING_STARTED.md'
+      - 'sdk-python/pyproject.toml'
+      - 'sdk-typescript/package.json'
+      - 'scripts/check-doc-versions.sh'
+      - '.github/workflows/doc-version-drift.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'GETTING_STARTED.md'
+      - 'sdk-python/pyproject.toml'
+      - 'sdk-typescript/package.json'
+      - 'scripts/check-doc-versions.sh'
+      - '.github/workflows/doc-version-drift.yml'
+
+jobs:
+  drift:
+    name: GETTING_STARTED openai versions vs manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check doc version drift
+        run: bash scripts/check-doc-versions.sh
