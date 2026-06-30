@@ -122,6 +122,22 @@ pub struct ModelDelta {
     pub removed: u32,
 }
 
+/// One ADDED (`+`) priced model call-site, attributed to the file it was added
+/// in. Drives per-glob budget gating (`budgets::check`): each glob's
+/// `max_call_usd` ceiling is checked against the `projected_call_usd` of every
+/// added call in a matching file. Removals carry no cost, so only additions are
+/// collected.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AddedCall {
+    /// Repo-relative path of the file the call was added in (the diff's `+++`
+    /// target, `b/` prefix and any trailing timestamp stripped).
+    pub file: String,
+    pub model: String,
+    pub provider: String,
+    /// Projected cost of this one call under the active token profile.
+    pub projected_call_usd: f64,
+}
+
 /// Result of analysing a diff: per-model deltas, models we couldn't price, and
 /// the net projected per-call cost change across the whole diff.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -133,6 +149,10 @@ pub struct CostDiffReport {
     /// `Σ (added − removed) × projected_call_usd` over all priced models.
     /// Positive = projected cost increase; negative = projected saving.
     pub net_projected_usd: f64,
+    /// Every added priced call-site with its file + projected per-call cost,
+    /// in diff order. Empty when no `budgets.toml` gating is needed; populated
+    /// regardless (cheap) so per-glob budget checks have what they need.
+    pub added_calls: Vec<AddedCall>,
 }
 
 impl CostDiffReport {
@@ -195,9 +215,21 @@ pub fn analyze(diff_text: &str) -> CostDiffReport {
 pub fn analyze_with_profile(diff_text: &str, profile: &CostProfile) -> CostDiffReport {
     // model -> (added, removed)
     let mut counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    // Added priced calls, attributed to the file they were added in (for
+    // per-glob budget gating). Collected as (file, model) during the scan, then
+    // priced below.
+    let mut added_occ: Vec<(String, String)> = Vec::new();
+    // The file the current hunk targets, from the most recent `+++ b/<path>`
+    // header. Empty for `/dev/null` (a pure deletion) or before any header.
+    let mut current_file = String::new();
 
     for line in diff_text.lines() {
-        // Only content +/- lines; skip the `+++`/`---` file headers.
+        // A `+++ ` file header names the target file for the lines that follow.
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            current_file = normalize_diff_target(rest);
+            continue;
+        }
+        // Only content +/- lines; skip the remaining `+++`/`---` headers.
         let (is_add, content) = if line.starts_with("+++") || line.starts_with("---") {
             continue;
         } else if let Some(rest) = line.strip_prefix('+') {
@@ -212,9 +244,15 @@ pub fn analyze_with_profile(diff_text: &str, profile: &CostProfile) -> CostDiffR
         // scanning both never double-counts the same reference.
         for cap in quoted_model_regex().captures_iter(content) {
             bump(&mut counts, &cap[1], is_add);
+            if is_add {
+                added_occ.push((current_file.clone(), cap[1].to_string()));
+            }
         }
         for cap in unquoted_model_regex().captures_iter(content) {
             bump(&mut counts, &cap[1], is_add);
+            if is_add {
+                added_occ.push((current_file.clone(), cap[1].to_string()));
+            }
         }
     }
 
@@ -242,11 +280,40 @@ pub fn analyze_with_profile(diff_text: &str, profile: &CostProfile) -> CostDiffR
         }
     }
 
+    // Price each added occurrence (skip unknown models — they carry no budget).
+    let added_calls = added_occ
+        .into_iter()
+        .filter_map(|(file, model)| {
+            pricing::lookup(&model).ok().map(|hit| AddedCall {
+                file,
+                provider: hit.provider.to_string(),
+                projected_call_usd: pricing::cost_usd(
+                    profile.input_tokens,
+                    profile.output_tokens,
+                    &hit,
+                ),
+                model,
+            })
+        })
+        .collect();
+
     CostDiffReport {
         models,
         unknown_models,
         net_projected_usd,
+        added_calls,
     }
+}
+
+/// Normalize a unified-diff `+++` target into a repo-relative path: strip the
+/// `b/` prefix git emits, drop any trailing `\t<timestamp>`, and map
+/// `/dev/null` (a pure deletion) to the empty string.
+fn normalize_diff_target(raw: &str) -> String {
+    let path = raw.split('\t').next().unwrap_or(raw).trim();
+    if path == "/dev/null" {
+        return String::new();
+    }
+    path.strip_prefix("b/").unwrap_or(path).to_string()
 }
 
 /// Render a [`CostDiffReport`] as markdown (default standard token profile)

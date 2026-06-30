@@ -59,6 +59,12 @@ enum Command {
         /// In `--cost-diff` mode, exit non-zero when a net cost increase is projected.
         #[arg(long)]
         fail_on_cost_increase: bool,
+        /// In `--cost-diff` mode, a `.tokentrimmer/budgets.toml` declaring
+        /// per-glob `max_call_usd` ceilings + a global `max_pr_delta_usd` cap.
+        /// When set, the diff also fails (non-zero exit) on any budget
+        /// violation. A missing/malformed file is a hard error (money gate).
+        #[arg(long, value_name = "PATH")]
+        budget_file: Option<std::path::PathBuf>,
         /// Suggest-plan mode: scan `path` for model strings, generate cheaper-model
         /// route suggestions via the preview engine, and emit a skeleton
         /// `PlanInput` JSON with `proposed_routes` pre-filled.
@@ -675,13 +681,20 @@ async fn main() -> anyhow::Result<()> {
             cost_diff,
             base,
             fail_on_cost_increase,
+            budget_file,
             suggest_plan,
             from_db,
             org,
             window_days,
         } => {
             if cost_diff {
-                run_cost_diff(&path, &base, output.as_deref(), fail_on_cost_increase)?;
+                run_cost_diff(
+                    &path,
+                    &base,
+                    output.as_deref(),
+                    fail_on_cost_increase,
+                    budget_file.as_deref(),
+                )?;
             } else if suggest_plan {
                 run_suggest_plan(
                     &path,
@@ -2566,12 +2579,14 @@ async fn run_suggest_plan(
 /// LLM model identifiers added/removed between `base` and the working tree,
 /// scoped to `path`. Output is markdown (default / `*.json` → JSON) suitable
 /// for a GitHub check-run summary. With `fail_on_cost_increase`, exits non-zero
-/// on a projected net increase so CI can gate.
+/// on a projected net increase so CI can gate. With `budget_file`, also exits
+/// non-zero on any `.tokentrimmer/budgets.toml` violation.
 fn run_cost_diff(
     path: &str,
     base: &str,
     output: Option<&str>,
     fail_on_cost_increase: bool,
+    budget_file: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     use std::process::Command as ProcCommand;
 
@@ -2606,13 +2621,28 @@ fn run_cost_diff(
 
     let report = tt_cli::cost_diff::analyze_with_profile(&diff_text, &profile);
 
+    // Budget gate (opt-in via --budget-file): per-glob `max_call_usd` ceilings +
+    // a global `max_pr_delta_usd` cap. A pointed budget file is a money gate, so
+    // a missing/malformed file is a hard error (load returns Err), and any
+    // violation fails the check below.
+    let budget_violations = match budget_file {
+        Some(p) => {
+            let budgets = tt_cli::budgets::BudgetFile::load(p)?;
+            tt_cli::budgets::check(&report, &budgets)
+        }
+        None => Vec::new(),
+    };
+
     let formatted = match output_format_for(output) {
         OutputFormat::Json => serde_json::to_string_pretty(&report)
             .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}")),
         // SARIF is not a cost-diff format; `output_format_for` never yields it,
         // so cost-diff only ever produces markdown or JSON.
         OutputFormat::Markdown | OutputFormat::Sarif => {
-            tt_cli::cost_diff::format_markdown_with_profile(&report, &profile)
+            let mut md = tt_cli::cost_diff::format_markdown_with_profile(&report, &profile);
+            // Append any budget-violation section (empty string when none).
+            md.push_str(&tt_cli::budgets::format_violations(&budget_violations));
+            md
         }
     };
 
@@ -2639,11 +2669,24 @@ fn run_cost_diff(
         tt_cli::ui::note("No net per-call cost change projected.");
     }
 
+    if !budget_violations.is_empty() {
+        tt_cli::ui::warn(&format!(
+            "{} budget violation(s) — see the report",
+            budget_violations.len()
+        ));
+    }
+
     if fail_on_cost_increase && report.is_increase() {
         anyhow::bail!(
             "projected per-call cost increase of +${:.6} \
              (use without --fail-on-cost-increase to report only)",
             report.net_projected_usd
+        );
+    }
+    if !budget_violations.is_empty() {
+        anyhow::bail!(
+            "{} cost-budget violation(s) — see the report (remove --budget-file to report only)",
+            budget_violations.len()
         );
     }
 
