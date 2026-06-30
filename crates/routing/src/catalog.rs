@@ -153,11 +153,10 @@ mod tests {
     #[test]
     fn every_catalog_route_enables_lossless_agentic_levers() {
         for r in catalog_routes() {
-            let ab = r
-                .then
-                .agentic_budget
-                .as_ref()
-                .unwrap_or_else(|| panic!("catalog route {} must carry agentic_budget", r.name));
+            let ab =
+                r.then.agentic_budget.as_ref().unwrap_or_else(|| {
+                    panic!("catalog route {} must carry agentic_budget", r.name)
+                });
             assert!(ab.cache_prefix, "{}: cache_prefix (lossless) on", r.name);
             assert!(
                 ab.elide_stale_tools,
@@ -179,7 +178,11 @@ mod tests {
                 r.name
             );
             // Keep-recent blast-radius bound is the validated default.
-            assert!(ab.keep_recent_pairs >= 1, "{}: keep_recent_pairs >= 1", r.name);
+            assert!(
+                ab.keep_recent_pairs >= 1,
+                "{}: keep_recent_pairs >= 1",
+                r.name
+            );
         }
     }
 
