@@ -56,6 +56,10 @@
 //!   returns `WfStatus::Failed` rather than looping.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 
 use futures::future::BoxFuture;
 use tt_shared::context::SecretString;
@@ -115,6 +119,16 @@ pub(crate) struct NodeJournalEntry {
 
 const DEFAULT_MAX_TURNS: u32 = 8;
 const MAX_SUBWORKFLOW_DEPTH: u32 = 5;
+/// Global ceiling on total node executions across the entire run tree (parent
+/// workflow + all nested loops and sub-workflows combined).
+///
+/// Rationale: zero-cost nodes (Transform, Branch, Http) never accrue model
+/// spend, so the cost-budget guard cannot bound `max_iters^depth` for nested
+/// loops. 10 000 is a generous ceiling — the worst-case zero-cost product
+/// 100^5 ≈ 10^10 is halted after ≤ 10 000 executions; a legitimate
+/// 50-node, depth-3, 10-iter workflow uses ≤ 5 050 nodes. Adjust upward if
+/// product requirements change.
+const MAX_TOTAL_NODE_EXECUTIONS: u32 = 10_000;
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -147,6 +161,10 @@ pub(crate) fn run_workflow<'a>(
     depth: u32,
     ancestors: &'a [Uuid],
 ) -> BoxFuture<'a, WorkflowRunResult> {
+    // Seed a fresh execution counter at the root. The Arc is cloned into every
+    // recursive `run_workflow_boxed` call so all nested loops and sub-workflows
+    // draw from ONE shared budget.
+    let executions = Arc::new(AtomicU32::new(0));
     run_workflow_boxed(
         executor,
         def,
@@ -157,6 +175,7 @@ pub(crate) fn run_workflow<'a>(
         secrets,
         depth,
         ancestors,
+        executions,
     )
 }
 
@@ -176,6 +195,7 @@ fn run_workflow_boxed<'a>(
     secrets: &'a HashMap<String, SecretString>,
     depth: u32,
     ancestors: &'a [Uuid],
+    executions: Arc<AtomicU32>,
 ) -> BoxFuture<'a, WorkflowRunResult> {
     Box::pin(async move {
         let mut journal = journal;
@@ -280,6 +300,33 @@ fn run_workflow_boxed<'a>(
             // A. Concurrent Model/Agent batch
             // ==============================================================
             if !model_agent_wave.is_empty() {
+                // Global execution-cap: count this wave's nodes at the serialized
+                // pre-launch point. `executions` is Arc<AtomicU32> and is only
+                // incremented here (serialized fold) and in recursive boxed calls —
+                // NEVER inside the concurrently-spawned model/agent futures.
+                let wave_count = model_agent_wave.len() as u32;
+                let new_total = executions.fetch_add(wave_count, Ordering::Relaxed) + wave_count;
+                if new_total > MAX_TOTAL_NODE_EXECUTIONS {
+                    let saved_usd = (accrued_baseline - accrued).max(0.0);
+                    emit(WfEvent::RunDone {
+                        status: "failed".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                    });
+                    return WorkflowRunResult {
+                        status: WfStatus::Failed,
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                        node_outputs: collected_outputs,
+                        error: Some(format!(
+                            "workflow exceeded the maximum total node executions \
+                             ({MAX_TOTAL_NODE_EXECUTIONS}) — likely an unbounded \
+                             loop or sub-workflow nesting"
+                        )),
+                    };
+                }
                 // HARD BUDGET GATE — checked once before launching any node in the wave.
                 //
                 // GUARANTEE: no Model/Agent node is ever LAUNCHED when accrued >= cap.
@@ -471,6 +518,31 @@ fn run_workflow_boxed<'a>(
             // B. Sequential Control nodes (Trigger, Transform, Branch, Output)
             // ==============================================================
             for node_id in &control_wave {
+                // Global execution-cap: each control node counts as 1 execution.
+                // Checked at the serialized top-of-loop point (never inside an
+                // async spawn).
+                let new_total = executions.fetch_add(1, Ordering::Relaxed) + 1;
+                if new_total > MAX_TOTAL_NODE_EXECUTIONS {
+                    let saved_usd = (accrued_baseline - accrued).max(0.0);
+                    emit(WfEvent::RunDone {
+                        status: "failed".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                    });
+                    return WorkflowRunResult {
+                        status: WfStatus::Failed,
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                        node_outputs: collected_outputs,
+                        error: Some(format!(
+                            "workflow exceeded the maximum total node executions \
+                             ({MAX_TOTAL_NODE_EXECUTIONS}) — likely an unbounded \
+                             loop or sub-workflow nesting"
+                        )),
+                    };
+                }
                 let node = match node_map.get(node_id.as_str()) {
                     Some(n) => n,
                     None => {
@@ -790,6 +862,7 @@ fn run_workflow_boxed<'a>(
                                 secrets,
                                 depth + 1,
                                 &child_ancestors,
+                                Arc::clone(&executions),
                             )
                             .await;
                             loop_cost += child.cost_usd;
@@ -970,6 +1043,7 @@ fn run_workflow_boxed<'a>(
                             secrets,
                             depth + 1,
                             &child_ancestors,
+                            Arc::clone(&executions),
                         )
                         .await;
                         // h. Propagate child failure with partial spend.
@@ -4513,6 +4587,243 @@ mod tests {
         assert!(
             validate(&make_def(50), &any_model).is_ok(),
             "max_iters=50 must be valid"
+        );
+    }
+
+    // ---- Execution-cap guard tests (W3a-2 follow-up) -------------------------
+
+    /// NESTED LOOP DoS — two nested loops each with max_iters=100 over a
+    /// zero-cost body (Trigger → Output, no model spend) would produce
+    /// 100×100×2 ≈ 20 000 node executions — well above
+    /// MAX_TOTAL_NODE_EXECUTIONS=10 000.  The cap must fire cleanly (status
+    /// Failed, "execution" in error) long before completing all iterations.
+    /// The test completing quickly IS the no-hang proof.
+    ///
+    /// NOTE: three levels of `run_workflow_boxed` async state machines stack up
+    /// during `.await` polling. In unoptimised debug builds each frame can be
+    /// several hundred KiB, so we spawn on a 32 MiB thread to avoid overflow.
+    #[test]
+    fn nested_loops_hit_execution_cap() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024) // 32 MiB for 3-level debug async nesting
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let leaf_id = Uuid::new_v4();
+                        let inner_id = Uuid::new_v4();
+                        let outer_id = Uuid::new_v4();
+
+                        // leaf_wf: Trigger → Output (zero cost)
+                        let leaf_def = make_leaf_def(leaf_id);
+
+                        // inner_wf: Trigger → Loop(body=leaf_id, max_iters=100, cond="true") → Output
+                        let inner_def = WorkflowDefinition {
+                            id: inner_id,
+                            version: 1,
+                            name: "inner-wf".into(),
+                            nodes: vec![
+                                Node {
+                                    id: "t".into(),
+                                    kind: NodeKind::Trigger,
+                                },
+                                Node {
+                                    id: "lp".into(),
+                                    kind: NodeKind::Loop {
+                                        body_workflow_id: leaf_id,
+                                        cond: "true".into(),
+                                        max_iters: 100,
+                                    },
+                                },
+                                Node {
+                                    id: "o".into(),
+                                    kind: NodeKind::Output,
+                                },
+                            ],
+                            edges: vec![
+                                Edge {
+                                    from: "t".into(),
+                                    to: "lp".into(),
+                                    map: None,
+                                },
+                                Edge {
+                                    from: "lp".into(),
+                                    to: "o".into(),
+                                    map: None,
+                                },
+                            ],
+                            inputs: serde_json::Value::Null,
+                            budget: BudgetPolicy::default(),
+                            allowed_hosts: vec![],
+                        };
+
+                        // outer parent: Trigger → Loop(body=inner_id, max_iters=100, cond="true") → Output
+                        let outer_def = WorkflowDefinition {
+                            id: outer_id,
+                            version: 1,
+                            name: "outer-wf".into(),
+                            nodes: vec![
+                                Node {
+                                    id: "t".into(),
+                                    kind: NodeKind::Trigger,
+                                },
+                                Node {
+                                    id: "lp".into(),
+                                    kind: NodeKind::Loop {
+                                        body_workflow_id: inner_id,
+                                        cond: "true".into(),
+                                        max_iters: 100,
+                                    },
+                                },
+                                Node {
+                                    id: "o".into(),
+                                    kind: NodeKind::Output,
+                                },
+                            ],
+                            edges: vec![
+                                Edge {
+                                    from: "t".into(),
+                                    to: "lp".into(),
+                                    map: None,
+                                },
+                                Edge {
+                                    from: "lp".into(),
+                                    to: "o".into(),
+                                    map: None,
+                                },
+                            ],
+                            inputs: serde_json::Value::Null,
+                            budget: BudgetPolicy::default(),
+                            allowed_hosts: vec![],
+                        };
+
+                        let mut stub = StubExecutor::new(vec![]);
+                        stub.subworkflows.insert(leaf_id, leaf_def);
+                        stub.subworkflows.insert(inner_id, inner_def);
+
+                        let result = run_workflow(
+                            &stub,
+                            &outer_def,
+                            &json!("go"),
+                            None,
+                            |_| {},
+                            None,
+                            &HashMap::new(),
+                            0,
+                            &[],
+                        )
+                        .await;
+
+                        assert_eq!(
+                            result.status,
+                            WfStatus::Failed,
+                            "nested loops must trip the execution cap and return Failed; got {:?}",
+                            result.status
+                        );
+                        let err = result
+                            .error
+                            .expect("execution cap must produce an error string");
+                        assert!(
+                            err.contains("execution")
+                                || err.contains("10000")
+                                || err.contains("10_000"),
+                            "error must mention executions/cap; got: {err}"
+                        );
+                    })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// LEGIT WORKFLOW UNDER CAP — a small linear chain (t → m1 → m2 → o) plus
+    /// a loop with max_iters=3 over a leaf body produces ≪ 10 000 node
+    /// executions and must Succeed without tripping the cap.
+    #[tokio::test]
+    async fn normal_workflow_under_cap() {
+        // Simple sequential workflow: t → m1 → m2 → o
+        let def = make_sequential_def();
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("r1"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.20,
+                    model_used: Some("haiku".into()),
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("r2"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.10,
+                    model_used: Some("haiku".into()),
+                },
+            ),
+        ]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hello"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            WfStatus::Succeeded,
+            "normal workflow must Succeed without hitting the execution cap"
+        );
+    }
+
+    /// LOOP EXECUTIONS COUNTED — a single loop with max_iters=5 over a
+    /// zero-cost leaf body (Trigger → Output, 2 nodes each) runs 5 body
+    /// iterations = 5×2 + 3 parent nodes = 13 total executions, well under
+    /// MAX_TOTAL_NODE_EXECUTIONS=10 000.  The run must Succeed, proving the
+    /// counter does not falsely trip the cap for well-behaved loops.
+    #[tokio::test]
+    async fn loop_executions_counted() {
+        let body_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+
+        // Leaf body: Trigger → Output (zero cost, 2 nodes per iteration)
+        let body_def = make_leaf_def(body_id);
+
+        // Parent: t → lp (Loop, max_iters=5, cond="true") → o
+        let parent_def = make_loop_parent(parent_id, body_id, "true", 5);
+
+        let mut stub = StubExecutor::new(vec![]);
+        stub.subworkflows.insert(body_id, body_def);
+
+        let result = run_workflow(
+            &stub,
+            &parent_def,
+            &json!("go"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+        )
+        .await;
+
+        // 5 iterations × 2 nodes/iter + 3 parent nodes = 13 total < 10 000 cap
+        assert_eq!(
+            result.status,
+            WfStatus::Succeeded,
+            "5-iter loop (13 total executions) must not trip the cap; got {:?} (err: {:?})",
+            result.status,
+            result.error
         );
     }
 }
