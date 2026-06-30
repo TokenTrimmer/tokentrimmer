@@ -5387,6 +5387,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tt-preview-wasm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+ "tt-tokenize",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "tt-provider-anthropic"
 version = "0.1.0"
 dependencies = [

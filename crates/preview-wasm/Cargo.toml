@@ -1,0 +1,27 @@
+[package]
+name = "tt-preview-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Browser (wasm) cost-preview projector — paste a prompt, get tokens + list-price cost + a down-route suggestion + projected savings, fully client-side."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+# cdylib for the wasm artifact; rlib so the pure projection is unit-testable
+# natively (`cargo test -p tt-preview-wasm`).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tt-tokenize = { workspace = true }
+
+# Build (see README): `wasm-pack build crates/preview-wasm --target web --release
+#   --out-dir ../tokentrimmer-web/public/playground --no-typescript`.
+# wasm-pack's bundled wasm-opt is older than the bulk-memory features rustc
+# emits, so skip it here and size-opt as a documented manual step:
+#   `wasm-opt -Oz --enable-bulk-memory --enable-sign-ext -o <out> <in>`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
