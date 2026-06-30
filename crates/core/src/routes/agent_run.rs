@@ -29,7 +29,10 @@ use crate::{
     passes::agentic_budget::summarize_judge::SummarizeCall,
     quality_sample::{self, GatewayLlmJudge},
     routes::{
-        agent_run_budget::{estimate_next_turn_cost, would_exceed, StopReason},
+        agent_run_budget::{
+            estimate_next_turn_cost, step_signature, would_exceed, NoProgressTracker, StopReason,
+            RUNAWAY_REPEAT_THRESHOLD,
+        },
         chat::{self, CompletionOutcome},
     },
     ApiResult, AppState,
@@ -358,6 +361,13 @@ pub(crate) async fn run_loop_core(
     // byte-behavior-identical to pre-2c-1. With a summarizer, start the metered
     // accumulator at `Some(0.0)` so each turn's tax folds in via `sum_metered`.
     let mut summarizer_tax: Option<f64> = summarizer.map(|_| 0.0);
+    // Runaway / no-progress guard: terminate a gateway-only loop that re-issues
+    // the same tool call and gets the same result turn after turn (the fastest
+    // way an autonomous loop burns money — it trips before the static cost cap).
+    // Per-`run_loop`-invocation: a client-tool pause returns `Paused` and the
+    // detector resets on resume, which is correct (a paused loop cannot burn
+    // server-side between turns).
+    let mut no_progress = NoProgressTracker::new(RUNAWAY_REPEAT_THRESHOLD);
     while turn < max_turns {
         let est_next = if max_cost_usd.is_some() {
             estimate_next_turn_cost(&model, &messages)
@@ -463,7 +473,10 @@ pub(crate) async fn run_loop_core(
 
         // Execute the gateway tool_calls of this turn inline (whether or not we
         // are about to pause — so a mixed turn's gateway work isn't wasted and,
-        // on resume, every tool_call of this assistant turn is answered).
+        // on resume, every tool_call of this assistant turn is answered). The
+        // results are collected (in call order) to fingerprint this step for the
+        // no-progress guard below.
+        let mut gateway_results: Vec<String> = Vec::new();
         for tc in &tool_calls {
             if crate::routes::gateway_tools::is_gateway_tool(&tc.function.name) {
                 let result = match crate::routes::gateway_tools::execute(
@@ -475,6 +488,7 @@ pub(crate) async fn run_loop_core(
                     // so the model can read it and react on the next turn.
                     Err(e) => format!("tool error: {e}"),
                 };
+                gateway_results.push(result.clone());
                 emit(RunEvent::ToolResult {
                     tool_call_id: tc.id.clone(),
                     content: result.clone(),
@@ -499,6 +513,26 @@ pub(crate) async fn run_loop_core(
                 summarized_upto,
                 summarizer_tax_usd: summarizer_tax,
             };
+        }
+
+        // Gateway-only continuation: fingerprint this step (tool calls + their
+        // results) and terminate if the loop has repeated the same step
+        // `RUNAWAY_REPEAT_THRESHOLD` times — it is making no progress and will
+        // only keep spending. Ends `Incomplete` (partial transcript preserved),
+        // disambiguated by `StopReason::Runaway`.
+        if no_progress.record(step_signature(&tool_calls, &gateway_results)) {
+            return LoopOutcome::Terminal(Run {
+                id,
+                status: RunStatus::Incomplete,
+                messages,
+                turns: turn + 1,
+                usage,
+                note: Some(format!(
+                    "no progress: {RUNAWAY_REPEAT_THRESHOLD} consecutive identical tool-call/result steps (runaway loop) — terminated"
+                )),
+                summarizer_tax_usd: summarizer_tax,
+                stop_reason: Some(StopReason::Runaway),
+            });
         }
         turn += 1;
     }
@@ -746,6 +780,7 @@ fn durable_record_to_run(rec: &crate::routes::agent_run_store::AgentRunRecord) -
     let stop_reason = rec.stop_reason.as_deref().and_then(|s| match s {
         "max_turns" => Some(crate::routes::agent_run_budget::StopReason::MaxTurns),
         "budget_exhausted" => Some(crate::routes::agent_run_budget::StopReason::BudgetExhausted),
+        "runaway" => Some(crate::routes::agent_run_budget::StopReason::Runaway),
         _ => None,
     });
     Run {
@@ -3475,6 +3510,79 @@ mod tests {
             Some(crate::routes::agent_run_budget::StopReason::MaxTurns)
         );
         assert_eq!(run.turns, 2);
+    }
+
+    /// A gateway-only loop that re-issues the SAME tool call (and gets the same
+    /// result) every turn is terminated as a runaway at the threshold — well
+    /// before the generous `max_turns` would stop it — preserving the partial
+    /// transcript (Incomplete, not Failed).
+    #[tokio::test]
+    async fn loop_runaway_terminates_with_stop_reason() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_toolcall("find_route_for"),
+                assistant_toolcall("find_route_for"),
+            ]),
+            cost_per_turn: 0.10,
+            baseline_per_turn: 0.0,
+        };
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8, // generous turn cap — the runaway guard must fire first
+            None,
+        )
+        .await;
+        assert_eq!(run.status, RunStatus::Incomplete);
+        assert_eq!(
+            run.stop_reason,
+            Some(crate::routes::agent_run_budget::StopReason::Runaway),
+            "3 identical tool-call/result steps must trip the runaway guard"
+        );
+        // Tripped at the 3rd identical step, not at max_turns (8).
+        assert_eq!(run.turns, 3);
+        assert!(
+            run.note
+                .as_deref()
+                .is_some_and(|n| n.contains("no progress")),
+            "note explains the runaway termination: {:?}",
+            run.note
+        );
+    }
+
+    /// A loop that alternates between two DIFFERENT tool calls never repeats a
+    /// step signature, so the runaway guard stays silent and the run completes
+    /// normally on the final (tool-call-free) answer.
+    #[tokio::test]
+    async fn loop_alternating_tools_does_not_trip_runaway() {
+        let stub = CostStub {
+            script: std::sync::Mutex::new(vec![
+                assistant_toolcall("find_route_for"),
+                assistant_toolcall("preview_cost"),
+                assistant_toolcall("find_route_for"),
+                assistant_toolcall("preview_cost"),
+                assistant_final(),
+            ]),
+            cost_per_turn: 0.01,
+            baseline_per_turn: 0.0,
+        };
+        let run = run_loop_capped(
+            &stub,
+            uuid::Uuid::nil(),
+            "m".into(),
+            vec![],
+            vec![],
+            8,
+            None,
+        )
+        .await;
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.stop_reason, None);
+        assert_eq!(run.turns, 5);
     }
 
     #[test]

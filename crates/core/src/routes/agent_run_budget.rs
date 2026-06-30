@@ -3,7 +3,7 @@
 //! Kept out of the oversized `agent_run.rs` (ADR-011). All functions are pure
 //! and unit-tested here; the loop in `agent_run.rs` calls them.
 //!
-use tt_shared::messages::{Message, MessageContent};
+use tt_shared::messages::{Message, MessageContent, ToolCall};
 
 /// A non-success terminal cause for a run, recorded on `Run.stop_reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -13,6 +13,75 @@ pub enum StopReason {
     MaxTurns,
     /// The run's accumulated served cost reached `max_cost_usd`.
     BudgetExhausted,
+    /// The loop made no progress — `RUNAWAY_REPEAT_THRESHOLD` consecutive
+    /// byte-identical (tool-call + tool-result) steps. The model saw the same
+    /// result and re-issued the same call with no new information; left alone it
+    /// would burn the budget turn after turn (the *fastest* way an agent loop
+    /// leaks money — it trips well before a static cost cap).
+    Runaway,
+}
+
+/// Consecutive byte-identical (tool-call + tool-result) steps that mark a
+/// gateway-only agent loop as a runaway. Three tolerates one accidental repeat:
+/// the 3rd identical step in a row means the model saw the same result twice and
+/// still emitted the same call, so it has no new information to act on. The run
+/// ends `Incomplete` with [`StopReason::Runaway`]; the partial transcript is
+/// preserved (never `Failed`).
+pub(crate) const RUNAWAY_REPEAT_THRESHOLD: u32 = 3;
+
+/// A deterministic fingerprint of one loop step's ACTION + OUTCOME: the
+/// assistant's tool calls (name + arguments, in order) plus the gateway tool
+/// results they produced (in order). The per-call `id` and the assistant's prose
+/// content are excluded on purpose — only whether the agent *did the same thing
+/// and got the same answer* matters for no-progress detection. A loop that polls
+/// a genuinely changing result keeps producing fresh signatures and is never
+/// flagged.
+pub(crate) fn step_signature(tool_calls: &[ToolCall], tool_results: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for tc in tool_calls {
+        tc.function.name.hash(&mut h);
+        tc.function.arguments.hash(&mut h);
+    }
+    // Domain separator so a call's bytes can't alias a result's across the join.
+    0xff_u8.hash(&mut h);
+    for r in tool_results {
+        r.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Tracks consecutive identical step signatures across loop turns. [`record`]
+/// returns `true` once `threshold` identical steps have been seen in a row.
+///
+/// [`record`]: NoProgressTracker::record
+pub(crate) struct NoProgressTracker {
+    last: Option<u64>,
+    streak: u32,
+    threshold: u32,
+}
+
+impl NoProgressTracker {
+    pub(crate) fn new(threshold: u32) -> Self {
+        Self {
+            last: None,
+            streak: 0,
+            threshold,
+        }
+    }
+
+    /// Feed the current step's signature; returns `true` iff this is the
+    /// `threshold`-th identical step in an unbroken run (a runaway). Any
+    /// different signature resets the streak to 1.
+    pub(crate) fn record(&mut self, sig: u64) -> bool {
+        if self.last == Some(sig) {
+            self.streak += 1;
+        } else {
+            self.last = Some(sig);
+            self.streak = 1;
+        }
+        self.streak >= self.threshold
+    }
 }
 
 /// True iff the accrued cost has reached the cap (no estimate — pure threshold check).
@@ -108,6 +177,52 @@ mod tests {
     fn estimate_unknown_model_is_none() {
         // The agent-loop test model "m" is not in any pricing catalog.
         assert_eq!(estimate_next_turn_cost("m", &[]), None);
+    }
+
+    fn tc(name: &str, args: &str, id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            r#type: "function".into(),
+            function: tt_shared::messages::ToolCallFunction {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn step_signature_ignores_call_id_and_keys_on_action_and_outcome() {
+        let a = step_signature(&[tc("find_route_for", "{\"q\":1}", "c1")], &["ok".into()]);
+        // Same name+args+result, DIFFERENT call id → same signature.
+        let b = step_signature(&[tc("find_route_for", "{\"q\":1}", "c2")], &["ok".into()]);
+        assert_eq!(a, b, "call id must not affect the signature");
+        // Different arguments → different signature.
+        let c = step_signature(&[tc("find_route_for", "{\"q\":2}", "c1")], &["ok".into()]);
+        assert_ne!(a, c, "different args must change the signature");
+        // Same call, DIFFERENT result (e.g. a poll that advanced) → different.
+        let d = step_signature(&[tc("find_route_for", "{\"q\":1}", "c1")], &["done".into()]);
+        assert_ne!(a, d, "a changed result must change the signature");
+    }
+
+    #[test]
+    fn no_progress_trips_only_after_threshold_identical_steps() {
+        let mut t = NoProgressTracker::new(RUNAWAY_REPEAT_THRESHOLD); // 3
+        assert!(!t.record(1)); // streak 1
+        assert!(!t.record(1)); // streak 2
+        assert!(t.record(1)); //  streak 3 → runaway
+    }
+
+    #[test]
+    fn no_progress_resets_on_any_change() {
+        let mut t = NoProgressTracker::new(3);
+        assert!(!t.record(1));
+        assert!(!t.record(1)); // streak 2
+        assert!(!t.record(2)); // different → reset to 1
+        assert!(!t.record(2)); // streak 2
+        assert!(!t.record(1)); // different → reset to 1
+                               // An alternating A,B,A,B,… loop never trips.
+        assert!(!t.record(2));
+        assert!(!t.record(1));
     }
 
     #[test]
