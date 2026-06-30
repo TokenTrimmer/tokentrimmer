@@ -22,6 +22,7 @@ pub mod routes;
 pub mod server;
 pub(crate) mod shaping;
 pub mod single_flight;
+pub mod spend;
 pub mod state;
 pub mod tier_resolver;
 pub mod workflow;

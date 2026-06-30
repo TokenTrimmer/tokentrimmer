@@ -732,7 +732,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             use tt_mcp::{
                 auth,
-                cost::{CostControlBackend, UnconfiguredBackend},
+                cost::{CostControlBackend, HttpCostBackend},
                 resources::{cost_ledger, inspect_baseline},
                 tools::{
                     cost_control, find_route_for, inspect_diff, lookup_semantic_cache, preview_cost,
@@ -807,15 +807,18 @@ async fn main() -> anyhow::Result<()> {
                         match authenticator.context().await {
                             Ok(ctx) => {
                                 let org_id = ctx.org_id;
-                                // PUBLIC-repo MVP: no per-org-key cost endpoint
-                                // exists in the hosted API yet, so the cost tools
-                                // run against the documented `UnconfiguredBackend`
-                                // seam (clearly-marked responses, no fabricated
-                                // numbers). A hosted deployment swaps in a real
-                                // `CostControlBackend` here without changing the
-                                // tool surface.
+                                // Read tools (get_spend_today / check_budget_remaining)
+                                // hit the gateway's tenant-authed `GET /v1/spend`
+                                // with the bound key (the gateway re-derives the
+                                // org). The WRITE tool (set_cost_limit) reports
+                                // `applied: false` until the cloud-owned cap-write
+                                // endpoint ships (a follow-up).
                                 let backend: std::sync::Arc<dyn CostControlBackend> =
-                                    std::sync::Arc::new(UnconfiguredBackend);
+                                    std::sync::Arc::new(HttpCostBackend {
+                                        gateway_base: tt_api_base.clone(),
+                                        api_key: api_key.clone(),
+                                        http: reqwest::Client::new(),
+                                    });
                                 server
                                     .tools
                                     .register(Box::new(cost_control::GetSpendTodayTool {
@@ -835,7 +838,7 @@ async fn main() -> anyhow::Result<()> {
                                         org_id,
                                     }));
                                 tracing::info!(
-                                    "MCP cost-control tools registered (org-scoped); backend: unconfigured seam"
+                                    "MCP cost-control tools registered (org-scoped); read backend: gateway GET /v1/spend"
                                 );
                                 if allow_write {
                                     // The CLI has a single configured base; both
@@ -1942,6 +1945,14 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
             tt_core::route_savings::PostgresRouteSavingsSource::new(pool.clone()),
         ));
         tracing::info!("route savings: Postgres-backed netting (GET /v1/routes/:id/savings)");
+
+        // Tenant-facing spend read-side (GET /v1/spend) over request_logs +
+        // org_budget_caps — read-only, no request-path behavior change. Without a
+        // DB pool the endpoint keeps answering 503 (spend reporting not configured).
+        state = state.with_spend_source(Arc::new(tt_core::spend::PostgresSpendSource::new(
+            pool.clone(),
+        )));
+        tracing::info!("spend reporting: Postgres-backed (GET /v1/spend)");
 
         // Opt-in quality auto-pause evaluator. Doubly gated: the judge must
         // be enabled (TT_JUDGE_ENABLED → a persistent sink was wired above)

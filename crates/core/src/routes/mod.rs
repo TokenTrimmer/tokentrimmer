@@ -17,6 +17,7 @@ pub mod preview;
 pub mod ready;
 pub mod responses;
 pub mod routes_api;
+pub mod spend_api;
 pub mod sse;
 pub mod workflows;
 
