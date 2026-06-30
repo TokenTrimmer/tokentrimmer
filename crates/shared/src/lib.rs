@@ -34,6 +34,7 @@ pub use model_catalog::{model_catalog, ModelCatalog};
 pub use pricing::{CacheWriteTier, ModelInfo, ModelPricing};
 pub use provider::Provider;
 pub use url_guard::{
-    filter_extra_headers, find_denied_header, validate_provider_url, UrlGuardError,
+    filter_extra_headers, filter_outbound_headers, find_denied_header, find_outbound_denied_header,
+    validate_provider_url, UrlGuardError,
 };
 pub use usage::Usage;

@@ -216,11 +216,11 @@ pub fn validate(
                 errors.push(format!("node \"{node_id}\": Http url rejected: {e}"));
             }
 
-            // ---- d. Denied headers ----
-            if let Some(denied) = tt_shared::url_guard::find_denied_header(headers) {
+            // ---- d. Denied headers (outbound policy: host + hop-by-hop only) ----
+            if let Some(denied) = tt_shared::url_guard::find_outbound_denied_header(headers) {
                 errors.push(format!(
                     "node \"{node_id}\": Http header \"{denied}\" is not allowed \
-                     (denied headers list)"
+                     (outbound denied headers list)"
                 ));
             }
         }
@@ -1125,20 +1125,58 @@ mod tests {
         );
     }
 
-    /// An Http node with a denied header (e.g. `authorization`) must be rejected.
+    /// An Http node with a `host` header (outbound-denied) must be rejected.
     #[test]
     fn http_rejects_denied_header() {
         let def = http_def(
             "https://api.example.com/path",
             vec!["api.example.com".to_string()],
-            vec![("authorization".to_string(), "Bearer token".to_string())],
+            vec![("host".to_string(), "evil.com".to_string())],
             None,
         );
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
         assert!(
-            combined.contains("authorization") || combined.contains("denied header"),
+            combined.contains("host") || combined.contains("denied header"),
             "expected denied-header error; got: {combined}"
+        );
+    }
+
+    /// An Http node with an `authorization` header must now PASS validation
+    /// (outbound policy allows auth headers so HTTP nodes can call external APIs).
+    #[test]
+    fn http_node_auth_header_passes_validation() {
+        let def = http_def(
+            "https://api.example.com/path",
+            vec!["api.example.com".to_string()],
+            vec![
+                ("authorization".to_string(), "Bearer token".to_string()),
+                ("x-api-key".to_string(), "sk-test".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+            None,
+        );
+        assert!(
+            validate(&def, &any_model).is_ok(),
+            "authorization/x-api-key/content-type must pass outbound validation"
+        );
+    }
+
+    /// An Http node with a `host` header must still fail validation (even after
+    /// outbound policy allows auth headers).
+    #[test]
+    fn http_node_host_header_fails_validation() {
+        let def = http_def(
+            "https://api.example.com/path",
+            vec!["api.example.com".to_string()],
+            vec![("host".to_string(), "evil.com".to_string())],
+            None,
+        );
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("host") || combined.contains("denied"),
+            "expected denied-header error for host; got: {combined}"
         );
     }
 
