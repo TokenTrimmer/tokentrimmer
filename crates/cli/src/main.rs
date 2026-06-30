@@ -167,6 +167,15 @@ enum Command {
     Logout,
     /// Show the resolved API key (masked), its source, and the gateway base URL.
     Whoami,
+    /// Emit a ready-to-paste code snippet using your stored key + gateway base URL.
+    Connect {
+        /// Output language / format.
+        #[arg(long, value_enum, default_value = "curl")]
+        lang: tt_cli::account::ConnectLang,
+        /// Print the full API key in the snippet (default: masked).
+        #[arg(long)]
+        reveal: bool,
+    },
     /// Interactive chat through the gateway (streams responses + shows savings).
     Chat {
         /// Model to request (the gateway may route it). Default: gpt-4o-mini.
@@ -949,6 +958,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Whoami => {
             tt_cli::account::whoami()?;
+        }
+        Command::Connect { lang, reveal } => {
+            if let Err(e) = tt_cli::account::connect(lang, reveal) {
+                tt_cli::ui::error(&format!("{e:#}"));
+                std::process::exit(1);
+            }
         }
         Command::Chat {
             model,

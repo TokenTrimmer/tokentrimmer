@@ -1,10 +1,13 @@
-//! `tt login` / `tt logout` / `tt whoami` command bodies. The credential store
-//! and resolver live in `crate::context`.
+//! `tt login` / `tt logout` / `tt whoami` / `tt connect` command bodies. The
+//! credential store and resolver live in `crate::context`.
 
 use anyhow::Context as _;
 
 use crate::context::{self, store};
 use crate::ui;
+
+pub mod connect;
+pub use connect::{connect, ConnectLang};
 
 /// The dashboard page where a user mints an API key (the cloud dashboard; the
 /// public gateway only verifies keys). One-line change if the route differs.
