@@ -37,6 +37,7 @@ pub(crate) fn stop_reason_str(r: StopReason) -> &'static str {
     match r {
         StopReason::MaxTurns => "max_turns",
         StopReason::BudgetExhausted => "budget_exhausted",
+        StopReason::Runaway => "runaway",
     }
 }
 
@@ -424,6 +425,7 @@ mod tests {
         let cases = [
             (StopReason::MaxTurns, "max_turns"),
             (StopReason::BudgetExhausted, "budget_exhausted"),
+            (StopReason::Runaway, "runaway"),
         ];
         for (reason, expected) in cases {
             let r = AgentRunRecord::from_terminal(
