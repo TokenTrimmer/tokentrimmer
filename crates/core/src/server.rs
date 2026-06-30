@@ -147,6 +147,10 @@ pub fn build_router_with_retrieval(
         .route("/v1/routes/:id/pause", post(routes::routes_api::pause))
         .route("/v1/routes/:id/resume", post(routes::routes_api::resume))
         .route("/v1/routes/:id/savings", get(routes::routes_api::savings))
+        // Tenant-facing spend summary (spend-today + MTD + budget-remaining) —
+        // org derived from the authenticated tt_live_ key. Backs the MCP
+        // cost-control tools.
+        .route("/v1/spend", get(routes::spend_api::get_spend))
         // Batch Lane (slice 2): OpenAI-compatible submit/status + file proxy.
         // Non-streaming, so the short timeout tier. The slice-3 worker owns
         // long-running polling; these handlers only proxy + persist.

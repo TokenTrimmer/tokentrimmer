@@ -286,6 +286,11 @@ pub struct AppState {
     /// [`AppState::with_route_savings`] wires a source (a
     /// [`crate::route_savings::PostgresRouteSavingsSource`] in production).
     pub route_savings: Option<Arc<dyn crate::route_savings::RouteSavingsSource>>,
+    /// Read-side source for `GET /v1/spend` (tenant-facing spend-today + MTD +
+    /// budget-remaining; backs the MCP cost-control tools). `None` (default) →
+    /// the endpoint answers 503 until [`AppState::with_spend_source`] wires a
+    /// source (a [`crate::spend::PostgresSpendSource`] in production).
+    pub spend_source: Option<Arc<dyn crate::spend::SpendSource>>,
     /// Optional Postgres pool handle used by the `GET /ready` readiness probe
     /// to issue a `SELECT 1` liveness check against the database.
     ///
@@ -375,6 +380,7 @@ impl AppState {
             shadow_timeout: DEFAULT_SHADOW_TIMEOUT,
             l2_hit_judge_limiter,
             route_savings: None,
+            spend_source: None,
             db_pool: None,
             telemetry_tracker: None,
             summary_gate: Arc::new(crate::passes::agentic_budget::summarize_judge::NeverCommitGate),
@@ -762,6 +768,18 @@ impl AppState {
         src: Arc<dyn crate::route_savings::RouteSavingsSource>,
     ) -> Self {
         self.route_savings = Some(src);
+        self
+    }
+
+    /// Builder-style attach: enable the tenant-facing spend read-side behind
+    /// `GET /v1/spend` (spend-today + MTD + budget-remaining; backs the MCP
+    /// cost-control tools). Production wires a
+    /// [`crate::spend::PostgresSpendSource`]; tests seed a
+    /// [`crate::spend::InMemorySpendSource`]. Until called, the endpoint answers
+    /// 503 (spend reporting not configured) — wiring this changes no
+    /// request-path behavior.
+    pub fn with_spend_source(mut self, src: Arc<dyn crate::spend::SpendSource>) -> Self {
+        self.spend_source = Some(src);
         self
     }
 

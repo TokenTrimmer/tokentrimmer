@@ -25,7 +25,8 @@ const DEFAULT_SAVINGS_WINDOW_HOURS: u32 = 720;
 const MAX_SAVINGS_WINDOW_HOURS: u32 = 2160;
 
 /// Resolve the caller's real org, or 401. Dogfood/absent contexts are rejected.
-fn require_org(ctx: Option<Extension<ApiKeyContext>>) -> Result<Uuid, ApiError> {
+/// Shared with other tenant-key-authed customer endpoints (e.g. `/v1/spend`).
+pub(crate) fn require_org(ctx: Option<Extension<ApiKeyContext>>) -> Result<Uuid, ApiError> {
     match ctx {
         Some(Extension(c)) if c.org_id != DOGFOOD_ORG_ID => Ok(c.org_id),
         _ => Err(ApiError::Unauthorized),
