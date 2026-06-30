@@ -20,3 +20,4 @@ pub mod retrieval;
 pub mod route;
 pub mod telemetry_window;
 pub mod ui;
+pub mod workflow;

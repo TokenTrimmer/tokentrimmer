@@ -370,6 +370,39 @@ enum Command {
         #[arg(long, global = true)]
         tt_api_base: Option<String>,
     },
+    /// Workflow tools: offline validate, cost-estimate, and cost-diff.
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkflowAction {
+    /// Validate a WorkflowDefinition JSON offline, project its cost, and optionally
+    /// diff against a prior estimate baseline.
+    ///
+    /// All structurally-valid pinned models are accepted offline (no registry call).
+    /// `ModelSelection::Auto` is always rejected — pin a model or a route_ref instead.
+    Check {
+        /// Path to the WorkflowDefinition JSON file to check.
+        file: PathBuf,
+        /// JSON string substituted for `{{input}}` in node prompts during estimation.
+        #[arg(long)]
+        inputs: Option<String>,
+        /// Path to a prior WorkflowEstimate JSON (written by a previous `--output` run).
+        /// When set, prints a per-node cost diff and a net delta.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Exit non-zero when the current projected cost exceeds the baseline.
+        /// Requires `--baseline`.
+        #[arg(long, requires = "baseline")]
+        fail_on_cost_increase: bool,
+        /// Write the WorkflowEstimate JSON to this path (a baseline dump for
+        /// future `--baseline` comparisons).
+        #[arg(long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1217,6 +1250,17 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
         }
+        Command::Workflow { action } => match action {
+            WorkflowAction::Check {
+                file,
+                inputs,
+                baseline,
+                fail_on_cost_increase,
+                output,
+            } => {
+                tt_cli::workflow::check(file, inputs, baseline, fail_on_cost_increase, output)?;
+            }
+        },
     }
     Ok(())
 }
