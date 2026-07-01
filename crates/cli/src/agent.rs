@@ -18,8 +18,10 @@ use crate::context::ResolvedContext;
 use crate::ui;
 
 /// The gateway's read-only agent tools (executed server-side). Mirrors
-/// `crates/core/src/routes/gateway_tools.rs::GATEWAY_TOOLS`.
-fn gateway_tool_defs() -> Vec<tt_client::Tool> {
+/// `crates/core/src/routes/gateway_tools.rs::GATEWAY_TOOLS`. Shared with the
+/// `--server-loop` paths of `tt chat`/`tt advise`, which advertise the same four
+/// tools so the gateway runs them server-side (no client `ToolExecutor` work).
+pub(crate) fn gateway_tool_defs() -> Vec<tt_client::Tool> {
     vec![
         tt_client::tool(
             "find_route_for",
@@ -65,8 +67,9 @@ fn gateway_tool_defs() -> Vec<tt_client::Tool> {
 /// Declines any CLIENT (non-gateway) tool call. The gateway runs its own tools
 /// server-side, so with only `--tools` advertised this is never invoked; it
 /// exists to satisfy the driver's `ToolExecutor` and to fail gracefully (rather
-/// than hang) if a model somehow requests a tool the CLI can't run.
-struct DeclineExecutor;
+/// than hang) if a model somehow requests a tool the CLI can't run. Shared with
+/// the `--server-loop` paths of `tt chat`/`tt advise`.
+pub(crate) struct DeclineExecutor;
 
 #[tt_client::async_trait]
 impl tt_client::ToolExecutor for DeclineExecutor {
@@ -179,7 +182,8 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
 
 /// Print the run's turns, final answer, and aggregate cost. Transcript/cost
 /// detail goes to stderr (status); the final answer to stdout (the result).
-fn print_outcome(outcome: &tt_client::AgentOutcome) {
+/// Shared with `tt advise --server-loop`.
+pub(crate) fn print_outcome(outcome: &tt_client::AgentOutcome) {
     let run = &outcome.run;
     ui::note(&format!(
         "status: {:?} · server turns: {} · client resumes: {}",

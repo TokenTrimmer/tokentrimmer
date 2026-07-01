@@ -70,6 +70,30 @@ pub fn format_turn_footer(
     ui::muted().apply_to(s).to_string()
 }
 
+/// Muted per-turn footer for a `--server-loop` turn. Deliberately carries NO
+/// `saved …%` segment: the agent-run endpoint reports only gateway-attributed
+/// served cost (no baseline), so the footer states the cost and the number of
+/// server-side turns rather than a savings claim it can't ground.
+#[must_use]
+pub fn format_agent_footer(
+    model: &str,
+    in_tok: u64,
+    out_tok: u64,
+    cost_usd: f64,
+    server_turns: u32,
+) -> String {
+    ui::muted()
+        .apply_to(format!(
+            "{} {} · {} tok · ${:.4} · server loop ({} turn(s), gateway-attributed)",
+            ui::BULLET,
+            model,
+            in_tok + out_tok,
+            cost_usd,
+            server_turns
+        ))
+        .to_string()
+}
+
 /// In-memory conversation state (also the on-disk session format).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
@@ -171,6 +195,16 @@ impl Ledger {
         self.cost_usd += cost_usd;
         self.compaction_spend_usd += cost_usd;
         self.compaction_calls += 1;
+    }
+    /// Book one server-side agent-loop turn (`--server-loop`). HONESTY GUARD:
+    /// `POST /v1/agent/runs` returns gateway-attributed served cost but NO
+    /// baseline/saved figure, so this raises `turns` + `cost_usd` only and never
+    /// touches `saved_usd`/`baseline_usd` — the server loop must not fabricate a
+    /// savings % it cannot attribute. (The gateway's down-routing does save; we
+    /// simply have no attributed baseline to divide against, so we under-claim.)
+    pub fn add_agent_run(&mut self, cost_usd: f64) {
+        self.turns += 1;
+        self.cost_usd += cost_usd;
     }
     #[must_use]
     pub fn summary(&self) -> String {
@@ -316,7 +350,70 @@ async fn do_turn(client: &tt_client::Client, conv: &mut Conversation, ledger: &m
     }
 }
 
-/// Route a turn to the tool-calling loop (tools on) or the streamed path (off).
+/// Drive one turn through the server-side agent loop (`POST /v1/agent/runs`)
+/// instead of the plain chat path. The gateway owns the model->tool->model loop
+/// (mid-loop down-routing, judge-gated summarize, substep cache); the client
+/// posts the whole conversation, gets back a terminal run, and carries only the
+/// final assistant text into history — matching [`do_turn`]'s contract so the
+/// caller's snapshot/rollback on `false` stays correct.
+///
+/// With `tools_enabled`, the four read-only gateway tools are advertised so the
+/// loop can call them SERVER-SIDE; the client never runs a tool (hence the
+/// [`crate::agent::DeclineExecutor`]). Cost is GATEWAY-ATTRIBUTED (the run
+/// body's `usage.cost_usd`) — the endpoint returns no baseline/saved, so this
+/// books cost only via [`Ledger::add_agent_run`] and never claims a savings %.
+async fn agent_turn(
+    client: &tt_client::Client,
+    conv: &mut Conversation,
+    ledger: &mut Ledger,
+    tools_enabled: bool,
+) -> bool {
+    let mut builder = client
+        .agent()
+        .model(&conv.model)
+        // A human is waiting in the REPL: declare interactivity so the gateway
+        // never marks this run batch-eligible (mirrors the plain chat path).
+        .interactive()
+        .messages(conv.wire_messages());
+    if tools_enabled {
+        builder = builder.tools(crate::agent::gateway_tool_defs());
+    }
+    let outcome = match builder.run(&crate::agent::DeclineExecutor).await {
+        Ok(o) => o,
+        Err(e) => {
+            ui::error(&format!("agent run failed: {e}"));
+            return false;
+        }
+    };
+    let run = &outcome.run;
+    let Some(answer) = run.text().map(str::to_string) else {
+        ui::warn("the run produced no final text answer");
+        return false;
+    };
+    println!("{answer}");
+    conv.push_assistant(answer);
+    let u = &run.usage;
+    ledger.add_agent_run(u.cost_usd);
+    println!(
+        "{}",
+        format_agent_footer(
+            &conv.model,
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.cost_usd,
+            run.turns
+        )
+    );
+    if let Some(tax) = run.summarizer_tax_usd {
+        if tax > 0.0 {
+            ui::note(&format!("summarizer measurement tax: ${tax:.6}"));
+        }
+    }
+    true
+}
+
+/// Route a turn to the right driver: the server-side agent loop (`--server-loop`),
+/// the client-side tool-calling loop (tools on), or the streamed path (off).
 async fn dispatch_turn(
     client: &tt_client::Client,
     conv: &mut Conversation,
@@ -324,8 +421,11 @@ async fn dispatch_turn(
     reg: &tt_mcp::tools::Registry,
     tools_enabled: bool,
     tool_trim: bool,
+    server_loop: bool,
 ) -> bool {
-    if tools_enabled {
+    if server_loop {
+        agent_turn(client, conv, ledger, tools_enabled).await
+    } else if tools_enabled {
         tools::run_tool_turn(client, conv, reg, ledger, tool_trim).await
     } else {
         do_turn(client, conv, ledger).await
@@ -395,6 +495,10 @@ pub struct RunOpts {
     pub compact_every: u32,
     /// Model for the compaction summary call.
     pub compact_model: Option<String>,
+    /// Drive each turn through the server-side agent loop (`POST /v1/agent/runs`)
+    /// so TT's own levers run — mechanical mid-loop down-routing, judge-gated
+    /// summarize, budget cap. OFF by default (opt-in; no behavior change).
+    pub server_loop: bool,
     /// `--tt-api-key` flag.
     pub flag_key: Option<String>,
     /// `--tt-api-base` flag.
@@ -413,6 +517,7 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
         compact,
         compact_every,
         compact_model,
+        server_loop,
         flag_key,
         flag_base,
     } = opts;
@@ -452,8 +557,9 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
         ui::warn(&msg);
     }
     ui::heading(&format!(
-        "tt chat · {} via TokenTrimmer{}   (/help)",
+        "tt chat · {} via TokenTrimmer{}{}   (/help)",
         conv.model,
+        if server_loop { " · server loop" } else { "" },
         if tools_enabled { " · tools on" } else { "" }
     ));
 
@@ -476,6 +582,7 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                             &registry,
                             tools_enabled,
                             tool_trim,
+                            server_loop,
                         )
                         .await
                         {
@@ -604,6 +711,7 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                                 &registry,
                                 tools_enabled,
                                 tool_trim,
+                                server_loop,
                             )
                             .await
                             {
@@ -632,6 +740,7 @@ pub async fn run(opts: RunOpts) -> anyhow::Result<()> {
                                 &registry,
                                 tools_enabled,
                                 tool_trim,
+                                server_loop,
                             )
                             .await
                             {
@@ -725,6 +834,51 @@ mod tests {
         assert_eq!(u.output_tokens, 2);
     }
 
+    #[tokio::test]
+    async fn agent_turn_drives_server_loop_and_books_gateway_cost() {
+        let server = MockServer::start_async().await;
+        // The server-side loop endpoint: a terminal completed run whose usage
+        // aggregates the whole loop's served cost (no per-turn headers here).
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/agent/runs")
+                // A human is waiting in the REPL — declare interactivity so the
+                // gateway never marks this run batch-eligible.
+                .header("x-tokentrimmer-interactive", "1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "r1", "status": "completed", "turns": 2,
+                    "usage": { "prompt_tokens": 15, "completion_tokens": 6, "cost_usd": 0.0004 },
+                    "messages": [
+                        { "role": "user", "content": "hi" },
+                        { "role": "assistant", "content": "Hello from the loop." }
+                    ]
+                }));
+        });
+
+        let client = tt_client::Client::new(server.base_url(), "k");
+        let mut conv = Conversation::new("gpt-4o-mini".into(), None);
+        conv.push_user("hi".into());
+        let mut ledger = Ledger::default();
+
+        // tools off → no gateway tools advertised, but the loop still runs.
+        let ok = agent_turn(&client, &mut conv, &mut ledger, false).await;
+        assert!(ok);
+        m.assert();
+        // Only the final assistant text is carried into history (matches do_turn).
+        assert!(
+            matches!(conv.messages.last(), Some(Message::Assistant { content: Some(MessageContent::Text(t)), .. }) if t == "Hello from the loop."),
+            "last = {:?}",
+            conv.messages.last()
+        );
+        // Gateway-attributed cost is booked; saved/baseline stay zero (honesty).
+        assert_eq!(ledger.turns, 1);
+        assert!((ledger.cost_usd - 0.0004).abs() < 1e-9);
+        assert_eq!(ledger.saved_usd, 0.0);
+        assert_eq!(ledger.baseline_usd, 0.0);
+    }
+
     #[test]
     fn footer_formats_with_savings() {
         console::set_colors_enabled(false);
@@ -732,6 +886,32 @@ mod tests {
         assert_eq!(s, "· gpt-4o-mini · 30 tok · $0.0001 · saved 75%");
         let s2 = format_turn_footer("gpt-4o", 5, 5, 0.001, 0.0, 0.0);
         assert_eq!(s2, "· gpt-4o · 10 tok · $0.0010");
+    }
+
+    #[test]
+    fn agent_footer_states_cost_without_a_savings_claim() {
+        console::set_colors_enabled(false);
+        // The server-loop footer reports gateway-attributed cost + server turns
+        // and NEVER a `saved …%` segment (the agent endpoint has no baseline).
+        let s = format_agent_footer("gpt-4o-mini", 15, 6, 0.0004, 2);
+        assert_eq!(
+            s,
+            "· gpt-4o-mini · 21 tok · $0.0004 · server loop (2 turn(s), gateway-attributed)"
+        );
+        assert!(!s.contains("saved"), "{s}");
+    }
+
+    #[test]
+    fn add_agent_run_books_cost_only_never_savings() {
+        // HONESTY GUARD: an agent-loop turn raises turns + cost, but must leave
+        // saved/baseline at zero (no attributed baseline to claim a % against).
+        let mut l = Ledger::default();
+        l.add_agent_run(0.0004);
+        l.add_agent_run(0.0006);
+        assert_eq!(l.turns, 2);
+        assert!((l.cost_usd - 0.001).abs() < 1e-9);
+        assert_eq!(l.saved_usd, 0.0);
+        assert_eq!(l.baseline_usd, 0.0);
     }
 
     #[test]
