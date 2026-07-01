@@ -182,9 +182,85 @@ If you build `ChatOpenAI` yourself, set `include_response_headers=True` (and
 `response_metadata["headers"]`. Without it the callback degrades gracefully:
 nothing is recorded and the chain runs normally.
 
-> v1 covers **LangChain (Python)**. The semconv keys and
-> `TokenTrimmerMeta.from_headers` are framework-agnostic; LiteLLM, the Vercel AI
-> SDK, and LangGraph adapters are deferred follow-ups that reuse them.
+### LangGraph
+
+A LangGraph graph runs on LangChain's callback manager, so the **same**
+`TokenTrimmerCostCallback` works unchanged — no LangGraph-specific class. Build
+the node LLM with `make_gateway_chat_openai(...)` (so it emits the headers) and
+pass the callback through `config={"callbacks": [cb]}` on `invoke` / `stream`;
+LangGraph propagates it into every LLM call inside the graph's nodes.
+
+```python
+from langgraph.graph import StateGraph, START, END
+from tokentrimmer.integrations.langchain import (
+    TokenTrimmerCostCallback,
+    make_gateway_chat_openai,
+)
+
+llm = make_gateway_chat_openai(model="claude-haiku-4-5", api_key="tt_live_...")
+
+def call_model(state):
+    return {"messages": state["messages"] + [llm.invoke(state["messages"])]}
+
+graph = StateGraph(dict)
+graph.add_node("model", call_model)
+graph.add_edge(START, "model")
+graph.add_edge("model", END)
+app = graph.compile()
+
+cb = TokenTrimmerCostCallback(max_cost_usd=0.50)
+app.invoke({"messages": [("user", "Hello")]}, config={"callbacks": [cb]})
+
+print(f"run cost  ${cb.total_cost_usd:.4f}")
+print(f"run saved ${cb.total_saved_usd:.4f}")
+```
+
+Install with `pip install "tokentrimmer[langchain,langgraph,otel]"`.
+
+## LiteLLM cost logger + OpenTelemetry spans
+
+Using [LiteLLM](https://github.com/BerriAI/litellm) instead? It has its own
+callback system, so there's a dedicated `TokenTrimmerLiteLLMLogger` (a LiteLLM
+`CustomLogger`) that surfaces the `x-tokentrimmer-*` headers into the same
+`gen_ai.*` / `tokentrimmer.*` span attributes and per-run totals.
+
+```bash
+pip install "tokentrimmer[litellm,otel]"
+```
+
+```python
+import litellm
+from tokentrimmer.integrations.litellm import TokenTrimmerLiteLLMLogger
+
+# install() sets litellm.return_response_headers=True (required for LiteLLM to
+# expose the gateway headers) and registers the logger on litellm.callbacks.
+logger = TokenTrimmerLiteLLMLogger.install(max_cost_usd=0.50)
+
+resp = litellm.completion(
+    model="openai/claude-haiku-4-5",
+    api_base="https://api.tokentrimmer.com/v1",
+    api_key="tt_live_...",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+logger.raise_if_exceeded()          # enforce the budget at your checkpoint
+
+print(f"run cost  ${logger.total_cost_usd:.4f}")
+print(f"run saved ${logger.total_saved_usd:.4f}")
+```
+
+LiteLLM only exposes the raw gateway response headers when
+`litellm.return_response_headers = True` — `install()` sets it for you (the
+counterpart to `include_response_headers=True` on the LangChain side). The logger
+reads them from `response._response_headers` / `response._hidden_params
+["additional_headers"]` on every success, so a response without them (self-hosted
+gateway, no pricing) simply records nothing.
+
+**Budget stop.** LiteLLM's callbacks are post-hoc *logging* events — LiteLLM
+swallows exceptions raised inside them — so, unlike the LangChain callback's
+inline `raise_error` stop, the budget is enforced at a **checkpoint**: crossing
+`max_cost_usd` flips `logger.budget_exceeded` and `logger.raise_if_exceeded()`
+raises `BudgetExceeded` (the same class both integrations share). Call it right
+after each `completion` to cap a multi-call loop.
 
 ## Batch (50% cheaper, async)
 
