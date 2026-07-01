@@ -10,9 +10,10 @@
 //! ## Fan-out bound
 //!
 //! When a **chain** of more than one candidate is provided the per-candidate
-//! retry budget is capped to [`CHAINED_MAX_ATTEMPTS`] (2). A single-candidate
-//! route keeps the full policy budget. This bounds the worst-case upstream call
-//! count to `candidates.len() * CHAINED_MAX_ATTEMPTS`. With the default policy
+//! retry budget is capped to [`DEFAULT_CHAINED_MAX_ATTEMPTS`] (2, overridable
+//! via `TT_FAILOVER_CHAINED_MAX_ATTEMPTS`). A single-candidate route keeps the
+//! full policy budget. This bounds the worst-case upstream call count to
+//! `candidates.len() * chained_max_attempts`. With the default policy
 //! (max_attempts=3) and a 3-candidate chain that is at most **6** calls instead
 //! of the un-bounded **9**.
 //!
@@ -41,14 +42,68 @@ use tt_shared::{
 use crate::registry::ProviderRegistry;
 use crate::retry::{with_retry, RetryPolicy};
 
-/// Per-candidate attempt cap when dispatching a **chain** (more than one
+/// Default consecutive-failure count that OPENS a provider's circuit — the
+/// historical hardcoded value, overridable at startup via the
+/// `TT_BREAKER_FAILURE_THRESHOLD` env var (see [`CircuitBreaker::from_env`]).
+const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
+
+/// Default seconds a circuit stays OPEN before admitting a half-open trial — the
+/// historical hardcoded value, overridable via `TT_BREAKER_COOLDOWN_SECS`.
+const DEFAULT_COOLDOWN_SECS: u64 = 30;
+
+/// Default per-candidate attempt cap when dispatching a **chain** (more than one
 /// candidate). Keeps the worst-case upstream call count to
-/// `candidates.len() × CHAINED_MAX_ATTEMPTS`.
+/// `candidates.len() × DEFAULT_CHAINED_MAX_ATTEMPTS`. Overridable via
+/// `TT_FAILOVER_CHAINED_MAX_ATTEMPTS` (see [`chained_max_attempts`]).
 ///
 /// A single-candidate route is NOT subject to this cap — it keeps the full
 /// policy budget so operators who hard-wire a single model don't silently lose
 /// retries.
-const CHAINED_MAX_ATTEMPTS: u32 = 2;
+const DEFAULT_CHAINED_MAX_ATTEMPTS: u32 = 2;
+
+/// Parse env var `key` as `T`, returning `default` when the var is unset. A
+/// present-but-unparseable value logs a warning and falls back to `default` —
+/// this NEVER panics, so a fat-fingered override can't take the gateway down.
+fn env_parse<T>(get: &impl Fn(&str) -> Option<String>, key: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    match get(key) {
+        None => default,
+        Some(raw) => raw.trim().parse::<T>().unwrap_or_else(|_| {
+            tracing::warn!(
+                env_var = key,
+                value = %raw,
+                "unparseable breaker/failover env override; using default"
+            );
+            default
+        }),
+    }
+}
+
+/// Per-candidate attempt cap for a chained dispatch, resolved ONCE from
+/// `TT_FAILOVER_CHAINED_MAX_ATTEMPTS` (default [`DEFAULT_CHAINED_MAX_ATTEMPTS`],
+/// clamped to `>= 1`; unset/unparseable → default). Cached in a [`OnceLock`] so
+/// the env read is a one-time startup cost rather than a per-request one, and so
+/// the value is stable for the life of the process.
+///
+/// [`OnceLock`]: std::sync::OnceLock
+fn chained_max_attempts() -> u32 {
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| chained_max_attempts_from_lookup(|k| std::env::var(k).ok()))
+}
+
+/// Testable seam for [`chained_max_attempts`]: parse the cap from a key→value
+/// lookup so tests never mutate process env (which races the parallel harness
+/// and is `unsafe` in edition 2024).
+fn chained_max_attempts_from_lookup(get: impl Fn(&str) -> Option<String>) -> u32 {
+    env_parse(
+        &get,
+        "TT_FAILOVER_CHAINED_MAX_ATTEMPTS",
+        DEFAULT_CHAINED_MAX_ATTEMPTS,
+    )
+    .max(1)
+}
 
 /// Optional capability guard passed to the failover dispatch functions.
 ///
@@ -104,6 +159,35 @@ impl CircuitBreaker {
             cooldown,
             state: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Construct from the environment, so operators can tune the breaker without
+    /// a rebuild. Reads:
+    ///
+    /// * `TT_BREAKER_FAILURE_THRESHOLD` — consecutive failures that open a
+    ///   circuit (default [`DEFAULT_FAILURE_THRESHOLD`] = 5; clamped to `>= 1`).
+    /// * `TT_BREAKER_COOLDOWN_SECS` — seconds a circuit stays open before a
+    ///   half-open trial (default [`DEFAULT_COOLDOWN_SECS`] = 30).
+    ///
+    /// Each var falls back to its default when unset **or unparseable** (an
+    /// unparseable value logs a warning; it never panics). With no vars set the
+    /// result is byte-identical to [`CircuitBreaker::default`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Testable seam for [`from_env`](CircuitBreaker::from_env): build from a
+    /// key→value lookup so tests never mutate process env.
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let failure_threshold = env_parse(
+            &get,
+            "TT_BREAKER_FAILURE_THRESHOLD",
+            DEFAULT_FAILURE_THRESHOLD,
+        )
+        .max(1);
+        let cooldown_secs = env_parse(&get, "TT_BREAKER_COOLDOWN_SECS", DEFAULT_COOLDOWN_SECS);
+        Self::new(failure_threshold, Duration::from_secs(cooldown_secs))
     }
 
     /// Whether `provider_id`'s circuit should be treated as open at `now`.
@@ -191,7 +275,10 @@ impl CircuitBreaker {
 
 impl Default for CircuitBreaker {
     fn default() -> Self {
-        Self::new(5, Duration::from_secs(30))
+        Self::new(
+            DEFAULT_FAILURE_THRESHOLD,
+            Duration::from_secs(DEFAULT_COOLDOWN_SECS),
+        )
     }
 }
 
@@ -228,7 +315,7 @@ pub async fn dispatch_with_failover(
     let chained = candidates.len() > 1;
     let effective_retry;
     let retry = if chained {
-        effective_retry = retry.capped(CHAINED_MAX_ATTEMPTS);
+        effective_retry = retry.capped(chained_max_attempts());
         &effective_retry
     } else {
         retry
@@ -354,7 +441,7 @@ pub async fn dispatch_stream_with_failover(
     let chained = candidates.len() > 1;
     let effective_retry;
     let retry = if chained {
-        effective_retry = retry.capped(CHAINED_MAX_ATTEMPTS);
+        effective_retry = retry.capped(chained_max_attempts());
         &effective_retry
     } else {
         retry
@@ -449,6 +536,96 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap()
+    }
+
+    // ---- env-tunable config (from_env / from_lookup) ----
+
+    /// Build a lookup closure from a fixed list of `(key, value)` pairs; any
+    /// unlisted key resolves to `None` (an unset env var).
+    fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// With NO env vars set, `from_lookup` must reproduce the historical
+    /// hardcoded defaults exactly (byte-identical to `default()` today).
+    #[test]
+    fn breaker_from_lookup_unset_matches_current_defaults() {
+        let b = CircuitBreaker::from_lookup(|_| None);
+        assert_eq!(b.failure_threshold, DEFAULT_FAILURE_THRESHOLD);
+        assert_eq!(b.failure_threshold, 5, "historical default");
+        assert_eq!(b.cooldown, Duration::from_secs(DEFAULT_COOLDOWN_SECS));
+        assert_eq!(b.cooldown, Duration::from_secs(30), "historical default");
+
+        // ...and identical to what `default()` produces.
+        let d = CircuitBreaker::default();
+        assert_eq!(b.failure_threshold, d.failure_threshold);
+        assert_eq!(b.cooldown, d.cooldown);
+    }
+
+    /// Set env vars override the defaults.
+    #[test]
+    fn breaker_from_lookup_applies_overrides() {
+        let b = CircuitBreaker::from_lookup(lookup(&[
+            ("TT_BREAKER_FAILURE_THRESHOLD", "9"),
+            ("TT_BREAKER_COOLDOWN_SECS", "120"),
+        ]));
+        assert_eq!(b.failure_threshold, 9);
+        assert_eq!(b.cooldown, Duration::from_secs(120));
+    }
+
+    /// Unparseable values fall back to the defaults — and never panic.
+    #[test]
+    fn breaker_from_lookup_unparseable_falls_back_to_defaults() {
+        let b = CircuitBreaker::from_lookup(lookup(&[
+            ("TT_BREAKER_FAILURE_THRESHOLD", "not-a-number"),
+            ("TT_BREAKER_COOLDOWN_SECS", "   "),
+        ]));
+        assert_eq!(b.failure_threshold, DEFAULT_FAILURE_THRESHOLD);
+        assert_eq!(b.cooldown, Duration::from_secs(DEFAULT_COOLDOWN_SECS));
+    }
+
+    /// A zero (or negative-parse) threshold is clamped to `>= 1` so the breaker
+    /// can never be configured into a nonsensical "opens before any failure".
+    #[test]
+    fn breaker_from_lookup_clamps_threshold_to_at_least_one() {
+        let b = CircuitBreaker::from_lookup(lookup(&[("TT_BREAKER_FAILURE_THRESHOLD", "0")]));
+        assert_eq!(b.failure_threshold, 1);
+    }
+
+    /// The chained-attempt cap: unset → default, set → override, unparseable →
+    /// default (no panic), zero → clamped to 1.
+    #[test]
+    fn chained_max_attempts_lookup_covers_unset_set_and_unparseable() {
+        assert_eq!(
+            chained_max_attempts_from_lookup(|_| None),
+            DEFAULT_CHAINED_MAX_ATTEMPTS,
+            "unset → default"
+        );
+        assert_eq!(
+            chained_max_attempts_from_lookup(|_| None),
+            2,
+            "historical default"
+        );
+        assert_eq!(
+            chained_max_attempts_from_lookup(|_| Some("4".to_string())),
+            4,
+            "set → override"
+        );
+        assert_eq!(
+            chained_max_attempts_from_lookup(|_| Some("garbage".to_string())),
+            DEFAULT_CHAINED_MAX_ATTEMPTS,
+            "unparseable → default (no panic)"
+        );
+        assert_eq!(
+            chained_max_attempts_from_lookup(|_| Some("0".to_string())),
+            1,
+            "zero clamps to 1"
+        );
     }
 
     // ---- CircuitBreaker ----
@@ -1379,7 +1556,7 @@ mod tests {
     }
 
     /// (b) A 3-candidate all-failing chain makes at most
-    /// `3 * CHAINED_MAX_ATTEMPTS` = 6 upstream calls — well below the
+    /// `3 * DEFAULT_CHAINED_MAX_ATTEMPTS` = 6 upstream calls — well below the
     /// old un-bounded 9 (3 candidates × 3 attempts each).
     #[tokio::test]
     async fn three_candidate_chain_bounded_call_count() {
@@ -1407,7 +1584,7 @@ mod tests {
         }));
 
         // Use max_attempts=3 (the default budget) so we can prove the chain cap
-        // kicks in and limits each candidate to CHAINED_MAX_ATTEMPTS=2.
+        // kicks in and limits each candidate to DEFAULT_CHAINED_MAX_ATTEMPTS=2.
         let policy = RetryPolicy {
             max_attempts: 3,
             base_delay: Duration::ZERO,
@@ -1437,12 +1614,12 @@ mod tests {
             + calls_b.load(std::sync::atomic::Ordering::SeqCst)
             + calls_c.load(std::sync::atomic::Ordering::SeqCst);
 
-        // Each candidate is capped to CHAINED_MAX_ATTEMPTS=2; total ≤ 3*2=6.
+        // Each candidate is capped to DEFAULT_CHAINED_MAX_ATTEMPTS=2; total ≤ 3*2=6.
         // The old un-bounded code would produce 3*3=9 calls.
         assert!(
-            total <= (3 * CHAINED_MAX_ATTEMPTS),
+            total <= (3 * DEFAULT_CHAINED_MAX_ATTEMPTS),
             "expected ≤ {} upstream calls, got {total}",
-            3 * CHAINED_MAX_ATTEMPTS,
+            3 * DEFAULT_CHAINED_MAX_ATTEMPTS,
         );
         assert!(
             total < 9,

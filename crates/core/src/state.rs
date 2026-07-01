@@ -371,7 +371,10 @@ impl AppState {
             budget: None,
             tier_resolver: None,
             dynamic_budget: Arc::new(DynamicBudgetEnforcer::new()),
-            breaker: Arc::new(CircuitBreaker::default()),
+            // Reads `TT_BREAKER_FAILURE_THRESHOLD` / `TT_BREAKER_COOLDOWN_SECS`
+            // so operators can tune the circuit breaker without a rebuild. Unset
+            // env → byte-identical to `CircuitBreaker::default()`.
+            breaker: Arc::new(CircuitBreaker::from_env()),
             single_flight: Arc::new(SingleFlight::new()),
             judge_config,
             judge_sink: None,

@@ -41,6 +41,57 @@ pub(crate) const STREAMING_TIMEOUT_SECS: u64 = 600;
 /// [`STREAMING_TIMEOUT_SECS`].
 pub(crate) const SHORT_TIMEOUT_SECS: u64 = 60;
 
+/// Resolve the streaming-tier timeout (seconds), letting an operator override
+/// [`STREAMING_TIMEOUT_SECS`] via the `TT_STREAMING_TIMEOUT_SECS` env var. Unset,
+/// unparseable, or `0` → the compiled default (never panics).
+pub(crate) fn streaming_timeout_secs() -> u64 {
+    timeout_secs_from_lookup(
+        |k| std::env::var(k).ok(),
+        "TT_STREAMING_TIMEOUT_SECS",
+        STREAMING_TIMEOUT_SECS,
+    )
+}
+
+/// Resolve the short (non-streaming) route timeout (seconds), letting an operator
+/// override [`SHORT_TIMEOUT_SECS`] via the `TT_ROUTE_TIMEOUT_SECS` env var. Unset,
+/// unparseable, or `0` → the compiled default (never panics).
+pub(crate) fn short_timeout_secs() -> u64 {
+    timeout_secs_from_lookup(
+        |k| std::env::var(k).ok(),
+        "TT_ROUTE_TIMEOUT_SECS",
+        SHORT_TIMEOUT_SECS,
+    )
+}
+
+/// Parse a timeout (seconds) from a key→value lookup. A missing var uses
+/// `default`; a present value must parse as a `u64 >= 1` (a `0`s timeout would
+/// shed every request). Unparseable / zero values log a warning and fall back
+/// to `default` — this NEVER panics. The lookup indirection lets tests exercise
+/// the parsing without mutating process env.
+fn timeout_secs_from_lookup(get: impl Fn(&str) -> Option<String>, key: &str, default: u64) -> u64 {
+    match get(key) {
+        None => default,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(v) if v >= 1 => v,
+            Ok(_) => {
+                tracing::warn!(
+                    env_var = key,
+                    "route-timeout override must be >= 1s; using default"
+                );
+                default
+            }
+            Err(_) => {
+                tracing::warn!(
+                    env_var = key,
+                    value = %raw,
+                    "unparseable route-timeout override; using default"
+                );
+                default
+            }
+        },
+    }
+}
+
 /// Read the `TT_PANEL_ENABLED` environment variable and return the resolved
 /// kill-switch value for [`AppState::with_panel_enabled`].
 ///
@@ -109,7 +160,7 @@ pub fn build_router_with_retrieval(
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(STREAMING_TIMEOUT_SECS),
+            std::time::Duration::from_secs(streaming_timeout_secs()),
         ));
 
     let short = Router::new()
@@ -191,7 +242,7 @@ pub fn build_router_with_retrieval(
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(SHORT_TIMEOUT_SECS),
+            std::time::Duration::from_secs(short_timeout_secs()),
         ));
 
     let base = streaming.merge(short);
@@ -1206,6 +1257,45 @@ mod tests {
         assert!(
             short < streaming,
             "short tier must be tighter than the streaming ceiling"
+        );
+    }
+
+    /// The env-tunable route-timeout seam: unset → the compiled default;
+    /// a valid value overrides; `0` and unparseable values fall back to the
+    /// default (never panic, never a 0s timeout).
+    #[test]
+    fn timeout_secs_from_lookup_covers_unset_set_and_bad_values() {
+        // Unset → compiled default, byte-identical to today.
+        assert_eq!(
+            timeout_secs_from_lookup(|_| None, "TT_ROUTE_TIMEOUT_SECS", SHORT_TIMEOUT_SECS),
+            SHORT_TIMEOUT_SECS,
+        );
+        // Set → override.
+        assert_eq!(
+            timeout_secs_from_lookup(
+                |_| Some("45".to_string()),
+                "TT_ROUTE_TIMEOUT_SECS",
+                SHORT_TIMEOUT_SECS,
+            ),
+            45,
+        );
+        // Unparseable → default (no panic).
+        assert_eq!(
+            timeout_secs_from_lookup(
+                |_| Some("soon".to_string()),
+                "TT_STREAMING_TIMEOUT_SECS",
+                STREAMING_TIMEOUT_SECS,
+            ),
+            STREAMING_TIMEOUT_SECS,
+        );
+        // Zero would shed every request → clamped back to the default.
+        assert_eq!(
+            timeout_secs_from_lookup(
+                |_| Some("0".to_string()),
+                "TT_ROUTE_TIMEOUT_SECS",
+                SHORT_TIMEOUT_SECS,
+            ),
+            SHORT_TIMEOUT_SECS,
         );
     }
 
