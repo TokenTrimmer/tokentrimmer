@@ -41,7 +41,7 @@
     "test": "vitest run"
   },
   "peerDependencies": {
-    "openai": "^6.44.0",
+    "openai": "^6.45.0",
     "ai": ">=3.0.0",
     "@opentelemetry/api": ">=1.0.0 <2.0.0"
   },
@@ -57,7 +57,7 @@
     }
   },
   "devDependencies": {
-    "openai": "^6.44.0",
+    "openai": "^6.45.0",
     "@opentelemetry/api": "^1.9.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9",
