@@ -8,8 +8,14 @@ Thin Node SDK over the official OpenAI client — routes through the TokenTrimme
 ```bash
 git clone https://github.com/TokenTrimmer/tokentrimmer.git
 (cd tokentrimmer/sdk-typescript && npm install && npm run build)
-npm install ./tokentrimmer/sdk-typescript
+npm install ./tokentrimmer/sdk-typescript openai
 ```
+
+> **`openai` is a peer dependency** — you install it alongside this SDK (not bundled
+> inside it). This avoids having two separate copies of the `openai` client in your
+> dependency tree when your app already depends on `openai` directly, which would
+> break subclassing and cause subtle type mismatches.
+> Once on npm, install both together: `npm i @tokentrimmer/client openai`.
 
 ## Try it in 30 seconds — no account, no provider key, $0
 
@@ -74,12 +80,11 @@ The class is an `openai.OpenAI` subclass — every other method (`embeddings`, `
 
 ### `openai` version compatibility
 
-The wrapper depends on `openai@"^5.0.0 || ^6.0.0"` and its full test suite passes
-against both majors (CI locks and tests the v6 line). Because the class subclasses
-`openai.OpenAI`, your app's `openai` version is effectively coupled to this range:
-either major dedupes cleanly with an app that pins `^5` or `^6`. If you pin `openai`
-yourself, prefer `^6` — that is the resolution this package is locked and tested
-against day-to-day.
+`openai` is a **peer dependency** (`^6.44.0`). Install it alongside this package —
+your copy is the one that gets used, with no risk of a duplicate instance in the tree.
+Because `TokenTrimmer` subclasses `openai.OpenAI`, sharing a single copy is required
+for correct subclassing and TypeScript types. The package is developed and tested
+against the `^6` line; `^5` is not supported.
 
 ### Streaming
 

@@ -32,10 +32,16 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run"
   },
-  "dependencies": {
+  "peerDependencies": {
     "openai": "^6.44.0"
   },
+  "peerDependenciesMeta": {
+    "openai": {
+      "optional": false
+    }
+  },
   "devDependencies": {
+    "openai": "^6.44.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9",
     "@types/node": "^25.9.3"
