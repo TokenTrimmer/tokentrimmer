@@ -33,7 +33,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Mapping, Optional, Union
 
 import httpx
 from openai import OpenAI
@@ -73,6 +73,25 @@ class TokenTrimmerMeta:
     baseline_cost_usd: Optional[float]
     saved_usd: Optional[float]
     cache: Optional[str]  # "hit-l1" | "hit-l2" | "neg-hit" | "miss" | "none" | "sandbox"
+    route: Optional[str] = None  # matched route name (x-tokentrimmer-route-matched)
+
+    @classmethod
+    def from_headers(
+        cls, headers: Union[httpx.Headers, Mapping[str, str]]
+    ) -> "TokenTrimmerMeta":
+        """Parse a mapping of response headers into a :class:`TokenTrimmerMeta`.
+
+        The public, reusable entry point to the canonical ``X-TokenTrimmer-*``
+        header parser. Accepts an ``httpx.Headers`` (as produced on the SDK's own
+        request path) or any plain mapping of header name → value — e.g. the
+        ``dict`` a framework integration recovers from a captured HTTP response
+        (see :mod:`tokentrimmer.integrations.langchain`). A plain mapping is
+        normalised through ``httpx.Headers`` first so lookups stay
+        case-insensitive regardless of how the caller cased the keys.
+        """
+        if not isinstance(headers, httpx.Headers):
+            headers = httpx.Headers(dict(headers))
+        return _parse_meta(headers)
 
 
 def _parse_meta(headers: httpx.Headers) -> TokenTrimmerMeta:
@@ -95,6 +114,10 @@ def _parse_meta(headers: httpx.Headers) -> TokenTrimmerMeta:
         baseline_cost_usd=f("x-tokentrimmer-baseline-cost-usd"),
         saved_usd=f("x-tokentrimmer-saved-usd"),
         cache=headers.get("x-tokentrimmer-cache"),
+        # The matched route name rides on `x-tokentrimmer-route-matched` (the
+        # gateway stamps it via `stamp_route_matched_header`); surfacing it here
+        # lets the OTel semconv mapping populate `tokentrimmer.route`.
+        route=headers.get("x-tokentrimmer-route-matched"),
     )
 
 

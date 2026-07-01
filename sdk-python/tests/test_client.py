@@ -70,6 +70,7 @@ def _completion_route(cost: str = "0.0034", cache: str = "miss") -> respx.Route:
                 "x-tokentrimmer-baseline-cost-usd": "0.02",
                 "x-tokentrimmer-saved-usd": "0.0166",
                 "x-tokentrimmer-cache": cache,
+                "x-tokentrimmer-route-matched": "cheap-route",
             },
             json={
                 "id": "chatcmpl-1",
@@ -107,6 +108,23 @@ def test_parses_tt_metadata_onto_response():
     assert meta.cost_usd == 0.0034
     assert meta.saved_usd == 0.0166
     assert meta.cache == "miss"
+    assert meta.route == "cheap-route"
+
+
+def test_from_headers_parses_a_plain_mapping():
+    """The public reuse entry point accepts a plain (case-insensitive) mapping."""
+    meta = TokenTrimmerMeta.from_headers(
+        {
+            "X-TokenTrimmer-Cost-Usd": "0.01",
+            "x-tokentrimmer-saved-usd": "0.02",
+            "X-TokenTrimmer-Route-Matched": "cheap-route",
+        }
+    )
+    assert meta.cost_usd == 0.01
+    assert meta.saved_usd == 0.02
+    assert meta.route == "cheap-route"
+    # Absent headers stay None (additive).
+    assert meta.cache is None
 
 
 @respx.mock

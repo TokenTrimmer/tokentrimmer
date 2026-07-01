@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tokentrimmer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Thin wrapper around the OpenAI Python SDK that routes through TokenTrimmer Gateway."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -37,8 +37,29 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+# Optional framework integrations. The BASE package must never hard-depend on
+# these — `import tokentrimmer` works with none installed (guarded imports +
+# lazy `__getattr__`). Install an extra only for the integration you use.
 [project.optional-dependencies]
-test = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.22"]
+# LangChain cost callback (tokentrimmer.integrations.langchain). langchain-core
+# is enough for the callback itself; langchain-openai is what surfaces the
+# x-tokentrimmer-* response headers (include_response_headers=True) and is used
+# by the make_gateway_chat_openai() convenience factory.
+langchain = ["langchain-core>=0.3", "langchain-openai>=0.2"]
+# OpenTelemetry span recording. The callback records cost attributes onto the
+# current span when this is installed; without it, it still accumulates totals.
+otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
+# CI installs ONLY this extra (see .github/workflows/sdks.yml), so it must pull
+# in langchain-core + opentelemetry for the integration tests to run. It omits
+# langchain-openai (heavy, only exercised by an importorskip'd factory test).
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.22",
+    "langchain-core>=0.3",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+]
 
 [project.urls]
 Homepage = "https://tokentrimmer.com"

@@ -128,6 +128,64 @@ print(f"cost   ${outcome.usage.cost_usd:.4f}")
 print(f"rounds {outcome.resume_rounds}")  # client-side tool_outputs resumes made
 ```
 
+## LangChain cost callback + OpenTelemetry spans
+
+When you point a LangChain `ChatOpenAI` at the Gateway (a plain `base_url` swap),
+the `x-tokentrimmer-*` cost/savings headers are invisible to LangSmith / OTel.
+`TokenTrimmerCostCallback` recovers them on every LLM finish, records them as
+OpenTelemetry span attributes (the **same** `gen_ai.*` / `tokentrimmer.*` keys
+the Gateway stamps on its own span — see `tokentrimmer.semconv`), and accumulates
+a per-run cost / savings total with an optional budget.
+
+Optional extras — the base package never depends on LangChain or OpenTelemetry:
+
+```bash
+pip install "tokentrimmer[langchain,otel]"
+```
+
+```python
+from tokentrimmer.integrations.langchain import (
+    TokenTrimmerCostCallback,
+    make_gateway_chat_openai,
+)
+
+cb = TokenTrimmerCostCallback(max_cost_usd=0.50)   # optional per-run budget
+
+# make_gateway_chat_openai sets the two easy-to-miss flags for you:
+#   include_response_headers=True  → surfaces the x-tokentrimmer-* headers
+#   use_responses_api=False        → the Gateway speaks Chat Completions, not Responses
+llm = make_gateway_chat_openai(
+    model="claude-haiku-4-5",
+    api_key="tt_live_...",
+    base_url="http://localhost:8080/v1",
+    callbacks=[cb],
+)
+
+llm.invoke("Hello")
+
+print(f"run cost  ${cb.total_cost_usd:.4f}")
+print(f"run saved ${cb.total_saved_usd:.4f}")
+```
+
+The cost attributes land on whatever span is active when the LLM call finishes
+(the callback calls `opentelemetry.trace.get_current_span()`), so any tracer you
+already run picks them up. Without the `otel` extra the callback still tallies
+`total_cost_usd` / `total_saved_usd` — span recording is a no-op.
+
+**Budget stop hook.** With `max_cost_usd` set, the finish that tips the
+accumulated cost past the cap raises `BudgetExceeded`; the handler sets
+`raise_error = True`, so LangChain propagates it out of `invoke` / `stream`
+instead of silently overspending.
+
+If you build `ChatOpenAI` yourself, set `include_response_headers=True` (and
+`use_responses_api=False`) — that is the hook the callback reads from
+`response_metadata["headers"]`. Without it the callback degrades gracefully:
+nothing is recorded and the chain runs normally.
+
+> v1 covers **LangChain (Python)**. The semconv keys and
+> `TokenTrimmerMeta.from_headers` are framework-agnostic; LiteLLM, the Vercel AI
+> SDK, and LangGraph adapters are deferred follow-ups that reuse them.
+
 ## Batch (50% cheaper, async)
 
 The Gateway's `/v1/files` + `/v1/batches` endpoints are OpenAI-compatible, so the
