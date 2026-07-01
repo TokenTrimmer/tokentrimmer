@@ -28,8 +28,12 @@ else
 fi
 
 # ── TypeScript pin ────────────────────────────────────────────────────────────
-# Extract the openai value from package.json dependencies, e.g. "^6.44.0"
-ts_pin="$(grep -A1 '"dependencies"' "$PKG_JSON" | grep '"openai"' | sed 's/.*"openai": *"\([^"]*\)".*/\1/')"
+# Extract the openai value from package.json, e.g. "^6.44.0". openai is a
+# peerDependency (not a bundled dependency), so match the versioned entry
+# `"openai": "<spec>"` in whatever section it lives in (peer/dev) rather than
+# only the line after `"dependencies"` — the bare `"openai"` keywords entry has
+# no colon+version and is skipped by the `":` anchor.
+ts_pin="$(grep -E '"openai": *"' "$PKG_JSON" | head -1 | sed 's/.*"openai": *"\([^"]*\)".*/\1/')"
 if [[ -z "$ts_pin" ]]; then
     echo "ERROR: could not parse openai pin from $PKG_JSON" >&2
     exit 1
