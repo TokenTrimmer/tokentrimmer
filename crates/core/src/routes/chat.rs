@@ -1912,6 +1912,9 @@ pub(crate) async fn complete_once(
         diff_failed,
         diff_failed_cost_usd: cost_breakdown.diff_failed_cost_usd,
         retrieval_tokens_saved: retrieval_telemetry.tokens_saved,
+        // Document Lane D2: token-denominated record of what the lossless
+        // doc-compaction pass removed (0 unless the route opted in).
+        doc_compaction_tokens_removed: pass_effects.doc_compaction_tokens_removed as i64,
         // Agent-run grain (W0b Task 4): stamped via `attribute_run` below
         // so the ctx→row mapping is independently unit-testable.
         run_id: None,
@@ -6285,6 +6288,8 @@ fn request_log_for_l1_hit(
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved,
+        // Cache hits never run the doc-compaction pass (nothing dispatched).
+        doc_compaction_tokens_removed: 0,
         // run_id/node_id stamped in Task 4 (agentic loop context).
         run_id: None,
         node_id: None,
@@ -6356,6 +6361,8 @@ fn request_log_for_l2_hit(
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved,
+        // Cache hits never run the doc-compaction pass (nothing dispatched).
+        doc_compaction_tokens_removed: 0,
         // run_id/node_id stamped in Task 4 (agentic loop context).
         run_id: None,
         node_id: None,
@@ -9468,6 +9475,7 @@ mod telemetry_drain_tests {
             diff_failed: false,
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: 0,
+            doc_compaction_tokens_removed: 0,
             run_id: None,
             node_id: None,
         }
