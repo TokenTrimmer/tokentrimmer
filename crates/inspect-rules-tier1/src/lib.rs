@@ -24,6 +24,7 @@ pub use rules::PromptDynamicPrefixBreaksCacheRule;
 pub use rules::PromptNoOutputConstraintRule;
 pub use rules::PromptVerboseFewShotRule;
 pub use rules::PromptVolatileInSystemPromptRule;
+pub use rules::RawDocumentToVisionModelRule;
 
 use tt_inspect_core::{Finding, Language, Rule, Severity};
 
@@ -57,6 +58,8 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
         Box::new(PromptVolatileInSystemPromptRule::new()),
         // Code-offload: large CSV/log/JSON dump pasted inline into a prompt.
         Box::new(InlineDataOffloadCandidateRule::new()),
+        // Document Lane (D1): raw image / base64-PDF fed straight to a vision model.
+        Box::new(RawDocumentToVisionModelRule::new()),
     ]
 }
 

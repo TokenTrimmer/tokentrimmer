@@ -5330,6 +5330,8 @@ dependencies = [
  "tempfile",
  "tracing",
  "tt-inspect-core",
+ "tt-preview",
+ "tt-tokenize",
  "walkdir",
 ]
 

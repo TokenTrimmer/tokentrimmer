@@ -9,6 +9,9 @@ description = "The 10 launch-day P0 Inspect rules (deterministic, Tier 1)."
 
 [dependencies]
 tt-inspect-core.workspace = true
+# D1 Document Lane: quote D0's deterministic image/doc-token projector.
+tt-tokenize.workspace = true
+tt-preview.workspace = true
 serde.workspace = true
 tracing.workspace = true
 regex.workspace = true
