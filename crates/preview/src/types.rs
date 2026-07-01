@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::document_projection::DocProjection;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PreviewRequest {
     pub model: String,
@@ -38,6 +40,12 @@ pub struct PreviewResponse {
     pub route_suggestions: Vec<RouteSuggestion>,
     pub warnings: Vec<String>,
     pub trace_id: String,
+    /// Present only when the request carries image parts: a directional
+    /// image/document-token projection (raw image cost vs a projected distilled
+    /// text-token cost). Absent for text-only requests. See
+    /// [`crate::document_projection`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_projection: Option<DocProjection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,9 +131,40 @@ mod tests {
             route_suggestions: vec![],
             warnings: vec![],
             trace_id: "trace".into(),
+            doc_projection: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"estimation_confidence\":\"high\""));
         assert!(json.contains("\"weighted_savings_usd\":0.000098"));
+        // Absent for a text-only response.
+        assert!(!json.contains("doc_projection"));
+    }
+
+    #[test]
+    fn doc_projection_serializes_when_present() {
+        let r = PreviewResponse {
+            current: CurrentEstimate {
+                model: "gpt-4o".into(),
+                provider: "openai".into(),
+                input_tokens_estimated: 765,
+                output_tokens_estimated: 16,
+                cost_usd: 0.001,
+                estimation_confidence: EstimationConfidence::High,
+            },
+            cache_projections: CacheProjections {
+                l1_hit_savings_usd: 0.0,
+                l1_hit_probability: 0.2,
+                l2_hit_savings_usd: 0.0,
+                l2_hit_probability: 0.1,
+                weighted_savings_usd: 0.0,
+            },
+            route_suggestions: vec![],
+            warnings: vec![],
+            trace_id: "trace".into(),
+            doc_projection: Some(crate::document_projection::project(765, 153, 5.0, "gpt-4o")),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"doc_projection\""));
+        assert!(json.contains("\"basis\":\"estimate\""));
     }
 }
