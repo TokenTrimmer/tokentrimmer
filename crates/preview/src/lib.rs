@@ -19,6 +19,13 @@ pub use types::{
 
 use uuid::Uuid;
 
+/// Fraction of raw image tokens a lossy image→text distillation is assumed to
+/// produce, for the DIRECTIONAL `DocProjection` savings figure. Deliberately
+/// conservative (a distilled page of prose is typically far smaller than the
+/// image tokens it replaces); it is a labelled `basis:"estimate"`, not a
+/// precise projection. See `document_projection`.
+const DISTILLED_TOKEN_RATIO: f64 = 0.20;
+
 /// Top-level entry point. Returns a complete `PreviewResponse`. The only
 /// way this returns `Err` is if the model is unknown AND the optional
 /// fallback heuristic also fails — in practice the handler converts that
@@ -69,6 +76,14 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
         ));
     }
 
+    // Surface a directional document/image-token projection only when the
+    // request actually carries image parts (image_tokens > 0). The Gemini
+    // provider-direction guard inside `project` books $0 saving there.
+    let doc_projection = (image_tokens > 0).then(|| {
+        let distilled = (f64::from(image_tokens) * DISTILLED_TOKEN_RATIO).ceil() as u32;
+        document_projection::project(image_tokens, distilled, hit.input_per_m, &req.model)
+    });
+
     Ok(PreviewResponse {
         current: CurrentEstimate {
             model: req.model.clone(),
@@ -82,6 +97,7 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
         route_suggestions: suggestions,
         warnings,
         trace_id: Uuid::new_v4().to_string(),
+        doc_projection,
     })
 }
 
@@ -151,5 +167,39 @@ mod tests {
             resp.current.input_tokens_estimated
         );
         assert!(resp.current.cost_usd > 0.0);
+        // An image request also surfaces a directional DocProjection.
+        let dp = resp.doc_projection.expect("image request → doc_projection");
+        assert_eq!(dp.basis, "estimate");
+        assert_eq!(dp.raw_image_tokens, resp.current.input_tokens_estimated);
+        assert!(dp.projected_savings_usd >= 0.0);
+    }
+
+    /// A text-only request carries NO `doc_projection`.
+    #[test]
+    fn text_only_request_has_no_doc_projection() {
+        let resp = preview(&req_with_max("gpt-4o", Some(64))).unwrap();
+        assert!(resp.doc_projection.is_none());
+    }
+
+    /// The Gemini direction guard flows through the builder: an image → Gemini
+    /// request books $0 projected saving with an explanatory note.
+    #[test]
+    fn gemini_image_request_books_zero_saving() {
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
+        let req = PreviewRequest {
+            model: "gemini-3.5-flash".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: json!([{"type": "image_url", "image_url": {"url": png}}]),
+            }],
+            max_tokens: Some(16),
+            tools: None,
+            stream: None,
+            tt_extras: Default::default(),
+        };
+        let resp = preview(&req).unwrap();
+        let dp = resp.doc_projection.expect("image request → doc_projection");
+        assert_eq!(dp.projected_savings_usd, 0.0);
+        assert!(dp.note.is_some());
     }
 }
