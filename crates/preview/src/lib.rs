@@ -39,7 +39,12 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
         req.max_tokens,
         model_max_output,
     );
-    let cost = pricing::cost_usd(est.input_tokens, est.output_tokens, &hit);
+    // Image parts don't survive `concat_message_text` (it reads only `text`), so
+    // add the model's per-provider image-token estimate to the text total — else
+    // an image-heavy request prices as ~0 (the historical preview bug).
+    let image_tokens = token_estimator::sum_image_tokens(&req.messages, &req.model);
+    let input_tokens = est.input_tokens.saturating_add(image_tokens);
+    let cost = pricing::cost_usd(input_tokens, est.output_tokens, &hit);
 
     let task_class = classifier::classify(&req.messages);
 
@@ -52,7 +57,7 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
     let suggestions = route_suggestions::suggest(
         &req.model,
         cost,
-        est.input_tokens,
+        input_tokens,
         est.output_tokens,
         task_class,
     );
@@ -68,7 +73,7 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
         current: CurrentEstimate {
             model: req.model.clone(),
             provider: hit.provider.to_string(),
-            input_tokens_estimated: est.input_tokens,
+            input_tokens_estimated: input_tokens,
             output_tokens_estimated: est.output_tokens,
             cost_usd: cost,
             estimation_confidence: est.confidence,
@@ -120,5 +125,31 @@ mod tests {
     fn modest_max_tokens_is_honored() {
         let resp = preview(&req_with_max("gpt-4o", Some(1000))).unwrap();
         assert_eq!(resp.current.output_tokens_estimated, 1000);
+    }
+
+    /// Regression: an image-only request previews NON-ZERO input tokens + cost,
+    /// where it historically counted the image as ~0 (`concat_message_text` only
+    /// reads text parts).
+    #[test]
+    fn image_only_request_previews_nonzero() {
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
+        let req = PreviewRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: json!([{"type": "image_url", "image_url": {"url": png}}]),
+            }],
+            max_tokens: Some(16),
+            tools: None,
+            stream: None,
+            tt_extras: Default::default(),
+        };
+        let resp = preview(&req).unwrap();
+        assert!(
+            resp.current.input_tokens_estimated >= 255,
+            "image tokens must be summed into the input estimate, got {}",
+            resp.current.input_tokens_estimated
+        );
+        assert!(resp.current.cost_usd > 0.0);
     }
 }
