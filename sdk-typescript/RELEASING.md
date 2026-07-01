@@ -57,7 +57,10 @@ cd sdk-typescript
 npm install
 npm run build
 npm pack --dry-run    # shows the exact tarball contents (dist/, README, LICENSE)
+npm pack             # produces the installable tarball (e.g. tokentrimmer-client-0.1.0.tgz)
 ```
 
 > Do **not** run `npm publish` locally — publishing (with provenance) is the
-> workflow's job.
+> workflow's job. The `.tgz` produced by `npm pack` can be shared or installed
+> directly (`npm install ./tokentrimmer-client-0.1.0.tgz`) but should not be
+> committed to the repository.
