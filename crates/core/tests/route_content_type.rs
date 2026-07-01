@@ -226,6 +226,7 @@ async fn setup(target_model: &str) -> (Arc<Mutex<Vec<String>>>, String, axum::Ro
                 batch: false,
                 compress: false,
                 doc_compaction: false,
+                document_lane: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

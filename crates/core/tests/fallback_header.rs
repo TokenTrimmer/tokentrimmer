@@ -289,6 +289,7 @@ async fn fallback_header_overrides_route_chain() {
                 batch: false,
                 compress: false,
                 doc_compaction: false,
+                document_lane: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

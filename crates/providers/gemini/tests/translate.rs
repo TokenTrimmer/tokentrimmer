@@ -8,8 +8,9 @@ use tt_provider_gemini::translate::{
 };
 use tt_shared::{
     messages::{
-        ContentPart, ImageUrl, Message, MessageContent, ResponseFormat, Tool, ToolCall,
-        ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
+        ContentPart, DocumentPart, DocumentSource, ImageUrl, Message, MessageContent,
+        ResponseFormat, Tool, ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction,
+        ToolFunction,
     },
     ChatCompletionRequest,
 };
@@ -80,6 +81,54 @@ fn remote_url_image_stays_file_data() {
     let s = serde_json::to_string(&body).unwrap();
     assert!(s.contains(r#""fileData""#), "expected fileData: {s}");
     assert!(s.contains("https://example.com/cat.png"), "{s}");
+}
+
+#[test]
+fn base64_document_becomes_inline_data() {
+    // Document Lane D4a: a base64 document part maps to Gemini inline_data with
+    // the document's mime type (e.g. application/pdf).
+    let req = make_request(
+        "gemini-3.1-pro",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::Document {
+                document: DocumentPart {
+                    source: DocumentSource::Base64 {
+                        media_type: "application/pdf".into(),
+                        data: "JVBERi0xLjQK".into(),
+                    },
+                    filename: Some("report.pdf".into()),
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(s.contains(r#""inlineData""#), "expected inlineData: {s}");
+    assert!(s.contains(r#""mimeType":"application/pdf""#), "{s}");
+    assert!(s.contains(r#""data":"JVBERi0xLjQK""#), "{s}");
+}
+
+#[test]
+fn remote_url_document_becomes_file_data() {
+    let req = make_request(
+        "gemini-3.1-pro",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::Document {
+                document: DocumentPart {
+                    source: DocumentSource::Url {
+                        url: "https://example.com/report.pdf".into(),
+                    },
+                    filename: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(s.contains(r#""fileData""#), "expected fileData: {s}");
+    assert!(s.contains("https://example.com/report.pdf"), "{s}");
 }
 
 #[test]

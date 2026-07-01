@@ -559,6 +559,36 @@ fn translate_user_content(content: MessageContent) -> Result<Vec<GeminiPart>, Pr
                             "audio input is not supported by the Gemini adapter".to_string(),
                         ));
                     }
+                    // Document Lane (D4a): a document part maps to Gemini's
+                    // inline_data (base64 bytes, e.g. a PDF) or file_data (remote
+                    // URI), mirroring the image path. In the normal D4c flow the
+                    // pre-routing seam has already distilled documents to text, so
+                    // this native passthrough only fires when the seam is off.
+                    ContentPart::Document { document } => match document.source {
+                        tt_shared::messages::DocumentSource::Base64 { media_type, data } => {
+                            gemini_parts.push(GeminiPart::InlineData(GeminiInlineData {
+                                mime_type: media_type,
+                                data,
+                            }));
+                        }
+                        tt_shared::messages::DocumentSource::Url { url } => {
+                            match tt_shared::messages::parse_data_url(&url) {
+                                Some((mime_type, data)) => {
+                                    gemini_parts.push(GeminiPart::InlineData(GeminiInlineData {
+                                        mime_type,
+                                        data,
+                                    }));
+                                }
+                                None => {
+                                    let mime_type = guess_mime_from_url(&url);
+                                    gemini_parts.push(GeminiPart::FileData(GeminiFileData {
+                                        mime_type,
+                                        file_uri: url,
+                                    }));
+                                }
+                            }
+                        }
+                    },
                 }
             }
             Ok(gemini_parts)

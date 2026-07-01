@@ -752,7 +752,9 @@ fn message_content_text(content: &MessageContent) -> String {
             .iter()
             .filter_map(|part| match part {
                 ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => None,
+                ContentPart::ImageUrl { .. }
+                | ContentPart::InputAudio { .. }
+                | ContentPart::Document { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),

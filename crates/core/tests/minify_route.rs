@@ -403,6 +403,15 @@ async fn minify_route_books_zero_for_prose_response() {
     assert_eq!(est, 0.0, "prose response must book 0 (no claim)");
     let rows = rows_after(&h.log_writer, 1).await;
     assert_eq!(rows[0].minify_saved_est_usd, 0.0);
+    // Document Lane D4a: the isolated vision-avoided header is present and books
+    // 0.000000 on every request (the seam that sets it is D4c), and the row
+    // persists 0.0.
+    assert_eq!(
+        header_f64(&resp, "x-tokentrimmer-doc-vision-saved-est-usd"),
+        0.0,
+        "doc-vision estimate header must emit 0.000000 in D4a"
+    );
+    assert_eq!(rows[0].doc_vision_saved_est_usd, 0.0);
 }
 
 /// (c) Streaming: the instruction is dispatched and the warning emitted

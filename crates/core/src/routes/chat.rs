@@ -1915,6 +1915,10 @@ pub(crate) async fn complete_once(
         // Document Lane D2: token-denominated record of what the lossless
         // doc-compaction pass removed (0 unless the route opted in).
         doc_compaction_tokens_removed: pass_effects.doc_compaction_tokens_removed as i64,
+        // Document Lane D4: ISOLATED, ESTIMATED vision-avoided saving (own
+        // column, migration 0032; never folded into cost/baseline/saved).
+        // Always 0.0 in D4a — the seam that books it is D4c.
+        doc_vision_saved_est_usd: cost_breakdown.doc_vision_saved_est_usd,
         // Agent-run grain (W0b Task 4): stamped via `attribute_run` below
         // so the ctx→row mapping is independently unit-testable.
         run_id: None,
@@ -3542,6 +3546,8 @@ async fn handle_streaming(
                             diff_saved_usd: 0.0,
                             format_switch_saved_est_usd: 0.0,
                             diff_failed_cost_usd: 0.0,
+                            // Document Lane vision-avoided saving (D4c sets it).
+                            doc_vision_saved_est_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -4425,6 +4431,9 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         diff_saved_usd: 0.0,
         format_switch_saved_est_usd: 0.0,
         diff_failed_cost_usd: 0.0,
+        // Document Lane vision-avoided saving — the seam that sets a non-zero
+        // value is D4c; a cache hit / non-seam path always books 0.
+        doc_vision_saved_est_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -4498,6 +4507,9 @@ fn build_hit_l2_response(
         diff_saved_usd: 0.0,
         format_switch_saved_est_usd: 0.0,
         diff_failed_cost_usd: 0.0,
+        // Document Lane vision-avoided saving — the seam that sets a non-zero
+        // value is D4c; a cache hit / non-seam path always books 0.
+        doc_vision_saved_est_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -4832,6 +4844,19 @@ pub(crate) struct CostBreakdown {
     /// pure-failure trace's headline clamps to 0 — the honest outcome. Zero
     /// when no diff failed.
     pub diff_failed_cost_usd: f64,
+    /// ESTIMATED vision-avoided saving from the Document Lane seam (D4): when the
+    /// pre-routing distillation seam swaps an image/document part for distilled
+    /// TEXT, the request that actually dispatched never contained the image, so
+    /// this saving is a COUNTERFACTUAL (the raw image tokens that WOULD have been
+    /// billed minus the distilled text tokens, priced at the input rate; $0 for
+    /// Gemini per the D0 direction guard). Like `minify_saved_est_usd` it is
+    /// ISOLATED: NEVER folded into `cost_usd` / `baseline_cost_usd` /
+    /// [`tt_saved_usd`](Self::tt_saved_usd) (those reconcile against the realized
+    /// invoice — a request that never sent the image cannot be invoice-reconciled
+    /// on it). Surfaced on its own `X-TokenTrimmer-Doc-Vision-Saved-Est-Usd`
+    /// header + `request_logs` column (migration 0032). **Always 0.0 in D4a**
+    /// (substrate only — the seam that sets a non-zero value is D4c).
+    pub doc_vision_saved_est_usd: f64,
 }
 
 impl CostBreakdown {
@@ -5245,6 +5270,10 @@ pub(crate) fn compute_cost_full(
         diff_saved_usd: diff_saved_usd * fee_multiplier,
         format_switch_saved_est_usd: shape.format_switch_saved_est_usd * fee_multiplier,
         diff_failed_cost_usd: shape.diff_failed_cost_usd * fee_multiplier,
+        // Document Lane (D4a): always 0 — the pre-routing distillation seam that
+        // books a non-zero vision-avoided saving on this isolated field is D4c.
+        // Isolated: NOT folded into cost_usd/baseline_cost_usd above.
+        doc_vision_saved_est_usd: 0.0,
     }
 }
 
@@ -5390,6 +5419,14 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-diff-failed-cost-usd",
             format!("{:.6}", cost.diff_failed_cost_usd),
+        ),
+        // ESTIMATED Document-Lane vision-avoided saving (D4): a COUNTERFACTUAL
+        // (the dispatched request never contained the image) — NEVER included in
+        // `saved-usd` / baseline (isolated, like the minify estimate). 0.000000
+        // for all traffic in D4a; the seam that books a non-zero value is D4c.
+        (
+            "x-tokentrimmer-doc-vision-saved-est-usd",
+            format!("{:.6}", cost.doc_vision_saved_est_usd),
         ),
     ];
 
@@ -6290,6 +6327,8 @@ fn request_log_for_l1_hit(
         retrieval_tokens_saved,
         // Cache hits never run the doc-compaction pass (nothing dispatched).
         doc_compaction_tokens_removed: 0,
+        // Document Lane D4: cache hits never run the seam → 0.
+        doc_vision_saved_est_usd: 0.0,
         // run_id/node_id stamped in Task 4 (agentic loop context).
         run_id: None,
         node_id: None,
@@ -6363,6 +6402,8 @@ fn request_log_for_l2_hit(
         retrieval_tokens_saved,
         // Cache hits never run the doc-compaction pass (nothing dispatched).
         doc_compaction_tokens_removed: 0,
+        // Document Lane D4: cache hits never run the seam → 0.
+        doc_vision_saved_est_usd: 0.0,
         // run_id/node_id stamped in Task 4 (agentic loop context).
         run_id: None,
         node_id: None,
@@ -9127,6 +9168,10 @@ mod output_shaping_tests {
             crate::shaping::ShapeEffects::default(),
         );
         assert_eq!(base.minify_saved_est_usd, 0.0);
+        // Document Lane D4a: the isolated vision-avoided estimate is ALWAYS 0.0
+        // on the compute path (the seam that books it is D4c) and, like minify,
+        // is never folded into cost/baseline.
+        assert_eq!(base.doc_vision_saved_est_usd, 0.0);
 
         let bd = compute_cost_full(
             &usage,
@@ -9476,6 +9521,7 @@ mod telemetry_drain_tests {
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: 0,
             doc_compaction_tokens_removed: 0,
+            doc_vision_saved_est_usd: 0.0,
             run_id: None,
             node_id: None,
         }

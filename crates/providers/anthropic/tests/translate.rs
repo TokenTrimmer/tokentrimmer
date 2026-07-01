@@ -8,8 +8,8 @@ use tt_provider_anthropic::translate::{
 };
 use tt_shared::{
     messages::{
-        ContentPart, ImageUrl, Message, MessageContent, Tool, ToolCall, ToolCallFunction,
-        ToolChoice, ToolChoiceFunction, ToolFunction,
+        ContentPart, DocumentPart, DocumentSource, ImageUrl, Message, MessageContent, Tool,
+        ToolCall, ToolCallFunction, ToolChoice, ToolChoiceFunction, ToolFunction,
     },
     ChatCompletionRequest,
 };
@@ -89,6 +89,62 @@ fn remote_url_image_stays_url_source() {
     let s = serde_json::to_string(&body).unwrap();
     assert!(s.contains(r#""type":"url""#), "expected url source: {s}");
     assert!(s.contains("https://example.com/cat.png"), "{s}");
+}
+
+#[test]
+fn base64_document_becomes_document_block() {
+    // Document Lane D4a: a base64 document part translates to Anthropic's native
+    // `document` block with a base64 source (the flagship native-PDF path).
+    let req = make_request(
+        "claude-sonnet-4-6",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::Document {
+                document: DocumentPart {
+                    source: DocumentSource::Base64 {
+                        media_type: "application/pdf".into(),
+                        data: "JVBERi0xLjQK".into(),
+                    },
+                    filename: Some("report.pdf".into()),
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(
+        s.contains(r#""type":"document""#),
+        "expected document block: {s}"
+    );
+    assert!(s.contains(r#""type":"base64""#), "{s}");
+    assert!(s.contains(r#""media_type":"application/pdf""#), "{s}");
+    assert!(s.contains(r#""data":"JVBERi0xLjQK""#), "{s}");
+}
+
+#[test]
+fn remote_url_document_stays_url_source() {
+    let req = make_request(
+        "claude-sonnet-4-6",
+        vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::Document {
+                document: DocumentPart {
+                    source: DocumentSource::Url {
+                        url: "https://example.com/report.pdf".into(),
+                    },
+                    filename: None,
+                },
+            }]),
+            name: None,
+        }],
+    );
+    let body = translate_request(req).expect("translate ok");
+    let s = serde_json::to_string(&body).unwrap();
+    assert!(
+        s.contains(r#""type":"document""#),
+        "expected document block: {s}"
+    );
+    assert!(s.contains(r#""type":"url""#), "expected url source: {s}");
+    assert!(s.contains("https://example.com/report.pdf"), "{s}");
 }
 
 #[test]

@@ -210,6 +210,7 @@ async fn cost_condition_counts_full_prompt() {
                 batch: false,
                 compress: false,
                 doc_compaction: false,
+                document_lane: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

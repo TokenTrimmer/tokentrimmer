@@ -127,7 +127,7 @@ impl Tool for AddRouteTool {
                     },
                     "when": {
                         "type": "object",
-                        "description": "AND-ed match conditions (model_in, input_tokens_lt/gt, tag_equals, has_images, has_audio, prompt_contains_any_of, estimated_cost_gt/lt, upstream_latency_ms_p95_gt). Empty matches everything."
+                        "description": "AND-ed match conditions (model_in, input_tokens_lt/gt, tag_equals, has_images, has_audio, has_documents, prompt_contains_any_of, estimated_cost_gt/lt, upstream_latency_ms_p95_gt). has_documents (Document Lane) may target a TEXT model — unlike has_images/has_audio it imposes no Vision requirement. Empty matches everything."
                     },
                     "then": {
                         "type": "object",
@@ -391,6 +391,31 @@ mod tests {
         assert!(
             out.is_ok(),
             "modifier-only route (flex, no target_model) should be accepted, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_documents_condition_on_text_target_accepted() {
+        // Document Lane (D4a): a `has_documents` route targeting a TEXT model
+        // (`o3`, no Vision) is ACCEPTED — unlike `has_images`, documents impose
+        // no Vision requirement (the point is to downgrade to a text model).
+        let server = MockServer::start_async().await;
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/v1/routes");
+                then.status(201).body(r#"{"id":"docs"}"#);
+            })
+            .await;
+        let out = tool(server.base_url(), Uuid::now_v7())
+            .call(json!({
+                "name": "docs",
+                "when": { "has_documents": true },
+                "then": { "target_model": "o3" }
+            }))
+            .await;
+        assert!(
+            out.is_ok(),
+            "a has_documents route may target a text model, got {out:?}"
         );
     }
 
