@@ -1572,6 +1572,9 @@ fn aggregate_cost_breakdown(total_cost_usd: f64) -> CostBreakdown {
         diff_saved_usd: 0.0,
         format_switch_saved_est_usd: 0.0,
         diff_failed_cost_usd: 0.0,
+        // A panel claims no routing/cache saving; the vision-avoided saving is
+        // likewise 0 (the Document Lane seam does not run on a panel path).
+        doc_vision_saved_est_usd: 0.0,
     }
 }
 
@@ -1717,6 +1720,8 @@ pub(crate) async fn complete_panel(
             retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
             // Panels never run the doc-compaction pass (multi-member fan-out).
             doc_compaction_tokens_removed: 0,
+            // Document Lane D4: panels never run the seam → 0.
+            doc_vision_saved_est_usd: 0.0,
             // Panels never run agentic loops; run_id/node_id stay None.
             run_id: None,
             node_id: None,

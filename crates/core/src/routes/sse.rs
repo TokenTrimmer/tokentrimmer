@@ -1083,6 +1083,9 @@ pub fn stream_response(
                     // lossless doc-compaction pass removed (0 unless opted in).
                     doc_compaction_tokens_removed: pass_effects.doc_compaction_tokens_removed
                         as i64,
+                    // Document Lane D4: isolated vision-avoided estimate. The
+                    // streaming path books $0 in D4a (the seam is D4c).
+                    doc_vision_saved_est_usd: 0.0,
                     // run_id/node_id stamped in Task 4 (agentic loop context).
                     run_id: None,
                     node_id: None,
