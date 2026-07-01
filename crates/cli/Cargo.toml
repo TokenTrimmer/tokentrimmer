@@ -78,6 +78,10 @@ uuid.workspace = true
 [dev-dependencies]
 httpmock.workspace = true
 insta = { workspace = true }
+# Integration tests mint a real signed audit chain (via
+# `tt_cli::local_audit::append_entry`) to exercise the `--attestation` bundle
+# path end-to-end; that helper takes a `uuid::Uuid` org id.
+uuid.workspace = true
 
 [lints]
 workspace = true
