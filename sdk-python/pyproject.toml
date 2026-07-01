@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tokentrimmer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Thin wrapper around the OpenAI Python SDK that routes through TokenTrimmer Gateway."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -46,17 +46,30 @@ dependencies = [
 # x-tokentrimmer-* response headers (include_response_headers=True) and is used
 # by the make_gateway_chat_openai() convenience factory.
 langchain = ["langchain-core>=0.3", "langchain-openai>=0.2"]
-# OpenTelemetry span recording. The callback records cost attributes onto the
-# current span when this is installed; without it, it still accumulates totals.
+# LangGraph cost attribution. The LangChain callback (above) drives a LangGraph
+# graph unchanged — pass it via graph.invoke(config={"callbacks": [cb]}). This
+# extra just pulls in LangGraph (which itself runs on langchain-core's callback
+# manager) so the same callback flows through the graph's nodes.
+langgraph = ["langgraph>=0.2", "langchain-core>=0.3"]
+# LiteLLM cost logger (tokentrimmer.integrations.litellm). litellm is enough for
+# the CustomLogger; the logger reads the x-tokentrimmer-* response headers LiteLLM
+# surfaces when litellm.return_response_headers=True.
+litellm = ["litellm>=1.40"]
+# OpenTelemetry span recording. The integrations record cost attributes onto the
+# current span when this is installed; without it, they still accumulate totals.
 otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
-# CI installs ONLY this extra (see .github/workflows/sdks.yml), so it must pull
-# in langchain-core + opentelemetry for the integration tests to run. It omits
-# langchain-openai (heavy, only exercised by an importorskip'd factory test).
+# CI installs ONLY this extra (see .github/workflows/sdks.yml), so it must pull in
+# every dep the integration tests exercise: langchain-core + opentelemetry (the
+# LangChain callback + span recording), langgraph (callback-propagation test), and
+# litellm (the LiteLLM logger tests, incl. the respx end-to-end round-trip). It
+# omits langchain-openai (heavy, only exercised by an importorskip'd factory test).
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "respx>=0.22",
     "langchain-core>=0.3",
+    "langgraph>=0.2",
+    "litellm>=1.40",
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
 ]

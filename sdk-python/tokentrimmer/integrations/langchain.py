@@ -45,10 +45,13 @@ surfacing headers), the callback degrades gracefully: no headers are found, no
 attributes/totals are recorded, and nothing is raised — the chain runs normally,
 just without cost attribution.
 
-Scope: this is the v1 LangChain (Python) + OTel-semconv integration. Sibling
-frameworks (LiteLLM, Vercel AI SDK, LangGraph) are deferred follow-ups; they can
-reuse :mod:`tokentrimmer.semconv` and :meth:`TokenTrimmerMeta.from_headers`
-identically.
+Scope: this is the LangChain (Python) + OTel-semconv integration. It also drives
+**LangGraph** unchanged — a LangGraph graph runs on LangChain's callback manager,
+so passing this callback via ``graph.invoke(..., config={"callbacks": [cb]})``
+propagates it to every LLM call inside the graph's nodes (see the README). The
+sibling **LiteLLM** logger lives in :mod:`tokentrimmer.integrations.litellm`;
+both reuse :mod:`tokentrimmer.semconv`, :meth:`TokenTrimmerMeta.from_headers`, and
+the shared :class:`~tokentrimmer.integrations._budget.BudgetExceeded` identically.
 """
 
 from __future__ import annotations
@@ -66,28 +69,22 @@ except ImportError as exc:  # pragma: no cover - exercised via the extras guard
     ) from exc
 
 from tokentrimmer import semconv
+
+# BudgetExceeded is the shared per-run budget primitive (originally defined here
+# in 0.2.0, lifted to _budget.py in 0.3.0 so the LiteLLM logger shares it). It is
+# re-exported here so ``from tokentrimmer.integrations.langchain import
+# BudgetExceeded`` keeps working.
 from tokentrimmer.client import DEFAULT_BASE_URL, TokenTrimmerMeta
+from tokentrimmer.integrations._budget import BudgetExceeded
+from tokentrimmer.integrations._spans import record_on_current_span
 
 _logger = logging.getLogger("tokentrimmer.integrations.langchain")
 
-
-class BudgetExceeded(RuntimeError):
-    """Raised when a run's accumulated cost exceeds the configured budget.
-
-    Carries the offending total and the limit so a caller catching it can report
-    or react. Because :class:`TokenTrimmerCostCallback` sets ``raise_error =
-    True``, LangChain propagates this out of the ``invoke`` / ``stream`` call
-    rather than swallowing it — the run stops on the LLM finish that tipped the
-    accumulated cost past the cap.
-    """
-
-    def __init__(self, total_cost_usd: float, limit_usd: float) -> None:
-        self.total_cost_usd = total_cost_usd
-        self.limit_usd = limit_usd
-        super().__init__(
-            f"TokenTrimmer run budget exceeded: accumulated ${total_cost_usd:.6f} "
-            f"> limit ${limit_usd:.6f}"
-        )
+__all__ = [
+    "BudgetExceeded",
+    "TokenTrimmerCostCallback",
+    "make_gateway_chat_openai",
+]
 
 
 class TokenTrimmerCostCallback(BaseCallbackHandler):
@@ -164,7 +161,7 @@ class TokenTrimmerCostCallback(BaseCallbackHandler):
         attrs.update(_token_attributes(response))
 
         if self.record_spans and attrs:
-            _record_on_current_span(attrs)
+            record_on_current_span(attrs)
 
         if meta.cost_usd is not None:
             self.total_cost_usd += meta.cost_usd
@@ -261,22 +258,6 @@ def _token_attributes(response: LLMResult) -> Dict[str, Any]:
             if attrs:
                 return attrs
     return {}
-
-
-def _record_on_current_span(attrs: Mapping[str, Any]) -> None:
-    """Set ``attrs`` on the current OpenTelemetry span, if one is recording.
-
-    OpenTelemetry is an optional extra: when it isn't installed this is a no-op,
-    so the callback still accumulates totals without the ``otel`` dependency.
-    """
-    try:
-        from opentelemetry import trace
-    except ImportError:
-        return
-    span = trace.get_current_span()
-    # NonRecordingSpan (no active tracer) reports is_recording() == False.
-    if span is not None and span.is_recording():
-        span.set_attributes(dict(attrs))
 
 
 def make_gateway_chat_openai(

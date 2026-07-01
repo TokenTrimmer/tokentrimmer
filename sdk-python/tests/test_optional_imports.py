@@ -1,11 +1,12 @@
-"""The base package must import without the optional (langchain / otel) extras.
+"""The base package must import without any optional framework extra.
 
-`import tokentrimmer` and the whole base API must work with neither the
-`langchain` nor the `otel` extra installed. Since CI installs both (via the
-`test` extra), we prove the invariant structurally in a clean subprocess: after
-`import tokentrimmer`, neither `langchain_core` nor `opentelemetry` may appear in
-`sys.modules` — i.e. the base import does not eagerly pull them in. The lazy
-`__getattr__` and the `semconv` module are checked in-process.
+`import tokentrimmer` and the whole base API must work with none of the
+`langchain` / `langgraph` / `litellm` / `otel` extras installed. Since CI installs
+them (via the `test` extra), we prove the invariant structurally in a clean
+subprocess: after `import tokentrimmer`, none of `langchain_core`,
+`opentelemetry`, `litellm`, or `langgraph` may appear in `sys.modules` — i.e. the
+base import does not eagerly pull them in. The lazy `__getattr__` and the
+`semconv` module are checked in-process.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ def test_base_import_does_not_pull_in_optional_extras():
         # The base import must not have imported the optional frameworks.
         "assert 'langchain_core' not in sys.modules, 'base import pulled in langchain'\n"
         "assert 'opentelemetry' not in sys.modules, 'base import pulled in opentelemetry'\n"
+        "assert 'litellm' not in sys.modules, 'base import pulled in litellm'\n"
+        "assert 'langgraph' not in sys.modules, 'base import pulled in langgraph'\n"
         # semconv is dependency-free and fully usable.
         "assert semconv.TT_SAVED_USD == 'tokentrimmer.saved_usd'\n"
         "print('ok')\n"
@@ -53,6 +56,31 @@ def test_lazy_attribute_resolves_langchain_callback():
 
     assert cb_cls is TokenTrimmerCostCallback
     assert isinstance(tokentrimmer.BudgetExceeded, type)
+
+
+def test_lazy_attribute_resolves_litellm_logger():
+    # Touching the lazily-exported name imports the integration on demand
+    # (litellm IS installed under the test extra).
+    import tokentrimmer
+
+    logger_cls = tokentrimmer.TokenTrimmerLiteLLMLogger
+    from tokentrimmer.integrations.litellm import TokenTrimmerLiteLLMLogger
+
+    assert logger_cls is TokenTrimmerLiteLLMLogger
+
+
+def test_budget_exceeded_is_shared_across_integrations():
+    # BudgetExceeded is dependency-free and resolves without any extra; both the
+    # LangChain callback and the LiteLLM logger raise the *same* class.
+    import tokentrimmer
+    from tokentrimmer.integrations._budget import BudgetExceeded
+
+    assert tokentrimmer.BudgetExceeded is BudgetExceeded
+    from tokentrimmer.integrations.langchain import BudgetExceeded as FromLangchain
+    from tokentrimmer.integrations.litellm import BudgetExceeded as FromLitellm
+
+    assert FromLangchain is BudgetExceeded
+    assert FromLitellm is BudgetExceeded
 
 
 def test_unknown_top_level_attribute_still_raises():

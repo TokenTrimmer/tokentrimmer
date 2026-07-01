@@ -37,10 +37,9 @@ from tokentrimmer.agent import Agent, AgentOutcome, Run, RunUsage
 from tokentrimmer.client import StreamCost, TokenTrimmer, TokenTrimmerMeta
 
 if TYPE_CHECKING:  # for type checkers only — no runtime import of the extra
-    from tokentrimmer.integrations.langchain import (
-        BudgetExceeded,
-        TokenTrimmerCostCallback,
-    )
+    from tokentrimmer.integrations._budget import BudgetExceeded
+    from tokentrimmer.integrations.langchain import TokenTrimmerCostCallback
+    from tokentrimmer.integrations.litellm import TokenTrimmerLiteLLMLogger
 
 __all__ = [
     "TokenTrimmer",
@@ -51,24 +50,36 @@ __all__ = [
     "Run",
     "RunUsage",
     "semconv",
-    # Lazily importable (require the `langchain` extra) — see __getattr__.
+    # Lazily importable — see __getattr__. The callbacks require their framework
+    # extra (`langchain` / `litellm`); BudgetExceeded is dependency-free.
     "TokenTrimmerCostCallback",
+    "TokenTrimmerLiteLLMLogger",
     "BudgetExceeded",
 ]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Names that live in an optional-extra submodule. Exposing them at the top level
 # is a convenience, but importing them eagerly would make `import tokentrimmer`
-# hard-depend on LangChain. Resolve them lazily instead: `import tokentrimmer`
-# (and every base API above) works with no extras installed; touching
-# `tokentrimmer.TokenTrimmerCostCallback` imports the integration on demand and,
-# if LangChain is missing, raises the integration's actionable ImportError.
-_LAZY_LANGCHAIN = {"TokenTrimmerCostCallback", "BudgetExceeded"}
+# hard-depend on a framework. Resolve them lazily instead: `import tokentrimmer`
+# (and every base API above) works with no extras installed; touching an
+# integration name imports it on demand and, if the framework is missing, raises
+# the integration's actionable ImportError. `BudgetExceeded` is the shared,
+# dependency-free budget primitive and resolves without any extra.
+_LAZY_LANGCHAIN = {"TokenTrimmerCostCallback"}
+_LAZY_LITELLM = {"TokenTrimmerLiteLLMLogger"}
 
 
 def __getattr__(name: str) -> Any:
+    if name == "BudgetExceeded":
+        from tokentrimmer.integrations._budget import BudgetExceeded
+
+        return BudgetExceeded
     if name in _LAZY_LANGCHAIN:
         from tokentrimmer.integrations import langchain as _lc
 
         return getattr(_lc, name)
+    if name in _LAZY_LITELLM:
+        from tokentrimmer.integrations import litellm as _ll
+
+        return getattr(_ll, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
