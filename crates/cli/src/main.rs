@@ -141,6 +141,29 @@ enum Command {
         /// automation). Ignored without --apply.
         #[arg(long)]
         yes: bool,
+
+        /// Also write a portable, offline-reproducible savings bundle to this
+        /// path. The bundle captures the exact replay input (historical rows,
+        /// proposed routes, the RNG seed, and the catalog/pricing snapshot), the
+        /// expected outputs, and any embedded attestation, so anyone can
+        /// re-derive this plan's savings bit-for-bit with
+        /// `tt verify-bundle <path>`.
+        #[arg(long, conflicts_with = "example")]
+        emit_bundle: Option<String>,
+
+        /// With --emit-bundle: embed a signed attestation reference from this
+        /// `AUDIT-CHAIN.jsonl` export (the file `tt plan --apply` writes). Its
+        /// Ed25519 signatures are then checked offline by `tt verify-bundle`.
+        #[arg(long, requires = "emit_bundle")]
+        attestation: Option<String>,
+    },
+    /// Verify a portable savings bundle OFFLINE: re-run the deterministic plan
+    /// replay from the captured input+seed+pricing, assert the reproduced
+    /// savings match the recorded outputs bit-for-bit, and check any embedded
+    /// attestation signature. Prints PASS/FAIL and exits non-zero on mismatch.
+    VerifyBundle {
+        /// Path to a bundle JSON produced by `tt plan --emit-bundle`.
+        path: String,
     },
     /// Audit log helpers.
     Audit {
@@ -820,8 +843,22 @@ async fn main() -> anyhow::Result<()> {
             example,
             apply,
             yes,
+            emit_bundle,
+            attestation,
         } => {
-            run_plan(input.as_deref(), output.as_deref(), example, apply, yes).await?;
+            run_plan(
+                input.as_deref(),
+                output.as_deref(),
+                example,
+                apply,
+                yes,
+                emit_bundle.as_deref(),
+                attestation.as_deref(),
+            )
+            .await?;
+        }
+        Command::VerifyBundle { path } => {
+            tt_cli::bundle::run_verify_bundle(&path)?;
         }
         Command::Audit {
             action:
@@ -2890,6 +2927,8 @@ async fn run_plan(
     example: bool,
     apply: bool,
     yes: bool,
+    emit_bundle: Option<&str>,
+    attestation: Option<&str>,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
 
@@ -2910,9 +2949,32 @@ async fn run_plan(
     let org_id = plan_input.org_id;
     let plan_id = plan_input.plan_id;
     let proposed = plan_input.proposed_routes.clone();
+    // The bundle records the EXACT input the replay ran on; clone it before
+    // `replay` consumes the original (only when we're actually emitting one).
+    let bundle_input = emit_bundle.map(|_| plan_input.clone());
 
     let result =
         tt_plan_core::replay(plan_input).map_err(|e| anyhow::anyhow!("replay failed: {e}"))?;
+
+    // Emit a portable reproduce-this-savings bundle when requested. This reuses
+    // the exact `(plan_input, result)` pair above — nothing is recomputed — so
+    // `tt verify-bundle` re-derives an identical `PlanResult` from the captured
+    // input+seed+pricing.
+    if let (Some(bundle_path), Some(input_snapshot)) = (emit_bundle, bundle_input) {
+        let attestation_ref = match attestation {
+            Some(chain) => Some(
+                tt_cli::bundle::load_attestation_from_chain(std::path::Path::new(chain))
+                    .with_context(|| format!("load attestation from {chain}"))?,
+            ),
+            None => None,
+        };
+        let bundle =
+            tt_cli::bundle::SavingsBundle::new(input_snapshot, result.clone(), attestation_ref);
+        tt_cli::bundle::write_bundle(std::path::Path::new(bundle_path), &bundle)?;
+        tt_cli::ui::note(&format!(
+            "wrote reproducible savings bundle to {bundle_path}  (verify: tt verify-bundle {bundle_path})"
+        ));
+    }
 
     let payload = match output {
         Some(p) if p.ends_with(".json") => serde_json::to_string_pretty(&result)?,
@@ -3246,6 +3308,8 @@ mod plan_apply_tests {
             false,
             true,  // --apply
             false, // --yes
+            None,  // --emit-bundle
+            None,  // --attestation
         )
         .await;
 
@@ -3271,6 +3335,8 @@ mod plan_apply_tests {
             false,
             false, // --apply
             false, // --yes
+            None,  // --emit-bundle
+            None,  // --attestation
         )
         .await
         .expect("projection without --apply should succeed");
