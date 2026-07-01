@@ -24,6 +24,9 @@ reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 tt-tokenize.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
+# Header-only base64 decode for reading inline image dims from `data:` URLs
+# (PNG IHDR / JPEG SOF) — NOT a full image-decode crate.
+base64 = "0.22"
 
 [dev-dependencies]
 httpmock = "0.8.3"
