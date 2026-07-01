@@ -282,14 +282,14 @@ Useful flags: `--path <dir>` (target a directory other than cwd), `--language <n
 
 ### 5. `tt mcp` — MCP server for AI clients
 
-Exposes TokenTrimmer intelligence (cost preview, cheapest-route lookup, inspect-on-diff, semantic-cache lookup, plan simulation) to MCP-compatible clients over stdio (default) or SSE.
+Exposes TokenTrimmer intelligence (cost preview, cheapest-route lookup, inspect-on-diff, semantic-cache lookup, plan simulation) to MCP-compatible clients over stdio (default) or Streamable HTTP.
 
 ```bash
 # stdio (default), e.g. for Claude Desktop / Claude Code
 tt mcp --tt-api-key tt_live_...
 
-# SSE transport for Cursor / Zed (default port 31416)
-tt mcp --transport sse --tt-api-key tt_live_... --sse-port 31416
+# Streamable HTTP transport for Cursor / Zed (default port 31416)
+tt mcp --transport http --tt-api-key tt_live_... --sse-port 31416
 ```
 
 Register it with an MCP client:
@@ -306,7 +306,7 @@ Register it with an MCP client:
 }
 ```
 
-Tools: `preview_cost`, `find_route_for`, `inspect_diff`, `lookup_semantic_cache`, `simulate_plan`. Resources: `cost-ledger/last-7d`, `inspect/baseline`, plan history.
+Tools (always available): `preview_cost` (estimate cost before sending), `find_route_for` (cheapest route for a model), `inspect_diff` (Inspect scan on a diff), `get_repo_context` (repo context for prompts), `lookup_semantic_cache` (check the semantic cache), `simulate_plan` (simulate a routing plan). With `DATABASE_URL` + verified key: `get_spend_today` (current-day org spend), `check_budget_remaining` (remaining monthly budget), `set_cost_limit` (set org or per-key monthly cap). With `--allow-write` + `DATABASE_URL`: `add_route` (add a gateway route), `apply_plan` (apply an optimization plan). With `--query-config`: `run_query` (run a named dataset query), `list_datasets` (list configured datasets). Resources: `mcp://tokentrimmer/cost-ledger/last-7d`, `mcp://tokentrimmer/inspect/baseline`, `mcp://tokentrimmer/plan/history?last=10`.
 
 **Requires:** a `tt_live_…` key — run `tt login --token <KEY>`, or pass `--tt-api-key` / set `TT_API_KEY`. The hosted API base defaults to `https://api.tokentrimmer.com` (override with `--tt-api-base` or `TT_API_BASE`).
 
