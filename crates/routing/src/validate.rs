@@ -180,6 +180,12 @@ pub fn validate_panel(then: &RouteAction) -> Result<(), ValidationError> {
 /// When the route requires image or audio input, the target must be
 /// `Vision`-capable (the runtime guard sets `vision=true` for both). An unknown
 /// target (`lookup` returns `None`) is permissive, matching the runtime guard.
+///
+/// `has_documents` is DELIBERATELY excluded from `needs_vision`: a document
+/// route's whole purpose is to target a TEXT model (the Document Lane distills
+/// the document to text pre-routing), so it must validate against a non-Vision
+/// target rather than being rejected for lacking Vision. See the field doc on
+/// [`RouteConditions::has_documents`].
 pub fn validate_capability(
     when: &RouteConditions,
     then: &RouteAction,
@@ -317,6 +323,30 @@ mod tests {
         let when = RouteConditions::default();
         let lookup = |_: &str| -> Option<ModelInfo> { None };
         assert!(validate_capability(&when, &action("anything"), lookup).is_ok());
+    }
+
+    #[test]
+    fn has_documents_validates_against_text_target() {
+        // The key difference from `has_images`: a document route downgrades to a
+        // TEXT model, so `has_documents:true` must NOT require a Vision target —
+        // a text (non-Vision) target validates cleanly.
+        let when = RouteConditions {
+            has_documents: Some(true),
+            ..Default::default()
+        };
+        let lookup = |m: &str| -> Option<ModelInfo> {
+            match m {
+                "txt" => Some(text_model("txt")),
+                "vis" => Some(vision_model("vis")),
+                _ => None,
+            }
+        };
+        assert!(
+            validate_capability(&when, &action("txt"), lookup).is_ok(),
+            "a document route must validate against a text (non-Vision) target"
+        );
+        // A Vision target is also fine (documents impose no capability gate).
+        assert!(validate_capability(&when, &action("vis"), lookup).is_ok());
     }
 
     #[test]

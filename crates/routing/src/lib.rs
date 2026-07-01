@@ -91,6 +91,15 @@ pub struct RouteConditions {
     /// (`ContentPart::InputAudio`). `Some(false)` requires no audio; `None` ignores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_audio: Option<bool>,
+    /// Match only if the request carries at least one document input part
+    /// (`ContentPart::Document`) — the Document Lane signal (D4a). `Some(false)`
+    /// requires no document; `None` ignores. UNLIKE `has_images`/`has_audio`,
+    /// this does NOT require a Vision-capable target: a document route targets a
+    /// TEXT model (the pre-routing seam distills the document to text before
+    /// dispatch), so it is deliberately absent from the `needs_vision` gate in
+    /// `validate::validate_capability`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_documents: Option<bool>,
     /// Match if the request's user+system text contains ANY of these keywords
     /// (case-insensitive substring). Empty = ignore.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -688,6 +697,11 @@ fn matches(
             return false;
         }
     }
+    if let Some(want) = c.has_documents {
+        if tt_shared::capability_check::request_has_documents(req) != want {
+            return false;
+        }
+    }
     if !c.prompt_contains_any_of.is_empty() {
         let text = tt_shared::capability_check::request_input_text(req).to_lowercase();
         if !c
@@ -706,7 +720,7 @@ mod tests {
     use super::*;
     use tt_shared::{
         context::{ProviderCredentials, SecretString},
-        messages::{ContentPart, ImageUrl, InputAudio},
+        messages::{ContentPart, DocumentPart, DocumentSource, ImageUrl, InputAudio},
         ChatCompletionRequest, Message, MessageContent,
     };
 
@@ -783,6 +797,18 @@ mod tests {
             input_audio: InputAudio {
                 data: "abc".into(),
                 format: "wav".into(),
+            },
+        }
+    }
+
+    fn document_part() -> ContentPart {
+        ContentPart::Document {
+            document: DocumentPart {
+                source: DocumentSource::Base64 {
+                    media_type: "application/pdf".into(),
+                    data: "JVBERi0=".into(),
+                },
+                filename: Some("a.pdf".into()),
             },
         }
     }
@@ -866,6 +892,61 @@ mod tests {
         assert!(eng
             .evaluate(
                 &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn has_documents_true_matches_only_document_requests() {
+        // A document route targets a TEXT model ("cheap") — the Document Lane
+        // point. It matches only requests carrying a Document part, and NOT
+        // image/audio/text-only requests.
+        let route = Route {
+            when: RouteConditions {
+                has_documents: Some(true),
+                ..Default::default()
+            },
+            ..make_route("docs", 10, vec![], "cheap")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("gpt-4o", document_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_some());
+        // Image and text-only requests must NOT match a document route.
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("gpt-4o", image_part()),
+                &make_ctx(None),
+                100
+            )
+            .is_none());
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_none());
+    }
+
+    #[test]
+    fn has_documents_false_matches_only_non_document_requests() {
+        let route = Route {
+            when: RouteConditions {
+                has_documents: Some(false),
+                ..Default::default()
+            },
+            ..make_route("text", 10, vec![], "cheap")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_some());
+        assert!(eng
+            .evaluate(
+                &make_req_with_part("gpt-4o", document_part()),
                 &make_ctx(None),
                 100
             )
