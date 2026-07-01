@@ -14,6 +14,9 @@ pub struct AddArgs {
     pub to: Option<String>,
     pub when_has_images: bool,
     pub when_has_audio: bool,
+    /// `--when-has-documents`: match only requests carrying a document input
+    /// part (Document Lane). Unlike images/audio, may target a text model.
+    pub when_has_documents: bool,
     pub when_tag: Option<String>,
     pub when_prompt_contains: Vec<String>,
     pub when_cost_gt: Option<f64>,
@@ -83,6 +86,9 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     }
     if args.when_has_audio {
         when.insert("has_audio".into(), json!(true));
+    }
+    if args.when_has_documents {
+        when.insert("has_documents".into(), json!(true));
     }
     if let Some(tag) = &args.when_tag {
         when.insert("tag_equals".into(), json!(tag));
@@ -405,6 +411,7 @@ mod tests {
             to: None,
             when_has_images: false,
             when_has_audio: false,
+            when_has_documents: false,
             when_tag: None,
             when_prompt_contains: vec![],
             when_cost_gt: None,
@@ -537,6 +544,23 @@ mod tests {
         assert_eq!(body["then"]["fallbacks"], json!(["gpt-4o"]));
         assert_eq!(body["name"], "vis");
         assert_eq!(body["enabled"], false);
+    }
+
+    #[test]
+    fn when_has_documents_sets_condition() {
+        // A document route may target a TEXT model — no vision requirement.
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-5-mini".into()),
+            when_has_documents: true,
+            ..base_args()
+        })
+        .unwrap();
+        assert_eq!(body["when"]["has_documents"], true);
+        assert!(
+            body["when"].get("has_images").is_none(),
+            "documents must not imply has_images"
+        );
+        assert_eq!(body["then"]["target_model"], "gpt-5-mini");
     }
 
     #[test]

@@ -211,6 +211,12 @@ pub struct RouteConditions {
     /// Mirror of `tt_routing::RouteConditions::has_audio`. See `has_images`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_audio: Option<bool>,
+    /// Mirror of `tt_routing::RouteConditions::has_documents` (Document Lane
+    /// D4a). Like the other modality mirrors, not evaluable in replay
+    /// (RequestLog records no modality) — a conservative non-match in
+    /// `routing::matches_conditions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_documents: Option<bool>,
     /// Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. Replay
     /// matches against `RequestLog.body` when present, else conservative no-match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1142,6 +1148,7 @@ mod tests {
             tag_equals: Some("batch".to_string()),
             has_images: Some(true),
             has_audio: Some(false),
+            has_documents: Some(true),
             prompt_contains_any_of: vec!["summarize".to_string()],
             estimated_cost_gt: Some(0.01),
             estimated_cost_lt: Some(5.0),
@@ -1159,6 +1166,7 @@ mod tests {
         assert_eq!(plan_conditions.tag_equals, Some("batch".to_string()));
         assert_eq!(plan_conditions.has_images, Some(true));
         assert_eq!(plan_conditions.has_audio, Some(false));
+        assert_eq!(plan_conditions.has_documents, Some(true));
         assert_eq!(
             plan_conditions.prompt_contains_any_of,
             vec!["summarize".to_string()]

@@ -640,6 +640,10 @@ enum RouteAction {
         when_has_images: bool,
         #[arg(long)]
         when_has_audio: bool,
+        /// Match only requests carrying a document input part (Document Lane).
+        /// UNLIKE --when-has-images, a document route may target a TEXT model.
+        #[arg(long)]
+        when_has_documents: bool,
         /// Match only requests tagged with this value (X-TokenTrimmer-Tag header).
         #[arg(long)]
         when_tag: Option<String>,
@@ -1316,6 +1320,7 @@ async fn main() -> anyhow::Result<()> {
                     to,
                     when_has_images,
                     when_has_audio,
+                    when_has_documents,
                     when_tag,
                     when_prompt_contains,
                     when_cost_gt,
@@ -1338,6 +1343,7 @@ async fn main() -> anyhow::Result<()> {
                     to,
                     when_has_images,
                     when_has_audio,
+                    when_has_documents,
                     when_tag,
                     when_prompt_contains,
                     when_cost_gt,
