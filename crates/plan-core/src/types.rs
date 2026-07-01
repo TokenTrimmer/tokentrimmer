@@ -1041,6 +1041,8 @@ mod tests {
             compress: false, // not mirrored (pre-existing) — omitted when false
             // not mirrored (Document Lane D2, runtime-only) — omitted when false
             doc_compaction: false,
+            // not mirrored (Document Lane D4, runtime-only) — omitted when false
+            document_lane: false,
             redact: true,
             format_switch: Some("csv".to_string()),
             diff: false, // mutually exclusive with format_switch on a real route

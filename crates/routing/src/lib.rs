@@ -223,6 +223,19 @@ pub struct RouteAction {
     /// false (back-compat).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub doc_compaction: bool,
+    /// Opt the matched request into the **Document Lane** (D4): the pre-routing
+    /// image/document → text distillation seam. When true (and the seam is
+    /// live — D4c), image/document input parts are distilled to text BEFORE
+    /// routing, so `request_has_images`/`request_has_documents` flip false and a
+    /// route may downgrade the request to a cheaper TEXT model; the
+    /// vision-avoided saving books to the ISOLATED `doc_vision_saved_est_usd`
+    /// (never the invoice-reconciled headline). Lossy substitution stays
+    /// judge-gated (the `DocDistillGate` + 0.90 auto-pause floor) and fails open
+    /// to the verbatim request. **Off by default** — in D4a this flag only
+    /// carries opt-in intent (the seam is not wired yet); omitted from JSON when
+    /// false (back-compat, mirrors `compress`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub document_lane: bool,
     /// Opt the matched request into the **request-redaction guardrail**
     /// (request-pass pipeline): a conservative SAFETY transform that replaces
     /// PII/secrets in the OUTBOUND request (user prose, system blocks,
@@ -745,6 +758,7 @@ mod tests {
                 batch: false,
                 compress: false,
                 doc_compaction: false,
+                document_lane: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
@@ -1134,6 +1148,7 @@ mod tests {
             batch: false,
             compress: false,
             doc_compaction: false,
+            document_lane: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1178,6 +1193,7 @@ mod tests {
             batch: false,
             compress: false,
             doc_compaction: false,
+            document_lane: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1214,6 +1230,7 @@ mod tests {
             batch: false,
             compress: false,
             doc_compaction: false,
+            document_lane: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1275,6 +1292,48 @@ mod tests {
         assert!(serde_json::to_string(&b)
             .unwrap()
             .contains("\"doc_compaction\":true"));
+    }
+
+    /// `document_lane` (Document Lane D4) defaults to false, is omitted from JSON
+    /// when false (back-compat), `{"document_lane":true}` deserializes set, and
+    /// a `document_lane`-only modifier route (no target_model) is a valid effect.
+    #[test]
+    fn route_action_document_lane_defaults_false_omits_and_is_an_effect() {
+        // Default: absent on read → false.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.document_lane, "document_lane must default false");
+
+        // {"document_lane":true} deserializes with the flag set.
+        let on: RouteAction = serde_json::from_str(r#"{"document_lane":true}"#).unwrap();
+        assert!(on.document_lane, "explicit true must deserialize as set");
+
+        // Omitted from JSON when false (existing route JSON stays byte-identical).
+        let off = RouteAction {
+            target_model: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&off).unwrap(),
+            r#"{"target_model":"x"}"#,
+            "document_lane:false must be omitted from the wire form"
+        );
+
+        // Present when true.
+        let b = RouteAction {
+            document_lane: true,
+            ..off
+        };
+        assert!(serde_json::to_string(&b)
+            .unwrap()
+            .contains("\"document_lane\":true"));
+
+        // A modifier-only route (no target_model) carrying ONLY document_lane is
+        // a valid effect (mirrors compress/doc_compaction).
+        let modifier_only = RouteAction {
+            document_lane: true,
+            ..Default::default()
+        };
+        assert!(crate::validate::validate_route_has_effect(&modifier_only).is_ok());
     }
 
     /// `format_switch` defaults to `None`, is omitted from JSON when `None`

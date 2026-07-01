@@ -283,6 +283,7 @@ fn panel_route(name: &str, strategy: &str, paused: bool, max_cost_usd: Option<f6
             batch: false,
             compress: false,
             doc_compaction: false,
+            document_lane: false,
             redact: false,
             format_switch: None,
             diff: false,
@@ -327,6 +328,7 @@ fn non_panel_route(name: &str) -> Route {
             batch: false,
             compress: true, // a benign effect so the route is not a no-op.
             doc_compaction: false,
+            document_lane: false,
             redact: false,
             format_switch: None,
             diff: false,
