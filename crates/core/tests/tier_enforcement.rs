@@ -431,6 +431,7 @@ async fn spend_sink_and_auth_share_same_enforcer_seam() {
                     monthly_served_cap: None,
                     l2_cache: true,
                 },
+                semantic_cache_disabled: false,
             })
         }
     }
@@ -500,6 +501,7 @@ async fn per_key_spend_cap_denies_through_router() {
                     monthly_served_cap: None,
                     l2_cache: true,
                 },
+                semantic_cache_disabled: false,
             })
         }
         async fn resolve_key_cap(&self, _org_id: Uuid, _api_key_id: Uuid) -> KeyBudgetCap {

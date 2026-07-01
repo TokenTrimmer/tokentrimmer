@@ -67,15 +67,25 @@ pub struct ResolvedTier {
     pub caller_tier: CallerTier,
     /// Gateway enforcement limits derived from the tier.
     pub limits: BudgetLimits,
+    /// Per-org compliance control: `true` means the org has opted OUT of the
+    /// semantic (L2) cache and the request path must force caching off for it.
+    /// `false` (the default for every org that has not opted out) means caching
+    /// behaves exactly as today. Read best-effort alongside the tier so it rides
+    /// the same [`CachedTierResolver`] cache; fail-soft to `false` (see
+    /// [`PostgresTierResolver::fetch_semantic_cache_disabled`]).
+    pub semantic_cache_disabled: bool,
 }
 
 impl ResolvedTier {
     /// Safe default — used when resolution fails (fail-open) or when no
-    /// subscription record exists.
+    /// subscription record exists. Caching is ENABLED
+    /// (`semantic_cache_disabled = false`): the compliance flag only ever
+    /// tightens, so the safe default when it is unset/unreadable is "cache on".
     pub fn free_default() -> Self {
         Self {
             caller_tier: CallerTier::Free,
             limits: BudgetLimits::free_tier(),
+            semantic_cache_disabled: false,
         }
     }
 }
@@ -189,6 +199,40 @@ impl PostgresTierResolver {
         matches!(row, Ok(Some((true,))))
     }
 
+    /// Best-effort read of `orgs.semantic_cache_disabled` — a per-org compliance
+    /// control letting a no-cache tenant opt OUT of the L2 semantic cache
+    /// entirely. Fail-soft → `false` (caching ENABLED).
+    ///
+    /// **Runtime `sqlx::query_as`, NOT a compile-checked `query!`** — mirrors
+    /// [`Self::fetch_is_internal`] exactly. The `semantic_cache_disabled` column
+    /// is added by a SEPARATE cloud migration that may not have run yet against
+    /// the pool this gateway is pointed at; a compile-time-checked `query!` would
+    /// fail to *build* against a schema without the column. With the runtime
+    /// form, a missing column is a runtime `Err` that this fn folds to `false`
+    /// (via `matches!(.., Ok(Some((true,))))`), so the gateway keeps building and
+    /// running against an un-migrated schema — identical behaviour to today.
+    ///
+    /// **Compliance tradeoff (deliberate).** Fail-soft-to-`false` means a
+    /// TRANSIENT DB error while reading the flag re-enables caching for an
+    /// opted-out org for the duration of that error, rather than hard-failing the
+    /// request. We accept this to match the gateway-wide fail-open precedent
+    /// (`fetch_is_internal`, tier resolution, cap reads): a DB blip must never
+    /// block legitimate traffic. Because the flag only ever TIGHTENS (an org opts
+    /// OUT), an UNSET/absent flag correctly means "caching enabled" with zero
+    /// behaviour change for every org that has not opted out; and when the flag
+    /// IS set `true` and the read succeeds, caching is reliably forced off.
+    /// Read alongside `is_internal` (a separate query, so a missing
+    /// `semantic_cache_disabled` column never breaks the entitlement read) and
+    /// cached by [`CachedTierResolver`], so this adds no per-request DB round-trip.
+    async fn fetch_semantic_cache_disabled(&self, org_id: Uuid) -> bool {
+        let row: Result<Option<(bool,)>, sqlx::Error> =
+            sqlx::query_as(r#"SELECT semantic_cache_disabled FROM orgs WHERE id = $1"#)
+                .bind(org_id)
+                .fetch_optional(&self.pool)
+                .await;
+        matches!(row, Ok(Some((true,))))
+    }
+
     /// Best-effort read of the per-org budget-cap override from
     /// `org_budget_caps` (rv-budget-cap-ui). Returns `(monthly_cap_usd,
     /// monthly_request_cap)`.
@@ -270,6 +314,11 @@ impl std::fmt::Debug for PostgresTierResolver {
 #[async_trait]
 impl TierResolver for PostgresTierResolver {
     async fn resolve(&self, org_id: Uuid) -> Result<ResolvedTier, TierResolverError> {
+        // Per-org semantic-cache compliance flag — read best-effort alongside
+        // `is_internal` (a separate query) so it rides the same `CachedTierResolver`
+        // cache and every returned `ResolvedTier` carries it. Fail-soft → false.
+        let semantic_cache_disabled = self.fetch_semantic_cache_disabled(org_id).await;
+
         // Internal orgs (platform-admin SP-0) get unlimited limits regardless
         // of their subscription record. Fail-soft: any DB error → false →
         // normal resolution continues.
@@ -277,6 +326,7 @@ impl TierResolver for PostgresTierResolver {
             return Ok(ResolvedTier {
                 caller_tier: CallerTier::Scale, // top tier label; semantics carried by unlimited limits
                 limits: BudgetLimits::internal_unlimited(),
+                semantic_cache_disabled,
             });
         }
 
@@ -304,6 +354,7 @@ impl TierResolver for PostgresTierResolver {
         Ok(ResolvedTier {
             caller_tier,
             limits,
+            semantic_cache_disabled,
         })
     }
 
@@ -643,6 +694,54 @@ mod tests {
         assert_eq!(resolved.caller_tier, CallerTier::Free);
         assert!(!resolved.limits.l2_cache);
         assert_eq!(resolved.limits.max_requests_per_min, Some(60));
+    }
+
+    // ── semantic_cache_disabled (per-org compliance control) ────────────────
+
+    #[test]
+    fn free_default_has_caching_enabled() {
+        // The unset/unresolved default MUST be caching-ENABLED (the flag only
+        // ever tightens), so an org that never opted out sees zero change.
+        assert!(
+            !ResolvedTier::free_default().semantic_cache_disabled,
+            "unset semantic_cache_disabled must default to false (caching enabled)"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_error_fails_soft_to_caching_enabled() {
+        // A resolver/DB error (incl. a missing column) folds to free_default,
+        // whose semantic_cache_disabled is false → caching stays enabled. This
+        // pins the documented fail-soft compliance tradeoff: a DB blip re-enables
+        // caching rather than hard-failing, and never panics.
+        let org = Uuid::from_u128(7);
+        let (stub, _counter) = StubResolver::err();
+        let resolved = resolve_or_free(&stub, org).await;
+        assert!(
+            !resolved.semantic_cache_disabled,
+            "a resolver error must fail soft to caching ENABLED"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_tier_carries_semantic_cache_disabled_through_cache() {
+        // An opted-out org's flag survives resolution + the CachedTierResolver.
+        let org = Uuid::from_u128(8);
+        let disabled = ResolvedTier {
+            caller_tier: CallerTier::Pro,
+            limits: BudgetLimits::free_tier(),
+            semantic_cache_disabled: true,
+        };
+        let (stub, _counter) = StubResolver::ok(disabled);
+        let cached = CachedTierResolver::new(stub);
+        let resolved = cached.resolve(org).await.expect("resolve");
+        assert!(
+            resolved.semantic_cache_disabled,
+            "an opted-out org's flag must be carried through resolution + cache"
+        );
+        // Cache hit on the second call preserves the flag.
+        let again = cached.resolve(org).await.expect("resolve again");
+        assert!(again.semantic_cache_disabled);
     }
 
     // ── resolve_key_cap: default + caching (P2) ─────────────────────────────
