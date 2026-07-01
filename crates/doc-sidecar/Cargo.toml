@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Out-of-process OCR/parse sidecar for the TokenTrimmer Document Lane (POST /extract)."
+# Internal operational binary deployed alongside the gateway — not a
+# distributable library/CLI, so it is not published to crates.io (mirrors
+# tt-ts-types). This also excludes it from the per-crate LICENSE/NOTICE sync.
+publish = false
 
 [lib]
 name = "doc_sidecar"
