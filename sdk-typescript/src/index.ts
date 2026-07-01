@@ -89,6 +89,8 @@ export interface TokenTrimmerMeta {
   savedUsd: number | null;
   /** `'hit-l1' | 'hit-l2' | 'neg-hit' | 'miss' | 'none' | 'sandbox'` */
   cache: string | null;
+  /** Matched route name (`x-tokentrimmer-route-matched`), when routing applied. */
+  route: string | null;
 }
 
 /**
@@ -147,7 +149,29 @@ function parseMeta(headers: Headers): TokenTrimmerMeta {
     baselineCostUsd: parseFloatOrNull(headers.get('x-tokentrimmer-baseline-cost-usd')),
     savedUsd: parseFloatOrNull(headers.get('x-tokentrimmer-saved-usd')),
     cache: headers.get('x-tokentrimmer-cache'),
+    // The matched route name rides on `x-tokentrimmer-route-matched` (the gateway
+    // stamps it via `stamp_route_matched_header`); surfacing it lets the OTel
+    // semconv mapping populate `tokentrimmer.route`. Mirrors the Python client.
+    route: headers.get('x-tokentrimmer-route-matched'),
   };
+}
+
+/**
+ * Parse `X-TokenTrimmer-*` response headers into a {@link TokenTrimmerMeta} from
+ * ANY header container — a `Headers`, a plain `Record<string, string>`, or the
+ * `[key, value]` pair array shape. This is the canonical, reusable header
+ * extractor for framework integrations (e.g. the Vercel AI SDK adapter in
+ * `./vercel`), so they do NOT reinvent the header names / float parsing.
+ *
+ * @example
+ * ```ts
+ * import { metaFromHeaders } from '@tokentrimmer/client';
+ * const meta = metaFromHeaders(result.response.headers); // AI SDK raw headers
+ * console.log(meta.savedUsd, meta.route);
+ * ```
+ */
+export function metaFromHeaders(src: unknown): TokenTrimmerMeta {
+  return parseMeta(toHeaders(src));
 }
 
 // Valid X-TokenTrimmer-Cache REQUEST-override values (API reference §6.1).

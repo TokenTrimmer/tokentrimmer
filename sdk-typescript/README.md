@@ -190,6 +190,45 @@ Prefer no code? The [`tt` CLI](https://github.com/TokenTrimmer/tokentrimmer)
 wraps the same flow: `tt batch submit requests.jsonl`, `tt batch get <id>`,
 `tt batch download <output_file_id>`.
 
+## Framework integrations: cost/savings into OTel spans
+
+Point the Vercel AI SDK (`ai`) at the Gateway with a
+`baseURL` swap and the `x-tokentrimmer-*` cost/savings headers ride back on
+`result.response.headers` — but they're invisible to the observability you
+already watch. The optional `@tokentrimmer/client/vercel` adapter recovers them
+and records them as OpenTelemetry span attributes using a shared semantic-
+convention vocabulary (`gen_ai.*` + `tokentrimmer.{cost_usd,saved_usd,cache,route,…}`)
+that is **identical** across the gateway span, this TS adapter, and the Python
+SDK — so one dashboard query resolves cost end to end, in any language.
+
+```ts
+import { openai } from '@ai-sdk/openai';
+import { generateText } from 'ai';
+import { TokenTrimmerRunCost } from '@tokentrimmer/client/vercel';
+
+const gateway = openai.provider({ baseURL: 'https://api.tokentrimmer.com/v1', apiKey: 'tt_live_...' });
+const run = new TokenTrimmerRunCost({ maxCostUsd: 0.5 }); // optional per-run budget
+
+const result = await generateText({
+  model: gateway('claude-haiku-4-5'),
+  prompt: 'Hello',
+  experimental_telemetry: { isEnabled: true }, // AI SDK records the active span
+});
+await run.record(result); // reads TT headers, records span attrs, accumulates totals
+
+console.log(`run cost $${run.totalCostUsd} · saved $${run.totalSavedUsd}`);
+```
+
+A run whose accumulated cost exceeds `maxCostUsd` throws `BudgetExceededError`
+(a framework-level stop). For one-off recording use `recordTokenTrimmerCost(result, { span })`.
+A non-gateway response (no `x-tokentrimmer-*` headers) degrades quietly: nothing
+is recorded and nothing is thrown.
+
+`ai` and `@opentelemetry/api` are **optional** peer dependencies — install them
+only if you use this adapter. The base `import { TokenTrimmer } from '@tokentrimmer/client'`
+never depends on them. The raw semconv constants + `costInfoToAttributes()` are
+also exposed dependency-free at `@tokentrimmer/client/semconv`.
+
 ## Self-hosted Gateway
 
 ```ts
