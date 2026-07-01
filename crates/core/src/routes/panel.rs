@@ -1564,6 +1564,7 @@ fn aggregate_cost_breakdown(total_cost_usd: f64) -> CostBreakdown {
         provider_cache_saved_usd: 0.0,
         flex_saved_usd: 0.0,
         compression_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
         summarizer_tax_usd: 0.0,
         batch_forgone_usd: 0.0,

@@ -227,6 +227,7 @@ fn diff_action() -> RouteAction {
         flex: false,
         batch: false,
         compress: false,
+        doc_compaction: false,
         redact: false,
         format_switch: None,
         diff: true,
