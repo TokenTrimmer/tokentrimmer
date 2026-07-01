@@ -17,6 +17,11 @@
 //! default-CLOSED and fails open to the verbatim request. Error blobs are never
 //! distilled. See `docs/superpowers/specs/2026-07-01-document-lane-d4-server-seam-design.md`.
 
+/// The fail-open client for the out-of-process `doc-sidecar` OCR/parse service
+/// (D4b). Disabled unless `TT_DOC_SIDECAR_URL` is set; any error/timeout → no
+/// extraction, so the request stays verbatim.
+pub mod sidecar_client;
+
 /// Whether a distillation span is lossless (a PDF text layer — structurally
 /// safe to substitute) or lossy (OCR / a scanned page — must clear the judge +
 /// floor before it may replace the verbatim image).
