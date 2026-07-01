@@ -30,8 +30,17 @@ Usage::
     print(f"Cache: {response.tt.cache}  Trace: {response.tt.trace_id}")
 """
 
+from typing import TYPE_CHECKING, Any
+
+from tokentrimmer import semconv
 from tokentrimmer.agent import Agent, AgentOutcome, Run, RunUsage
 from tokentrimmer.client import StreamCost, TokenTrimmer, TokenTrimmerMeta
+
+if TYPE_CHECKING:  # for type checkers only — no runtime import of the extra
+    from tokentrimmer.integrations.langchain import (
+        BudgetExceeded,
+        TokenTrimmerCostCallback,
+    )
 
 __all__ = [
     "TokenTrimmer",
@@ -41,5 +50,25 @@ __all__ = [
     "AgentOutcome",
     "Run",
     "RunUsage",
+    "semconv",
+    # Lazily importable (require the `langchain` extra) — see __getattr__.
+    "TokenTrimmerCostCallback",
+    "BudgetExceeded",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+# Names that live in an optional-extra submodule. Exposing them at the top level
+# is a convenience, but importing them eagerly would make `import tokentrimmer`
+# hard-depend on LangChain. Resolve them lazily instead: `import tokentrimmer`
+# (and every base API above) works with no extras installed; touching
+# `tokentrimmer.TokenTrimmerCostCallback` imports the integration on demand and,
+# if LangChain is missing, raises the integration's actionable ImportError.
+_LAZY_LANGCHAIN = {"TokenTrimmerCostCallback", "BudgetExceeded"}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_LANGCHAIN:
+        from tokentrimmer.integrations import langchain as _lc
+
+        return getattr(_lc, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
