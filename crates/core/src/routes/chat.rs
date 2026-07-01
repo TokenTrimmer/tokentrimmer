@@ -476,6 +476,19 @@ impl CacheBehavior {
             },
         }
     }
+
+    /// Force BOTH lookup and insert off when the org has opted OUT of caching
+    /// via the per-org `semantic_cache_disabled` compliance control. A no-op
+    /// when `disabled` is false, so orgs that have not opted out keep today's
+    /// behaviour exactly. When true this forces the request past both the L1
+    /// exact-match and the L2 semantic cache (no read, no write) — the correct
+    /// posture for a no-cache compliance tenant.
+    pub(crate) fn apply_org_cache_disabled(&mut self, disabled: bool) {
+        if disabled {
+            self.do_lookup = false;
+            self.do_insert = false;
+        }
+    }
 }
 
 /// `X-TokenTrimmer-Cache` → `(do_lookup, do_insert)` per the documented modes.
@@ -3279,6 +3292,24 @@ pub(crate) async fn prepare(
     if diff_plan.is_some() {
         cache_behavior.do_lookup = false;
         cache_behavior.do_insert = false;
+    }
+    // Per-org `semantic_cache_disabled` compliance control (a hard deal-blocker
+    // for no-cache tenants): when the org has explicitly opted OUT of caching,
+    // force BOTH lookup and insert off for this request. Resolved via the tier
+    // resolver so it rides the same per-org `CachedTierResolver` cache the auth
+    // middleware already populated earlier in this request (cache hit within the
+    // 30s TTL → no extra DB round-trip on the hot path). Fail-soft: on any
+    // resolver error `resolve_or_free` yields Free defaults with
+    // `semantic_cache_disabled = false`, so a DB blip never disables caching for
+    // a non-opted-out org. Per the documented compliance tradeoff (see
+    // `PostgresTierResolver::fetch_semantic_cache_disabled`), a transient blip
+    // can conversely re-enable caching for an opted-out org — accepted to match
+    // the gateway-wide fail-open precedent. Zero behaviour change when unset.
+    if let Some(resolver) = state.tier_resolver.as_ref() {
+        let org_cache_disabled = crate::tier_resolver::resolve_or_free(resolver.as_ref(), org_id)
+            .await
+            .semantic_cache_disabled;
+        cache_behavior.apply_org_cache_disabled(org_cache_disabled);
     }
     // Format-switch keeps L1 (the mutated request — instruction + no
     // response_format — hashes to its own exact, per-org key) but disables L2
@@ -6918,6 +6949,48 @@ mod cache_eligibility_tests {
         req.tt_extras
             .insert("cache".into(), serde_json::json!({"mode": "refresh"}));
         let b = CacheBehavior::resolve(&req);
+        assert!(!b.do_lookup);
+        assert!(!b.do_insert);
+    }
+
+    // --- Per-org semantic_cache_disabled compliance control ---
+
+    #[test]
+    fn org_cache_disabled_forces_lookup_and_insert_off() {
+        // An org that opted OUT of caching → both lookup and insert forced off,
+        // even for an otherwise fully cache-eligible request.
+        let req = base_req();
+        let mut b = CacheBehavior::resolve(&req);
+        assert!(b.do_lookup, "precondition: eligible request looks up");
+        assert!(b.do_insert, "precondition: eligible request inserts");
+        b.apply_org_cache_disabled(true);
+        assert!(!b.do_lookup, "disabled org must not look up");
+        assert!(!b.do_insert, "disabled org must not insert");
+    }
+
+    #[test]
+    fn org_cache_not_disabled_is_noop() {
+        // An org WITHOUT the flag (the default) sees zero behaviour change.
+        let req = base_req();
+        let mut b = CacheBehavior::resolve(&req);
+        let (lookup_before, insert_before, ttl_before) = (b.do_lookup, b.do_insert, b.ttl_secs);
+        b.apply_org_cache_disabled(false);
+        assert_eq!(b.do_lookup, lookup_before);
+        assert_eq!(b.do_insert, insert_before);
+        assert_eq!(b.ttl_secs, ttl_before);
+    }
+
+    #[test]
+    fn org_cache_disabled_stays_off_when_already_off() {
+        // Idempotent with the other force-off short-circuits (route/diff/bypass):
+        // applying it to an already-off behavior leaves both off.
+        let mut req = base_req();
+        req.tt_extras
+            .insert("cache".into(), serde_json::json!({"mode": "bypass"}));
+        let mut b = CacheBehavior::resolve(&req);
+        assert!(!b.do_lookup);
+        assert!(!b.do_insert);
+        b.apply_org_cache_disabled(true);
         assert!(!b.do_lookup);
         assert!(!b.do_insert);
     }

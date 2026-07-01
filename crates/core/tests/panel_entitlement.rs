@@ -163,6 +163,7 @@ impl TierResolver for FixedTierResolver {
                 monthly_served_cap: None,
                 l2_cache: self.tier != CallerTier::Free,
             },
+            semantic_cache_disabled: false,
         })
     }
 }
