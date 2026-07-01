@@ -336,3 +336,51 @@ fn recipes_apply_spawns_without_panic() {
         REFUSED_BASE,
     ]);
 }
+
+/// Run `tt <args>` to completion, draining stdout+stderr concurrently (so a
+/// large completion script can't deadlock on a full pipe the way the
+/// `try_wait`-polling `run_tt` harness would), and return (stdout, stderr).
+fn output_tt(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_tt"))
+        .args(args)
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tt binary to completion")
+}
+
+/// `tt completions <shell>` must exit cleanly and emit a non-empty script to
+/// stdout for every supported shell. Fully offline.
+#[test]
+fn completions_emit_scripts_for_every_shell() {
+    let home = tempfile::tempdir().unwrap();
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let out = output_tt(home.path(), &["completions", shell]);
+        assert!(
+            out.status.success(),
+            "`tt completions {shell}` exited non-zero"
+        );
+        assert!(
+            !out.stdout.is_empty(),
+            "`tt completions {shell}` produced no output"
+        );
+        // The generated script must not be corrupted by a startup log line.
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("panicked"),
+            "`tt completions {shell}` panicked"
+        );
+    }
+}
+
+/// `tt man` must exit cleanly and emit a non-empty roff man page to stdout.
+#[test]
+fn man_emits_a_page() {
+    let home = tempfile::tempdir().unwrap();
+    let out = output_tt(home.path(), &["man"]);
+    assert!(out.status.success(), "`tt man` exited non-zero");
+    assert!(!out.stdout.is_empty(), "`tt man` produced no output");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("panicked"),
+        "`tt man` panicked"
+    );
+}
