@@ -176,6 +176,11 @@ enum Command {
         /// unreadable/invalid config refuses to start (fail closed).
         #[arg(long, env = "TT_MCP_QUERY_CONFIG")]
         query_config: Option<PathBuf>,
+        /// Optional action. With no action (the default), `tt mcp` runs the MCP
+        /// server as before — this keeps `tt mcp --transport http …` working.
+        /// `tt mcp install` autowires an MCP client's config instead.
+        #[command(subcommand)]
+        action: Option<McpAction>,
     },
     /// Log in: opens the dashboard to create an API key (paste it back), or pass --token <KEY>.
     Login {
@@ -449,6 +454,63 @@ enum WorkflowAction {
         #[arg(long)]
         output: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Autowire an MCP client's config to launch the TokenTrimmer MCP server.
+    ///
+    /// Locates the client's config JSON per-OS, injects (or overwrites just) an
+    /// `mcpServers.tokentrimmer` entry carrying your resolved API key, and backs
+    /// up the prior file. Merges into existing config — other servers and keys
+    /// are preserved.
+    Install {
+        /// Which client(s) to configure.
+        #[arg(long, value_enum, default_value = "claude-desktop")]
+        client: McpClientArg,
+        /// Show the merged JSON that would be written without touching any file.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the full key in the on-screen summary / dry-run JSON (default: masked).
+        #[arg(long)]
+        reveal: bool,
+        /// Write to this exact config file instead of auto-detecting per-OS.
+        /// Requires exactly one `--client`.
+        #[arg(long)]
+        config_path: Option<PathBuf>,
+        #[arg(long)]
+        tt_api_key: Option<String>,
+        #[arg(long)]
+        tt_api_base: Option<String>,
+    },
+}
+
+/// `--client` selector for `tt mcp install`. `all` expands to every client.
+#[derive(clap::ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
+enum McpClientArg {
+    ClaudeDesktop,
+    ClaudeCode,
+    Cursor,
+    All,
+}
+
+impl McpClientArg {
+    /// Expand the selector into the concrete client set the installer patches.
+    fn expand(self) -> Vec<tt_cli::mcp_install::McpClient> {
+        use tt_cli::mcp_install::McpClient;
+        match self {
+            McpClientArg::ClaudeDesktop => vec![McpClient::ClaudeDesktop],
+            McpClientArg::ClaudeCode => vec![McpClient::ClaudeCode],
+            McpClientArg::Cursor => vec![McpClient::Cursor],
+            McpClientArg::All => {
+                vec![
+                    McpClient::ClaudeDesktop,
+                    McpClient::ClaudeCode,
+                    McpClient::Cursor,
+                ]
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -776,6 +838,43 @@ async fn main() -> anyhow::Result<()> {
             sse_port,
             allow_write,
             query_config,
+            action:
+                Some(McpAction::Install {
+                    client,
+                    dry_run,
+                    reveal,
+                    config_path,
+                    tt_api_key: install_key,
+                    tt_api_base: install_base,
+                }),
+        } => {
+            // `tt mcp install` — the server-serve flags above are unused here
+            // (the parser accepts them but this action ignores them).
+            let _ = (
+                transport,
+                tt_api_key,
+                tt_api_base,
+                sse_port,
+                allow_write,
+                query_config,
+            );
+            tt_cli::mcp_install::run_install(
+                &client.expand(),
+                dry_run,
+                reveal,
+                config_path,
+                install_key,
+                install_base,
+            )?;
+        }
+        Command::Mcp {
+            transport,
+            tt_api_key,
+            tt_api_base,
+            sse_port,
+            allow_write,
+            query_config,
+            action: None,
         } => {
             use tt_mcp::{
                 auth,
