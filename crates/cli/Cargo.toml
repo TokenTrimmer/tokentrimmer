@@ -39,6 +39,12 @@ percent-encoding.workspace = true
 
 axum.workspace = true
 clap.workspace = true
+# Shell-completion + man-page generation for the hidden `tt completions`/`tt man`
+# subcommands. Both track clap's major version (clap 4 → clap_complete 4.x,
+# clap_mangen 0.2.x); not in [workspace.dependencies] since tt-cli is the only
+# consumer.
+clap_complete = "4"
+clap_mangen = "0.2"
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true

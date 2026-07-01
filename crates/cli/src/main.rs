@@ -4,15 +4,35 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 mod audit;
 use audit::AuditAction;
 mod repo_context;
 
+/// Grouped command reference shown at the bottom of `tt --help`.
+///
+/// clap 4 has no native way to sort flat subcommands into multiple help
+/// headings (only `next_help_heading`, which scopes to an item's own args), so
+/// the logical grouping is presented here while the auto-generated `Commands:`
+/// list keeps each command's one-line description.
+const COMMAND_GROUPS: &str = "\
+Command groups:
+  Run             gateway, proxy, chat, agent, embed, models, batch
+  Optimize        inspect, plan, route, recipes, advise, workflow
+  Prove           audit
+  Account         login, logout, whoami, connect
+  MCP & tooling   mcp, init, retrieval, context
+
+Run `tt <command> --help` for details on any command.";
+
 #[derive(Parser)]
 #[command(name = "tt")]
-#[command(about = "TokenTrimmer CLI — gateway, inspect, plan, audit", version)]
+#[command(
+    about = "TokenTrimmer CLI — run traffic (gateway/proxy/chat/agent/embed/batch), optimize cost (inspect/plan/route/recipes/advise), prove savings (audit/verify), manage your account (login/connect), and MCP tooling.",
+    after_help = COMMAND_GROUPS,
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -395,6 +415,17 @@ enum Command {
         #[command(subcommand)]
         action: WorkflowAction,
     },
+    /// Generate shell completions for `tt` (bash/zsh/fish/powershell/elvish) to stdout.
+    ///
+    /// Hidden from `--help`; example: `tt completions zsh > _tt`.
+    #[command(hide = true)]
+    Completions {
+        /// Shell to generate a completion script for.
+        shell: clap_complete::Shell,
+    },
+    /// Render a `tt` man page (roff) to stdout. Hidden; e.g. `tt man > tt.1`.
+    #[command(hide = true)]
+    Man,
 }
 
 #[derive(Subcommand)]
@@ -701,11 +732,14 @@ async fn main() -> anyhow::Result<()> {
     // to STDOUT on startup. That's fine for human commands, but it corrupts a
     // machine-readable `tt inspect --format json|sarif` report when that report
     // is printed to stdout (the GitHub Action does `... > results.sarif`, which
-    // would otherwise prepend a log line and break SARIF parsing). When this
-    // invocation is exactly that, silence the stdout log layer before init by
-    // forcing the env filter off — unless the operator has set RUST_LOG, in
-    // which case we honor their explicit choice.
-    if inspect_emits_machine_output_to_stdout(std::env::args())
+    // would otherwise prepend a log line and break SARIF parsing). The hidden
+    // `tt completions <shell>` and `tt man` generators write a shell script /
+    // roff man page to stdout and would be broken the same way (e.g.
+    // `tt completions zsh > _tt`). When this invocation is any of those,
+    // silence the stdout log layer before init by forcing the env filter off —
+    // unless the operator has set RUST_LOG, in which case we honor their choice.
+    if (inspect_emits_machine_output_to_stdout(std::env::args())
+        || is_stdout_generator_subcommand(std::env::args()))
         && std::env::var_os("RUST_LOG").is_none()
     {
         // SAFETY: set before any threads are spawned that read RUST_LOG; tracing
@@ -1391,6 +1425,16 @@ async fn main() -> anyhow::Result<()> {
                 tt_cli::workflow::check(file, inputs, baseline, fail_on_cost_increase, output)?;
             }
         },
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+        }
+        Command::Man => {
+            clap_mangen::Man::new(Cli::command())
+                .render(&mut std::io::stdout())
+                .context("rendering man page")?;
+        }
     }
     Ok(())
 }
@@ -2497,6 +2541,24 @@ where
     )
 }
 
+/// Decide, from the raw process args, whether this is one of the hidden
+/// stdout-generator subcommands (`completions` / `man`) whose entire output is
+/// machine-readable (a shell completion script / roff man page). Used, like
+/// [`inspect_emits_machine_output_to_stdout`], to silence the startup tracing
+/// log line so it can't be prepended to that output.
+fn is_stdout_generator_subcommand<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    // The subcommand is the first non-flag token after the binary name.
+    args.into_iter()
+        .skip(1)
+        .map(|s| s.as_ref().to_string())
+        .find(|a| !a.starts_with('-'))
+        .is_some_and(|sub| sub == "completions" || sub == "man")
+}
+
 /// Resolve the `tt inspect` output format from an explicit `--format` value
 /// (when set) and otherwise from the `--output` path extension.
 ///
@@ -3203,7 +3265,10 @@ mod plan_apply_tests {
 
 #[cfg(test)]
 mod inspect_format_tests {
-    use super::{inspect_emits_machine_output_to_stdout, inspect_output_format, OutputFormat};
+    use super::{
+        inspect_emits_machine_output_to_stdout, inspect_output_format,
+        is_stdout_generator_subcommand, OutputFormat,
+    };
 
     fn argv(s: &str) -> Vec<String> {
         std::iter::once("tt".to_string())
@@ -3286,5 +3351,18 @@ mod inspect_format_tests {
         assert!(!inspect_emits_machine_output_to_stdout(argv(
             "inspect . --cost-diff --format json"
         )));
+    }
+
+    #[test]
+    fn detects_stdout_generator_subcommands() {
+        // completions / man write machine output to stdout → silence logs.
+        assert!(is_stdout_generator_subcommand(argv("completions bash")));
+        assert!(is_stdout_generator_subcommand(argv("man")));
+        // A leading global flag before the subcommand is skipped.
+        assert!(is_stdout_generator_subcommand(argv("--no-color man")));
+        // Other subcommands (and no subcommand) are not generators.
+        assert!(!is_stdout_generator_subcommand(argv("inspect .")));
+        assert!(!is_stdout_generator_subcommand(argv("chat")));
+        assert!(!is_stdout_generator_subcommand(argv("")));
     }
 }
