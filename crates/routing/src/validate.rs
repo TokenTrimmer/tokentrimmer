@@ -226,6 +226,7 @@ pub fn validate_route_has_effect(then: &RouteAction) -> Result<(), ValidationErr
         || then.flex
         || then.batch
         || then.compress
+        || then.doc_compaction
         || then.redact
         || then.format_switch.is_some()
         || then.diff
@@ -257,6 +258,7 @@ mod tests {
             flex: false,
             batch: false,
             compress: false,
+            doc_compaction: false,
             redact: false,
             format_switch: None,
             diff: false,
@@ -656,6 +658,12 @@ mod tests {
         compress.target_model = None;
         compress.compress = true;
         assert!(validate_route_has_effect(&compress).is_ok());
+
+        // None target + a non-agentic effect (doc_compaction) → Ok.
+        let mut doc = action("ignored");
+        doc.target_model = None;
+        doc.doc_compaction = true;
+        assert!(validate_route_has_effect(&doc).is_ok());
 
         // Some target + nothing else → Ok (the rewrite is the effect).
         assert!(validate_route_has_effect(&action("gpt-4o")).is_ok());

@@ -199,6 +199,21 @@ pub struct RouteAction {
     /// unless a route enables it; omitted from JSON when false (back-compat).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compress: bool,
+    /// Opt the matched request into the **lossless document-compaction pass**
+    /// (Document Lane D2, request-pass pipeline): a content-preserving trim of
+    /// LARGE non-prose text documents (system/tool-result blocks ≥ a size
+    /// threshold) — markdown-normalize (collapse ≥3 blank lines, strip trailing
+    /// whitespace), strip repeated pure separator/header/footer boilerplate
+    /// lines, and de-duplicate exactly-repeated multi-line blocks (keeping the
+    /// first). User prose and the actual instruction content are never altered
+    /// and small blocks are left untouched. Text-only, so it rides the
+    /// token-true gate cleanly; the removed input tokens lower the prompt-token
+    /// bill and are attributed as a distinct `doc_compaction` savings source
+    /// that folds into the baseline exactly like `compress`. **Off by default**
+    /// — no behavior change unless a route enables it; omitted from JSON when
+    /// false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub doc_compaction: bool,
     /// Opt the matched request into the **request-redaction guardrail**
     /// (request-pass pipeline): a conservative SAFETY transform that replaces
     /// PII/secrets in the OUTBOUND request (user prose, system blocks,
@@ -715,6 +730,7 @@ mod tests {
                 flex: false,
                 batch: false,
                 compress: false,
+                doc_compaction: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
@@ -1036,6 +1052,7 @@ mod tests {
             flex: false,
             batch: false,
             compress: false,
+            doc_compaction: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1079,6 +1096,7 @@ mod tests {
             flex: false,
             batch: false,
             compress: false,
+            doc_compaction: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1114,6 +1132,7 @@ mod tests {
             flex: false,
             batch: false,
             compress: false,
+            doc_compaction: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1141,6 +1160,40 @@ mod tests {
         assert!(serde_json::to_string(&b)
             .unwrap()
             .contains("\"disable_cache\":true"));
+    }
+
+    /// `doc_compaction` (Document Lane D2) defaults to false, is omitted from
+    /// JSON when false (back-compat: existing rows/payloads unchanged), and
+    /// `{"doc_compaction":true}` deserializes to the flag being set.
+    #[test]
+    fn route_action_doc_compaction_defaults_false_omits_and_round_trips() {
+        // Default: absent on read → false.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(!parsed.doc_compaction, "doc_compaction must default false");
+
+        // {"doc_compaction":true} deserializes with the flag set.
+        let on: RouteAction = serde_json::from_str(r#"{"doc_compaction":true}"#).unwrap();
+        assert!(on.doc_compaction, "explicit true must deserialize as set");
+
+        // Omitted from JSON when false (existing route JSON stays byte-identical).
+        let off = RouteAction {
+            target_model: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&off).unwrap(),
+            r#"{"target_model":"x"}"#,
+            "doc_compaction:false must be omitted from the wire form"
+        );
+
+        // Present when true.
+        let b = RouteAction {
+            doc_compaction: true,
+            ..off
+        };
+        assert!(serde_json::to_string(&b)
+            .unwrap()
+            .contains("\"doc_compaction\":true"));
     }
 
     /// `format_switch` defaults to `None`, is omitted from JSON when `None`

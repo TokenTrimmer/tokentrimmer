@@ -1014,9 +1014,12 @@ mod tests {
     /// branch had to repair for the auto-pause fields).
     ///
     /// `flex` IS now mirrored (COST-7) and set TRUE here so the round-trip
-    /// exercises it. KNOWN REMAINING DRIFT: `compress` is NOT mirrored in
-    /// `tt_plan_core::RouteAction` (pre-existing); it is set `false` here, where
-    /// its skip_serializing_if gating omits it from the wire form, keeping the
+    /// exercises it. KNOWN REMAINING DRIFT: `compress` and `doc_compaction`
+    /// (Document Lane D2) are NOT mirrored in `tt_plan_core::RouteAction`
+    /// (pre-existing precedent — both are runtime-only request-pass levers whose
+    /// savings are REALIZED from real tokenizer counts, not projected by replay
+    /// from a historical `RequestLog` row); each is set `false` here, where its
+    /// skip_serializing_if gating omits it from the wire form, keeping the
     /// byte-identity assertion honest for every mirrored field. The
     /// output-shaping levers (`format_switch` / `diff`, research Phase 3.3 +
     /// 3.4) ARE mirrored — round-trip-only, not projected by replay.
@@ -1030,6 +1033,8 @@ mod tests {
             max_cost_usd: Some(0.25),
             flex: true,      // mirrored (COST-7) — round-trips to plan-core
             compress: false, // not mirrored (pre-existing) — omitted when false
+            // not mirrored (Document Lane D2, runtime-only) — omitted when false
+            doc_compaction: false,
             redact: true,
             format_switch: Some("csv".to_string()),
             diff: false, // mutually exclusive with format_switch on a real route

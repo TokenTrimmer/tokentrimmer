@@ -217,6 +217,7 @@ async fn app_with_redact_route_and_cache_min(
                 flex: false,
                 batch: false,
                 compress: false,
+                doc_compaction: false,
                 redact: redact_flag,
                 traffic_pct: None,
                 shadow_model: None,

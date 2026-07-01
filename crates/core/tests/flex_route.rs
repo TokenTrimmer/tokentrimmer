@@ -304,6 +304,7 @@ async fn app_with_flex_route(
                 flex: true,
                 batch: false,
                 compress: false,
+                doc_compaction: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

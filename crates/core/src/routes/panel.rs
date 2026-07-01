@@ -1564,6 +1564,7 @@ fn aggregate_cost_breakdown(total_cost_usd: f64) -> CostBreakdown {
         provider_cache_saved_usd: 0.0,
         flex_saved_usd: 0.0,
         compression_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
         summarizer_tax_usd: 0.0,
         batch_forgone_usd: 0.0,
@@ -1714,6 +1715,8 @@ pub(crate) async fn complete_panel(
             diff_failed: false,
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
+            // Panels never run the doc-compaction pass (multi-member fan-out).
+            doc_compaction_tokens_removed: 0,
             // Panels never run agentic loops; run_id/node_id stay None.
             run_id: None,
             node_id: None,

@@ -108,6 +108,7 @@
 pub mod agentic_budget;
 pub mod cache_classifier;
 pub mod compression;
+pub mod doc_compaction;
 pub mod redaction;
 pub mod split;
 
@@ -116,6 +117,7 @@ pub use agentic_budget::{
 };
 pub use cache_classifier::CacheClassifierPass;
 pub use compression::CompressionPass;
+pub use doc_compaction::DocCompactionPass;
 pub use redaction::{RedactedField, RedactedHit, RedactionPass};
 pub use split::{
     CacheBustEstimate, MutationDeterminism, PassContext, SplitRequest, StablePrefix, StableReason,
@@ -197,6 +199,13 @@ pub struct PassEffects {
     /// Input tokens the compression pipeline removed (pipeline-measured,
     /// token-true-gated). Drives `compression_saved_usd`.
     pub compression_tokens_removed: u32,
+    /// Input tokens the lossless document-compaction pass removed (Document
+    /// Lane D2, pipeline-measured, token-true-gated). A SEPARATE bucket from
+    /// `compression_tokens_removed` so the two levers attribute independently;
+    /// it folds into `baseline_cost_usd` the same way and drives the distinct
+    /// `doc_compaction_saved_usd`. Zero on every request whose route did not
+    /// opt into `doc_compaction`.
+    pub doc_compaction_tokens_removed: u32,
     /// Estimated USD penalty of a deliberate stable-prefix mutation (a booked
     /// [`CacheBustEstimate`]), pre-fee. Drives
     /// `CostBreakdown::cache_bust_penalty_usd` — the negative savings entry.
@@ -245,6 +254,15 @@ impl PassPipeline {
     #[must_use]
     pub fn conservative_compression() -> Self {
         Self::new().with(CompressionPass::new())
+    }
+
+    /// The lossless document-compaction stage (Document Lane D2) — the only
+    /// stage enabled by `RouteAction::doc_compaction`. Runs SEPARATELY from
+    /// `conservative_compression` so the two levers' token deltas attribute to
+    /// distinct savings buckets.
+    #[must_use]
+    pub fn doc_compaction() -> Self {
+        Self::new().with(DocCompactionPass::new())
     }
 
     /// Append a pass to the end of the pipeline (builder style).

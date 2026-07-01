@@ -199,6 +199,7 @@ async fn app_with_compress_route(
                 flex: false,
                 batch: false,
                 compress: compress_flag,
+                doc_compaction: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
