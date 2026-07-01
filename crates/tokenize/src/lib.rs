@@ -60,6 +60,8 @@ use std::sync::OnceLock;
 
 use tiktoken_rs::CoreBPE;
 
+pub mod image_tokens;
+
 /// How the estimate was produced — surfaced by `/v1/preview` so callers can
 /// weight it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
