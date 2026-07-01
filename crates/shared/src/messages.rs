@@ -313,9 +313,29 @@ pub enum MessageContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrl },
-    InputAudio { input_audio: InputAudio },
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        image_url: ImageUrl,
+    },
+    InputAudio {
+        input_audio: InputAudio,
+    },
+    /// A document (PDF / office file) input part — the Document Lane substrate
+    /// (D4a). Accepts BOTH provider conventions for the same logical part:
+    /// OpenAI's `{"type":"file","file":{...}}` and Anthropic's
+    /// `{"type":"document","source":{...}}`. The variant tag aliases `file`, and
+    /// the payload field aliases `file`/`source`, so either wire form
+    /// deserializes into this one variant. The canonical serialization is
+    /// `{"type":"document","document":{"source":{...},"filename":...}}` (see
+    /// [`DocumentPart`]). In D4a this part only carries + routes; the pre-routing
+    /// distillation seam that turns it into text is D4c.
+    #[serde(alias = "file")]
+    Document {
+        #[serde(alias = "file", alias = "source")]
+        document: DocumentPart,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +349,102 @@ pub struct ImageUrl {
 pub struct InputAudio {
     pub data: String,
     pub format: String,
+}
+
+/// A document input part's payload — the source bytes/URL plus an optional
+/// filename. Mirrors [`ImageUrl`] for the document modality.
+///
+/// `DocumentPart` has a hand-written [`Deserialize`] that accepts the three wire
+/// shapes the gateway may receive for the SAME logical document part:
+/// 1. **Canonical / Anthropic-wrapped** — `{"source":{...},"filename"?}` (what
+///    this type serializes to).
+/// 2. **Anthropic bare source** — `{"type":"base64"|"url", ...}` (the payload
+///    Anthropic nests under the block's `source` key, delivered here via the
+///    `ContentPart::Document` field alias).
+/// 3. **OpenAI file object** — `{"file_data":"data:<mime>;base64,<b64>",
+///    "filename"?, "file_id"?}` (`file_data` data-URLs are split into a
+///    [`DocumentSource::Base64`]).
+///
+/// Serialization is derived (the canonical shape #1), so a value parsed from any
+/// provider form re-serializes to a stable canonical form that round-trips.
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentPart {
+    pub source: DocumentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for DocumentPart {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("document part must be a JSON object"))?;
+
+        let filename = obj
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        // Shape #1 (canonical / Anthropic-wrapped): an explicit `source` object.
+        if let Some(src) = obj.get("source") {
+            let source: DocumentSource =
+                serde_json::from_value(src.clone()).map_err(D::Error::custom)?;
+            return Ok(DocumentPart { source, filename });
+        }
+
+        // Shape #2 (Anthropic bare source): a `{"type":"base64"|"url", ...}`
+        // object delivered directly (the block-level `source` value).
+        if matches!(
+            obj.get("type").and_then(serde_json::Value::as_str),
+            Some("base64" | "url")
+        ) {
+            let source: DocumentSource =
+                serde_json::from_value(value.clone()).map_err(D::Error::custom)?;
+            return Ok(DocumentPart { source, filename });
+        }
+
+        // Shape #3 (OpenAI `file` object): a data-URL in `file_data`, else a
+        // plain URL / `file_id` reference.
+        if let Some(file_data) = obj.get("file_data").and_then(serde_json::Value::as_str) {
+            let source = match parse_data_url(file_data) {
+                Some((media_type, data)) => DocumentSource::Base64 { media_type, data },
+                None => DocumentSource::Url {
+                    url: file_data.to_string(),
+                },
+            };
+            return Ok(DocumentPart { source, filename });
+        }
+        if let Some(file_id) = obj.get("file_id").and_then(serde_json::Value::as_str) {
+            return Ok(DocumentPart {
+                source: DocumentSource::Url {
+                    url: file_id.to_string(),
+                },
+                filename,
+            });
+        }
+
+        Err(D::Error::custom(
+            "unrecognized document part shape (expected `source`, an Anthropic \
+             `{type:base64|url}` source, or an OpenAI `file_data`/`file_id`)",
+        ))
+    }
+}
+
+/// Where a [`DocumentPart`]'s bytes come from: a remote/`data:` URL or inline
+/// base64. Serializes to Anthropic's source convention
+/// (`{"type":"url",...}` / `{"type":"base64","media_type":...,"data":...}`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DocumentSource {
+    /// Remote document URL (or an unparsed `data:` URL).
+    Url { url: String },
+    /// Inline base64-encoded document bytes with their media type.
+    Base64 { media_type: String, data: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -677,5 +793,131 @@ mod embeddings_default_tests {
             serde_json::to_value(ToolChoice::function("get_weather")).unwrap(),
             serde_json::json!({ "type": "function", "function": { "name": "get_weather" } })
         );
+    }
+}
+
+#[cfg(test)]
+mod document_part_tests {
+    use super::*;
+
+    /// The OpenAI `{"type":"file","file":{...}}` content-part shape deserializes
+    /// into `ContentPart::Document`, splitting the `file_data` data-URL into a
+    /// base64 source and carrying the filename.
+    #[test]
+    fn openai_file_part_deserializes_into_document() {
+        let json = serde_json::json!({
+            "type": "file",
+            "file": {
+                "filename": "draconomicon.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi0xLjQK"
+            }
+        });
+        let part: ContentPart = serde_json::from_value(json).unwrap();
+        let ContentPart::Document { document } = part else {
+            panic!("expected ContentPart::Document, got {part:?}");
+        };
+        assert_eq!(document.filename.as_deref(), Some("draconomicon.pdf"));
+        match document.source {
+            DocumentSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "application/pdf");
+                assert_eq!(data, "JVBERi0xLjQK");
+            }
+            other => panic!("expected base64 source, got {other:?}"),
+        }
+    }
+
+    /// The Anthropic `{"type":"document","source":{...}}` content-part shape
+    /// deserializes into the SAME `ContentPart::Document` variant.
+    #[test]
+    fn anthropic_document_part_deserializes_into_document() {
+        let json = serde_json::json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjQK"
+            }
+        });
+        let part: ContentPart = serde_json::from_value(json).unwrap();
+        let ContentPart::Document { document } = part else {
+            panic!("expected ContentPart::Document, got {part:?}");
+        };
+        assert!(document.filename.is_none());
+        match document.source {
+            DocumentSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "application/pdf");
+                assert_eq!(data, "JVBERi0xLjQK");
+            }
+            other => panic!("expected base64 source, got {other:?}"),
+        }
+    }
+
+    /// The Anthropic `url` document source round-trips too.
+    #[test]
+    fn anthropic_url_document_part_deserializes() {
+        let json = serde_json::json!({
+            "type": "document",
+            "source": { "type": "url", "url": "https://example.com/report.pdf" }
+        });
+        let part: ContentPart = serde_json::from_value(json).unwrap();
+        let ContentPart::Document { document } = part else {
+            panic!("expected ContentPart::Document");
+        };
+        match document.source {
+            DocumentSource::Url { url } => assert_eq!(url, "https://example.com/report.pdf"),
+            other => panic!("expected url source, got {other:?}"),
+        }
+    }
+
+    /// A parsed document part serializes to the canonical
+    /// `{"type":"document","document":{"source":{...},"filename":...}}` form and
+    /// that form round-trips back to an equal value.
+    #[test]
+    fn document_part_serializes_to_canonical_and_round_trips() {
+        let json = serde_json::json!({
+            "type": "file",
+            "file": {
+                "filename": "a.pdf",
+                "file_data": "data:application/pdf;base64,QUJD"
+            }
+        });
+        let part: ContentPart = serde_json::from_value(json).unwrap();
+        let canonical = serde_json::to_value(&part).unwrap();
+        assert_eq!(
+            canonical,
+            serde_json::json!({
+                "type": "document",
+                "document": {
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "QUJD"
+                    },
+                    "filename": "a.pdf"
+                }
+            })
+        );
+        // Canonical form re-deserializes into an equal Document part.
+        let reparsed: ContentPart = serde_json::from_value(canonical).unwrap();
+        let ContentPart::Document { document } = reparsed else {
+            panic!("canonical form must re-parse as Document");
+        };
+        assert_eq!(document.filename.as_deref(), Some("a.pdf"));
+    }
+
+    /// Text and image parts are unaffected by the new variant.
+    #[test]
+    fn text_and_image_parts_unaffected() {
+        let text: ContentPart = serde_json::from_value(serde_json::json!({
+            "type": "text", "text": "hello"
+        }))
+        .unwrap();
+        assert!(matches!(text, ContentPart::Text { .. }));
+
+        let image: ContentPart = serde_json::from_value(serde_json::json!({
+            "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" }
+        }))
+        .unwrap();
+        assert!(matches!(image, ContentPart::ImageUrl { .. }));
     }
 }

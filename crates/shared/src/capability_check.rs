@@ -64,7 +64,12 @@ impl RequiredCapabilities {
                                 ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => {
                                     caps.vision = true;
                                 }
-                                ContentPart::Text { .. } => {}
+                                // A Document part does NOT require Vision: the
+                                // Document Lane's target is a TEXT model (the
+                                // pre-routing seam distills it to text). Leaving
+                                // `vision` unset is what lets a document route
+                                // downgrade to a non-Vision model.
+                                ContentPart::Document { .. } | ContentPart::Text { .. } => {}
                             }
                         }
                     }

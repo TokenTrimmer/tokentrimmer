@@ -103,6 +103,15 @@ pub enum AnthropicContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
+    /// A document (e.g. PDF) — Anthropic's native `document` block, which
+    /// reuses the same `{type:url|base64,...}` source shape as an image
+    /// (Document Lane D4a). Fires only when the pre-routing distillation seam
+    /// (D4c) is off; normally documents are distilled to text before dispatch.
+    Document {
+        source: AnthropicImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
     /// A tool call initiated by the assistant.
     ToolUse {
         id: String,
@@ -126,6 +135,7 @@ impl AnthropicContentBlock {
         let slot = match self {
             AnthropicContentBlock::Text { cache_control, .. }
             | AnthropicContentBlock::Image { cache_control, .. }
+            | AnthropicContentBlock::Document { cache_control, .. }
             | AnthropicContentBlock::ToolUse { cache_control, .. }
             | AnthropicContentBlock::ToolResult { cache_control, .. } => cache_control,
         };
@@ -573,7 +583,7 @@ fn estimate_message_tokens(m: &AnthropicMessage) -> u32 {
                 tt_tokenize::estimate_tokens("anthropic", name)
                     + tt_tokenize::estimate_tokens("anthropic", &input.to_string())
             }
-            AnthropicContentBlock::Image { .. } => 0,
+            AnthropicContentBlock::Image { .. } | AnthropicContentBlock::Document { .. } => 0,
         })
         .sum()
 }
@@ -693,6 +703,29 @@ fn translate_content_blocks(
                         return Err(ProviderError::Unsupported(
                             "audio input is not supported by the Anthropic adapter".to_string(),
                         ));
+                    }
+                    // Document Lane (D4a): map to Anthropic's native `document`
+                    // block, reusing the image source shape (base64 bytes or a
+                    // remote/data URL). Only reached when the pre-routing
+                    // distillation seam (D4c) is off.
+                    ContentPart::Document { document } => {
+                        let source = match document.source {
+                            tt_shared::messages::DocumentSource::Base64 { media_type, data } => {
+                                AnthropicImageSource::Base64 { media_type, data }
+                            }
+                            tt_shared::messages::DocumentSource::Url { url } => {
+                                match tt_shared::messages::parse_data_url(&url) {
+                                    Some((media_type, data)) => {
+                                        AnthropicImageSource::Base64 { media_type, data }
+                                    }
+                                    None => AnthropicImageSource::Url { url },
+                                }
+                            }
+                        };
+                        blocks.push(AnthropicContentBlock::Document {
+                            source,
+                            cache_control: None,
+                        });
                     }
                 }
             }
