@@ -4,6 +4,7 @@
 
 pub mod cache_projection;
 pub mod classifier;
+pub mod document_projection;
 pub mod error;
 pub mod pricing;
 pub mod route_suggestions;
