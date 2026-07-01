@@ -202,10 +202,19 @@ pub fn detect_models(root: &Path) -> Vec<ModelUsage> {
 }
 
 /// `tt advise` entry point: scan the repo, then run one tool-grounded turn.
+///
+/// With `server_loop`, the turn is driven through the server-side agent loop
+/// (`POST /v1/agent/runs`) instead of the client-side tool-calling loop: the
+/// four advisor tools (`find_route_for`, `preview_cost`, `inspect_diff`,
+/// `batch_savings`) are exactly the gateway's read-only tools, so the gateway
+/// runs the whole model->tool->model loop SERVER-SIDE — exercising TT's own
+/// levers (mid-loop down-routing, judge-gated summarize) on its showcase
+/// command. OFF by default (opt-in; no behavior change).
 pub async fn run(
     path: Option<String>,
     describe: Option<String>,
     model: Option<String>,
+    server_loop: bool,
     flag_key: Option<String>,
     flag_base: Option<String>,
 ) -> anyhow::Result<()> {
@@ -232,10 +241,28 @@ pub async fn run(
     );
     conv.push_user(build_context_message(&detected, describe.as_deref()));
 
-    let reg = tools::build_advisor_registry();
-    let mut ledger = Ledger::default();
-    ui::heading("TokenTrimmer advisor");
-    tools::run_tool_turn(&client, &mut conv, &reg, &mut ledger, true).await;
+    if server_loop {
+        ui::heading("TokenTrimmer advisor · server loop");
+        // The advisor's four tools ARE the gateway's read-only tools, so the
+        // gateway runs the entire tool loop server-side; `DeclineExecutor` is
+        // never actually asked to run anything. Cost is gateway-attributed and
+        // printed honestly by `print_outcome` (no fabricated savings %).
+        let outcome = client
+            .agent()
+            .model(&conv.model)
+            .interactive()
+            .messages(conv.wire_messages())
+            .tools(crate::agent::gateway_tool_defs())
+            .run(&crate::agent::DeclineExecutor)
+            .await
+            .map_err(|e| anyhow::anyhow!("agent run failed: {e}"))?;
+        crate::agent::print_outcome(&outcome);
+    } else {
+        let reg = tools::build_advisor_registry();
+        let mut ledger = Ledger::default();
+        ui::heading("TokenTrimmer advisor");
+        tools::run_tool_turn(&client, &mut conv, &reg, &mut ledger, true).await;
+    }
     Ok(())
 }
 

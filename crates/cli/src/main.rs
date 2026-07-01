@@ -238,6 +238,11 @@ enum Command {
         /// Model for the compaction summary call (default: gpt-4o-mini).
         #[arg(long)]
         compact_model: Option<String>,
+        /// Drive each turn through the server-side agent loop (POST /v1/agent/runs)
+        /// so TT's own levers run — mechanical mid-loop down-routing, judge-gated
+        /// summarize, budget cap. Off by default (opt-in).
+        #[arg(long)]
+        server_loop: bool,
         #[arg(long, global = true)]
         tt_api_key: Option<String>,
         #[arg(long, global = true)]
@@ -284,6 +289,11 @@ enum Command {
         /// Advisor model (default: gpt-4o-mini).
         #[arg(long)]
         model: Option<String>,
+        /// Run the advisor through the server-side agent loop (POST /v1/agent/runs)
+        /// so the gateway executes the advisor tools server-side and TT's own
+        /// levers run. Off by default (opt-in).
+        #[arg(long)]
+        server_loop: bool,
         #[arg(long)]
         tt_api_key: Option<String>,
         #[arg(long)]
@@ -1124,6 +1134,7 @@ async fn main() -> anyhow::Result<()> {
             compact,
             compact_every,
             compact_model,
+            server_loop,
             tt_api_key,
             tt_api_base,
         } => {
@@ -1137,6 +1148,7 @@ async fn main() -> anyhow::Result<()> {
                 compact,
                 compact_every,
                 compact_model,
+                server_loop,
                 flag_key: tt_api_key,
                 flag_base: tt_api_base,
             })
@@ -1152,10 +1164,12 @@ async fn main() -> anyhow::Result<()> {
             path,
             describe,
             model,
+            server_loop,
             tt_api_key,
             tt_api_base,
         } => {
-            tt_cli::advise::run(path, describe, model, tt_api_key, tt_api_base).await?;
+            tt_cli::advise::run(path, describe, model, server_loop, tt_api_key, tt_api_base)
+                .await?;
         }
         Command::Embed {
             input,
