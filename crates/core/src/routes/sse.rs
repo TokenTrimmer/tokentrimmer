@@ -1079,6 +1079,10 @@ pub fn stream_response(
                     diff_failed: false,
                     diff_failed_cost_usd: 0.0,
                     retrieval_tokens_saved,
+                    // Document Lane D2: token-denominated record of what the
+                    // lossless doc-compaction pass removed (0 unless opted in).
+                    doc_compaction_tokens_removed: pass_effects.doc_compaction_tokens_removed
+                        as i64,
                     // run_id/node_id stamped in Task 4 (agentic loop context).
                     run_id: None,
                     node_id: None,
