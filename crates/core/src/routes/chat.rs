@@ -916,6 +916,12 @@ pub(crate) struct Prepared {
     pub diff_plan: Option<crate::shaping::diff::DiffPlan>,
     /// Aggregated request-pass effects threaded into the cost computation.
     pub pass_effects: PassEffects,
+    /// Content-aware compression flywheel label (P1a): the dominant content kind
+    /// the content_compress backend compacted (`json`/`csv`/`log`), or `None`
+    /// when the route did not opt in / nothing compacted. Recorded on the
+    /// `request_logs` row (`content_compress_kind`) only when the pass removed
+    /// tokens. Metrics-only (no request content).
+    pub content_compress_kind: Option<String>,
     /// Whether the minify-JSON instruction was injected (drives the estimate).
     pub minify_applied: bool,
     /// Whether a reasoning cap fired (judge eligibility).
@@ -1099,6 +1105,7 @@ pub(crate) async fn complete_once(
         format_switch_plan,
         diff_plan,
         pass_effects,
+        content_compress_kind,
         minify_applied,
         reasoning_capped,
         flex_applied,
@@ -1923,6 +1930,15 @@ pub(crate) async fn complete_once(
         // so the ctx→row mapping is independently unit-testable.
         run_id: None,
         node_id: None,
+        // Content-aware compression (P1a): the ISOLATED estimated saving (own
+        // column, migration 0033; never folded into cost/baseline/saved) + the
+        // flywheel kind label, recorded only when the pass removed tokens.
+        content_compress_saved_est_usd: cost_breakdown.content_compress_saved_est_usd,
+        content_compress_kind: if pass_effects.content_compress_tokens_removed > 0 {
+            content_compress_kind.clone()
+        } else {
+            None
+        },
     };
     // Agent-run grain (W0b Task 4): inherit run_id/node_id from ctx so every
     // row produced under an agent run carries the run's id.  `None` for
@@ -3459,6 +3475,7 @@ pub(crate) async fn prepare(
         format_switch_plan,
         diff_plan,
         pass_effects,
+        content_compress_kind,
         minify_applied,
         reasoning_capped,
         flex_applied,
@@ -3513,6 +3530,11 @@ async fn handle_streaming(
         format_switch_plan: _,
         diff_plan: _,
         pass_effects,
+        // Streaming defers the content_compress isolated estimate + flywheel
+        // label to the non-streaming path in v1 (the pass still runs pre-split,
+        // so the metered token reduction is real; the isolated estimate books $0
+        // on a streamed row, matching the minify-estimate v1 posture).
+        content_compress_kind: _,
         minify_applied,
         reasoning_capped: _,
         flex_applied,
@@ -3600,6 +3622,8 @@ async fn handle_streaming(
                             diff_failed_cost_usd: 0.0,
                             // Document Lane vision-avoided saving (D4c sets it).
                             doc_vision_saved_est_usd: 0.0,
+                            // Cache hit → no dispatch → no content_compress.
+                            content_compress_saved_est_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -4486,6 +4510,8 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         // Document Lane vision-avoided saving — the seam that sets a non-zero
         // value is D4c; a cache hit / non-seam path always books 0.
         doc_vision_saved_est_usd: 0.0,
+        // Cache hit → no dispatch → no content_compress.
+        content_compress_saved_est_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -4562,6 +4588,8 @@ fn build_hit_l2_response(
         // Document Lane vision-avoided saving — the seam that sets a non-zero
         // value is D4c; a cache hit / non-seam path always books 0.
         doc_vision_saved_est_usd: 0.0,
+        // Cache hit → no dispatch → no content_compress.
+        content_compress_saved_est_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -4909,6 +4937,19 @@ pub(crate) struct CostBreakdown {
     /// header + `request_logs` column (migration 0032). **Always 0.0 in D4a**
     /// (substrate only — the seam that sets a non-zero value is D4c).
     pub doc_vision_saved_est_usd: f64,
+    /// ESTIMATED content-aware compression saving (P1a): the input tokens the
+    /// content_compress structural backend (JSON/CSV/log, opt-in via
+    /// `RouteAction::content_compress`) removed before dispatch, priced at the
+    /// served model's input rate, fee-applied. Like `doc_vision_saved_est_usd` it
+    /// is ISOLATED: NEVER folded into `cost_usd` / `baseline_cost_usd` /
+    /// [`tt_saved_usd`](Self::tt_saved_usd) (a conservative estimate, not an
+    /// invoice-reconciled figure — the JSON/log/CSV compaction is content-
+    /// lossless and could fold like `compression`, but P1a books it here to keep
+    /// the reconciled headline clean and the isolated pattern consistent).
+    /// Surfaced on its own `X-TokenTrimmer-Content-Compress-Saved-Est-Usd` header
+    /// and the `request_logs` column (migration 0033). Zero when the route did
+    /// not opt into `content_compress`.
+    pub content_compress_saved_est_usd: f64,
 }
 
 impl CostBreakdown {
@@ -5270,6 +5311,14 @@ pub(crate) fn compute_cost_full(
         (compression_input_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
     let doc_compaction_saved_usd =
         (doc_compaction_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
+    // Content-aware compression (P1a): the input tokens the content_compress
+    // structural backend removed, valued at the served model's input rate. This
+    // is ISOLATED — NOT added to `input_tokens_removed`/the baseline fold below
+    // (unlike compression/doc_compaction) — so it never enters the reconciled
+    // `baseline − cost` headline; it books ONLY into the estimate field. Zero
+    // when the route did not opt into content_compress.
+    let content_compress_saved_est_usd =
+        (effects.content_compress_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
     // Fold the removed-token value into the baseline at the baseline model's
     // input rate (what the customer would have paid sending the un-trimmed
     // prompt to the baseline model). Includes BOTH the compression and the
@@ -5326,6 +5375,10 @@ pub(crate) fn compute_cost_full(
         // books a non-zero vision-avoided saving on this isolated field is D4c.
         // Isolated: NOT folded into cost_usd/baseline_cost_usd above.
         doc_vision_saved_est_usd: 0.0,
+        // Content-aware compression (P1a): the ISOLATED estimated saving from the
+        // content_compress backend's removed input tokens. NOT folded into
+        // cost_usd/baseline_cost_usd above (unlike compression/doc_compaction).
+        content_compress_saved_est_usd: content_compress_saved_est_usd * fee_multiplier,
     }
 }
 
@@ -5479,6 +5532,14 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-doc-vision-saved-est-usd",
             format!("{:.6}", cost.doc_vision_saved_est_usd),
+        ),
+        // ESTIMATED content-aware compression saving (P1a): the input tokens the
+        // content_compress backend removed, input-rate-priced — a conservative
+        // estimate, NEVER included in `saved-usd` / baseline (isolated, like the
+        // minify + doc-vision estimates). 0.000000 unless the route opted in.
+        (
+            "x-tokentrimmer-content-compress-saved-est-usd",
+            format!("{:.6}", cost.content_compress_saved_est_usd),
         ),
     ];
 
@@ -6384,6 +6445,9 @@ fn request_log_for_l1_hit(
         // run_id/node_id stamped in Task 4 (agentic loop context).
         run_id: None,
         node_id: None,
+        // Cache hit → nothing dispatched → no content_compress.
+        content_compress_saved_est_usd: 0.0,
+        content_compress_kind: None,
     }
 }
 
@@ -6459,6 +6523,9 @@ fn request_log_for_l2_hit(
         // run_id/node_id stamped in Task 4 (agentic loop context).
         run_id: None,
         node_id: None,
+        // Cache hit → nothing dispatched → no content_compress.
+        content_compress_saved_est_usd: 0.0,
+        content_compress_kind: None,
     }
 }
 
@@ -9232,6 +9299,10 @@ mod output_shaping_tests {
         // on the compute path (the seam that books it is D4c) and, like minify,
         // is never folded into cost/baseline.
         assert_eq!(base.doc_vision_saved_est_usd, 0.0);
+        // Content-aware compression (P1a): 0.0 with default (empty) PassEffects —
+        // the isolated estimate is booked only when content_compress removed
+        // tokens, and (like minify/doc-vision) is never folded into cost/baseline.
+        assert_eq!(base.content_compress_saved_est_usd, 0.0);
 
         let bd = compute_cost_full(
             &usage,
@@ -9584,6 +9655,8 @@ mod telemetry_drain_tests {
             doc_vision_saved_est_usd: 0.0,
             run_id: None,
             node_id: None,
+            content_compress_saved_est_usd: 0.0,
+            content_compress_kind: None,
         }
     }
 

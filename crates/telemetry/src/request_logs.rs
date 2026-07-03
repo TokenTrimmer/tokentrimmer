@@ -239,6 +239,25 @@ pub struct RequestLogRow {
     /// 0027. Stamped alongside `run_id` by the agentic loop (Task 4).
     #[serde(default)]
     pub node_id: Option<Uuid>,
+    /// Content-aware compression (P1a, migration 0033): ISOLATED, ESTIMATED USD
+    /// value of the input tokens the content_compress structural backend removed
+    /// (tokens removed × the served model's input rate, fee-applied). Like
+    /// `doc_vision_saved_est_usd` it is NEVER part of `cost_usd` /
+    /// `baseline_cost_usd` / the saved-usd headline — a conservative estimate,
+    /// not an invoice-reconciled figure. Surfaced on
+    /// `X-TokenTrimmer-Content-Compress-Saved-Est-Usd`. `0.0` when the route did
+    /// not opt into `content_compress` and for rows predating migration 0033
+    /// (zero omitted on serialize so legacy row JSON stays byte-identical).
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
+    pub content_compress_saved_est_usd: f64,
+    /// Content-aware compression flywheel (P1a, migration 0033): the DOMINANT
+    /// content kind the content_compress backend compacted on this request
+    /// (`"json"` / `"csv"` / `"log"`), or `None` when the route did not opt in,
+    /// nothing was compacted, or for rows predating migration 0033. Metrics-only
+    /// label (no request content) — the ZDR-safe flywheel signal; the opt-in raw
+    /// before/after pair capture is a separate, off-by-default path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_compress_kind: Option<String>,
 }
 
 /// `skip_serializing_if` helper: the minify estimate column is omitted from
@@ -428,7 +447,8 @@ pub mod postgres {
                       retrieval_tokens_saved,
                       run_id, node_id,
                       doc_compaction_tokens_removed,
-                      doc_vision_saved_est_usd)
+                      doc_vision_saved_est_usd,
+                      content_compress_saved_est_usd, content_compress_kind)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -449,11 +469,12 @@ pub mod postgres {
                       $39,
                       $40, $41,
                       $42,
-                      $43)"#;
+                      $43,
+                      $44, $45)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 43;
+    pub const INSERT_BIND_COUNT: usize = 45;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -502,6 +523,8 @@ pub mod postgres {
                 .bind(row.node_id) // $41
                 .bind(row.doc_compaction_tokens_removed) // $42
                 .bind(row.doc_vision_saved_est_usd) // $43
+                .bind(row.content_compress_saved_est_usd) // $44
+                .bind(row.content_compress_kind.as_deref()) // $45
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -621,6 +644,8 @@ mod tests {
             doc_vision_saved_est_usd: 0.0,
             run_id: None,
             node_id: None,
+            content_compress_saved_est_usd: 0.0,
+            content_compress_kind: None,
         }
     }
 
@@ -964,6 +989,51 @@ mod tests {
             legacy.doc_vision_saved_est_usd, 0.0,
             "legacy rows default to 0"
         );
+    }
+
+    /// Content-aware compression (P1a, migration 0033): the isolated estimated
+    /// saving round-trips in its OWN field, defaults to 0.0, is serde-omitted
+    /// when 0.0 (legacy JSON byte-identical), and the `content_compress_kind`
+    /// flywheel label round-trips + defaults to None + is omitted when None.
+    #[tokio::test]
+    async fn in_memory_round_trips_content_compress_columns() {
+        // Defaults + zero/None omitted on serialize.
+        assert_eq!(sample_row().content_compress_saved_est_usd, 0.0);
+        assert_eq!(sample_row().content_compress_kind, None);
+        let zero_json = serde_json::to_string(&sample_row()).unwrap();
+        assert!(
+            !zero_json.contains("content_compress_saved_est_usd"),
+            "zero saving must be omitted on serialize: {zero_json}"
+        );
+        assert!(
+            !zero_json.contains("content_compress_kind"),
+            "None kind must be omitted on serialize: {zero_json}"
+        );
+
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.02;
+        row.content_compress_saved_est_usd = 0.0031;
+        row.content_compress_kind = Some("json".into());
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert!((got.content_compress_saved_est_usd - 0.0031).abs() < 1e-12);
+        assert_eq!(got.content_compress_kind.as_deref(), Some("json"));
+        assert!((got.cost_usd - 0.02).abs() < 1e-12, "cost untouched");
+
+        // Non-zero / Some are present on serialize.
+        let mut row2 = sample_row();
+        row2.content_compress_saved_est_usd = 0.001;
+        row2.content_compress_kind = Some("log".into());
+        let j2 = serde_json::to_string(&row2).unwrap();
+        assert!(j2.contains("content_compress_saved_est_usd"), "{j2}");
+        assert!(j2.contains("content_compress_kind"), "{j2}");
+
+        // A legacy row that omits the columns deserializes to 0.0 / None.
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","org_id":"00000000-0000-0000-0000-000000000000","api_key_id":"00000000-0000-0000-0000-000000000000","ts":"2026-06-30T00:00:00Z","provider":"p","model":"m","input_tokens":1,"output_tokens":1,"cached_tokens":0,"cost_usd":0.0,"baseline_cost_usd":0.0,"provider_cache_saved_usd":0.0,"cache_bust_penalty_usd":0.0,"cached":false,"route_id":null,"latency_ms":1,"upstream_latency_ms":null,"status":200,"tag":null,"error_class":null,"trace_id":null,"truncated":false}"#;
+        let legacy: RequestLogRow = serde_json::from_str(json).unwrap();
+        assert_eq!(legacy.content_compress_saved_est_usd, 0.0);
+        assert_eq!(legacy.content_compress_kind, None);
     }
 
     /// The output-shaping columns (migration 0020) round-trip through the
