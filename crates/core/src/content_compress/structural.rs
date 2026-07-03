@@ -18,8 +18,12 @@
 //!   consecutive lines into the line plus a `[... previous line repeated N more
 //!   times]` marker. The repeat COUNT is preserved, so the transform is
 //!   content-preserving (a model reads the marker as the N copies).
-//! - **Code / Prose** → classified but LEFT UNTOUCHED in P1a (their backends land
-//!   in P1c / P1b).
+//! - **Prose** → EXTRACTIVE compaction (P1b, LOSSY) via [`prose`](super::prose),
+//!   committed ONLY when the [`ContentCompressPass`]'s judge gate trusts the
+//!   [`PROSE_CLASS`](super::prose::PROSE_CLASS) — fail-open to verbatim
+//!   otherwise. The structural backends above are content-preserving and need no
+//!   gate; prose drops information, so it inherits the summarize lever's gate.
+//! - **Code** → classified but LEFT UNTOUCHED here (its backend lands in P1c).
 //!
 //! Every transform commits only on a strict shrink of the block, and the whole
 //! pass rides the pipeline's TOKEN-TRUE GATE: a result that tokenizes larger than
@@ -27,9 +31,12 @@
 //! reduction is booked into the ISOLATED `content_compress_saved_est_usd`
 //! estimate (never the invoice-reconciled headline).
 
+use std::sync::Arc;
+
 use tt_shared::messages::{ContentPart, Message, MessageContent};
 
-use crate::content_compress::{classify, ContentKind};
+use crate::content_compress::{classify, prose, ContentKind};
+use crate::passes::agentic_budget::summarize_judge::SummaryGate;
 use crate::passes::split::{PassContext, StablePrefix, VolatileTail};
 use crate::passes::{push_content_text, PassOutcome, RequestPass};
 
@@ -39,14 +46,43 @@ const LOG_MIN_RUN: usize = 3;
 
 /// The content-aware compression stage (Phase 1). Off by default; enabled by
 /// `RouteAction::content_compress`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ContentCompressPass;
+///
+/// The optional `prose_gate` enables the P1b LOSSY prose backend: `None` (the
+/// P1a posture) leaves Prose blocks untouched; `Some(gate)` compresses a Prose
+/// block ONLY when `gate.is_committable(PROSE_CLASS)` (fail-open to verbatim
+/// otherwise). The gate is the shared summarize-lever
+/// [`SummaryGate`](crate::passes::agentic_budget::summarize_judge::SummaryGate)
+/// — the synchronous projection of the ~2% paired judge + the 0.90-floor ratchet.
+#[derive(Clone, Default)]
+pub struct ContentCompressPass {
+    prose_gate: Option<Arc<dyn SummaryGate>>,
+}
+
+impl std::fmt::Debug for ContentCompressPass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContentCompressPass")
+            .field("prose_gate", &self.prose_gate.as_ref().map(|_| "<gate>"))
+            .finish()
+    }
+}
 
 impl ContentCompressPass {
-    /// Construct the pass.
+    /// Construct the pass with the LOSSY prose backend DISABLED (structural
+    /// JSON/CSV/log backends only — the P1a behavior; Prose left verbatim).
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self { prose_gate: None }
+    }
+
+    /// Construct the pass with the P1b prose backend enabled behind `gate` (the
+    /// shared summarize-lever gate). A Prose block is compressed only when the
+    /// gate trusts [`PROSE_CLASS`](super::prose::PROSE_CLASS); an untrusted /
+    /// closed / unavailable gate fails OPEN to the verbatim bytes.
+    #[must_use]
+    pub fn with_prose_gate(gate: Arc<dyn SummaryGate>) -> Self {
+        Self {
+            prose_gate: Some(gate),
+        }
     }
 }
 
@@ -64,7 +100,7 @@ impl RequestPass for ContentCompressPass {
         // Self-report only (drift telemetry): the pipeline's token-true gate
         // measures the whole-tail delta itself and uses THAT for attribution.
         let before = touchable_text(tail.messages());
-        compact_in_place(tail);
+        compact_in_place(tail, self.prose_gate.as_deref());
         let after = touchable_text(tail.messages());
 
         let before_tokens =
@@ -89,12 +125,13 @@ fn touchable_text(msgs: &[Message]) -> String {
     out
 }
 
-/// Classify + structurally compact every LARGE System / Tool text block in place.
-fn compact_in_place(tail: &mut VolatileTail<'_>) {
+/// Classify + compact every LARGE System / Tool text block in place. `prose_gate`
+/// is threaded to the LOSSY prose backend (P1b); `None` disables prose.
+fn compact_in_place(tail: &mut VolatileTail<'_>, prose_gate: Option<&dyn SummaryGate>) {
     for m in tail.messages_mut() {
         match m {
             Message::System { content } | Message::Tool { content, .. } => {
-                compact_content(content);
+                compact_content(content, prose_gate);
             }
             // User + Assistant prose are never touched.
             Message::User { .. } | Message::Assistant { .. } => {}
@@ -102,17 +139,17 @@ fn compact_in_place(tail: &mut VolatileTail<'_>) {
     }
 }
 
-fn compact_content(content: &mut MessageContent) {
+fn compact_content(content: &mut MessageContent, prose_gate: Option<&dyn SummaryGate>) {
     match content {
         MessageContent::Text(s) => {
-            if let Some(compacted) = compact_block(s) {
+            if let Some(compacted) = compact_block(s, prose_gate) {
                 *s = compacted;
             }
         }
         MessageContent::Parts(parts) => {
             for p in parts {
                 if let ContentPart::Text { text } = p {
-                    if let Some(compacted) = compact_block(text) {
+                    if let Some(compacted) = compact_block(text, prose_gate) {
                         *text = compacted;
                     }
                 }
@@ -121,17 +158,31 @@ fn compact_content(content: &mut MessageContent) {
     }
 }
 
-/// Classify one text block and apply the matching structural backend. Returns
-/// `Some(new)` only on a strict shrink (a real removal); `None` when the block
-/// is unclassifiable / a non-P1a kind / nothing safely removable — the caller
+/// Classify one text block and apply the matching backend. Returns `Some(new)`
+/// only on a strict shrink (a real removal); `None` when the block is
+/// unclassifiable / a non-backed kind / nothing safely removable — the caller
 /// keeps the original. The pipeline's token-true gate is the final arbiter.
-pub(crate) fn compact_block(s: &str) -> Option<String> {
+///
+/// The structural (Json/Csv/Log) backends are content-preserving and commit on
+/// the shrink alone. The Prose backend is LOSSY (P1b): it compresses ONLY when a
+/// gate is present AND `prose_gate.is_committable(PROSE_CLASS)` — an absent /
+/// untrusted / closed gate fails OPEN to the verbatim block (no compression).
+pub(crate) fn compact_block(s: &str, prose_gate: Option<&dyn SummaryGate>) -> Option<String> {
     let result = match classify(s)? {
         ContentKind::Json => minify_json_whitespace(s)?,
         ContentKind::Csv => strip_trailing_line_ws(s),
         ContentKind::Log => collapse_repeated_log_lines(s),
-        // Code / Prose backends land in P1c / P1b — untouched here.
-        ContentKind::Code | ContentKind::Diff | ContentKind::Prose => return None,
+        ContentKind::Prose => {
+            // LOSSY → gated by the shared judge projection. Fail open to verbatim
+            // when there is no gate, or the judge does not (yet) trust the class.
+            let gate = prose_gate?;
+            if !gate.is_committable(prose::PROSE_CLASS) {
+                return None;
+            }
+            prose::compress(s)?.0
+        }
+        // The AST code backend lands in P1c — untouched here.
+        ContentKind::Code | ContentKind::Diff => return None,
     };
     if result.len() < s.len() {
         Some(result)
@@ -140,14 +191,18 @@ pub(crate) fn compact_block(s: &str) -> Option<String> {
     }
 }
 
-/// The [`ContentKind`] the P1a dispatcher would COMPACT for this block (Json /
-/// Csv / Log), or `None` for an unclassifiable / non-compacting kind. Used by
-/// the flywheel to label a compressed request.
+/// The [`ContentKind`] the dispatcher has a backend for on this block (Json /
+/// Csv / Log structural, or Prose extractive), or `None` for an unclassifiable /
+/// non-backed kind (Code / Diff). Used by the flywheel to label a compressed
+/// request. Gate-independent — it names the kind the dispatcher WOULD compact
+/// (Prose only actually compacts behind an open judge gate).
 #[must_use]
 pub fn compactable_kind(s: &str) -> Option<ContentKind> {
     match classify(s)? {
-        k @ (ContentKind::Json | ContentKind::Csv | ContentKind::Log) => Some(k),
-        ContentKind::Code | ContentKind::Diff | ContentKind::Prose => None,
+        k @ (ContentKind::Json | ContentKind::Csv | ContentKind::Log | ContentKind::Prose) => {
+            Some(k)
+        }
+        ContentKind::Code | ContentKind::Diff => None,
     }
 }
 
@@ -503,5 +558,194 @@ mod tests {
             },
         ];
         assert_eq!(dominant_compactable_kind(&msgs), Some(ContentKind::Json));
+    }
+
+    // ── P1b: the LOSSY prose backend, gated by the shared summarize judge ──────
+
+    use crate::passes::agentic_budget::summarize_judge::{
+        AlwaysCommitGate, NeverCommitGate, RatchetConfig, RatchetSummaryGate, SummaryGate,
+    };
+    use std::sync::Arc;
+
+    /// Run the pass with the P1b prose backend enabled behind `gate`, returning
+    /// the self-reported token delta (the pipeline's token-true gate measures the
+    /// authoritative delta; here we self-report to assert commit vs no-op).
+    fn run_gated(req: &mut ChatCompletionRequest, gate: Arc<dyn SummaryGate>) -> u32 {
+        let cx = PassContext {
+            provider_id: "openai",
+            model: "gpt-4o",
+            pricing: None,
+        };
+        let mut split = SplitRequest::compute(req, &cx);
+        split
+            .run_pass(|stable, tail| {
+                ContentCompressPass::with_prose_gate(gate.clone()).apply(stable, tail, &cx)
+            })
+            .tokens_removed
+    }
+
+    fn system(text: &str) -> Message {
+        Message::System {
+            content: MessageContent::Text(text.into()),
+        }
+    }
+
+    /// A large block of DISTINCT prose sentences (no digits / paths / identifiers,
+    /// so the must-keep override does not protect everything) — over the prose
+    /// backend's size threshold, with recurring topical vocabulary for salience.
+    fn prose_blob() -> String {
+        [
+            "The gateway routes each request to the cheapest capable model.",
+            "Routing decisions weigh model capability against the expected cost.",
+            "A cheaper model often answers a simple question just as well.",
+            "Quality regressions would erode user trust in the routing layer.",
+            "The judge samples a small fraction of traffic to catch regressions.",
+            "When quality drops the lever pauses itself automatically.",
+            "Caching avoids paying twice for an identical repeated request.",
+            "Semantic caching matches requests that mean the same thing.",
+            "Compression trims redundant scaffolding before dispatch.",
+            "Prose blocks were historically left almost entirely untouched.",
+            "Extractive selection keeps the most salient sentences of a block.",
+            "The remaining sentences are dropped to reach a target ratio.",
+            "Every lossy transform stays behind a strict quality gate.",
+            "The gate fails open to the verbatim text whenever unsure.",
+        ]
+        .join(" ")
+    }
+
+    #[test]
+    fn prose_backend_no_gate_is_verbatim() {
+        // `ContentCompressPass::new()` (no prose gate) leaves Prose untouched —
+        // the conservative posture (fail-open). This is the default the pipeline
+        // builder `content_compress()` uses.
+        let blob = prose_blob();
+        let mut req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![system(&blob)],
+            ..Default::default()
+        };
+        let removed = run(&mut req);
+        assert_eq!(text_of(&req.messages[0]), blob, "no gate → prose verbatim");
+        assert_eq!(removed, 0, "no gate → no prose saving");
+    }
+
+    #[test]
+    fn prose_backend_open_gate_compresses_and_books_saving() {
+        // A judge-trusted `"prose"` class → the extractive backend commits: the
+        // block shrinks and books a positive token delta (which the cost path
+        // values into the ISOLATED `content_compress_saved_est_usd`).
+        let blob = prose_blob();
+        let mut req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![system(&blob)],
+            ..Default::default()
+        };
+        let removed = run_gated(&mut req, Arc::new(AlwaysCommitGate));
+        assert!(removed > 0, "an open gate compresses prose → saving booked");
+        let got = text_of(&req.messages[0]);
+        assert!(
+            got.len() < blob.len(),
+            "the prose block is strictly shorter"
+        );
+    }
+
+    #[test]
+    fn prose_backend_closed_gate_is_verbatim_fail_open() {
+        // A closed / unavailable gate → fail OPEN to the verbatim bytes, $0.
+        let blob = prose_blob();
+        let mut req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![system(&blob)],
+            ..Default::default()
+        };
+        let removed = run_gated(&mut req, Arc::new(NeverCommitGate));
+        assert_eq!(
+            text_of(&req.messages[0]),
+            blob,
+            "closed gate → prose verbatim (fail-open)"
+        );
+        assert_eq!(removed, 0, "closed gate → no prose saving");
+    }
+
+    #[test]
+    fn prose_backend_rides_090_floor_ratchet() {
+        // MIRRORS the summarize lever: the same `RatchetSummaryGate` 0.90 floor
+        // (the `route_autopause` floor). A judge history AT/ABOVE 0.90 keeps the
+        // `"prose"` class open (compress); a sustained sub-0.90 run ratchets it
+        // SHUT (verbatim) — sub-0.90 recall auto-pauses the lever per class.
+        let blob = prose_blob();
+
+        // (a) ≥ 0.90 recall history → open → compresses.
+        let good = Arc::new(RatchetSummaryGate::new(
+            ["prose".to_string()].into_iter().collect(),
+            RatchetConfig::default(),
+        ));
+        for _ in 0..10 {
+            good.record_summary_verdict("prose", tt_plan_core::JudgeVerdict::Acceptable);
+        }
+        let mut req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![system(&blob)],
+            ..Default::default()
+        };
+        assert!(
+            run_gated(&mut req, good) > 0,
+            "a >=0.90 judge history keeps prose compressing"
+        );
+
+        // (b) sustained sub-0.90 recall → the floor ratchets the class SHUT.
+        let bad = Arc::new(RatchetSummaryGate::new(
+            ["prose".to_string()].into_iter().collect(),
+            RatchetConfig::default(),
+        ));
+        for _ in 0..5 {
+            bad.record_summary_verdict("prose", tt_plan_core::JudgeVerdict::Degraded);
+        }
+        assert!(
+            !bad.is_committable("prose"),
+            "a sub-0.90 run must auto-pause the prose lever (0.90 floor)"
+        );
+        let mut req2 = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![system(&blob)],
+            ..Default::default()
+        };
+        let removed = run_gated(&mut req2, bad);
+        assert_eq!(
+            text_of(&req2.messages[0]),
+            blob,
+            "an auto-paused prose class serves verbatim"
+        );
+        assert_eq!(removed, 0, "auto-paused → no saving");
+    }
+
+    #[test]
+    fn prose_backend_small_block_untouched_even_with_open_gate() {
+        // A prose block below the backend's size threshold is left verbatim even
+        // behind an OPEN gate (the extractive backend's own small-block guard).
+        let small = "This is short. Only a couple sentences here. Nothing to drop.";
+        let mut req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![system(small)],
+            ..Default::default()
+        };
+        let removed = run_gated(&mut req, Arc::new(AlwaysCommitGate));
+        assert_eq!(text_of(&req.messages[0]), small);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn prose_backend_never_touches_user_prose() {
+        // Even with an open gate, USER prose is never compressed (prose invariant:
+        // the pass only touches System + Tool scaffolding).
+        let blob = prose_blob();
+        let mut req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![user(&blob)],
+            ..Default::default()
+        };
+        let removed = run_gated(&mut req, Arc::new(AlwaysCommitGate));
+        assert_eq!(text_of(&req.messages[0]), blob, "user prose untouched");
+        assert_eq!(removed, 0);
     }
 }

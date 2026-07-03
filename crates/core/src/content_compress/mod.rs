@@ -7,11 +7,14 @@
 //! auto-pause (for the lossy backends), and isolated/attested savings.
 //!
 //! # Slices
-//! - **P1a (this):** the classifier + the opt-in [`ContentCompressPass`]
+//! - **P1a:** the classifier + the opt-in [`ContentCompressPass`]
 //!   dispatcher + a JSON/CSV/log CONTENT-PRESERVING structural backend + the
 //!   isolated `content_compress_saved_est_usd` cost field + flywheel telemetry
-//!   ([`capture`]). Code/Prose blocks are classified but LEFT UNTOUCHED here.
-//! - **P1b:** a prose extractive backend (lossy, judge-gated).
+//!   ([`capture`]). Code blocks are classified but LEFT UNTOUCHED there.
+//! - **P1b (this):** a prose EXTRACTIVE backend ([`prose`]) — LOSSY, so it
+//!   commits only behind the shared judge gate + 0.90 auto-pause (fail-open to
+//!   verbatim), routed by the dispatcher when a route sets `content_compress`
+//!   AND the `"prose"` class is judge-trusted.
 //! - **P1c:** an AST code backend (reuses `inspect-core` tree-sitter).
 //! - **P1d:** the flywheel dataset export.
 //!
@@ -22,7 +25,9 @@
 
 pub mod capture;
 pub mod classify;
+pub mod prose;
 pub mod structural;
 
 pub use classify::{classify, ContentKind, MIN_BLOB_CHARS};
+pub use prose::PROSE_CLASS;
 pub use structural::{compactable_kind, dominant_compactable_kind, ContentCompressPass};
