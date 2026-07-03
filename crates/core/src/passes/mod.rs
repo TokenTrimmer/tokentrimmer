@@ -282,6 +282,20 @@ impl PassPipeline {
         Self::new().with(crate::content_compress::ContentCompressPass::new())
     }
 
+    /// The content-aware compression stage WITH the P1b LOSSY prose backend
+    /// enabled behind `gate` (the shared summarize-lever
+    /// [`SummaryGate`](crate::passes::agentic_budget::summarize_judge::SummaryGate)).
+    /// A Prose block is compressed only when the gate trusts the `"prose"` class
+    /// (fail-open to verbatim otherwise); the JSON/CSV/log structural backends run
+    /// exactly as in [`Self::content_compress`]. The measured token delta still
+    /// books into the ISOLATED `content_compress_saved_est_usd`.
+    #[must_use]
+    pub fn content_compress_with_prose_gate(
+        gate: std::sync::Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
+    ) -> Self {
+        Self::new().with(crate::content_compress::ContentCompressPass::with_prose_gate(gate))
+    }
+
     /// Append a pass to the end of the pipeline (builder style).
     #[must_use]
     pub fn with<P: RequestPass + 'static>(mut self, pass: P) -> Self {
