@@ -173,6 +173,7 @@ fn dogfood_routing_store() -> Arc<CachingRoutingStore> {
                 compress: false,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

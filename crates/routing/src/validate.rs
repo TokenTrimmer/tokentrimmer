@@ -234,6 +234,7 @@ pub fn validate_route_has_effect(then: &RouteAction) -> Result<(), ValidationErr
         || then.compress
         || then.doc_compaction
         || then.document_lane
+        || then.content_compress
         || then.redact
         || then.format_switch.is_some()
         || then.diff
@@ -267,6 +268,7 @@ mod tests {
             compress: false,
             doc_compaction: false,
             document_lane: false,
+            content_compress: false,
             redact: false,
             format_switch: None,
             diff: false,

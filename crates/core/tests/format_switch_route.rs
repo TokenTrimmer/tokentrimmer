@@ -235,6 +235,7 @@ async fn app_with_format_switch_route(format_switch: Option<&str>) -> Harness {
                 compress: false,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 format_switch: format_switch.map(str::to_string),
                 minify_json: false,

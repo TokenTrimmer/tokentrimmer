@@ -52,6 +52,12 @@ fn matches_conditions(req: &RequestLog, c: &RouteConditions) -> bool {
     if c.has_images.is_some() || c.has_audio.is_some() || c.has_documents.is_some() {
         return false;
     }
+    // content_type needs the gateway's live content classifier over the request
+    // body, unavailable in Plan replay — conservative non-match so Plan never
+    // over-projects savings on a content-type route.
+    if c.content_type.is_some() {
+        return false;
+    }
     // The live p95-latency condition is backed by the gateway's in-process
     // rolling window, which does not exist for historical rows. Like modality,
     // a route carrying it is a conservative non-match in replay — Plan never

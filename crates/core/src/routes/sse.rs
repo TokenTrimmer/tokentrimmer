@@ -1089,6 +1089,12 @@ pub fn stream_response(
                     // run_id/node_id stamped in Task 4 (agentic loop context).
                     run_id: None,
                     node_id: None,
+                    // Content-aware compression (P1a): the pass runs pre-split so
+                    // the metered token reduction is real, but the streaming row
+                    // defers the ISOLATED estimate + flywheel label to the
+                    // non-streaming path in v1 (the minify-estimate v1 posture).
+                    content_compress_saved_est_usd: 0.0,
+                    content_compress_kind: None,
                 };
 
                 // Per-route provider-cache counters on cleanly completed

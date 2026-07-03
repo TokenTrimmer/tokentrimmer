@@ -223,6 +223,7 @@ async fn route_to_local_dispatches_to_ollama_provider() {
                 compress: false,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

@@ -233,6 +233,39 @@ pub fn request_input_text(req: &ChatCompletionRequest) -> String {
         .join("\n")
 }
 
+/// The [`ContentKind`](crate::content_kind::ContentKind) of the LARGEST text
+/// block in the request — the request's "dominant content kind" — backing the
+/// `content_type` routing condition (P1a). Scans every message's text content
+/// (all roles), then classifies the single largest block; `None` when no block
+/// is large enough to classify. Allocation-light: it borrows each block and
+/// runs the classifier once, on the largest.
+pub fn request_dominant_content_kind(
+    req: &ChatCompletionRequest,
+) -> Option<crate::content_kind::ContentKind> {
+    let mut best: Option<&str> = None;
+    for m in &req.messages {
+        if let Some(content) = content_of(m) {
+            match content {
+                MessageContent::Text(s) => update_largest(&mut best, s),
+                MessageContent::Parts(parts) => {
+                    for p in parts {
+                        if let ContentPart::Text { text } = p {
+                            update_largest(&mut best, text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.and_then(crate::content_kind::classify)
+}
+
+fn update_largest<'a>(best: &mut Option<&'a str>, s: &'a str) {
+    if best.is_none_or(|cur| s.len() > cur.len()) {
+        *best = Some(s);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

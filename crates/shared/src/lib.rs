@@ -5,6 +5,7 @@
 
 pub mod batch_advisor;
 pub mod capability_check;
+pub mod content_kind;
 pub mod context;
 pub mod dns_guard;
 pub mod error;
@@ -22,6 +23,7 @@ pub use batch_advisor::{
     DEFAULT_BATCH_ELIGIBLE_TAGS,
 };
 pub use capability_check::{message_text_for_estimation, RequiredCapabilities};
+pub use content_kind::{classify as classify_content, ContentKind};
 pub use context::{CallerTier, RequestContext};
 pub use dns_guard::{with_guarded_dns, GuardedResolveError, GuardedResolver};
 pub use error::ProviderError;

@@ -219,6 +219,7 @@ async fn app_with_redact_route_and_cache_min(
                 compress: false,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: redact_flag,
                 traffic_pct: None,
                 shadow_model: None,

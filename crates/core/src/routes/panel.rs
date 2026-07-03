@@ -1575,6 +1575,8 @@ fn aggregate_cost_breakdown(total_cost_usd: f64) -> CostBreakdown {
         // A panel claims no routing/cache saving; the vision-avoided saving is
         // likewise 0 (the Document Lane seam does not run on a panel path).
         doc_vision_saved_est_usd: 0.0,
+        // Content_compress does not run on a panel path → 0.
+        content_compress_saved_est_usd: 0.0,
     }
 }
 
@@ -1725,6 +1727,9 @@ pub(crate) async fn complete_panel(
             // Panels never run agentic loops; run_id/node_id stay None.
             run_id: None,
             node_id: None,
+            // Panels never run the content_compress pass → 0 / None.
+            content_compress_saved_est_usd: 0.0,
+            content_compress_kind: None,
         },
     );
 
