@@ -202,6 +202,7 @@ async fn app_with_compress_route(
                 compress: true,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

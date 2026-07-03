@@ -2223,6 +2223,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     compress: false,
                     doc_compaction: false,
                     document_lane: false,
+                    content_compress: false,
                     redact: false,
                     traffic_pct: None,
                     shadow_model: None,

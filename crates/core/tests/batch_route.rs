@@ -323,6 +323,7 @@ async fn app_with_batch_route(model_in: &str, batch: bool) -> Harness {
                 compress: false,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

@@ -201,6 +201,7 @@ async fn app_with_compress_route(
                 compress: compress_flag,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
@@ -499,6 +500,149 @@ async fn compression_saving_is_attributed() {
         (cost - expected_cost).abs() < 1e-9,
         "cost ({cost}) should meter the reported (compressed) usage ({expected_cost})"
     );
+}
+
+/// Build an app whose route opts into `content_compress` (P1a) instead of
+/// `compress`. Mirrors [`app_with_compress_route`] with the flag flipped.
+async fn app_with_content_compress_route() -> (axum::Router, String, Arc<Mutex<Vec<Vec<Message>>>>)
+{
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        seen_messages: Arc::clone(&seen),
+    }));
+    let raw_store = InMemoryKeyStore::new();
+    let org_id = Uuid::now_v7();
+    let plaintext = issue_key_for(&raw_store, org_id).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
+    let routes_backing = Arc::new(InMemoryRoutingStore::new());
+    routes_backing.set_routes(
+        org_id,
+        vec![Route {
+            paused: false,
+            id: Uuid::now_v7(),
+            name: "content-compress-route".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                model_in: vec!["rec-model".into()],
+                ..Default::default()
+            },
+            then: RouteAction {
+                target_model: Some("rec-model".into()),
+                content_compress: true,
+                ..Default::default()
+            },
+        }],
+    );
+    let routing = Arc::new(CachingRoutingStore::new(
+        routes_backing as Arc<dyn RoutingStore>,
+    ));
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_routing_store(routing),
+    );
+    (app, plaintext, seen)
+}
+
+/// A request carrying a whitespace-padded (pretty-printed) JSON tool result — a
+/// content-aware compression target that the P1a structural backend minifies.
+fn json_tool_request(key: &str) -> Request<Body> {
+    let json_blob = "{\n  \"temperature\": 72,\n  \"humidity\": 55,\n  \
+                     \"wind_speed\": 10,\n  \"pressure\": 1013,\n  \
+                     \"visibility\": 10,\n  \"conditions\": \"clear skies\",\n  \
+                     \"forecast\": \"sunny all afternoon\"\n}";
+    let body = json!({
+        "model": "rec-model",
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "What is the weather?" },
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_w",
+                    "type": "function",
+                    "function": { "name": "weather", "arguments": "{}" }
+                }]
+            },
+            { "role": "tool", "tool_call_id": "call_w", "content": json_blob }
+        ]
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// End-to-end: a `content_compress` route minifies the pretty JSON tool block
+/// before dispatch (the upstream sees the compact form), books the ISOLATED
+/// `content_compress_saved_est_usd` (header > 0) WITHOUT inflating the
+/// invoice-reconciled `saved_usd` headline (isolated, not folded).
+#[tokio::test]
+async fn content_compress_route_books_isolated_estimate() {
+    let (app, key, seen) = app_with_content_compress_route().await;
+    let resp = app.oneshot(json_tool_request(&key)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let header_f64 =
+        |name: &str| -> f64 { resp.headers()[name].to_str().unwrap().parse().unwrap() };
+    let cc_saved = header_f64("x-tokentrimmer-content-compress-saved-est-usd");
+    let saved = header_f64("x-tokentrimmer-saved-usd");
+
+    assert!(
+        cc_saved > 0.0,
+        "content_compress isolated estimate must be positive, got {cc_saved}"
+    );
+    // ISOLATED: no routing/flex/cache lever here, so the reconciled headline is
+    // 0 even though the content_compress estimate is positive.
+    assert_eq!(saved, 0.0, "isolated estimate must NOT fold into saved_usd");
+
+    // The upstream received the MINIFIED JSON (insignificant whitespace gone).
+    let dispatched = seen.lock().unwrap();
+    let tool_text = dispatched
+        .last()
+        .unwrap()
+        .iter()
+        .find_map(text_of_tool)
+        .expect("a tool block was dispatched");
+    assert!(
+        !tool_text.contains("\n  \""),
+        "dispatched JSON was minified: {tool_text}"
+    );
+    assert!(
+        tool_text.contains("\"temperature\":72"),
+        "JSON values preserved (compact): {tool_text}"
+    );
+}
+
+fn text_of_tool(m: &Message) -> Option<String> {
+    match m {
+        Message::Tool { content, .. } => match content {
+            MessageContent::Text(s) => Some(s.clone()),
+            MessageContent::Parts(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// Without content_compress (route off), the isolated header is exactly 0.
+#[tokio::test]
+async fn content_compress_off_by_default_zero_estimate() {
+    // Reuse the compress-route harness with the compress flag OFF: neither lever
+    // is enabled, so the content_compress estimate header is 0.
+    let (app, key, _seen) = app_with_compress_route(false).await;
+    let resp = app.oneshot(request_with_key(false, &key)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cc: f64 = resp.headers()["x-tokentrimmer-content-compress-saved-est-usd"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(cc, 0.0, "off → zero content_compress estimate");
 }
 
 /// Without any compression (route off), the compression-saved header is exactly

@@ -217,6 +217,14 @@ pub struct RouteConditions {
     /// `routing::matches_conditions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_documents: Option<bool>,
+    /// Mirror of `tt_routing::RouteConditions::content_type` (content-aware
+    /// compression, P1a). Carried for lossless wire round-trip only — NOT
+    /// projectable in replay (Plan has no live content classifier over the
+    /// historical `RequestLog` row), so a route carrying it is a conservative
+    /// non-match in `routing::matches_conditions`, keeping Plan from
+    /// over-projecting savings on a content-type route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. Replay
     /// matches against `RequestLog.body` when present, else conservative no-match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1043,6 +1051,9 @@ mod tests {
             doc_compaction: false,
             // not mirrored (Document Lane D4, runtime-only) — omitted when false
             document_lane: false,
+            // not mirrored (content-aware compression, runtime-only) — omitted
+            // when false
+            content_compress: false,
             redact: true,
             format_switch: Some("csv".to_string()),
             diff: false, // mutually exclusive with format_switch on a real route
@@ -1151,6 +1162,7 @@ mod tests {
             has_images: Some(true),
             has_audio: Some(false),
             has_documents: Some(true),
+            content_type: Some("code".to_string()),
             prompt_contains_any_of: vec!["summarize".to_string()],
             estimated_cost_gt: Some(0.01),
             estimated_cost_lt: Some(5.0),
@@ -1169,6 +1181,7 @@ mod tests {
         assert_eq!(plan_conditions.has_images, Some(true));
         assert_eq!(plan_conditions.has_audio, Some(false));
         assert_eq!(plan_conditions.has_documents, Some(true));
+        assert_eq!(plan_conditions.content_type.as_deref(), Some("code"));
         assert_eq!(
             plan_conditions.prompt_contains_any_of,
             vec!["summarize".to_string()]
