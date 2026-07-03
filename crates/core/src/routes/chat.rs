@@ -3210,15 +3210,17 @@ pub(crate) async fn prepare(
         0
     };
 
-    // Content-aware compression pass (`RouteAction::content_compress`, P1a): OFF
-    // BY DEFAULT — `route_content_compress` is false for every unrouted request
-    // and every route that did not enable it, so `req` is byte-for-byte
-    // unchanged on the default path. For each LARGE non-prose System/Tool block
-    // the dispatcher classifies the content kind and applies a
-    // CONTENT-PRESERVING structural backend (JSON whitespace-minify, CSV
-    // trailing-padding trim, log repeated-line collapse); Code/Prose are
-    // classified but left untouched in P1a. Same token-true gate + cache-span
-    // invariant as the other passes; the returned `tokens_removed` is the
+    // Content-aware compression pass (`RouteAction::content_compress`): OFF BY
+    // DEFAULT — `route_content_compress` is false for every unrouted request and
+    // every route that did not enable it, so `req` is byte-for-byte unchanged on
+    // the default path. For each LARGE System/Tool block the dispatcher
+    // classifies the content kind and applies a backend: CONTENT-PRESERVING
+    // structural compaction (JSON whitespace-minify, CSV trailing-padding trim,
+    // log repeated-line collapse) for JSON/CSV/log; and the P1b LOSSY prose
+    // EXTRACTIVE backend for Prose — the latter committed only behind the shared
+    // judge gate (`state.summary_gate`, default closed → verbatim). Code/Diff are
+    // classified but left untouched (their AST backend is P1c). Same token-true
+    // gate + cache-span invariant as the other passes; the returned `tokens_removed` is the
     // pipeline-MEASURED tokenizer delta, which drives the ISOLATED
     // `content_compress_saved_est_usd` estimate (NOT the baseline fold) below.
     // The flywheel records the dominant compacted kind (metrics only; raw
@@ -3233,7 +3235,15 @@ pub(crate) async fn prepare(
     let content_compress_tokens_removed: u32 = if route_content_compress {
         let out = {
             let mut split = crate::passes::SplitRequest::compute(req, &pass_cx);
-            crate::passes::PassPipeline::content_compress().run(&mut split, &pass_cx)
+            // P1b: the LOSSY prose backend rides the SAME judge gate as the
+            // summarize lever (`state.summary_gate`, default `NeverCommitGate`).
+            // Prose compresses only when the `"prose"` class is judge-trusted;
+            // otherwise it fails open to verbatim. The structural JSON/CSV/log
+            // backends are unaffected (content-preserving, no gate).
+            crate::passes::PassPipeline::content_compress_with_prose_gate(
+                state.summary_gate.clone(),
+            )
+            .run(&mut split, &pass_cx)
         };
         for name in &out.rejected {
             warnings.push(format!("pass_rejected:{name}"));
