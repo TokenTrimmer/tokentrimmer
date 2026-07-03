@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/shared",
     "crates/core",
+    "crates/doc-sidecar",
     "crates/cache",
     "crates/preview",
     "crates/routing",

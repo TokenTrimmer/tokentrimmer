@@ -1,0 +1,66 @@
+[package]
+name = "doc-sidecar"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Out-of-process OCR/parse sidecar for the TokenTrimmer Document Lane (POST /extract)."
+# Internal operational binary deployed alongside the gateway — not a
+# distributable library/CLI, so it is not published to crates.io (mirrors
+# tt-ts-types). This also excludes it from the per-crate LICENSE/NOTICE sync.
+publish = false
+
+[lib]
+name = "doc_sidecar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "doc-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Header-only base64 decode of the inline document bytes. Same version the
+# rest of the workspace pins (crates/cli, crates/preview). Unlicense OR MIT.
+base64 = "0.22"
+# Pure-Rust PDF text-layer extractor (no native lib): pulls the document's own
+# text layer, so the produced spans are LOSSLESS. MIT.
+pdf-extract = "0.12"
+
+# OCR (opt-in). Pure-Rust ocrs + the rten inference runtime — no native lib —
+# but a heavy compile + a runtime dependency on downloaded model files, so it is
+# OFF by default to keep the default workspace build lean and CI-safe. Enable
+# with `--features ocr` and point TT_OCR_DETECTION_MODEL / TT_OCR_RECOGNITION_MODEL
+# at the ocrs `.rten` models. All MIT OR Apache-2.0.
+#
+# Pinned to the ocrs 0.10 / rten 0.16 line on purpose: rten >= 0.22 raises its
+# MSRV to rustc 1.89, above this workspace's 1.88 pin, so a newer ocrs would make
+# even the opt-in feature un-buildable on the CI toolchain. Revisit when the
+# workspace MSRV moves to >= 1.89.
+image = { version = "0.25", optional = true }
+ocrs = { version = "=0.10.0", optional = true }
+rten = { version = "=0.16.0", optional = true }
+
+[features]
+default = []
+# Compile the real ocrs-backed image OCR path. Without this feature the
+# `image/*` branch returns a documented `ocr_unavailable` result (200, empty
+# text) rather than pulling the ML graph into every workspace build.
+ocr = ["dep:image", "dep:ocrs", "dep:rten"]
+
+[dev-dependencies]
+tower.workspace = true
+serde_json.workspace = true
+# Build a valid text-layer PDF fixture in-test (correct xref/offsets) instead of
+# hand-crafting brittle PDF bytes. lopdf is pdf-extract's own parser. MIT.
+lopdf = "0.42"
+
+[lints]
+workspace = true
