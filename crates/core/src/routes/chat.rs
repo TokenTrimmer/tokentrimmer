@@ -2511,6 +2511,11 @@ pub(crate) async fn prepare(
     // request-pass pipeline never runs and the request is byte-for-byte
     // unchanged.
     let route_doc_compaction = route_match.as_ref().is_some_and(|m| m.doc_compaction);
+    // A matched route opting into the content-aware compression pass
+    // (`RouteAction::content_compress`, P1a). When false (the default — no route
+    // or a route that did not enable it) the content_compress request-pass
+    // pipeline never runs and the request is byte-for-byte unchanged.
+    let route_content_compress = route_match.as_ref().is_some_and(|m| m.content_compress);
     // A matched route opting into the request-redaction guardrail
     // (`RouteAction::redact`). When false (the default) the redaction pass never
     // runs and the request is byte-for-byte unchanged. This is a SAFETY
@@ -3189,6 +3194,52 @@ pub(crate) async fn prepare(
         0
     };
 
+    // Content-aware compression pass (`RouteAction::content_compress`, P1a): OFF
+    // BY DEFAULT — `route_content_compress` is false for every unrouted request
+    // and every route that did not enable it, so `req` is byte-for-byte
+    // unchanged on the default path. For each LARGE non-prose System/Tool block
+    // the dispatcher classifies the content kind and applies a
+    // CONTENT-PRESERVING structural backend (JSON whitespace-minify, CSV
+    // trailing-padding trim, log repeated-line collapse); Code/Prose are
+    // classified but left untouched in P1a. Same token-true gate + cache-span
+    // invariant as the other passes; the returned `tokens_removed` is the
+    // pipeline-MEASURED tokenizer delta, which drives the ISOLATED
+    // `content_compress_saved_est_usd` estimate (NOT the baseline fold) below.
+    // The flywheel records the dominant compacted kind (metrics only; raw
+    // before/after capture is opt-in + off by default — see
+    // `content_compress::capture`).
+    let content_compress_kind: Option<String> = if route_content_compress {
+        crate::content_compress::dominant_compactable_kind(&req.messages)
+            .map(|k| k.as_str().to_string())
+    } else {
+        None
+    };
+    let content_compress_tokens_removed: u32 = if route_content_compress {
+        let out = {
+            let mut split = crate::passes::SplitRequest::compute(req, &pass_cx);
+            crate::passes::PassPipeline::content_compress().run(&mut split, &pass_cx)
+        };
+        for name in &out.rejected {
+            warnings.push(format!("pass_rejected:{name}"));
+        }
+        warnings.extend(out.warnings);
+        if out.tokens_removed > 0 {
+            tracing::debug!(
+                org_id = %ctx.org_id,
+                tokens_removed = out.tokens_removed,
+                kind = content_compress_kind.as_deref().unwrap_or("none"),
+                "content-compress pass removed input tokens"
+            );
+            crate::content_compress::capture::record(
+                content_compress_kind.as_deref(),
+                out.tokens_removed,
+            );
+        }
+        out.tokens_removed
+    } else {
+        0
+    };
+
     // Agentic context budget (`RouteAction::agentic_budget`): OFF BY DEFAULT —
     // `route_agentic_budget` is `None` for every unrouted request (and every
     // route that did not opt in), so the planner is never constructed and `req`
@@ -3242,6 +3293,7 @@ pub(crate) async fn prepare(
     let pass_effects = crate::passes::PassEffects {
         compression_tokens_removed,
         doc_compaction_tokens_removed,
+        content_compress_tokens_removed,
         cache_bust_penalty_usd: cache_bust.penalty_usd(pass_cx.pricing)
             + agentic_effects.cache_bust_penalty_usd,
         elide_field_drop_tokens_removed: agentic_effects.elide_field_drop_tokens_removed,
@@ -6460,6 +6512,11 @@ pub(crate) struct RouteMatch {
     /// default (no pass runs otherwise). A COST lever: suppressed on a paused
     /// route.
     pub(crate) doc_compaction: bool,
+    /// The matched route opted into the content-aware compression pass
+    /// (`RouteAction::content_compress`, P1a). When true the gateway runs the
+    /// content_compress request-pass pipeline before dispatch; off by default
+    /// (no pass runs otherwise). A COST lever: suppressed on a paused route.
+    pub(crate) content_compress: bool,
     /// The matched route opted into the request-redaction guardrail
     /// (`RouteAction::redact`). When true the gateway redacts PII/secrets from
     /// the outbound request before dispatch (a SAFETY transform, not a saving);
@@ -6661,6 +6718,7 @@ pub(crate) async fn apply_routing(
             flex: false,
             compress: false,
             doc_compaction: false,
+            content_compress: false,
             format_switch: None,
             diff: false,
             traffic_pct: None,
@@ -6694,6 +6752,7 @@ pub(crate) async fn apply_routing(
     let batch = m.then.batch;
     let compress = m.then.compress;
     let doc_compaction = m.then.doc_compaction;
+    let content_compress = m.then.content_compress;
     let redact = m.then.redact;
     let format_switch = m.then.format_switch.clone();
     let diff = m.then.diff;
@@ -6769,6 +6828,7 @@ pub(crate) async fn apply_routing(
         batch,
         compress,
         doc_compaction,
+        content_compress,
         redact,
         format_switch,
         diff,

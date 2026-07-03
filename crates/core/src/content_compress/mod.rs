@@ -20,6 +20,9 @@
 //! dependency cycle; this module re-exports it so the spec-named
 //! `content_compress::classify` path holds.
 
+pub mod capture;
 pub mod classify;
+pub mod structural;
 
 pub use classify::{classify, ContentKind, MIN_BLOB_CHARS};
+pub use structural::{compactable_kind, dominant_compactable_kind, ContentCompressPass};

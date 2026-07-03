@@ -206,6 +206,14 @@ pub struct PassEffects {
     /// `doc_compaction_saved_usd`. Zero on every request whose route did not
     /// opt into `doc_compaction`.
     pub doc_compaction_tokens_removed: u32,
+    /// Input tokens the content-aware compression pass
+    /// (`RouteAction::content_compress`, P1a) removed from LARGE non-prose text
+    /// blocks (JSON/CSV/log structural compaction), pipeline-measured under the
+    /// token-true gate. A SEPARATE bucket that drives the ISOLATED
+    /// `content_compress_saved_est_usd` estimate (NOT folded into
+    /// `baseline_cost_usd` — unlike compression/doc_compaction). Zero on every
+    /// request whose route did not opt into `content_compress`.
+    pub content_compress_tokens_removed: u32,
     /// Estimated USD penalty of a deliberate stable-prefix mutation (a booked
     /// [`CacheBustEstimate`]), pre-fee. Drives
     /// `CostBreakdown::cache_bust_penalty_usd` — the negative savings entry.
@@ -263,6 +271,15 @@ impl PassPipeline {
     #[must_use]
     pub fn doc_compaction() -> Self {
         Self::new().with(DocCompactionPass::new())
+    }
+
+    /// The content-aware compression stage (Phase 1) — the only stage enabled by
+    /// `RouteAction::content_compress`. Runs SEPARATELY from
+    /// `conservative_compression` / `doc_compaction` so its measured token delta
+    /// attributes to the distinct, ISOLATED `content_compress_saved_est_usd`.
+    #[must_use]
+    pub fn content_compress() -> Self {
+        Self::new().with(crate::content_compress::ContentCompressPass::new())
     }
 
     /// Append a pass to the end of the pipeline (builder style).
