@@ -165,6 +165,7 @@ fn route(name: &str, priority: u32, tag: Option<&str>, target: &str) -> Route {
             compress: false,
             doc_compaction: false,
             document_lane: false,
+            content_compress: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,

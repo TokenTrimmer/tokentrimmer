@@ -379,6 +379,7 @@ async fn privacy_route_disable_cache_beats_force_write() {
                 compress: false,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

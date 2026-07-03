@@ -176,6 +176,7 @@ async fn embeddings_prompt_route_downgrades_and_reports_savings() {
                 compress: false,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

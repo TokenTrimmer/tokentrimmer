@@ -100,6 +100,17 @@ pub struct RouteConditions {
     /// `validate::validate_capability`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_documents: Option<bool>,
+    /// Match only if the request's DOMINANT content kind (the classified kind of
+    /// its largest text block — see
+    /// [`tt_shared::capability_check::request_dominant_content_kind`]) equals this
+    /// lowercase [`ContentKind`](tt_shared::content_kind::ContentKind) string
+    /// (`"json"`, `"csv"`, `"log"`, `"code"`, `"diff"`, `"prose"`) — the
+    /// content-aware compression routing signal (P1a). Lets a route target, e.g.,
+    /// `content_type=code` to opt code-dominant traffic into a compressor. `None`
+    /// ignores. A request with no block large enough to classify never matches a
+    /// `content_type` condition (an unclassifiable request is not "of" any kind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// Match if the request's user+system text contains ANY of these keywords
     /// (case-insensitive substring). Empty = ignore.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -236,6 +247,23 @@ pub struct RouteAction {
     /// false (back-compat, mirrors `compress`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub document_lane: bool,
+    /// Opt the matched request into the **content-aware compression pass**
+    /// (content_compress, request-pass pipeline; Phase 1). For each LARGE
+    /// non-prose text block the dispatcher classifies its
+    /// [`ContentKind`](tt_shared::content_kind::ContentKind) and applies a
+    /// specialized backend: in P1a, JSON / CSV / log blocks get a
+    /// CONTENT-PRESERVING structural compaction (collapse insignificant JSON
+    /// whitespace, collapse repeated identical log lines, trim CSV padding);
+    /// Code / Prose blocks are classified but left UNTOUCHED (their backends land
+    /// in P1c / P1b). It rides the pipeline's token-true gate (a token-growing
+    /// result → verbatim); the measured token reduction is booked into the
+    /// ISOLATED `content_compress_saved_est_usd` estimate (never the
+    /// invoice-reconciled headline) + surfaced on
+    /// `X-TokenTrimmer-Content-Compress-Saved-Est-Usd`. **Off by default** — no
+    /// behavior change unless a route enables it; omitted from JSON when false
+    /// (back-compat, mirrors `compress`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content_compress: bool,
     /// Opt the matched request into the **request-redaction guardrail**
     /// (request-pass pipeline): a conservative SAFETY transform that replaces
     /// PII/secrets in the OUTBOUND request (user prose, system blocks,
@@ -715,6 +743,14 @@ fn matches(
             return false;
         }
     }
+    if let Some(want) = &c.content_type {
+        // The request's dominant content kind must equal the targeted kind. An
+        // unclassifiable request (no block large enough) never matches.
+        let got = tt_shared::capability_check::request_dominant_content_kind(req);
+        if got.map(|k| k.as_str()) != Some(want.as_str()) {
+            return false;
+        }
+    }
     if !c.prompt_contains_any_of.is_empty() {
         let text = tt_shared::capability_check::request_input_text(req).to_lowercase();
         if !c
@@ -759,6 +795,7 @@ mod tests {
                 compress: false,
                 doc_compaction: false,
                 document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
@@ -1149,6 +1186,7 @@ mod tests {
             compress: false,
             doc_compaction: false,
             document_lane: false,
+            content_compress: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1194,6 +1232,7 @@ mod tests {
             compress: false,
             doc_compaction: false,
             document_lane: false,
+            content_compress: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1231,6 +1270,7 @@ mod tests {
             compress: false,
             doc_compaction: false,
             document_lane: false,
+            content_compress: false,
             redact: false,
             traffic_pct: None,
             shadow_model: None,
@@ -1321,6 +1361,7 @@ mod tests {
         // Present when true.
         let b = RouteAction {
             document_lane: true,
+            content_compress: false,
             ..off
         };
         assert!(serde_json::to_string(&b)
@@ -1331,9 +1372,123 @@ mod tests {
         // a valid effect (mirrors compress/doc_compaction).
         let modifier_only = RouteAction {
             document_lane: true,
+            content_compress: false,
             ..Default::default()
         };
         assert!(crate::validate::validate_route_has_effect(&modifier_only).is_ok());
+    }
+
+    /// `content_compress` (content-aware compression, P1a) defaults to false, is
+    /// omitted from JSON when false (back-compat), `{"content_compress":true}`
+    /// deserializes set, and a `content_compress`-only modifier route (no
+    /// target_model) is a valid effect (mirrors compress/doc_compaction).
+    #[test]
+    fn route_action_content_compress_defaults_false_omits_and_is_an_effect() {
+        // Default: absent on read → false.
+        let parsed: RouteAction = serde_json::from_str(r#"{"target_model":"m"}"#).unwrap();
+        assert!(
+            !parsed.content_compress,
+            "content_compress must default false"
+        );
+
+        // {"content_compress":true} deserializes with the flag set.
+        let on: RouteAction = serde_json::from_str(r#"{"content_compress":true}"#).unwrap();
+        assert!(on.content_compress, "explicit true must deserialize as set");
+
+        // Omitted from JSON when false (existing route JSON stays byte-identical).
+        let off = RouteAction {
+            target_model: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&off).unwrap(),
+            r#"{"target_model":"x"}"#,
+            "content_compress:false must be omitted from the wire form"
+        );
+
+        // Present when true.
+        let b = RouteAction {
+            content_compress: true,
+            ..off
+        };
+        assert!(serde_json::to_string(&b)
+            .unwrap()
+            .contains("\"content_compress\":true"));
+
+        // A modifier-only route carrying ONLY content_compress is a valid effect.
+        let modifier_only = RouteAction {
+            content_compress: true,
+            ..Default::default()
+        };
+        assert!(crate::validate::validate_route_has_effect(&modifier_only).is_ok());
+    }
+
+    /// A `content_type` condition matches only requests whose DOMINANT content
+    /// kind equals the targeted kind: `content_type=code` matches a code-dominant
+    /// request and NOT a prose-dominant one nor a tiny/unclassifiable request.
+    #[test]
+    fn content_type_matches_dominant_content_kind() {
+        let route = Route {
+            when: RouteConditions {
+                content_type: Some("code".into()),
+                ..Default::default()
+            },
+            ..make_route("code-route", 10, vec![], "cheap")
+        };
+        let eng = RoutingEngine::with_routes(vec![route]);
+
+        let code = "fn a() {\n  let x = 1;\n}\n".repeat(20);
+        let code_req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message::User {
+                content: MessageContent::Text(code),
+                name: None,
+            }],
+            ..serde_json::from_str(r#"{"model":"placeholder","messages":[]}"#).unwrap()
+        };
+        assert!(
+            eng.evaluate(&code_req, &make_ctx(None), 100).is_some(),
+            "code-dominant request must match content_type=code"
+        );
+
+        let prose = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+        let prose_req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message::User {
+                content: MessageContent::Text(prose),
+                name: None,
+            }],
+            ..serde_json::from_str(r#"{"model":"placeholder","messages":[]}"#).unwrap()
+        };
+        assert!(
+            eng.evaluate(&prose_req, &make_ctx(None), 100).is_none(),
+            "prose-dominant request must NOT match content_type=code"
+        );
+
+        // Tiny / unclassifiable request → never matches a content_type route.
+        assert!(eng
+            .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
+            .is_none());
+    }
+
+    /// `content_type` defaults to `None`, is omitted from JSON when `None`
+    /// (legacy rows / payloads unchanged), and `Some("code")` round-trips.
+    #[test]
+    fn route_conditions_content_type_defaults_none_omits_and_round_trips() {
+        // Default: absent on read → None; omitted on write (skip_serializing_if).
+        let parsed: RouteConditions = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(parsed.content_type, None);
+        let j = serde_json::to_string(&parsed).unwrap();
+        assert!(!j.contains("content_type"), "{j}");
+
+        // Some("code") deserializes and re-emits the key (RouteConditions does
+        // not skip its leading always-present fields, so we assert on the key,
+        // not full byte-identity).
+        let c: RouteConditions = serde_json::from_str(r#"{"content_type":"code"}"#).unwrap();
+        assert_eq!(c.content_type.as_deref(), Some("code"));
+        assert!(serde_json::to_string(&c)
+            .unwrap()
+            .contains("\"content_type\":\"code\""));
     }
 
     /// `format_switch` defaults to `None`, is omitted from JSON when `None`
