@@ -3216,10 +3216,12 @@ pub(crate) async fn prepare(
     // the default path. For each LARGE System/Tool block the dispatcher
     // classifies the content kind and applies a backend: CONTENT-PRESERVING
     // structural compaction (JSON whitespace-minify, CSV trailing-padding trim,
-    // log repeated-line collapse) for JSON/CSV/log; and the P1b LOSSY prose
-    // EXTRACTIVE backend for Prose — the latter committed only behind the shared
-    // judge gate (`state.summary_gate`, default closed → verbatim). Code/Diff are
-    // classified but left untouched (their AST backend is P1c). Same token-true
+    // log repeated-line collapse) for JSON/CSV/log; the P1b LOSSY prose
+    // EXTRACTIVE backend for Prose; and the P1c LOSSY AST backend for Code
+    // (truncate long function bodies, keep imports/signatures, re-parse-verify) —
+    // the latter two committed only behind the shared judge gate
+    // (`state.summary_gate`, default closed → verbatim). Diff is classified but
+    // left untouched (no Phase-1 backend). Same token-true
     // gate + cache-span invariant as the other passes; the returned `tokens_removed` is the
     // pipeline-MEASURED tokenizer delta, which drives the ISOLATED
     // `content_compress_saved_est_usd` estimate (NOT the baseline fold) below.
@@ -3235,15 +3237,16 @@ pub(crate) async fn prepare(
     let content_compress_tokens_removed: u32 = if route_content_compress {
         let out = {
             let mut split = crate::passes::SplitRequest::compute(req, &pass_cx);
-            // P1b: the LOSSY prose backend rides the SAME judge gate as the
-            // summarize lever (`state.summary_gate`, default `NeverCommitGate`).
-            // Prose compresses only when the `"prose"` class is judge-trusted;
-            // otherwise it fails open to verbatim. The structural JSON/CSV/log
-            // backends are unaffected (content-preserving, no gate).
-            crate::passes::PassPipeline::content_compress_with_prose_gate(
-                state.summary_gate.clone(),
-            )
-            .run(&mut split, &pass_cx)
+            // P1b/P1c: the LOSSY prose + AST-code backends ride the SAME judge
+            // gate as the summarize lever (`state.summary_gate`, default
+            // `NeverCommitGate`). Prose compresses only when the `"prose"` class
+            // is judge-trusted, Code only when the `"code"` class is (independent
+            // classes + 0.90-floor ratchets); otherwise each fails open to
+            // verbatim (Code additionally re-parse-verifies — never serve broken
+            // code). The structural JSON/CSV/log backends are unaffected
+            // (content-preserving, no gate).
+            crate::passes::PassPipeline::content_compress_with_gates(state.summary_gate.clone())
+                .run(&mut split, &pass_cx)
         };
         for name in &out.rejected {
             warnings.push(format!("pass_rejected:{name}"));
