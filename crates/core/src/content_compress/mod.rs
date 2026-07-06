@@ -21,7 +21,13 @@
 //!   ("never serve broken code"), committed only behind the shared judge gate for
 //!   the `"code"` class (fail-open to verbatim), routed by the dispatcher when a
 //!   route sets `content_compress`.
-//! - **P1d:** the flywheel dataset export.
+//! - **P1d (this):** the flywheel dataset export. Makes the P1a raw-capture
+//!   scaffold REAL: [`capture::record_pair`] appends a JSONL `{kind, before,
+//!   after, tokens, gate_committed}` pair per compacted block to
+//!   `TT_COMPRESS_CAPTURE_PATH` (opt-in, OFF by default — ZDR). A `CaptureCtx`
+//!   (the org/trace/model/provider join keys) threads from the route through the
+//!   pass to the per-block capture point; the offline `tt export compress-corpus`
+//!   CLI materializes the JSONL into a versioned Phase-2 training corpus.
 //!
 //! The classifier itself lives in `tt-shared` ([`tt_shared::content_kind`]) so
 //! the routing engine's `content_type` condition can reuse it without a
@@ -34,7 +40,10 @@ pub mod code;
 pub mod prose;
 pub mod structural;
 
+pub use capture::CaptureRecord;
 pub use classify::{classify, ContentKind, MIN_BLOB_CHARS};
 pub use code::CODE_CLASS;
 pub use prose::PROSE_CLASS;
-pub use structural::{compactable_kind, dominant_compactable_kind, ContentCompressPass};
+pub use structural::{
+    compactable_kind, dominant_compactable_kind, CaptureCtx, ContentCompressPass,
+};

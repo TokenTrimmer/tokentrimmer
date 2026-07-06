@@ -48,6 +48,24 @@ use crate::passes::{push_content_text, PassOutcome, RequestPass};
 /// the line plus a repeat-count marker (fewer than this is left in place).
 const LOG_MIN_RUN: usize = 3;
 
+/// The per-request join keys threaded to the P1d raw-capture sink. Carries the
+/// `org_id` (the ZDR opt-in is instance-level today), the `trace_id` (the join
+/// key to the eventual response-side paired quality verdict, Phase 2), and the
+/// `model`/`provider_id` (tokenization context the export CLI recomputes per
+/// block). Built once in `chat.rs prepare()` from the `RequestContext` + the
+/// `PassContext`; the pass clones the `Arc` into each compacted block's record.
+///
+/// `None` = capture OFF for this request (the default — metrics-only). The pass
+/// is a no-op for capture when `None`, so threading is observability-only and
+/// never changes the bytes dispatched.
+#[derive(Clone)]
+pub struct CaptureCtx {
+    pub org_id: String,
+    pub trace_id: String,
+    pub model: String,
+    pub provider_id: String,
+}
+
 /// The content-aware compression stage (Phase 1). Off by default; enabled by
 /// `RouteAction::content_compress`.
 ///
@@ -60,10 +78,17 @@ const LOG_MIN_RUN: usize = 3;
 /// — the synchronous projection of the ~2% paired judge + the 0.90-floor ratchet
 /// — and in production are the SAME gate object (distinct class keys keep the
 /// prose and code levers independent).
+///
+/// The optional `capture` ([`CaptureCtx`]) enables the P1d raw before/after
+/// capture: when `Some` AND the instance opted in via `TT_COMPRESS_CAPTURE` +
+/// `TT_COMPRESS_CAPTURE_PATH`, each compacted block appends a JSONL record. `None`
+/// (default) = capture OFF, zero overhead. Capture is observability — it never
+/// changes the bytes the pass dispatches.
 #[derive(Clone, Default)]
 pub struct ContentCompressPass {
     prose_gate: Option<Arc<dyn SummaryGate>>,
     code_gate: Option<Arc<dyn SummaryGate>>,
+    capture: Option<Arc<CaptureCtx>>,
 }
 
 impl std::fmt::Debug for ContentCompressPass {
@@ -71,6 +96,7 @@ impl std::fmt::Debug for ContentCompressPass {
         f.debug_struct("ContentCompressPass")
             .field("prose_gate", &self.prose_gate.as_ref().map(|_| "<gate>"))
             .field("code_gate", &self.code_gate.as_ref().map(|_| "<gate>"))
+            .field("capture", &self.capture.as_ref().map(|_| "<ctx>"))
             .finish()
     }
 }
@@ -78,12 +104,13 @@ impl std::fmt::Debug for ContentCompressPass {
 impl ContentCompressPass {
     /// Construct the pass with BOTH LOSSY backends DISABLED (structural
     /// JSON/CSV/log backends only — the conservative posture; Prose + Code left
-    /// verbatim).
+    /// verbatim) AND raw capture DISABLED.
     #[must_use]
     pub fn new() -> Self {
         Self {
             prose_gate: None,
             code_gate: None,
+            capture: None,
         }
     }
 
@@ -97,6 +124,7 @@ impl ContentCompressPass {
         Self {
             prose_gate: Some(gate),
             code_gate: None,
+            capture: None,
         }
     }
 
@@ -111,6 +139,22 @@ impl ContentCompressPass {
         Self {
             prose_gate: Some(gate.clone()),
             code_gate: Some(gate),
+            capture: None,
+        }
+    }
+
+    /// Construct the pass with BOTH lossy backends behind `gate` AND the P1d raw
+    /// before/after capture enabled via `capture`. The capture records ONLY when
+    /// the instance opted in (`TT_COMPRESS_CAPTURE` + `TT_COMPRESS_CAPTURE_PATH`);
+    /// otherwise the [`CaptureCtx`] is carried but [`capture::record_pair`] is a
+    /// no-op (zero overhead). Distinct from [`with_gates`](Self::with_gates) so
+    /// existing callers are unchanged.
+    #[must_use]
+    pub fn with_gates_and_capture(gate: Arc<dyn SummaryGate>, capture: Arc<CaptureCtx>) -> Self {
+        Self {
+            prose_gate: Some(gate.clone()),
+            code_gate: Some(gate),
+            capture: Some(capture),
         }
     }
 }
@@ -129,7 +173,14 @@ impl RequestPass for ContentCompressPass {
         // Self-report only (drift telemetry): the pipeline's token-true gate
         // measures the whole-tail delta itself and uses THAT for attribution.
         let before = touchable_text(tail.messages());
-        compact_in_place(tail, self.prose_gate.as_deref(), self.code_gate.as_deref());
+        compact_in_place(
+            tail,
+            self.prose_gate.as_deref(),
+            self.code_gate.as_deref(),
+            // `as_deref` on `Option<Arc<CaptureCtx>>` → `Option<&CaptureCtx>`
+            // (Arc derefs to its target); None = capture OFF for this request.
+            self.capture.as_deref(),
+        );
         let after = touchable_text(tail.messages());
 
         let before_tokens =
@@ -156,16 +207,18 @@ fn touchable_text(msgs: &[Message]) -> String {
 
 /// Classify + compact every LARGE System / Tool text block in place. `prose_gate`
 /// / `code_gate` are threaded to the LOSSY prose (P1b) / code (P1c) backends;
-/// `None` disables that kind.
+/// `None` disables that kind. `capture` (the P1d [`CaptureCtx`]) is threaded to
+/// the per-block capture point; `None` = capture OFF.
 fn compact_in_place(
     tail: &mut VolatileTail<'_>,
     prose_gate: Option<&dyn SummaryGate>,
     code_gate: Option<&dyn SummaryGate>,
+    capture: Option<&CaptureCtx>,
 ) {
     for m in tail.messages_mut() {
         match m {
             Message::System { content } | Message::Tool { content, .. } => {
-                compact_content(content, prose_gate, code_gate);
+                compact_content(content, prose_gate, code_gate, capture);
             }
             // User + Assistant prose are never touched.
             Message::User { .. } | Message::Assistant { .. } => {}
@@ -177,17 +230,18 @@ fn compact_content(
     content: &mut MessageContent,
     prose_gate: Option<&dyn SummaryGate>,
     code_gate: Option<&dyn SummaryGate>,
+    capture: Option<&CaptureCtx>,
 ) {
     match content {
         MessageContent::Text(s) => {
-            if let Some(compacted) = compact_block(s, prose_gate, code_gate) {
+            if let Some(compacted) = compact_block(s, prose_gate, code_gate, capture) {
                 *s = compacted;
             }
         }
         MessageContent::Parts(parts) => {
             for p in parts {
                 if let ContentPart::Text { text } = p {
-                    if let Some(compacted) = compact_block(text, prose_gate, code_gate) {
+                    if let Some(compacted) = compact_block(text, prose_gate, code_gate, capture) {
                         *text = compacted;
                     }
                 }
@@ -207,12 +261,20 @@ fn compact_content(
 /// (`PROSE_CLASS` / `CODE_CLASS`) — an absent / untrusted / closed gate fails OPEN
 /// to the verbatim block (no compression). The Code backend additionally
 /// re-parse-verifies its own output (never serve broken code).
+///
+/// P1d: when `capture` is `Some`, a [`CaptureRecord`] for the compacted pair
+/// (`before` = `s`, `after` = `result`, `gate_committed` = true — the block
+/// compacted) is appended to the configured sink. [`capture::record_pair`] is a
+/// no-op when the instance did not opt in, so the capture is observability-only
+/// and never changes the bytes the pass dispatches.
 pub(crate) fn compact_block(
     s: &str,
     prose_gate: Option<&dyn SummaryGate>,
     code_gate: Option<&dyn SummaryGate>,
+    capture: Option<&CaptureCtx>,
 ) -> Option<String> {
-    let result = match classify(s)? {
+    let kind = classify(s)?;
+    let result = match kind {
         ContentKind::Json => minify_json_whitespace(s)?,
         ContentKind::Csv => strip_trailing_line_ws(s),
         ContentKind::Log => collapse_repeated_log_lines(s),
@@ -240,6 +302,24 @@ pub(crate) fn compact_block(
         ContentKind::Diff => return None,
     };
     if result.len() < s.len() {
+        // P1d: capture the before/after pair when the route opted into raw
+        // capture. record_pair is a no-op unless the instance set
+        // TT_COMPRESS_CAPTURE + TT_COMPRESS_CAPTURE_PATH, and a write error is
+        // swallowed (capture must never break a request). tokens_removed is 0
+        // here; the export CLI recomputes the per-block delta offline.
+        if let Some(ctx) = capture {
+            let rec = crate::content_compress::CaptureRecord::new(
+                kind.as_str(),
+                s,
+                &result,
+                0,
+                &ctx.org_id,
+                &ctx.trace_id,
+                &ctx.model,
+                &ctx.provider_id,
+            );
+            crate::content_compress::capture::record_pair(&rec);
+        }
         Some(result)
     } else {
         None
@@ -1077,5 +1157,117 @@ export function boot(opts: ClientOptions): number {
             original, after,
             "JSON values unchanged (structural, not code)"
         );
+    }
+
+    // ── P1d: the CaptureCtx is observability-only (never changes the bytes) ──
+
+    /// A helper `CaptureCtx` for the capture-on tests (the env gate is OFF in
+    /// the test env, so `record_pair` is a no-op — the test asserts the ctx is
+    /// threaded without changing the dispatched bytes).
+    fn capture_ctx() -> Arc<CaptureCtx> {
+        Arc::new(CaptureCtx {
+            org_id: "00000000-0000-0000-0000-0000000000ff".into(),
+            trace_id: "00000000-0000-0000-0000-0000000000ee".into(),
+            model: "gpt-4o".into(),
+            provider_id: "openai".into(),
+        })
+    }
+
+    #[test]
+    fn capture_ctx_threaded_is_byte_identical_to_without_it() {
+        // The SAME code blob, an OPEN gate, with vs without the CaptureCtx: the
+        // dispatched bytes + tokens_removed MUST be identical — capture is
+        // observability-only (it never changes what the pass dispatches).
+        let blob = code_blob();
+        let mut req_a = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![system(&blob)],
+            ..Default::default()
+        };
+        let mut req_b = req_a.clone();
+        let gate = Arc::new(AlwaysCommitGate);
+
+        let cx = PassContext {
+            provider_id: "openai",
+            model: "gpt-4o",
+            pricing: None,
+        };
+        // (a) WITHOUT capture (the P1c posture).
+        let removed_a = {
+            let mut split = SplitRequest::compute(&mut req_a, &cx);
+            split
+                .run_pass(|stable, tail| {
+                    ContentCompressPass::with_gates(gate.clone()).apply(stable, tail, &cx)
+                })
+                .tokens_removed
+        };
+        // (b) WITH capture (the P1d builder). Env gate is OFF in tests, so
+        // record_pair is a no-op — the bytes + delta are unchanged.
+        let removed_b = {
+            let mut split = SplitRequest::compute(&mut req_b, &cx);
+            split
+                .run_pass(|stable, tail| {
+                    ContentCompressPass::with_gates_and_capture(gate.clone(), capture_ctx())
+                        .apply(stable, tail, &cx)
+                })
+                .tokens_removed
+        };
+        assert_eq!(
+            text_of(&req_a.messages[0]),
+            text_of(&req_b.messages[0]),
+            "capture ctx is observability-only — bytes identical with/without it"
+        );
+        assert_eq!(
+            removed_a, removed_b,
+            "the token delta is identical with/without capture"
+        );
+        assert!(removed_b > 0, "the gate is open → code compressed");
+    }
+
+    #[test]
+    fn capture_ctx_with_capture_off_appends_no_record() {
+        // The default test-env posture is capture OFF (capture_enabled() is
+        // OnceLock-cached false, so record_pair returns before touching any
+        // path). A route with a CaptureCtx threaded + an OPEN gate still
+        // compresses (capture is observability, not a control) but writes NO
+        // record_pair — the metrics-only plane carries the signal (ZDR).
+        assert!(
+            !crate::content_compress::capture::capture_enabled(),
+            "capture is OFF in the test env"
+        );
+        let blob = code_blob();
+        let mut req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![system(&blob)],
+            ..Default::default()
+        };
+        let removed =
+            run_gated_both_with_capture(&mut req, Arc::new(AlwaysCommitGate), capture_ctx());
+        assert!(
+            removed > 0,
+            "the gate is open → code still compresses (capture is observability)"
+        );
+    }
+
+    /// Run the pass with BOTH lossy backends AND the capture ctx, returning the
+    /// self-reported token delta. Mirrors [`run_gated_both`] + the P1d capture
+    /// threading (the env gate is OFF in tests, so record_pair is a no-op).
+    fn run_gated_both_with_capture(
+        req: &mut ChatCompletionRequest,
+        gate: Arc<dyn SummaryGate>,
+        capture: Arc<CaptureCtx>,
+    ) -> u32 {
+        let cx = PassContext {
+            provider_id: "openai",
+            model: "gpt-4o",
+            pricing: None,
+        };
+        let mut split = SplitRequest::compute(req, &cx);
+        split
+            .run_pass(|stable, tail| {
+                ContentCompressPass::with_gates_and_capture(gate.clone(), capture)
+                    .apply(stable, tail, &cx)
+            })
+            .tokens_removed
     }
 }
