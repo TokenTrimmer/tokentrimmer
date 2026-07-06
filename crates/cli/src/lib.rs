@@ -9,6 +9,7 @@ pub mod budgets;
 pub mod bundle;
 pub mod catalog;
 pub mod chat;
+pub mod compress_corpus;
 pub mod context;
 pub mod cost_diff;
 pub mod embed;
