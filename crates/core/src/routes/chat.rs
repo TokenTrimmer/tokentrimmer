@@ -3245,8 +3245,26 @@ pub(crate) async fn prepare(
             // verbatim (Code additionally re-parse-verifies — never serve broken
             // code). The structural JSON/CSV/log backends are unaffected
             // (content-preserving, no gate).
-            crate::passes::PassPipeline::content_compress_with_gates(state.summary_gate.clone())
-                .run(&mut split, &pass_cx)
+            //
+            // P1d: a CaptureCtx is threaded so each compacted block's
+            // before/after pair is recorded (the Phase-2 training flywheel).
+            // record_pair is a NO-OP unless the instance opted in
+            // (TT_COMPRESS_CAPTURE + TT_COMPRESS_CAPTURE_PATH), so this is
+            // observability-only — never changes the dispatched bytes. The
+            // per-block record_pair supersedes the old per-request
+            // capture::record (the kind + tokens are both in the per-block
+            // record).
+            let capture = std::sync::Arc::new(crate::content_compress::CaptureCtx {
+                org_id: ctx.org_id.to_string(),
+                trace_id: ctx.trace_id.to_string(),
+                model: pass_cx.model.to_string(),
+                provider_id: pass_cx.provider_id.to_string(),
+            });
+            crate::passes::PassPipeline::content_compress_with_gates_and_capture(
+                state.summary_gate.clone(),
+                capture,
+            )
+            .run(&mut split, &pass_cx)
         };
         for name in &out.rejected {
             warnings.push(format!("pass_rejected:{name}"));
@@ -3258,10 +3276,6 @@ pub(crate) async fn prepare(
                 tokens_removed = out.tokens_removed,
                 kind = content_compress_kind.as_deref().unwrap_or("none"),
                 "content-compress pass removed input tokens"
-            );
-            crate::content_compress::capture::record(
-                content_compress_kind.as_deref(),
-                out.tokens_removed,
             );
         }
         out.tokens_removed
