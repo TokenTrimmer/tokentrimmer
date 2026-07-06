@@ -314,6 +314,24 @@ impl PassPipeline {
         ))
     }
 
+    /// The content-aware compression stage with BOTH lossy backends (P1b prose +
+    /// P1c code) AND the P1d raw before/after capture enabled. The capture
+    /// records ONLY when the instance opted in (`TT_COMPRESS_CAPTURE` +
+    /// `TT_COMPRESS_CAPTURE_PATH`); otherwise the [`CaptureCtx`] is carried but
+    /// [`capture::record_pair`](crate::content_compress::capture::record_pair) is
+    /// a no-op (zero overhead, capture is observability-not-control). Distinct
+    /// from [`content_compress_with_gates`](Self::content_compress_with_gates) so
+    /// existing callers are unchanged.
+    #[must_use]
+    pub fn content_compress_with_gates_and_capture(
+        gate: std::sync::Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
+        capture: std::sync::Arc<crate::content_compress::CaptureCtx>,
+    ) -> Self {
+        Self::new().with(
+            crate::content_compress::ContentCompressPass::with_gates_and_capture(gate, capture),
+        )
+    }
+
     /// Append a pass to the end of the pipeline (builder style).
     #[must_use]
     pub fn with<P: RequestPass + 'static>(mut self, pass: P) -> Self {
