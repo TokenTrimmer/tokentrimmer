@@ -17,3 +17,4 @@ pub mod panel_legs;
 pub mod propagation;
 pub mod request_logs;
 pub mod tracing;
+pub mod vcr;
