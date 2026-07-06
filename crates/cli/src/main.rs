@@ -170,6 +170,11 @@ enum Command {
         #[command(subcommand)]
         action: AuditAction,
     },
+    /// Export helpers (offline artifact materialization).
+    Export {
+        #[command(subcommand)]
+        action: tt_cli::compress_corpus::ExportAction,
+    },
     /// Run the MCP server (stdio transport by default).
     ///
     /// `--transport http` serves the current MCP Streamable HTTP transport on a
@@ -881,6 +886,18 @@ async fn main() -> anyhow::Result<()> {
                 key_hex.as_deref(),
                 expected_tip.as_deref(),
             )?;
+        }
+        Command::Export {
+            action: tt_cli::compress_corpus::ExportAction::CompressCorpus { input, output },
+        } => {
+            let count = tt_cli::compress_corpus::run_export(
+                std::path::Path::new(&input),
+                std::path::Path::new(&output),
+            )?;
+            tt_cli::ui::note(&format!(
+                "exported {count} content-compression pair{} to {output}",
+                if count == 1 { "" } else { "s" }
+            ));
         }
         Command::Mcp {
             transport,

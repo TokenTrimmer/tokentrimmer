@@ -23,9 +23,32 @@
 
 use std::path::Path;
 
+use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 use anyhow::Context;
+
+/// The `tt export` subcommands.
+#[derive(Subcommand)]
+pub enum ExportAction {
+    /// Materialize the opt-in content-compression capture into a versioned
+    /// Phase-2 training corpus (offline).
+    ///
+    /// Reads the JSONL sink produced when the gateway ran with
+    /// `TT_COMPRESS_CAPTURE=1` + `TT_COMPRESS_CAPTURE_PATH=<file>`, recomputes
+    /// the per-block token counts offline, and writes a versioned training
+    /// corpus to `--output`. REFUSES any capture record not marked opted-in
+    /// (ZDR — names the `trace_id`, writes no output). An empty capture yields
+    /// an empty corpus (not an error).
+    CompressCorpus {
+        /// Path to the capture JSONL (`TT_COMPRESS_CAPTURE_PATH` sink).
+        #[arg(long, value_name = "PATH")]
+        input: String,
+        /// Path to write the versioned training corpus JSON.
+        #[arg(long, value_name = "PATH")]
+        output: String,
+    },
+}
 
 /// The corpus schema version. Bumped only on a breaking shape change; a future
 /// exporter refuses a corpus whose `schema_version` it does not understand
