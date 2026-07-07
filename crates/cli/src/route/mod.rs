@@ -253,13 +253,54 @@ pub async fn run(
             match sub {
                 CatalogCmd::Enable => {
                     let catalog = tt_routing::catalog::catalog_routes();
-                    let existing_names: std::collections::HashSet<&str> = existing_arr
-                        .iter()
-                        .filter_map(|r| r["name"].as_str())
-                        .collect();
+                    // Index existing catalog routes by name + capture their id +
+                    // their current then.content_compress (so a re-run is
+                    // idempotent: an existing row that already has
+                    // content_compress=true is left alone; a stale row from
+                    // before P2a — content_compress=false/absent — is delete +
+                    // recreated to pick up the new default-on flag).
+                    let mut existing_by_name: std::collections::HashMap<&str, (&str, bool)> =
+                        std::collections::HashMap::new();
+                    for r in &existing_arr {
+                        let Some(name) = r["name"].as_str() else {
+                            continue;
+                        };
+                        if !tt_routing::catalog::is_catalog_route_name(name) {
+                            continue;
+                        }
+                        let id = r["id"].as_str().unwrap_or("");
+                        let cc = r["then"]["content_compress"].as_bool().unwrap_or(false);
+                        existing_by_name.insert(name, (id, cc));
+                    }
                     let mut added = 0usize;
+                    let mut refreshed = 0usize;
                     for new_route in &catalog {
-                        if existing_names.contains(new_route.name.as_str()) {
+                        if let Some((id, cc)) = existing_by_name.get(new_route.name.as_str()) {
+                            if *cc {
+                                // Already current (content_compress=true): skip.
+                                continue;
+                            }
+                            // Stale catalog row (pre-P2a, content_compress
+                            // false/absent): the routes API has no PUT/PATCH, so
+                            // delete + recreate to pick up the new default-on
+                            // content_compress flag.
+                            let sp = ui::spinner(&format!(
+                                "Refreshing catalog route {} (content_compress)…",
+                                new_route.name
+                            ));
+                            let _: Value = send(
+                                http.delete(format!("{base}/v1/routes/{}", enc_segment(id)))
+                                    .bearer_auth(&key),
+                            )
+                            .await?;
+                            let _: Value = send(
+                                http.post(format!("{base}/v1/routes"))
+                                    .bearer_auth(&key)
+                                    .json(new_route),
+                            )
+                            .await?;
+                            drop(sp);
+                            refreshed += 1;
                             continue;
                         }
                         let sp = ui::spinner(&format!("Creating route {}…", new_route.name));
@@ -272,9 +313,15 @@ pub async fn run(
                         drop(sp);
                         added += 1;
                     }
-                    ui::success(&format!(
-                        "Down-route catalog enabled ({added} new route(s)). Run `tt route list` to view."
-                    ));
+                    if refreshed > 0 {
+                        ui::success(&format!(
+                            "Down-route catalog enabled ({added} new, {refreshed} refreshed to content_compress=true). Run `tt route list` to view."
+                        ));
+                    } else {
+                        ui::success(&format!(
+                            "Down-route catalog enabled ({added} new route(s)). Run `tt route list` to view."
+                        ));
+                    }
                 }
                 CatalogCmd::Disable => {
                     let mut removed = 0usize;

@@ -165,6 +165,22 @@ enum Command {
         /// Path to a bundle JSON produced by `tt plan --emit-bundle`.
         path: String,
     },
+    /// Verify a TokenTrimmer Verifiable Compression Receipt (VCR) OFFLINE: check
+    /// the Ed25519 signature over the canonical `vcr:v1|…` payload against a
+    /// verifying-key hex you supply out-of-band. Prints PASS/FAIL + the receipt
+    /// fields and exits non-zero on any mismatch (tampered receipt, wrong key,
+    /// unknown schema version).
+    VerifyReceipt {
+        /// Path to a VCR JSON receipt (produced by the cloud
+        /// `POST /v1/admin/requests/{trace_id}/compression-receipt/sign` endpoint).
+        #[arg(long, value_name = "PATH")]
+        receipt: String,
+        /// Hex-encoded 32-byte Ed25519 verifying (public) key, supplied
+        /// out-of-band (NOT the embedded `verifying_key_hex` — the stronger
+        /// trust model: the customer pins the key they trust).
+        #[arg(long, value_name = "HEX")]
+        key_hex: String,
+    },
     /// Audit log helpers.
     Audit {
         #[command(subcommand)]
@@ -868,6 +884,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::VerifyBundle { path } => {
             tt_cli::bundle::run_verify_bundle(&path)?;
+        }
+        Command::VerifyReceipt { receipt, key_hex } => {
+            tt_cli::vcr::run_verify_receipt(&receipt, &key_hex)?;
         }
         Command::Audit {
             action:
