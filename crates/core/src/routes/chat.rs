@@ -2022,6 +2022,9 @@ pub(crate) async fn complete_once(
         // samples the judge even without a model downgrade — shaping is
         // exactly what the #155 gate exists to police.
         format_switch_outcome.is_some() || diff_applied,
+        // P2a: a content_compress-only same-model request is judge-eligible when
+        // the pass removed tokens (the label-gap closure — see the predicate).
+        pass_effects.content_compress_tokens_removed > 0,
     );
 
     // 5. Return the typed response + header metadata. The chat wrapper (and
@@ -6027,6 +6030,7 @@ fn maybe_spawn_quality_judge(
     judge_source_ctx: Option<RequestContext>,
     judge_original_req: Option<ChatCompletionRequest>,
     response_shaped: bool,
+    content_compressed: bool,
 ) {
     use crate::quality_sample as qs;
 
@@ -6051,12 +6055,22 @@ fn maybe_spawn_quality_judge(
     // capture already provides the un-shaped baseline counterfactual, so an
     // action-only shaped route (same target model, identical pricing) is
     // judge-gateable too.
+    //
+    // P2a (label-gap closure): a content_compress-only same-model request (where
+    // `is_downgrade` is false + not shaped) is ALSO judge-eligible when the
+    // pass actually removed tokens — the pre-routing `judge_original_req` capture
+    // is the uncompressed counterfactual, so re-dispatching it produces the
+    // recall-of-baseline verdict the P1d capture pair needs to become RUNG 3
+    // gold. `content_compressed = pass_effects.content_compress_tokens_removed > 0`
+    // — a route that opted in but compressed nothing is NOT eligible (no
+    // compression event to label).
     if matched_route_id.is_none() {
         return;
     }
     if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage)
         || output_shaped
-        || response_shaped)
+        || response_shaped
+        || content_compressed)
     {
         return;
     }
