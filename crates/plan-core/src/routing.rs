@@ -49,7 +49,13 @@ fn matches_conditions(req: &RequestLog, c: &RouteConditions) -> bool {
     // (no modality recorded). Treat ANY modality requirement as a non-match so
     // Plan never over-projects savings. Follow-up: capture had_images/had_audio
     // on request_logs to enable modality projection.
-    if c.has_images.is_some() || c.has_audio.is_some() {
+    if c.has_images.is_some() || c.has_audio.is_some() || c.has_documents.is_some() {
+        return false;
+    }
+    // content_type needs the gateway's live content classifier over the request
+    // body, unavailable in Plan replay — conservative non-match so Plan never
+    // over-projects savings on a content-type route.
+    if c.content_type.is_some() {
         return false;
     }
     // The live p95-latency condition is backed by the gateway's in-process

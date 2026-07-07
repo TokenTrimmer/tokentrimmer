@@ -342,8 +342,12 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved: 0,
+        doc_compaction_tokens_removed: 0,
+        doc_vision_saved_est_usd: 0.0,
         run_id: None,
         node_id: None,
+        content_compress_saved_est_usd: 0.0,
+        content_compress_kind: None,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");
@@ -454,8 +458,12 @@ async fn request_log_insert_round_trips_batch_columns() {
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved: 0,
+        doc_compaction_tokens_removed: 0,
+        doc_vision_saved_est_usd: 0.0,
         run_id: None,
         node_id: None,
+        content_compress_saved_est_usd: 0.0,
+        content_compress_kind: None,
     };
     let marked_id = marked.id;
     writer.write(marked.clone()).await.expect("insert marked");
@@ -565,8 +573,16 @@ async fn request_logs_insert_round_trips_against_postgres() {
         diff_failed: false,
         diff_failed_cost_usd: 0.0,
         retrieval_tokens_saved: 0,
+        doc_compaction_tokens_removed: 0,
+        // Nonzero on purpose: pins the f64 → NUMERIC(12,6) encode of the NEW
+        // 0032 column against real Postgres, not just the bind position.
+        doc_vision_saved_est_usd: 0.000733,
         run_id: None,
         node_id: None,
+        // Nonzero + Some on purpose: pins the f64 → NUMERIC(12,6) encode AND the
+        // TEXT bind of the NEW 0033 columns against real Postgres.
+        content_compress_saved_est_usd: 0.000517,
+        content_compress_kind: Some("json".into()),
     };
     let id = row.id;
     writer
@@ -574,19 +590,35 @@ async fn request_logs_insert_round_trips_against_postgres() {
         .await
         .expect("PostgresRequestLogWriter::write must succeed (bind chain == placeholders)");
 
-    let (provider, route_paused, minify_est) = sqlx::query_as::<_, (String, bool, f64)>(
-        "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8 \
-         FROM request_logs WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_one(&pool)
-    .await
-    .expect("fetch row");
+    let (provider, route_paused, minify_est, doc_vision_est, cc_est, cc_kind) =
+        sqlx::query_as::<_, (String, bool, f64, f64, f64, Option<String>)>(
+            "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8, \
+             doc_vision_saved_est_usd::FLOAT8, \
+             content_compress_saved_est_usd::FLOAT8, content_compress_kind \
+             FROM request_logs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch row");
     assert_eq!(provider, "test-provider");
     assert!(route_paused, "route_paused=true must survive write→read");
     assert!(
         (minify_est - 0.000412).abs() < 1e-9,
         "minify_saved_est_usd must round-trip nonzero through NUMERIC(12,6), got {minify_est}"
+    );
+    assert!(
+        (doc_vision_est - 0.000733).abs() < 1e-9,
+        "doc_vision_saved_est_usd must round-trip nonzero through NUMERIC(12,6), got {doc_vision_est}"
+    );
+    assert!(
+        (cc_est - 0.000517).abs() < 1e-9,
+        "content_compress_saved_est_usd must round-trip nonzero through NUMERIC(12,6), got {cc_est}"
+    );
+    assert_eq!(
+        cc_kind.as_deref(),
+        Some("json"),
+        "content_compress_kind (TEXT) must round-trip"
     );
 
     sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
@@ -655,8 +687,12 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         diff_failed: true,
         diff_failed_cost_usd: 0.0007,
         retrieval_tokens_saved: 0,
+        doc_compaction_tokens_removed: 0,
+        doc_vision_saved_est_usd: 0.0,
         run_id: None,
         node_id: None,
+        content_compress_saved_est_usd: 0.0,
+        content_compress_kind: None,
     };
     let shaped_id = shaped.id;
     writer.write(shaped.clone()).await.expect("insert shaped");

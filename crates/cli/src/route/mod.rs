@@ -14,6 +14,9 @@ pub struct AddArgs {
     pub to: Option<String>,
     pub when_has_images: bool,
     pub when_has_audio: bool,
+    /// `--when-has-documents`: match only requests carrying a document input
+    /// part (Document Lane). Unlike images/audio, may target a text model.
+    pub when_has_documents: bool,
     pub when_tag: Option<String>,
     pub when_prompt_contains: Vec<String>,
     pub when_cost_gt: Option<f64>,
@@ -83,6 +86,9 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
     }
     if args.when_has_audio {
         when.insert("has_audio".into(), json!(true));
+    }
+    if args.when_has_documents {
+        when.insert("has_documents".into(), json!(true));
     }
     if let Some(tag) = &args.when_tag {
         when.insert("tag_equals".into(), json!(tag));
@@ -247,13 +253,54 @@ pub async fn run(
             match sub {
                 CatalogCmd::Enable => {
                     let catalog = tt_routing::catalog::catalog_routes();
-                    let existing_names: std::collections::HashSet<&str> = existing_arr
-                        .iter()
-                        .filter_map(|r| r["name"].as_str())
-                        .collect();
+                    // Index existing catalog routes by name + capture their id +
+                    // their current then.content_compress (so a re-run is
+                    // idempotent: an existing row that already has
+                    // content_compress=true is left alone; a stale row from
+                    // before P2a — content_compress=false/absent — is delete +
+                    // recreated to pick up the new default-on flag).
+                    let mut existing_by_name: std::collections::HashMap<&str, (&str, bool)> =
+                        std::collections::HashMap::new();
+                    for r in &existing_arr {
+                        let Some(name) = r["name"].as_str() else {
+                            continue;
+                        };
+                        if !tt_routing::catalog::is_catalog_route_name(name) {
+                            continue;
+                        }
+                        let id = r["id"].as_str().unwrap_or("");
+                        let cc = r["then"]["content_compress"].as_bool().unwrap_or(false);
+                        existing_by_name.insert(name, (id, cc));
+                    }
                     let mut added = 0usize;
+                    let mut refreshed = 0usize;
                     for new_route in &catalog {
-                        if existing_names.contains(new_route.name.as_str()) {
+                        if let Some((id, cc)) = existing_by_name.get(new_route.name.as_str()) {
+                            if *cc {
+                                // Already current (content_compress=true): skip.
+                                continue;
+                            }
+                            // Stale catalog row (pre-P2a, content_compress
+                            // false/absent): the routes API has no PUT/PATCH, so
+                            // delete + recreate to pick up the new default-on
+                            // content_compress flag.
+                            let sp = ui::spinner(&format!(
+                                "Refreshing catalog route {} (content_compress)…",
+                                new_route.name
+                            ));
+                            let _: Value = send(
+                                http.delete(format!("{base}/v1/routes/{}", enc_segment(id)))
+                                    .bearer_auth(&key),
+                            )
+                            .await?;
+                            let _: Value = send(
+                                http.post(format!("{base}/v1/routes"))
+                                    .bearer_auth(&key)
+                                    .json(new_route),
+                            )
+                            .await?;
+                            drop(sp);
+                            refreshed += 1;
                             continue;
                         }
                         let sp = ui::spinner(&format!("Creating route {}…", new_route.name));
@@ -266,9 +313,15 @@ pub async fn run(
                         drop(sp);
                         added += 1;
                     }
-                    ui::success(&format!(
-                        "Down-route catalog enabled ({added} new route(s)). Run `tt route list` to view."
-                    ));
+                    if refreshed > 0 {
+                        ui::success(&format!(
+                            "Down-route catalog enabled ({added} new, {refreshed} refreshed to content_compress=true). Run `tt route list` to view."
+                        ));
+                    } else {
+                        ui::success(&format!(
+                            "Down-route catalog enabled ({added} new route(s)). Run `tt route list` to view."
+                        ));
+                    }
                 }
                 CatalogCmd::Disable => {
                     let mut removed = 0usize;
@@ -405,6 +458,7 @@ mod tests {
             to: None,
             when_has_images: false,
             when_has_audio: false,
+            when_has_documents: false,
             when_tag: None,
             when_prompt_contains: vec![],
             when_cost_gt: None,
@@ -537,6 +591,23 @@ mod tests {
         assert_eq!(body["then"]["fallbacks"], json!(["gpt-4o"]));
         assert_eq!(body["name"], "vis");
         assert_eq!(body["enabled"], false);
+    }
+
+    #[test]
+    fn when_has_documents_sets_condition() {
+        // A document route may target a TEXT model — no vision requirement.
+        let body = build_new_route(&AddArgs {
+            always: Some("gpt-5-mini".into()),
+            when_has_documents: true,
+            ..base_args()
+        })
+        .unwrap();
+        assert_eq!(body["when"]["has_documents"], true);
+        assert!(
+            body["when"].get("has_images").is_none(),
+            "documents must not imply has_images"
+        );
+        assert_eq!(body["then"]["target_model"], "gpt-5-mini");
     }
 
     #[test]

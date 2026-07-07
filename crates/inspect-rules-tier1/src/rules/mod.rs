@@ -24,6 +24,7 @@ pub mod prompt_dynamic_prefix_breaks_cache;
 pub mod prompt_no_output_constraint;
 pub mod prompt_verbose_few_shot;
 pub mod prompt_volatile_in_system_prompt;
+pub mod raw_document_to_vision_model;
 
 pub use agent_no_termination_condition::AgentNoTerminationConditionRule;
 pub use cache_anthropic_prompt_cache_missing::CacheAnthropicPromptCacheMissingRule;
@@ -46,3 +47,4 @@ pub use prompt_dynamic_prefix_breaks_cache::PromptDynamicPrefixBreaksCacheRule;
 pub use prompt_no_output_constraint::PromptNoOutputConstraintRule;
 pub use prompt_verbose_few_shot::PromptVerboseFewShotRule;
 pub use prompt_volatile_in_system_prompt::PromptVolatileInSystemPromptRule;
+pub use raw_document_to_vision_model::RawDocumentToVisionModelRule;

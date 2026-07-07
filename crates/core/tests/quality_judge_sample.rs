@@ -268,6 +268,10 @@ struct HarnessOpts {
     /// The planted same-model route opts into delta/diff responses
     /// (`diff: true`).
     same_model_route_diff: bool,
+    /// The planted same-model route opts into `content_compress` (P2a: the
+    /// label-gap closure — a content_compress-only same-model request is
+    /// judge-eligible when the pass removed tokens).
+    same_model_route_content_compress: bool,
     /// Fixed assistant body for NON-judge dispatches (both the served call
     /// and the reference re-dispatch); `None` keeps the default
     /// `answer from <model>`.
@@ -288,6 +292,7 @@ impl Default for HarnessOpts {
             same_model_route: false,
             plant_same_model_route: false,
             same_model_route_diff: false,
+            same_model_route_content_compress: false,
             served_body: None,
         }
     }
@@ -366,6 +371,9 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     flex: false,
                     batch: false,
                     compress: false,
+                    doc_compaction: false,
+                    document_lane: false,
+                    content_compress: opts.same_model_route_content_compress,
                     redact: false,
                     minify_json: false,
                     reasoning_max_effort: None,
@@ -416,6 +424,9 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     flex: false,
                     batch: false,
                     compress: false,
+                    doc_compaction: false,
+                    document_lane: false,
+                    content_compress: false,
                     redact: opts.redact_route,
                     traffic_pct: None,
                     shadow_model: None,
@@ -466,6 +477,36 @@ fn chat_request(model: &str, bearer: &str) -> Request<Body> {
             json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "hello world"}],
+                "stream": false,
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// A chat request with a LARGE pretty-printed JSON system message — large enough
+/// to clear `MIN_BLOB_CHARS` + classifiable as `ContentKind::Json`, so the
+/// content_compress pass actually compacts it (`content_compress_tokens_removed`
+/// `> 0`). P2a: the label-gap closure makes such a request judge-eligible on a
+/// same-model content_compress route.
+fn chat_request_with_large_json_system(model: &str, bearer: &str) -> Request<Body> {
+    let mut obj = String::from("{\n");
+    for i in 0..40 {
+        obj.push_str(&format!("  \"key_{i}\": \"value {i}\",\n"));
+    }
+    obj.push_str("  \"last\": true\n}");
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::from(
+            json!({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": obj},
+                    {"role": "user", "content": "summarize"},
+                ],
                 "stream": false,
             })
             .to_string(),
@@ -711,6 +752,60 @@ async fn unshaped_non_downgrade_route_still_never_samples_judge() {
         "an unshaped non-downgrade route must not sample"
     );
     assert_eq!(h.sink.outcomes.lock().unwrap().len(), 0);
+}
+
+/// P2a (label-gap closure): a content_compress-only same-model route samples
+/// the paired judge when the pass actually removed tokens — the pre-routing
+/// `judge_original_req` capture is the uncompressed counterfactual, so
+/// re-dispatching it yields the recall-of-baseline verdict the P1d capture pair
+/// needs to become RUNG 3 gold. `is_downgrade` is false (same model) + not
+/// shaped — the ONLY eligibility arm firing here is `content_compressed`.
+#[tokio::test]
+async fn content_compress_only_same_model_route_samples_judge() {
+    let h = build_harness_opts(HarnessOpts {
+        rate: 1.0,
+        plant_downgrade_route: false,
+        plant_same_model_route: true,
+        same_model_route_diff: false,
+        same_model_route_content_compress: true,
+        ..Default::default()
+    })
+    .await;
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(chat_request_with_large_json_system(
+            "gpt-4o-mini",
+            &h.plaintext,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Precondition: the content_compress pass must have actually compacted the
+    // large JSON system block (the `content-compress` savings header is the
+    // observable signal). If this fails, the test request isn't triggering
+    // compaction + the eligibility arm isn't exercised.
+    let saved_header = resp
+        .headers()
+        .get("x-tokentrimmer-content-compress-saved-est-usd")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("0.000000");
+    let saved: f64 = saved_header.parse().unwrap_or(0.0);
+    assert!(
+        saved > 0.0,
+        "precondition: content_compress must have compacted the JSON block (got saved={saved_header})"
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.sink.recorded.notified(),
+    )
+    .await
+    .expect(
+        "a content_compress-only same-model request must sample the judge (P2a label-gap closure)",
+    );
+    assert!(h.judge_calls.load(Ordering::SeqCst) >= 1);
 }
 
 /// (c) At rate 0.0 a rerouted-down request is never judged.
@@ -1432,6 +1527,9 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
                 flex: false,
                 batch: false,
                 compress: false,
+                doc_compaction: false,
+                document_lane: false,
+                content_compress: false,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,

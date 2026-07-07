@@ -165,10 +165,31 @@ enum Command {
         /// Path to a bundle JSON produced by `tt plan --emit-bundle`.
         path: String,
     },
+    /// Verify a TokenTrimmer Verifiable Compression Receipt (VCR) OFFLINE: check
+    /// the Ed25519 signature over the canonical `vcr:v1|…` payload against a
+    /// verifying-key hex you supply out-of-band. Prints PASS/FAIL + the receipt
+    /// fields and exits non-zero on any mismatch (tampered receipt, wrong key,
+    /// unknown schema version).
+    VerifyReceipt {
+        /// Path to a VCR JSON receipt (produced by the cloud
+        /// `POST /v1/admin/requests/{trace_id}/compression-receipt/sign` endpoint).
+        #[arg(long, value_name = "PATH")]
+        receipt: String,
+        /// Hex-encoded 32-byte Ed25519 verifying (public) key, supplied
+        /// out-of-band (NOT the embedded `verifying_key_hex` — the stronger
+        /// trust model: the customer pins the key they trust).
+        #[arg(long, value_name = "HEX")]
+        key_hex: String,
+    },
     /// Audit log helpers.
     Audit {
         #[command(subcommand)]
         action: AuditAction,
+    },
+    /// Export helpers (offline artifact materialization).
+    Export {
+        #[command(subcommand)]
+        action: tt_cli::compress_corpus::ExportAction,
     },
     /// Run the MCP server (stdio transport by default).
     ///
@@ -640,6 +661,10 @@ enum RouteAction {
         when_has_images: bool,
         #[arg(long)]
         when_has_audio: bool,
+        /// Match only requests carrying a document input part (Document Lane).
+        /// UNLIKE --when-has-images, a document route may target a TEXT model.
+        #[arg(long)]
+        when_has_documents: bool,
         /// Match only requests tagged with this value (X-TokenTrimmer-Tag header).
         #[arg(long)]
         when_tag: Option<String>,
@@ -860,6 +885,9 @@ async fn main() -> anyhow::Result<()> {
         Command::VerifyBundle { path } => {
             tt_cli::bundle::run_verify_bundle(&path)?;
         }
+        Command::VerifyReceipt { receipt, key_hex } => {
+            tt_cli::vcr::run_verify_receipt(&receipt, &key_hex)?;
+        }
         Command::Audit {
             action:
                 AuditAction::Verify {
@@ -877,6 +905,18 @@ async fn main() -> anyhow::Result<()> {
                 key_hex.as_deref(),
                 expected_tip.as_deref(),
             )?;
+        }
+        Command::Export {
+            action: tt_cli::compress_corpus::ExportAction::CompressCorpus { input, output },
+        } => {
+            let count = tt_cli::compress_corpus::run_export(
+                std::path::Path::new(&input),
+                std::path::Path::new(&output),
+            )?;
+            tt_cli::ui::note(&format!(
+                "exported {count} content-compression pair{} to {output}",
+                if count == 1 { "" } else { "s" }
+            ));
         }
         Command::Mcp {
             transport,
@@ -1316,6 +1356,7 @@ async fn main() -> anyhow::Result<()> {
                     to,
                     when_has_images,
                     when_has_audio,
+                    when_has_documents,
                     when_tag,
                     when_prompt_contains,
                     when_cost_gt,
@@ -1338,6 +1379,7 @@ async fn main() -> anyhow::Result<()> {
                     to,
                     when_has_images,
                     when_has_audio,
+                    when_has_documents,
                     when_tag,
                     when_prompt_contains,
                     when_cost_gt,
@@ -2215,6 +2257,9 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     flex: false,
                     batch: false,
                     compress: false,
+                    doc_compaction: false,
+                    document_lane: false,
+                    content_compress: false,
                     redact: false,
                     traffic_pct: None,
                     shadow_model: None,

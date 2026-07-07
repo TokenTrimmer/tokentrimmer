@@ -4,6 +4,7 @@
 
 pub mod cache_projection;
 pub mod classifier;
+pub mod document_projection;
 pub mod error;
 pub mod pricing;
 pub mod route_suggestions;
@@ -17,6 +18,13 @@ pub use types::{
 };
 
 use uuid::Uuid;
+
+/// Fraction of raw image tokens a lossy image→text distillation is assumed to
+/// produce, for the DIRECTIONAL `DocProjection` savings figure. Deliberately
+/// conservative (a distilled page of prose is typically far smaller than the
+/// image tokens it replaces); it is a labelled `basis:"estimate"`, not a
+/// precise projection. See `document_projection`.
+const DISTILLED_TOKEN_RATIO: f64 = 0.20;
 
 /// Top-level entry point. Returns a complete `PreviewResponse`. The only
 /// way this returns `Err` is if the model is unknown AND the optional
@@ -38,7 +46,12 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
         req.max_tokens,
         model_max_output,
     );
-    let cost = pricing::cost_usd(est.input_tokens, est.output_tokens, &hit);
+    // Image parts don't survive `concat_message_text` (it reads only `text`), so
+    // add the model's per-provider image-token estimate to the text total — else
+    // an image-heavy request prices as ~0 (the historical preview bug).
+    let image_tokens = token_estimator::sum_image_tokens(&req.messages, &req.model);
+    let input_tokens = est.input_tokens.saturating_add(image_tokens);
+    let cost = pricing::cost_usd(input_tokens, est.output_tokens, &hit);
 
     let task_class = classifier::classify(&req.messages);
 
@@ -51,7 +64,7 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
     let suggestions = route_suggestions::suggest(
         &req.model,
         cost,
-        est.input_tokens,
+        input_tokens,
         est.output_tokens,
         task_class,
     );
@@ -63,11 +76,19 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
         ));
     }
 
+    // Surface a directional document/image-token projection only when the
+    // request actually carries image parts (image_tokens > 0). The Gemini
+    // provider-direction guard inside `project` books $0 saving there.
+    let doc_projection = (image_tokens > 0).then(|| {
+        let distilled = (f64::from(image_tokens) * DISTILLED_TOKEN_RATIO).ceil() as u32;
+        document_projection::project(image_tokens, distilled, hit.input_per_m, &req.model)
+    });
+
     Ok(PreviewResponse {
         current: CurrentEstimate {
             model: req.model.clone(),
             provider: hit.provider.to_string(),
-            input_tokens_estimated: est.input_tokens,
+            input_tokens_estimated: input_tokens,
             output_tokens_estimated: est.output_tokens,
             cost_usd: cost,
             estimation_confidence: est.confidence,
@@ -76,6 +97,7 @@ pub fn preview(req: &PreviewRequest) -> Result<PreviewResponse, PreviewError> {
         route_suggestions: suggestions,
         warnings,
         trace_id: Uuid::new_v4().to_string(),
+        doc_projection,
     })
 }
 
@@ -119,5 +141,65 @@ mod tests {
     fn modest_max_tokens_is_honored() {
         let resp = preview(&req_with_max("gpt-4o", Some(1000))).unwrap();
         assert_eq!(resp.current.output_tokens_estimated, 1000);
+    }
+
+    /// Regression: an image-only request previews NON-ZERO input tokens + cost,
+    /// where it historically counted the image as ~0 (`concat_message_text` only
+    /// reads text parts).
+    #[test]
+    fn image_only_request_previews_nonzero() {
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
+        let req = PreviewRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: json!([{"type": "image_url", "image_url": {"url": png}}]),
+            }],
+            max_tokens: Some(16),
+            tools: None,
+            stream: None,
+            tt_extras: Default::default(),
+        };
+        let resp = preview(&req).unwrap();
+        assert!(
+            resp.current.input_tokens_estimated >= 255,
+            "image tokens must be summed into the input estimate, got {}",
+            resp.current.input_tokens_estimated
+        );
+        assert!(resp.current.cost_usd > 0.0);
+        // An image request also surfaces a directional DocProjection.
+        let dp = resp.doc_projection.expect("image request → doc_projection");
+        assert_eq!(dp.basis, "estimate");
+        assert_eq!(dp.raw_image_tokens, resp.current.input_tokens_estimated);
+        assert!(dp.projected_savings_usd >= 0.0);
+    }
+
+    /// A text-only request carries NO `doc_projection`.
+    #[test]
+    fn text_only_request_has_no_doc_projection() {
+        let resp = preview(&req_with_max("gpt-4o", Some(64))).unwrap();
+        assert!(resp.doc_projection.is_none());
+    }
+
+    /// The Gemini direction guard flows through the builder: an image → Gemini
+    /// request books $0 projected saving with an explanatory note.
+    #[test]
+    fn gemini_image_request_books_zero_saving() {
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
+        let req = PreviewRequest {
+            model: "gemini-3.5-flash".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: json!([{"type": "image_url", "image_url": {"url": png}}]),
+            }],
+            max_tokens: Some(16),
+            tools: None,
+            stream: None,
+            tt_extras: Default::default(),
+        };
+        let resp = preview(&req).unwrap();
+        let dp = resp.doc_projection.expect("image request → doc_projection");
+        assert_eq!(dp.projected_savings_usd, 0.0);
+        assert!(dp.note.is_some());
     }
 }

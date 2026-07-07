@@ -108,6 +108,7 @@
 pub mod agentic_budget;
 pub mod cache_classifier;
 pub mod compression;
+pub mod doc_compaction;
 pub mod redaction;
 pub mod split;
 
@@ -116,6 +117,7 @@ pub use agentic_budget::{
 };
 pub use cache_classifier::CacheClassifierPass;
 pub use compression::CompressionPass;
+pub use doc_compaction::DocCompactionPass;
 pub use redaction::{RedactedField, RedactedHit, RedactionPass};
 pub use split::{
     CacheBustEstimate, MutationDeterminism, PassContext, SplitRequest, StablePrefix, StableReason,
@@ -197,6 +199,21 @@ pub struct PassEffects {
     /// Input tokens the compression pipeline removed (pipeline-measured,
     /// token-true-gated). Drives `compression_saved_usd`.
     pub compression_tokens_removed: u32,
+    /// Input tokens the lossless document-compaction pass removed (Document
+    /// Lane D2, pipeline-measured, token-true-gated). A SEPARATE bucket from
+    /// `compression_tokens_removed` so the two levers attribute independently;
+    /// it folds into `baseline_cost_usd` the same way and drives the distinct
+    /// `doc_compaction_saved_usd`. Zero on every request whose route did not
+    /// opt into `doc_compaction`.
+    pub doc_compaction_tokens_removed: u32,
+    /// Input tokens the content-aware compression pass
+    /// (`RouteAction::content_compress`, P1a) removed from LARGE non-prose text
+    /// blocks (JSON/CSV/log structural compaction), pipeline-measured under the
+    /// token-true gate. A SEPARATE bucket that drives the ISOLATED
+    /// `content_compress_saved_est_usd` estimate (NOT folded into
+    /// `baseline_cost_usd` — unlike compression/doc_compaction). Zero on every
+    /// request whose route did not opt into `content_compress`.
+    pub content_compress_tokens_removed: u32,
     /// Estimated USD penalty of a deliberate stable-prefix mutation (a booked
     /// [`CacheBustEstimate`]), pre-fee. Drives
     /// `CostBreakdown::cache_bust_penalty_usd` — the negative savings entry.
@@ -245,6 +262,74 @@ impl PassPipeline {
     #[must_use]
     pub fn conservative_compression() -> Self {
         Self::new().with(CompressionPass::new())
+    }
+
+    /// The lossless document-compaction stage (Document Lane D2) — the only
+    /// stage enabled by `RouteAction::doc_compaction`. Runs SEPARATELY from
+    /// `conservative_compression` so the two levers' token deltas attribute to
+    /// distinct savings buckets.
+    #[must_use]
+    pub fn doc_compaction() -> Self {
+        Self::new().with(DocCompactionPass::new())
+    }
+
+    /// The content-aware compression stage (Phase 1) — the only stage enabled by
+    /// `RouteAction::content_compress`. Runs SEPARATELY from
+    /// `conservative_compression` / `doc_compaction` so its measured token delta
+    /// attributes to the distinct, ISOLATED `content_compress_saved_est_usd`.
+    #[must_use]
+    pub fn content_compress() -> Self {
+        Self::new().with(crate::content_compress::ContentCompressPass::new())
+    }
+
+    /// The content-aware compression stage WITH the P1b LOSSY prose backend
+    /// enabled behind `gate` (the shared summarize-lever
+    /// [`SummaryGate`](crate::passes::agentic_budget::summarize_judge::SummaryGate)).
+    /// A Prose block is compressed only when the gate trusts the `"prose"` class
+    /// (fail-open to verbatim otherwise); the JSON/CSV/log structural backends run
+    /// exactly as in [`Self::content_compress`]. The measured token delta still
+    /// books into the ISOLATED `content_compress_saved_est_usd`.
+    #[must_use]
+    pub fn content_compress_with_prose_gate(
+        gate: std::sync::Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
+    ) -> Self {
+        Self::new().with(crate::content_compress::ContentCompressPass::with_prose_gate(gate))
+    }
+
+    /// The content-aware compression stage with BOTH the P1b LOSSY prose backend
+    /// and the P1c LOSSY AST code backend enabled behind the SAME shared
+    /// summarize-lever
+    /// [`SummaryGate`](crate::passes::agentic_budget::summarize_judge::SummaryGate).
+    /// A Prose block compresses only when the gate trusts `"prose"`; a Code block
+    /// only when it trusts `"code"` (independent classes + 0.90-floor ratchets),
+    /// each failing OPEN to verbatim otherwise. The JSON/CSV/log structural
+    /// backends run exactly as in [`Self::content_compress`]. The measured token
+    /// delta still books into the ISOLATED `content_compress_saved_est_usd`.
+    #[must_use]
+    pub fn content_compress_with_gates(
+        gate: std::sync::Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
+    ) -> Self {
+        Self::new().with(crate::content_compress::ContentCompressPass::with_gates(
+            gate,
+        ))
+    }
+
+    /// The content-aware compression stage with BOTH lossy backends (P1b prose +
+    /// P1c code) AND the P1d raw before/after capture enabled. The capture
+    /// records ONLY when the instance opted in (`TT_COMPRESS_CAPTURE` +
+    /// `TT_COMPRESS_CAPTURE_PATH`); otherwise the [`CaptureCtx`] is carried but
+    /// [`capture::record_pair`](crate::content_compress::capture::record_pair) is
+    /// a no-op (zero overhead, capture is observability-not-control). Distinct
+    /// from [`content_compress_with_gates`](Self::content_compress_with_gates) so
+    /// existing callers are unchanged.
+    #[must_use]
+    pub fn content_compress_with_gates_and_capture(
+        gate: std::sync::Arc<dyn crate::passes::agentic_budget::summarize_judge::SummaryGate>,
+        capture: std::sync::Arc<crate::content_compress::CaptureCtx>,
+    ) -> Self {
+        Self::new().with(
+            crate::content_compress::ContentCompressPass::with_gates_and_capture(gate, capture),
+        )
     }
 
     /// Append a pass to the end of the pipeline (builder style).

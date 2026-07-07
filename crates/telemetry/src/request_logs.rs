@@ -207,6 +207,27 @@ pub struct RequestLogRow {
     /// for the request, and is the default for rows predating migration 0023.
     #[serde(default)]
     pub retrieval_tokens_saved: i64,
+    /// Document Lane D2: pipeline-MEASURED input tokens the lossless
+    /// document-compaction pass (`RouteAction::doc_compaction`) removed from
+    /// LARGE non-prose documents before dispatch (token-true-gated, text-only).
+    /// Token-denominated; the USD value folds into the saved-usd headline via
+    /// the same baseline fold as compression and is surfaced on its own
+    /// `X-TokenTrimmer-Doc-Compaction-Saved-Usd` header. `0` when the route did
+    /// not opt into doc_compaction and for rows predating migration 0031.
+    #[serde(default)]
+    pub doc_compaction_tokens_removed: i64,
+    /// Document Lane D4: ISOLATED, ESTIMATED vision-avoided saving (USD, migration
+    /// 0032) — the counterfactual value of swapping an image/document part for
+    /// distilled text at the pre-routing seam (raw image tokens that WOULD have
+    /// been billed minus the distilled text tokens, at the input rate; $0 for
+    /// Gemini per the D0 direction guard). NEVER part of `cost_usd` /
+    /// `baseline_cost_usd` / the saved-usd headline (the dispatched request never
+    /// contained the image, so it is not invoice-reconcilable). Surfaced on
+    /// `X-TokenTrimmer-Doc-Vision-Saved-Est-Usd`. `0.0` in D4a (the seam that
+    /// books a non-zero value is D4c) and for rows predating migration 0032 (zero
+    /// omitted on serialize so legacy row JSON stays byte-identical).
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
+    pub doc_vision_saved_est_usd: f64,
     /// UUID of the durable agent run this request belongs to (W0b migration
     /// 0027). `None` for single-turn (non-agentic) requests and for rows
     /// written before the agent-run grain shipped. Stamped by the agentic
@@ -218,6 +239,25 @@ pub struct RequestLogRow {
     /// 0027. Stamped alongside `run_id` by the agentic loop (Task 4).
     #[serde(default)]
     pub node_id: Option<Uuid>,
+    /// Content-aware compression (P1a, migration 0033): ISOLATED, ESTIMATED USD
+    /// value of the input tokens the content_compress structural backend removed
+    /// (tokens removed × the served model's input rate, fee-applied). Like
+    /// `doc_vision_saved_est_usd` it is NEVER part of `cost_usd` /
+    /// `baseline_cost_usd` / the saved-usd headline — a conservative estimate,
+    /// not an invoice-reconciled figure. Surfaced on
+    /// `X-TokenTrimmer-Content-Compress-Saved-Est-Usd`. `0.0` when the route did
+    /// not opt into `content_compress` and for rows predating migration 0033
+    /// (zero omitted on serialize so legacy row JSON stays byte-identical).
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
+    pub content_compress_saved_est_usd: f64,
+    /// Content-aware compression flywheel (P1a, migration 0033): the DOMINANT
+    /// content kind the content_compress backend compacted on this request
+    /// (`"json"` / `"csv"` / `"log"`), or `None` when the route did not opt in,
+    /// nothing was compacted, or for rows predating migration 0033. Metrics-only
+    /// label (no request content) — the ZDR-safe flywheel signal; the opt-in raw
+    /// before/after pair capture is a separate, off-by-default path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_compress_kind: Option<String>,
 }
 
 /// `skip_serializing_if` helper: the minify estimate column is omitted from
@@ -405,7 +445,10 @@ pub mod postgres {
                       diff_applied, diff_saved_usd,
                       diff_failed, diff_failed_cost_usd,
                       retrieval_tokens_saved,
-                      run_id, node_id)
+                      run_id, node_id,
+                      doc_compaction_tokens_removed,
+                      doc_vision_saved_est_usd,
+                      content_compress_saved_est_usd, content_compress_kind)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -424,11 +467,14 @@ pub mod postgres {
                       $35, $36,
                       $37, $38,
                       $39,
-                      $40, $41)"#;
+                      $40, $41,
+                      $42,
+                      $43,
+                      $44, $45)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 41;
+    pub const INSERT_BIND_COUNT: usize = 45;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -475,6 +521,10 @@ pub mod postgres {
                 .bind(row.retrieval_tokens_saved) // $39
                 .bind(row.run_id) // $40
                 .bind(row.node_id) // $41
+                .bind(row.doc_compaction_tokens_removed) // $42
+                .bind(row.doc_vision_saved_est_usd) // $43
+                .bind(row.content_compress_saved_est_usd) // $44
+                .bind(row.content_compress_kind.as_deref()) // $45
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -590,8 +640,12 @@ mod tests {
             diff_failed: false,
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: 0,
+            doc_compaction_tokens_removed: 0,
+            doc_vision_saved_est_usd: 0.0,
             run_id: None,
             node_id: None,
+            content_compress_saved_est_usd: 0.0,
+            content_compress_kind: None,
         }
     }
 
@@ -899,6 +953,89 @@ mod tests {
         assert!((got.cost_usd - 0.02).abs() < 1e-12, "cost untouched");
     }
 
+    /// Document Lane D4: the isolated vision-avoided estimate column (migration
+    /// 0032) round-trips in its OWN field, defaults to 0.0, and is serde-omitted
+    /// when 0.0 so legacy row JSON stays byte-identical (mirror of the minify
+    /// estimate).
+    #[tokio::test]
+    async fn in_memory_round_trips_doc_vision_estimate() {
+        // Defaults to 0.0 and omitted from JSON when 0.0.
+        assert_eq!(sample_row().doc_vision_saved_est_usd, 0.0);
+        let zero_json = serde_json::to_string(&sample_row()).unwrap();
+        assert!(
+            !zero_json.contains("doc_vision_saved_est_usd"),
+            "zero must be omitted on serialize: {zero_json}"
+        );
+
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.02;
+        row.doc_vision_saved_est_usd = 0.0031;
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert!((got.doc_vision_saved_est_usd - 0.0031).abs() < 1e-12);
+        assert!((got.cost_usd - 0.02).abs() < 1e-12, "cost untouched");
+
+        // A non-zero value is present on serialize.
+        let mut row2 = sample_row();
+        row2.doc_vision_saved_est_usd = 0.001;
+        let j2 = serde_json::to_string(&row2).unwrap();
+        assert!(j2.contains("doc_vision_saved_est_usd"), "{j2}");
+
+        // A legacy row that omits the column deserializes to 0.0.
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","org_id":"00000000-0000-0000-0000-000000000000","api_key_id":"00000000-0000-0000-0000-000000000000","ts":"2026-06-30T00:00:00Z","provider":"p","model":"m","input_tokens":1,"output_tokens":1,"cached_tokens":0,"cost_usd":0.0,"baseline_cost_usd":0.0,"provider_cache_saved_usd":0.0,"cache_bust_penalty_usd":0.0,"cached":false,"route_id":null,"latency_ms":1,"upstream_latency_ms":null,"status":200,"tag":null,"error_class":null,"trace_id":null,"truncated":false}"#;
+        let legacy: RequestLogRow = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            legacy.doc_vision_saved_est_usd, 0.0,
+            "legacy rows default to 0"
+        );
+    }
+
+    /// Content-aware compression (P1a, migration 0033): the isolated estimated
+    /// saving round-trips in its OWN field, defaults to 0.0, is serde-omitted
+    /// when 0.0 (legacy JSON byte-identical), and the `content_compress_kind`
+    /// flywheel label round-trips + defaults to None + is omitted when None.
+    #[tokio::test]
+    async fn in_memory_round_trips_content_compress_columns() {
+        // Defaults + zero/None omitted on serialize.
+        assert_eq!(sample_row().content_compress_saved_est_usd, 0.0);
+        assert_eq!(sample_row().content_compress_kind, None);
+        let zero_json = serde_json::to_string(&sample_row()).unwrap();
+        assert!(
+            !zero_json.contains("content_compress_saved_est_usd"),
+            "zero saving must be omitted on serialize: {zero_json}"
+        );
+        assert!(
+            !zero_json.contains("content_compress_kind"),
+            "None kind must be omitted on serialize: {zero_json}"
+        );
+
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.cost_usd = 0.02;
+        row.content_compress_saved_est_usd = 0.0031;
+        row.content_compress_kind = Some("json".into());
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert!((got.content_compress_saved_est_usd - 0.0031).abs() < 1e-12);
+        assert_eq!(got.content_compress_kind.as_deref(), Some("json"));
+        assert!((got.cost_usd - 0.02).abs() < 1e-12, "cost untouched");
+
+        // Non-zero / Some are present on serialize.
+        let mut row2 = sample_row();
+        row2.content_compress_saved_est_usd = 0.001;
+        row2.content_compress_kind = Some("log".into());
+        let j2 = serde_json::to_string(&row2).unwrap();
+        assert!(j2.contains("content_compress_saved_est_usd"), "{j2}");
+        assert!(j2.contains("content_compress_kind"), "{j2}");
+
+        // A legacy row that omits the columns deserializes to 0.0 / None.
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","org_id":"00000000-0000-0000-0000-000000000000","api_key_id":"00000000-0000-0000-0000-000000000000","ts":"2026-06-30T00:00:00Z","provider":"p","model":"m","input_tokens":1,"output_tokens":1,"cached_tokens":0,"cost_usd":0.0,"baseline_cost_usd":0.0,"provider_cache_saved_usd":0.0,"cache_bust_penalty_usd":0.0,"cached":false,"route_id":null,"latency_ms":1,"upstream_latency_ms":null,"status":200,"tag":null,"error_class":null,"trace_id":null,"truncated":false}"#;
+        let legacy: RequestLogRow = serde_json::from_str(json).unwrap();
+        assert_eq!(legacy.content_compress_saved_est_usd, 0.0);
+        assert_eq!(legacy.content_compress_kind, None);
+    }
+
     /// The output-shaping columns (migration 0020) round-trip through the
     /// writer in their OWN fields. `format_switch_saved_est_usd` is a LABELED
     /// ESTIMATE and `diff_failed_cost_usd` duplicates real spend already in
@@ -993,6 +1130,29 @@ mod tests {
         let got = &w.rows()[0];
         assert_eq!(got.retrieval_tokens_saved, -7);
         assert!((got.cost_usd - 0.02).abs() < 1e-12, "cost untouched");
+    }
+
+    /// Document Lane D2: the doc-compaction token count round-trips
+    /// independently and defaults to 0 (mirror of `retrieval_tokens_saved`).
+    #[tokio::test]
+    async fn in_memory_round_trips_doc_compaction_tokens_removed() {
+        // Defaults to 0.
+        assert_eq!(sample_row().doc_compaction_tokens_removed, 0);
+
+        let w = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.doc_compaction_tokens_removed = 4096;
+        w.write(row).await.unwrap();
+        let got = &w.rows()[0];
+        assert_eq!(got.doc_compaction_tokens_removed, 4096);
+
+        // A row that omits the column still deserializes (serde default).
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","org_id":"00000000-0000-0000-0000-000000000000","api_key_id":"00000000-0000-0000-0000-000000000000","ts":"2026-06-30T00:00:00Z","provider":"p","model":"m","input_tokens":1,"output_tokens":1,"cached_tokens":0,"cost_usd":0.0,"baseline_cost_usd":0.0,"provider_cache_saved_usd":0.0,"cache_bust_penalty_usd":0.0,"cached":false,"route_id":null,"latency_ms":1,"upstream_latency_ms":null,"status":200,"tag":null,"error_class":null,"trace_id":null,"truncated":false}"#;
+        let legacy: RequestLogRow = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            legacy.doc_compaction_tokens_removed, 0,
+            "legacy rows default to 0"
+        );
     }
 
     /// Guard: the INSERT_SQL column list, placeholder list, and the

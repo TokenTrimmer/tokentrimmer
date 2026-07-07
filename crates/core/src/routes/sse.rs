@@ -1079,9 +1079,22 @@ pub fn stream_response(
                     diff_failed: false,
                     diff_failed_cost_usd: 0.0,
                     retrieval_tokens_saved,
+                    // Document Lane D2: token-denominated record of what the
+                    // lossless doc-compaction pass removed (0 unless opted in).
+                    doc_compaction_tokens_removed: pass_effects.doc_compaction_tokens_removed
+                        as i64,
+                    // Document Lane D4: isolated vision-avoided estimate. The
+                    // streaming path books $0 in D4a (the seam is D4c).
+                    doc_vision_saved_est_usd: 0.0,
                     // run_id/node_id stamped in Task 4 (agentic loop context).
                     run_id: None,
                     node_id: None,
+                    // Content-aware compression (P1a): the pass runs pre-split so
+                    // the metered token reduction is real, but the streaming row
+                    // defers the ISOLATED estimate + flywheel label to the
+                    // non-streaming path in v1 (the minify-estimate v1 posture).
+                    content_compress_saved_est_usd: 0.0,
+                    content_compress_kind: None,
                 };
 
                 // Per-route provider-cache counters on cleanly completed

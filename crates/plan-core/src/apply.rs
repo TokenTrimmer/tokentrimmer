@@ -289,6 +289,8 @@ mod tests {
                 tag_equals: None,
                 has_images: None,
                 has_audio: None,
+                has_documents: None,
+                content_type: None,
                 prompt_contains_any_of: vec![],
                 estimated_cost_gt: None,
                 estimated_cost_lt: None,

@@ -64,7 +64,12 @@ impl RequiredCapabilities {
                                 ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => {
                                     caps.vision = true;
                                 }
-                                ContentPart::Text { .. } => {}
+                                // A Document part does NOT require Vision: the
+                                // Document Lane's target is a TEXT model (the
+                                // pre-routing seam distills it to text). Leaving
+                                // `vision` unset is what lets a document route
+                                // downgrade to a non-Vision model.
+                                ContentPart::Document { .. } | ContentPart::Text { .. } => {}
                             }
                         }
                     }
@@ -175,6 +180,18 @@ pub fn request_has_audio(req: &ChatCompletionRequest) -> bool {
         .any(|m| content_of(m).is_some_and(has_audio_part))
 }
 
+/// True when any message carries a document (`ContentPart::Document`) content
+/// part — the Document Lane routing signal (D4a).
+///
+/// Distinct from [`request_has_images`]/[`request_has_audio`]: a document part
+/// does NOT imply the `vision` capability (its route target is a TEXT model),
+/// so it gets its own detector rather than folding into the vision flag.
+pub fn request_has_documents(req: &ChatCompletionRequest) -> bool {
+    req.messages
+        .iter()
+        .any(|m| content_of(m).is_some_and(has_document_part))
+}
+
 /// The content of a message, if it has any (Assistant content is optional).
 fn content_of(m: &Message) -> Option<&MessageContent> {
     match m {
@@ -195,6 +212,11 @@ fn has_audio_part(c: &MessageContent) -> bool {
         if parts.iter().any(|p| matches!(p, ContentPart::InputAudio { .. })))
 }
 
+fn has_document_part(c: &MessageContent) -> bool {
+    matches!(c, MessageContent::Parts(parts)
+        if parts.iter().any(|p| matches!(p, ContentPart::Document { .. })))
+}
+
 /// Concatenated text of the **user + system** messages — the caller-controlled
 /// input, used for content/topic routing. Assistant/tool turns are excluded so a
 /// model's own output can't spuriously trigger a topic route.
@@ -211,6 +233,39 @@ pub fn request_input_text(req: &ChatCompletionRequest) -> String {
         .join("\n")
 }
 
+/// The [`ContentKind`](crate::content_kind::ContentKind) of the LARGEST text
+/// block in the request — the request's "dominant content kind" — backing the
+/// `content_type` routing condition (P1a). Scans every message's text content
+/// (all roles), then classifies the single largest block; `None` when no block
+/// is large enough to classify. Allocation-light: it borrows each block and
+/// runs the classifier once, on the largest.
+pub fn request_dominant_content_kind(
+    req: &ChatCompletionRequest,
+) -> Option<crate::content_kind::ContentKind> {
+    let mut best: Option<&str> = None;
+    for m in &req.messages {
+        if let Some(content) = content_of(m) {
+            match content {
+                MessageContent::Text(s) => update_largest(&mut best, s),
+                MessageContent::Parts(parts) => {
+                    for p in parts {
+                        if let ContentPart::Text { text } = p {
+                            update_largest(&mut best, text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.and_then(crate::content_kind::classify)
+}
+
+fn update_largest<'a>(best: &mut Option<&'a str>, s: &'a str) {
+    if best.is_none_or(|cur| s.len() > cur.len()) {
+        *best = Some(s);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -218,7 +273,8 @@ mod tests {
     use super::*;
     use crate::{
         messages::{
-            ImageUrl, InputAudio, ResponseFormat, Tool, ToolCall, ToolCallFunction, ToolFunction,
+            DocumentPart, DocumentSource, ImageUrl, InputAudio, ResponseFormat, Tool, ToolCall,
+            ToolCallFunction, ToolFunction,
         },
         pricing::Capability,
         ModelInfo,
@@ -457,6 +513,51 @@ mod tests {
         let req = base_req();
         assert!(!request_has_images(&req));
         assert!(!request_has_audio(&req));
+        assert!(!request_has_documents(&req));
+    }
+
+    #[test]
+    fn request_has_documents_detects_document_part() {
+        let mut req = base_req();
+        req.messages = vec![Message::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "summarize".into(),
+                },
+                ContentPart::Document {
+                    document: DocumentPart {
+                        source: DocumentSource::Base64 {
+                            media_type: "application/pdf".into(),
+                            data: "JVBERi0=".into(),
+                        },
+                        filename: Some("a.pdf".into()),
+                    },
+                },
+            ]),
+            name: None,
+        }];
+        assert!(request_has_documents(&req));
+        // A document is NOT an image or audio modality.
+        assert!(!request_has_images(&req));
+        assert!(!request_has_audio(&req));
+        // A document does NOT require the Vision capability.
+        assert!(!RequiredCapabilities::from_request(&req).vision);
+    }
+
+    #[test]
+    fn image_only_request_has_no_documents() {
+        let mut req = base_req();
+        req.messages = vec![Message::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,abc".into(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }];
+        assert!(!request_has_documents(&req));
+        assert!(request_has_images(&req));
     }
 
     #[test]

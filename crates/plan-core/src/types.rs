@@ -211,6 +211,20 @@ pub struct RouteConditions {
     /// Mirror of `tt_routing::RouteConditions::has_audio`. See `has_images`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_audio: Option<bool>,
+    /// Mirror of `tt_routing::RouteConditions::has_documents` (Document Lane
+    /// D4a). Like the other modality mirrors, not evaluable in replay
+    /// (RequestLog records no modality) — a conservative non-match in
+    /// `routing::matches_conditions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_documents: Option<bool>,
+    /// Mirror of `tt_routing::RouteConditions::content_type` (content-aware
+    /// compression, P1a). Carried for lossless wire round-trip only — NOT
+    /// projectable in replay (Plan has no live content classifier over the
+    /// historical `RequestLog` row), so a route carrying it is a conservative
+    /// non-match in `routing::matches_conditions`, keeping Plan from
+    /// over-projecting savings on a content-type route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. Replay
     /// matches against `RequestLog.body` when present, else conservative no-match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1014,9 +1028,12 @@ mod tests {
     /// branch had to repair for the auto-pause fields).
     ///
     /// `flex` IS now mirrored (COST-7) and set TRUE here so the round-trip
-    /// exercises it. KNOWN REMAINING DRIFT: `compress` is NOT mirrored in
-    /// `tt_plan_core::RouteAction` (pre-existing); it is set `false` here, where
-    /// its skip_serializing_if gating omits it from the wire form, keeping the
+    /// exercises it. KNOWN REMAINING DRIFT: `compress` and `doc_compaction`
+    /// (Document Lane D2) are NOT mirrored in `tt_plan_core::RouteAction`
+    /// (pre-existing precedent — both are runtime-only request-pass levers whose
+    /// savings are REALIZED from real tokenizer counts, not projected by replay
+    /// from a historical `RequestLog` row); each is set `false` here, where its
+    /// skip_serializing_if gating omits it from the wire form, keeping the
     /// byte-identity assertion honest for every mirrored field. The
     /// output-shaping levers (`format_switch` / `diff`, research Phase 3.3 +
     /// 3.4) ARE mirrored — round-trip-only, not projected by replay.
@@ -1030,6 +1047,13 @@ mod tests {
             max_cost_usd: Some(0.25),
             flex: true,      // mirrored (COST-7) — round-trips to plan-core
             compress: false, // not mirrored (pre-existing) — omitted when false
+            // not mirrored (Document Lane D2, runtime-only) — omitted when false
+            doc_compaction: false,
+            // not mirrored (Document Lane D4, runtime-only) — omitted when false
+            document_lane: false,
+            // not mirrored (content-aware compression, runtime-only) — omitted
+            // when false
+            content_compress: false,
             redact: true,
             format_switch: Some("csv".to_string()),
             diff: false, // mutually exclusive with format_switch on a real route
@@ -1137,6 +1161,8 @@ mod tests {
             tag_equals: Some("batch".to_string()),
             has_images: Some(true),
             has_audio: Some(false),
+            has_documents: Some(true),
+            content_type: Some("code".to_string()),
             prompt_contains_any_of: vec!["summarize".to_string()],
             estimated_cost_gt: Some(0.01),
             estimated_cost_lt: Some(5.0),
@@ -1154,6 +1180,8 @@ mod tests {
         assert_eq!(plan_conditions.tag_equals, Some("batch".to_string()));
         assert_eq!(plan_conditions.has_images, Some(true));
         assert_eq!(plan_conditions.has_audio, Some(false));
+        assert_eq!(plan_conditions.has_documents, Some(true));
+        assert_eq!(plan_conditions.content_type.as_deref(), Some("code"));
         assert_eq!(
             plan_conditions.prompt_contains_any_of,
             vec!["summarize".to_string()]

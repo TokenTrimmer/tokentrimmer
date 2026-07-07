@@ -11,6 +11,12 @@ pub mod walk;
 
 pub use engine::Engine;
 
+/// Re-export the underlying `tree-sitter` crate so downstream crates (e.g.
+/// `tt-core`'s content-aware code compressor) can name the [`tree_sitter::Tree`]
+/// / [`tree_sitter::Node`] types returned by [`parse::parse_cached`] WITHOUT
+/// taking their own `tree-sitter` dependency — the single shared grammar/version.
+pub use tree_sitter;
+
 use serde::{Deserialize, Serialize};
 
 /// Severity level for a finding.
