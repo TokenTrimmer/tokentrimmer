@@ -116,6 +116,21 @@ pub fn catalog_routes() -> Vec<NewRoute> {
                     elide_stale_tools: true,
                     ..Default::default()
                 }),
+                // P2a: default-on the content-aware compression pass on the
+                // catalog's down-route traffic so the P1d capture corpus
+                // accumulates organically from real flagship→mini traffic (the
+                // Phase-2 training-data seed). Content-preserving on
+                // JSON/CSV/log blocks (the bulk of tool results) + LOSSY + judge-
+                // gated on prose/code (P1b/P1c behind the 0.90-floor ratchet,
+                // fail-open to verbatim). Rides `auto_pause` like the other cost
+                // levers: a paused route suppresses it (fail-safe to expensive).
+                // The ZDR posture SHIFTS here — content_compress was opt-in; the
+                // catalog now turns it on by default for these routes. The raw
+                // before/after CAPTURE remains a separate instance-level opt-in
+                // (TT_COMPRESS_CAPTURE + TT_COMPRESS_CAPTURE_PATH, OFF by
+                // default) — so default-on here means "compress + save", NOT
+                // "persist raw request text" (that still needs the env opt-in).
+                content_compress: true,
                 ..Default::default()
             },
         })
@@ -181,6 +196,23 @@ mod tests {
             assert!(
                 ab.keep_recent_pairs >= 1,
                 "{}: keep_recent_pairs >= 1",
+                r.name
+            );
+        }
+    }
+
+    /// P2a: every catalog route default-ons `content_compress` so the P1d
+    /// capture corpus accumulates from real flagship→mini traffic (the Phase-2
+    /// training-data seed). The raw before/after CAPTURE is still a separate
+    /// instance-level env opt-in — default-on here means "compress + save", NOT
+    /// "persist raw request text".
+    #[test]
+    fn every_catalog_route_enables_content_compress() {
+        for r in catalog_routes() {
+            assert!(
+                r.then.content_compress,
+                "catalog route {} must default-on content_compress \
+                 (P2a: seed the P1d capture corpus from organic traffic)",
                 r.name
             );
         }
