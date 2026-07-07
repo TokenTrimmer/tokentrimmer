@@ -916,6 +916,12 @@ pub(crate) struct Prepared {
     pub diff_plan: Option<crate::shaping::diff::DiffPlan>,
     /// Aggregated request-pass effects threaded into the cost computation.
     pub pass_effects: PassEffects,
+    /// Content-aware compression flywheel label (P1a): the dominant content kind
+    /// the content_compress backend compacted (`json`/`csv`/`log`), or `None`
+    /// when the route did not opt in / nothing compacted. Recorded on the
+    /// `request_logs` row (`content_compress_kind`) only when the pass removed
+    /// tokens. Metrics-only (no request content).
+    pub content_compress_kind: Option<String>,
     /// Whether the minify-JSON instruction was injected (drives the estimate).
     pub minify_applied: bool,
     /// Whether a reasoning cap fired (judge eligibility).
@@ -1099,6 +1105,7 @@ pub(crate) async fn complete_once(
         format_switch_plan,
         diff_plan,
         pass_effects,
+        content_compress_kind,
         minify_applied,
         reasoning_capped,
         flex_applied,
@@ -1923,6 +1930,15 @@ pub(crate) async fn complete_once(
         // so the ctx→row mapping is independently unit-testable.
         run_id: None,
         node_id: None,
+        // Content-aware compression (P1a): the ISOLATED estimated saving (own
+        // column, migration 0033; never folded into cost/baseline/saved) + the
+        // flywheel kind label, recorded only when the pass removed tokens.
+        content_compress_saved_est_usd: cost_breakdown.content_compress_saved_est_usd,
+        content_compress_kind: if pass_effects.content_compress_tokens_removed > 0 {
+            content_compress_kind.clone()
+        } else {
+            None
+        },
     };
     // Agent-run grain (W0b Task 4): inherit run_id/node_id from ctx so every
     // row produced under an agent run carries the run's id.  `None` for
@@ -2006,6 +2022,9 @@ pub(crate) async fn complete_once(
         // samples the judge even without a model downgrade — shaping is
         // exactly what the #155 gate exists to police.
         format_switch_outcome.is_some() || diff_applied,
+        // P2a: a content_compress-only same-model request is judge-eligible when
+        // the pass removed tokens (the label-gap closure — see the predicate).
+        pass_effects.content_compress_tokens_removed > 0,
     );
 
     // 5. Return the typed response + header metadata. The chat wrapper (and
@@ -2511,6 +2530,11 @@ pub(crate) async fn prepare(
     // request-pass pipeline never runs and the request is byte-for-byte
     // unchanged.
     let route_doc_compaction = route_match.as_ref().is_some_and(|m| m.doc_compaction);
+    // A matched route opting into the content-aware compression pass
+    // (`RouteAction::content_compress`, P1a). When false (the default — no route
+    // or a route that did not enable it) the content_compress request-pass
+    // pipeline never runs and the request is byte-for-byte unchanged.
+    let route_content_compress = route_match.as_ref().is_some_and(|m| m.content_compress);
     // A matched route opting into the request-redaction guardrail
     // (`RouteAction::redact`). When false (the default) the redaction pass never
     // runs and the request is byte-for-byte unchanged. This is a SAFETY
@@ -3189,6 +3213,79 @@ pub(crate) async fn prepare(
         0
     };
 
+    // Content-aware compression pass (`RouteAction::content_compress`): OFF BY
+    // DEFAULT — `route_content_compress` is false for every unrouted request and
+    // every route that did not enable it, so `req` is byte-for-byte unchanged on
+    // the default path. For each LARGE System/Tool block the dispatcher
+    // classifies the content kind and applies a backend: CONTENT-PRESERVING
+    // structural compaction (JSON whitespace-minify, CSV trailing-padding trim,
+    // log repeated-line collapse) for JSON/CSV/log; the P1b LOSSY prose
+    // EXTRACTIVE backend for Prose; and the P1c LOSSY AST backend for Code
+    // (truncate long function bodies, keep imports/signatures, re-parse-verify) —
+    // the latter two committed only behind the shared judge gate
+    // (`state.summary_gate`, default closed → verbatim). Diff is classified but
+    // left untouched (no Phase-1 backend). Same token-true
+    // gate + cache-span invariant as the other passes; the returned `tokens_removed` is the
+    // pipeline-MEASURED tokenizer delta, which drives the ISOLATED
+    // `content_compress_saved_est_usd` estimate (NOT the baseline fold) below.
+    // The flywheel records the dominant compacted kind (metrics only; raw
+    // before/after capture is opt-in + off by default — see
+    // `content_compress::capture`).
+    let content_compress_kind: Option<String> = if route_content_compress {
+        crate::content_compress::dominant_compactable_kind(&req.messages)
+            .map(|k| k.as_str().to_string())
+    } else {
+        None
+    };
+    let content_compress_tokens_removed: u32 = if route_content_compress {
+        let out = {
+            let mut split = crate::passes::SplitRequest::compute(req, &pass_cx);
+            // P1b/P1c: the LOSSY prose + AST-code backends ride the SAME judge
+            // gate as the summarize lever (`state.summary_gate`, default
+            // `NeverCommitGate`). Prose compresses only when the `"prose"` class
+            // is judge-trusted, Code only when the `"code"` class is (independent
+            // classes + 0.90-floor ratchets); otherwise each fails open to
+            // verbatim (Code additionally re-parse-verifies — never serve broken
+            // code). The structural JSON/CSV/log backends are unaffected
+            // (content-preserving, no gate).
+            //
+            // P1d: a CaptureCtx is threaded so each compacted block's
+            // before/after pair is recorded (the Phase-2 training flywheel).
+            // record_pair is a NO-OP unless the instance opted in
+            // (TT_COMPRESS_CAPTURE + TT_COMPRESS_CAPTURE_PATH), so this is
+            // observability-only — never changes the dispatched bytes. The
+            // per-block record_pair supersedes the old per-request
+            // capture::record (the kind + tokens are both in the per-block
+            // record).
+            let capture = std::sync::Arc::new(crate::content_compress::CaptureCtx {
+                org_id: ctx.org_id.to_string(),
+                trace_id: ctx.trace_id.to_string(),
+                model: pass_cx.model.to_string(),
+                provider_id: pass_cx.provider_id.to_string(),
+            });
+            crate::passes::PassPipeline::content_compress_with_gates_and_capture(
+                state.summary_gate.clone(),
+                capture,
+            )
+            .run(&mut split, &pass_cx)
+        };
+        for name in &out.rejected {
+            warnings.push(format!("pass_rejected:{name}"));
+        }
+        warnings.extend(out.warnings);
+        if out.tokens_removed > 0 {
+            tracing::debug!(
+                org_id = %ctx.org_id,
+                tokens_removed = out.tokens_removed,
+                kind = content_compress_kind.as_deref().unwrap_or("none"),
+                "content-compress pass removed input tokens"
+            );
+        }
+        out.tokens_removed
+    } else {
+        0
+    };
+
     // Agentic context budget (`RouteAction::agentic_budget`): OFF BY DEFAULT —
     // `route_agentic_budget` is `None` for every unrouted request (and every
     // route that did not opt in), so the planner is never constructed and `req`
@@ -3242,6 +3339,7 @@ pub(crate) async fn prepare(
     let pass_effects = crate::passes::PassEffects {
         compression_tokens_removed,
         doc_compaction_tokens_removed,
+        content_compress_tokens_removed,
         cache_bust_penalty_usd: cache_bust.penalty_usd(pass_cx.pricing)
             + agentic_effects.cache_bust_penalty_usd,
         elide_field_drop_tokens_removed: agentic_effects.elide_field_drop_tokens_removed,
@@ -3407,6 +3505,7 @@ pub(crate) async fn prepare(
         format_switch_plan,
         diff_plan,
         pass_effects,
+        content_compress_kind,
         minify_applied,
         reasoning_capped,
         flex_applied,
@@ -3461,6 +3560,11 @@ async fn handle_streaming(
         format_switch_plan: _,
         diff_plan: _,
         pass_effects,
+        // Streaming defers the content_compress isolated estimate + flywheel
+        // label to the non-streaming path in v1 (the pass still runs pre-split,
+        // so the metered token reduction is real; the isolated estimate books $0
+        // on a streamed row, matching the minify-estimate v1 posture).
+        content_compress_kind: _,
         minify_applied,
         reasoning_capped: _,
         flex_applied,
@@ -3548,6 +3652,8 @@ async fn handle_streaming(
                             diff_failed_cost_usd: 0.0,
                             // Document Lane vision-avoided saving (D4c sets it).
                             doc_vision_saved_est_usd: 0.0,
+                            // Cache hit → no dispatch → no content_compress.
+                            content_compress_saved_est_usd: 0.0,
                         };
                         record_request_span_attributes(
                             &entry.response.model,
@@ -4434,6 +4540,8 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
         // Document Lane vision-avoided saving — the seam that sets a non-zero
         // value is D4c; a cache hit / non-seam path always books 0.
         doc_vision_saved_est_usd: 0.0,
+        // Cache hit → no dispatch → no content_compress.
+        content_compress_saved_est_usd: 0.0,
     };
     attach_cost_headers(
         http_response.headers_mut(),
@@ -4510,6 +4618,8 @@ fn build_hit_l2_response(
         // Document Lane vision-avoided saving — the seam that sets a non-zero
         // value is D4c; a cache hit / non-seam path always books 0.
         doc_vision_saved_est_usd: 0.0,
+        // Cache hit → no dispatch → no content_compress.
+        content_compress_saved_est_usd: 0.0,
     };
     let mut http_response = Json(response).into_response();
     attach_cost_headers(
@@ -4857,6 +4967,19 @@ pub(crate) struct CostBreakdown {
     /// header + `request_logs` column (migration 0032). **Always 0.0 in D4a**
     /// (substrate only — the seam that sets a non-zero value is D4c).
     pub doc_vision_saved_est_usd: f64,
+    /// ESTIMATED content-aware compression saving (P1a): the input tokens the
+    /// content_compress structural backend (JSON/CSV/log, opt-in via
+    /// `RouteAction::content_compress`) removed before dispatch, priced at the
+    /// served model's input rate, fee-applied. Like `doc_vision_saved_est_usd` it
+    /// is ISOLATED: NEVER folded into `cost_usd` / `baseline_cost_usd` /
+    /// [`tt_saved_usd`](Self::tt_saved_usd) (a conservative estimate, not an
+    /// invoice-reconciled figure — the JSON/log/CSV compaction is content-
+    /// lossless and could fold like `compression`, but P1a books it here to keep
+    /// the reconciled headline clean and the isolated pattern consistent).
+    /// Surfaced on its own `X-TokenTrimmer-Content-Compress-Saved-Est-Usd` header
+    /// and the `request_logs` column (migration 0033). Zero when the route did
+    /// not opt into `content_compress`.
+    pub content_compress_saved_est_usd: f64,
 }
 
 impl CostBreakdown {
@@ -5218,6 +5341,14 @@ pub(crate) fn compute_cost_full(
         (compression_input_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
     let doc_compaction_saved_usd =
         (doc_compaction_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
+    // Content-aware compression (P1a): the input tokens the content_compress
+    // structural backend removed, valued at the served model's input rate. This
+    // is ISOLATED — NOT added to `input_tokens_removed`/the baseline fold below
+    // (unlike compression/doc_compaction) — so it never enters the reconciled
+    // `baseline − cost` headline; it books ONLY into the estimate field. Zero
+    // when the route did not opt into content_compress.
+    let content_compress_saved_est_usd =
+        (effects.content_compress_tokens_removed as f64) * pricing.input_per_million / 1_000_000.0;
     // Fold the removed-token value into the baseline at the baseline model's
     // input rate (what the customer would have paid sending the un-trimmed
     // prompt to the baseline model). Includes BOTH the compression and the
@@ -5274,6 +5405,10 @@ pub(crate) fn compute_cost_full(
         // books a non-zero vision-avoided saving on this isolated field is D4c.
         // Isolated: NOT folded into cost_usd/baseline_cost_usd above.
         doc_vision_saved_est_usd: 0.0,
+        // Content-aware compression (P1a): the ISOLATED estimated saving from the
+        // content_compress backend's removed input tokens. NOT folded into
+        // cost_usd/baseline_cost_usd above (unlike compression/doc_compaction).
+        content_compress_saved_est_usd: content_compress_saved_est_usd * fee_multiplier,
     }
 }
 
@@ -5427,6 +5562,14 @@ pub(crate) fn attach_cost_headers(
         (
             "x-tokentrimmer-doc-vision-saved-est-usd",
             format!("{:.6}", cost.doc_vision_saved_est_usd),
+        ),
+        // ESTIMATED content-aware compression saving (P1a): the input tokens the
+        // content_compress backend removed, input-rate-priced — a conservative
+        // estimate, NEVER included in `saved-usd` / baseline (isolated, like the
+        // minify + doc-vision estimates). 0.000000 unless the route opted in.
+        (
+            "x-tokentrimmer-content-compress-saved-est-usd",
+            format!("{:.6}", cost.content_compress_saved_est_usd),
         ),
     ];
 
@@ -5887,6 +6030,7 @@ fn maybe_spawn_quality_judge(
     judge_source_ctx: Option<RequestContext>,
     judge_original_req: Option<ChatCompletionRequest>,
     response_shaped: bool,
+    content_compressed: bool,
 ) {
     use crate::quality_sample as qs;
 
@@ -5911,17 +6055,45 @@ fn maybe_spawn_quality_judge(
     // capture already provides the un-shaped baseline counterfactual, so an
     // action-only shaped route (same target model, identical pricing) is
     // judge-gateable too.
+    //
+    // P2a (label-gap closure): a content_compress-only same-model request (where
+    // `is_downgrade` is false + not shaped) is ALSO judge-eligible when the
+    // pass actually removed tokens — the pre-routing `judge_original_req` capture
+    // is the uncompressed counterfactual, so re-dispatching it produces the
+    // recall-of-baseline verdict the P1d capture pair needs to become RUNG 3
+    // gold. `content_compressed = pass_effects.content_compress_tokens_removed > 0`
+    // — a route that opted in but compressed nothing is NOT eligible (no
+    // compression event to label).
     if matched_route_id.is_none() {
         return;
     }
     if !(qs::is_downgrade(requested_pricing, served_pricing, &response.usage)
         || output_shaped
-        || response_shaped)
+        || response_shaped
+        || content_compressed)
     {
         return;
     }
     // Deterministic ~2% sample keyed on the trace id.
     if !qs::should_sample(trace_id, state.judge_config.sample_rate) {
+        return;
+    }
+    // P2a (label-gap budget): the per-org / per-UTC-day cap on dispatch-path
+    // judge re-dispatches. Bounds the RUNG 3 measurement spend on
+    // content_compress-only traffic (judge cost is ALREADY excluded from
+    // monthly_cap_usd + savings — this is an additional throttle that protects
+    // the org's provider bill from the re-dispatch tax when the sample rate is
+    // raised for capture traffic). The cap fires BEFORE any upstream call, so
+    // NO 'unjudged:cap' row is recorded (migration 0014's "EVERY failure AFTER
+    // an upstream call was attempted records a row" rule is about attempted
+    // dispatches — a capped request never attempted one, so no row is the
+    // honest ledger posture). A metrics log carries the throttle signal.
+    if !state.judge_daily_cap.try_acquire(org_id) {
+        tracing::debug!(
+            org_id = %org_id,
+            trace_id = %trace_id,
+            "quality judge throttled by per-org/day cap (TT_JUDGE_DAILY_CAP_PER_ORG)"
+        );
         return;
     }
     let served_answer = response_assistant_text(response);
@@ -6332,6 +6504,9 @@ fn request_log_for_l1_hit(
         // run_id/node_id stamped in Task 4 (agentic loop context).
         run_id: None,
         node_id: None,
+        // Cache hit → nothing dispatched → no content_compress.
+        content_compress_saved_est_usd: 0.0,
+        content_compress_kind: None,
     }
 }
 
@@ -6407,6 +6582,9 @@ fn request_log_for_l2_hit(
         // run_id/node_id stamped in Task 4 (agentic loop context).
         run_id: None,
         node_id: None,
+        // Cache hit → nothing dispatched → no content_compress.
+        content_compress_saved_est_usd: 0.0,
+        content_compress_kind: None,
     }
 }
 
@@ -6460,6 +6638,11 @@ pub(crate) struct RouteMatch {
     /// default (no pass runs otherwise). A COST lever: suppressed on a paused
     /// route.
     pub(crate) doc_compaction: bool,
+    /// The matched route opted into the content-aware compression pass
+    /// (`RouteAction::content_compress`, P1a). When true the gateway runs the
+    /// content_compress request-pass pipeline before dispatch; off by default
+    /// (no pass runs otherwise). A COST lever: suppressed on a paused route.
+    pub(crate) content_compress: bool,
     /// The matched route opted into the request-redaction guardrail
     /// (`RouteAction::redact`). When true the gateway redacts PII/secrets from
     /// the outbound request before dispatch (a SAFETY transform, not a saving);
@@ -6661,6 +6844,7 @@ pub(crate) async fn apply_routing(
             flex: false,
             compress: false,
             doc_compaction: false,
+            content_compress: false,
             format_switch: None,
             diff: false,
             traffic_pct: None,
@@ -6694,6 +6878,7 @@ pub(crate) async fn apply_routing(
     let batch = m.then.batch;
     let compress = m.then.compress;
     let doc_compaction = m.then.doc_compaction;
+    let content_compress = m.then.content_compress;
     let redact = m.then.redact;
     let format_switch = m.then.format_switch.clone();
     let diff = m.then.diff;
@@ -6769,6 +6954,7 @@ pub(crate) async fn apply_routing(
         batch,
         compress,
         doc_compaction,
+        content_compress,
         redact,
         format_switch,
         diff,
@@ -9172,6 +9358,10 @@ mod output_shaping_tests {
         // on the compute path (the seam that books it is D4c) and, like minify,
         // is never folded into cost/baseline.
         assert_eq!(base.doc_vision_saved_est_usd, 0.0);
+        // Content-aware compression (P1a): 0.0 with default (empty) PassEffects —
+        // the isolated estimate is booked only when content_compress removed
+        // tokens, and (like minify/doc-vision) is never folded into cost/baseline.
+        assert_eq!(base.content_compress_saved_est_usd, 0.0);
 
         let bd = compute_cost_full(
             &usage,
@@ -9524,6 +9714,8 @@ mod telemetry_drain_tests {
             doc_vision_saved_est_usd: 0.0,
             run_id: None,
             node_id: None,
+            content_compress_saved_est_usd: 0.0,
+            content_compress_kind: None,
         }
     }
 

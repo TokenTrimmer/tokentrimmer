@@ -22,6 +22,11 @@ allow = [
     # Permissive (data) license carried by transitive deps (e.g. webpki-roots
     # cert data); Apache-2.0 compatible.
     "CDLA-Permissive-2.0",
+    # University of Illinois/NCSA Open Source License — OSI-approved + FSF-free,
+    # a permissive BSD/MIT-style license. Carried by `libfuzzer-sys` (a fuzz-only
+    # dep of `rav1e`, pulled transitively by `image`'s AVIF support in the
+    # out-of-process doc-sidecar); Apache-2.0/MIT compatible.
+    "NCSA",
 ]
 confidence-threshold = 0.93
 
@@ -69,6 +74,18 @@ ignore = [
     # `indicatif` (tt-cli's spinner/progress UI). Blocker: revisit when
     # indicatif drops it.
     "RUSTSEC-2025-0119", # number_prefix unmaintained (not vuln); blocker: indicatif transitive; re-check 2026-09-15
+    # --- ttf-parser unmaintained ----------------------------------------------
+    # `ttf-parser` (font-table parsing) — unmaintained but NOT vulnerable. Pulled
+    # transitively by the doc-sidecar's pure-Rust PDF text extractor
+    # (pdf-extract -> lopdf -> ttf-parser) for correct glyph->text mapping. The
+    # sidecar is an out-of-process operational binary; not on the gateway hot
+    # path. Blocker: lopdf must migrate off ttf-parser. Re-check 2026-09-15.
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained (not vuln); blocker: lopdf transitive (doc-sidecar); re-check 2026-09-15
+    # --- paste unmaintained --------------------------------------------------
+    # `paste` (macro helper) — unmaintained but NOT vulnerable. Pulled
+    # transitively by the doc-sidecar's OCR stack (ocrs -> ndarray -> paste).
+    # Blocker: ndarray must drop paste. Re-check 2026-09-15.
+    "RUSTSEC-2024-0436", # paste unmaintained (not vuln); blocker: ndarray transitive (doc-sidecar); re-check 2026-09-15
 ]
 
 [sources]

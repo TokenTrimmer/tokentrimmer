@@ -79,7 +79,72 @@ pub const DEFAULT_JUDGE_BASELINE_TIMEOUT: std::time::Duration = std::time::Durat
 /// off (dispatch-path judging unaffected).
 pub const DEFAULT_L2_HIT_MAX_PER_HOUR: u32 = 50;
 
-/// The task classes the sampled judge can score. MVP enables only
+/// P2a: default per-org / UTC-day cap on dispatch-path judge re-dispatches
+/// (`TT_JUDGE_DAILY_CAP_PER_ORG`). Bounds the RUNG 3 measurement spend on
+/// content_compress-only traffic. Judge cost is ALREADY excluded from
+/// `monthly_cap_usd` + savings (it flows only to `quality_verdicts.judge_cost_usd`)
+/// — this cap is an additional throttle that protects the org's provider bill
+/// from the re-dispatch tax when the sample rate is raised for capture traffic.
+pub const DEFAULT_JUDGE_DAILY_CAP_PER_ORG: u32 = 50;
+
+/// P2a: per-org / per-UTC-day judge re-dispatch cap. Mirrors
+/// [`L2HitJudgeLimiter`]'s coarse-counter spirit, but keyed `(org_id, day)`
+/// (not per-instance-hour) + held under a `Mutex<HashMap>` (judge spawning is
+/// ~rare — the ~2% sample of eligible traffic — so a Mutex is fine, NOT a hot
+/// path). Over-cap traffic is NOT judged (the eligibility chain records an
+/// `'unjudged:cap'` row via `JudgeSink::record` per migration 0014's "EVERY
+/// failure after an upstream call was attempted records a row" rule —
+/// ledger-complete, not a silent drop).
+pub struct PerOrgDayJudgeCap {
+    max: u32,
+    inner: std::sync::Mutex<std::collections::HashMap<Uuid, (u64, u64)>>,
+}
+
+impl PerOrgDayJudgeCap {
+    /// A cap allowing at most `max_per_day` acquisitions per `(org, UTC day)`.
+    /// `0` = never allows (the dispatch-path judge fully capped off). The
+    /// clock-injected seam (`try_acquire_at`) lets tests drive the day window
+    /// directly without time-mocking.
+    #[must_use]
+    pub fn new(max_per_day: u32) -> Self {
+        Self {
+            max: max_per_day,
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// True iff a judge re-dispatch is allowed for `org_id` in the UTC-day
+    /// window `now_day` (unix-epoch days); increments the counter on success.
+    /// Different orgs are independent; a new day rolls the counter.
+    pub fn try_acquire_at(&self, org_id: Uuid, now_day: u64) -> bool {
+        if self.max == 0 {
+            return false;
+        }
+        let mut g = self.inner.lock().expect("PerOrgDayJudgeCap poisoned");
+        let entry = g.entry(org_id).or_insert((now_day, 0));
+        if entry.0 != now_day {
+            // New day window: reset.
+            entry.0 = now_day;
+            entry.1 = 0;
+        }
+        if entry.1 < u64::from(self.max) {
+            entry.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// [`Self::try_acquire_at`] with `now_day = unix_seconds / 86_400`.
+    pub fn try_acquire(&self, org_id: Uuid) -> bool {
+        let now_day = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        self.try_acquire_at(org_id, now_day)
+    }
+}
+
 /// [`JudgeTaskClass::ChatCompletions`]; the enum exists so additional classes
 /// (embeddings re-rank, messages-ingress, …) can be opted in without reshaping
 /// the call sites.
@@ -138,6 +203,14 @@ pub struct JudgeConfig {
     /// [`DEFAULT_L2_HIT_MAX_PER_HOUR`]). `0` = L2-hit judging fully capped off
     /// (dispatch-path judging unaffected).
     pub l2_hit_max_per_hour: u32,
+    /// P2a (label-gap): max judge re-dispatches per org per UTC day
+    /// (`TT_JUDGE_DAILY_CAP_PER_ORG`, default
+    /// [`DEFAULT_JUDGE_DAILY_CAP_PER_ORG`]). `0` = the dispatch-path judge is
+    /// fully capped off (the cap bites BEFORE `should_sample`). Bounds the
+    /// RUNG 3 measurement spend on content_compress-only traffic; judge cost is
+    /// ALREADY excluded from `monthly_cap_usd` + savings (it flows only to
+    /// `quality_verdicts.judge_cost_usd`) — this cap is an additional throttle.
+    pub daily_cap_per_org: u32,
 }
 
 impl Default for JudgeConfig {
@@ -151,6 +224,7 @@ impl Default for JudgeConfig {
             l2_hit_sample_rate: None,
             l2_band_sample_rate: None,
             l2_hit_max_per_hour: DEFAULT_L2_HIT_MAX_PER_HOUR,
+            daily_cap_per_org: DEFAULT_JUDGE_DAILY_CAP_PER_ORG,
         }
     }
 }
@@ -201,6 +275,9 @@ impl JudgeConfig {
         let l2_hit_max_per_hour = get("TT_JUDGE_L2_HIT_MAX_PER_HOUR")
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(DEFAULT_L2_HIT_MAX_PER_HOUR);
+        let daily_cap_per_org = get("TT_JUDGE_DAILY_CAP_PER_ORG")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(DEFAULT_JUDGE_DAILY_CAP_PER_ORG);
         Self {
             enabled,
             sample_rate,
@@ -210,6 +287,7 @@ impl JudgeConfig {
             l2_hit_sample_rate,
             l2_band_sample_rate,
             l2_hit_max_per_hour,
+            daily_cap_per_org,
         }
     }
 }
@@ -3406,6 +3484,52 @@ mod tests {
         let off = L2HitJudgeLimiter::new(0);
         assert!(!off.try_acquire_at(0), "max=0 never admits");
         assert!(!off.try_acquire_at(1), "max=0 never admits in any hour");
+    }
+
+    /// P2a: the per-org / per-UTC-day judge cap throttles after `max` acquires
+    /// for the same org; different orgs are independent; a new day rolls the
+    /// counter; `max=0` never admits. Mirrors `l2_hit_judge_limiter_caps_per_hour`.
+    #[test]
+    fn per_org_day_judge_cap_throttles_after_max() {
+        let org_a = Uuid::from_u128(1);
+        let org_b = Uuid::from_u128(2);
+
+        let cap = PerOrgDayJudgeCap::new(3);
+        // Org A: the first 3 acquires in day 100 succeed; the 4th is capped.
+        assert!(cap.try_acquire_at(org_a, 100));
+        assert!(cap.try_acquire_at(org_a, 100));
+        assert!(cap.try_acquire_at(org_a, 100));
+        assert!(
+            !cap.try_acquire_at(org_a, 100),
+            "4th acquire same org/day is capped"
+        );
+        assert!(
+            !cap.try_acquire_at(org_a, 100),
+            "still capped within the day"
+        );
+
+        // Org B is INDEPENDENT — a different org has its own counter.
+        assert!(cap.try_acquire_at(org_b, 100), "different org independent");
+        assert!(cap.try_acquire_at(org_b, 100));
+        assert!(cap.try_acquire_at(org_b, 100));
+        assert!(!cap.try_acquire_at(org_b, 100), "org B hits its own cap");
+
+        // New day (101) rolls org A's counter.
+        assert!(cap.try_acquire_at(org_a, 101), "new day rolls the counter");
+        assert!(cap.try_acquire_at(org_a, 101));
+        assert!(cap.try_acquire_at(org_a, 101));
+        assert!(
+            !cap.try_acquire_at(org_a, 101),
+            "capped again in the new day"
+        );
+
+        // max=0 never admits (the dispatch-path judge fully capped off).
+        let off = PerOrgDayJudgeCap::new(0);
+        assert!(!off.try_acquire_at(org_a, 1), "max=0 never admits");
+        assert!(
+            !off.try_acquire_at(org_b, 1),
+            "max=0 never admits for any org"
+        );
     }
 
     /// A Degraded verdict on a job carrying an `l2_fp_feed` reaches the

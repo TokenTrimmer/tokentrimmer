@@ -280,6 +280,13 @@ pub struct AppState {
     /// is attached. Consumed only by L2-hit samples that would otherwise spawn
     /// a judge — the dispatch-path judge is unaffected.
     pub l2_hit_judge_limiter: Arc<crate::quality_sample::L2HitJudgeLimiter>,
+    /// P2a (label-gap): per-org / per-UTC-day cap on dispatch-path judge
+    /// re-dispatches (`judge_config.daily_cap_per_org`). Bounds the RUNG 3
+    /// measurement spend on content_compress-only traffic; checked in
+    /// `maybe_spawn_quality_judge` after the eligibility OR-chain + before
+    /// `should_sample`. Judge cost is ALREADY excluded from `monthly_cap_usd`
+    /// + savings — this is an additional throttle.
+    pub judge_daily_cap: Arc<crate::quality_sample::PerOrgDayJudgeCap>,
     /// Optional route-level netted-savings read-side backing
     /// `GET /v1/routes/:id/savings` (research Phase 2.3 judge-tax netting).
     /// `None` (default) → the endpoint answers 503 until
@@ -353,6 +360,9 @@ impl AppState {
         let l2_hit_judge_limiter = Arc::new(crate::quality_sample::L2HitJudgeLimiter::new(
             judge_config.l2_hit_max_per_hour,
         ));
+        let judge_daily_cap = Arc::new(crate::quality_sample::PerOrgDayJudgeCap::new(
+            judge_config.daily_cap_per_org,
+        ));
         Self {
             registry: Arc::new(registry),
             l1: None,
@@ -382,6 +392,7 @@ impl AppState {
             latency_tracker: Arc::new(tt_routing::LatencyTracker::new()),
             shadow_timeout: DEFAULT_SHADOW_TIMEOUT,
             l2_hit_judge_limiter,
+            judge_daily_cap,
             route_savings: None,
             spend_source: None,
             db_pool: None,

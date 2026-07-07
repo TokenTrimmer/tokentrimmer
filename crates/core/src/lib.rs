@@ -4,6 +4,7 @@
 pub mod batch_store;
 pub mod budget;
 pub mod cache_volatility;
+pub mod content_compress;
 pub mod db;
 pub mod document_lane;
 pub mod error;
