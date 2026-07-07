@@ -6078,6 +6078,24 @@ fn maybe_spawn_quality_judge(
     if !qs::should_sample(trace_id, state.judge_config.sample_rate) {
         return;
     }
+    // P2a (label-gap budget): the per-org / per-UTC-day cap on dispatch-path
+    // judge re-dispatches. Bounds the RUNG 3 measurement spend on
+    // content_compress-only traffic (judge cost is ALREADY excluded from
+    // monthly_cap_usd + savings — this is an additional throttle that protects
+    // the org's provider bill from the re-dispatch tax when the sample rate is
+    // raised for capture traffic). The cap fires BEFORE any upstream call, so
+    // NO 'unjudged:cap' row is recorded (migration 0014's "EVERY failure AFTER
+    // an upstream call was attempted records a row" rule is about attempted
+    // dispatches — a capped request never attempted one, so no row is the
+    // honest ledger posture). A metrics log carries the throttle signal.
+    if !state.judge_daily_cap.try_acquire(org_id) {
+        tracing::debug!(
+            org_id = %org_id,
+            trace_id = %trace_id,
+            "quality judge throttled by per-org/day cap (TT_JUDGE_DAILY_CAP_PER_ORG)"
+        );
+        return;
+    }
     let served_answer = response_assistant_text(response);
     if served_answer.trim().is_empty() {
         return; // tool-call-only response — nothing textual to judge.
