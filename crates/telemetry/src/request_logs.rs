@@ -267,7 +267,6 @@ pub struct RequestLogRow {
     // (skipped on serialize when None). The cloud mint endpoint
     // (POST /v1/admin/requests/{trace_id}/l2-receipt/sign) reads these off the
     // row + signs them with the audit key — mirroring the VCR mint endpoint.
-
     /// The cache entry the query matched (`cache_entries.id`). None when this
     /// row was not an L2 hit. Lets the customer attribute the hit to a specific
     /// prior answer.
