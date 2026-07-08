@@ -221,8 +221,13 @@ mod tests {
 
     #[test]
     fn scorer_default_timeout_is_50ms() {
+        // Save/restore the env (a prior test may have set TT_ML_SCORE_TIMEOUT_MS).
+        let saved = std::env::var(TIMEOUT_ENV).ok();
         std::env::remove_var(TIMEOUT_ENV);
         let scorer = Scorer::new();
         assert_eq!(scorer.timeout_ms, DEFAULT_TIMEOUT_MS);
+        if let Some(v) = saved {
+            std::env::set_var(TIMEOUT_ENV, v);
+        }
     }
 }
