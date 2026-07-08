@@ -13,6 +13,7 @@ pub mod compress_corpus;
 pub mod context;
 pub mod cost_diff;
 pub mod embed;
+pub mod eval_shadow;
 pub mod init;
 pub mod local_audit;
 pub mod mcp_install;
