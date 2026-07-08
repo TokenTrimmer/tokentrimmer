@@ -18,3 +18,4 @@ pub mod propagation;
 pub mod request_logs;
 pub mod tracing;
 pub mod vcr;
+pub mod l2_receipt;
