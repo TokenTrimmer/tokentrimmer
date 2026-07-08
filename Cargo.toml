@@ -209,6 +209,7 @@ tt-preview = { path = "crates/preview", version = "0.1" }
 tt-mcp = { path = "crates/mcp", version = "0.1" }
 tt-retrieval = { path = "crates/retrieval", version = "0.1" }
 tt-context = { path = "crates/context", version = "0.1" }
+tt-ml-scoring = { path = "crates/ml-scoring", version = "0.1" }
 
 [profile.release]
 lto = "thin"

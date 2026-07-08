@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 description = "Axum HTTP server, routing engine, middleware, and provider registry."
 
+[features]
+# Phase-2b learned-compression scorer (OFF by default — the public/Fly builds
+# stay ML-dep-free; only the owner's M4 Max gateway build enables this).
+ml-scoring = ["dep:tt-ml-scoring"]
+
 [dependencies]
 tt-shared.workspace = true
 tt-tokenize.workspace = true
@@ -86,6 +91,8 @@ zeroize.workspace = true
 tempfile.workspace = true
 # Guarded outbound HTTP client for workflow Http nodes (W3b Task 3).
 reqwest.workspace = true
+# Phase-2b learned-compression scorer (optional, behind `ml-scoring`).
+tt-ml-scoring = { workspace = true, optional = true }
 
 [dev-dependencies]
 argon2.workspace = true
