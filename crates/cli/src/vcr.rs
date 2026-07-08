@@ -60,11 +60,7 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
 }
 
 /// Verify a VCR (compression-savings) receipt.
-fn verify_vcr_receipt(
-    raw: &str,
-    _peek: &serde_json::Value,
-    key_hex: &str,
-) -> anyhow::Result<()> {
+fn verify_vcr_receipt(raw: &str, _peek: &serde_json::Value, key_hex: &str) -> anyhow::Result<()> {
     let receipt: VcrReceipt = serde_json::from_str(raw).context("parse VCR receipt JSON")?;
     crate::ui::note(&format!(
         "VCR v{} for org {} trace {} (route {}, model {})",
@@ -85,11 +81,7 @@ fn verify_vcr_receipt(
 }
 
 /// Verify an L2 (semantic-cache-hit provenance) receipt.
-fn verify_l2_receipt(
-    raw: &str,
-    _peek: &serde_json::Value,
-    key_hex: &str,
-) -> anyhow::Result<()> {
+fn verify_l2_receipt(raw: &str, _peek: &serde_json::Value, key_hex: &str) -> anyhow::Result<()> {
     let receipt: tt_telemetry::l2_receipt::L2Receipt =
         serde_json::from_str(raw).context("parse L2 receipt JSON")?;
     crate::ui::note(&format!(
@@ -220,10 +212,7 @@ mod tests {
     // The same `tt verify-receipt` CLI verifies an L2 receipt (dispatched by
     // field-presence: matched_entry_id + verdict). Mirrors the VCR tests.
 
-    use tt_telemetry::l2_receipt::{
-        sign as sign_l2, verifying_key_hex as verifying_key_hex_l2, L2Receipt, L2_SCHEMA_VERSION,
-        VERDICT_VERIFIED,
-    };
+    use tt_telemetry::l2_receipt::{sign as sign_l2, L2Receipt, L2_SCHEMA_VERSION, VERDICT_VERIFIED};
 
     fn sign_l2_receipt() -> L2Receipt {
         sign_l2(

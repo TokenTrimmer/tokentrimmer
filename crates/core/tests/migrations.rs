@@ -589,6 +589,12 @@ async fn request_logs_insert_round_trips_against_postgres() {
         // TEXT bind of the NEW 0033 columns against real Postgres.
         content_compress_saved_est_usd: 0.000517,
         content_compress_kind: Some("json".into()),
+        // Pinned Some/Some/nonzero on purpose: pins the UUID, REAL, + TEXT binds
+        // of the NEW 0035 L2-provenance columns against real Postgres (mirrors
+        // the 0020/0032/0033 pinning intent above).
+        l2_matched_entry_id: Some(Uuid::from_u128(0xface)),
+        l2_similarity: Some(0.9312),
+        l2_verdict: Some("verified".into()),
     };
     let id = row.id;
     writer

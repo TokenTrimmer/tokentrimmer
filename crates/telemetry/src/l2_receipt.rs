@@ -300,7 +300,10 @@ mod tests {
     #[test]
     fn sign_then_verify_round_trips_with_embedded_key() {
         let receipt = sign_test_receipt();
-        assert!(verify(&receipt), "a receipt signed + verified with its embedded key must PASS");
+        assert!(
+            verify(&receipt),
+            "a receipt signed + verified with its embedded key must PASS"
+        );
     }
 
     #[test]
