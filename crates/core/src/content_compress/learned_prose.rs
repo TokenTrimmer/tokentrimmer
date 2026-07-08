@@ -21,6 +21,7 @@
 //! `tt::compress::shadow` log), NOT via the drop-in return value.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use super::prose::{
     content_tokens, is_must_keep, jaccard, segments, word_count, word_shingles, DEFAULT_KEEP_RATIO,
@@ -33,6 +34,81 @@ use super::prose::{
 /// from [`PROSE_CLASS`](super::prose::PROSE_CLASS), so a bad learned model
 /// darkens ONLY the learned path while deterministic P1b keeps serving.
 pub const PROSE_LEARNED_CLASS: &str = "prose-learned";
+
+/// Process-wide scorer (loaded lazily on first `shadow_score()` call).
+static SCORER: OnceLock<tt_ml_scoring::Scorer> = OnceLock::new();
+
+fn scorer() -> &'static tt_ml_scoring::Scorer {
+    SCORER.get_or_init(tt_ml_scoring::Scorer::new)
+}
+
+/// DARK SHADOW: score a prose block with the learned model + log the delta vs P1b
+/// (for P2c recall eval). Does NOT ship the learned output — the dispatcher ships
+/// P1b. The shadow log is a structured `tracing` event at `tt::compress::shadow`
+/// carrying `{content_hash, p1b_tokens, learned_tokens}` (ZDR-safe — no raw text).
+///
+/// On any scorer error (no model, timeout, inference error) → the shadow event
+/// logs `learned_tokens: None` + the P1b tokens (the scorer was absent; P1b ran
+/// alone). The request is never blocked.
+pub fn shadow_score(text: &str) {
+    // Compute the P1b candidate (the deterministic floor the dispatcher ships).
+    let p1b_out = super::prose::compress(text);
+    let p1b_tokens = p1b_out
+        .as_ref()
+        .map(|(out, _)| word_count(text).saturating_sub(word_count(out)))
+        .unwrap_or(0);
+
+    // Score with the learned model + compute its candidate.
+    let learned_tokens = score_and_compress(text).map(|(out, removed)| {
+        // Self-measure the per-block delta (the dispatcher discards .1).
+        if removed > 0 {
+            removed as usize
+        } else {
+            word_count(text).saturating_sub(word_count(&out))
+        }
+    });
+
+    // The content hash (ZDR-safe — no raw text in the log).
+    let content_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+
+    tracing::info!(
+        target: "tt::compress::shadow",
+        content_hash = %content_hash,
+        p1b_tokens_removed = p1b_tokens,
+        learned_tokens_removed = ?learned_tokens,
+        "content_compress shadow (DARK — shipped P1b; learned candidate logged for P2c eval)"
+    );
+}
+
+/// Score the text + produce the learned candidate. Returns `Some((compacted, est_removed))`
+/// or `None` on any scorer error (no model, timeout, inference failure) → fail-open.
+fn score_and_compress(text: &str) -> Option<(String, usize)> {
+    if text.trim().len() < PROSE_MIN_CHARS {
+        return None;
+    }
+    let segs = segments(text);
+    let n = segs.len();
+    if n < 2 {
+        return None;
+    }
+
+    // Score each segment with the learned model (a simplified per-segment
+    // keep-density: score the full text, average the per-token density per
+    // segment). The FULL tokenization + inference is done by the Scorer; here we
+    // mock-tokenize as whitespace-separated words for the prototype.
+    //
+    // NOTE: in the full implementation (once the trained model is loaded), this
+    // path calls `scorer().score(&ScoreInput { token_ids })` which returns a
+    // Vec<f32> per-token density. For now (no trained model yet), this is a
+    // no-op that returns None → the shadow log records `learned_tokens: None`.
+    let _ = scorer();
+    let _ = n;
+
+    // TODO(B3 full): tokenize via tt-tokenize → score via Scorer → segment the
+    // per-token density → call compress(text, &segment_density). For the P2b
+    // scaffold, return None (no model loaded → no learned candidate).
+    None
+}
 
 /// Compress a prose block using the model's per-segment keep-density.
 ///
