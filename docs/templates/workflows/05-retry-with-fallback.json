@@ -1,0 +1,64 @@
+{
+  "name": "retry-with-fallback",
+  "description": "A cost-aware error-handling pattern: a primary Model call with a tight max_cost_usd, a Branch on whether the output is empty/errored, + a fallback to a more-capable (still down-routed) model on failure. Demonstrates the Branch + the two-path fallback \u2014 the receipt captures both attempts' costs so the retry overhead is visible, not hidden.",
+  "nodes": [
+    {
+      "id": "in",
+      "type": "trigger"
+    },
+    {
+      "id": "primary",
+      "type": "model",
+      "selection": {
+        "type": "route",
+        "route_ref": "primary-down-route"
+      },
+      "prompt": "Extract the key claim from this text as a single sentence. If the text has no clear claim, respond with the single word NONE. Text: {{input.text}}",
+      "max_cost_usd": 0.01
+    },
+    {
+      "id": "check",
+      "type": "branch",
+      "cond": "{{nodes.primary.output}} == 'NONE'",
+      "when_true": "fallback",
+      "when_false": "out"
+    },
+    {
+      "id": "fallback",
+      "type": "model",
+      "selection": {
+        "type": "route",
+        "route_ref": "capable-down-route"
+      },
+      "prompt": "Extract the key claim from this text as a single sentence. Text: {{input.text}}",
+      "max_cost_usd": 0.03
+    },
+    {
+      "id": "out",
+      "type": "output"
+    }
+  ],
+  "edges": [
+    {
+      "from": "in",
+      "to": "primary"
+    },
+    {
+      "from": "primary",
+      "to": "check"
+    },
+    {
+      "from": "check",
+      "to": "fallback"
+    },
+    {
+      "from": "check",
+      "to": "out"
+    },
+    {
+      "from": "fallback",
+      "to": "out"
+    }
+  ],
+  "allowed_hosts": []
+}

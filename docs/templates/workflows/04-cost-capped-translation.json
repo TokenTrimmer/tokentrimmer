@@ -1,0 +1,72 @@
+{
+  "name": "cost-capped-translation",
+  "description": "Detect the input language, branch on whether translation is needed, then translate with a cost-capped Model call. Demonstrates the Branch node + the Transform node (a deterministic no-LLM pass) + per-node max_cost_usd. A translation workflow is a classic per-call cost-sensitivity case \u2014 the receipt shows each step's token_delta.",
+  "nodes": [
+    {
+      "id": "in",
+      "type": "trigger"
+    },
+    {
+      "id": "detect",
+      "type": "model",
+      "selection": {
+        "type": "auto"
+      },
+      "prompt": "Detect the ISO 639-1 language code of this text. Respond with only the 2-letter code. Text: {{input.text}}",
+      "max_cost_usd": 0.005
+    },
+    {
+      "id": "branch",
+      "type": "branch",
+      "cond": "{{nodes.detect.output}} != 'en'",
+      "when_true": "translate",
+      "when_false": "passthrough"
+    },
+    {
+      "id": "translate",
+      "type": "model",
+      "selection": {
+        "type": "route",
+        "route_ref": "translate-down-route"
+      },
+      "prompt": "Translate the following text to English, preserving meaning + tone. Text: {{input.text}}",
+      "max_cost_usd": 0.02
+    },
+    {
+      "id": "passthrough",
+      "type": "transform",
+      "expr": "{{input.text}}"
+    },
+    {
+      "id": "out",
+      "type": "output"
+    }
+  ],
+  "edges": [
+    {
+      "from": "in",
+      "to": "detect"
+    },
+    {
+      "from": "detect",
+      "to": "branch"
+    },
+    {
+      "from": "branch",
+      "to": "translate"
+    },
+    {
+      "from": "branch",
+      "to": "passthrough"
+    },
+    {
+      "from": "translate",
+      "to": "out"
+    },
+    {
+      "from": "passthrough",
+      "to": "out"
+    }
+  ],
+  "allowed_hosts": []
+}
