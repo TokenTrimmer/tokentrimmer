@@ -1,0 +1,49 @@
+# TokenTrimmer
+
+> TokenTrimmer is a gateway for LLM APIs (OpenAI-compatible, Anthropic-native, + Gemini) that routes, caches, compresses, and meters every request — reducing what you spend and signing every saving as a receipt you can verify offline. "They observe, we reduce AND prove."
+
+The gateway is open source (Apache-2.0); `cargo install tt-cli` works. The hosted service adds the dashboard, billing, the durable Postgres + cache, and the cloud admin endpoints (signing, attestations).
+
+## Key concepts
+- The proof-of-savings moat: a Verifiable Compression Receipt (VCR) — an Ed25519 signature over `vcr:v1|<org>|<trace>|<route>|<model>|<token_delta>|<savings_micros>|<ts>`, verifiable offline with `tt verify-receipt --receipt <json> --key-hex <hex>`.
+- Two cost gates: the runtime `$` cap + kill-switch (`monthly_cap_usd` + `CircuitBreaker`) AND the PR-time `budgets.toml` cost-gate (`tt inspect`).
+- "They observe, we reduce AND prove" — the honest differentiator vs Helicone/LiteLLM/Portkey.
+
+## API references (the gateway's `/v1/*` surface)
+- [Coding agents — cap your Claude Code / Cursor spend](docs/coding-agents.md): the `/v1/messages` Anthropic-native ingress.
+- [Workflow DSL reference](docs/05-workflow-dsl-reference.md): `/v1/workflows` CRUD + the node types (Model, Agent, Http, Branch, Transform, SubWorkflow, Loop).
+- [Agent Runs API reference](docs/07-agent-runs-api-reference.md): `/v1/agent/runs` + the SSE events (`run.turn_cost`) + the stop reasons (max_turns, budget_exhausted, runaway).
+- [Spend API reference](docs/06-spend-api-reference.md): `/v1/spend` + `/v1/spend/limit`.
+- [Document Lane reference](docs/08-document-lane-reference.md): image/document → text distillation before routing; the isolated `doc_vision_saved_est_usd`.
+- [Gateway API reference](docs/04-gateway-api-reference.md): the OpenAI-compatible chat + completions + responses surface.
+
+## Gateway endpoints (the `/v1/*` routes)
+- `POST /v1/chat/completions` — OpenAI-compatible.
+- `POST /v1/messages` — Anthropic-native Messages API (Claude Code, Anthropic SDKs).
+- `POST /v1/responses` — OpenAI Responses API.
+- `GET /v1/models` — list the served catalog.
+- `POST /v1/embeddings` — embeddings (routed + cached).
+- `POST /v1/preview` — offline cost preview (no LLM call; projects the cost + savings + route suggestions).
+- `POST /v1/agent/runs` — create + run an agentic loop (per-turn cost, runaway detector). `stream:true` → SSE.
+- `GET /v1/agent/runs` — list runs. `GET /v1/agent/runs/:id` — fetch. `POST /v1/agent/runs/:id/tool_outputs` — resume.
+- `GET /v1/routes` / `POST /v1/routes` — routing rules CRUD. `GET /v1/routes/:id` / `DELETE`. `POST /v1/routes/:id/pause` / `resume`. `GET /v1/routes/:id/savings`.
+- `GET /v1/spend` — spend-today + MTD + budget-remaining. `POST /v1/spend/limit` — set/clear the monthly cap.
+- `POST /v1/workflows` (CRUD) + `POST /v1/workflows/:id/estimate` (offline cost preview) + `POST /v1/workflows/:id/runs` (run; SSE).
+- `POST /v1/files` / `GET /v1/files/:id/content` / `POST /v1/batches` / `GET /v1/batches/:id` / `POST /v1/batches/:id/cancel` — the Batch Lane (OpenAI-compatible).
+
+## Cloud admin endpoints (signed receipts + attestations)
+- `POST /v1/admin/requests/{trace_id}/compression-receipt/sign` — mint a VCR (verify with `tt verify-receipt`).
+- `POST /v1/admin/workflow-runs/{run_id}/receipt/sign` — mint a workflow receipt.
+- `POST /v1/admin/agent-runs/{run_id}/receipt/sign` — mint an agent-run receipt.
+- `POST /v1/admin/attestation/sign` + `GET /v1/admin/attestations` — monthly Ed25519-signed attestation.
+- `GET /v1/admin/audit/export` — the tamper-evident hash-chained audit log (verify with `tt audit verify`).
+
+## CLI commands (the `tt` binary — `cargo install tt-cli`)
+- `tt connect` — browser-assisted key paste.
+- `tt init` — install the best-practices harness (`.claude/` hooks + `.tokentrimmer/budgets.toml` PR cost-gate).
+- `tt mcp install --client claude-code` — wire the MCP tools (get_spend_today, check_budget_remaining, set_cost_limit).
+- `tt verify-receipt --receipt <json> --key-hex <hex>` — offline VCR verification.
+- `tt verify-bundle <bundle.json>` — offline savings-reproduce verification (deterministic plan replay).
+- `tt audit verify [PATH]` — verify the tamper-evident audit hash chain.
+- `tt inspect` — offline per-PR cost-diff + the budgets.toml gate.
+- `tt plan` / `tt route` / `tt workflow check` / `tt retrieval` — the operator surface.

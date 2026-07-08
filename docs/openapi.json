@@ -1,0 +1,99 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "TokenTrimmer Gateway API",
+    "version": "1.0.0",
+    "description": "OpenAI-compatible + Anthropic-native + Gemini gateway that routes, caches, compresses, and meters every LLM request. 'They observe, we reduce AND prove.' Every compression is signable as a Verifiable Compression Receipt (VCR). Auth: a `tt_live_` key in the `Authorization: Bearer` header (never caller-supplied org).",
+    "license": { "name": "Apache-2.0" }
+  },
+  "servers": [
+    { "url": "https://api.tokentrimmer.com", "description": "Hosted gateway" },
+    { "url": "http://localhost:8080", "description": "Self-hosted (tt-proxy)" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": { "type": "http", "scheme": "bearer", "description": "A tt_live_ (production) or tt_test_ (sandbox) API key." }
+    }
+  },
+  "security": [ { "BearerAuth": [] } ],
+  "paths": {
+    "/v1/chat/completions": {
+      "post": { "summary": "Chat completions (OpenAI-compatible)", "description": "The OpenAI Chat Completions shape, routed + cached + cost-accounted + (optionally) compressed through the gateway. Returns x-tokentrimmer-* cost headers.", "responses": { "200": { "description": "The chat completion (or SSE stream when stream:true)." } } }
+    },
+    "/v1/messages": {
+      "post": { "summary": "Messages (Anthropic-native)", "description": "Anthropic Messages API ingress for Claude Code + Anthropic SDKs. Translated to the canonical chat request, dispatched through the same pipeline, and translated back (non-streaming `{type:\"message\",...}` JSON or Anthropic typed SSE frames).", "responses": { "200": { "description": "The Anthropic-shaped message response." } } }
+    },
+    "/v1/responses": {
+      "post": { "summary": "Responses (OpenAI Responses API)", "responses": { "200": { "description": "The responses-API-shaped response." } } }
+    },
+    "/v1/models": {
+      "get": { "summary": "List the served model catalog", "responses": { "200": { "description": "The model list." } } }
+    },
+    "/v1/embeddings": {
+      "post": { "summary": "Embeddings (routed + cached)", "responses": { "200": { "description": "The embeddings response." } } }
+    },
+    "/v1/preview": {
+      "post": { "summary": "Offline cost preview", "description": "Projects the cost + savings + route suggestions for a request WITHOUT calling any model (pure, synchronous, no network).", "responses": { "200": { "description": "The preview (projected tokens, cost, savings, route suggestions)." } } }
+    },
+    "/v1/agent/runs": {
+      "post": { "summary": "Create + run an agentic loop", "description": "Server-side model→tool→model loop over the read-only gateway tools. Non-streaming returns a JSON Run; stream:true returns SSE events (run.turn, run.turn_cost, run.message, run.tool_result, run.requires_action, run.completed, run.failed, run.incomplete). Stops on max_turns, budget_exhausted, or the runaway-repeat detector.", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "model": { "type": "string" }, "messages": { "type": "array" }, "tools": { "type": "array" }, "max_turns": { "type": "integer", "minimum": 1, "maximum": 32, "default": 8 }, "max_cost_usd": { "type": "number", "nullable": true }, "stream": { "type": "boolean", "default": false } } } } } }, "responses": { "200": { "description": "The run (JSON or SSE)." } } },
+      "get": { "summary": "List the caller's runs", "responses": { "200": { "description": "The run list (org-scoped, newest-first)." } } }
+    },
+    "/v1/agent/runs/{id}": {
+      "get": { "summary": "Fetch a run by id", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The run." }, "404": { "description": "Not found (or cross-org)." } } }
+    },
+    "/v1/agent/runs/{id}/tool_outputs": {
+      "post": { "summary": "Resume a paused (requires_action) run", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The resumed run." } } }
+    },
+    "/v1/workflows": {
+      "post": { "summary": "Create a workflow (CRUD)", "description": "id/version optional (auto-generated). See the Workflow DSL reference.", "responses": { "200": { "description": "The created workflow." } } },
+      "get": { "summary": "List workflow definitions", "responses": { "200": { "description": "The workflow list." } } }
+    },
+    "/v1/workflows/{id}": {
+      "get": { "summary": "Fetch a workflow definition", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The workflow definition." } } }
+    },
+    "/v1/workflows/{id}/estimate": {
+      "post": { "summary": "Offline cost preview for a workflow", "description": "Projects the cost from the graph + pricing (NO LLM calls).", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The projected cost." } } }
+    },
+    "/v1/workflows/{id}/runs": {
+      "post": { "summary": "Run a workflow (SSE)", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The run (SSE events: run.turn, run.turn_cost, run.completed)." } } }
+    },
+    "/v1/routes": {
+      "get": { "summary": "List routing rules", "responses": { "200": { "description": "The route list." } } },
+      "post": { "summary": "Create a route", "responses": { "200": { "description": "The created route." } } }
+    },
+    "/v1/routes/{id}": {
+      "get": { "summary": "Fetch a route", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "The route." } } },
+      "delete": { "summary": "Delete a route", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "204": { "description": "Deleted." } } }
+    },
+    "/v1/routes/{id}/pause": { "post": { "summary": "Manual sticky pause", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "Paused." } } } },
+    "/v1/routes/{id}/resume": { "post": { "summary": "Re-enable a paused route", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } } ], "responses": { "200": { "description": "Resumed." } } } },
+    "/v1/routes/{id}/savings": { "get": { "summary": "Windowed route-level netted savings", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }, { "name": "hours", "in": "query", "schema": { "type": "integer", "default": 720 } } ], "responses": { "200": { "description": "The route savings." } } } },
+    "/v1/spend": {
+      "get": { "summary": "Spend-today + MTD + budget-remaining", "description": "Backs the MCP cost-control tools (get_spend_today, check_budget_remaining). 503 until a SpendSource is wired.", "responses": { "200": { "description": "The spend summary." }, "503": { "description": "Spend reporting not configured." } } }
+    },
+    "/v1/spend/limit": {
+      "post": { "summary": "Set/clear the monthly spend cap", "description": "Per org or per key (key-ownership-gated). 400 on a negative/non-finite cap; 404 when key_id isn't the caller-org's. Backs the MCP set_cost_limit tool.", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "monthly_cap_usd": { "type": "number", "nullable": true, "description": "null clears the cap." }, "key_id": { "type": "string", "format": "uuid", "nullable": true, "description": "Scope to this key (org-owned); else org-wide." } } } } }, "responses": { "200": { "description": "The updated cap." } } }
+    },
+    "/v1/files": {
+      "post": { "summary": "Upload a file (Batch Lane)", "responses": { "200": { "description": "The file id." } } }
+    },
+    "/v1/files/{id}/content": {
+      "get": { "summary": "Download file content", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ], "responses": { "200": { "description": "The file content." } } }
+    },
+    "/v1/batches": {
+      "post": { "summary": "Create a batch", "responses": { "200": { "description": "The batch." } } },
+      "get": { "summary": "List batches", "responses": { "200": { "description": "The batch list." } } }
+    },
+    "/v1/batches/{id}": {
+      "get": { "summary": "Fetch a batch", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ], "responses": { "200": { "description": "The batch." } } }
+    },
+    "/v1/batches/{id}/cancel": {
+      "post": { "summary": "Cancel a batch", "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ], "responses": { "200": { "description": "Cancelled." } } }
+    },
+    "/health": { "get": { "summary": "Liveness", "security": [], "responses": { "200": { "description": "ok" } } } },
+    "/ready": { "get": { "summary": "Readiness", "security": [], "responses": { "200": { "description": "ready" } } } },
+    "/metrics": { "get": { "summary": "Prometheus metrics", "security": [], "responses": { "200": { "description": "Prometheus exposition." } } } }
+    }
+  }
+}
