@@ -212,7 +212,9 @@ mod tests {
     // The same `tt verify-receipt` CLI verifies an L2 receipt (dispatched by
     // field-presence: matched_entry_id + verdict). Mirrors the VCR tests.
 
-    use tt_telemetry::l2_receipt::{sign as sign_l2, L2Receipt, L2_SCHEMA_VERSION, VERDICT_VERIFIED};
+    use tt_telemetry::l2_receipt::{
+        sign as sign_l2, L2Receipt, L2_SCHEMA_VERSION, VERDICT_VERIFIED,
+    };
 
     fn sign_l2_receipt() -> L2Receipt {
         sign_l2(
