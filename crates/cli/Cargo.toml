@@ -18,7 +18,7 @@ path = "src/lib.rs"
 [dependencies]
 tt-shared.workspace = true
 tt-core.workspace = true
-tt-retrieval.workspace = true
+tt-retrieval = { workspace = true, features = ["postgres"] }
 tt-cache.workspace = true
 tt-routing = { workspace = true, features = ["postgres"] }
 tt-auth = { workspace = true, features = ["postgres"] }

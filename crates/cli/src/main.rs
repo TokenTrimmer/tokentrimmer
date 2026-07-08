@@ -599,16 +599,25 @@ enum AgentAction {
 
 #[derive(Subcommand)]
 enum RetrievalAction {
-    /// EXPERIMENTAL: add a doc to a corpus. In-process only — the corpus lives
-    /// in this process's memory and is discarded on exit; nothing is persisted.
+    /// EXPERIMENTAL: add a doc to a corpus. By default uses an in-process
+    /// store (the corpus is discarded on exit; nothing is persisted). Pass
+    /// `--dsn` to persist to a Postgres + pgvector store (migration 0005),
+    /// so a later `tt retrieval search --dsn ...` can see the indexed doc.
     DocAdd {
         corpus: String,
         path: String,
         #[arg(long, env = "OPENAI_API_KEY")]
         openai_key: String,
+        /// Postgres DSN for the durable pgvector store. When set, chunks
+        /// persist (shared across invocations); when unset, an in-process
+        /// store is used (discarded on exit — EXPERIMENTAL demo only).
+        #[arg(long, env = "DATABASE_URL")]
+        dsn: Option<String>,
     },
-    /// EXPERIMENTAL: ad-hoc search over an in-process corpus. Each invocation
-    /// starts empty, so a separate `doc-add` run is never visible here.
+    /// EXPERIMENTAL: ad-hoc search over a corpus. By default uses an in-process
+    /// store (empty — a separate `doc-add` run is never visible here). Pass
+    /// `--dsn` to search the Postgres + pgvector store a prior
+    /// `doc-add --dsn` populated.
     Search {
         corpus: String,
         query: String,
@@ -616,6 +625,10 @@ enum RetrievalAction {
         k: usize,
         #[arg(long, env = "OPENAI_API_KEY")]
         openai_key: String,
+        /// Postgres DSN for the durable pgvector store. When set, searches the
+        /// persisted corpus; when unset, an empty in-process store.
+        #[arg(long, env = "DATABASE_URL")]
+        dsn: Option<String>,
     },
 }
 
@@ -1321,8 +1334,9 @@ async fn main() -> anyhow::Result<()> {
                     corpus,
                     path,
                     openai_key,
+                    dsn,
                 } => {
-                    cli_retrieval::add_doc(&corpus, std::path::Path::new(&path), &openai_key)
+                    cli_retrieval::add_doc(&corpus, std::path::Path::new(&path), &openai_key, dsn)
                         .await?;
                 }
                 RetrievalAction::Search {
@@ -1330,8 +1344,9 @@ async fn main() -> anyhow::Result<()> {
                     query,
                     k,
                     openai_key,
+                    dsn,
                 } => {
-                    cli_retrieval::search(&corpus, &query, k, &openai_key).await?;
+                    cli_retrieval::search(&corpus, &query, k, &openai_key, dsn).await?;
                 }
             }
         }
