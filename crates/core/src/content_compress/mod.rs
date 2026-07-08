@@ -44,17 +44,17 @@
 pub mod capture;
 pub mod classify;
 pub mod code;
-pub mod prose;
-pub mod structural;
 #[cfg(feature = "ml-scoring")]
 pub mod learned_prose;
+pub mod prose;
+pub mod structural;
 
 pub use capture::CaptureRecord;
 pub use classify::{classify, ContentKind, MIN_BLOB_CHARS};
 pub use code::CODE_CLASS;
-pub use prose::PROSE_CLASS;
 #[cfg(feature = "ml-scoring")]
 pub use learned_prose::PROSE_LEARNED_CLASS;
+pub use prose::PROSE_CLASS;
 pub use structural::{
     compactable_kind, dominant_compactable_kind, CaptureCtx, ContentCompressPass,
 };

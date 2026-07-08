@@ -292,7 +292,8 @@ pub(crate) fn compact_block(
             // When `ml-scoring` is OFF or the class is untrusted, P1b runs alone.
             #[cfg(feature = "ml-scoring")]
             {
-                if gate.is_committable(crate::content_compress::learned_prose::PROSE_LEARNED_CLASS) {
+                if gate.is_committable(crate::content_compress::learned_prose::PROSE_LEARNED_CLASS)
+                {
                     crate::content_compress::learned_prose::shadow_score(s);
                 }
             }

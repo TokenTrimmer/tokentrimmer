@@ -16,8 +16,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
+use ort::session::Session;
 use ort::value::TensorRef;
 
 /// Environment variable naming the ONNX model path. Required for live scoring;
@@ -102,9 +102,7 @@ impl Scorer {
         if let Some(s) = self.session.get() {
             return Ok(s);
         }
-        ort::init()
-            .with_name("tt-ml-scoring")
-            .commit();
+        ort::init().with_name("tt-ml-scoring").commit();
         let path = self.model_path.as_ref().ok_or(ScoreError::NoModel {
             env: MODEL_PATH_ENV,
         })?;
@@ -135,11 +133,9 @@ impl Scorer {
     pub fn score(&self, input: &ScoreInput<'_>) -> Result<KeepDensity, ScoreError> {
         let session = self.session()?;
 
-        let ids = ndarray::Array2::from_shape_vec(
-            (1, input.token_ids.len()),
-            input.token_ids.to_vec(),
-        )
-        .map_err(|e| ScoreError::Inference(format!("input tensor shape: {e}")))?;
+        let ids =
+            ndarray::Array2::from_shape_vec((1, input.token_ids.len()), input.token_ids.to_vec())
+                .map_err(|e| ScoreError::Inference(format!("input tensor shape: {e}")))?;
 
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
         let session_arc = Arc::clone(session);
@@ -147,9 +143,10 @@ impl Scorer {
 
         std::thread::spawn(move || {
             let result = (|| {
-                let guard = session_arc.0.lock().map_err(|e| {
-                    ScoreError::Inference(format!("session mutex: {e}"))
-                })?;
+                let guard = session_arc
+                    .0
+                    .lock()
+                    .map_err(|e| ScoreError::Inference(format!("session mutex: {e}")))?;
                 let mut session = guard;
                 let tensor = TensorRef::from_array_view(&ids)
                     .map_err(|e| ScoreError::Inference(format!("tensor: {e}")))?;
@@ -183,7 +180,10 @@ fn parse_output(outputs: &ort::session::SessionOutputs) -> Result<KeepDensity, S
         .try_extract_array::<f32>()
         .map_err(|e| ScoreError::Inference(format!("extract output: {e}")))?;
     // Sigmoid (logit → [0,1] keep-density).
-    Ok(array.iter().map(|&logit| 1.0 / (1.0 + (-logit).exp())).collect())
+    Ok(array
+        .iter()
+        .map(|&logit| 1.0 / (1.0 + (-logit).exp()))
+        .collect())
 }
 
 impl Default for Scorer {
@@ -201,7 +201,9 @@ mod tests {
         std::env::remove_var(MODEL_PATH_ENV);
         let scorer = Scorer::new();
         assert!(!scorer.is_configured());
-        let input = ScoreInput { token_ids: &[1, 2, 3] };
+        let input = ScoreInput {
+            token_ids: &[1, 2, 3],
+        };
         let result = scorer.score(&input);
         assert!(
             matches!(result, Err(ScoreError::NoModel { .. })),
