@@ -1,0 +1,50 @@
+{
+  "name": "doc-summarize-with-fetch",
+  "description": "Fetch a document from an allowlisted host, summarize it with a cost-capped Model call, and return the summary. Demonstrates the Http node (host must be a static literal in allowed_hosts) + max_cost_usd per call + the Output collection. The receipt attests the fetch + the summary cost.",
+  "nodes": [
+    {
+      "id": "in",
+      "type": "trigger"
+    },
+    {
+      "id": "fetch",
+      "type": "http",
+      "method": "GET",
+      "url": "https://example.com/{{input.path}}",
+      "headers": [],
+      "body": null,
+      "max_response_bytes": 1048576
+    },
+    {
+      "id": "summarize",
+      "type": "model",
+      "selection": {
+        "type": "route",
+        "route_ref": "summarize-down-route"
+      },
+      "prompt": "Summarize the fetched document in 5 bullet points. Document: {{nodes.fetch.body}}",
+      "max_cost_usd": 0.02
+    },
+    {
+      "id": "out",
+      "type": "output"
+    }
+  ],
+  "edges": [
+    {
+      "from": "in",
+      "to": "fetch"
+    },
+    {
+      "from": "fetch",
+      "to": "summarize"
+    },
+    {
+      "from": "summarize",
+      "to": "out"
+    }
+  ],
+  "allowed_hosts": [
+    "example.com"
+  ]
+}
