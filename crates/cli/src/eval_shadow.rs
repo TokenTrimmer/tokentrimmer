@@ -111,8 +111,8 @@ pub fn run_eval_shadow(
         if line.trim().is_empty() {
             continue;
         }
-        let row: VerdictRow = serde_json::from_str(line)
-            .with_context(|| format!("parse verdict line {}", i + 1))?;
+        let row: VerdictRow =
+            serde_json::from_str(line).with_context(|| format!("parse verdict line {}", i + 1))?;
         verdicts.insert(row.request_id, row.verdict);
     }
 
@@ -125,7 +125,10 @@ pub fn run_eval_shadow(
 
     for row in &shadow_rows {
         let trace_id = row.trace_id.clone().unwrap_or_default();
-        let verdict = verdicts.get(&trace_id).cloned().unwrap_or_else(|| "?".into());
+        let verdict = verdicts
+            .get(&trace_id)
+            .cloned()
+            .unwrap_or_else(|| "?".into());
         let learned_beats = row
             .learned_tokens_removed
             .map(|l| l > row.p1b_tokens_removed)
@@ -152,10 +155,7 @@ pub fn run_eval_shadow(
         });
     }
 
-    let joined = traces
-        .iter()
-        .filter(|t| t.verdict != "?")
-        .count();
+    let joined = traces.iter().filter(|t| t.verdict != "?").count();
     let positive_bar = if joined > 0 {
         (learned_acceptable as f64 / joined as f64) * 100.0
     } else {
@@ -223,18 +223,26 @@ mod tests {
         let verdicts = dir.path().join("verdicts.jsonl");
         let report = dir.path().join("report.json");
 
-        std::fs::write(&shadow, format!(
-            "{}\n{}\n{}\n",
-            shadow_line("h1", 100, Some(120), "t1"),
-            shadow_line("h2", 80, Some(60), "t2"),
-            shadow_line("h3", 50, None, "t3"),  // no learned candidate
-        )).unwrap();
+        std::fs::write(
+            &shadow,
+            format!(
+                "{}\n{}\n{}\n",
+                shadow_line("h1", 100, Some(120), "t1"),
+                shadow_line("h2", 80, Some(60), "t2"),
+                shadow_line("h3", 50, None, "t3"), // no learned candidate
+            ),
+        )
+        .unwrap();
 
-        std::fs::write(&verdicts, format!(
-            "{}\n{}\n",
-            verdict_line("t1", "acceptable"),
-            verdict_line("t2", "degraded"),
-        )).unwrap();
+        std::fs::write(
+            &verdicts,
+            format!(
+                "{}\n{}\n",
+                verdict_line("t1", "acceptable"),
+                verdict_line("t2", "degraded"),
+            ),
+        )
+        .unwrap();
 
         run_eval_shadow(&shadow, &verdicts, &report).expect("eval succeeds");
 
@@ -242,10 +250,13 @@ mod tests {
         let r: EvalReport = serde_json::from_str(&raw).unwrap();
         assert_eq!(r.total_shadow_rows, 3);
         assert_eq!(r.joined_verdicts, 2); // t1+t2 joined; t3 has no verdict
-        // t1: learned(120) > p1b(100) AND acceptable → counts toward the positive bar.
+                                          // t1: learned(120) > p1b(100) AND acceptable → counts toward the positive bar.
         assert_eq!(r.learned_acceptable_count, 1);
         assert_eq!(r.p1b_acceptable_count, 1); // t1 acceptable
-        assert!(r.positive_recall_bar_pct > 0.0, "positive bar > 0 (t1 beats P1b + acceptable)");
+        assert!(
+            r.positive_recall_bar_pct > 0.0,
+            "positive bar > 0 (t1 beats P1b + acceptable)"
+        );
     }
 
     #[test]
@@ -257,7 +268,8 @@ mod tests {
         std::fs::write(&shadow, "").unwrap();
         std::fs::write(&verdicts, "").unwrap();
         run_eval_shadow(&shadow, &verdicts, &report).expect("empty = not an error");
-        let r: EvalReport = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+        let r: EvalReport =
+            serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
         assert_eq!(r.total_shadow_rows, 0);
         assert_eq!(r.positive_recall_bar_pct, 0.0);
     }

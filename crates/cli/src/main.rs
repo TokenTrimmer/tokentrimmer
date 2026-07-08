@@ -942,7 +942,12 @@ async fn main() -> anyhow::Result<()> {
             ));
         }
         Command::Eval {
-            action: EvalAction::Shadow { shadow, verdicts, output },
+            action:
+                EvalAction::Shadow {
+                    shadow,
+                    verdicts,
+                    output,
+                },
         } => {
             tt_cli::eval_shadow::run_eval_shadow(
                 std::path::Path::new(&shadow),
