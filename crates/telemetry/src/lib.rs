@@ -13,6 +13,7 @@
 pub mod audit;
 pub mod body_capture;
 pub mod gen_ai;
+pub mod l2_receipt;
 pub mod panel_legs;
 pub mod propagation;
 pub mod request_logs;

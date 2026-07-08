@@ -258,6 +258,28 @@ pub struct RequestLogRow {
     /// before/after pair capture is a separate, off-by-default path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_compress_kind: Option<String>,
+
+    // ── L2 (semantic-cache) hit provenance (migration 0035) ───────────────
+    // The three fields below persist the cache-hit provenance a signed L2 receipt
+    // (tt_telemetry::l2_receipt) attests. Set ONLY by `request_log_for_l2_hit`
+    // (the L2-hit row); None for every other row (L1 hits, dispatches, tests).
+    // Stored as Options so legacy rows + non-L2 requests stay byte-identical
+    // (skipped on serialize when None). The cloud mint endpoint
+    // (POST /v1/admin/requests/{trace_id}/l2-receipt/sign) reads these off the
+    // row + signs them with the audit key — mirroring the VCR mint endpoint.
+    /// The cache entry the query matched (`cache_entries.id`). None when this
+    /// row was not an L2 hit. Lets the customer attribute the hit to a specific
+    /// prior answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2_matched_entry_id: Option<Uuid>,
+    /// The cosine similarity of the match (0.0–1.0). None for non-L2 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2_similarity: Option<f32>,
+    /// The L2 verify-gate verdict code (`confident` / `verified` /
+    /// `unverifiable` / `rejected` — see `tt_telemetry::l2_receipt`). None for
+    /// non-L2 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2_verdict: Option<String>,
 }
 
 /// `skip_serializing_if` helper: the minify estimate column is omitted from
@@ -448,7 +470,8 @@ pub mod postgres {
                       run_id, node_id,
                       doc_compaction_tokens_removed,
                       doc_vision_saved_est_usd,
-                      content_compress_saved_est_usd, content_compress_kind)
+                      content_compress_saved_est_usd, content_compress_kind,
+                      l2_matched_entry_id, l2_similarity, l2_verdict)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -470,11 +493,12 @@ pub mod postgres {
                       $40, $41,
                       $42,
                       $43,
-                      $44, $45)"#;
+                      $44, $45,
+                      $46, $47, $48)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 45;
+    pub const INSERT_BIND_COUNT: usize = 48;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -525,6 +549,9 @@ pub mod postgres {
                 .bind(row.doc_vision_saved_est_usd) // $43
                 .bind(row.content_compress_saved_est_usd) // $44
                 .bind(row.content_compress_kind.as_deref()) // $45
+                .bind(row.l2_matched_entry_id) // $46
+                .bind(row.l2_similarity) // $47
+                .bind(row.l2_verdict.as_deref()) // $48
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -646,6 +673,9 @@ mod tests {
             node_id: None,
             content_compress_saved_est_usd: 0.0,
             content_compress_kind: None,
+            l2_matched_entry_id: None,
+            l2_similarity: None,
+            l2_verdict: None,
         }
     }
 
