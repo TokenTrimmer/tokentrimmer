@@ -348,6 +348,9 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         node_id: None,
         content_compress_saved_est_usd: 0.0,
         content_compress_kind: None,
+        l2_matched_entry_id: None,
+        l2_similarity: None,
+        l2_verdict: None,
     };
     let reported_id = base.id;
     writer.write(base.clone()).await.expect("insert reported");
@@ -464,6 +467,9 @@ async fn request_log_insert_round_trips_batch_columns() {
         node_id: None,
         content_compress_saved_est_usd: 0.0,
         content_compress_kind: None,
+        l2_matched_entry_id: None,
+        l2_similarity: None,
+        l2_verdict: None,
     };
     let marked_id = marked.id;
     writer.write(marked.clone()).await.expect("insert marked");
@@ -693,6 +699,9 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         node_id: None,
         content_compress_saved_est_usd: 0.0,
         content_compress_kind: None,
+        l2_matched_entry_id: None,
+        l2_similarity: None,
+        l2_verdict: None,
     };
     let shaped_id = shaped.id;
     writer.write(shaped.clone()).await.expect("insert shaped");

@@ -1730,6 +1730,10 @@ pub(crate) async fn complete_panel(
             // Panels never run the content_compress pass → 0 / None.
             content_compress_saved_est_usd: 0.0,
             content_compress_kind: None,
+            // No L2 provenance on a panel-synthesized row.
+            l2_matched_entry_id: None,
+            l2_similarity: None,
+            l2_verdict: None,
         },
     );
 

@@ -851,6 +851,8 @@ async fn try_l2_hit(
                     route_paused,
                     baseline_cost_usd,
                     retrieval_tokens_saved,
+                    similarity,
+                    decision,
                 ),
             );
             Some(
@@ -1939,6 +1941,10 @@ pub(crate) async fn complete_once(
         } else {
             None
         },
+        // This is a dispatched row (not an L2 hit) → no L2 provenance.
+        l2_matched_entry_id: None,
+        l2_similarity: None,
+        l2_verdict: None,
     };
     // Agent-run grain (W0b Task 4): inherit run_id/node_id from ctx so every
     // row produced under an agent run carries the run's id.  `None` for
@@ -6507,6 +6513,10 @@ fn request_log_for_l1_hit(
         // Cache hit → nothing dispatched → no content_compress.
         content_compress_saved_est_usd: 0.0,
         content_compress_kind: None,
+        // L1 hit — no L2 provenance.
+        l2_matched_entry_id: None,
+        l2_similarity: None,
+        l2_verdict: None,
     }
 }
 
@@ -6524,6 +6534,8 @@ fn request_log_for_l2_hit(
     route_paused: bool,
     baseline_cost_usd: f64,
     retrieval_tokens_saved: i64,
+    similarity: f32,
+    verdict: L2VerifyDecision,
 ) -> RequestLogRow {
     RequestLogRow {
         id: Uuid::now_v7(),
@@ -6585,6 +6597,28 @@ fn request_log_for_l2_hit(
         // Cache hit → nothing dispatched → no content_compress.
         content_compress_saved_est_usd: 0.0,
         content_compress_kind: None,
+        // L2-hit provenance (migration 0035) — the fields a signed L2 receipt
+        // (tt_telemetry::l2_receipt) attests. The matched entry id +
+        // similarity + the verify-gate verdict. Read by the cloud mint endpoint
+        // (POST /v1/admin/requests/{trace_id}/l2-receipt/sign).
+        l2_matched_entry_id: Some(entry.id),
+        l2_similarity: Some(similarity),
+        l2_verdict: Some(l2_verdict_code(verdict).to_string()),
+    }
+}
+
+/// Map an `L2VerifyDecision` to the stable string code a signed L2 receipt
+/// carries in its canonical payload (see `tt_telemetry::l2_receipt` —
+/// `confident` / `verified` / `unverifiable` / `rejected`). The code is part
+/// of the SIGNED bytes, so it must be byte-stable across versions (change the
+/// version, never the code).
+fn l2_verdict_code(d: L2VerifyDecision) -> &'static str {
+    match d {
+        L2VerifyDecision::Confident => "confident",
+        // The agreement f32 is telemetry, not part of the receipt contract.
+        L2VerifyDecision::Verified(_) => "verified",
+        L2VerifyDecision::Unverifiable => "unverifiable",
+        L2VerifyDecision::Rejected(_) => "rejected",
     }
 }
 
@@ -9716,6 +9750,9 @@ mod telemetry_drain_tests {
             node_id: None,
             content_compress_saved_est_usd: 0.0,
             content_compress_kind: None,
+            l2_matched_entry_id: None,
+            l2_similarity: None,
+            l2_verdict: None,
         }
     }
 

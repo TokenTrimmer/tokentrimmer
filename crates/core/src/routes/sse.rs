@@ -1095,6 +1095,10 @@ pub fn stream_response(
                     // non-streaming path in v1 (the minify-estimate v1 posture).
                     content_compress_saved_est_usd: 0.0,
                     content_compress_kind: None,
+                    // No L2 provenance on this row.
+                    l2_matched_entry_id: None,
+                    l2_similarity: None,
+                    l2_verdict: None,
                 };
 
                 // Per-route provider-cache counters on cleanly completed
