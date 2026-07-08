@@ -199,7 +199,7 @@ pub fn compress(text: &str) -> Option<(String, usize)> {
 /// split — the following char is a digit, not whitespace) or after a newline
 /// (list items / lines become segments). The trailing run of whitespace is kept
 /// with the segment so a subset of segments re-joins as readable text.
-fn segments(text: &str) -> Vec<(usize, usize)> {
+pub(crate) fn segments(text: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut chars = text.char_indices().peekable();
@@ -231,7 +231,7 @@ fn segments(text: &str) -> Vec<(usize, usize)> {
 
 /// Lowercased alphanumeric content tokens of a segment, filtering short tokens
 /// and stopwords (the salience vocabulary).
-fn content_tokens(seg: &str) -> Vec<String> {
+pub(crate) fn content_tokens(seg: &str) -> Vec<String> {
     seg.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() >= MIN_TOKEN_LEN)
         .map(str::to_ascii_lowercase)
@@ -242,7 +242,7 @@ fn content_tokens(seg: &str) -> Vec<String> {
 /// Word 2-gram shingles (hashed) of a segment's content tokens, for the
 /// near-duplicate Jaccard test. A single-token segment falls back to its
 /// 1-gram; a token-less segment has no shingles (never a duplicate).
-fn word_shingles(tokens: &[String]) -> HashSet<u64> {
+pub(crate) fn word_shingles(tokens: &[String]) -> HashSet<u64> {
     use std::hash::{Hash, Hasher};
     let mut set = HashSet::new();
     let hash = |a: &str, b: &str| {
@@ -266,7 +266,7 @@ fn word_shingles(tokens: &[String]) -> HashSet<u64> {
 }
 
 /// Jaccard similarity of two shingle sets (0 when either is empty).
-fn jaccard(a: &HashSet<u64>, b: &HashSet<u64>) -> f64 {
+pub(crate) fn jaccard(a: &HashSet<u64>, b: &HashSet<u64>) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
@@ -275,7 +275,7 @@ fn jaccard(a: &HashSet<u64>, b: &HashSet<u64>) -> f64 {
     inter as f64 / union as f64
 }
 
-fn word_count(s: &str) -> usize {
+pub(crate) fn word_count(s: &str) -> usize {
     s.split_whitespace().count()
 }
 
@@ -290,7 +290,7 @@ fn word_count(s: &str) -> usize {
 /// - a lower→upper transition — CamelCase identifiers (`getUserName`);
 /// - an underscore between word chars — snake_case identifiers (`file_path`);
 /// - a backtick — inline code / code-fence spans.
-fn is_must_keep(seg: &str) -> bool {
+pub(crate) fn is_must_keep(seg: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         Regex::new(r"\d|https?://|www\.|`|[\w.-]+/[\w./-]+|(?:^|\s)-{1,2}[A-Za-z]|[a-z][A-Z]|\w_\w")

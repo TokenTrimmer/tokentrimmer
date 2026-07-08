@@ -28,6 +28,13 @@
 //!   (the org/trace/model/provider join keys) threads from the route through the
 //!   pass to the per-block capture point; the offline `tt export compress-corpus`
 //!   CLI materializes the JSONL into a versioned Phase-2 training corpus.
+//! - **P2b (this, feature-flagged):** an in-process learned prose backend
+//!   ([`learned_prose`]) — BEHIND the `ml-scoring` feature (OFF by default; the
+//!   public/Fly builds stay ML-dep-free). Ships DARK in SHADOW: scores the block
+//!   with the mBERT model + SHIPS deterministic P1b + logs the delta (the P2c
+//!   recall evaluation input). A NEW separate `prose-learned` gate class
+//!   (independent ratchet from `prose`). Promotion (ship the learned output) is
+//!   P2d.
 //!
 //! The classifier itself lives in `tt-shared` ([`tt_shared::content_kind`]) so
 //! the routing engine's `content_type` condition can reuse it without a
@@ -37,12 +44,16 @@
 pub mod capture;
 pub mod classify;
 pub mod code;
+#[cfg(feature = "ml-scoring")]
+pub mod learned_prose;
 pub mod prose;
 pub mod structural;
 
 pub use capture::CaptureRecord;
 pub use classify::{classify, ContentKind, MIN_BLOB_CHARS};
 pub use code::CODE_CLASS;
+#[cfg(feature = "ml-scoring")]
+pub use learned_prose::PROSE_LEARNED_CLASS;
 pub use prose::PROSE_CLASS;
 pub use structural::{
     compactable_kind, dominant_compactable_kind, CaptureCtx, ContentCompressPass,

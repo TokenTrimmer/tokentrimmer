@@ -285,6 +285,18 @@ pub(crate) fn compact_block(
             if !gate.is_committable(prose::PROSE_CLASS) {
                 return None;
             }
+            // P2b: if the `ml-scoring` feature is enabled AND the operator opened
+            // the `prose-learned` class, the learned backend computes its
+            // candidate in DARK SHADOW (the candidate is NOT shipped — P1b is).
+            // The shadow log carries the per-block delta (P2c recall eval input).
+            // When `ml-scoring` is OFF or the class is untrusted, P1b runs alone.
+            #[cfg(feature = "ml-scoring")]
+            {
+                if gate.is_committable(crate::content_compress::learned_prose::PROSE_LEARNED_CLASS)
+                {
+                    crate::content_compress::learned_prose::shadow_score(s);
+                }
+            }
             prose::compress(s)?.0
         }
         ContentKind::Code => {
