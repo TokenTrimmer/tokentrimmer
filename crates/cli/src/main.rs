@@ -10,6 +10,8 @@ mod audit;
 use audit::AuditAction;
 mod repo_context;
 
+use tt_cli::eval_shadow::EvalAction;
+
 /// Grouped command reference shown at the bottom of `tt --help`.
 ///
 /// clap 4 has no native way to sort flat subcommands into multiple help
@@ -190,6 +192,14 @@ enum Command {
     Export {
         #[command(subcommand)]
         action: tt_cli::compress_corpus::ExportAction,
+    },
+    /// Offline shadow-log → recall-vs-deterministic eval (P2c). Reads the
+    /// structured tt::compress::shadow JSONL + the quality_verdicts, joins by
+    /// trace_id, and reports the positive recall bar over deterministic (the P2d
+    /// promotion gate).
+    Eval {
+        #[command(subcommand)]
+        action: EvalAction,
     },
     /// Run the MCP server (stdio transport by default).
     ///
@@ -930,6 +940,15 @@ async fn main() -> anyhow::Result<()> {
                 "exported {count} content-compression pair{} to {output}",
                 if count == 1 { "" } else { "s" }
             ));
+        }
+        Command::Eval {
+            action: EvalAction::Shadow { shadow, verdicts, output },
+        } => {
+            tt_cli::eval_shadow::run_eval_shadow(
+                std::path::Path::new(&shadow),
+                std::path::Path::new(&verdicts),
+                std::path::Path::new(&output),
+            )?;
         }
         Command::Mcp {
             transport,

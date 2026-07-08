@@ -20,6 +20,7 @@ pub mod plan_apply;
 pub mod plan_suggest;
 pub mod proxy;
 pub mod recipes;
+pub mod eval_shadow;
 pub mod retrieval;
 pub mod route;
 pub mod telemetry_window;
