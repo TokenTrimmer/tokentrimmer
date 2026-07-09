@@ -125,6 +125,11 @@ WHERE id = $1 AND org_id = $2";
 /// on completion. Mirrors `finish_run`'s fail-open posture (a write error logs +
 /// returns; the run is unaffected — the verdict is an attestation attribute, not
 /// a run-state change).
+//
+// `dead_code`: referenced by the gate-wiring spawn (the follow-up to this
+// foundation PR); allowed here so clippy -D warnings doesn't block the
+// mergeable foundation before the spawn lands.
+#[allow(dead_code)]
 pub(crate) const UPSERT_QUALITY_VERDICT_SQL: &str = "\
 UPDATE workflow_runs \
 SET quality_verdict = $3 \
@@ -368,12 +373,12 @@ pub(crate) async fn finish_run(
 /// detached judge on completion (BACKLOG item #5). `verdict` is the stable code
 /// from [`crate::workflow::quality_gate::QualityVerdict::code`]
 /// (`equivalent` / `degraded` / `inconclusive`).
-pub(crate) async fn upsert_quality_verdict(
-    pool: &PgPool,
-    id: Uuid,
-    org_id: Uuid,
-    verdict: &str,
-) {
+//
+// `dead_code`: called by the gate-wiring spawn (the follow-up to this
+// foundation PR); allowed here so clippy -D warnings doesn't block the
+// mergeable foundation before the spawn lands.
+#[allow(dead_code)]
+pub(crate) async fn upsert_quality_verdict(pool: &PgPool, id: Uuid, org_id: Uuid, verdict: &str) {
     let result = sqlx::query(UPSERT_QUALITY_VERDICT_SQL)
         .bind(id) // $1 id         UUID
         .bind(org_id) // $2 org_id     UUID
