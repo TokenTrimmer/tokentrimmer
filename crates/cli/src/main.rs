@@ -309,6 +309,17 @@ enum Command {
         #[arg(long)]
         tt_api_base: Option<String>,
     },
+    /// Distill a local document/image to text (Document Lane D3, client-side).
+    /// Reuses the same in-process extraction the gateway's sidecar runs, so the
+    /// client + the gateway agree byte-for-byte. Prints the distilled text; --json
+    /// prints the full spans/pages/engine response.
+    Docprep {
+        /// Path to the document (pdf) or image (png/jpg/gif/webp/bmp/tiff) to distill.
+        path: PathBuf,
+        /// Print the full ExtractResponse JSON (spans + fidelity + pages + engine).
+        #[arg(long)]
+        json: bool,
+    },
     /// Embed text via the gateway and print a cost summary (or --json vectors).
     Embed {
         /// Text to embed. One arg → single; many → a batch. Omit to read stdin.
@@ -1284,6 +1295,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tt_cli::advise::run(path, describe, model, server_loop, tt_api_key, tt_api_base)
                 .await?;
+        }
+        Command::Docprep { path, json } => {
+            tt_cli::docprep::run(&path, json)?;
         }
         Command::Embed {
             input,
