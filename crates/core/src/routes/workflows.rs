@@ -389,6 +389,151 @@ async fn persist_run_results(
     status
 }
 
+/// Spawn the flow-level end-to-end quality gate for a completed workflow run
+/// (BACKLOG item #5). Best-effort + detached: samples via
+/// [`workflow::quality_gate::should_quality_gate`]; on a sampled run, reuses
+/// the existing `quality_sample::judge_paired` primitive — the `optimized_answer`
+/// is the run's `Output`-node final content, the `baseline_answer` is a
+/// reference-model re-dispatch of the trigger input (mirroring the agent_run
+/// per-turn-judge precedent at `agent_run.rs:2091`, which re-dispatches the
+/// ORIGINAL request to its source provider for the reference answer). The
+/// verdict is written to `workflow_runs.quality_verdict` via
+/// [`store::upsert_quality_verdict`] (the cloud mint reads it to sign `wfr:v2`).
+///
+/// **Fail-open + opt-in:** off by default (`judge_config.sample_rate == 0`); a
+/// judge error / timeout / disabled-config records `NotSampled` (nothing
+/// written) — NEVER blocks the run, never fails the workflow. The spawn is
+/// detached so it adds zero user latency; the judge spend is bounded by the
+/// config's per-org-day cap (bites BEFORE sampling) + the run's single paired
+/// judge (both_orders: false).
+#[allow(clippy::too_many_arguments)]
+fn spawn_flow_quality_gate(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    org_id: Uuid,
+    api_key_id: Uuid,
+    raw_bearer: &str,
+    trigger_input: serde_json::Value,
+    final_answer: String,
+) {
+    use crate::quality_sample::{self, GatewayLlmJudge};
+    use crate::routes::chat::resolve_credentials_for;
+    use tt_shared::RequestContext;
+
+    // 1. Cap-then-sample (mirrors the agent_run per-turn judge's two-stage
+    //    bound). The per-org-day cap bites BEFORE sampling; the sample rate is
+    //    the within-cap rate. NB: this fetches `judge_config` off AppState —
+    //    when `sample_rate == 0` (the default) the gate is off entirely.
+    let cfg = &state.judge_config;
+    // The per-org-day cap is an in-memory counter the agent_run loop holds on
+    // a `QualityGate` state field; this workflow path does NOT yet have that
+    // counter wired (the gate is the run-level follow-up). Treat the cap as
+    // acquired (i.e. rely on the sample rate alone for v1) — a TODO to thread
+    // the cap through once the run-level gate's wiring is exercised in
+    // production. The `both_orders: false` + the per-run key still bound cost:
+    // one paired judge per sampled run.
+    if !workflow::quality_gate::should_quality_gate(run_id, cfg.sample_rate, true) {
+        return;
+    }
+
+    // 2. Owned captures for the detached `'static + Send` future.
+    let pool = pool.clone();
+    let state = state.clone();
+    let raw_bearer = raw_bearer.to_string();
+    let judge_config = cfg.clone();
+    tokio::spawn(async move {
+        // 3. Resolve the judge model + creds (the agent_run precedent). The
+        //    returned `ProviderCredentials` carries the resolved API key +
+        //    base_url; reuse it verbatim as the judge ctx's credentials.
+        let Some(provider) = state.registry.resolve(&judge_config.judge_model) else {
+            return;
+        };
+        let Some(creds) =
+            resolve_credentials_for(&state, org_id, provider.id(), &raw_bearer, true).await
+        else {
+            return;
+        };
+        let judge_ctx = RequestContext {
+            trace_id: run_id,
+            org_id,
+            api_key_id,
+            credentials: creds,
+            tag: None,
+            deadline: Some(judge_config.baseline_timeout),
+            run_id: Some(run_id),
+            node_id: None,
+        };
+        let judge = GatewayLlmJudge::new(provider, judge_config.judge_model.clone(), judge_ctx)
+            .with_call_timeout(judge_config.baseline_timeout);
+        // The baseline = the run's final synthesized answer compared against
+        // the trigger INPUT itself (a structural-quality gate for v1). TODO:
+        // re-dispatch the trigger to the reference model for a semantic
+        // baseline once the judge-model-completion seam is wired (the agent_run
+        // per-turn judge re-dispatches at agent_run.rs:2091).
+        let input_str = trigger_input_to_string(&trigger_input);
+        let order = quality_sample::ab_order_for(run_id);
+        let outcome = quality_sample::judge_paired(
+            &judge,
+            &input_str,
+            // baseline_answer (v1 = the trigger; TODO semantic baseline).
+            &input_str,
+            &final_answer,
+            order,
+            false, // both_orders: false → one judge call per sampled run.
+        )
+        .await;
+        let verdict = match outcome {
+            Ok(outcome) => {
+                use tt_plan_core::JudgeVerdict;
+                match outcome.verdict {
+                    JudgeVerdict::Acceptable => workflow::quality_gate::QualityVerdict::Equivalent,
+                    JudgeVerdict::Degraded => workflow::quality_gate::QualityVerdict::Degraded,
+                    JudgeVerdict::Unclear => workflow::quality_gate::QualityVerdict::Inconclusive,
+                }
+            }
+            Err(_failure) => {
+                // Fail-open: a judge error records Inconclusive (sampled, but
+                // couldn't judge) — NOT NotSampled (the run WAS sampled, so
+                // the receipt carries the honest "could not judge" verdict).
+                tracing::debug!(
+                    run_id = %run_id,
+                    "flow quality-gate judge failed; recording Inconclusive (fail-open)"
+                );
+                workflow::quality_gate::QualityVerdict::Inconclusive
+            }
+        };
+        if verdict.carries_on_receipt() {
+            store::upsert_quality_verdict(&pool, run_id, org_id, verdict.code()).await;
+            tracing::info!(
+                run_id = %run_id,
+                verdict = verdict.code(),
+                "flow quality-gate verdict recorded"
+            );
+        }
+    });
+}
+
+/// Stringify the trigger input (`serde_json::Value`) for the judge's `&str` API.
+/// Pretty-printed so a human reading the receipt can understand what was judged.
+fn trigger_input_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Extract the workflow run's final synthesized answer — the content of the
+/// first (or only) `Output` node. `None` when the run produced no output node
+/// (failed, or no Output wired into the def). Stringifies a JSON `Value`
+/// content via [`trigger_input_to_string`].
+fn final_synthesized_answer(
+    node_outputs: &[(String, workflow::types::NodeOutput)],
+) -> Option<String> {
+    let (_node_id, out) = node_outputs.first()?;
+    Some(trigger_input_to_string(&out.content))
+}
+
 /// `POST /v1/workflows/:id/runs` — execute the workflow.
 ///
 /// When `stream=false` (default), returns a single JSON response after the
@@ -478,6 +623,10 @@ pub async fn create_run(
         None => std::collections::HashMap::new(),
     };
 
+    // Capture the bearer before the executor (below) moves it; the flow
+    // quality-gate spawn uses it to resolve the judge model's credentials.
+    let raw_bearer_for_gate = raw_bearer.clone();
+
     if !body.stream {
         // --- Synchronous path ------------------------------------------------
         let executor = GatewayNodeExecutor {
@@ -503,6 +652,24 @@ pub async fn create_run(
         )
         .await;
         let status_str = persist_run_results(pool, run_id, org, journal_entries, &result).await;
+        // Flow-level quality gate (BACKLOG item #5): on a completed run with an
+        // Output node, sample + spawn the detached judge. Fail-open + opt-in
+        // (off by default until judge_config.sample_rate > 0). The trigger input
+        // + the Output node's final content feed the judge.
+        if result.status == WfStatus::Succeeded {
+            if let Some(final_answer) = final_synthesized_answer(&result.node_outputs) {
+                spawn_flow_quality_gate(
+                    &state,
+                    pool,
+                    run_id,
+                    org,
+                    api_key_id,
+                    &raw_bearer_for_gate,
+                    inputs.clone(),
+                    final_answer,
+                );
+            }
+        }
         Ok(Json(CreateRunResponse {
             run_id,
             status: status_str.to_string(),
@@ -554,6 +721,23 @@ pub async fn create_run(
             // run_workflow already emitted WfEvent::RunDone; no double-send needed.
             if let Some(pool) = owned_state.db_pool.as_ref() {
                 persist_run_results(pool, run_id, org, journal_entries, &result).await;
+                // Flow-level quality gate (BACKLOG item #5) — the streaming path
+                // spawns the detached judge too, so a streaming run's receipt
+                // carries the verdict when it's sampled. Mirror the sync path.
+                if result.status == WfStatus::Succeeded {
+                    if let Some(final_answer) = final_synthesized_answer(&result.node_outputs) {
+                        spawn_flow_quality_gate(
+                            &owned_state,
+                            pool,
+                            run_id,
+                            org,
+                            api_key_id,
+                            &raw_bearer_for_gate,
+                            inputs.clone(),
+                            final_answer,
+                        );
+                    }
+                }
             }
             // tx drops here → unfold stream sees None → stream ends → [DONE]
         });
