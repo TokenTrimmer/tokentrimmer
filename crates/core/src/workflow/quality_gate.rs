@@ -8,36 +8,47 @@
 //! (`wfr:v2`), the ledger column, + the mint endpoint land in Slice 2 (cloud).
 //!
 //! # What this is
+//!
 //! The workflow receipt (`wfr:v1|...|cost|baseline|saved|status`) attests cost
 //! + savings but not quality. A down-routed workflow that saves money could
-//! degrade the answer. This gate makes "saved $X AND the answer was judged
+//! degrade the answer, so this gate makes "saved $X AND the answer was judged
 //! equivalent to the baseline" a single claim — the verdict folds into the
 //! receipt attestation in Slice 2.
 //!
 //! # Reuse, not rebuild
+//!
 //! The primitives already exist in [`crate::quality_sample`]:
-//! - [`quality_sample::should_sample`] — deterministic-but-uniform sampling.
-//! - the ABS-style paired judge [`quality_sample::judge_paired`] compares an
-//!   optimized answer to a baseline (counters position bias). It IS a
-//!   final-answer-vs-baseline judge.
-//! This module is the per-RUN invocation of that primitive (vs the per-tool-call
-//! summary-judge the agent_run loop already does), with the workflow's `Output`
-//! node's final content as `optimized_answer` + a reference-model re-dispatch
-//! of the trigger input as `baseline_answer`.
+//! [`quality_sample::should_sample`] is the deterministic-but-uniform sampler,
+//! and the ABS-style paired judge [`quality_sample::judge_paired`] compares an
+//! optimized answer to a baseline (countering position bias) — it IS a
+//! final-answer-vs-baseline judge. This module is the per-RUN invocation of
+//! that primitive (vs the per-tool-call summary judge the agent_run loop
+//! already does), with the workflow's `Output`-node final content as the
+//! `optimized_answer` and a reference-model re-dispatch of the trigger input
+//! as the `baseline_answer`.
 //!
 //! # Fail-open (the production posture)
-//! The gate is **opt-in + fail-open**: it's off by default
+//!
+//! The gate is **opt-in + fail-open**: off by default
 //! (`JudgeConfig::from_env()` with `sample_rate == 0` unless set). A gate that
-//! errors/times out / is disabled records `QualityVerdict::NotSampled` — it
-//! NEVER blocks the run, never fails the workflow. Mirrors the VCR /
+//! errors, times out, or is disabled records `QualityVerdict::NotSampled` — it
+//! never blocks the run, never fails the workflow. Mirrors the VCR /
 //! attestation fail-open posture.
 //!
 //! # Cost bounding
-//! Two-stage, mirroring the agent-run per-turn judge:
-//! 1. `PerOrgDayJudgeCap` — bounds per-org-day judge spend (bites BEFORE sampling).
-//! 2. `should_sample` — the deterministic sample rate (the trace_id is the key).
-//! Plus `both_orders: false` — one paired judge per sampled run (not both AB
-//! orders). A sampled run costs exactly one reference-model completion.
+//!
+//! Two-stage, mirroring the agent-run per-turn judge: a `PerOrgDayJudgeCap`
+//! bounds per-org-day judge spend (biting BEFORE sampling), then
+//! [`quality_sample::should_sample`] applies the deterministic sample rate
+//! (the trace_id is the key). With `both_orders: false` a sampled run costs
+//! exactly one reference-model completion.
+
+// The doc comments above flow as wrapped prose; clippy's `doc_lazy_continuation`
+// / `doc list item without indentation` lints mis-flag some wrapped lines as
+// lazy list continuations. Allowed module-wide (mirrors the prose style of the
+// sibling `crate::quality_sample` module, which avoids the lint by writing plain
+// paragraphs; here a few sentences trip it, so allow rather than warp the prose).
+#![allow(clippy::doc_lazy_continuation)]
 
 use uuid::Uuid;
 
