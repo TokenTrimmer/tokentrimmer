@@ -25,8 +25,10 @@ pub const SIDECAR_URL_ENV: &str = "TT_DOC_SIDECAR_URL";
 
 /// Hard ceiling on a single sidecar round-trip. Kept short: the seam is on the
 /// pre-routing hot path, and a distillation is optional, so a slow sidecar must
-/// fail open rather than delay the request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// fail open rather than delay the request. `pub(crate)` so the D4c seam builds
+/// its own `reqwest::Client` with the same bound (a single source of truth for
+/// the fail-open timeout).
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One extracted span, with its fidelity resolved onto D4a's [`SpanFidelity`].
 #[derive(Debug, Clone, PartialEq, Eq)]

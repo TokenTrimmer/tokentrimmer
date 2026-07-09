@@ -17,6 +17,8 @@
 //! default-CLOSED and fails open to the verbatim request. Error blobs are never
 //! distilled. See `docs/superpowers/specs/2026-07-01-document-lane-d4-server-seam-design.md`.
 
+/// D4c — the pre-routing distillation seam (invoked in `prepare()`).
+pub mod seam;
 /// The fail-open client for the out-of-process `doc-sidecar` OCR/parse service
 /// (D4b). Disabled unless `TT_DOC_SIDECAR_URL` is set; any error/timeout → no
 /// extraction, so the request stays verbatim.

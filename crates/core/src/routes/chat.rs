@@ -2536,6 +2536,14 @@ pub(crate) async fn prepare(
     // request-pass pipeline never runs and the request is byte-for-byte
     // unchanged.
     let route_doc_compaction = route_match.as_ref().is_some_and(|m| m.doc_compaction);
+    // A matched route opting into the Document Lane pre-routing distillation
+    // seam (`RouteAction::document_lane`, D4c). When true the gateway distills
+    // inline document/image content parts to text BEFORE `SplitRequest::compute`
+    // (so the cache-stable prefix + L1/L2 keys derive from the distilled request
+    // + routing can downgrade to a text model). When false (the default) the
+    // seam never runs — zero behavior change. Fail-open when the sidecar is
+    // disabled (`TT_DOC_SIDECAR_URL` unset) or errors.
+    let route_document_lane = route_match.as_ref().is_some_and(|m| m.document_lane);
     // A matched route opting into the content-aware compression pass
     // (`RouteAction::content_compress`, P1a). When false (the default — no route
     // or a route that did not enable it) the content_compress request-pass
@@ -3062,6 +3070,34 @@ pub(crate) async fn prepare(
     // them on the all-volatile (pre-split) path.
     let pass_model = req.model.clone();
     let pass_pricing = provider.pricing(&pass_model);
+    // Document Lane D4c — the pre-routing distillation seam. When the matched
+    // route opted in (`route_document_lane`), distill inline document/image
+    // content parts to text BEFORE the pass pipeline, so the cache-stable prefix
+    // + L1/L2 keys derive from the DISTILLED request + routing can downgrade to
+    // a text model. Fail-open: sidecar disabled / error → the request stays
+    // verbatim (no distillation, no downgrade — byte-identical to the no-document-
+    // lane path). When `route_document_lane` is false (the default), the seam
+    // early-returns with zero work. The isolated `doc_vision_saved_est_usd`
+    // saving is booked in the cost-breakdown below (TODO D4c-v2: wire the saving
+    // figure once the sidecar returns the projection; v1 distills without booking
+    // the saving, surfacing the capability + the downgrade, with the saving in a
+    // follow-up).
+    if route_document_lane {
+        let harness = crate::document_lane::seam::DistillHarness::from_env();
+        let _distilled = crate::document_lane::seam::distill_request_parts(&harness, req).await;
+        if _distilled > 0 {
+            tracing::info!(
+                target: "tokentrimmer.document_lane",
+                distilled_parts = _distilled,
+                "document-lane seam distilled document/image parts to text"
+            );
+            // TODO D4c-v2: recompute request_has_images/request_has_documents
+            // (now false) so routing downgrades to a text model + book the
+            // isolated doc_vision_saved_est_usd via D0's document_projection.
+            // v1 substitutes the parts (routing sees the text) but does not yet
+            // re-flip the capability flags or book the saving.
+        }
+    }
     let pass_cx = crate::passes::PassContext {
         provider_id: provider.id(),
         model: &pass_model,
@@ -6677,6 +6713,13 @@ pub(crate) struct RouteMatch {
     /// content_compress request-pass pipeline before dispatch; off by default
     /// (no pass runs otherwise). A COST lever: suppressed on a paused route.
     pub(crate) content_compress: bool,
+    /// The matched route opted into the Document Lane pre-routing distillation
+    /// seam (`RouteAction::document_lane`, Document Lane D4c). When true the
+    /// gateway distills image/document content parts to text BEFORE routing
+    /// (so the route can downgrade to a text model) + books the isolated
+    /// `doc_vision_saved_est_usd`. A COST lever: suppressed on a paused route.
+    /// Off by default (no distillation runs otherwise).
+    pub(crate) document_lane: bool,
     /// The matched route opted into the request-redaction guardrail
     /// (`RouteAction::redact`). When true the gateway redacts PII/secrets from
     /// the outbound request before dispatch (a SAFETY transform, not a saving);
@@ -6879,6 +6922,8 @@ pub(crate) async fn apply_routing(
             compress: false,
             doc_compaction: false,
             content_compress: false,
+            // Paused route → Document Lane suppressed (COST lever).
+            document_lane: false,
             format_switch: None,
             diff: false,
             traffic_pct: None,
@@ -6913,6 +6958,7 @@ pub(crate) async fn apply_routing(
     let compress = m.then.compress;
     let doc_compaction = m.then.doc_compaction;
     let content_compress = m.then.content_compress;
+    let document_lane = m.then.document_lane;
     let redact = m.then.redact;
     let format_switch = m.then.format_switch.clone();
     let diff = m.then.diff;
@@ -6989,6 +7035,7 @@ pub(crate) async fn apply_routing(
         compress,
         doc_compaction,
         content_compress,
+        document_lane,
         redact,
         format_switch,
         diff,
