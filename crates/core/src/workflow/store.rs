@@ -120,6 +120,16 @@ UPDATE workflow_runs \
 SET status = $3, cost_usd = $4, baseline_cost_usd = $5, saved_usd = $6, error = $7, finished_at = now() \
 WHERE id = $1 AND org_id = $2";
 
+/// Write the flow-level quality-gate verdict to the run row (migration 0036).
+/// Best-effort + scoped by `(id, org_id)` — the gate's detached judge calls this
+/// on completion. Mirrors `finish_run`'s fail-open posture (a write error logs +
+/// returns; the run is unaffected — the verdict is an attestation attribute, not
+/// a run-state change).
+pub(crate) const UPSERT_QUALITY_VERDICT_SQL: &str = "\
+UPDATE workflow_runs \
+SET quality_verdict = $3 \
+WHERE id = $1 AND org_id = $2";
+
 /// SELECT a single run scoped by `(id, org_id)`.
 ///
 /// `NUMERIC(12,6)` columns are cast to `::float8` so sqlx can decode them
@@ -346,6 +356,35 @@ pub(crate) async fn finish_run(
             run_id = %id,
             error = %e,
             "workflow_runs UPDATE (finish) failed (best-effort, run not affected)"
+        );
+    }
+}
+
+/// Write the flow-level quality-gate verdict to the run row (migration 0036).
+///
+/// Best-effort + scoped by `(id, org_id)` (mirrors [`finish_run`]'s fail-open
+/// posture: a write error logs + returns; the run is unaffected — the verdict
+/// is an attestation attribute, not a run-state change). Called by the gate's
+/// detached judge on completion (BACKLOG item #5). `verdict` is the stable code
+/// from [`crate::workflow::quality_gate::QualityVerdict::code`]
+/// (`equivalent` / `degraded` / `inconclusive`).
+pub(crate) async fn upsert_quality_verdict(
+    pool: &PgPool,
+    id: Uuid,
+    org_id: Uuid,
+    verdict: &str,
+) {
+    let result = sqlx::query(UPSERT_QUALITY_VERDICT_SQL)
+        .bind(id) // $1 id         UUID
+        .bind(org_id) // $2 org_id     UUID
+        .bind(verdict) // $3 quality_verdict TEXT
+        .execute(pool)
+        .await;
+    if let Err(e) = result {
+        tracing::warn!(
+            run_id = %id,
+            error = %e,
+            "workflow_runs quality_verdict UPDATE failed (best-effort)"
         );
     }
 }
