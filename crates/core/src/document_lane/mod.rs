@@ -8,10 +8,15 @@
 //!   `false`. No behavior change.
 //! - **D4b:** the out-of-process OCR/parse sidecar + a fail-open Rust client.
 //! - **D4c:** the pre-routing seam in `prepare()` that (when the org/route opts
-//!   in via `RouteAction::document_lane`) distills image/document parts to text,
-//!   flips `request_has_images`/`request_has_documents` false so routing can
-//!   downgrade to a text model, and books the isolated `doc_vision_saved_est_usd`
-//!   — gated by a filled-in [`DocDistillGate`] + the sticky 0.90 auto-pause floor.
+//!   in via `RouteAction::document_lane`) distills image/document parts to text
+//!   so routing's `target_model` rewrite downgrades to a text model, and books
+//!   the isolated `doc_vision_saved_est_usd` counterfactual (D4c-v2: priced from
+//!   the seam's bookkeeping via D0's [`document_projection::project`]). The
+//!   downgrade is the route's `target_model` rewrite, NOT a capability-flag
+//!   re-flip (see #307). The lossy-substitution [`DocDistillGate`] (recall judge
+//!   + the sticky 0.90 auto-pause floor) is STILL the default-CLOSED scaffold —
+//!   lossy spans stay verbatim until that slice; lossless PDF-text layers
+//!   substitute unconditionally + book their saving now.
 //!
 //! Lossy substitution is **opt-in + judge-gated permanently**: the gate is
 //! default-CLOSED and fails open to the verbatim request. Error blobs are never

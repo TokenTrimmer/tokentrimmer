@@ -18,6 +18,9 @@ tt-tokenize.workspace = true
 tt-cache.workspace = true
 tt-retrieval = { workspace = true, features = ["postgres"] }
 tt-preview.workspace = true
+# Header-only base64 decode of inline image bytes for the document-lane seam's
+# vision-avoided saving projection (D4c-v2). Same version the preview crate uses.
+base64 = "0.22"
 # Gateway-tool executor (routes/gateway_tools.rs): the `inspect_diff` read-only
 # tool scans a proposed diff via inspect-core + the Tier-1 rule set, ported from
 # the MCP tool so the agent loop can run it inline (no core->mcp cycle).
