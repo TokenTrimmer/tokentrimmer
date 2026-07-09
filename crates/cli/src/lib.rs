@@ -12,6 +12,7 @@ pub mod chat;
 pub mod compress_corpus;
 pub mod context;
 pub mod cost_diff;
+pub mod docprep;
 pub mod embed;
 pub mod eval_shadow;
 pub mod init;

@@ -33,6 +33,10 @@ tt-context.workspace = true
 tt-mcp.workspace = true
 tt-tokenize.workspace = true
 tt-client.workspace = true
+# The doc-sidecar lib (the in-process extraction engine `tt docprep` reuses
+# client-side — the same PDF-text-layer + OCR code the gateway seam calls over
+# HTTP). Off-by-default OCR feature keeps the CLI build lean.
+doc-sidecar = { path = "../doc-sidecar" }
 reqwest.workspace = true
 regex.workspace = true
 percent-encoding.workspace = true
