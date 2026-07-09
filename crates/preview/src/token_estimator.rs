@@ -21,8 +21,9 @@ const DEFAULT_OUTPUT_TOKENS: u32 = 512;
 /// Nominal square dimension assumed for an image whose real dimensions can't be
 /// read (remote `http(s)` URL, unknown/unsupported format, or an unreadable
 /// header). Paired with [`ImageDetail::High`] so an un-inspectable image still
-/// prices at a realistic, non-trivial token cost rather than ~0.
-const FALLBACK_IMAGE_DIM: u32 = 1024;
+/// prices at a realistic, non-trivial token cost rather than ~0. Re-exported
+/// from `tt-tokenize` (the single source — the D4c-v2 seam shares it).
+const FALLBACK_IMAGE_DIM: u32 = tt_tokenize::image_tokens::FALLBACK_IMAGE_DIM;
 
 /// Upper bound on the number of base64 header chars we decode to read image
 /// dimensions. Enough for a PNG IHDR (always in the first 24 bytes) and to scan
@@ -152,10 +153,15 @@ fn parse_detail(hint: Option<&str>) -> ImageDetail {
     }
 }
 
-/// Read `(width, height)` from an inline base64 `data:` image URL by parsing the
-/// image header only — no full decode, no heavy image crate. Returns `None` for
-/// remote URLs, non-`data:` URLs, or formats/headers we don't recognise (PNG and
-/// JPEG are supported); the caller then falls back to a nominal size.
+/// Read `(width, height)` from an inline base64 `data:` image URL by parsing
+/// the image header only — no full decode, no heavy image crate. Returns `None`
+/// for remote URLs, non-`data:` URLs, or formats/headers we don't recognise
+/// (PNG and JPEG are supported); the caller then falls back to a nominal size.
+///
+/// The PNG/JPEG header parse itself lives in `tt_tokenize::image_tokens`
+/// (`image_dims_from_bytes`) so the Document Lane D4c-v2 seam (which holds the
+/// raw decoded bytes pre-distillation, not a data URL) shares the one parser.
+/// This wrapper owns the `data:` URL split + the bounded base64 decode.
 fn image_dims_from_data_url(url: &str) -> Option<(u32, u32)> {
     let (_media_type, b64) = tt_shared::messages::parse_data_url(url)?;
     // Decode only a bounded header prefix. Truncate to a whole number of base64
@@ -166,65 +172,7 @@ fn image_dims_from_data_url(url: &str) -> Option<(u32, u32)> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(prefix)
         .ok()?;
-    png_dims(&bytes).or_else(|| jpeg_dims(&bytes))
-}
-
-/// PNG dimensions from the IHDR chunk (width/height are big-endian u32 at bytes
-/// 16..24, immediately after the 8-byte signature + IHDR length/type).
-fn png_dims(bytes: &[u8]) -> Option<(u32, u32)> {
-    const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-    if bytes.len() < 24 || bytes[..8] != SIG {
-        return None;
-    }
-    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-    Some((w, h))
-}
-
-/// JPEG dimensions by scanning segment markers for an SOF (Start-Of-Frame)
-/// marker; the frame header carries height then width as big-endian u16.
-fn jpeg_dims(bytes: &[u8]) -> Option<(u32, u32)> {
-    // Must start with SOI (0xFF 0xD8).
-    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return None;
-    }
-    let mut i = 2usize;
-    while i + 1 < bytes.len() {
-        if bytes[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        // Skip any 0xFF fill bytes to land on the marker code.
-        let mut mp = i;
-        while mp < bytes.len() && bytes[mp] == 0xFF {
-            mp += 1;
-        }
-        if mp >= bytes.len() {
-            break;
-        }
-        let marker = bytes[mp];
-        // Standalone markers with no length payload: SOI/EOI and RSTn/TEM.
-        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) || marker == 0x01 {
-            i = mp + 1;
-            continue;
-        }
-        // Every other marker is followed by a 2-byte big-endian segment length
-        // (which includes those 2 length bytes).
-        let len_hi = *bytes.get(mp + 1)?;
-        let len_lo = *bytes.get(mp + 2)?;
-        let seg_len = u16::from_be_bytes([len_hi, len_lo]) as usize;
-        // SOF0..SOF15 carry the frame dimensions; C4 (DHT), C8 (JPG), CC (DAC)
-        // are NOT frame headers and are excluded.
-        let is_sof = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
-        if is_sof {
-            // FF Cn LenHi LenLo Precision HeightHi HeightLo WidthHi WidthLo
-            let h = u16::from_be_bytes([*bytes.get(mp + 4)?, *bytes.get(mp + 5)?]);
-            let w = u16::from_be_bytes([*bytes.get(mp + 6)?, *bytes.get(mp + 7)?]);
-            return Some((u32::from(w), u32::from(h)));
-        }
-        i = mp + 1 + seg_len.max(2);
-    }
-    None
+    tt_tokenize::image_tokens::image_dims_from_bytes(&bytes)
 }
 
 #[cfg(test)]
