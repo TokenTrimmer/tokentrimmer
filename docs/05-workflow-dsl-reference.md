@@ -95,8 +95,30 @@ enforcer, the kill-switch all apply identically. The run rolls the per-node
 cost + baseline into a parent total; `saved_usd` derives without
 double-counting (sub-workflows pass the parent's remaining cap to the child).
 
-Each run is signable as a workflow receipt (`POST /v1/admin/workflow-runs/{run_id}/receipt/sign` — mirrors the VCR mint endpoint) + verifiable offline
-with `tt verify-receipt`.
+Each completed run is signable as a workflow receipt — `POST /v1/admin/workflow-runs/{run_id}/receipt/sign` returns a frozen, Ed25519-signed receipt + a
+shareable verify URL. The receipt's canonical payload is
+`wfr:v1|<org>|<workflow_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>`
+(or `wfr:v2|…|<quality_verdict>` when the run carried a sampled flow-level
+quality-gate verdict).
+
+### Verifying a workflow receipt
+
+The mint returns a self-contained `VerifyReceiptResponse` (from the public GET
+endpoint `GET /v1/workflow-runs/{run_id}/receipt?expires=&sig=`) exposing every
+canonical-payload field — `org_id`, `workflow_id`, `run_id`, `cost_micros`,
+`baseline_micros`, `saved_micros`, `status`, `canonical_version`,
+`quality_verdict`, `signature_hex`, + the embedded `verifying_key_hex`. Any party
+with the share URL can reconstruct the canonical string + check the Ed25519
+signature with that key — offline, no TokenTrimmer network call beyond fetching
+the receipt.
+
+The `tt verify-receipt` CLI dispatches over the **compression** (`vcr:v1|`) +
+**cache-hit** (`l2:v1|`) receipt families (the gateway-signed receipts; the
+families customers verify most). Workflow-receipt (`wfr:`) online verify runs
+via the GET endpoint above; offline CLI verify of `wfr:` is a follow-up (the
+canonical-payload + verify primitives currently live cloud-side; moving them to
+the public `tt_telemetry` crate would make the CLI the single offline-verify
+entry point across all three families).
 
 ## Example
 
