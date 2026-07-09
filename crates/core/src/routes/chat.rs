@@ -3091,11 +3091,18 @@ pub(crate) async fn prepare(
                 distilled_parts = _distilled,
                 "document-lane seam distilled document/image parts to text"
             );
-            // TODO D4c-v2: recompute request_has_images/request_has_documents
-            // (now false) so routing downgrades to a text model + book the
-            // isolated doc_vision_saved_est_usd via D0's document_projection.
-            // v1 substitutes the parts (routing sees the text) but does not yet
-            // re-flip the capability flags or book the saving.
+            // The downgrade is the route's `target_model` rewrite (apply_routing
+            // already set req.model to the text model); the seam's job is to
+            // swap the image/document parts for text so the text model receives
+            // processable input — done above. No capability-flag re-flip is
+            // needed (the `has_documents` condition matched pre-routing; the
+            // rewrite is the downgrade).
+            //
+            // TODO D4c-v2: book the isolated `doc_vision_saved_est_usd` saving
+            // via D0's `document_projection::project` (the raw image tokens the
+            // request WOULD have sent vs the distilled text tokens, priced at
+            // the served model's input rate, with the Gemini direction guard).
+            // v1 distills + downgrades without booking the saving figure.
         }
     }
     let pass_cx = crate::passes::PassContext {
