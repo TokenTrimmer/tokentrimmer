@@ -196,8 +196,17 @@ impl Default for Scorer {
 mod tests {
     use super::*;
 
+    // These tests mutate the process-global env (TIMEOUT_ENV / MODEL_PATH_ENV)
+    // + read it via `Scorer::new()`. Under parallel test execution they race
+    // (one sets TT_ML_SCORE_TIMEOUT_MS=25 while another removes it + reads the
+    // default) → flaky failures. This lock serializes the env-touching tests so
+    // each sees a consistent env. (The stdlib `serial_test` crate would do this
+    // too; a local Mutex avoids the dep.)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn scorer_without_model_path_returns_no_model() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(MODEL_PATH_ENV);
         let scorer = Scorer::new();
         assert!(!scorer.is_configured());
@@ -213,6 +222,7 @@ mod tests {
 
     #[test]
     fn scorer_reads_timeout_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var(TIMEOUT_ENV).ok();
         std::env::set_var(TIMEOUT_ENV, "25");
         let scorer = Scorer::new();
@@ -226,6 +236,7 @@ mod tests {
 
     #[test]
     fn scorer_default_timeout_is_50ms() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var(TIMEOUT_ENV).ok();
         std::env::remove_var(TIMEOUT_ENV);
         let scorer = Scorer::new();
