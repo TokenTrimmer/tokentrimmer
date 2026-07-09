@@ -27,6 +27,9 @@ def test_base_import_does_not_pull_in_optional_extras():
         "assert 'opentelemetry' not in sys.modules, 'base import pulled in opentelemetry'\n"
         "assert 'litellm' not in sys.modules, 'base import pulled in litellm'\n"
         "assert 'langgraph' not in sys.modules, 'base import pulled in langgraph'\n"
+        # D3: pypdf stays lazy (imported inside distill_document, not at module load)
+        # so the `doc-distill` extra is never pulled in by `import tokentrimmer`.
+        "assert 'pypdf' not in sys.modules, 'base import pulled in pypdf'\n"
         # semconv is dependency-free and fully usable.
         "assert semconv.TT_SAVED_USD == 'tokentrimmer.saved_usd'\n"
         "print('ok')\n"

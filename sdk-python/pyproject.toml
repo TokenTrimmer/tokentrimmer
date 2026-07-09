@@ -46,6 +46,12 @@ dependencies = [
 # x-tokentrimmer-* response headers (include_response_headers=True) and is used
 # by the make_gateway_chat_openai() convenience factory.
 langchain = ["langchain-core>=0.3", "langchain-openai>=0.2"]
+# Client-side document distillation (D3): pull a PDF's text layer locally so a
+# request can arrive pre-distilled (no gateway sidecar round-trip → routes to a
+# text model). Pure-Python pypdf (light). Mirrors the `doc_distill` feature on
+# the Rust client. Without this extra, `user_with_document` raises an
+# actionable ImportError (use `user_with_document_raw` to attach the bytes).
+doc-distill = ["pypdf>=4.0"]
 # LangGraph cost attribution. The LangChain callback (above) drives a LangGraph
 # graph unchanged — pass it via graph.invoke(config={"callbacks": [cb]}). This
 # extra just pulls in LangGraph (which itself runs on langchain-core's callback
@@ -72,6 +78,8 @@ test = [
     "litellm>=1.40",
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
+    # D3: pypdf for the client-side document-distillation tests.
+    "pypdf>=4.0",
 ]
 
 [project.urls]
