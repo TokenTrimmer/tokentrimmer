@@ -118,11 +118,7 @@ impl QualityVerdict {
 /// * `cap` — the per-org-day cap (None = uncapped; the cap is the caller's to
 ///   acquire so it can record the outcome).
 #[must_use]
-pub fn should_quality_gate(
-    key: Uuid,
-    sample_rate: f64,
-    cap_acquired: bool,
-) -> bool {
+pub fn should_quality_gate(key: Uuid, sample_rate: f64, cap_acquired: bool) -> bool {
     // The cap bites BEFORE sampling (mirrors the agent-run judge: the cap is
     // the hard bound on judge spend; the sample rate is the within-cap rate).
     if !cap_acquired {
@@ -150,7 +146,10 @@ mod tests {
     #[test]
     fn unknown_code_fails_safe_to_not_sampled() {
         // A receipt with a garbage verdict must NOT be treated as a PASS.
-        assert_eq!(QualityVerdict::from_code("pass"), QualityVerdict::NotSampled);
+        assert_eq!(
+            QualityVerdict::from_code("pass"),
+            QualityVerdict::NotSampled
+        );
         assert_eq!(QualityVerdict::from_code(""), QualityVerdict::NotSampled);
         assert_eq!(
             QualityVerdict::from_code("EQUIVALENT"), // case-sensitive
