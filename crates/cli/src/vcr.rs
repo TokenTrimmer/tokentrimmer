@@ -6,10 +6,13 @@
 //!   - a **VCR** (`vcr:v1|…` canonical payload) — compression savings.
 //!   - an **L2 receipt** (`l2:v1|…` canonical payload) — semantic-cache hit
 //!     provenance (`matched_entry_id` / `similarity` / `verdict`).
+//!   - a **WFR receipt** (`wfr:v1|…` / `wfr:v2|…` canonical payload) — workflow
+//!     run cost + savings (+ optional quality verdict).
 //!
 //! The sign side of each lives in the cloud mint-on-demand endpoint
 //! (`POST /v1/admin/requests/{trace_id}/{compression,l2}-receipt/sign`, which
-//! calls `tt_telemetry::vcr::sign` / `tt_telemetry::l2_receipt::sign`). This
+//! calls `tt_telemetry::vcr::sign` / `tt_telemetry::l2_receipt::sign`; and
+//! `POST /v1/admin/workflow-runs/{run_id}/receipt/sign` for wfr). This
 //! CLI takes a receipt JSON + the customer's out-of-band verifying-key hex +
 //! asserts the Ed25519 signature is valid over the canonical payload — proving
 //! the figure was attested by the key holder, offline, with no network or DB.
@@ -41,18 +44,27 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
     let raw = std::fs::read_to_string(receipt_path)
         .with_context(|| format!("read receipt {receipt_path}"))?;
 
-    // Family dispatch: an L2 receipt carries `matched_entry_id` + `verdict` +
-    // `similarity`; a VCR carries `route` + `token_delta`. Peek as a Value so a
-    // mismatch is a clean "unknown receipt type" error, not a deserialization
-    // panic. This keeps the one CLI verifying every receipt family without a
-    // `--kind` flag (the signed canonical payload's prefix — `l2:v1|` vs
-    // `vcr:v1|` — is the disjointness guarantee; the JSON fields are the
-    // dispatch key).
+    // Family dispatch by field-presence (the JSON fields are the dispatch key;
+    // the signed canonical payload's prefix — `vcr:v1|` / `l2:v1|` / `wfr:v1|` —
+    // is the disjointness guarantee). Order matters:
+    //   - WFR carries `canonical_version` + `signature_hex` (the discriminator —
+    //     checked before VCR, since a WFR also carries a `verifying_key_hex`).
+    //   - L2 carries `matched_entry_id` + `verdict` (checked before VCR, since
+    //     L2 shares the `signature`/`verifying_key_hex` names).
+    //   - VCR carries `signature` + `verifying_key_hex` (or `route`+`schema`).
+    // Peek as a Value so a mismatch is a clean "unknown receipt type" error,
+    // not a deserialization panic. This keeps the one CLI verifying every
+    // receipt family without a `--kind` flag.
     let peek: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("parse receipt JSON {receipt_path}"))?;
+    let is_wfr = (peek.get("canonical_version").and_then(|v| v.as_str()) == Some("v1")
+        || peek.get("canonical_version").and_then(|v| v.as_str()) == Some("v2"))
+        && peek.get("signature_hex").is_some();
     let is_l2 = peek.get("matched_entry_id").is_some() && peek.get("verdict").is_some();
 
-    if is_l2 {
+    if is_wfr {
+        verify_wfr_receipt(&raw, &peek, key_hex)
+    } else if is_l2 {
         verify_l2_receipt(&raw, &peek, key_hex)
     } else {
         verify_vcr_receipt(&raw, &peek, key_hex)
@@ -105,6 +117,45 @@ fn verify_l2_receipt(raw: &str, _peek: &serde_json::Value, key_hex: &str) -> any
         anyhow::bail!(
             "L2-receipt verification failed for trace_id={}",
             receipt.trace_id
+        );
+    }
+}
+
+/// Verify a WFR (workflow-run) receipt (v1 cost-only or v2 cost + quality verdict).
+/// Money fields are already integer micro-USD, so there's no float
+/// canonicalization (unlike VCR/L2) — the canonical payload is built from the
+/// `*_micros` integers directly.
+fn verify_wfr_receipt(raw: &str, _peek: &serde_json::Value, key_hex: &str) -> anyhow::Result<()> {
+    let receipt: tt_telemetry::wfr_receipt::WfrReceipt =
+        serde_json::from_str(raw).context("parse WFR receipt JSON")?;
+    crate::ui::note(&format!(
+        "WFR-receipt {} for org {} workflow {} run {} (status {})",
+        receipt.canonical_version,
+        receipt.org_id,
+        receipt.workflow_id,
+        receipt.run_id,
+        receipt.status,
+    ));
+    crate::ui::note(&format!(
+        "cost_micros: {}, baseline_micros: {}, saved_micros: {}{}",
+        receipt.cost_micros,
+        receipt.baseline_micros,
+        receipt.saved_micros,
+        receipt
+            .quality_verdict
+            .as_deref()
+            .map(|q| format!(", quality_verdict: {q}"))
+            .unwrap_or_default(),
+    ));
+
+    if tt_telemetry::wfr_receipt::verify_with_key(key_hex, &receipt) {
+        crate::ui::ok("PASS: signature verifies against the supplied verifying key");
+        Ok(())
+    } else {
+        crate::ui::error("FAIL: signature does not verify (tampered receipt, wrong key, unknown canonical version, or a v2 receipt missing its quality_verdict)");
+        anyhow::bail!(
+            "WFR-receipt verification failed for run_id={}",
+            receipt.run_id
         );
     }
 }
@@ -285,5 +336,105 @@ mod tests {
             .expect("VCR dispatches to the VCR path");
         run_verify_receipt(l2_path.to_str().unwrap(), &key_hex())
             .expect("L2 dispatches to the L2 path");
+    }
+
+    // ── WFR (workflow-run) receipt dispatch + verify ─────────────────────────
+    // The same `tt verify-receipt` CLI verifies a WFR receipt (dispatched by
+    // field-presence: canonical_version + signature_hex). The cloud mint signs
+    // these; here we sign over the public canonical_payload to produce a
+    // verifiable fixture (the verify side is what the CLI owns).
+
+    use tt_telemetry::wfr_receipt::{canonical_payload as wfr_canonical, WfrReceipt};
+
+    fn sample_wfr_receipt(canonical_version: &str, quality_verdict: Option<&str>) -> WfrReceipt {
+        use ed25519_dalek::Signer as _;
+        // Sign over the canonical payload the way the cloud mint does, using the
+        // same fixed test key as the other families so key_hex() verifies it.
+        let mut receipt = WfrReceipt {
+            run_id: Uuid::from_u128(0xa1),
+            org_id: Uuid::from_u128(42),
+            workflow_id: Uuid::from_u128(0xb2),
+            status: "completed".to_string(),
+            cost_micros: 70_000,
+            baseline_micros: 180_000,
+            saved_micros: 110_000,
+            cost_usd: None,
+            baseline_usd: None,
+            saved_usd: None,
+            signature_hex: String::new(),
+            verifying_key_hex: String::new(),
+            canonical_version: canonical_version.to_string(),
+            quality_verdict: quality_verdict.map(str::to_string),
+            signed_at: None,
+        };
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let payload = wfr_canonical(&receipt).expect("canonical payload builds");
+        let sig = key.sign(payload.as_bytes());
+        receipt.signature_hex = hex::encode(sig.to_bytes());
+        receipt.verifying_key_hex = hex::encode(key.verifying_key().to_bytes());
+        receipt
+    }
+
+    fn write_test_wfr_receipt(
+        dir: &std::path::Path,
+        name: &str,
+        receipt: &WfrReceipt,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, serde_json::to_string_pretty(receipt).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn wfr_v1_receipt_verifies_via_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_wfr_receipt(dir.path(), "wfr-v1.json", &sample_wfr_receipt("v1", None));
+        run_verify_receipt(path.to_str().unwrap(), &key_hex())
+            .expect("a valid WFR v1 receipt verifies via the dispatch path");
+    }
+
+    #[test]
+    fn wfr_v2_receipt_verifies_via_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_wfr_receipt(
+            dir.path(),
+            "wfr-v2.json",
+            &sample_wfr_receipt("v2", Some("equivalent")),
+        );
+        run_verify_receipt(path.to_str().unwrap(), &key_hex())
+            .expect("a valid WFR v2 receipt verifies via the dispatch path");
+    }
+
+    #[test]
+    fn wfr_receipt_fails_when_tampered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut receipt = sample_wfr_receipt("v2", Some("equivalent"));
+        receipt.saved_micros = 999_999; // tamper after signing
+        let path = write_test_wfr_receipt(dir.path(), "wfr-tampered.json", &receipt);
+        let err = run_verify_receipt(path.to_str().unwrap(), &key_hex())
+            .expect_err("a tampered WFR receipt must fail");
+        assert!(
+            format!("{err:#}").contains("WFR-receipt verification failed"),
+            "the error names the WFR failure: {err:#}"
+        );
+    }
+
+    #[test]
+    fn vcr_l2_and_wfr_receipts_dispatch_independently() {
+        // All three families at the same key verify through the one entry point.
+        let dir = tempfile::tempdir().unwrap();
+        let vcr_path = write_test_receipt(dir.path(), "vcr.json", &sign_receipt());
+        let l2_path = write_test_l2_receipt(dir.path(), "l2.json", &sign_l2_receipt());
+        let wfr_path = write_test_wfr_receipt(
+            dir.path(),
+            "wfr.json",
+            &sample_wfr_receipt("v2", Some("equivalent")),
+        );
+        run_verify_receipt(vcr_path.to_str().unwrap(), &key_hex())
+            .expect("VCR dispatches to the VCR path");
+        run_verify_receipt(l2_path.to_str().unwrap(), &key_hex())
+            .expect("L2 dispatches to the L2 path");
+        run_verify_receipt(wfr_path.to_str().unwrap(), &key_hex())
+            .expect("WFR dispatches to the WFR path");
     }
 }
