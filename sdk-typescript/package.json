@@ -2,7 +2,13 @@
   "name": "@tokentrimmer/client",
   "version": "0.1.0",
   "description": "Thin wrapper around the OpenAI Node SDK that routes through TokenTrimmer Gateway.",
-  "keywords": ["llm", "openai", "anthropic", "gateway", "cost-optimization"],
+  "keywords": [
+    "llm",
+    "openai",
+    "anthropic",
+    "gateway",
+    "cost-optimization"
+  ],
   "homepage": "https://tokentrimmer.com",
   "bugs": "https://github.com/tokentrimmer/tokentrimmer/issues",
   "license": "Apache-2.0",
@@ -34,16 +40,21 @@
       "types": "./dist/vercel.d.ts"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run"
   },
   "peerDependencies": {
-    "openai": "^6.45.0",
+    "@opentelemetry/api": ">=1.0.0 <2.0.0",
     "ai": ">=3.0.0",
-    "@opentelemetry/api": ">=1.0.0 <2.0.0"
+    "openai": "^6.45.0",
+    "unpdf": "^1.0.0"
   },
   "peerDependenciesMeta": {
     "openai": {
@@ -54,14 +65,18 @@
     },
     "@opentelemetry/api": {
       "optional": true
+    },
+    "unpdf": {
+      "optional": true
     }
   },
   "devDependencies": {
-    "openai": "^6.45.0",
     "@opentelemetry/api": "^1.9.0",
+    "@types/node": "^26.1.0",
+    "openai": "^6.45.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.9",
-    "@types/node": "^26.1.0"
+    "unpdf": "^1.6.2",
+    "vitest": "^4.1.9"
   },
   "engines": {
     "node": ">=18"
