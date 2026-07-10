@@ -23,6 +23,8 @@
 //! distills fresh) + a no-op on upsert (the next run re-tries). The cache is a
 //! pure optimization — it must never be able to break a workflow run.
 
+use uuid::Uuid;
+
 /// A cached distillation result (mirrors `document_lane::seam::DistillOutcome`'s
 /// success shape + the `flow_doc_distill_cache` row). The engine stores the
 /// distilled text + its provenance; a hit skips the sidecar call entirely.
@@ -72,6 +74,89 @@ impl DistillCacheStore for NoCache {
         None
     }
     async fn upsert(&self, _key: &DistillCacheKey, _doc: &CachedDistill) {}
+}
+
+/// The concrete per-org distillation reuse cache backed by the
+/// `flow_doc_distill_cache` table (cloud migration `0044`). Constructed per-run
+/// with the org_id + the gateway's Postgres pool; the `get`/`upsert` scope to
+/// that org (`WHERE org_id = $1` — one org's distillation never served to
+/// another). The cache fails OPEN: any DB error → `None` on get (the node
+/// distills fresh) + a no-op on upsert (the next run re-tries + re-stores).
+///
+/// Rows expire after 30 days (the table's partial expiry index); a
+/// re-distillation after expiry is byte-identical (the extraction is a
+/// deterministic function of the source bytes).
+pub struct FlowDocDistillCache<'a> {
+    pub org_id: Uuid,
+    pub pool: &'a sqlx::PgPool,
+}
+
+const GET_SQL: &str = r#"
+    SELECT distilled_text, pages, engine
+      FROM flow_doc_distill_cache
+     WHERE org_id = $1
+       AND content_hash = $2
+       AND COALESCE(caller_key, '') = COALESCE($3, '')
+       AND distilled_at >= now() - INTERVAL '30 days'
+     LIMIT 1
+"#;
+
+const UPSERT_SQL: &str = r#"
+    INSERT INTO flow_doc_distill_cache
+        (org_id, content_hash, caller_key, distilled_text, pages, engine)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT (org_id, content_hash, COALESCE(caller_key, ''))
+    DO UPDATE SET
+        distilled_text = EXCLUDED.distilled_text,
+        pages          = EXCLUDED.pages,
+        engine         = EXCLUDED.engine,
+        distilled_at   = now()
+"#;
+
+#[async_trait::async_trait]
+impl<'a> DistillCacheStore for FlowDocDistillCache<'a> {
+    async fn get(&self, key: &DistillCacheKey) -> Option<CachedDistill> {
+        // Fail-open: any DB error (no table yet, unreachable, decode) → None.
+        sqlx::query_as::<_, FlowDocDistillRow>(GET_SQL)
+            .bind(self.org_id)
+            .bind(&key.content_hash)
+            .bind(&key.caller_key)
+            .fetch_optional(self.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(Into::into)
+    }
+
+    async fn upsert(&self, key: &DistillCacheKey, doc: &CachedDistill) {
+        // Fail-open: an upsert error is swallowed (the next run re-tries).
+        let _ = sqlx::query(UPSERT_SQL)
+            .bind(self.org_id)
+            .bind(&key.content_hash)
+            .bind(&key.caller_key)
+            .bind(&doc.text)
+            .bind(doc.pages as i32)
+            .bind(&doc.engine)
+            .execute(self.pool)
+            .await;
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct FlowDocDistillRow {
+    distilled_text: String,
+    pages: i32,
+    engine: String,
+}
+
+impl From<FlowDocDistillRow> for CachedDistill {
+    fn from(row: FlowDocDistillRow) -> Self {
+        CachedDistill {
+            text: row.distilled_text,
+            pages: row.pages.max(0) as u32,
+            engine: row.engine,
+        }
+    }
 }
 
 #[cfg(test)]

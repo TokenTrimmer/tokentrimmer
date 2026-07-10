@@ -639,6 +639,7 @@ pub async fn create_run(
             run_id,
         };
         let mut journal_entries: Vec<engine::NodeJournalEntry> = Vec::new();
+        let cache = engine::FlowDocDistillCache { org_id: org, pool };
         let result = engine::run_workflow(
             &executor,
             &def,
@@ -649,7 +650,7 @@ pub async fn create_run(
             &secrets,
             0,
             &[],
-            &engine::NoCache,
+            &cache,
         )
         .await;
         let status_str = persist_run_results(pool, run_id, org, journal_entries, &result).await;
@@ -706,6 +707,19 @@ pub async fn create_run(
                 run_id,
             };
             let mut journal_entries: Vec<engine::NodeJournalEntry> = Vec::new();
+            // The cache borrows the pool from `owned_state` (the spawned task's
+            // own state clone), not the outer `state` (which the borrow-checker
+            // flags as not living long enough across the 'static spawn). No pool
+            // → fall back to `NoCache` (the Document node distills fresh).
+            let no_cache = engine::NoCache;
+            let pool_cache: Option<engine::FlowDocDistillCache<'_>> = owned_state
+                .db_pool
+                .as_ref()
+                .map(|pool| engine::FlowDocDistillCache { org_id: org, pool });
+            let cache: &dyn engine::DistillCacheStore = match &pool_cache {
+                Some(c) => c,
+                None => &no_cache,
+            };
             let result = engine::run_workflow(
                 &executor,
                 &def,
@@ -716,7 +730,7 @@ pub async fn create_run(
                 &secrets,
                 0,
                 &[],
-                &engine::NoCache,
+                cache,
             )
             .await;
             // Persist node runs + finalize (best-effort, mirrors sync path).
