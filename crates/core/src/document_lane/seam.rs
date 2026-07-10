@@ -6,7 +6,11 @@
 //! request). When the route opted in + the request carries document/image
 //! content parts, the sidecar distills each to text; the parts are swapped for
 //! `ContentPart::Text` so routing can downgrade to a text model + the request
-//! is billed at text-model rates.
+//! is billed at text-model rates. The isolated `doc_vision_saved_est_usd`
+//! saving (D4c-v2) is booked from the [`DistillBookkeeping`] the seam returns —
+//! the raw image tokens the request WOULD have sent vs the distilled text tokens
+//! it now sends, priced at the served model's input rate via D0's
+//! `document_projection::project`.
 //!
 //! # Fail-open (the production posture)
 //! Mirrors the sidecar client's fail-open: sidecar disabled (`TT_DOC_SIDECAR_URL`
@@ -15,22 +19,28 @@
 //! vision model as before. The seam is a pure optimization — it must never be
 //! able to break a request. Error blobs are never distilled (`should_distill`
 //! stays false). The default-CLOSED [`DocDistillGate`] means lossy substitution
-//! never happens unless an operator opts in.
+//! never happens unless an operator opts in. A part whose extraction fails is
+//! left verbatim AND contributes nothing to the bookkeeping — the saving is
+//! never over-booked for a part we did not actually replace.
 //!
 //! # The v1 scope (honest)
 //! v1 distills INLINE base64 document/image bytes (URL parts are NOT fetched —
 //! a future slice that resolves URLs to bytes, with the SSRF posture the `http`
 //! workflow node already enforces). Lossless extractions (PDF text layers)
 //! substitute without the judge; LOSSY extractions (OCR images) require the
-//! [`DocDistillGate`] + the 0.90 floor. The isolated `doc_vision_saved_est_usd`
-//! saving is booked via D0's `document_projection` (the raw image tokens the
-//! request WOULD have sent vs the distilled text tokens, priced at input rate).
-//! **Gemini direction guard:** the saving is $0 for Gemini-targeted downgrades
-//! (Gemini's multimodal pricing model is non-comparable; never claim a saving
-//! the provider's invoice would contradict).
+//! [`DocDistillGate`] + the 0.90 floor. **Gemini direction guard:** the booked
+//! saving is $0 for Gemini-targeted downgrades (Gemini prices page-images flat
+//! and cheaper than distilled text; never claim a saving the provider's invoice
+//! would contradict — the guard lives in `document_projection::project`).
+
+use base64::Engine as _;
 
 use tt_shared::messages::{
     ChatCompletionRequest, ContentPart, DocumentSource, Message, MessageContent,
+};
+use tt_tokenize::estimate_tokens_for_model;
+use tt_tokenize::image_tokens::{
+    estimate_image_tokens, image_dims_from_bytes, ImageDetail, FALLBACK_IMAGE_DIM,
 };
 
 use super::{sidecar_client, DocDistillGate, SpanFidelity};
@@ -81,6 +91,31 @@ pub(crate) enum DistillOutcome {
     Distilled { text: String, lossless: bool },
 }
 
+/// The bookkeeping a [`distill_request_parts`] call accrues so the handler can
+/// book the isolated `doc_vision_saved_est_usd` (D4c-v2). Only parts that were
+/// ACTUALLY substituted contribute — a part that failed extraction / the sidecar
+/// is disabled contributes nothing (the saving is never over-booked).
+///
+/// - `raw_image_tokens` — the input tokens the distilled-away IMAGE parts WOULD
+///   have spent at the served model (`estimate_image_tokens` on each image's
+///   decoded dims; a PDF/audio/other document part has no pixel-token analogue
+///   and contributes 0 here — its saving is the text tokens it displaced, below).
+/// - `distilled_text_tokens` — the input tokens the substituted `ContentPart::Text`
+///   now spends (real BPE, `estimate_tokens_for_model`).
+///
+/// The handler prices both at the served model's input rate via D0's
+/// `document_projection::project` (which applies the Gemini guard + clamps
+/// negatives to 0). All-zero when the sidecar is disabled or nothing distilled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DistillBookkeeping {
+    /// Number of content parts substituted for text (0 when none).
+    pub distilled_parts: usize,
+    /// Raw image input tokens the substituted image parts would have spent.
+    pub raw_image_tokens: u32,
+    /// Distilled-text input tokens the substituted parts now spend.
+    pub distilled_text_tokens: u32,
+}
+
 /// Distill ONE content part's document/image payload to text via the sidecar,
 /// applying the gate. Pure of the request mutation — returns the outcome so the
 /// caller can swap the part.
@@ -119,7 +154,12 @@ pub(crate) async fn distill_part(
     if !lossless
         && !harness.gate.should_distill(
             SpanFidelity::Lossy,
-            1.0, /* TODO: judge recall, D4c v2 */
+            1.0, /* TODO: judge recall — the lossy-substitution quality gate
+                  * (DocDistillGate::should_distill) is still the D4a default-CLOSED
+                  * scaffold; wiring the real recall-of-baseline judge + the 0.90
+                  * floor is a separate slice from the cost-booking work (which is
+                  * done). Lossy spans stay verbatim until then; lossless PDF-text
+                  * layers substitute unconditionally + book their saving now. */
         )
     {
         tracing::debug!(
@@ -137,22 +177,27 @@ pub(crate) async fn distill_part(
 
 /// Walk the request's messages + swap each inline-base64 Document / data-URL
 /// Image part for a `ContentPart::Text` carrying the sidecar's distilled text.
-/// Returns the count of parts distilled (0 when none / the seam early-returned).
+/// Returns a [`DistillBookkeeping`] accrues the raw-image-tokens vs
+/// distilled-text-tokens so the handler can book the isolated `doc_vision_saved_est_usd`
+/// (D4c-v2) — all-zero when none distilled / the seam early-returned.
 ///
-/// v1 distills INLINE base64 document bytes + data-URL image bytes ONLY (remote
-/// URLs are not fetched — a future slice). After substitution, the caller
-/// recomputes `request_has_images`/`request_has_documents` (now false → the
-/// route can downgrade to a text model).
+/// `model` is the SERVED model (the post-routing `target_model` rewrite) — used
+/// to (a) pick the per-provider image-token formula for the raw image tokens +
+/// (b) BPE-encode the distilled text. v1 distills INLINE base64 document bytes +
+/// data-URL image bytes ONLY (remote URLs are not fetched — a future slice).
+/// After substitution, the caller recomputes `request_has_images`/
+/// `request_has_documents` (now false → the route can downgrade to a text model).
 pub(crate) async fn distill_request_parts(
     harness: &DistillHarness,
+    model: &str,
     req: &mut ChatCompletionRequest,
-) -> usize {
+) -> DistillBookkeeping {
     // Early-return: when the sidecar is disabled (the common case), skip the
     // message walk entirely — zero added latency for text traffic.
     if harness.sidecar_url.is_none() {
-        return 0;
+        return DistillBookkeeping::default();
     }
-    let mut distilled = 0usize;
+    let mut booking = DistillBookkeeping::default();
     for message in &mut req.messages {
         // Only User / System / Tool messages carry a `Parts` content the seam
         // mutates (Assistant content is optional + treated as verbatim).
@@ -175,10 +220,13 @@ pub(crate) async fn distill_request_parts(
             }
         };
         for part in parts.iter_mut() {
-            let (media_type, data_b64) = match part {
+            // `is_image` flags the image parts whose raw pixel tokens we accrue
+            // to `raw_image_tokens` (a PDF/audio document part has no pixel-token
+            // analogue — its saving comes entirely from the displaced text tokens).
+            let (media_type, data_b64, is_image) = match part {
                 ContentPart::Document { document } => match &document.source {
                     DocumentSource::Base64 { media_type, data } => {
-                        (media_type.clone(), data.clone())
+                        (media_type.clone(), data.clone(), false)
                     }
                     // v1: URLs are not fetched — leave verbatim.
                     DocumentSource::Url { .. } => continue,
@@ -187,23 +235,47 @@ pub(crate) async fn distill_request_parts(
                 // left verbatim (a future fetch slice).
                 ContentPart::ImageUrl { image_url } => {
                     if let Some((media, b64)) = parse_data_url(&image_url.url) {
-                        (media, b64)
+                        (media, b64, true)
                     } else {
                         continue;
                     }
                 }
                 _ => continue, // Text, audio — not distilled.
             };
-            if let DistillOutcome::Distilled { text, .. } =
+            let DistillOutcome::Distilled { text, .. } =
                 distill_part(harness, &media_type, &data_b64).await
-            {
-                *part = ContentPart::Text { text };
-                distilled += 1;
+            else {
+                // NotADocument / Disabled / ExtractFailed → leave verbatim, accrue
+                // nothing (never book a saving for a part we did not replace).
+                continue;
+            };
+            // Accrue the raw image tokens the substituted image WOULD have spent.
+            // Only image parts contribute (a PDF document's pixels are not billed
+            // as image tokens — the sidecar extracted its text layer). Un-decodable
+            // dims → the nominal square (mirrors tt-preview's fallback).
+            if is_image {
+                let dims = image_dims_from_decoded_b64(&data_b64)
+                    .unwrap_or((FALLBACK_IMAGE_DIM, FALLBACK_IMAGE_DIM));
+                booking.raw_image_tokens =
+                    booking
+                        .raw_image_tokens
+                        .saturating_add(estimate_image_tokens(
+                            model,
+                            dims.0,
+                            dims.1,
+                            ImageDetail::Auto,
+                        ));
             }
-            // NotADocument / Disabled / ExtractFailed → leave the part verbatim.
+            // Accrue the distilled text tokens the substituted part now spends
+            // (real BPE; provider "" → o200k proxy, a sound directional estimate).
+            booking.distilled_text_tokens = booking
+                .distilled_text_tokens
+                .saturating_add(estimate_tokens_for_model("", model, &text));
+            *part = ContentPart::Text { text };
+            booking.distilled_parts += 1;
         }
     }
-    distilled
+    booking
 }
 
 /// Parse a `data:<media>;base64,<payload>` URL into `(media_type, base64_payload)`.
@@ -225,9 +297,39 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
     Some((media_type, payload.to_string()))
 }
 
+/// Decode a bounded prefix of a standard-base64 image payload + read its
+/// `(width, height)` via the shared header-only parser. Returns `None` when the
+/// base64 is malformed or the header is an unsupported/truncated format — the
+/// caller then falls back to the nominal square. Bounds the decode to a header
+/// prefix (PNG/JPEG dims live in the first bytes) so a multi-megabyte inline
+/// image is not fully decoded just to read its dimensions. Mirrors the bounded
+/// decode in `tt-preview::token_estimator::image_dims_from_data_url`.
+fn image_dims_from_decoded_b64(b64: &str) -> Option<(u32, u32)> {
+    /// Upper bound on the base64 header chars we decode. Enough for a PNG IHDR
+    /// (first 24 bytes) + scanning past typical JPEG APP0/APP1 (EXIF) segments
+    /// to the SOF marker. A multiple of 4 so any prefix slice decodes as whole
+    /// base64 groups (no padding error).
+    const HEADER_B64_CHARS: usize = 65_536;
+    let take = b64.len().min(HEADER_B64_CHARS);
+    let take = take - (take % 4);
+    let prefix = b64.as_bytes().get(..take)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(prefix)
+        .ok()?;
+    image_dims_from_bytes(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Parallel workspace-test exec races env reads/writes across these
+    // env-touching tests (they set/remove TT_DOC_SIDECAR_URL). The lock
+    // serializes them so each sees a consistent env across the `await` that
+    // reads it (mirrors the ml-scoring ENV_LOCK fix from #302, but async-aware
+    // so the guard may legitimately span the mocked-sidecar round-trip).
+    // stdlib `serial_test` would do this too; a local Mutex avoids the dep.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn parse_data_url_extracts_media_and_payload() {
@@ -254,10 +356,11 @@ mod tests {
         assert_eq!(media, "application/octet-stream");
     }
 
-    #[test]
-    fn harness_from_env_is_disabled_without_sidecar_url() {
+    #[tokio::test]
+    async fn harness_from_env_is_disabled_without_sidecar_url() {
         // No env var set → disabled (the common no-sidecar case) + the gate is
         // default-CLOSED (lossy substitution never fires unless opted in).
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("TT_DOC_SIDECAR_URL");
         let h = DistillHarness::from_env();
         assert!(h.sidecar_url.is_none());
@@ -266,6 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn distill_part_returns_disabled_without_sidecar_url() {
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("TT_DOC_SIDECAR_URL");
         let h = DistillHarness::from_env();
         // Disabled path early-returns BEFORE any network — safe to await here.
@@ -273,5 +377,199 @@ mod tests {
             distill_part(&h, "application/pdf", "JVBERi0=").await,
             DistillOutcome::Disabled
         );
+    }
+
+    #[tokio::test]
+    async fn distill_request_parts_disabled_sidecar_is_zero_bookkeeping() {
+        // No sidecar URL → the seam early-returns with all-zero bookkeeping — no
+        // mutation, no network, no saving booked (the common no-sidecar case).
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("TT_DOC_SIDECAR_URL");
+        let h = DistillHarness::from_env();
+        let mut req = ChatCompletionRequest {
+            messages: vec![Message::User {
+                content: MessageContent::Parts(vec![ContentPart::Document {
+                    document: tt_shared::messages::DocumentPart {
+                        source: DocumentSource::Base64 {
+                            media_type: "application/pdf".into(),
+                            data: "JVBERi0=".into(),
+                        },
+                        filename: None,
+                    },
+                }]),
+                name: None,
+            }],
+            ..default_request()
+        };
+        let booking = distill_request_parts(&h, "gpt-4o", &mut req).await;
+        assert_eq!(booking, DistillBookkeeping::default());
+        // The document part is left verbatim (fail-open).
+        let Message::User {
+            content: MessageContent::Parts(p),
+            ..
+        } = &req.messages[0]
+        else {
+            panic!("user message parts preserved");
+        };
+        assert!(matches!(p[0], ContentPart::Document { .. }));
+    }
+
+    #[tokio::test]
+    async fn distill_request_parts_books_tokens_for_a_distilled_image() {
+        // A mocked sidecar returns distilled text for the inline 1×1 PNG. The
+        // seam substitutes the image part for text + accrues BOTH the raw image
+        // tokens the image would have spent AND the distilled text tokens.
+        use httpmock::prelude::*;
+        let _guard = ENV_LOCK.lock().await;
+        std::env::set_var("TT_DOC_SIDECAR_URL", "http://unused-set-per-mock");
+        let server = MockServer::start();
+        // Point the harness's client at the mock by overriding the env URL.
+        std::env::set_var("TT_DOC_SIDECAR_URL", server.base_url());
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/extract");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "text": "redacted-text",
+                        "pages": 1,
+                        "spans": [{ "kind": "lossless", "page": 0, "chars": 13 }]
+                    })
+                    .to_string(),
+                );
+        });
+        // A real 1×1 PNG header (decodes to dims (1,1)).
+        const PNG_1X1_B64: &str =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
+        let h = DistillHarness::from_env();
+        let mut req = ChatCompletionRequest {
+            messages: vec![Message::User {
+                content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: tt_shared::messages::ImageUrl {
+                        url: format!("data:image/png;base64,{PNG_1X1_B64}"),
+                        detail: None,
+                    },
+                }]),
+                name: None,
+            }],
+            ..default_request()
+        };
+        let booking = distill_request_parts(&h, "gpt-4o", &mut req).await;
+        mock.assert();
+        assert_eq!(
+            booking.distilled_parts, 1,
+            "the one image part was distilled"
+        );
+        assert!(
+            booking.raw_image_tokens > 0,
+            "the substituted image accrued its raw image tokens"
+        );
+        assert!(
+            booking.distilled_text_tokens > 0,
+            "the distilled text accrued its token count"
+        );
+        // The image part is now a Text part.
+        let Message::User {
+            content: MessageContent::Parts(p),
+            ..
+        } = &req.messages[0]
+        else {
+            panic!("user message parts preserved");
+        };
+        assert!(matches!(p[0], ContentPart::Text { .. }));
+        std::env::remove_var("TT_DOC_SIDECAR_URL");
+    }
+
+    #[tokio::test]
+    async fn distill_request_parts_does_not_book_a_failed_extraction() {
+        // A sidecar 500 → fail-open: the part stays verbatim AND the bookkeeping
+        // stays all-zero (never book a saving for a part we did not replace).
+        use httpmock::prelude::*;
+        let _guard = ENV_LOCK.lock().await;
+        let server = MockServer::start();
+        std::env::set_var("TT_DOC_SIDECAR_URL", server.base_url());
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/extract");
+            then.status(500);
+        });
+        const PNG_1X1_B64: &str =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
+        let h = DistillHarness::from_env();
+        let mut req = ChatCompletionRequest {
+            messages: vec![Message::User {
+                content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: tt_shared::messages::ImageUrl {
+                        url: format!("data:image/png;base64,{PNG_1X1_B64}"),
+                        detail: None,
+                    },
+                }]),
+                name: None,
+            }],
+            ..default_request()
+        };
+        let booking = distill_request_parts(&h, "gpt-4o", &mut req).await;
+        assert_eq!(booking, DistillBookkeeping::default());
+        std::env::remove_var("TT_DOC_SIDECAR_URL");
+    }
+
+    /// The handler's D4c-v2 override prices the seam's bookkeeping via D0's
+    /// `document_projection::project` at the served model's input rate. This pins
+    /// the booking math + the fail-open postures the override relies on (NOT a
+    /// re-test of `project`, which has its own suite): a real distilled image
+    /// books a positive isolated saving; a Gemini-targeted downgrade books $0
+    /// (the direction guard); a no-distill / no-pricing path leaves the field at 0.
+    #[test]
+    fn booking_to_projection_books_isolated_saving_with_gemini_guard() {
+        use tt_shared::pricing::ModelPricing;
+        // A 1024×1024 gpt-4o image (~765 raw image tokens) distilled to ~50 text
+        // tokens @ $5/Mtok input → a positive saving, NEVER folded into tt_saved.
+        let booking = DistillBookkeeping {
+            distilled_parts: 1,
+            raw_image_tokens: 765,
+            distilled_text_tokens: 50,
+        };
+        let pricing = ModelPricing {
+            input_per_million: 5.0,
+            output_per_million: 15.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let proj = tt_preview::document_projection::project(
+            booking.raw_image_tokens,
+            booking.distilled_text_tokens,
+            pricing.input_per_million,
+            "gpt-4o",
+        );
+        assert!(
+            proj.projected_savings_usd > 0.0,
+            "an image-heavy gpt-4o distillation books a positive isolated saving"
+        );
+        // Gemini direction guard: page-images are priced flat + cheaper than
+        // distilled text → the override books $0 for a Gemini-targeted downgrade.
+        let gemini_proj = tt_preview::document_projection::project(
+            booking.raw_image_tokens,
+            booking.distilled_text_tokens,
+            1.0,
+            "gemini-2.5-flash",
+        );
+        assert_eq!(gemini_proj.projected_savings_usd, 0.0);
+        // Fail-open: nothing distilled → the handler's `distilled_parts > 0` gate
+        // skips the override entirely (the field stays at compute_cost_full's 0.0).
+        assert_eq!(DistillBookkeeping::default().distilled_parts, 0);
+    }
+
+    /// A minimal `ChatCompletionRequest` for the seam tests (the seam only walks
+    /// `messages`; the other fields are the default).
+    fn default_request() -> ChatCompletionRequest {
+        serde_json::from_str(r#"{"model":"gpt-4o","messages":[]}"#)
+            .expect("a minimal request deserializes")
     }
 }

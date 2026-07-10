@@ -10,5 +10,9 @@ description = "Shared token estimation (tiktoken cl100k + heuristic fallback) us
 [dependencies]
 tiktoken-rs.workspace = true
 
+[dev-dependencies]
+# Header-only decode of the inline image bytes in the dimension-parser tests.
+base64 = "0.22"
+
 [lints]
 workspace = true

@@ -61,6 +61,87 @@ pub fn formula_for_model(model: &str) -> ImageFormula {
     }
 }
 
+/// Nominal square dimension assumed for an image whose real dimensions can't be
+/// read (an un-decodable header, an unsupported format, an audio/PDF document
+/// part with no pixel-token analogue). Paired with [`ImageDetail::High`] so an
+/// un-inspectable image still prices at a realistic, non-trivial token cost
+/// rather than ~0. Shared by `tt-tokenize` callers + `tt-preview`.
+pub const FALLBACK_IMAGE_DIM: u32 = 1024;
+
+/// Read `(width, height)` from the first bytes of a decoded image by parsing
+/// the image header ONLY — no full decode, no heavy image crate. Supports PNG
+/// (IHDR chunk) and JPEG (SOF marker scan). Returns `None` for any other format,
+/// a truncated header, or a garbage prefix; the caller then falls back to
+/// [`FALLBACK_IMAGE_DIM`].
+///
+/// Pure + allocation-free: the same header bytes the provider would bill on
+/// (PNG dims live in the first 24 bytes; JPEG dims follow the SOF marker past
+/// the EXIF/APP segments). Shared between `tt-preview`'s data-URL path + the
+/// Document Lane D4c-v2 seam (which keeps the raw decoded bytes pre-distillation
+/// so it can book the vision-avoided saving the substituted image represented).
+#[must_use]
+pub fn image_dims_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    png_dims(bytes).or_else(|| jpeg_dims(bytes))
+}
+
+/// PNG dimensions from the IHDR chunk (width/height are big-endian u32 at bytes
+/// 16..24, immediately after the 8-byte signature + IHDR length/type).
+fn png_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 24 || bytes[..8] != SIG {
+        return None;
+    }
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((w, h))
+}
+
+/// JPEG dimensions by scanning segment markers for an SOF (Start-Of-Frame)
+/// marker; the frame header carries height then width as big-endian u16.
+fn jpeg_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    // Must start with SOI (0xFF 0xD8).
+    if bytes.len() < 2 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        // Skip any 0xFF fill bytes to land on the marker code.
+        let mut mp = i;
+        while mp < bytes.len() && bytes[mp] == 0xFF {
+            mp += 1;
+        }
+        if mp >= bytes.len() {
+            break;
+        }
+        let marker = bytes[mp];
+        // Standalone markers with no length payload: SOI/EOI and RSTn/TEM.
+        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) || marker == 0x01 {
+            i = mp + 1;
+            continue;
+        }
+        // Every other marker is followed by a 2-byte big-endian segment length
+        // (which includes those 2 length bytes).
+        let len_hi = *bytes.get(mp + 1)?;
+        let len_lo = *bytes.get(mp + 2)?;
+        let seg_len = u16::from_be_bytes([len_hi, len_lo]) as usize;
+        // SOF0..SOF15 carry the frame dimensions; C4 (DHT), C8 (JPG), CC (DAC)
+        // are NOT frame headers and are excluded.
+        let is_sof = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
+        if is_sof {
+            // FF Cn LenHi LenLo Precision HeightHi HeightLo WidthHi WidthLo
+            let h = u16::from_be_bytes([*bytes.get(mp + 4)?, *bytes.get(mp + 5)?]);
+            let w = u16::from_be_bytes([*bytes.get(mp + 6)?, *bytes.get(mp + 7)?]);
+            return Some((u32::from(w), u32::from(h)));
+        }
+        i = mp + 1 + seg_len.max(2);
+    }
+    None
+}
+
 #[inline]
 fn ceil_div(a: u32, b: u32) -> u32 {
     a.div_ceil(b)
@@ -211,5 +292,53 @@ mod tests {
             estimate_image_tokens("gpt-4o", 0, 0, ImageDetail::High),
             85 + 170
         );
+    }
+
+    // The header-only dimension parser. A real 1x1 PNG header → (1,1); a
+    // truncated/garbage/unsupported prefix → None (the caller falls back).
+    use base64::Engine as _;
+    const PNG_1X1_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMEAWJcCq0AAAAASUVORK5CYII=";
+
+    fn png_1x1_bytes() -> Vec<u8> {
+        base64_decode_header(PNG_1X1_B64)
+    }
+
+    /// Decode the test fixture's base64 payload (the data-URL wrapper is stripped
+    /// at the call site that owns it; the shared parser takes raw image bytes).
+    fn base64_decode_header(b64: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap()
+    }
+
+    #[test]
+    fn image_dims_from_bytes_reads_png() {
+        assert_eq!(image_dims_from_bytes(&png_1x1_bytes()), Some((1, 1)));
+    }
+
+    #[test]
+    fn image_dims_empty_returns_none() {
+        assert_eq!(image_dims_from_bytes(&[]), None);
+    }
+
+    #[test]
+    fn image_dims_garbage_returns_none() {
+        // No PNG signature, no JPEG SOI.
+        assert_eq!(image_dims_from_bytes(&[0x00, 0x01, 0x02, 0x03]), None);
+    }
+
+    #[test]
+    fn image_dims_truncated_png_returns_none() {
+        // A PNG signature but shorter than the 24-byte IHDR tail → None.
+        let mut bytes = png_1x1_bytes();
+        bytes.truncate(20);
+        assert_eq!(image_dims_from_bytes(&bytes), None);
+    }
+
+    #[test]
+    fn image_dims_unsupported_format_returns_none() {
+        // A GIF89a header is a known image format the parser does not read.
+        assert_eq!(image_dims_from_bytes(b"GIF89a rest of the bytes"), None);
     }
 }

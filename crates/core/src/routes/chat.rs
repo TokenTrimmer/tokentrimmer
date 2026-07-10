@@ -918,6 +918,13 @@ pub(crate) struct Prepared {
     pub diff_plan: Option<crate::shaping::diff::DiffPlan>,
     /// Aggregated request-pass effects threaded into the cost computation.
     pub pass_effects: PassEffects,
+    /// Document Lane D4c-v2: the pre-routing distillation seam's bookkeeping (raw
+    /// image tokens the distilled-away image parts would have spent vs the
+    /// distilled text tokens they now spend). All-zero when the route did not opt
+    /// in / the sidecar is disabled / nothing distilled → `complete_once` prices
+    /// it via D0's `document_projection::project` (Gemini guard + fail-open to $0)
+    /// into the isolated `doc_vision_saved_est_usd` counterfactual.
+    pub doc_distill_booking: crate::document_lane::seam::DistillBookkeeping,
     /// Content-aware compression flywheel label (P1a): the dominant content kind
     /// the content_compress backend compacted (`json`/`csv`/`log`), or `None`
     /// when the route did not opt in / nothing compacted. Recorded on the
@@ -1107,6 +1114,7 @@ pub(crate) async fn complete_once(
         format_switch_plan,
         diff_plan,
         pass_effects,
+        doc_distill_booking,
         content_compress_kind,
         minify_applied,
         reasoning_capped,
@@ -1681,7 +1689,7 @@ pub(crate) async fn complete_once(
     } else {
         0
     };
-    let cost_breakdown = compute_cost_full(
+    let mut cost_breakdown = compute_cost_full(
         &response.usage,
         pricing.as_ref(),
         baseline_pricing.as_ref(),
@@ -1692,6 +1700,27 @@ pub(crate) async fn complete_once(
         minify_saved_tokens,
         shape_effects,
     );
+    // Document Lane D4c-v2: price the isolated vision-avoided saving from the
+    // pre-routing seam's bookkeeping (raw image tokens the distilled-away image
+    // parts WOULD have spent vs the distilled text tokens they now spend) via
+    // D0's `document_projection::project`, at the served model's input rate.
+    // `project` applies the Gemini direction guard ($0 for Gemini — page-images
+    // are priced flat and cheaper than distilled text) + clamps negatives to 0.
+    // Fail-open to $0: no pricing, nothing distilled (the common no-sidecar /
+    // no-image path), or a $0 projection → the field stays at its compute_cost_full
+    // default of 0.0. NEVER folded into cost_usd/baseline/tt_saved_usd (it is a
+    // counterfactual the request never sent — not invoice-reconcilable).
+    if doc_distill_booking.distilled_parts > 0 {
+        if let Some(p) = pricing.as_ref() {
+            let proj = tt_preview::document_projection::project(
+                doc_distill_booking.raw_image_tokens,
+                doc_distill_booking.distilled_text_tokens,
+                p.input_per_million,
+                &response.model,
+            );
+            cost_breakdown.doc_vision_saved_est_usd = proj.projected_savings_usd;
+        }
+    }
     if minify_applied {
         crate::metrics::record_minify_estimate(
             route_matched_name.as_deref().unwrap_or("none"),
@@ -1924,9 +1953,11 @@ pub(crate) async fn complete_once(
         // Document Lane D2: token-denominated record of what the lossless
         // doc-compaction pass removed (0 unless the route opted in).
         doc_compaction_tokens_removed: pass_effects.doc_compaction_tokens_removed as i64,
-        // Document Lane D4: ISOLATED, ESTIMATED vision-avoided saving (own
-        // column, migration 0032; never folded into cost/baseline/saved).
-        // Always 0.0 in D4a — the seam that books it is D4c.
+        // Document Lane D4c-v2: ISOLATED, ESTIMATED vision-avoided saving (own
+        // column, migration 0032; never folded into cost/baseline/saved). Priced
+        // from the pre-routing seam's DistillBooking via D0's
+        // document_projection::project (Gemini guard + fail-open); $0 when the
+        // route did not opt in / the sidecar is disabled / nothing distilled.
         doc_vision_saved_est_usd: cost_breakdown.doc_vision_saved_est_usd,
         // Agent-run grain (W0b Task 4): stamped via `attribute_run` below
         // so the ctx→row mapping is independently unit-testable.
@@ -3077,18 +3108,23 @@ pub(crate) async fn prepare(
     // a text model. Fail-open: sidecar disabled / error → the request stays
     // verbatim (no distillation, no downgrade — byte-identical to the no-document-
     // lane path). When `route_document_lane` is false (the default), the seam
-    // early-returns with zero work. The isolated `doc_vision_saved_est_usd`
-    // saving is booked in the cost-breakdown below (TODO D4c-v2: wire the saving
-    // figure once the sidecar returns the projection; v1 distills without booking
-    // the saving, surfacing the capability + the downgrade, with the saving in a
-    // follow-up).
+    // early-returns with zero work. The seam returns the `DistillBookkeeping`
+    // (raw-image-tokens vs distilled-text-tokens, D4c-v2); the isolated
+    // `doc_vision_saved_est_usd` saving is priced from it below, after
+    // `compute_cost_full` builds the breakdown (D0's `document_projection::project`,
+    // served-model input rate, Gemini guard — fail-open to $0 when no pricing /
+    // nothing distilled).
+    let mut doc_distill_booking = crate::document_lane::seam::DistillBookkeeping::default();
     if route_document_lane {
         let harness = crate::document_lane::seam::DistillHarness::from_env();
-        let _distilled = crate::document_lane::seam::distill_request_parts(&harness, req).await;
-        if _distilled > 0 {
+        doc_distill_booking =
+            crate::document_lane::seam::distill_request_parts(&harness, &pass_model, req).await;
+        if doc_distill_booking.distilled_parts > 0 {
             tracing::info!(
                 target: "tokentrimmer.document_lane",
-                distilled_parts = _distilled,
+                distilled_parts = doc_distill_booking.distilled_parts,
+                raw_image_tokens = doc_distill_booking.raw_image_tokens,
+                distilled_text_tokens = doc_distill_booking.distilled_text_tokens,
                 "document-lane seam distilled document/image parts to text"
             );
             // The downgrade is the route's `target_model` rewrite (apply_routing
@@ -3096,13 +3132,7 @@ pub(crate) async fn prepare(
             // swap the image/document parts for text so the text model receives
             // processable input — done above. No capability-flag re-flip is
             // needed (the `has_documents` condition matched pre-routing; the
-            // rewrite is the downgrade).
-            //
-            // TODO D4c-v2: book the isolated `doc_vision_saved_est_usd` saving
-            // via D0's `document_projection::project` (the raw image tokens the
-            // request WOULD have sent vs the distilled text tokens, priced at
-            // the served model's input rate, with the Gemini direction guard).
-            // v1 distills + downgrades without booking the saving figure.
+            // rewrite is the downgrade — see #307).
         }
     }
     let pass_cx = crate::passes::PassContext {
@@ -3554,6 +3584,7 @@ pub(crate) async fn prepare(
         format_switch_plan,
         diff_plan,
         pass_effects,
+        doc_distill_booking,
         content_compress_kind,
         minify_applied,
         reasoning_capped,
@@ -3609,6 +3640,11 @@ async fn handle_streaming(
         format_switch_plan: _,
         diff_plan: _,
         pass_effects,
+        // Streaming defers the D4c-v2 vision-avoided estimate to the non-streaming
+        // path (the seam still ran pre-split, so the distillation + downgrade are
+        // real; the isolated $ figure books $0 on a streamed row — same v1 posture
+        // as `content_compress_kind` / the minify estimate).
+        doc_distill_booking: _,
         // Streaming defers the content_compress isolated estimate + flywheel
         // label to the non-streaming path in v1 (the pass still runs pre-split,
         // so the metered token reduction is real; the isolated estimate books $0

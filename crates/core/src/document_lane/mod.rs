@@ -1,5 +1,12 @@
 //! Document Lane — the pre-routing image/document → text distillation seam.
 //!
+//! This module's prose docs wrap across many `//!` continuation lines (the
+//! D4a–D4c slice history), which trips clippy's `doc_lazy_continuation` /
+//! `doc list item without indentation` lints on the wrapped list-item prose.
+//! Allow them here (mirrors the `quality_gate` module's allow) — the prose is
+//! intentional + indented with `//!   ` for the list continuations.
+#![allow(clippy::doc_lazy_continuation)]
+//!
 //! This module is the D4a **substrate**: it declares the shape the later slices
 //! build on, but performs NO extraction, distillation, or cost reduction.
 //!
@@ -8,10 +15,15 @@
 //!   `false`. No behavior change.
 //! - **D4b:** the out-of-process OCR/parse sidecar + a fail-open Rust client.
 //! - **D4c:** the pre-routing seam in `prepare()` that (when the org/route opts
-//!   in via `RouteAction::document_lane`) distills image/document parts to text,
-//!   flips `request_has_images`/`request_has_documents` false so routing can
-//!   downgrade to a text model, and books the isolated `doc_vision_saved_est_usd`
-//!   — gated by a filled-in [`DocDistillGate`] + the sticky 0.90 auto-pause floor.
+//!   in via `RouteAction::document_lane`) distills image/document parts to text
+//!   so routing's `target_model` rewrite downgrades to a text model, and books
+//!   the isolated `doc_vision_saved_est_usd` counterfactual (D4c-v2: priced from
+//!   the seam's bookkeeping via D0's [`document_projection::project`]). The
+//!   downgrade is the route's `target_model` rewrite, NOT a capability-flag
+//!   re-flip (see #307). The lossy-substitution [`DocDistillGate`] (recall judge
+//!   + the sticky 0.90 auto-pause floor) is STILL the default-CLOSED scaffold —
+//!   lossy spans stay verbatim until that slice; lossless PDF-text layers
+//!   substitute unconditionally + book their saving now.
 //!
 //! Lossy substitution is **opt-in + judge-gated permanently**: the gate is
 //! default-CLOSED and fails open to the verbatim request. Error blobs are never
