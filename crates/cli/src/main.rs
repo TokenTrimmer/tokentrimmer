@@ -252,6 +252,8 @@ enum Command {
     Logout,
     /// Show the resolved API key (masked), its source, and the gateway base URL.
     Whoami,
+    /// Diagnose the setup: base-URL reachability, key validity, gateway vs CLI version, MCP config.
+    Doctor,
     /// Emit a ready-to-paste code snippet using your stored key + gateway base URL.
     Connect {
         /// Output language / format.
@@ -1242,6 +1244,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Whoami => {
             tt_cli::account::whoami()?;
+        }
+        Command::Doctor => {
+            tt_cli::doctor::run().await?;
         }
         Command::Connect { lang, reveal } => {
             if let Err(e) = tt_cli::account::connect(lang, reveal) {
