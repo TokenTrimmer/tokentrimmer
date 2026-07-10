@@ -418,9 +418,7 @@ pub(crate) fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> 
     if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
         if let Ok(value) = value.to_str() {
             let scheme_len = "Bearer ".len();
-            if value.len() > scheme_len
-                && value[..scheme_len].eq_ignore_ascii_case("Bearer ")
-            {
+            if value.len() > scheme_len && value[..scheme_len].eq_ignore_ascii_case("Bearer ") {
                 return Some(value[scheme_len..].to_string());
             }
         }
@@ -481,9 +479,9 @@ mod tests {
     use tt_auth::{ApiKey, Environment, KeyError, KeyStore};
     use uuid::Uuid;
 
+    use super::extract_bearer;
     use crate::middleware::key_cache::{hash_token, KeyVerifyCache};
     use crate::state::AppState;
-    use super::extract_bearer;
 
     // ------------------------------------------------------------------
     // extract_bearer — Authorization: Bearer preference + x-api-key alias.
