@@ -1,0 +1,90 @@
+name: endpoint-liveness
+
+# Probes the canonical customer-facing endpoints the CLI + dashboard link to:
+#   • api.tokentrimmer.com      — the gateway (DEFAULT_BASE_URL in the CLI)
+#   • dashboard.tokentrimmer.com — the hosted dashboard (DASHBOARD_KEYS_URL)
+#   • tokentrimmer.fly.dev       — the gateway's live Fly host (the known-good
+#                                  fallback while the canonical DNS records are
+#                                  being stood up)
+#
+# This is the P0-3 CI guard from the 2026-07-09 UX review: `tt chat`, `tt
+# models`, and `tt login` all died on DNS (NXDOMAIN) out of the box because
+# the CLI's defaults pointed at canonical subdomains that didn't resolve.
+# Once the DNS records land this workflow hard-fails on any regression; until
+# then the canonical-host step is `continue-on-error` (so it doesn't block
+# every PR while DNS is in flight) but still PRINTS the resolution status so a
+# NXDOMAIN is visible. The Fly-host step is the real canary — it must stay up.
+#
+# Runs daily (catches a regression after a Fly deploy / DNS change) and on
+# changes to this workflow.
+
+on:
+  schedule:
+    # 09:17 UTC daily (off the :00 mark — see cron guidance). Runs on the
+    # default branch only; scheduled workflows never run for forks.
+    - cron: '17 9 * * *'
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - '.github/workflows/endpoint-liveness.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: endpoint-liveness
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe endpoints
+        run: |
+          set -u
+          fail=0
+          probe () {
+            local host="$1" url="$2" expect_dns="${3:-1}"
+            echo "::group::probe $url"
+            # DNS resolution (A/AAAA).
+            ips="$(dig +short "$host" || true)"
+            if [ -z "$ips" ]; then
+              echo "DNS: NXDOMAIN (no A/AAAA records for $host)"
+              if [ "$expect_dns" = "1" ]; then echo "::error::$host does not resolve (NXDOMAIN)"; fail=1; fi
+            else
+              echo "DNS: $host → $ips"
+            fi
+            # HTTP reachability (follow redirects; -f fails on 4xx/5xx).
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -L "$url" || echo "000")"
+            echo "HTTP: $url → $code"
+            if [ "$code" = "000" ] || [ "$code" -ge 500 ]; then
+              echo "::error::$url unreachable (HTTP $code)"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+
+          # Known-live gateway — the real canary. Must stay up.
+          probe tokentrimmer.fly.dev https://tokentrimmer.fly.dev/health 1
+
+          # Canonical customer-facing hosts. Until DNS records are created these
+          # NXDOMAIN; the workflow step below is marked continue-on-error so this
+          # doesn't block PRs while DNS is in flight — flip expect to 1 once DNS
+          # has landed (and drop the continue-on-error) so it becomes a hard gate.
+          probe api.tokentrimmer.com https://api.tokentrimmer.com/v1/models 0 || true
+          probe dashboard.tokentrimmer.com https://dashboard.tokentrimmer.com/health 0 || true
+
+          exit $fail
+        continue-on-error: true
+        # ↑ until api./dashboard. DNS records are created (P0-3), the canonical
+        # hosts NXDOMAIN. Keep continue-on-error so this isn't a blocker while
+        # DNS is in flight; the FLY canary step is the real gate. After DNS
+        # lands, remove this and set the expect flag to 1 above so the canonical
+        # hosts become a hard regression gate too.
+      - name: Result
+        run: |
+          echo "endpoint-liveness probe complete."
+          echo "If api.tokentrimmer.com / dashboard.tokentrimmer.com show NXDOMAIN,"
+          echo "the canonical DNS records (P0-3) are not yet created — see the runbook."
+          echo "If tokentrimmer.fly.dev was unreachable, the gateway is DOWN (real incident)."

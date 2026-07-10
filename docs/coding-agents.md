@@ -41,7 +41,9 @@ This page wires the shipped pieces into one 5-minute path.
   (the `.claude/` hooks + the `.tokentrimmer/budgets.toml` PR-cost-gate below).
 - **`tt mcp install --client claude-code`** — autowires the MCP client config
   so Claude Code sees TokenTrimmer's tools.
-- **`tt connect`** — browser-assisted key paste (no manual key copy).
+- **`tt login`** — browser-assisted key paste (opens the dashboard keys page,
+  reads the pasted key; no manual copy). `tt connect` generates SDK-specific
+  connect snippets instead.
 
 ## Two complementary cost gates (don't confuse them)
 
@@ -84,11 +86,15 @@ endemic cost inflation as the codebase evolves.
 
 ```bash
 # 1. Get a gateway key (browser-assisted, no manual copy)
-tt connect
+tt login
 
 # 2. Point Claude Code at the gateway — that's it.
-export ANTHROPIC_BASE_URL=https://api.tokentrimmer.com/v1
-export ANTHROPIC_API_KEY=<your tt_live_ key>
+#    NB: the BASE URL has NO /v1 — Claude Code appends /v1/messages itself,
+#    so /v1 here would double to /v1/v1/messages. Use ANTHROPIC_AUTH_TOKEN
+#    (sent as Authorization: Bearer); ANTHROPIC_API_KEY is sent as x-api-key,
+#    which the gateway also accepts as an auth alias.
+export ANTHROPIC_BASE_URL=https://api.tokentrimmer.com
+export ANTHROPIC_AUTH_TOKEN=<your tt_live_ key>
 
 # 3. (optional) Wire the MCP tools into Claude Code's config
 tt mcp install --client claude-code
@@ -127,9 +133,10 @@ key out-of-band (the stronger posture) to defend against a compromised gateway.
 
 Before the marketing page goes live, run the full loop once on staging:
 
-1. `tt connect` → key works.
-2. `ANTHROPIC_BASE_URL=<staging>/v1` + Claude Code → a non-streaming request +
-   a streaming request both round-trip (the SSE event frames are Anthropic-shaped).
+1. `tt login` → key works.
+2. `ANTHROPIC_BASE_URL=<staging>` (no `/v1` — Claude Code appends `/v1/messages`)
+   + Claude Code → a non-streaming request + a streaming request both round-trip
+   (the SSE event frames are Anthropic-shaped).
 3. A tool-use round-trip (Claude Code's `read_file` / `edit_file` tools) — the
    tool-call blocks translate cleanly both directions.
 4. Set a low `monthly_cap_usd` on a test key → run past it → confirm the 402 +

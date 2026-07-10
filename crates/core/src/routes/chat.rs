@@ -2146,19 +2146,14 @@ pub async fn handler(
             model: req.model.clone(),
         })?;
 
-    // 2. Pull api_key from "Authorization: Bearer <key>" if present. This is
-    //    the customer's TokenTrimmer key — the auth middleware already
-    //    verified it (when configured); we re-read it here only to detect the
-    //    sandbox `tt_test_*` short-circuit.
-    let raw_bearer = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            s.strip_prefix("Bearer ")
-                .or_else(|| s.strip_prefix("bearer "))
-        })
-        .unwrap_or("")
-        .to_string();
+    // 2. Pull the api_key credential (Authorization: Bearer, with x-api-key as
+    //    the Anthropic-SDK alias). This is the customer's TokenTrimmer key — the
+    //    auth middleware already verified it (when configured); we re-read it
+    //    here only to detect the sandbox `tt_test_*` short-circuit. Using the
+    //    shared `extract_bearer` guarantees the x-api-key alias is honored here
+    //    too (so a Claude Code user with ANTHROPIC_API_KEY + a tt_test_* key
+    //    still hits the sandbox path).
+    let raw_bearer = crate::middleware::auth::extract_bearer(&headers).unwrap_or_default();
 
     // Explicit provider pin (X-TokenTrimmer-Provider), applied after routing below.
     let provider_pin = provider_override_from_header(&headers);

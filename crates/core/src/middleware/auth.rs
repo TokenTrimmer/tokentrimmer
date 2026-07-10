@@ -87,7 +87,7 @@ pub async fn middleware(
     let mut org_id: Option<Uuid> = None;
     let mut api_key_id: Option<Uuid> = None;
 
-    if let Some(token) = extract_bearer(&req) {
+    if let Some(token) = extract_bearer(req.headers()) {
         // tt_test_* short-circuits to a synthetic sandbox response in the chat
         // handler — no key-store verify and no provider/credential dispatch. It
         // must NOT, however, bypass the per-IP rate cap: an unauthenticated
@@ -403,22 +403,38 @@ fn verify_cap_response(retry_after_secs: u64) -> Response {
     resp
 }
 
-/// Pull the bearer string out of `Authorization: Bearer <token>` if present.
-/// Tolerant of casing variations on the scheme name.
-fn extract_bearer(req: &Request) -> Option<String> {
-    let value = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    let scheme_len = "Bearer ".len();
-    if value.len() <= scheme_len {
-        return None;
+/// Pull the credential out of the request headers, preferring
+/// `Authorization: Bearer` and falling back to the `x-api-key` header as an
+/// alias. Tolerant of casing variations on the scheme name.
+///
+/// The `x-api-key` alias exists so a naive Claude Code / Anthropic-SDK setup
+/// works out of the box: the SDK sends `ANTHROPIC_API_KEY` as `x-api-key`
+/// (rather than `ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer`). Without
+/// this alias, the documented "set `ANTHROPIC_API_KEY`" path never
+/// authenticates. We prefer Bearer when both are present (it's the explicit
+/// gateway-native scheme); `x-api-key` is purely a convenience alias.
+pub(crate) fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+    // Prefer Authorization: Bearer <token>.
+    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(value) = value.to_str() {
+            let scheme_len = "Bearer ".len();
+            if value.len() > scheme_len
+                && value[..scheme_len].eq_ignore_ascii_case("Bearer ")
+            {
+                return Some(value[scheme_len..].to_string());
+            }
+        }
     }
-    if !value[..scheme_len].eq_ignore_ascii_case("Bearer ") {
-        return None;
+    // Fall back to x-api-key: <token> (Anthropic-SDK alias).
+    if let Some(value) = headers.get("x-api-key") {
+        if let Ok(token) = value.to_str() {
+            let token = token.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
     }
-    Some(value[scheme_len..].to_string())
+    None
 }
 
 #[cfg(test)]
@@ -467,6 +483,58 @@ mod tests {
 
     use crate::middleware::key_cache::{hash_token, KeyVerifyCache};
     use crate::state::AppState;
+    use super::extract_bearer;
+
+    // ------------------------------------------------------------------
+    // extract_bearer — Authorization: Bearer preference + x-api-key alias.
+    // The alias (P0-5) lets a naive Claude Code / Anthropic-SDK setup
+    // authenticate: the SDK sends ANTHROPIC_API_KEY as `x-api-key`.
+    // ------------------------------------------------------------------
+    #[test]
+    fn extract_bearer_prefers_authorization_bearer() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("authorization", "Bearer tt_live_abc".parse().unwrap());
+        h.insert("x-api-key", "tt_live_xyz".parse().unwrap());
+        assert_eq!(extract_bearer(&h).as_deref(), Some("tt_live_abc"));
+    }
+
+    #[test]
+    fn extract_bearer_falls_back_to_x_api_key() {
+        // No Authorization header → the x-api-key alias is used.
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-api-key", "tt_live_abc".parse().unwrap());
+        assert_eq!(extract_bearer(&h).as_deref(), Some("tt_live_abc"));
+    }
+
+    #[test]
+    fn extract_bearer_accepts_case_insensitive_scheme() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("authorization", "bearer tt_live_abc".parse().unwrap());
+        assert_eq!(extract_bearer(&h).as_deref(), Some("tt_live_abc"));
+    }
+
+    #[test]
+    fn extract_bearer_returns_none_when_absent() {
+        let h = axum::http::HeaderMap::new();
+        assert_eq!(extract_bearer(&h), None);
+    }
+
+    #[test]
+    fn extract_bearer_ignores_empty_x_api_key() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-api-key", "   ".parse().unwrap());
+        assert_eq!(extract_bearer(&h), None);
+    }
+
+    #[test]
+    fn extract_bearer_ignores_non_bearer_authorization() {
+        // A non-Bearer scheme (e.g. "Basic …") must not yield the rest, and if
+        // no x-api-key is present, returns None (forward-compat with future
+        // schemes — don't accidentally authenticate a Basic auth header).
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        assert_eq!(extract_bearer(&h), None);
+    }
 
     // ------------------------------------------------------------------
     // CountingKeyStore — a KeyStore backed by an interior-mutable HashMap
