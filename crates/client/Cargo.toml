@@ -26,10 +26,31 @@ thiserror.workspace = true
 futures.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
+# Header-only base64 encode for `user_with_document_raw` (the raw-bytes attach
+# path that inlines a file as a ContentPart::Document). Same version the rest of
+# the workspace pins. Unlicense OR MIT.
+base64 = "0.22"
+# Pure-Rust PDF text-layer extractor (no native lib): the doc's own text layer,
+# so produced spans are LOSSLESS (the gateway gate substitutes unconditionally).
+# MIT. Optional behind the `doc_distill` feature — off by default to keep the
+# default client dep-lean. Mirrors the `ocr` feature-gate on `doc-sidecar`.
+pdf-extract = { version = "0.12", optional = true }
+
+[features]
+default = []
+# Client-side document distillation (D3): pull a PDF's text layer locally so a
+# request can arrive pre-distilled (no gateway sidecar round-trip → routes to a
+# text model). Off by default to keep the default client dep-lean; opt in with
+# `--features doc_distill`. Images return an `unsupported` result (OCR is out
+# of scope for the SDK v1).
+doc_distill = ["dep:pdf-extract"]
 
 [dev-dependencies]
 tokio = { workspace = true }
 httpmock.workspace = true
+# Build a valid text-layer PDF fixture in-test (correct xref/offsets) instead of
+# hand-crafting brittle PDF bytes. lopdf is pdf-extract's own parser. MIT.
+lopdf = "0.42"
 
 [lints]
 workspace = true

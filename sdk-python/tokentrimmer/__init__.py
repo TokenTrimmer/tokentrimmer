@@ -35,6 +35,18 @@ from typing import TYPE_CHECKING, Any
 from tokentrimmer import semconv
 from tokentrimmer.agent import Agent, AgentOutcome, Run, RunUsage
 from tokentrimmer.client import StreamCost, TokenTrimmer, TokenTrimmerMeta
+# D3: client-side document distillation. The module imports cleanly without the
+# `doc-distill` extra (pypdf is imported lazily inside `distill_document`), so
+# eager import is safe — `import tokentrimmer` still works with no extras.
+from tokentrimmer.document import (
+    DistilledDocument,
+    DocumentError,
+    EmptyExtraction,
+    UnsupportedDocument,
+    distill_document,
+    user_with_document,
+    user_with_document_raw,
+)
 
 if TYPE_CHECKING:  # for type checkers only — no runtime import of the extra
     from tokentrimmer.integrations._budget import BudgetExceeded
@@ -50,6 +62,16 @@ __all__ = [
     "Run",
     "RunUsage",
     "semconv",
+    # D3: client-side document distillation (PDF text layers). The distill helpers
+    # require the `doc-distill` extra (pypdf) at call time; `user_with_document_raw`
+    # needs no extra.
+    "distill_document",
+    "user_with_document",
+    "user_with_document_raw",
+    "DistilledDocument",
+    "DocumentError",
+    "UnsupportedDocument",
+    "EmptyExtraction",
     # Lazily importable — see __getattr__. The callbacks require their framework
     # extra (`langchain` / `litellm`); BudgetExceeded is dependency-free.
     "TokenTrimmerCostCallback",

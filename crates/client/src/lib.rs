@@ -31,6 +31,12 @@ pub use agent::{AgentBuilder, AgentOutcome, AgentRunRecord, Run, RunStatus, RunU
 mod batch;
 pub use batch::{Batch, BatchCounts};
 
+mod document;
+pub use document::{
+    distill_document, distill_document_bytes, user_with_document, user_with_document_raw,
+    DistilledDocument, DocumentError,
+};
+
 /// Build a `user` message.
 #[must_use]
 pub fn user(content: impl Into<String>) -> Message {

@@ -701,3 +701,17 @@ export class TokenTrimmer extends OpenAI {
  * against it without re-deriving from the OpenAI SDK's internal types.
  */
 export type WithTokenTrimmerMeta<T> = T & { tt: TokenTrimmerMeta };
+
+// D3 — client-side document distillation (the `tt docprep` mirror). Re-exported
+// from ./document.js. The distill helpers require the optional `pdf-parse` peer
+// (imported lazily inside `distillDocument`); `userWithDocumentRaw` needs none.
+export {
+  distillDocument,
+  userWithDocument,
+  userWithDocumentRaw,
+  DocumentError,
+  UnsupportedDocumentError,
+  EmptyExtractionError,
+  type DistilledDocument,
+} from './document.js';
+
