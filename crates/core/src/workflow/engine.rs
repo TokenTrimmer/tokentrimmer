@@ -563,6 +563,7 @@ fn run_workflow_boxed<'a>(
                             cost_usd: 0.0,
                             baseline_cost_usd: 0.0,
                             model_used: None,
+                            doc_vision_saved_est_usd: 0.0,
                         };
                         outputs.insert(node_id.clone(), out);
                         propagate_edges(node_id, def, &mut reachable);
@@ -585,6 +586,7 @@ fn run_workflow_boxed<'a>(
                             cost_usd: 0.0,
                             baseline_cost_usd: 0.0,
                             model_used: None,
+                            doc_vision_saved_est_usd: 0.0,
                         };
                         journal(NodeJournalEntry {
                             node_id: node_id.clone(),
@@ -721,6 +723,7 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     baseline_cost_usd: 0.0,
                                     model_used: None,
+                                    doc_vision_saved_est_usd: 0.0,
                                 };
                                 journal(NodeJournalEntry {
                                     node_id: node_id.clone(),
@@ -882,6 +885,7 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: child.cost_usd,
                                     baseline_cost_usd: child.baseline_cost_usd,
                                     model_used: None,
+                                    doc_vision_saved_est_usd: 0.0,
                                 },
                             );
                         }
@@ -919,6 +923,7 @@ fn run_workflow_boxed<'a>(
                             cost_usd: loop_cost,
                             baseline_cost_usd: loop_baseline,
                             model_used: None,
+                            doc_vision_saved_est_usd: 0.0,
                         };
                         outputs.insert(node_id.clone(), final_out);
                         journal(NodeJournalEntry {
@@ -1083,6 +1088,7 @@ fn run_workflow_boxed<'a>(
                             cost_usd: child_cost,
                             baseline_cost_usd: child_baseline,
                             model_used: None,
+                            doc_vision_saved_est_usd: 0.0,
                         };
                         accrued += out.cost_usd;
                         accrued_baseline += out.baseline_cost_usd;
@@ -1099,6 +1105,120 @@ fn run_workflow_boxed<'a>(
                         emit(WfEvent::NodeDone {
                             node_id: node_id.clone(),
                             cost_usd: child_cost,
+                            run_cost_usd: accrued,
+                            baseline_cost_usd: accrued_baseline,
+                            saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                            budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                        });
+                    }
+
+                    // ---------------------------------------------------------------
+                    // D6 — Document node: distill the document's text layer to text
+                    // the downstream nodes can use. v1 (no cache yet): distills fresh
+                    // via the document_lane seam on every run (the per-org content-hash
+                    // reuse cache `flow_doc_distill_cache` is a follow-up slice that
+                    // skips the sidecar call on a cache hit). Fail-loud: a sidecar
+                    // error / disabled sidecar → an error NodeOutput (the node never
+                    // silently emits raw bytes — a downstream Model node would be
+                    // misled). The isolated `doc_vision_saved_est_usd` is booked $0
+                    // in v1 (the saving is realized on the downstream Model node,
+                    // which sends text-not-image tokens at the served model's rate;
+                    // booking it here would need that model, known only downstream).
+                    NodeKind::Document { source, cache_key } => {
+                        let _ = cache_key; // TODO D6 cache slice: compose into the cache key.
+                                           // v1 distills inline base64 bytes only (the seam's posture);
+                                           // a URL source is rejected at validation + never reaches here.
+                        let (media_type, data_b64) = match source {
+                            tt_shared::messages::DocumentSource::Base64 { media_type, data } => {
+                                (media_type.clone(), data.clone())
+                            }
+                            tt_shared::messages::DocumentSource::Url { .. } => {
+                                let err = "document node source must be base64 (URLs are not fetched in v1)";
+                                journal(NodeJournalEntry {
+                                    node_id: node_id.clone(),
+                                    status: "failed".into(),
+                                    output: None,
+                                    cost_usd: 0.0,
+                                    model_used: None,
+                                    error: Some(err.to_string()),
+                                });
+                                let out = NodeOutput {
+                                    content: serde_json::Value::Null,
+                                    cost_usd: 0.0,
+                                    baseline_cost_usd: 0.0,
+                                    model_used: None,
+                                    doc_vision_saved_est_usd: 0.0,
+                                };
+                                outputs.insert(node_id.clone(), out);
+                                propagate_edges(node_id, def, &mut reachable);
+                                emit(WfEvent::NodeDone {
+                                    node_id: node_id.clone(),
+                                    cost_usd: 0.0,
+                                    run_cost_usd: accrued,
+                                    baseline_cost_usd: accrued_baseline,
+                                    saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                                    budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                                });
+                                continue;
+                            }
+                        };
+                        // Distill via the gateway's Document Lane seam (the same
+                        // extraction a routed chat request runs). Fail-loud on any
+                        // sidecar error / disabled sidecar (the seam returns
+                        // DistillOutcome::Disabled/ExtractFailed).
+                        let harness = crate::document_lane::seam::DistillHarness::from_env();
+                        let distilled_outcome = crate::document_lane::seam::distill_part(
+                            &harness,
+                            &media_type,
+                            &data_b64,
+                        )
+                        .await;
+                        let out = match distilled_outcome {
+                            crate::document_lane::seam::DistillOutcome::Distilled {
+                                text, ..
+                            } => {
+                                let content = serde_json::Value::String(text.clone());
+                                journal(NodeJournalEntry {
+                                    node_id: node_id.clone(),
+                                    status: "completed".into(),
+                                    output: Some(content.clone()),
+                                    cost_usd: 0.0,
+                                    model_used: None,
+                                    error: None,
+                                });
+                                NodeOutput {
+                                    content,
+                                    cost_usd: 0.0,
+                                    baseline_cost_usd: 0.0,
+                                    model_used: None,
+                                    doc_vision_saved_est_usd: 0.0,
+                                }
+                            }
+                            crate::document_lane::seam::DistillOutcome::Disabled
+                            | crate::document_lane::seam::DistillOutcome::ExtractFailed => {
+                                let err = "document node distillation failed (sidecar disabled or errored)";
+                                journal(NodeJournalEntry {
+                                    node_id: node_id.clone(),
+                                    status: "failed".into(),
+                                    output: None,
+                                    cost_usd: 0.0,
+                                    model_used: None,
+                                    error: Some(err.to_string()),
+                                });
+                                NodeOutput {
+                                    content: serde_json::Value::Null,
+                                    cost_usd: 0.0,
+                                    baseline_cost_usd: 0.0,
+                                    model_used: None,
+                                    doc_vision_saved_est_usd: 0.0,
+                                }
+                            }
+                        };
+                        outputs.insert(node_id.clone(), out);
+                        propagate_edges(node_id, def, &mut reachable);
+                        emit(WfEvent::NodeDone {
+                            node_id: node_id.clone(),
+                            cost_usd: 0.0,
                             run_cost_usd: accrued,
                             baseline_cost_usd: accrued_baseline,
                             saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
@@ -1643,6 +1763,7 @@ mod tests {
                     cost_usd: 0.10,
                     baseline_cost_usd: 0.0,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -1652,6 +1773,7 @@ mod tests {
                     cost_usd: 0.15,
                     baseline_cost_usd: 0.0,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -1699,6 +1821,7 @@ mod tests {
                     cost_usd: 0.25,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -1708,6 +1831,7 @@ mod tests {
                     cost_usd: 0.25,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -1755,6 +1879,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -1764,6 +1889,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -1807,6 +1933,7 @@ mod tests {
                 cost_usd: 0.10,
                 baseline_cost_usd: 0.0,
                 model_used: None,
+                doc_vision_saved_est_usd: 0.0,
             },
         )]);
 
@@ -1936,6 +2063,7 @@ mod tests {
                     cost_usd: 0.10,
                     baseline_cost_usd: 0.20,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -1945,6 +2073,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.15,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -1996,6 +2125,7 @@ mod tests {
                     cost_usd: 0.30,
                     baseline_cost_usd: 0.10,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2005,6 +2135,7 @@ mod tests {
                     cost_usd: 0.0,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -2043,6 +2174,7 @@ mod tests {
                     cost_usd: 0.10,
                     baseline_cost_usd: 0.20,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2052,6 +2184,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.15,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -2166,6 +2299,7 @@ mod tests {
                     cost_usd: 0.10,
                     baseline_cost_usd: 0.20,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2175,6 +2309,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.15,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ];
@@ -2309,6 +2444,7 @@ mod tests {
                     cost_usd: 0.10,
                     baseline_cost_usd: 0.20,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2318,6 +2454,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.15,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -2377,6 +2514,7 @@ mod tests {
                         cost_usd: 0.05,
                         baseline_cost_usd: 0.10,
                         model_used: None,
+                        doc_vision_saved_est_usd: 0.0,
                     },
                 ),
                 (
@@ -2386,6 +2524,7 @@ mod tests {
                         cost_usd: 0.07,
                         baseline_cost_usd: 0.12,
                         model_used: None,
+                        doc_vision_saved_est_usd: 0.0,
                     },
                 ),
             ])
@@ -2460,6 +2599,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2469,6 +2609,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -2568,6 +2709,7 @@ mod tests {
                         cost_usd: 0.05,
                         baseline_cost_usd: 0.0,
                         model_used: None,
+                        doc_vision_saved_est_usd: 0.0,
                     },
                 ),
                 (
@@ -2577,6 +2719,7 @@ mod tests {
                         cost_usd: 0.05,
                         baseline_cost_usd: 0.0,
                         model_used: None,
+                        doc_vision_saved_est_usd: 0.0,
                     },
                 ),
             ]
@@ -2715,6 +2858,7 @@ mod tests {
                     cost_usd: 1.0,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2724,6 +2868,7 @@ mod tests {
                     cost_usd: 0.40,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2733,6 +2878,7 @@ mod tests {
                     cost_usd: 0.40,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2742,6 +2888,7 @@ mod tests {
                     cost_usd: 0.40,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -2790,6 +2937,7 @@ mod tests {
                         cost_usd: 0.05,
                         baseline_cost_usd: 0.10,
                         model_used: None,
+                        doc_vision_saved_est_usd: 0.0,
                     },
                 ),
                 (
@@ -2799,6 +2947,7 @@ mod tests {
                         cost_usd: 0.07,
                         baseline_cost_usd: 0.12,
                         model_used: None,
+                        doc_vision_saved_est_usd: 0.0,
                     },
                 ),
             ])
@@ -2869,6 +3018,7 @@ mod tests {
                 cost_usd: 0.15,
                 baseline_cost_usd: 0.30,
                 model_used: None,
+                doc_vision_saved_est_usd: 0.0,
             },
         )]);
 
@@ -2922,6 +3072,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -2931,6 +3082,7 @@ mod tests {
                     cost_usd: 0.07,
                     baseline_cost_usd: 0.0,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -3012,6 +3164,7 @@ mod tests {
                     cost_usd: 0.10,
                     baseline_cost_usd: 0.20,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -3021,6 +3174,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.15,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
@@ -3346,6 +3500,7 @@ mod tests {
                 cost_usd: 0.05,
                 baseline_cost_usd: 0.10,
                 model_used: Some("haiku".into()),
+                doc_vision_saved_est_usd: 0.0,
             },
         )]);
         stub.subworkflows.insert(child_id, child_def);
@@ -3676,6 +3831,7 @@ mod tests {
                 cost_usd: 0.30,
                 baseline_cost_usd: 0.50,
                 model_used: Some("haiku".into()),
+                doc_vision_saved_est_usd: 0.0,
             },
         )]);
         stub.subworkflows.insert(child_id, child_def);
@@ -3775,6 +3931,7 @@ mod tests {
                 cost_usd: 0.01,
                 baseline_cost_usd: 0.02,
                 model_used: Some("haiku".into()),
+                doc_vision_saved_est_usd: 0.0,
             },
         )]);
         stub.subworkflows.insert(child_id, child_def);
@@ -3972,6 +4129,7 @@ mod tests {
                 cost_usd: 0.10,
                 baseline_cost_usd: 0.20,
                 model_used: Some("haiku".into()),
+                doc_vision_saved_est_usd: 0.0,
             },
         )]);
         stub.subworkflows.insert(child_id, child_def);
@@ -4100,6 +4258,7 @@ mod tests {
                 cost_usd: 0.05,
                 baseline_cost_usd: 0.10,
                 model_used: Some("stub-model".into()),
+                doc_vision_saved_est_usd: 0.0,
             },
         )]);
         stub.subworkflows.insert(body_id, body_def);
@@ -4204,6 +4363,7 @@ mod tests {
             cost_usd,
             baseline_cost_usd,
             model_used: Some("stub-model".into()),
+            doc_vision_saved_est_usd: 0.0,
         };
         (def, out)
     }
@@ -4752,6 +4912,7 @@ mod tests {
                     cost_usd: 0.10,
                     baseline_cost_usd: 0.20,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
             (
@@ -4761,6 +4922,7 @@ mod tests {
                     cost_usd: 0.05,
                     baseline_cost_usd: 0.10,
                     model_used: Some("haiku".into()),
+                    doc_vision_saved_est_usd: 0.0,
                 },
             ),
         ]);
