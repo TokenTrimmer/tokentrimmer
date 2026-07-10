@@ -51,9 +51,9 @@
     "test": "vitest run"
   },
   "peerDependencies": {
-    "@opentelemetry/api": ">=1.0.0 <2.0.0",
-    "ai": ">=3.0.0",
     "openai": "^6.45.0",
+    "ai": ">=3.0.0",
+    "@opentelemetry/api": ">=1.0.0 <2.0.0",
     "unpdf": "^1.0.0"
   },
   "peerDependenciesMeta": {
