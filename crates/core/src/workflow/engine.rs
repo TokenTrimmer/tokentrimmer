@@ -66,6 +66,8 @@ use tt_shared::context::SecretString;
 use uuid::Uuid;
 
 use crate::routes::agent_run_budget::budget_reached;
+pub(crate) use crate::workflow::distill_cache::NoCache;
+use crate::workflow::distill_cache::{CachedDistill, DistillCacheKey, DistillCacheStore};
 use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{IntelligenceSpec, NodeExecutor};
 use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
@@ -160,6 +162,7 @@ pub(crate) fn run_workflow<'a>(
     secrets: &'a HashMap<String, SecretString>,
     depth: u32,
     ancestors: &'a [Uuid],
+    cache: &'a dyn DistillCacheStore,
 ) -> BoxFuture<'a, WorkflowRunResult> {
     // Seed a fresh execution counter at the root. The Arc is cloned into every
     // recursive `run_workflow_boxed` call so all nested loops and sub-workflows
@@ -176,6 +179,7 @@ pub(crate) fn run_workflow<'a>(
         depth,
         ancestors,
         executions,
+        cache,
     )
 }
 
@@ -196,6 +200,7 @@ fn run_workflow_boxed<'a>(
     depth: u32,
     ancestors: &'a [Uuid],
     executions: Arc<AtomicU32>,
+    cache: &'a dyn DistillCacheStore,
 ) -> BoxFuture<'a, WorkflowRunResult> {
     Box::pin(async move {
         let mut journal = journal;
@@ -866,6 +871,7 @@ fn run_workflow_boxed<'a>(
                                 depth + 1,
                                 &child_ancestors,
                                 Arc::clone(&executions),
+                                cache,
                             )
                             .await;
                             loop_cost += child.cost_usd;
@@ -1049,6 +1055,7 @@ fn run_workflow_boxed<'a>(
                             depth + 1,
                             &child_ancestors,
                             Arc::clone(&executions),
+                            cache,
                         )
                         .await;
                         // h. Propagate child failure with partial spend.
@@ -1159,13 +1166,60 @@ fn run_workflow_boxed<'a>(
                                     saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
                                     budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
                                 });
+                                done.insert(node_id.clone());
                                 continue;
                             }
                         };
-                        // Distill via the gateway's Document Lane seam (the same
-                        // extraction a routed chat request runs). Fail-loud on any
-                        // sidecar error / disabled sidecar (the seam returns
-                        // DistillOutcome::Disabled/ExtractFailed).
+                        // The cache key: blake3(content_bytes) + the optional
+                        // caller-supplied `cache_key` (substituted against the
+                        // trigger's outputs, like a Transform expr). Per-org
+                        // isolation is the store impl's responsibility — the
+                        // concrete `DistillCacheStore` is constructed per-run with
+                        // the org_id + scopes its get/upsert to that org.
+                        let caller_key = cache_key
+                            .as_ref()
+                            .map(|k| substitute(k, &trigger_id, &outputs));
+                        let content_hash = blake3::hash(data_b64.as_bytes()).to_hex().to_string();
+                        let key = DistillCacheKey {
+                            content_hash,
+                            caller_key,
+                        };
+                        // Cache hit → emit the cached text ($0, no sidecar call).
+                        // Fail-open: a cache error → None → distills fresh.
+                        if let Some(cached) = cache.get(&key).await {
+                            let content = serde_json::Value::String(cached.text.clone());
+                            journal(NodeJournalEntry {
+                                node_id: node_id.clone(),
+                                status: "completed".into(),
+                                output: Some(content.clone()),
+                                cost_usd: 0.0,
+                                model_used: None,
+                                error: None,
+                            });
+                            let out = NodeOutput {
+                                content,
+                                cost_usd: 0.0,
+                                baseline_cost_usd: 0.0,
+                                model_used: None,
+                                doc_vision_saved_est_usd: 0.0,
+                            };
+                            outputs.insert(node_id.clone(), out);
+                            propagate_edges(node_id, def, &mut reachable);
+                            emit(WfEvent::NodeDone {
+                                node_id: node_id.clone(),
+                                cost_usd: 0.0,
+                                run_cost_usd: accrued,
+                                baseline_cost_usd: accrued_baseline,
+                                saved_usd_so_far: (accrued_baseline - accrued).max(0.0),
+                                budget_remaining_usd: run_max_cost_usd.map(|m| m - accrued),
+                            });
+                            done.insert(node_id.clone());
+                            continue;
+                        }
+                        // Cache miss → distill via the gateway's Document Lane
+                        // seam (the same extraction a routed chat request runs).
+                        // Fail-loud on any sidecar error / disabled sidecar (the
+                        // seam returns DistillOutcome::Disabled/ExtractFailed).
                         let harness = crate::document_lane::seam::DistillHarness::from_env();
                         let distilled_outcome = crate::document_lane::seam::distill_part(
                             &harness,
@@ -1177,6 +1231,23 @@ fn run_workflow_boxed<'a>(
                             crate::document_lane::seam::DistillOutcome::Distilled {
                                 text, ..
                             } => {
+                                // Upsert the fresh distillation into the cache
+                                // (fail-open: an upsert error is swallowed — the
+                                // next run re-tries + re-stores). The bookkeeping's
+                                // `pages` is not carried by `distill_part`'s outcome
+                                // (it returns only the joined text); the cached row
+                                // records `pages: 0` + the engine tag (the cache is
+                                // a perf optimization — the page count is advisory).
+                                cache
+                                    .upsert(
+                                        &key,
+                                        &CachedDistill {
+                                            text: text.clone(),
+                                            pages: 0,
+                                            engine: "document_lane::seam".to_string(),
+                                        },
+                                    )
+                                    .await;
                                 let content = serde_json::Value::String(text.clone());
                                 journal(NodeJournalEntry {
                                     node_id: node_id.clone(),
@@ -1789,6 +1860,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -1849,6 +1921,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -1906,6 +1979,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -1948,6 +2022,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -2088,6 +2163,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -2150,6 +2226,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -2200,6 +2277,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
         drop(tx); // close the channel so try_recv returns Disconnected when drained
@@ -2325,6 +2403,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
         drop(tx);
@@ -2339,6 +2418,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -2469,6 +2549,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -2542,6 +2623,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
         assert_eq!(r1.status, WfStatus::Succeeded);
@@ -2572,6 +2654,7 @@ mod tests {
                 &HashMap::new(),
                 0,
                 &[],
+                &NoCache,
             )
             .await;
             assert_eq!(r.status, WfStatus::Succeeded);
@@ -2625,6 +2708,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -2738,6 +2822,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -2905,6 +2990,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -2966,6 +3052,7 @@ mod tests {
                 &HashMap::new(),
                 0,
                 &[],
+                &NoCache,
             )
             .await;
             results.push(r);
@@ -3032,6 +3119,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -3098,6 +3186,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
         drop(tx);
@@ -3189,6 +3278,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -3302,6 +3392,7 @@ mod tests {
             &secrets,
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -3515,6 +3606,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -3648,6 +3740,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -3691,6 +3784,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -3750,6 +3844,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -3846,6 +3941,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -3946,6 +4042,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4049,6 +4146,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4145,6 +4243,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4273,6 +4372,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4439,6 +4539,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4490,6 +4591,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4525,6 +4627,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4572,6 +4675,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4618,6 +4722,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4663,6 +4768,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4872,6 +4978,7 @@ mod tests {
                             &HashMap::new(),
                             0,
                             &[],
+                            &NoCache,
                         )
                         .await;
 
@@ -4937,6 +5044,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4976,6 +5084,7 @@ mod tests {
             &HashMap::new(),
             0,
             &[],
+            &NoCache,
         )
         .await;
 
@@ -4986,6 +5095,218 @@ mod tests {
             "5-iter loop (13 total executions) must not trip the cap; got {:?} (err: {:?})",
             result.status,
             result.error
+        );
+    }
+
+    // ---- D6 Slice 3: Document-node cache ----------------------------------
+
+    /// A recording `DistillCacheStore`: a pre-seeded hit map + an append-only log
+    /// of get/upsert calls. Used to prove the Document node consults the cache
+    /// (hit → cached text, no sidecar; miss → upsert after the distill).
+    struct RecordingCache {
+        /// Pre-seeded cache hits keyed by `content_hash`.
+        hits: std::sync::Mutex<HashMap<String, CachedDistill>>,
+        /// Append-only log of `(op, content_hash)` calls.
+        ops: std::sync::Mutex<Vec<(&'static str, String)>>,
+        /// The text an upsert stores (so a get-after-upsert returns it).
+        upserted: std::sync::Mutex<HashMap<String, CachedDistill>>,
+    }
+
+    impl RecordingCache {
+        fn empty() -> Self {
+            RecordingCache {
+                hits: std::sync::Mutex::new(HashMap::new()),
+                ops: std::sync::Mutex::new(Vec::new()),
+                upserted: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+        fn seed(content_hash: &str, text: &str) -> Self {
+            let cache = Self::empty();
+            cache.hits.lock().unwrap().insert(
+                content_hash.to_string(),
+                CachedDistill {
+                    text: text.to_string(),
+                    pages: 1,
+                    engine: "pdf-extract".to_string(),
+                },
+            );
+            cache
+        }
+        fn ops(&self) -> Vec<(String, String)> {
+            self.ops
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(op, h)| (op.to_string(), h.clone()))
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl DistillCacheStore for RecordingCache {
+        async fn get(&self, key: &DistillCacheKey) -> Option<CachedDistill> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(("get", key.content_hash.clone()));
+            // A hit from the seed OR a prior upsert.
+            self.hits
+                .lock()
+                .unwrap()
+                .get(&key.content_hash)
+                .cloned()
+                .or_else(|| {
+                    self.upserted
+                        .lock()
+                        .unwrap()
+                        .get(&key.content_hash)
+                        .cloned()
+                })
+        }
+        async fn upsert(&self, key: &DistillCacheKey, doc: &CachedDistill) {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(("upsert", key.content_hash.clone()));
+            self.upserted
+                .lock()
+                .unwrap()
+                .insert(key.content_hash.clone(), doc.clone());
+        }
+    }
+
+    /// Build a minimal Trigger → Document → Output flow whose Document node
+    /// sources a base64 PDF whose content hash is `hash_of(data)`.
+    fn doc_node_flow(data: &str) -> WorkflowDefinition {
+        let expected_hash = blake3::hash(data.as_bytes()).to_hex().to_string();
+        let _ = expected_hash; // the node computes this at runtime; here for reference.
+        WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "doc".to_string(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "d".into(),
+                    kind: NodeKind::Document {
+                        source: tt_shared::messages::DocumentSource::Base64 {
+                            media_type: "application/pdf".into(),
+                            data: data.to_string(),
+                        },
+                        cache_key: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "d".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "d".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn document_node_cache_hit_returns_cached_text_no_sidecar() {
+        // A pre-seeded cache hit → the Document node emits the cached text +
+        // does NOT consult the sidecar (no sidecar is configured, so a cache
+        // MISS would fail; the hit short-circuits before the distill).
+        std::env::remove_var("TT_DOC_SIDECAR_URL");
+        let data = "JVBERi0="; // the cached text is keyed on blake3(this).
+        let cache_hash = blake3::hash(data.as_bytes()).to_hex().to_string();
+        let cache = RecordingCache::seed(&cache_hash, "cached-distilled-text");
+        let def = doc_node_flow(data);
+        let result = run_workflow(
+            &StubExecutor::new(vec![]),
+            &def,
+            &json!("go"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &cache,
+        )
+        .await;
+        assert_eq!(result.status, WfStatus::Succeeded);
+        // The cache was consulted (a get), not upserted (no sidecar distill ran).
+        let ops = cache.ops();
+        assert!(ops.iter().any(|(o, _)| o == "get"), "cache get must fire");
+        assert!(
+            !ops.iter().any(|(o, _)| o == "upsert"),
+            "a cache hit must not upsert (no distill ran)"
+        );
+        // The Output node aggregates its upstream (the Document node) — so its
+        // content carries the cached distilled text (the engine's `node_outputs`
+        // is the Output node's collected set, keyed by the Output node id "o").
+        let out_node = result
+            .node_outputs
+            .iter()
+            .find(|(id, _)| id == "o")
+            .expect("output node present")
+            .1
+            .clone();
+        assert_eq!(
+            out_node.content,
+            json!("cached-distilled-text"),
+            "a cache hit → the Output node carries the cached text"
+        );
+    }
+
+    #[tokio::test]
+    async fn document_node_no_cache_no_sidecar_fails_loud() {
+        // NoCache + no sidecar → the Document node fails loud (error output),
+        // the run still Succeeds (a failed node surfaces in its output, not a
+        // run abort — the Output node collects downstream). Mirrors the
+        // fail-loud posture the owner approved.
+        std::env::remove_var("TT_DOC_SIDECAR_URL");
+        let def = doc_node_flow("JVBERi0=");
+        let result = run_workflow(
+            &StubExecutor::new(vec![]),
+            &def,
+            &json!("go"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+        // The Output node carries the Document's fail-loud null output (no cache
+        // hit + no sidecar → the node emits null + journals a failure; the run
+        // itself still Succeeds — a per-node failure surfaces in the node output,
+        // the Output node collects it).
+        assert_eq!(result.status, WfStatus::Succeeded);
+        let out_node = result
+            .node_outputs
+            .iter()
+            .find(|(id, _)| id == "o")
+            .expect("output node present")
+            .1
+            .clone();
+        assert!(
+            out_node.content.is_null(),
+            "no cache + no sidecar → the Document node's fail-loud null propagates to the Output; got: {:?}",
+            out_node.content
         );
     }
 }

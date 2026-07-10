@@ -4,6 +4,7 @@
 //! tasks (W1a Tasks 3–9) will add validate, store, engine, and route
 //! submodules.
 
+pub(crate) mod distill_cache;
 pub mod engine;
 pub mod estimate;
 pub(crate) mod events;
