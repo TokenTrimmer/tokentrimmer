@@ -136,6 +136,29 @@ pub enum NodeKind {
         #[serde(default)]
         max_iters: u32,
     },
+
+    /// D6 — distill a document's text layer to text the downstream nodes can use.
+    ///
+    /// Reuses the gateway's Document Lane seam (`document_lane::seam`) — the same
+    /// extraction the gateway runs on a routed request — so the workflow + the
+    /// gateway agree byte-for-byte on what a doc distills to. The node hashes
+    /// the source bytes (blake3) + checks a per-org content-addressed distillation
+    /// reuse cache (`flow_doc_distill_cache`): a hit returns the cached text
+    /// ($0, no sidecar call); a miss calls the sidecar, stores the result, +
+    /// returns it. Fail-loud: a cache-miss with the sidecar unreachable/erroring
+    /// emits an error `NodeOutput` (no distilled text) — the node never silently
+    /// emits raw bytes.
+    ///
+    /// v1 scope: `source` must be a `DocumentSource::Base64` (inline bytes). URLs
+    /// are rejected (the seam's v1 doesn't fetch — same posture). `cache_key`, if
+    /// `Some`, is an optional caller-supplied key (e.g. `"{{trigger.input_id}}"`)
+    /// composed into the cache key for explicit reuse control; `None` keys on
+    /// the content hash alone.
+    Document {
+        source: tt_shared::messages::DocumentSource,
+        #[serde(default)]
+        cache_key: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +228,15 @@ pub struct NodeOutput {
     #[serde(default)]
     pub baseline_cost_usd: f64,
     pub model_used: Option<String>,
+    /// D6 — ISOLATED, ESTIMATED vision-avoided saving the node's distillation
+    /// represents (the Document node): priced from the D4c-v2 seam's bookkeeping
+    /// via `document_projection::project` (raw image tokens the request WOULD
+    /// have sent vs the distilled text tokens, Gemini guard). $0 for every other
+    /// node + a cache-hit Document node (no distillation → no saving). NEVER
+    /// folded into `cost_usd`/`baseline_cost_usd`/`saved_usd` (a counterfactual,
+    /// not invoice-reconcilable — mirrors the gateway `CostBreakdown` field).
+    #[serde(default)]
+    pub doc_vision_saved_est_usd: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +352,26 @@ mod tests {
                     version: None,
                 },
             },
+            Node {
+                id: "document".into(),
+                kind: NodeKind::Document {
+                    source: tt_shared::messages::DocumentSource::Base64 {
+                        media_type: "application/pdf".into(),
+                        data: "JVBERi0=".into(),
+                    },
+                    cache_key: None,
+                },
+            },
+            Node {
+                id: "document_cached".into(),
+                kind: NodeKind::Document {
+                    source: tt_shared::messages::DocumentSource::Base64 {
+                        media_type: "application/pdf".into(),
+                        data: "JVBERi0=".into(),
+                    },
+                    cache_key: Some("{{trigger.input_id}}".into()),
+                },
+            },
         ];
 
         for node in &nodes {
@@ -332,6 +384,51 @@ mod tests {
                 serde_json::to_value(&back).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn document_node_roundtrips_and_is_content_stable() {
+        // A Document node deserializes from the canonical wire shape + the
+        // content_hash is stable across re-parses + differs when the source
+        // bytes change (the cache key is content-addressed on those bytes).
+        let json = r#"{"id":"d","type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}}"#;
+        let node: Node = serde_json::from_str(json).unwrap();
+        let NodeKind::Document { source, cache_key } = &node.kind else {
+            panic!("expected a Document node");
+        };
+        assert!(matches!(
+            source,
+            tt_shared::messages::DocumentSource::Base64 { media_type, data }
+                if media_type == "application/pdf" && data == "JVBERi0="
+        ));
+        assert!(cache_key.is_none());
+
+        // Re-serialize + re-parse → identical hash (deterministic serialization).
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "doc-flow".into(),
+            nodes: vec![node.clone()],
+            edges: Vec::new(),
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: Vec::new(),
+        };
+        let h1 = content_hash(&def);
+        let reparsed: WorkflowDefinition =
+            serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
+        assert_eq!(h1, content_hash(&reparsed));
+
+        // Different source bytes → different hash (the content-addressed key).
+        let mut def2 = def.clone();
+        if let NodeKind::Document {
+            source: tt_shared::messages::DocumentSource::Base64 { data, .. },
+            ..
+        } = &mut def2.nodes[0].kind
+        {
+            *data = "different".into();
+        }
+        assert_ne!(h1, content_hash(&def2));
     }
 
     #[test]

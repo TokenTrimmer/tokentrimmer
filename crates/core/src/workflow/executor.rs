@@ -165,6 +165,7 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
                     cost_usd: run.usage.cost_usd,
                     baseline_cost_usd: run.usage.baseline_cost_usd,
                     model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
                 })
             }
             // Workflows don't use client (non-gateway) tools in W1a — the agent
@@ -198,6 +199,7 @@ mod tests {
             cost_usd: 0.10,
             baseline_cost_usd: 0.15,
             model_used: None,
+            doc_vision_saved_est_usd: 0.0,
         };
         assert!(
             (out.baseline_cost_usd - 0.15).abs() < 1e-9,

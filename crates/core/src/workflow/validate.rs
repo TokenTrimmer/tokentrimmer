@@ -241,6 +241,47 @@ pub fn validate(
     }
 
     // ------------------------------------------------------------------
+    // 6c. Document nodes: source must be base64 (v1 doesn't fetch URLs — same
+    // posture as the document_lane seam); the data + media_type must be
+    // non-empty; an optional cache_key, if set, must be non-empty. No SSRF
+    // surface (the node distills inline bytes; remote URLs are a future slice).
+    // ------------------------------------------------------------------
+    for node in &def.nodes {
+        if let NodeKind::Document { source, cache_key } = &node.kind {
+            match source {
+                tt_shared::messages::DocumentSource::Base64 { media_type, data } => {
+                    if media_type.trim().is_empty() {
+                        errors.push(format!(
+                            "node \"{}\": document source media_type must be non-empty",
+                            node.id
+                        ));
+                    }
+                    if data.trim().is_empty() {
+                        errors.push(format!(
+                            "node \"{}\": document source data must be non-empty base64",
+                            node.id
+                        ));
+                    }
+                }
+                tt_shared::messages::DocumentSource::Url { .. } => {
+                    errors.push(format!(
+                        "node \"{}\": document source must be base64 (URLs are not fetched in v1)",
+                        node.id
+                    ));
+                }
+            }
+            if let Some(key) = cache_key {
+                if key.trim().is_empty() {
+                    errors.push(format!(
+                        "node \"{}\": document cache_key, if set, must be non-empty",
+                        node.id
+                    ));
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 7. No cycles — Kahn's algorithm (topological sort).
     //
     // The execution graph is the union of def.edges AND Branch arm targets:
@@ -1221,5 +1262,124 @@ mod tests {
             validate(&def, &any_model).is_ok(),
             "templated path + body with literal host in allowed_hosts must pass"
         );
+    }
+
+    /// A Document node with a base64 source + optional cache_key must validate.
+    #[test]
+    fn document_node_base64_validates() {
+        let def = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "doc".to_string(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "d".into(),
+                    kind: NodeKind::Document {
+                        source: tt_shared::messages::DocumentSource::Base64 {
+                            media_type: "application/pdf".into(),
+                            data: "JVBERi0=".into(),
+                        },
+                        cache_key: Some("{{trigger.input_id}}".into()),
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "d".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "d".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: Vec::new(),
+        };
+        assert!(
+            validate(&def, &any_model).is_ok(),
+            "a base64 Document node must validate"
+        );
+    }
+
+    /// A Document node with a URL source must be rejected (v1 doesn't fetch).
+    #[test]
+    fn document_node_rejects_url_source() {
+        let def = doc_def(tt_shared::messages::DocumentSource::Url {
+            url: "https://example.com/doc.pdf".into(),
+        });
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("base64") && combined.contains("URL"),
+            "expected URL-source rejection; got: {combined}"
+        );
+    }
+
+    /// A Document node with empty base64 data must be rejected.
+    #[test]
+    fn document_node_rejects_empty_data() {
+        let def = doc_def(tt_shared::messages::DocumentSource::Base64 {
+            media_type: "application/pdf".into(),
+            data: "   ".into(),
+        });
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("data") && combined.contains("base64"),
+            "expected empty-data rejection; got: {combined}"
+        );
+    }
+
+    /// Build a minimal Trigger → Document → Output flow with the given source.
+    fn doc_def(source: tt_shared::messages::DocumentSource) -> WorkflowDefinition {
+        WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "doc".to_string(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "d".into(),
+                    kind: NodeKind::Document {
+                        source,
+                        cache_key: None,
+                    },
+                },
+                Node {
+                    id: "o".into(),
+                    kind: NodeKind::Output,
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "t".into(),
+                    to: "d".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "d".into(),
+                    to: "o".into(),
+                    map: None,
+                },
+            ],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: Vec::new(),
+        }
     }
 }

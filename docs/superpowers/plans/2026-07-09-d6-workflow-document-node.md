@@ -1,6 +1,11 @@
 # D6 — Workflow Document node + hash-keyed distillation reuse cache plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax. **STATUS: planned, NOT yet implemented** — this is a larger build than D4c-v2 / D3 (new node kind + engine executor + per-org cache store). Skate-rink it as a full spec before executing.
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax. **STATUS: design decisions RESOLVED 7-09 (owner-approved) → ready to execute.**
+>
+> **Resolved design decisions (owner-approved 7-09):**
+> 1. **Cache store → NEW cloud table + migration.** `flow_doc_distill_cache` keyed `(org_id, content_hash)` → `(text, engine, pages, distilled_at)` + a TTL. Clean separation from the retrieval schema; needs a cloud migration + a cloud-side store fn + a re-pin. The retrieval store's hash-key is the design precedent (not the storage target).
+> 2. **Fail posture → ERROR `NodeOutput` (fail-loud).** A cache-miss with the sidecar unreachable/erroring → the Document node emits an error `NodeOutput` (no distilled text); the engine's error handling decides if the workflow aborts. A node that silently emits raw bytes misleads the downstream Model node.
+> 3. **Cost booking → on `NodeOutput` (reuse the D4c-v2 seam).** The Document node books its OWN isolated `doc_vision_saved_est_usd` on its `NodeOutput` via the D4c-v2 seam's `document_projection::project` (raw_image_tokens vs distilled_text_tokens → the served-model input rate, Gemini guard). The cache-hit (reused) case books $0 (no distillation — only the retrieval cost, ~$0). Add a `doc_vision_saved_est_usd` field to `NodeOutput` (isolated, mirroring the gateway `CostBreakdown` field) — NEVER folded into `cost_usd`/`baseline_cost_usd`/`saved_usd`.
 
 **Goal:** A workflow `Document` node that runs the document-lane distillation as a workflow step + a per-org content-hash distillation reuse cache, so the same PDF distilled once is reused across runs. Reuses the shipped `document_lane::seam` module (`DistillHarness`, `distill_request_parts`) from D4c v1 (#306) + the `content_hash` blake3 precedent.
 
