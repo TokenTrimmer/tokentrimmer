@@ -1,5 +1,12 @@
 //! Document Lane — the pre-routing image/document → text distillation seam.
 //!
+//! This module's prose docs wrap across many `//!` continuation lines (the
+//! D4a–D4c slice history), which trips clippy's `doc_lazy_continuation` /
+//! `doc list item without indentation` lints on the wrapped list-item prose.
+//! Allow them here (mirrors the `quality_gate` module's allow) — the prose is
+//! intentional + indented with `//!   ` for the list continuations.
+#![allow(clippy::doc_lazy_continuation)]
+//!
 //! This module is the D4a **substrate**: it declares the shape the later slices
 //! build on, but performs NO extraction, distillation, or cost reduction.
 //!
