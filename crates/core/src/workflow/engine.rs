@@ -66,8 +66,8 @@ use tt_shared::context::SecretString;
 use uuid::Uuid;
 
 use crate::routes::agent_run_budget::budget_reached;
-pub(crate) use crate::workflow::distill_cache::NoCache;
-use crate::workflow::distill_cache::{CachedDistill, DistillCacheKey, DistillCacheStore};
+use crate::workflow::distill_cache::{CachedDistill, DistillCacheKey};
+pub(crate) use crate::workflow::distill_cache::{DistillCacheStore, FlowDocDistillCache, NoCache};
 use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{IntelligenceSpec, NodeExecutor};
 use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
