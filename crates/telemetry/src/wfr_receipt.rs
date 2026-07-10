@@ -114,13 +114,23 @@ pub fn canonical_payload(receipt: &WfrReceipt) -> Result<String, WfrReceiptError
     let base = match receipt.canonical_version.as_str() {
         CANONICAL_VERSION_V2 => format!(
             "{WFR_PREFIX}v2|{}|{}|{}|{}|{}|{}|{}",
-            receipt.org_id, receipt.workflow_id, receipt.run_id,
-            receipt.cost_micros, receipt.baseline_micros, receipt.saved_micros, receipt.status,
+            receipt.org_id,
+            receipt.workflow_id,
+            receipt.run_id,
+            receipt.cost_micros,
+            receipt.baseline_micros,
+            receipt.saved_micros,
+            receipt.status,
         ),
         CANONICAL_VERSION_V1 => format!(
             "{WFR_PREFIX}v1|{}|{}|{}|{}|{}|{}|{}",
-            receipt.org_id, receipt.workflow_id, receipt.run_id,
-            receipt.cost_micros, receipt.baseline_micros, receipt.saved_micros, receipt.status,
+            receipt.org_id,
+            receipt.workflow_id,
+            receipt.run_id,
+            receipt.cost_micros,
+            receipt.baseline_micros,
+            receipt.saved_micros,
+            receipt.status,
         ),
         other => return Err(WfrReceiptError::UnknownVersion(other.to_string())),
     };
@@ -264,7 +274,10 @@ mod tests {
         let mut r = sample_v1();
         r.canonical_version = "v2".to_string();
         r.quality_verdict = None;
-        assert_eq!(canonical_payload(&r), Err(WfrReceiptError::MissingQualityVerdict));
+        assert_eq!(
+            canonical_payload(&r),
+            Err(WfrReceiptError::MissingQualityVerdict)
+        );
     }
 
     #[test]

@@ -388,7 +388,8 @@ mod tests {
     #[test]
     fn wfr_v1_receipt_verifies_via_dispatch() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_test_wfr_receipt(dir.path(), "wfr-v1.json", &sample_wfr_receipt("v1", None));
+        let path =
+            write_test_wfr_receipt(dir.path(), "wfr-v1.json", &sample_wfr_receipt("v1", None));
         run_verify_receipt(path.to_str().unwrap(), &key_hex())
             .expect("a valid WFR v1 receipt verifies via the dispatch path");
     }

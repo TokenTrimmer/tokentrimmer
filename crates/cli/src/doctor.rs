@@ -19,8 +19,8 @@ use std::time::Duration;
 use anyhow::Context;
 
 use crate::context;
-use crate::ui;
 use crate::mcp_install::{config_path_for, McpClient};
+use crate::ui;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(8);
 const AUTHED_TIMEOUT: Duration = Duration::from_secs(12);
@@ -41,7 +41,10 @@ pub async fn run() -> anyhow::Result<()> {
         Ok(c) => (c.base_url.clone(), c.base_source),
         Err(_) => {
             // No stored config at all → fall back to the default.
-            (context::DEFAULT_BASE_URL.to_string(), context::BaseSource::Default)
+            (
+                context::DEFAULT_BASE_URL.to_string(),
+                context::BaseSource::Default,
+            )
         }
     };
 
@@ -63,7 +66,9 @@ pub async fn run() -> anyhow::Result<()> {
                 Ok(ips) => {
                     if ips.is_empty() {
                         ui::error(&format!("DNS: {host} does not resolve (NXDOMAIN)"));
-                        ui::note("  fix: the base URL's hostname has no DNS A/AAAA record. Point it at");
+                        ui::note(
+                            "  fix: the base URL's hostname has no DNS A/AAAA record. Point it at",
+                        );
                         ui::note("       a live gateway, or `tt login --base-url <live-url>`.");
                         false
                     } else {
@@ -104,7 +109,9 @@ pub async fn run() -> anyhow::Result<()> {
             Err(e) => {
                 ui::error(&format!("gateway: /health unreachable: {e}"));
                 ui::note("  fix: is the gateway running + reachable at the base URL? If the host");
-                ui::note("       resolves but /health 404s, you may be pointing at a non-gateway host.");
+                ui::note(
+                    "       resolves but /health 404s, you may be pointing at a non-gateway host.",
+                );
                 failures += 1;
             }
         }
@@ -115,7 +122,9 @@ pub async fn run() -> anyhow::Result<()> {
         Some(k) => match probe_authed(&models_url, k.expose(), AUTHED_TIMEOUT).await {
             Ok(status) => {
                 if (200..300).contains(&status) {
-                    ui::ok(&format!("key:     GET /v1/models → {status} (authenticated OK)"));
+                    ui::ok(&format!(
+                        "key:     GET /v1/models → {status} (authenticated OK)"
+                    ));
                 } else if status == 401 || status == 403 {
                     ui::error(&format!(
                         "key:     GET /v1/models → {status} (rejected — key invalid or revoked)"
@@ -145,7 +154,9 @@ pub async fn run() -> anyhow::Result<()> {
         ui::success("All checks passed.");
         Ok(())
     } else {
-        ui::error(&format!("{failures} check(s) failed — see the fix hints above."));
+        ui::error(&format!(
+            "{failures} check(s) failed — see the fix hints above."
+        ));
         anyhow::bail!("doctor found {failures} problem(s)")
     }
 }
@@ -155,7 +166,9 @@ pub async fn run() -> anyhow::Result<()> {
 fn resolve_host(host: &str) -> anyhow::Result<Vec<String>> {
     use std::net::ToSocketAddrs;
     // to_socket_addrs needs a host:port; use a dummy port (we only want IPs).
-    let addrs = (host, 443u16).to_socket_addrs().context("DNS lookup failed")?;
+    let addrs = (host, 443u16)
+        .to_socket_addrs()
+        .context("DNS lookup failed")?;
     Ok(addrs.map(|a| a.ip().to_string()).collect())
 }
 
@@ -201,12 +214,15 @@ fn check_mcp_config() {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
     let os = std::env::consts::OS;
-    let clients = [McpClient::ClaudeCode, McpClient::Cursor, McpClient::ClaudeDesktop];
+    let clients = [
+        McpClient::ClaudeCode,
+        McpClient::Cursor,
+        McpClient::ClaudeDesktop,
+    ];
     let mut any = false;
     for c in clients {
-        let home_ref: &std::path::Path = home
-            .as_deref()
-            .unwrap_or_else(|| std::path::Path::new(""));
+        let home_ref: &std::path::Path =
+            home.as_deref().unwrap_or_else(|| std::path::Path::new(""));
         if let Some(path) = config_path_for(c, os, home_ref, appdata.as_deref()) {
             any = true;
             if path.exists() {
