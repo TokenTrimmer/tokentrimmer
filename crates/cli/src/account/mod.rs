@@ -69,6 +69,15 @@ fn store_key(raw: &str, base_url: Option<String>) -> anyhow::Result<()> {
         dir.join("credentials.toml").display(),
         base,
     ));
+    // DX-3: the "first-savings moment" — print a copy-paste next step that ends
+    // in the `saved $X` line the user came for. `tt chat` runs a one-turn request
+    // whose `session:` summary includes `saved $…`. A `tt_test_*` sandbox key
+    // runs this with no real provider spend (verify the setup before signup).
+    if validated.starts_with("tt_test_") {
+        ui::note("  next: `tt chat` → a no-spend sandbox turn that prints saved $…");
+    } else if validated.starts_with("tt_live_") {
+        ui::note("  next: `tt chat` → a real turn that ends with saved $… (or `tt doctor` to verify the setup)");
+    }
     Ok(())
 }
 
