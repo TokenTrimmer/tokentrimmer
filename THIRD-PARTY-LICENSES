@@ -1509,7 +1509,7 @@ Software.
 Used by:
 - [tt-auth 0.1.2](https://github.com/tokentrimmer/tokentrimmer)
 - [tt-cache 0.1.1](https://github.com/tokentrimmer/tokentrimmer)
-- [tt-cli 0.1.0](https://github.com/tokentrimmer/tokentrimmer)
+- [tt-cli 0.2.0](https://github.com/tokentrimmer/tokentrimmer)
 - [tokentrimmer-client 0.1.0](https://github.com/tokentrimmer/tokentrimmer)
 - [tt-config 0.1.0](https://github.com/tokentrimmer/tokentrimmer)
 - [tt-context 0.1.0](https://github.com/tokentrimmer/tokentrimmer)
