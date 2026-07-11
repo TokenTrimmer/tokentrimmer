@@ -14,6 +14,14 @@ use axum::response::sse;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub(crate) enum WfEvent {
+    /// Emitted once at the start of a streaming run, carrying the run's id so
+    /// the client can wire up the Seal-receipt affordance (which gates on
+    /// `run_id`) BEFORE the terminal `run.done`. The engine itself doesn't know
+    /// the run id (it's minted by the caller in `routes/workflows.rs`); the
+    /// caller emits this on the channel before invoking `run_workflow`. P0-8.
+    #[serde(rename = "run.start")]
+    RunStart { run_id: uuid::Uuid },
+
     /// A node has started executing.
     #[serde(rename = "node.start")]
     NodeStart { node_id: String },
@@ -52,6 +60,7 @@ pub(crate) enum WfEvent {
 impl WfEvent {
     fn event_name(&self) -> &'static str {
         match self {
+            WfEvent::RunStart { .. } => "run.start",
             WfEvent::NodeStart { .. } => "node.start",
             WfEvent::NodeDone { .. } => "node.done",
             WfEvent::RunDone { .. } => "run.done",
@@ -106,6 +115,17 @@ mod tests {
         );
 
         // Confirm to_sse does not panic.
+        let _ = ev.to_sse();
+    }
+
+    #[test]
+    fn wf_event_run_start_carries_run_id() {
+        let ev = WfEvent::RunStart {
+            run_id: uuid::Uuid::nil(),
+        };
+        let val = serde_json::to_value(&ev).unwrap();
+        assert_eq!(val["type"], "run.start", "serde tag must be run.start");
+        assert_eq!(val["run_id"], "00000000-0000-0000-0000-000000000000");
         let _ = ev.to_sse();
     }
 

@@ -696,6 +696,12 @@ pub async fn create_run(
         // `secrets` was loaded before the branch so both paths share one DB call.
         let owned_state = state.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
+        // P0-8: emit `run.start { run_id }` BEFORE the engine runs, so the
+        // client's Seal-receipt affordance (which gates on run_id) is reachable
+        // during + after the run. The engine itself doesn't know run_id (it's
+        // minted here in the caller); the terminal `run.done` carries the
+        // totals. `let _ =` because a closed client socket is not a run failure.
+        let _ = tx.send(WfEvent::RunStart { run_id });
         tokio::spawn(async move {
             let executor = GatewayNodeExecutor {
                 state: &owned_state,
