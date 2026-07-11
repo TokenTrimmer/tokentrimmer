@@ -272,6 +272,7 @@ async fn fallback_header_overrides_route_chain() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

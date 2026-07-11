@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
+    routes::chat::{CompletionHeaders, CompletionOutcome, CostBreakdown, Prepared},
     workflow::{
         self,
         engine::{self, WfStatus},
@@ -50,6 +51,7 @@ use crate::{
     },
     AppState, DOGFOOD_ORG_ID,
 };
+use tt_shared::{ChatCompletionResponse, Choice, Message, MessageContent, Usage};
 
 // ---------------------------------------------------------------------------
 // Guards
@@ -783,6 +785,284 @@ pub async fn create_run(
             .keep_alive(KeepAlive::default())
             .into_response())
     }
+}
+
+// ---------------------------------------------------------------------------
+// CO-1: route-triggered workflow detour / shadow (called from chat::complete_once)
+// ---------------------------------------------------------------------------
+//
+// A matched route whose `RouteAction.workflow` is `Some(_)` detours the chat
+// request into the referenced workflow — the flagship cohesion item ("routing
+// rules that detour into governed, receipted multi-step workflows"). DETOUR
+// mode replaces the upstream call (the workflow's final synthesized answer
+// becomes the chat response); SHADOW mode runs the workflow alongside the
+// normal dispatch and records its cost separately (no response substitution).
+//
+// These functions mirror `create_run`'s sync path (load + validate + run +
+// persist) but: (a) draw identity from the already-prepared `Prepared` bundle
+// rather than the HTTP `ApiKeyContext`, (b) reject over-cap projections BEFORE
+// any spend via `estimate_workflow`, and (c) for DETOUR, shape the workflow's
+// final answer into a `ChatCompletionResponse` + a single `provider="workflow"`
+// `request_logs` row (the same sentinel pattern `complete_panel` uses for
+// `provider="panel"`). Streaming workflow detour is unsupported in v1 (the
+// handler warns + falls through to single-model streaming before reaching here).
+
+/// Extract the last user message text from a chat request, as a.workflow
+/// trigger input. Mirrors the message-text extraction in
+/// `shaping::diff::prior_source` (concatenating text parts). Falls back to the
+/// JSON encoding of the whole messages vector when no user message is present
+/// (the workflow still runs; its first node sees an empty/object input).
+fn last_user_message_text(req: &tt_shared::ChatCompletionRequest) -> serde_json::Value {
+    for m in req.messages.iter().rev() {
+        if let Message::User { content, .. } = m {
+            let text = match content {
+                MessageContent::Text(s) => s.clone(),
+                MessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        tt_shared::messages::ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            };
+            return serde_json::Value::String(text);
+        }
+    }
+    // No user message: pass the whole request shape so the workflow's trigger
+    // node still has something to consume (a workflow that ignores its input
+    // still produces its declared output).
+    serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null)
+}
+
+/// Resolve identity + load + validate a workflow definition for a route detour.
+/// Shared by detour + shadow. Returns `(def, version)`.
+async fn load_route_workflow(
+    state: &AppState,
+    ctx: &tt_shared::RequestContext,
+    cfg: &tt_routing::RouteWorkflow,
+) -> ApiResult<(workflow::types::WorkflowDefinition, i32)> {
+    let pool = db_pool(state)?;
+    let workflow_id = cfg.workflow_id.parse::<Uuid>().map_err(|_| {
+        ApiError::InvalidRequest(format!("invalid workflow_id: {}", cfg.workflow_id))
+    })?;
+    let (def, version) = store::get_definition(pool, ctx.org_id, workflow_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {workflow_id}")))?;
+    {
+        let registry = state.registry.clone();
+        validate::validate(&def, &|m| registry.resolve(m).is_some())
+            .map_err(|errors| ApiError::InvalidRequest(errors.join("; ")))?;
+    }
+    Ok((def, version))
+}
+
+/// Run a route-detour workflow in DETOUR mode: the workflow's final synthesized
+/// answer replaces the upstream chat response. Records realized spend ONCE + a
+/// single `provider="workflow"` `request_logs` row, mirroring `complete_panel`'s
+/// billing discipline. Rejects an over-cap projection BEFORE any spend.
+pub(crate) async fn complete_workflow(
+    state: &AppState,
+    ctx: &tt_shared::RequestContext,
+    prep: Prepared,
+    cfg: tt_routing::RouteWorkflow,
+) -> ApiResult<CompletionOutcome> {
+    let (def, _version) = load_route_workflow(state, ctx, &cfg).await?;
+    let pool = db_pool(state)?;
+
+    // Inputs = the last user message text (the workflow's trigger node echoes
+    // `inputs` as its output, which downstream Model nodes substitute via
+    // `{{trigger}}`).
+    let inputs = last_user_message_text(&prep.req);
+
+    // Over-cap rejection BEFORE any spend: a workflow whose projection exceeds
+    // the route's `max_cost_usd` (or the workflow's own budget when the route
+    // caps None) is a 400, never a billed row.
+    let run_max_cost = cfg.max_cost_usd.or(def.budget.max_cost_usd);
+    if let Some(cap) = run_max_cost {
+        let est = estimate::estimate_workflow(&def, &inputs);
+        if est.projected_cost_usd > cap {
+            return Err(ApiError::InvalidRequest(format!(
+                "workflow projects ${:.4}, exceeds route cap ${:.4}",
+                est.projected_cost_usd, cap
+            )));
+        }
+    }
+
+    let run_id = Uuid::new_v4();
+    let secrets = match master_key_from_env() {
+        Some(master) => load_secrets(pool, ctx.org_id, &master).await,
+        None => std::collections::HashMap::new(),
+    };
+    let executor = GatewayNodeExecutor {
+        state,
+        org_id: ctx.org_id,
+        api_key_id: ctx.api_key_id,
+        caller_tier: prep.caller_tier,
+        l2_allowed: prep.l2_allowed,
+        raw_bearer: prep.raw_bearer.clone(),
+        run_id,
+    };
+    let mut journal: Vec<engine::NodeJournalEntry> = Vec::new();
+    let cache = workflow::engine::FlowDocDistillCache {
+        org_id: ctx.org_id,
+        pool,
+    };
+    let result = engine::run_workflow(
+        &executor,
+        &def,
+        &inputs,
+        run_max_cost,
+        |entry| journal.push(entry),
+        None,
+        &secrets,
+        0,
+        &[],
+        &cache,
+    )
+    .await;
+    let status_str = persist_run_results(pool, run_id, ctx.org_id, journal, &result).await;
+
+    // Failed / budget-exhausted workflow → a 502 (mirrors a failed panel: no
+    // client-facing answer, but the run record + journal are already persisted
+    // above so the failure is auditable + receipt-able via the run-inspector).
+    if result.status != WfStatus::Succeeded {
+        return Err(ApiError::ServiceUnavailable(format!(
+            "workflow {run_id} ended {status_str}"
+        )));
+    }
+
+    // NOTE: the workflow's realized spend + per-node `request_logs` rows are
+    // already recorded INSIDE `run_workflow` — every Model node dispatches
+    // through `agent_run::drive_workflow_node` → `chat::complete_once`, which
+    // calls `spend_sink().record()` + `settle()` + writes one `request_logs`
+    // row per node (stamped with `run_id`). So this function must NOT add an
+    // aggregate `record`/`settle` or a second `request_logs` row — that would
+    // DOUBLE-COUNT the org's spend (the bug the adversarial verify caught: the
+    // panel precedent does aggregate-settle because `run_panel` fans out legs
+    // itself, OUTSIDE complete_once; workflows route every node THROUGH
+    // complete_once, so the per-node settle IS the only settle). The aggregate
+    // cost/saved/baseline lives on the `workflow_runs` row (persist_run_results)
+    // + the per-node rows carry the breakdown in `workflow_node_runs`. This
+    // mirrors `create_run` exactly (it does no aggregate settle/row either).
+    let total_cost_usd = result.cost_usd;
+    let trace_id = ctx.trace_id;
+
+    // Shape the workflow's final synthesized answer as a chat completion. The
+    // workflow's Output node's content becomes the assistant message; `model`
+    // echoes the workflow id so the client knows the answer is workflow-sourced.
+    let answer = final_synthesized_answer(&result.node_outputs).unwrap_or_default();
+    let response = ChatCompletionResponse {
+        id: format!("wf-{run_id}"),
+        object: "chat.completion".to_string(),
+        created: chrono::Utc::now().timestamp(),
+        model: cfg.workflow_id.clone(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message::Assistant {
+                content: Some(MessageContent::Text(answer)),
+                tool_calls: Vec::new(),
+                name: None,
+            },
+            finish_reason: Some("stop".to_string()),
+        }],
+        usage: Usage::default(),
+    };
+
+    let cost_breakdown = CostBreakdown {
+        cost_usd: total_cost_usd,
+        baseline_cost_usd: result.baseline_cost_usd,
+        provider_cache_saved_usd: 0.0,
+        flex_saved_usd: 0.0,
+        compression_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        cache_bust_penalty_usd: 0.0,
+        summarizer_tax_usd: 0.0,
+        batch_forgone_usd: 0.0,
+        minify_saved_est_usd: 0.0,
+        diff_saved_usd: 0.0,
+        format_switch_saved_est_usd: 0.0,
+        diff_failed_cost_usd: 0.0,
+        doc_vision_saved_est_usd: 0.0,
+        content_compress_saved_est_usd: 0.0,
+    };
+
+    Ok(CompletionOutcome::Dispatched {
+        response,
+        headers: Box::new(CompletionHeaders {
+            trace_id,
+            provider_id: "workflow".to_string(),
+            model_used: cfg.workflow_id,
+            cost_breakdown,
+            cache_state: "none",
+            route_matched_name: prep.route_matched_name,
+            body_captured: false,
+            req: prep.req,
+            provider: prep.provider,
+            warnings: prep.warnings,
+            panel_body: None,
+        }),
+    })
+}
+
+/// Run a route-detour workflow in SHADOW mode: the workflow runs for its
+/// cost/receipt only, alongside the normal single-model dispatch (which
+/// `complete_once` continues after this returns). Best-effort: any error is
+/// returned as a string and surfaced as a warning, never failing the request.
+pub(crate) async fn run_workflow_shadow(
+    state: &AppState,
+    ctx: &tt_shared::RequestContext,
+    prep: &Prepared,
+    cfg: &tt_routing::RouteWorkflow,
+) -> Result<(), String> {
+    let (def, _version) = load_route_workflow(state, ctx, cfg)
+        .await
+        .map_err(|e| format!("load: {e}"))?;
+    let pool = db_pool(state).map_err(|e| format!("pool: {e}"))?;
+    let inputs = last_user_message_text(&prep.req);
+    let run_max_cost = cfg.max_cost_usd.or(def.budget.max_cost_usd);
+    let run_id = Uuid::new_v4();
+    let secrets = match master_key_from_env() {
+        Some(master) => load_secrets(pool, ctx.org_id, &master).await,
+        None => std::collections::HashMap::new(),
+    };
+    let executor = GatewayNodeExecutor {
+        state,
+        org_id: ctx.org_id,
+        api_key_id: ctx.api_key_id,
+        caller_tier: prep.caller_tier,
+        l2_allowed: prep.l2_allowed,
+        raw_bearer: prep.raw_bearer.clone(),
+        run_id,
+    };
+    let mut journal: Vec<engine::NodeJournalEntry> = Vec::new();
+    let cache = workflow::engine::FlowDocDistillCache {
+        org_id: ctx.org_id,
+        pool,
+    };
+    let result = engine::run_workflow(
+        &executor,
+        &def,
+        &inputs,
+        run_max_cost,
+        |entry| journal.push(entry),
+        None,
+        &secrets,
+        0,
+        &[],
+        &cache,
+    )
+    .await;
+    persist_run_results(pool, run_id, ctx.org_id, journal, &result).await;
+    // NOTE: no aggregate `spend_sink().record()`/`settle()` here. The shadow
+    // workflow's per-node spend is already recorded+settled inside
+    // `run_workflow` (each Model node dispatches through `chat::complete_once`,
+    // which settles). Adding an aggregate settle here would double-count the
+    // org's spend/billed-request counters (the bug the adversarial verify
+    // caught). The normal single-model dispatch that `complete_once` continues
+    // to after this returns records its OWN spend separately — that's correct
+    // (shadow mode doubles upstream spend by design, gated on max_cost_usd).
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

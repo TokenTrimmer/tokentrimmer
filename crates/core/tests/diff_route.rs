@@ -220,6 +220,7 @@ struct Harness {
 /// The default diff-route action; tests tweak individual levers on top.
 fn diff_action() -> RouteAction {
     RouteAction {
+        workflow: None,
         target_model: Some("diff-1".into()),
         fallbacks: Vec::new(),
         disable_cache: false,
@@ -750,6 +751,7 @@ async fn redact_diff_reemit_never_leaks_unredacted_content() {
     let h = app_with_route(
         false,
         RouteAction {
+            workflow: None,
             redact: true,
             ..diff_action()
         },
@@ -838,6 +840,7 @@ async fn canary_control_arm_never_receives_shaping() {
     let h = app_with_route(
         false,
         RouteAction {
+            workflow: None,
             traffic_pct: Some(0),
             ..diff_action()
         },
@@ -875,6 +878,7 @@ async fn canary_control_arm_never_receives_shaping() {
     let h = app_with_route(
         false,
         RouteAction {
+            workflow: None,
             traffic_pct: Some(100),
             ..diff_action()
         },
@@ -906,6 +910,7 @@ async fn conflicting_levers_defend_diff_wins_switch_skipped() {
     let h = app_with_route(
         false,
         RouteAction {
+            workflow: None,
             format_switch: Some("csv".into()),
             ..diff_action()
         },

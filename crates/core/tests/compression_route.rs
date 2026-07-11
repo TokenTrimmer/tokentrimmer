@@ -183,6 +183,7 @@ async fn app_with_compress_route(
             },
             // No model rewrite — compression is a pure request-pass action.
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

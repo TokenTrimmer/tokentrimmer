@@ -193,6 +193,7 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,
@@ -288,6 +289,7 @@ async fn routed_request_reports_savings_against_original_model() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,
@@ -415,6 +417,7 @@ async fn route_for_other_org_does_not_match() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,
@@ -487,6 +490,7 @@ async fn route_skipped_when_no_resolvable_org() {
             enabled: true,
             when: RouteConditions::default(),
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,
@@ -589,6 +593,7 @@ async fn routing_baseline_preserved_in_l1_cache_hit() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,
@@ -746,6 +751,7 @@ async fn not_reasoning_class_route_skips_reasoning_requests() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,
@@ -847,6 +853,7 @@ async fn not_reasoning_class_route_skips_reasoning_requests() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

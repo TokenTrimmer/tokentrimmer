@@ -171,6 +171,7 @@ async fn expensive_request_reroutes_cheap_one_passes_through() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,
@@ -255,6 +256,7 @@ async fn reroute_then_block_on_ceiling() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

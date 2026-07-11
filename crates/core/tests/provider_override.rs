@@ -437,6 +437,7 @@ async fn cross_provider_route_with_fallbacks_pin_does_not_leak_source_credential
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

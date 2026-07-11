@@ -1040,6 +1040,9 @@ mod tests {
     #[test]
     fn route_action_cross_type_lockstep_guard() {
         let gateway = tt_routing::RouteAction {
+            // not mirrored (CO-1 workflow detour is a runtime dispatch path,
+            // not replay-projected) — `None` is omitted from the wire.
+            workflow: None,
             batch: false,
             target_model: Some("gpt-4o-mini".to_string()),
             fallbacks: vec!["claude-haiku-4-5".to_string()],

@@ -361,6 +361,7 @@ async fn privacy_route_disable_cache_beats_force_write() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

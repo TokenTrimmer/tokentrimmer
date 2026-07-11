@@ -305,6 +305,7 @@ async fn app_with_batch_route(model_in: &str, batch: bool) -> Harness {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

@@ -364,6 +364,7 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     ..Default::default()
                 },
                 then: RouteAction {
+                    workflow: None,
                     target_model: Some("gpt-4o-mini".into()),
                     fallbacks: Vec::new(),
                     disable_cache: false,
@@ -404,6 +405,7 @@ async fn build_harness_opts(opts: HarnessOpts) -> Harness {
                     ..Default::default()
                 },
                 then: RouteAction {
+                    workflow: None,
                     format_switch: None,
                     diff: false,
                     auto_pause: false,
@@ -1511,6 +1513,7 @@ async fn build_cross_provider_harness(with_judge_credential: bool) -> CrossProvi
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

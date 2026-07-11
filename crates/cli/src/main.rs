@@ -2299,6 +2299,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
                     ..Default::default()
                 },
                 then: tt_routing::RouteAction {
+                    workflow: None,
                     format_switch: None,
                     diff: false,
                     auto_pause: false,
