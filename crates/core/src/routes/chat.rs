@@ -1995,6 +1995,14 @@ pub(crate) async fn complete_once(
         // Document Lane D2: token-denominated record of what the lossless
         // doc-compaction pass removed (0 unless the route opted in).
         doc_compaction_tokens_removed: pass_effects.doc_compaction_tokens_removed as i64,
+        // TR-2: the conservative `compress` pass's MEASURED saving + token
+        // count (0 unless the route opted into `compress`). The USD figure is
+        // the fee-applied value already on `cost_breakdown` (what the
+        // `X-TokenTrimmer-Compression-Saved-Usd` header carries); the token
+        // count is the raw `pass_effects.compression_tokens_removed`. Both
+        // fold into the saved-usd headline via the baseline fold (above).
+        compression_saved_usd: cost_breakdown.compression_saved_usd,
+        compression_tokens_removed: pass_effects.compression_tokens_removed as i64,
         // Document Lane D4c-v2: ISOLATED, ESTIMATED vision-avoided saving (own
         // column, migration 0032; never folded into cost/baseline/saved). Priced
         // from the pre-routing seam's DistillBooking via D0's
@@ -6642,6 +6650,9 @@ fn request_log_for_l1_hit(
         retrieval_tokens_saved,
         // Cache hits never run the doc-compaction pass (nothing dispatched).
         doc_compaction_tokens_removed: 0,
+        // Cache hits never run the compress pass → 0 (TR-2).
+        compression_saved_usd: 0.0,
+        compression_tokens_removed: 0,
         // Document Lane D4: cache hits never run the seam → 0.
         doc_vision_saved_est_usd: 0.0,
         // run_id/node_id stamped in Task 4 (agentic loop context).
@@ -6726,6 +6737,9 @@ fn request_log_for_l2_hit(
         retrieval_tokens_saved,
         // Cache hits never run the doc-compaction pass (nothing dispatched).
         doc_compaction_tokens_removed: 0,
+        // Cache hits never run the compress pass → 0 (TR-2).
+        compression_saved_usd: 0.0,
+        compression_tokens_removed: 0,
         // Document Lane D4: cache hits never run the seam → 0.
         doc_vision_saved_est_usd: 0.0,
         // run_id/node_id stamped in Task 4 (agentic loop context).
@@ -9914,6 +9928,8 @@ mod telemetry_drain_tests {
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: 0,
             doc_compaction_tokens_removed: 0,
+            compression_saved_usd: 0.0,
+            compression_tokens_removed: 0,
             doc_vision_saved_est_usd: 0.0,
             run_id: None,
             node_id: None,

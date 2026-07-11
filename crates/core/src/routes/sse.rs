@@ -1083,6 +1083,12 @@ pub fn stream_response(
                     // lossless doc-compaction pass removed (0 unless opted in).
                     doc_compaction_tokens_removed: pass_effects.doc_compaction_tokens_removed
                         as i64,
+                    // TR-2: the compress pass's token count (0 unless opted in).
+                    // The streaming row books the USD figure as 0.0 here (mirrors
+                    // diff_saved_usd / doc_vision above — the streaming row is
+                    // attribution-only for these levers).
+                    compression_saved_usd: 0.0,
+                    compression_tokens_removed: pass_effects.compression_tokens_removed as i64,
                     // Document Lane D4: isolated vision-avoided estimate. The
                     // streaming path books $0 in D4a (the seam is D4c).
                     doc_vision_saved_est_usd: 0.0,

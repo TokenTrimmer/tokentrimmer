@@ -1722,6 +1722,9 @@ pub(crate) async fn complete_panel(
             retrieval_tokens_saved: prep.retrieval_telemetry.tokens_saved,
             // Panels never run the doc-compaction pass (multi-member fan-out).
             doc_compaction_tokens_removed: 0,
+            // Panels never run the compress pass → 0 (TR-2).
+            compression_saved_usd: 0.0,
+            compression_tokens_removed: 0,
             // Document Lane D4: panels never run the seam → 0.
             doc_vision_saved_est_usd: 0.0,
             // Panels never run agentic loops; run_id/node_id stay None.

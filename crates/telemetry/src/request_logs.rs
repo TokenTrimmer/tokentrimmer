@@ -216,6 +216,25 @@ pub struct RequestLogRow {
     /// not opt into doc_compaction and for rows predating migration 0031.
     #[serde(default)]
     pub doc_compaction_tokens_removed: i64,
+    /// TR-2 (migration 0037): the MEASURED USD value (fee-applied) of the
+    /// input tokens the lossless conservative `compress` pass
+    /// (`RouteAction::compress`) removed before dispatch —
+    /// `pass_effects.compression_tokens_removed × input rate × fee`. Folds into
+    /// the saved-usd headline via the same baseline fold as
+    /// `doc_compaction_tokens_removed` (the removed tokens raise
+    /// `baseline_cost_usd`, so the saving rides `baseline − cost`). Surfaced on
+    /// `X-TokenTrimmer-Compression-Saved-Usd`. `0.0` when the route did not opt
+    /// into `compress` and for rows predating migration 0037.
+    #[serde(default)]
+    pub compression_saved_usd: f64,
+    /// TR-2 (migration 0037): the pipeline-MEASURED input-token count the
+    /// conservative `compress` pass removed (token-true-gated). The
+    /// token-denominated companion to `compression_saved_usd`, for methodology
+    /// reconciliation + the per-request compression waterfall (TR-1). `0` when
+    /// the route did not opt into `compress` and for rows predating
+    /// migration 0037.
+    #[serde(default)]
+    pub compression_tokens_removed: i64,
     /// Document Lane D4: ISOLATED, ESTIMATED vision-avoided saving (USD, migration
     /// 0032) — the counterfactual value of swapping an image/document part for
     /// distilled text at the pre-routing seam (raw image tokens that WOULD have
@@ -469,6 +488,7 @@ pub mod postgres {
                       retrieval_tokens_saved,
                       run_id, node_id,
                       doc_compaction_tokens_removed,
+                      compression_saved_usd, compression_tokens_removed,
                       doc_vision_saved_est_usd,
                       content_compress_saved_est_usd, content_compress_kind,
                       l2_matched_entry_id, l2_similarity, l2_verdict)
@@ -492,13 +512,14 @@ pub mod postgres {
                       $39,
                       $40, $41,
                       $42,
-                      $43,
-                      $44, $45,
-                      $46, $47, $48)"#;
+                      $43, $44,
+                      $45,
+                      $46, $47,
+                      $48, $49, $50)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 48;
+    pub const INSERT_BIND_COUNT: usize = 50;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -546,12 +567,14 @@ pub mod postgres {
                 .bind(row.run_id) // $40
                 .bind(row.node_id) // $41
                 .bind(row.doc_compaction_tokens_removed) // $42
-                .bind(row.doc_vision_saved_est_usd) // $43
-                .bind(row.content_compress_saved_est_usd) // $44
-                .bind(row.content_compress_kind.as_deref()) // $45
-                .bind(row.l2_matched_entry_id) // $46
-                .bind(row.l2_similarity) // $47
-                .bind(row.l2_verdict.as_deref()) // $48
+                .bind(row.compression_saved_usd) // $43
+                .bind(row.compression_tokens_removed) // $44
+                .bind(row.doc_vision_saved_est_usd) // $45
+                .bind(row.content_compress_saved_est_usd) // $46
+                .bind(row.content_compress_kind.as_deref()) // $47
+                .bind(row.l2_matched_entry_id) // $48
+                .bind(row.l2_similarity) // $49
+                .bind(row.l2_verdict.as_deref()) // $50
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -668,6 +691,8 @@ mod tests {
             diff_failed_cost_usd: 0.0,
             retrieval_tokens_saved: 0,
             doc_compaction_tokens_removed: 0,
+            compression_saved_usd: 0.0,
+            compression_tokens_removed: 0,
             doc_vision_saved_est_usd: 0.0,
             run_id: None,
             node_id: None,
