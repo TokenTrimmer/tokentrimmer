@@ -28,8 +28,8 @@ pub use store::{
 };
 pub use validate::{
     validate_agentic_budget, validate_auto_pause, validate_capability, validate_output_shaping,
-    validate_panel, validate_route_has_effect, validate_shadow_model, ValidationError,
-    PANEL_STRATEGY_VALUES,
+    validate_panel, validate_route_has_effect, validate_shadow_model, validate_workflow,
+    ValidationError, PANEL_STRATEGY_VALUES,
 };
 
 use serde::{Deserialize, Serialize};
@@ -400,6 +400,41 @@ pub struct RouteAction {
     /// dispatch and the rewrite is inert (complete_panel branches first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel: Option<RoutePanel>,
+    /// CO-1: Trigger + configure a governed workflow detour for matched
+    /// requests. None (default) ⇒ no workflow detour. When present, this route
+    /// dispatches the matched request through the named workflow (running it
+    /// through the workflow engine — with per-node budgets, signed receipts,
+    /// etc.) instead of a direct provider call. Mutually exclusive with `panel`
+    /// and `target_model` (validated at route creation). Workflows are non-
+    /// deterministic (same reason panel bypasses cache), so a workflow route
+    /// skips L1+L2. The `mode` controls whether the workflow result REPLACES
+    /// the upstream call (`detour`) or runs alongside it for comparison
+    /// (`shadow` — the workflow result is compared + logged but not returned).
+    /// Excludes the request from the savings headline unless `detour` mode
+    /// produces a cheaper answer than the direct call would have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<RouteWorkflow>,
+}
+
+/// Workflow-route config (CO-1) — an exact structural clone of the `RoutePanel`
+/// seam: a self-contained config that detours dispatch. No competitor gateway
+/// has "routing rules that detour into governed, receipted multi-step workflows."
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RouteWorkflow {
+    /// The workflow definition id to trigger (a UUID string in the workflow
+    /// definitions table). Validated at route creation for existence + org scope.
+    pub workflow_id: String,
+    /// Hard per-run ceiling (USD); the workflow engine's run_max_cost_usd.
+    /// None = inherit the route's max_cost_usd or the workflow's own budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+    /// `"detour"` (default) = the workflow result REPLACES the upstream call.
+    /// `"shadow"` = the workflow runs alongside; its result is compared + logged
+    /// but the direct upstream call's answer is returned. Shadow mode is the
+    /// safe rollout path: verify the workflow produces equivalent answers before
+    /// flipping to detour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// Deep-research panel config for a route-triggered panel (the same panel
@@ -807,6 +842,7 @@ mod tests {
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
                 panel: None,
+                workflow: None,
             },
             paused: false,
         }
@@ -1198,6 +1234,7 @@ mod tests {
             reasoning_budget_tokens: None,
             agentic_budget: None,
             panel: None,
+            workflow: None,
         };
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
@@ -1244,6 +1281,7 @@ mod tests {
             reasoning_budget_tokens: None,
             agentic_budget: None,
             panel: None,
+            workflow: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -1282,6 +1320,7 @@ mod tests {
             reasoning_budget_tokens: None,
             agentic_budget: None,
             panel: None,
+            workflow: None,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
@@ -2415,6 +2454,7 @@ mod tests {
         let a = RouteAction {
             target_model: Some("x".into()),
             panel: None,
+            workflow: None,
             ..Default::default()
         };
         let j = serde_json::to_string(&a).unwrap();

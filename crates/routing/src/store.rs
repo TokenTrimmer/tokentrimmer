@@ -635,6 +635,7 @@ mod tests {
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
                 panel: None,
+                workflow: None,
             },
             paused: false,
         }
@@ -689,6 +690,7 @@ mod tests {
                 reasoning_budget_tokens: None,
                 agentic_budget: None,
                 panel: None,
+                workflow: None,
             },
         };
         let created = s.create_route(org, spec).await.unwrap();
@@ -889,6 +891,7 @@ mod tests {
                         reasoning_budget_tokens: None,
                         agentic_budget: None,
                         panel: None,
+                        workflow: None,
                     },
                 },
             )
