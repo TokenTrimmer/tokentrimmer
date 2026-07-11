@@ -14,6 +14,14 @@ use axum::response::sse;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub(crate) enum WfEvent {
+    /// Emitted once at the start of a streaming run, carrying the run's id so
+    /// the client can wire up the Seal-receipt affordance (which gates on
+    /// `run_id`) BEFORE the terminal `run.done`. The engine itself doesn't know
+    /// the run id (it's minted by the caller in `routes/workflows.rs`); the
+    /// caller emits this on the channel before invoking `run_workflow`. P0-8.
+    #[serde(rename = "run.start")]
+    RunStart { run_id: uuid::Uuid },
+
     /// A node has started executing.
     #[serde(rename = "node.start")]
     NodeStart { node_id: String },
@@ -35,6 +43,14 @@ pub(crate) enum WfEvent {
         budget_remaining_usd: Option<f64>,
     },
 
+    /// A node failed; carries the node id + a sanitized error message so the
+    /// client can badge the failing node red instead of leaving it at "…"
+    /// forever (WF-9). Emitted BEFORE the terminal `run.done status:"failed"`.
+    /// The message is from the engine's error path (HttpError strings are
+    /// sanitized — no url/headers/secrets — see the engine note at the emit site).
+    #[serde(rename = "node.error")]
+    NodeError { node_id: String, message: String },
+
     /// The entire workflow run has finished.
     #[serde(rename = "run.done")]
     RunDone {
@@ -52,8 +68,10 @@ pub(crate) enum WfEvent {
 impl WfEvent {
     fn event_name(&self) -> &'static str {
         match self {
+            WfEvent::RunStart { .. } => "run.start",
             WfEvent::NodeStart { .. } => "node.start",
             WfEvent::NodeDone { .. } => "node.done",
+            WfEvent::NodeError { .. } => "node.error",
             WfEvent::RunDone { .. } => "run.done",
         }
     }
@@ -110,6 +128,17 @@ mod tests {
     }
 
     #[test]
+    fn wf_event_run_start_carries_run_id() {
+        let ev = WfEvent::RunStart {
+            run_id: uuid::Uuid::nil(),
+        };
+        let val = serde_json::to_value(&ev).unwrap();
+        assert_eq!(val["type"], "run.start", "serde tag must be run.start");
+        assert_eq!(val["run_id"], "00000000-0000-0000-0000-000000000000");
+        let _ = ev.to_sse();
+    }
+
+    #[test]
     fn wf_event_run_done_serializes() {
         let ev = WfEvent::RunDone {
             status: "completed".to_string(),
@@ -123,6 +152,19 @@ mod tests {
         assert!(val.get("saved_usd").is_some(), "saved_usd must be present");
         assert_eq!(val["status"], "completed");
 
+        let _ = ev.to_sse();
+    }
+
+    #[test]
+    fn wf_event_node_error_carries_node_id_and_message() {
+        let ev = WfEvent::NodeError {
+            node_id: "step-2".to_string(),
+            message: "http error: connection refused".to_string(),
+        };
+        let val = serde_json::to_value(&ev).unwrap();
+        assert_eq!(val["type"], "node.error", "serde tag must be node.error");
+        assert_eq!(val["node_id"], "step-2");
+        assert_eq!(val["message"], "http error: connection refused");
         let _ = ev.to_sse();
     }
 

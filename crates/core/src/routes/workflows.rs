@@ -94,6 +94,11 @@ pub struct CreateWorkflowRequest {
     /// Per-workflow egress allowlist forwarded to `WorkflowDefinition::allowed_hosts`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Freeform editor metadata forwarded to `WorkflowDefinition::metadata`
+    /// (WF-3: canvas node positions, previously localStorage-only). Optional +
+    /// defaulted so a save without it (an older editor) is unchanged.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 /// Response from `POST /v1/workflows`.
@@ -213,6 +218,9 @@ pub async fn create(
         inputs: body.inputs,
         budget: body.budget,
         allowed_hosts: body.allowed_hosts,
+        // WF-3: forward editor metadata (canvas positions) through to the stored
+        // definition. Body.metadata defaults to Null when the editor omits it.
+        metadata: body.metadata,
     };
 
     // Validate first — returns 400 with the full error list before any DB call.
@@ -696,6 +704,12 @@ pub async fn create_run(
         // `secrets` was loaded before the branch so both paths share one DB call.
         let owned_state = state.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
+        // P0-8: emit `run.start { run_id }` BEFORE the engine runs, so the
+        // client's Seal-receipt affordance (which gates on run_id) is reachable
+        // during + after the run. The engine itself doesn't know run_id (it's
+        // minted here in the caller); the terminal `run.done` carries the
+        // totals. `let _ =` because a closed client socket is not a run failure.
+        let _ = tx.send(WfEvent::RunStart { run_id });
         tokio::spawn(async move {
             let executor = GatewayNodeExecutor {
                 state: &owned_state,
@@ -772,8 +786,96 @@ pub async fn create_run(
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/workflows/secrets — store (or rotate) a per-org secret
+// GET /v1/workflows/:id/runs + GET /v1/workflows/runs/:run_id (WF-6)
 // ---------------------------------------------------------------------------
+// The run rows are persisted by `create_run`/`persist_run_results`
+// (`workflow_runs` + `workflow_node_runs`); this exposes them over HTTP so a run
+// that spent real dollars doesn't vanish on navigation. Org-scoped: a run is
+// only ever returned to its owning org (`require_org` + the SQL's org_id filter).
+
+/// A single workflow run row as returned to API clients. Mirrors
+/// [`store::WorkflowRunRecord`] minus the org_id (never echoed) + with the
+/// timestamps as RFC 3339 (JSON-friendly).
+#[derive(Debug, Serialize)]
+pub struct WorkflowRunView {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    pub version: i32,
+    /// `"running"` / `"completed"` / `"failed"`.
+    pub status: String,
+    pub inputs: Option<serde_json::Value>,
+    pub cost_usd: f64,
+    pub max_cost_usd: Option<f64>,
+    pub baseline_cost_usd: f64,
+    pub saved_usd: f64,
+    pub error: Option<String>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl WorkflowRunView {
+    fn from_record(r: store::WorkflowRunRecord) -> Self {
+        Self {
+            id: r.id,
+            workflow_id: r.workflow_id,
+            version: r.version,
+            status: r.status,
+            inputs: r.inputs,
+            cost_usd: r.cost_usd,
+            max_cost_usd: r.max_cost_usd,
+            baseline_cost_usd: r.baseline_cost_usd,
+            saved_usd: r.saved_usd,
+            error: r.error,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListWorkflowRunsResponse {
+    pub object: &'static str,
+    pub data: Vec<WorkflowRunView>,
+}
+
+/// `GET /v1/workflows/:id/runs` — list recent runs of a workflow, scoped to the
+/// caller's org. The workflow id is validated as org-owned the same way
+/// `create_run` does (store::get_definition returns None for a foreign-org id).
+pub async fn list_workflow_runs(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ListWorkflowRunsResponse>> {
+    let org = require_org(ctx)?;
+    let pool = db_pool(&state)?;
+    // Defense-in-depth: confirm the workflow exists + is org-scoped before
+    // listing its runs (a foreign org id → 404, not an empty list that might
+    // imply the workflow exists).
+    if store::get_definition(pool, org, id).await.is_none() {
+        return Err(ApiError::NotFound(format!("no workflow with id {id}")));
+    }
+    let runs = store::list_runs(pool, org, 50).await;
+    let data = runs.into_iter().map(WorkflowRunView::from_record).collect();
+    Ok(Json(ListWorkflowRunsResponse {
+        object: "list",
+        data,
+    }))
+}
+
+/// `GET /v1/workflows/runs/:run_id` — fetch a single run by id (org-scoped via
+/// the SQL's `WHERE id AND org_id`, so a foreign-org run id → 404).
+pub async fn get_workflow_run(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Path(run_id): Path<Uuid>,
+) -> ApiResult<Json<WorkflowRunView>> {
+    let org = require_org(ctx)?;
+    let pool = db_pool(&state)?;
+    let run = store::get_run(pool, run_id, org)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("no workflow run with id {run_id}")))?;
+    Ok(Json(WorkflowRunView::from_record(run)))
+}
 
 /// `POST /v1/workflows/secrets` — encrypt and upsert a named secret for the
 /// caller's org.
@@ -891,6 +993,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -918,6 +1021,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 

@@ -31,6 +31,22 @@ pub struct WorkflowDefinition {
     /// Http nodes are rejected — populate this list to enable Http calls.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Freeform editor metadata (WF-3). The engine ignores this field entirely;
+    /// it carries client-side data that should persist across devices/sessions —
+    /// today, canvas node positions (`{"canvas_positions": {node_id: {x,y}}}`),
+    /// previously localStorage-only + lost across browsers. Additive + defaulted
+    /// so an older definition without it deserializes fine + the engine never
+    /// reads it (the dashboard reads/writes it on save/load). Keep the shape
+    /// loosely typed (`serde_json::Value`) so future editor metadata (selection,
+    /// zoom) rides along without a schema bump.
+    ///
+    /// `skip_serializing_if = "Value::is_null"` keeps `content_hash` stable: a
+    /// definition written before this field existed (no `metadata` key)
+    /// deserializes to `Value::Null` + re-serializes WITHOUT the key — byte-
+    /// identical to the original, so the content-addressed version dedup
+    /// (`ON CONFLICT ... DO NOTHING` on `content_hash`) is unchanged.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +403,53 @@ mod tests {
     }
 
     #[test]
+    fn metadata_is_absent_for_null_and_round_trips_when_present() {
+        // WF-3: a Null metadata is omitted from the serialized form (so existing
+        // persisted definitions — no metadata key — re-serialize byte-identically
+        // + keep their content_hash after the field was added). And metadata
+        // round-trips when present (canvas positions persist across devices) +
+        // changes the hash (a layout change is a new version).
+        let base = WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 1,
+            name: "m".into(),
+            nodes: vec![Node {
+                id: "t".into(),
+                kind: NodeKind::Trigger,
+            }],
+            edges: Vec::new(),
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: Vec::new(),
+            metadata: serde_json::Value::Null,
+        };
+        // Null metadata → the serialized form has NO "metadata" key (omitted).
+        let v = serde_json::to_value(&base).unwrap();
+        assert!(v.get("metadata").is_none(), "Null metadata must be omitted");
+
+        // Re-parsing the serialized form → a def whose hash is identical (the
+        // content-addressed dedup stays stable across re-parses — the invariant
+        // the versioned-definition storage relies on).
+        let reparsed: WorkflowDefinition =
+            serde_json::from_str(&serde_json::to_string(&base).unwrap()).unwrap();
+        assert_eq!(content_hash(&base), content_hash(&reparsed));
+
+        // Present metadata → the key round-trips through serialize/deserialize.
+        let mut with_meta = base.clone();
+        with_meta.metadata = serde_json::json!({"canvas_positions": {"n1": {"x": 10, "y": 20}}});
+        let s = serde_json::to_string(&with_meta).unwrap();
+        assert!(s.contains("canvas_positions"));
+        let reparsed_m: WorkflowDefinition = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            reparsed_m.metadata,
+            serde_json::json!({"canvas_positions": {"n1": {"x": 10, "y": 20}}})
+        );
+        // A present metadata → a different content_hash (a layout change is a
+        // new version, NOT silently deduped).
+        assert_ne!(content_hash(&with_meta), content_hash(&base));
+    }
+
+    #[test]
     fn document_node_roundtrips_and_is_content_stable() {
         // A Document node deserializes from the canonical wire shape + the
         // content_hash is stable across re-parses + differs when the source
@@ -413,6 +476,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: Vec::new(),
+            metadata: serde_json::Value::Null,
         };
         let h1 = content_hash(&def);
         let reparsed: WorkflowDefinition =

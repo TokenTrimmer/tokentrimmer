@@ -448,6 +448,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -572,6 +573,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -625,6 +627,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -707,6 +710,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -747,6 +751,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -796,6 +801,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -875,6 +881,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         assert!(
             validate(&def, &any_model).is_ok(),
@@ -930,6 +937,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -1000,6 +1008,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
@@ -1041,6 +1050,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let errs = validate(&def, &|m| m == "gpt-4o").unwrap_err();
         assert!(
@@ -1101,6 +1111,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts,
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -1306,6 +1317,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: Vec::new(),
+            metadata: serde_json::Value::Null,
         };
         assert!(
             validate(&def, &any_model).is_ok(),
@@ -1380,6 +1392,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: Vec::new(),
+            metadata: serde_json::Value::Null,
         }
     }
 }
