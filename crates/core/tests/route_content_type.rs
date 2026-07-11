@@ -209,6 +209,7 @@ async fn setup(target_model: &str) -> (Arc<Mutex<Vec<String>>>, String, axum::Ro
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

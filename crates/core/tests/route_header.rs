@@ -147,6 +147,7 @@ fn route(name: &str, priority: u32, tag: Option<&str>, target: &str) -> Route {
             ..Default::default()
         },
         then: RouteAction {
+            workflow: None,
             format_switch: None,
             diff: false,
             auto_pause: false,

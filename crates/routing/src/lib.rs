@@ -1331,6 +1331,7 @@ mod tests {
         assert!(!parsed.disable_cache);
         // Present when true.
         let b = RouteAction {
+            workflow: None,
             disable_cache: true,
             ..a
         };
@@ -1365,6 +1366,7 @@ mod tests {
 
         // Present when true.
         let b = RouteAction {
+            workflow: None,
             doc_compaction: true,
             ..off
         };
@@ -1399,6 +1401,7 @@ mod tests {
 
         // Present when true.
         let b = RouteAction {
+            workflow: None,
             document_lane: true,
             content_compress: false,
             ..off
@@ -1447,6 +1450,7 @@ mod tests {
 
         // Present when true.
         let b = RouteAction {
+            workflow: None,
             content_compress: true,
             ..off
         };

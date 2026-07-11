@@ -146,6 +146,7 @@ fn failover_routing_store() -> Arc<CachingRoutingStore> {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

@@ -285,7 +285,7 @@ pub fn validate_route_has_effect(then: &RouteAction) -> Result<(), ValidationErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgenticBudget, RouteAction, RouteConditions, RoutePanel};
+    use crate::{AgenticBudget, RouteAction, RouteConditions, RoutePanel, RouteWorkflow};
     use tt_shared::pricing::{Capability, ModelInfo};
 
     fn action(target: &str) -> RouteAction {
@@ -682,6 +682,79 @@ mod tests {
     #[test]
     fn validate_panel_none_is_noop() {
         assert!(validate_panel(&action("m")).is_ok());
+    }
+
+    /// `validate_workflow` accepts the two valid modes ("detour", "shadow")
+    /// and a `None` mode (defaults to detour at dispatch). A bogus mode is
+    /// rejected with `InvalidWorkflowMode`. CO-1. (Uses a modifier-only route
+    /// — `target_model: None` — so `validate_workflow`'s mutual-exclusivity
+    /// check doesn't fire and the mode is the only variable.)
+    #[test]
+    fn validate_workflow_accepts_valid_modes_and_rejects_bogus() {
+        for mode in [Some("detour"), Some("shadow"), None] {
+            let mut a = action("m");
+            a.target_model = None;
+            a.workflow = Some(RouteWorkflow {
+                workflow_id: "00000000-0000-0000-0000-000000000000".into(),
+                max_cost_usd: Some(1.0),
+                mode: mode.map(str::to_string),
+            });
+            assert!(
+                validate_workflow(&a).is_ok(),
+                "mode {mode:?} must be accepted"
+            );
+        }
+        let mut bad = action("m");
+        bad.target_model = None;
+        bad.workflow = Some(RouteWorkflow {
+            workflow_id: "00000000-0000-0000-0000-000000000000".into(),
+            max_cost_usd: None,
+            mode: Some("canary".into()),
+        });
+        assert!(
+            matches!(
+                validate_workflow(&bad),
+                Err(ValidationError::InvalidWorkflowMode(ref s)) if s == "canary"
+            ),
+            "mode 'canary' must be rejected with InvalidWorkflowMode"
+        );
+    }
+
+    /// No workflow on the route → `validate_workflow` is a trivial no-op.
+    #[test]
+    fn validate_workflow_none_is_noop() {
+        assert!(validate_workflow(&action("m")).is_ok());
+    }
+
+    /// A workflow route is mutually exclusive with `panel` and `target_model`
+    /// (three independent dispatch paths — only one can govern). CO-1.
+    #[test]
+    fn validate_workflow_conflicts_with_panel_and_target_model() {
+        // workflow + panel
+        let mut a = action("m");
+        a.workflow = Some(RouteWorkflow::default());
+        a.panel = Some(RoutePanel::default());
+        assert!(
+            matches!(
+                validate_workflow(&a),
+                Err(ValidationError::WorkflowConflict("panel"))
+            ),
+            "workflow + panel must conflict"
+        );
+        // workflow + target_model — use a modifier-only route (target_model: None)
+        // so the only conflict is the workflow itself.
+        let mut b = action("m");
+        b.target_model = None;
+        b.workflow = Some(RouteWorkflow::default());
+        assert!(validate_workflow(&b).is_ok(), "workflow alone must be ok");
+        b.target_model = Some("conflict".into());
+        assert!(
+            matches!(
+                validate_workflow(&b),
+                Err(ValidationError::WorkflowConflict("target_model"))
+            ),
+            "workflow + target_model must conflict"
+        );
     }
 
     /// A modifier-only route (`target_model: None`) has no rewrite target to

@@ -166,6 +166,7 @@ fn route(target: &str, fallbacks: Vec<String>) -> Route {
             ..Default::default()
         },
         then: RouteAction {
+            workflow: None,
             format_switch: None,
             diff: false,
             auto_pause: false,

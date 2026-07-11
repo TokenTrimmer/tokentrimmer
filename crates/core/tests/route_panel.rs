@@ -274,6 +274,7 @@ fn panel_route(name: &str, strategy: &str, paused: bool, max_cost_usd: Option<f6
             ..Default::default()
         },
         then: RouteAction {
+            workflow: None,
             // modifier-only: no rewrite, the panel is the effect.
             target_model: None,
             fallbacks: vec![],
@@ -321,6 +322,7 @@ fn non_panel_route(name: &str) -> Route {
             ..Default::default()
         },
         then: RouteAction {
+            workflow: None,
             target_model: None,
             fallbacks: vec![],
             disable_cache: false,

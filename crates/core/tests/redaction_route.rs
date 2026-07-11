@@ -201,6 +201,7 @@ async fn app_with_redact_route_and_cache_min(
             },
             // No model rewrite — redaction is a pure request-pass guardrail.
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

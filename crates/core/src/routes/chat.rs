@@ -46,6 +46,7 @@ use crate::{
     retry::{with_retry, RetryPolicy},
     routes::panel,
     routes::sse::{self, CacheInsertContext, StreamLogContext, StreamSpanContext},
+    routes::workflows,
     single_flight::wait_for_leader,
     state::{L1Config, L2Config, L2VerifyConfig},
     ApiError, ApiResult, AppState,
@@ -989,6 +990,16 @@ pub(crate) struct Prepared {
     /// — `run_panel` records a member whose provider id is absent here as
     /// `skipped_no_cred`. Empty (and unused) when `panel` is `None`.
     pub panel_creds: std::collections::HashMap<String, ProviderCredentials>,
+    /// The matched route's opt-in **workflow detour** trigger
+    /// (`RouteAction.workflow`, CO-1). `Some(_)` makes a matched request run
+    /// the referenced workflow instead of (detour) or alongside (shadow) the
+    /// upstream call — resolved in [`complete_once`] BEFORE any cache lookup
+    /// (workflows are non-deterministic, the same reason `panel` bypasses
+    /// cache/single-flight). `None` for the overwhelming majority of routes
+    /// (no workflow), so this is a single cheap `Option::take` + `None` check
+    /// on the hot path; the un-opted single-model path is byte-identical (off
+    /// by default, load-bearing — same invariant as `panel`).
+    pub workflow: Option<tt_routing::RouteWorkflow>,
 }
 
 /// Cost/route/cache/warning metadata the chat [`handler`] turns into
@@ -1092,6 +1103,35 @@ pub(crate) async fn complete_once(
     if let Some(cfg) = prep.panel.take() {
         return panel::complete_panel(state, ctx, prep, cfg).await;
     }
+    // Workflow-detour branch (CO-1) — before cache / single-flight, for the
+    // same reason as the panel branch: a workflow is non-deterministic (a
+    // matched route must not coalesce two identical requests) and bills as ONE
+    // aggregate row. `take()` leaves `prep.workflow = None`. SHADOW mode runs
+    // the workflow alongside the normal dispatch (cost recorded separately, no
+    // response substitution) and falls through to the single-model path below —
+    // a best-effort shadow error never fails the request. DETOUR mode replaces
+    // the upstream call: the workflow's final synthesized answer becomes the
+    // chat response. Streaming workflow detour is unsupported in v1 (a
+    // `stream:true` request on a workflow route has already fallen through to
+    // `handle_streaming` in the handler, which warns + runs single-model). For
+    // the overwhelming majority of requests `prep.workflow` is `None`, so this
+    // is a single cheap `Option::take` + `None` check and the path below is
+    // wire-identical to today's single-model completion (off-by-default).
+    if let Some(cfg) = prep.workflow.take() {
+        // `mode: None` defaults to "detour" (validated to detour|shadow at route
+        // creation in `validate_workflow`).
+        let is_detour = cfg.mode.as_deref() != Some("shadow");
+        if is_detour {
+            return workflows::complete_workflow(state, ctx, prep, cfg).await;
+        } else {
+            // Shadow: run the workflow for its cost/receipt only, then continue
+            // to the normal single-model dispatch. Best-effort: an error in the
+            // shadow workflow is recorded as a warning, never propagated.
+            if let Err(msg) = workflows::run_workflow_shadow(state, ctx, &prep, &cfg).await {
+                prep.warnings.push(format!("workflow-shadow: {msg}"));
+            }
+        }
+    }
     // Destructure the prepared setup into locals with the exact names + types
     // the carved pipeline (the former handler non-streaming arm) reads, so the
     // body below is byte-for-byte the handler's. `state`/`ctx` are the params;
@@ -1141,6 +1181,8 @@ pub(crate) async fn complete_once(
         panel: _,
         // Panel-only; the single-model path never reads it.
         panel_creds: _,
+        // Already `take`n into the workflow branch above (and `None` otherwise).
+        workflow: _,
     } = prep;
     // The handler built `ctx.trace_id` from the same trace-id it derived; the
     // carved pipeline reads `trace_id` directly (cache rows, L1 envelopes,
@@ -2302,6 +2344,17 @@ pub async fn handler(
     // request with NO panel header (the overwhelming majority) goes down
     // `handle_streaming` unchanged — off-by-default.
     if prep.req.stream {
+        // Streaming workflow detour is unsupported in v1 (the workflow runs to
+        // a synthesized aggregate answer, not a chunk stream). A `stream:true`
+        // request on a workflow route warns + falls through to single-model
+        // streaming dispatch, leaving the config dropped. Best-effort + off by
+        // default (`prep.workflow` is `None` for the overwhelming majority).
+        if let Some(cfg) = prep.workflow.take() {
+            prep.warnings.push(format!(
+                "workflow-{}: streaming detour unsupported, single-model fallback",
+                cfg.workflow_id
+            ));
+        }
         if let Some(cfg) = prep.panel.take() {
             // `complete_panel_streaming` returns `Result<Response, ApiError>`;
             // `ApiError` is `IntoResponse`, so a fail-closed error (quorum-unmet
@@ -2595,6 +2648,11 @@ pub(crate) async fn prepare(
     // caller sent no `X-TokenTrimmer-Panel` header). `None` for the
     // overwhelming majority of routes — the single-model path is untouched.
     let route_panel = route_match.as_ref().and_then(|m| m.panel.clone());
+    // The matched route's workflow-detour trigger (CO-1). Unlike `panel` there
+    // is no header override — the route is the only trigger. `None` for the
+    // overwhelming majority of routes (no workflow), so this clone is a cheap
+    // `None` and the single-model path is untouched (off by default).
+    let route_workflow = route_match.as_ref().and_then(|m| m.workflow.clone());
     // Redaction × judge sampling: the judge captures above hold the
     // PRE-redaction request — the judge job re-dispatches it verbatim to the
     // source provider for the baseline reference AND embeds its text in the
@@ -3603,6 +3661,7 @@ pub(crate) async fn prepare(
         judge_original_req,
         panel,
         panel_creds,
+        workflow: route_workflow,
     })
 }
 
@@ -3671,6 +3730,10 @@ async fn handle_streaming(
         // by construction here.
         panel: _,
         panel_creds: _,
+        // `handle_streaming` is only reached after the handler's streaming guard
+        // has already `take`n any `workflow` config (warned + dropped for the
+        // single-model fallback); `None` by construction here.
+        workflow: _,
     } = prep;
     let trace_id = ctx.trace_id;
     {
@@ -6824,6 +6887,19 @@ pub(crate) struct RouteMatch {
     /// on a paused route (no panel on a paused route), and `None` by default so
     /// the un-opted single-model path is byte-identical.
     pub(crate) panel: Option<tt_routing::RoutePanel>,
+    /// The matched route's opt-in **workflow detour** trigger
+    /// (`RouteAction.workflow`, CO-1). `Some(_)` makes a matched request run
+    /// the referenced workflow instead of (detour) or alongside (shadow) the
+    /// upstream call — resolved in `complete_once` BEFORE cache (workflows are
+    /// non-deterministic, same reason panels bypass cache). A COST lever:
+    /// forced to `None` on a paused route (no workflow detour on a paused
+    /// route), and `None` by default so the un-opted single-model path is
+    /// byte-identical (off by default, load-bearing — same invariant as
+    /// `panel`). Streaming workflow detour is a follow-up; a `stream:true`
+    /// request on a workflow route falls through to the single-model path with
+    /// a warning (the workflow detour is a non-streaming aggregate, like
+    /// `panel`'s Phase-1 non-streaming arm).
+    pub(crate) workflow: Option<tt_routing::RouteWorkflow>,
 }
 
 /// A forced route that can't be honored is a `400`; absence of routing is fine
@@ -6977,6 +7053,10 @@ pub(crate) async fn apply_routing(
             // members + an arbiter) — suppressed on a paused route, so a paused
             // panel route flows to the originally-requested single model.
             panel: None,
+            // The workflow detour is a COST lever (a matched workflow runs real
+            // multi-step spend) — suppressed on a paused route, exactly like the
+            // panel above.
+            workflow: None,
             // SAFETY/privacy levers stay ON (pausing a quality gate must never
             // disable a privacy guardrail):
             disable_cache: m.then.disable_cache,
@@ -7088,6 +7168,10 @@ pub(crate) async fn apply_routing(
         // `prepare`). `m.then.panel` is `None` for the overwhelming majority of
         // routes (no panel), so this clone is a cheap `None`.
         panel: m.then.panel.clone(),
+        // Active route's workflow detour (CO-1). `m.then.workflow` is `None`
+        // for the overwhelming majority of routes (no workflow), so this clone
+        // is a cheap `None`. Resolved in `complete_once` before cache.
+        workflow: m.then.workflow.clone(),
     }))
 }
 

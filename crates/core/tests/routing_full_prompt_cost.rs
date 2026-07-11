@@ -193,6 +193,7 @@ async fn cost_condition_counts_full_prompt() {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

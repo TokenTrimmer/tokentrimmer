@@ -288,6 +288,7 @@ async fn app_with_flex_route(
             },
             // No model rewrite — flex is a pure request-parameter action.
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

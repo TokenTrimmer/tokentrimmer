@@ -184,6 +184,7 @@ async fn app_with_compress_route(
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 format_switch: None,
                 diff: false,
                 auto_pause: false,

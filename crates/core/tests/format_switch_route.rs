@@ -226,6 +226,7 @@ async fn app_with_format_switch_route(format_switch: Option<&str>) -> Harness {
                 ..Default::default()
             },
             then: RouteAction {
+                workflow: None,
                 target_model: Some("fs-1".into()),
                 fallbacks: Vec::new(),
                 disable_cache: false,
