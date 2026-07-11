@@ -42,6 +42,12 @@ pub enum ValidationError {
     EmptyRoute,
     #[error("panel.strategy `{0}` is not a recognized strategy (expected one of: synthesize, best-of-n, best_of_n, majority)")]
     InvalidPanelStrategy(String),
+    #[error("workflow.mode `{0}` is not recognized (expected: detour or shadow)")]
+    InvalidWorkflowMode(String),
+    #[error(
+        "workflow route is mutually exclusive with {0} — a route can only have one dispatch path"
+    )]
+    WorkflowConflict(&'static str),
 }
 
 /// Reject malformed auto-pause config at route-creation time: a
@@ -177,6 +183,30 @@ pub fn validate_panel(then: &RouteAction) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// CO-1: validate the workflow-route seam. `detour` and `shadow` are the only
+/// valid modes (default `detour` when None). A workflow route is mutually
+/// exclusive with `panel` and `target_model` — a route that detours into a
+/// governed workflow doesn't also rewrite the model or fan out a panel.
+pub fn validate_workflow(then: &RouteAction) -> Result<(), ValidationError> {
+    if let Some(w) = &then.workflow {
+        // Validate the mode (None defaults to "detour" at dispatch time).
+        if let Some(mode) = &w.mode {
+            if mode != "detour" && mode != "shadow" {
+                return Err(ValidationError::InvalidWorkflowMode(mode.clone()));
+            }
+        }
+        // Mutual exclusivity: a workflow route + panel + target_model are
+        // three independent dispatch paths — only one can govern.
+        if then.panel.is_some() {
+            return Err(ValidationError::WorkflowConflict("panel"));
+        }
+        if then.target_model.is_some() {
+            return Err(ValidationError::WorkflowConflict("target_model"));
+        }
+    }
+    Ok(())
+}
+
 /// When the route requires image or audio input, the target must be
 /// `Vision`-capable (the runtime guard sets `vision=true` for both). An unknown
 /// target (`lookup` returns `None`) is permissive, matching the runtime guard.
@@ -243,7 +273,8 @@ pub fn validate_route_has_effect(then: &RouteAction) -> Result<(), ValidationErr
         || then.shadow_model.is_some()
         || then.reasoning_max_effort.is_some()
         || then.reasoning_budget_tokens.is_some()
-        || !then.fallbacks.is_empty();
+        || !then.fallbacks.is_empty()
+        || then.workflow.is_some();
     if has_effect {
         Ok(())
     } else {
@@ -282,6 +313,7 @@ mod tests {
             reasoning_budget_tokens: None,
             agentic_budget: None,
             panel: None,
+            workflow: None,
         }
     }
     fn vision_model(id: &str) -> ModelInfo {
