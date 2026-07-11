@@ -1709,6 +1709,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -1776,6 +1777,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -1831,6 +1833,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -2523,6 +2526,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -2948,6 +2952,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         let stub = StubExecutor::new(vec![
@@ -3393,6 +3398,7 @@ mod tests {
             // "other-host.com" is in allowed_hosts, but URL host is "api.example.com"
             // → HostNotAllowed fires immediately without any network call.
             allowed_hosts: vec!["other-host.com".to_string()],
+            metadata: serde_json::Value::Null,
         };
 
         let stub = StubExecutor::new(vec![]);
@@ -3485,6 +3491,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         let mut stub = StubExecutor::new(vec![]);
@@ -3558,6 +3565,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         // Parent: t → sw (SubWorkflow → child_id) → o
@@ -3597,6 +3605,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         let mut stub = StubExecutor::new(vec![(
@@ -3687,6 +3696,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -3729,6 +3739,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -3930,6 +3941,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         let parent_def = make_subwf_def(parent_id, child_id);
@@ -4030,6 +4042,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         // Parent: t → sw → o  (output node collects sw's content)
@@ -4143,6 +4156,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         let parent_def = make_subwf_def(parent_id, child_id);
@@ -4231,6 +4245,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         let parent_def = make_subwf_def(parent_id, child_id);
@@ -4322,6 +4337,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         // Parent: t → lp (Loop → body_id, max_iters=3, cond="{{input}}") → o
@@ -4363,6 +4379,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         let mut stub = StubExecutor::new(vec![(
@@ -4472,6 +4489,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let out = NodeOutput {
             content: json!("body_response"),
@@ -4527,6 +4545,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -4846,6 +4865,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
 
         let any_model = |_: &str| true;
@@ -4937,6 +4957,7 @@ mod tests {
                             inputs: serde_json::Value::Null,
                             budget: BudgetPolicy::default(),
                             allowed_hosts: vec![],
+                            metadata: serde_json::Value::Null,
                         };
 
                         // outer parent: Trigger → Loop(body=inner_id, max_iters=100, cond="true") → Output
@@ -4977,6 +4998,7 @@ mod tests {
                             inputs: serde_json::Value::Null,
                             budget: BudgetPolicy::default(),
                             allowed_hosts: vec![],
+                            metadata: serde_json::Value::Null,
                         };
 
                         let mut stub = StubExecutor::new(vec![]);
@@ -5234,6 +5256,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: Vec::new(),
+            metadata: serde_json::Value::Null,
         }
     }
 

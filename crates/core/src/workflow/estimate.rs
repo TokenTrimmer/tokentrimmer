@@ -234,6 +234,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -276,6 +277,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -364,6 +366,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         };
         let est = estimate_workflow(&def, &json!("test"));
 

@@ -94,6 +94,11 @@ pub struct CreateWorkflowRequest {
     /// Per-workflow egress allowlist forwarded to `WorkflowDefinition::allowed_hosts`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Freeform editor metadata forwarded to `WorkflowDefinition::metadata`
+    /// (WF-3: canvas node positions, previously localStorage-only). Optional +
+    /// defaulted so a save without it (an older editor) is unchanged.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 /// Response from `POST /v1/workflows`.
@@ -213,6 +218,9 @@ pub async fn create(
         inputs: body.inputs,
         budget: body.budget,
         allowed_hosts: body.allowed_hosts,
+        // WF-3: forward editor metadata (canvas positions) through to the stored
+        // definition. Body.metadata defaults to Null when the editor omits it.
+        metadata: body.metadata,
     };
 
     // Validate first — returns 400 with the full error list before any DB call.
@@ -985,6 +993,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -1012,6 +1021,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             budget: BudgetPolicy::default(),
             allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
         }
     }
 
