@@ -240,6 +240,16 @@ pub fn build_router_with_retrieval(
             "/v1/workflows/:id/estimate",
             post(routes::workflows::estimate),
         )
+        // WF-6: run history — the rows were persisted by create_run but had no
+        // HTTP route, so runs + receipts vanished on navigation. Both org-scoped.
+        .route(
+            "/v1/workflows/:id/runs",
+            get(routes::workflows::list_workflow_runs),
+        )
+        .route(
+            "/v1/workflows/runs/:run_id",
+            get(routes::workflows::get_workflow_run),
+        )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             std::time::Duration::from_secs(short_timeout_secs()),

@@ -466,12 +466,15 @@ fn run_workflow_boxed<'a>(
                 // in stable topo order, never inside the concurrent futures.
                 // Fix #1: drain the whole vec before bailing so successful
                 // siblings' costs always accrue even on partial wave failure.
-                let mut wave_error: Option<String> = None;
+                // WF-9: carry (node_id, message) so a NodeError SSE event can
+                // attribute the failure to the offending node (red badge) before
+                // the terminal run.done — instead of leaving the node at "…" forever.
+                let mut wave_error: Option<(String, String)> = None;
                 for schedule::ConcurrentNodeResult { node_id, outcome } in results {
                     match outcome {
                         Err(e) => {
                             if wave_error.is_none() {
-                                wave_error = Some(format!("node \"{node_id}\" failed: {e}"));
+                                wave_error = Some((node_id.clone(), format!("{e}")));
                             }
                         }
                         Ok(out) => {
@@ -500,8 +503,14 @@ fn run_workflow_boxed<'a>(
                     }
                     done.insert(node_id.clone());
                 }
-                if let Some(error) = wave_error {
+                if let Some((err_node_id, err_msg)) = wave_error {
                     let saved_usd = (accrued_baseline - accrued).max(0.0);
+                    // WF-9: attribute the failure to the offending node BEFORE the
+                    // terminal run.done so the client can badge it red immediately.
+                    emit(WfEvent::NodeError {
+                        node_id: err_node_id.clone(),
+                        message: err_msg.clone(),
+                    });
                     emit(WfEvent::RunDone {
                         status: "failed".to_string(),
                         cost_usd: accrued,
@@ -514,7 +523,7 @@ fn run_workflow_boxed<'a>(
                         baseline_cost_usd: accrued_baseline,
                         saved_usd,
                         node_outputs: collected_outputs,
-                        error: Some(error),
+                        error: Some(format!("node \"{err_node_id}\" failed: {err_msg}")),
                     };
                 }
             }
@@ -752,6 +761,12 @@ fn run_workflow_boxed<'a>(
                             Err(e) => {
                                 // SECURITY: HttpError strings are sanitized (no url/headers/secrets).
                                 let saved_usd = (accrued_baseline - accrued).max(0.0);
+                                // WF-9: attribute the Http-node failure to the node
+                                // before the terminal run.done.
+                                emit(WfEvent::NodeError {
+                                    node_id: node_id.clone(),
+                                    message: format!("http error: {e}"),
+                                });
                                 emit(WfEvent::RunDone {
                                     status: "failed".to_string(),
                                     cost_usd: accrued,

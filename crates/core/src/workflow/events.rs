@@ -43,6 +43,14 @@ pub(crate) enum WfEvent {
         budget_remaining_usd: Option<f64>,
     },
 
+    /// A node failed; carries the node id + a sanitized error message so the
+    /// client can badge the failing node red instead of leaving it at "…"
+    /// forever (WF-9). Emitted BEFORE the terminal `run.done status:"failed"`.
+    /// The message is from the engine's error path (HttpError strings are
+    /// sanitized — no url/headers/secrets — see the engine note at the emit site).
+    #[serde(rename = "node.error")]
+    NodeError { node_id: String, message: String },
+
     /// The entire workflow run has finished.
     #[serde(rename = "run.done")]
     RunDone {
@@ -63,6 +71,7 @@ impl WfEvent {
             WfEvent::RunStart { .. } => "run.start",
             WfEvent::NodeStart { .. } => "node.start",
             WfEvent::NodeDone { .. } => "node.done",
+            WfEvent::NodeError { .. } => "node.error",
             WfEvent::RunDone { .. } => "run.done",
         }
     }
@@ -143,6 +152,19 @@ mod tests {
         assert!(val.get("saved_usd").is_some(), "saved_usd must be present");
         assert_eq!(val["status"], "completed");
 
+        let _ = ev.to_sse();
+    }
+
+    #[test]
+    fn wf_event_node_error_carries_node_id_and_message() {
+        let ev = WfEvent::NodeError {
+            node_id: "step-2".to_string(),
+            message: "http error: connection refused".to_string(),
+        };
+        let val = serde_json::to_value(&ev).unwrap();
+        assert_eq!(val["type"], "node.error", "serde tag must be node.error");
+        assert_eq!(val["node_id"], "step-2");
+        assert_eq!(val["message"], "http error: connection refused");
         let _ = ev.to_sse();
     }
 
