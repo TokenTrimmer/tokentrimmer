@@ -75,6 +75,9 @@ pub enum BodyCaptureError {
 pub enum BodyCaptureKind {
     Request,
     Response,
+    /// The request body as it was BEFORE the conservative `compress` pass ran
+    /// (TR-3). Stored only when capture is on + a compress pass committed.
+    PreCompressionRequest,
 }
 
 impl BodyCaptureKind {
@@ -82,6 +85,7 @@ impl BodyCaptureKind {
         match self {
             Self::Request => b'q',
             Self::Response => b's',
+            Self::PreCompressionRequest => b'p',
         }
     }
 }
@@ -264,6 +268,12 @@ pub struct BodyCaptureRecord {
     pub model: String,
     pub request_json: Vec<u8>,
     pub response_json: Option<Vec<u8>>,
+    /// TR-3: the request body serialized BEFORE the conservative `compress`
+    /// pass ran (the "before" side of the prompt diff). `None` when capture
+    /// was off, no route opted into `compress`, or the compress pass removed
+    /// nothing. Encrypted under `BodyCaptureKind::PreCompressionRequest` (AAD
+    /// tag `p`), same codec + truncate-to-max as `request_json`.
+    pub pre_compression_request_json: Option<Vec<u8>>,
     pub ts: DateTime<Utc>,
 }
 
@@ -315,8 +325,15 @@ pub mod postgres {
     use super::*;
 
     /// One `request_body_captures` row as fetched for re-encryption:
-    /// `(id, org_id, trace_id, request_enc, response_enc)`.
-    type CaptureRekeyRow = (Uuid, Uuid, String, Vec<u8>, Option<Vec<u8>>);
+    /// `(id, org_id, trace_id, request_enc, response_enc, pre_compression_request_enc)`.
+    type CaptureRekeyRow = (
+        Uuid,
+        Uuid,
+        String,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
 
     /// Default keyset-pagination batch size for
     /// [`PostgresBodyCaptureWriter::reencrypt_all`]. Each batch is re-keyed in
@@ -439,7 +456,7 @@ pub mod postgres {
 
             loop {
                 let rows: Vec<CaptureRekeyRow> = match sqlx::query_as(
-                    r#"SELECT id, org_id, trace_id, request_enc, response_enc
+                    r#"SELECT id, org_id, trace_id, request_enc, response_enc, pre_compression_request_enc
                              FROM request_body_captures
                             WHERE id > $1
                             ORDER BY id
@@ -467,7 +484,8 @@ pub mod postgres {
                     .await
                     .map_err(|e| BodyCaptureError::Storage(e.to_string()))?;
 
-                for (id, org_id, trace_id, request_enc, response_enc) in &rows {
+                for (id, org_id, trace_id, request_enc, response_enc, pre_compression_enc) in &rows
+                {
                     cursor = *id;
                     stats.scanned += 1;
 
@@ -488,6 +506,16 @@ pub mod postgres {
                         )?),
                         None => None,
                     };
+                    let pre_compression_outcome = match pre_compression_enc {
+                        Some(blob) => Some(self.codec.rekey_blob(
+                            &new_codec,
+                            *org_id,
+                            trace_id,
+                            BodyCaptureKind::PreCompressionRequest,
+                            blob,
+                        )?),
+                        None => None,
+                    };
 
                     let new_request = match request_outcome {
                         RekeyOutcome::Reencrypted(blob) => Some(blob),
@@ -497,24 +525,33 @@ pub mod postgres {
                         Some(RekeyOutcome::Reencrypted(blob)) => Some(blob),
                         _ => None,
                     };
+                    let new_pre_compression = match pre_compression_outcome {
+                        Some(RekeyOutcome::Reencrypted(blob)) => Some(blob),
+                        _ => None,
+                    };
 
-                    // Both columns already current → nothing to write for this
+                    // All columns already current → nothing to write for this
                     // row (the idempotent / resumable case).
-                    if new_request.is_none() && new_response.is_none() {
+                    if new_request.is_none()
+                        && new_response.is_none()
+                        && new_pre_compression.is_none()
+                    {
                         stats.already_current += 1;
                         continue;
                     }
 
                     // Update only the column(s) that actually changed; COALESCE
-                    // leaves an already-migrated (or NULL response) column as-is.
+                    // leaves an already-migrated (or NULL) column as-is.
                     sqlx::query(
                         r#"UPDATE request_body_captures
                               SET request_enc = COALESCE($1, request_enc),
-                                  response_enc = COALESCE($2, response_enc)
-                            WHERE id = $3"#,
+                                  response_enc = COALESCE($2, response_enc),
+                                  pre_compression_request_enc = COALESCE($3, pre_compression_request_enc)
+                            WHERE id = $4"#,
                     )
                     .bind(&new_request)
                     .bind(&new_response)
+                    .bind(&new_pre_compression)
                     .bind(id)
                     .execute(&mut *tx)
                     .await
@@ -590,12 +627,33 @@ pub mod postgres {
             let response_bytes = response_store
                 .as_ref()
                 .map(|(_, original_len)| i32::try_from(*original_len).unwrap_or(i32::MAX));
+            // TR-3: the pre-compression request (same truncate-then-encrypt
+            // discipline as request/response). `None` when no compress pass
+            // committed → NULL columns (COALESCE'd on upsert so a re-capture
+            // of the same trace doesn't clobber an earlier pre-compression body).
+            let pre_compression_store = record
+                .pre_compression_request_json
+                .as_ref()
+                .map(|bytes| truncate_for_storage(bytes, max_bytes));
+            let pre_compression_enc = match pre_compression_store.as_ref() {
+                Some((store, _)) => Some(self.codec.encrypt(
+                    record.org_id,
+                    &record.trace_id,
+                    BodyCaptureKind::PreCompressionRequest,
+                    store,
+                )?),
+                None => None,
+            };
+            let pre_compression_request_bytes = pre_compression_store
+                .as_ref()
+                .map(|(_, original_len)| i32::try_from(*original_len).unwrap_or(i32::MAX));
 
             let result = sqlx::query(
                 r#"INSERT INTO request_body_captures
                    (id, org_id, api_key_id, trace_id, ts, expires_at, endpoint,
-                    provider, model, request_enc, response_enc, request_bytes, response_bytes)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    provider, model, request_enc, response_enc, request_bytes, response_bytes,
+                    pre_compression_request_enc, pre_compression_request_bytes)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                    ON CONFLICT (org_id, trace_id) DO UPDATE SET
                     api_key_id = EXCLUDED.api_key_id,
                     ts = EXCLUDED.ts,
@@ -606,7 +664,9 @@ pub mod postgres {
                     request_enc = EXCLUDED.request_enc,
                     response_enc = COALESCE(EXCLUDED.response_enc, request_body_captures.response_enc),
                     request_bytes = EXCLUDED.request_bytes,
-                    response_bytes = COALESCE(EXCLUDED.response_bytes, request_body_captures.response_bytes)"#,
+                    response_bytes = COALESCE(EXCLUDED.response_bytes, request_body_captures.response_bytes),
+                    pre_compression_request_enc = COALESCE(EXCLUDED.pre_compression_request_enc, request_body_captures.pre_compression_request_enc),
+                    pre_compression_request_bytes = COALESCE(EXCLUDED.pre_compression_request_bytes, request_body_captures.pre_compression_request_bytes)"#,
             )
             .bind(Uuid::now_v7())
             .bind(record.org_id)
@@ -621,6 +681,8 @@ pub mod postgres {
             .bind(&response_enc)
             .bind(request_bytes)
             .bind(response_bytes)
+            .bind(pre_compression_enc)
+            .bind(pre_compression_request_bytes)
             .execute(&self.pool)
             .await;
 
@@ -760,6 +822,73 @@ mod tests {
             .is_err());
     }
 
+    /// TR-3: the pre-compression kind round-trips + is AAD-distinct from
+    /// Request/Response (a blob sealed as PreCompression must NOT decrypt as
+    /// another kind — a tag mismatch must fail closed, never silently return
+    /// the wrong slot's plaintext). Pins the new AAD tag `p`.
+    #[test]
+    fn pre_compression_kind_round_trips_and_is_aad_distinct() {
+        let codec = BodyCaptureCodec::new([9u8; 32]);
+        let org_id = Uuid::from_u128(11);
+        let trace_id = "trace-pre-comp";
+        let pre =
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"untrimmed prompt"}]}"#;
+
+        let blob = codec
+            .encrypt(
+                org_id,
+                trace_id,
+                BodyCaptureKind::PreCompressionRequest,
+                pre,
+            )
+            .unwrap();
+        assert_eq!(
+            codec
+                .decrypt(
+                    org_id,
+                    trace_id,
+                    BodyCaptureKind::PreCompressionRequest,
+                    &blob
+                )
+                .unwrap(),
+            pre,
+            "pre-compression blob round-trips under its own kind"
+        );
+        // AAD distinctness: the same blob must NOT decrypt under a different kind.
+        assert!(
+            codec
+                .decrypt(org_id, trace_id, BodyCaptureKind::Request, &blob)
+                .is_err(),
+            "a PreCompression blob must not decrypt as Request"
+        );
+        assert!(
+            codec
+                .decrypt(org_id, trace_id, BodyCaptureKind::Response, &blob)
+                .is_err(),
+            "a PreCompression blob must not decrypt as Response"
+        );
+        // And the reverse: a Request blob must not decrypt as PreCompression.
+        let req = codec
+            .encrypt(
+                org_id,
+                trace_id,
+                BodyCaptureKind::Request,
+                b"post-compression",
+            )
+            .unwrap();
+        assert!(
+            codec
+                .decrypt(
+                    org_id,
+                    trace_id,
+                    BodyCaptureKind::PreCompressionRequest,
+                    &req
+                )
+                .is_err(),
+            "a Request blob must not decrypt as PreCompression"
+        );
+    }
+
     /// A writer that persists everything it is handed inherits the trait
     /// default `is_capture_enabled` → `true` (correct for an always-persisting
     /// sink). Persistence-gated backends (Postgres) override it.
@@ -895,6 +1024,8 @@ mod tests {
                  response_enc  bytea,
                  request_bytes integer NOT NULL,
                  response_bytes integer,
+                 pre_compression_request_enc   bytea,
+                 pre_compression_request_bytes integer,
                  created_at    timestamptz NOT NULL DEFAULT now(),
                  UNIQUE (org_id, trace_id)
                )"#,
