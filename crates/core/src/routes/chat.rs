@@ -970,6 +970,13 @@ pub(crate) struct Prepared {
     /// Serialized request body for capture (`Some` only when capture is armed,
     /// the org is non-anonymous, and the org opted in). Consumed by value.
     pub capture_request_json: Option<Vec<u8>>,
+    /// TR-3: the request body serialized BEFORE the conservative `compress`
+    /// pass ran (the "before" side of the prompt diff). Populated in `prepare`
+    /// only when `route_compress` + a body-capture writer is armed; consumed
+    /// in `complete_once` only when `pass_effects.compression_tokens_removed > 0`
+    /// (the pass committed) AND capture is on — so an off path or a pass that
+    /// removed nothing pays nothing + persists nothing.
+    pub pre_compression_request_json: Option<Vec<u8>>,
     /// L2 quality-judge captures (PRE-redaction): the source provider/ctx/req
     /// re-dispatched for the reference answer. Consumed by value (passed by-ref
     /// into the L2-hit gate, moved into `maybe_spawn_quality_judge`).
@@ -1176,6 +1183,10 @@ pub(crate) async fn complete_once(
         judge_source_provider,
         judge_source_ctx,
         judge_original_req,
+        // TR-3: the pre-compression snapshot (None unless route_compress +
+        // writer-armed in `prepare`); consumed below by the body-capture build
+        // when the compress pass committed.
+        pre_compression_request_json,
         // Already `take`n into the panel branch above (and `None` for the
         // single-model path that reaches here); bind to `_` to stay exhaustive.
         panel: _,
@@ -2066,6 +2077,16 @@ pub(crate) async fn complete_once(
                 model: model_used.clone(),
                 request_json,
                 response_json,
+                // TR-3: only persist the pre-compression snapshot when the
+                // compress pass actually committed (removed > 0 tokens) — a pass
+                // that removed nothing produces an identical before/after, so
+                // storing it would waste bytes + show an empty diff. The
+                // snapshot was captured in `prepare` only on the compress path.
+                pre_compression_request_json: if pass_effects.compression_tokens_removed > 0 {
+                    pre_compression_request_json
+                } else {
+                    None
+                },
                 ts: Utc::now(),
             },
         );
@@ -3300,6 +3321,29 @@ pub(crate) async fn prepare(
     // pass's self-report), which drives the `compression` savings attribution
     // in the cost path below. A future, more-aggressive pass would attach a
     // Wave-B2 judge gate inside `PassPipeline::run`.
+    //
+    // TR-3: snapshot the PRE-compression request (the "before" side of the
+    // prompt diff) when a compress pass will run AND a body-capture writer is
+    // armed (cheap sync check — the per-org opt-in probe still runs once
+    // later at the capture_request_json block; if capture turns out off, the
+    // bytes are simply unused). The serialize is paid ONLY on the
+    // route_compress + writer-armed path — the default path (no compress, or
+    // no writer) is byte-identical + zero-cost.
+    let writer_armed = state.body_capture_writer.is_some();
+    let pre_compression_request_json: Option<Vec<u8>> = if route_compress
+        && writer_armed
+        && ctx.org_id != Uuid::nil()
+    {
+        match serde_json::to_vec(&req) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(error = %e, "pre-compression request snapshot serialization failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let compression_tokens_removed: u32 = if route_compress {
         let out = {
             let mut split = crate::passes::SplitRequest::compute(req, &pass_cx);
@@ -3667,6 +3711,7 @@ pub(crate) async fn prepare(
         judge_source_provider,
         judge_source_ctx,
         judge_original_req,
+        pre_compression_request_json,
         panel,
         panel_creds,
         workflow: route_workflow,
@@ -3729,6 +3774,7 @@ async fn handle_streaming(
         retrieval_telemetry,
         request_started,
         capture_request_json,
+        pre_compression_request_json: _,
         judge_source_provider: _,
         judge_source_ctx: _,
         judge_original_req: _,
@@ -3941,6 +3987,10 @@ async fn handle_streaming(
                     model: served_model.clone(),
                     request_json,
                     response_json: None,
+                    // TR-3: the streaming path binds the pre-compression
+                    // snapshot to `_` (deferred — the streaming diff is a
+                    // follow-up; the non-streaming path hosts the diff for now).
+                    pre_compression_request_json: None,
                     ts: Utc::now(),
                 },
             );

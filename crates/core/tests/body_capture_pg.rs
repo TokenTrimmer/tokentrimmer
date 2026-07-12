@@ -70,6 +70,7 @@ async fn over_cap_body_is_stored_truncated_with_marker_and_original_len_recorded
             model: "gpt-4o-mini".into(),
             request_json: request_json.clone(),
             response_json: Some(response_json.clone()),
+            pre_compression_request_json: Some(request_json.clone()),
             ts: Utc::now(),
         })
         .await
@@ -210,6 +211,7 @@ async fn under_cap_body_round_trips_verbatim_no_marker() {
             model: "gpt-4o-mini".into(),
             request_json: request_json.clone(),
             response_json: None,
+            pre_compression_request_json: None,
             ts: Utc::now(),
         })
         .await
