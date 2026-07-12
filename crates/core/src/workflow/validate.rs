@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::types::{ModelSelection, NodeKind, WorkflowDefinition};
+use super::types::{ModelSelection, NodeKind, WorkflowDefinition, WorkflowTrigger};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -292,11 +292,102 @@ pub fn validate(
     // ------------------------------------------------------------------
     check_cycles(def, &mut errors);
 
+    // ------------------------------------------------------------------
+    // CO-2: triggers (schedule/webhook) — optional invokers. At most one
+    // Schedule per workflow; interval parses to a bounded Duration; webhook
+    // token_id is a non-empty URL-safe string. Empty `triggers` is the default
+    // (human-Run only) and is fine.
+    // ------------------------------------------------------------------
+    validate_triggers(def, &mut errors);
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
     }
+}
+
+// ---------------------------------------------------------------------------
+// CO-2: triggers (schedule/webhook) validation
+// ---------------------------------------------------------------------------
+
+/// Validate the workflow's `triggers` invokers. Empty is the default
+/// (human-Run only) and is fine. At most one `Schedule` (two cadences is
+/// ambiguous). `Schedule.interval` parses to a bounded `Duration` (min 5 min,
+/// max 30 d — no busy-loops, no months-long silent gaps). `Webhook.token_id`
+/// is a non-empty URL-safe string.
+fn validate_triggers(def: &WorkflowDefinition, errors: &mut Vec<String>) {
+    let mut schedule_count = 0;
+    for t in &def.triggers {
+        match t {
+            WorkflowTrigger::Schedule { interval } => {
+                schedule_count += 1;
+                match parse_interval(interval) {
+                    Some(d) => {
+                        if d.as_secs() < 300 {
+                            errors.push(format!(
+                                "schedule interval '{interval}' is below the 5-minute minimum"
+                            ));
+                        } else if d.as_secs() > 30 * 24 * 3600 {
+                            errors.push(format!(
+                                "schedule interval '{interval}' exceeds the 30-day maximum"
+                            ));
+                        }
+                    }
+                    None => errors.push(format!(
+                        "schedule interval '{interval}' is not a valid duration (use e.g. '6h', '30m', '1d')"
+                    )),
+                }
+            }
+            WorkflowTrigger::Webhook { token_id } => {
+                if token_id.is_empty() {
+                    errors.push("webhook trigger token_id must not be empty".to_string());
+                } else if !token_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    errors.push(format!(
+                        "webhook trigger token_id '{token_id}' must be URL-safe (alphanumeric / - / _)"
+                    ));
+                }
+            }
+        }
+    }
+    if schedule_count > 1 {
+        errors.push(format!(
+            "workflow must have at most one schedule trigger (found {schedule_count})"
+        ));
+    }
+}
+
+/// Parse a duration string (`"6h"`, `"30m"`, `"1d"`, or a sum like `"1d6h"`)
+/// into a `Duration`. Returns `None` for garbage. The cloud sweep mirrors the
+/// fixed-`Duration` cadence discipline (no cron crate), so this is the only
+/// schedule grammar in v1.
+fn parse_interval(s: &str) -> Option<std::time::Duration> {
+    let mut total: u64 = 0;
+    let mut digits = String::new();
+    let mut saw_any = false;
+    for ch in s.trim().chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            let unit = match ch {
+                'h' => 3600,
+                'm' => 60,
+                'd' => 24 * 3600,
+                _ => return None,
+            };
+            let n: u64 = digits.parse().ok()?;
+            total = total.checked_add(n.checked_mul(unit)?)?;
+            digits.clear();
+            saw_any = true;
+        }
+    }
+    if !digits.is_empty() || !saw_any {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(total))
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +483,7 @@ mod tests {
 
     use super::*;
     use crate::workflow::types::{
-        BudgetPolicy, Edge, ModelSelection, Node, NodeKind, WorkflowDefinition,
+        BudgetPolicy, Edge, ModelSelection, Node, NodeKind, WorkflowDefinition, WorkflowTrigger,
     };
 
     // ------------------------------------------------------------------
@@ -410,6 +501,7 @@ mod tests {
     /// Minimal valid linear workflow: Trigger → Model → Output.
     fn linear_def(model: &str) -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "test".to_string(),
@@ -522,6 +614,7 @@ mod tests {
     #[test]
     fn two_node_cycle_is_error() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "cyclic".to_string(),
@@ -587,6 +680,7 @@ mod tests {
     #[test]
     fn self_loop_is_cycle_error() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "self-loop".to_string(),
@@ -699,6 +793,7 @@ mod tests {
     #[test]
     fn missing_trigger_is_error() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "no-trigger".to_string(),
@@ -740,6 +835,7 @@ mod tests {
     #[test]
     fn missing_output_is_error() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "no-output".to_string(),
@@ -765,6 +861,7 @@ mod tests {
     #[test]
     fn branch_when_true_missing_node_is_error() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "bad-branch".to_string(),
@@ -817,6 +914,7 @@ mod tests {
     #[test]
     fn valid_branch_diamond_ok() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "diamond".to_string(),
@@ -894,6 +992,7 @@ mod tests {
     #[test]
     fn branch_routed_cycle_is_error() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "branch-cycle".to_string(),
@@ -951,6 +1050,7 @@ mod tests {
     #[test]
     fn three_node_cycle_is_error() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "three-cycle".to_string(),
@@ -1023,6 +1123,7 @@ mod tests {
     fn multiple_errors_all_collected() {
         // No Trigger, bad edge, bad model — should get ≥3 errors.
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "multi-error".to_string(),
@@ -1073,6 +1174,7 @@ mod tests {
         body: Option<String>,
     ) -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "http-test".to_string(),
@@ -1279,6 +1381,7 @@ mod tests {
     #[test]
     fn document_node_base64_validates() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "doc".to_string(),
@@ -1357,6 +1460,7 @@ mod tests {
     /// Build a minimal Trigger → Document → Output flow with the given source.
     fn doc_def(source: tt_shared::messages::DocumentSource) -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "doc".to_string(),
@@ -1394,5 +1498,104 @@ mod tests {
             allowed_hosts: Vec::new(),
             metadata: serde_json::Value::Null,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // CO-2: triggers (schedule/webhook) validation
+    // ------------------------------------------------------------------
+    #[test]
+    fn validate_triggers_empty_is_ok() {
+        let mut def = linear_def("m");
+        def.triggers = vec![];
+        assert!(validate(&def, &any_model).is_ok());
+    }
+
+    #[test]
+    fn validate_triggers_accepts_valid_schedule_and_webhook() {
+        let mut def = linear_def("m");
+        def.triggers = vec![
+            WorkflowTrigger::Schedule {
+                interval: "6h".into(),
+            },
+            WorkflowTrigger::Webhook {
+                token_id: "t-1_a".into(),
+            },
+        ];
+        assert!(validate(&def, &any_model).is_ok());
+    }
+
+    #[test]
+    fn validate_triggers_rejects_garbage_interval() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "soon".into(),
+        }];
+        let errs = validate(&def, &any_model).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("not a valid duration")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_triggers_rejects_interval_below_minimum() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "1m".into(),
+        }];
+        let errs = validate(&def, &any_model).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("5-minute minimum")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_triggers_rejects_two_schedules() {
+        let mut def = linear_def("m");
+        def.triggers = vec![
+            WorkflowTrigger::Schedule {
+                interval: "6h".into(),
+            },
+            WorkflowTrigger::Schedule {
+                interval: "12h".into(),
+            },
+        ];
+        let errs = validate(&def, &any_model).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("at most one schedule")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_triggers_rejects_empty_or_unsafe_webhook_token() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Webhook {
+            token_id: "".into(),
+        }];
+        let errs = validate(&def, &any_model).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("must not be empty")),
+            "{errs:?}"
+        );
+
+        def.triggers = vec![WorkflowTrigger::Webhook {
+            token_id: "bad token!".into(),
+        }];
+        let errs = validate(&def, &any_model).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("URL-safe")), "{errs:?}");
+    }
+
+    #[test]
+    fn parse_interval_handles_compound_and_units() {
+        use std::time::Duration;
+        assert_eq!(parse_interval("6h"), Some(Duration::from_secs(6 * 3600)));
+        assert_eq!(parse_interval("30m"), Some(Duration::from_secs(30 * 60)));
+        assert_eq!(parse_interval("1d"), Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(parse_interval("1d6h"), Some(Duration::from_secs(30 * 3600)));
+        assert_eq!(parse_interval("soon"), None);
+        assert_eq!(parse_interval(""), None);
+        assert_eq!(parse_interval("6"), None); // a number with no unit
     }
 }

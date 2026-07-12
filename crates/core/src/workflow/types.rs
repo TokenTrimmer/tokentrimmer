@@ -47,6 +47,37 @@ pub struct WorkflowDefinition {
     /// (`ON CONFLICT ... DO NOTHING` on `content_hash`) is unchanged.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub metadata: serde_json::Value,
+    /// CO-2: workflow invokers (alongside the human-Run path). Empty (the
+    /// default) = only a human can start the workflow. `Schedule` fires on a
+    /// fixed interval; `Webhook` fires via a signed webhook URL. The engine
+    /// ignores this field (triggers are invokers, not nodes — `NodeKind::Trigger`
+    /// stays the passive entry point that echoes `inputs`); the cloud's sweep +
+    /// webhook endpoint read this to decide what to fire. `skip_serializing_if =
+    /// Vec::is_empty` keeps `content_hash` stable (a definition without
+    /// `triggers` round-trips byte-identical — the `metadata` precedent).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<WorkflowTrigger>,
+}
+
+/// A workflow invoker (CO-2). Distinct from `NodeKind::Trigger` (the passive
+/// entry-point node that echoes the run's `inputs`); these are OUT-OF-BAND
+/// invokers the cloud surfaces — a schedule a sweep fires, or a signed webhook
+/// an external caller POSTs. The engine never reads them; the cloud's
+/// `workflow_schedule` sweep + the `/v1/workflows/:id/webhooks/:token` endpoint
+/// are the consumers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkflowTrigger {
+    /// Fire on a fixed interval. `interval` is a duration string (`"6h"` /
+    /// `"30m"` / `"1d"`) the cloud sweep parses to a `Duration`. No real-cron
+    /// expressions in v1 (no cron crate dep — the cloud sweeps are fixed-
+    /// `Duration` sleeps; mirroring that keeps the cadence discipline uniform).
+    Schedule { interval: String },
+    /// Fire via a signed webhook URL. `token_id` is the public identifier in the
+    /// URL path (`POST /v1/workflows/:id/webhooks/:token_id`); the HMAC secret
+    /// is derived server-side under a `wfwh|{workflow_id}|{token_id}` domain,
+    /// reusing the badge-HMAC key + the `verify_receipt_share_url` idiom.
+    Webhook { token_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +441,7 @@ mod tests {
         // round-trips when present (canvas positions persist across devices) +
         // changes the hash (a layout change is a new version).
         let base = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "m".into(),
@@ -468,6 +500,7 @@ mod tests {
 
         // Re-serialize + re-parse → identical hash (deterministic serialization).
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "doc-flow".into(),

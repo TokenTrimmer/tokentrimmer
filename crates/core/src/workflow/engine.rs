@@ -1656,6 +1656,7 @@ mod tests {
     /// T → m1 → m2 → o (linear two-model chain)
     fn make_sequential_def() -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "seq".into(),
@@ -1716,6 +1717,7 @@ mod tests {
     /// T → br (cond: {{input}} == "yes") → m_yes / m_no → o
     fn make_branch_def() -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "branch".into(),
@@ -1784,6 +1786,7 @@ mod tests {
     /// T → tr (transform: "{{input}} processed") → m1 (prompt: "{{tr}}") → o
     fn make_transform_def() -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "transform".into(),
@@ -2468,6 +2471,7 @@ mod tests {
     /// nodes, both converge on a single output node).
     fn make_diamond_def() -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "diamond".into(),
@@ -2867,6 +2871,7 @@ mod tests {
     async fn hard_budget_under_concurrency() {
         // Workflow: t → prior → {n1, n2, n3} → out
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "budget_gate".into(),
@@ -3368,6 +3373,7 @@ mod tests {
 
         // Workflow: t → h (Http node referencing secret in header).
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "redaction_test".into(),
@@ -3470,6 +3476,7 @@ mod tests {
     async fn stub_load_subworkflow_returns_registered_def() {
         let child_id = Uuid::new_v4();
         let child_def = WorkflowDefinition {
+            triggers: vec![],
             id: child_id,
             version: 1,
             name: "child-wf".into(),
@@ -3527,6 +3534,7 @@ mod tests {
 
         // Child: t → m1 (costs 0.05 / baseline 0.10) → o
         let child_def = WorkflowDefinition {
+            triggers: vec![],
             id: child_id,
             version: 1,
             name: "child-wf".into(),
@@ -3570,6 +3578,7 @@ mod tests {
 
         // Parent: t → sw (SubWorkflow → child_id) → o
         let parent_def = WorkflowDefinition {
+            triggers: vec![],
             id: parent_id,
             version: 1,
             name: "parent-wf".into(),
@@ -3675,6 +3684,7 @@ mod tests {
     /// given id.  No model nodes, so it costs nothing and always succeeds.
     fn make_leaf_def(id: Uuid) -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id,
             version: 1,
             name: format!("leaf-{id}"),
@@ -3704,6 +3714,7 @@ mod tests {
     /// a SubWorkflow pointing at `child_id`, then an Output node.
     fn make_subwf_def(id: Uuid, child_id: Uuid) -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id,
             version: 1,
             name: format!("wf-{id}"),
@@ -3903,6 +3914,7 @@ mod tests {
 
         // Child: t → m1 (cost=0.30, baseline=0.50) → o
         let child_def = WorkflowDefinition {
+            triggers: vec![],
             id: child_id,
             version: 1,
             name: "child-wf".into(),
@@ -4004,6 +4016,7 @@ mod tests {
 
         // Child: t → m1 → o
         let child_def = WorkflowDefinition {
+            triggers: vec![],
             id: child_id,
             version: 1,
             name: "child-wf".into(),
@@ -4118,6 +4131,7 @@ mod tests {
         // Child has a Model node "m1" — but the stub has NO response for "m1",
         // so the stub returns ApiError::Internal → child run Fails.
         let child_def = WorkflowDefinition {
+            triggers: vec![],
             id: child_id,
             version: 1,
             name: "failing-child".into(),
@@ -4207,6 +4221,7 @@ mod tests {
 
         // Child has a Model node that would cost 0.10, but we'll exhaust budget before it runs.
         let child_def = WorkflowDefinition {
+            triggers: vec![],
             id: child_id,
             version: 1,
             name: "budget-child".into(),
@@ -4299,6 +4314,7 @@ mod tests {
 
         // Body: t → m1 (costs 0.05 / baseline 0.10) → o
         let body_def = WorkflowDefinition {
+            triggers: vec![],
             id: body_id,
             version: 1,
             name: "body-wf".into(),
@@ -4343,6 +4359,7 @@ mod tests {
         // Parent: t → lp (Loop → body_id, max_iters=3, cond="{{input}}") → o
         // cond "{{input}}" resolves to "hello" (truthy) throughout all iters.
         let parent_def = WorkflowDefinition {
+            triggers: vec![],
             id: parent_id,
             version: 1,
             name: "parent-wf".into(),
@@ -4451,6 +4468,7 @@ mod tests {
         baseline_cost_usd: f64,
     ) -> (WorkflowDefinition, NodeOutput) {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: body_id,
             version: 1,
             name: "body-wf".into(),
@@ -4509,6 +4527,7 @@ mod tests {
         max_iters: u32,
     ) -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: parent_id,
             version: 1,
             name: "loop-parent".into(),
@@ -4829,6 +4848,7 @@ mod tests {
         let body_id = Uuid::new_v4();
 
         let make_def = |max_iters: u32| WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::new_v4(),
             version: 1,
             name: "loop-val".into(),
@@ -4921,6 +4941,7 @@ mod tests {
 
                         // inner_wf: Trigger → Loop(body=leaf_id, max_iters=100, cond="true") → Output
                         let inner_def = WorkflowDefinition {
+                            triggers: vec![],
                             id: inner_id,
                             version: 1,
                             name: "inner-wf".into(),
@@ -4962,6 +4983,7 @@ mod tests {
 
                         // outer parent: Trigger → Loop(body=inner_id, max_iters=100, cond="true") → Output
                         let outer_def = WorkflowDefinition {
+                            triggers: vec![],
                             id: outer_id,
                             version: 1,
                             name: "outer-wf".into(),
@@ -5218,6 +5240,7 @@ mod tests {
         let expected_hash = blake3::hash(data.as_bytes()).to_hex().to_string();
         let _ = expected_hash; // the node computes this at runtime; here for reference.
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "doc".to_string(),

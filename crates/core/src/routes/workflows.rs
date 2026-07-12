@@ -212,6 +212,7 @@ pub async fn create(
 
     // Assemble a full WorkflowDefinition from the request body.
     let def = workflow::WorkflowDefinition {
+        triggers: vec![],
         id: body.id.unwrap_or_else(Uuid::new_v4),
         version: body.version.unwrap_or(0),
         name: body.name,

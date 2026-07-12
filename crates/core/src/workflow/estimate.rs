@@ -181,6 +181,7 @@ mod tests {
     /// T → m1 (gpt-4o-mini) → m2 (gpt-4o-mini) → o
     fn pinned_two_model_def() -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "estimate_test".into(),
@@ -241,6 +242,7 @@ mod tests {
     /// T → m_auto (Auto) → o
     fn auto_selection_def() -> WorkflowDefinition {
         WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "auto_test".into(),
@@ -328,6 +330,7 @@ mod tests {
     #[test]
     fn estimate_route_node_is_none_with_warning() {
         let def = WorkflowDefinition {
+            triggers: vec![],
             id: Uuid::nil(),
             version: 1,
             name: "route_test".into(),
