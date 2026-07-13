@@ -856,6 +856,10 @@ struct RunIdentity {
     caller_tier: Option<tt_shared::CallerTier>,
     /// L2 entitlement (paid-tier only) — derived once from `caller_tier`.
     l2_allowed: bool,
+    /// CO-4: at-breach PauseShadow shadow-skip flag (from `ApiKeyContext`);
+    /// inherited by every agent-loop turn so a breach doesn't double-spend
+    /// mid-loop either.
+    skip_shadow: bool,
     /// Raw bearer (the source provider's key for the legacy passthrough path;
     /// also the cross-provider re-emit credential).
     raw_bearer: String,
@@ -923,9 +927,9 @@ impl RunIdentity {
                 }
             });
 
-        let (org_id, api_key_id, caller_tier) = match auth_ctx {
-            Some(c) => (c.org_id, c.key_id, c.tier),
-            None => (Uuid::nil(), Uuid::nil(), None),
+        let (org_id, api_key_id, caller_tier, skip_shadow) = match auth_ctx {
+            Some(c) => (c.org_id, c.key_id, c.tier, c.skip_shadow),
+            None => (Uuid::nil(), Uuid::nil(), None, false),
         };
         let l2_allowed = matches!(
             caller_tier,
@@ -948,6 +952,7 @@ impl RunIdentity {
             api_key_id,
             caller_tier,
             l2_allowed,
+            skip_shadow,
             raw_bearer,
             trace_id,
             tag: headers
@@ -1067,6 +1072,10 @@ impl TurnCompleter for GatewayCompleter<'_> {
             Default::default(),
             request_started,
             is_mechanical,
+            // CO-4: agent-loop turns inherit the original request's
+            // skip_shadow flag (an at-breach PauseShadow org's loop turns
+            // also skip the pane/shadow dispatch — no doubled spend mid-loop).
+            self.identity.skip_shadow,
         )
         .await?;
 
@@ -1229,6 +1238,7 @@ pub(crate) async fn drive_workflow_node(
         api_key_id,
         caller_tier,
         l2_allowed,
+        skip_shadow: false,
         raw_bearer,
         // Fresh trace + idempotency per node invocation — a workflow run may
         // invoke many nodes concurrently in later tasks; per-node traces keep
@@ -2625,6 +2635,7 @@ mod tests {
             key_id: Uuid::from_u128(1),
             org_id: Uuid::from_u128(2),
             tier: Some(tt_shared::CallerTier::Pro),
+            skip_shadow: false,
         };
         let id = RunIdentity::from_request(Some(&ctx), "", &HeaderMap::new());
         assert_eq!(id.org_id, Uuid::from_u128(2));

@@ -260,6 +260,7 @@ fn chat_request_pro(content: &str, stream: bool) -> Request<Body> {
         key_id: Uuid::nil(),
         org_id: Uuid::nil(),
         tier: Some(CallerTier::Pro),
+        skip_shadow: false,
     });
     req
 }

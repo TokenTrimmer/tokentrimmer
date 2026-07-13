@@ -186,6 +186,7 @@ fn chat_request_with_tier(model: &str, stream: bool, tier: Option<CallerTier>) -
         key_id: Uuid::nil(),
         org_id: Uuid::nil(),
         tier,
+        skip_shadow: false,
     });
     req
 }

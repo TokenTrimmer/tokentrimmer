@@ -454,6 +454,7 @@ mod tests {
             key_id: Uuid::new_v4(),
             org_id: Uuid::new_v4(),
             tier: None,
+            skip_shadow: false,
         }
     }
 

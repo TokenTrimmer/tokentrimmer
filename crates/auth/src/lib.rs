@@ -48,4 +48,12 @@ pub struct ApiKeyContext {
     /// Subscription tier, injected by the cloud tier-resolution layer once
     /// `rv-tier-limits-enforcement` is wired. `None` → 24h TTL default.
     pub tier: Option<CallerTier>,
+    /// CO-4: `true` when the org's budget-breach policy is `PauseShadow` AND
+    /// the auth pre-flight allowed the request at-exactly-cap (`spend_remaining
+    /// == Some(0.0)`). `complete_once` reads this to SKIP the spend-amplifying
+    /// shadow/panel routes — a breach no longer doubles spend via the shadow
+    /// dispatch. Set by the auth middleware where the budget `check()` runs;
+    /// `false` (default) for the dogfood/anonymous/dev path + every non-at-breach
+    /// org, so the off-by-default path is byte-identical to pre-CO-4.
+    pub skip_shadow: bool,
 }

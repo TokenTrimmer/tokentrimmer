@@ -657,7 +657,16 @@ impl DynamicBudgetEnforcer {
         st.roll_month(now);
 
         if let Some(cap) = limits.monthly_cap_usd {
-            if st.spend_usd >= cap {
+            // CO-4: the BreachPolicy gates the threshold. Block denies at
+            // spend >= cap (429); PauseShadow denies only at spend > cap so an
+            // exactly-at-cap request is ALLOWED through to complete_once,
+            // which skips the shadow/panel dispatch (no doubled spend).
+            let breached = if limits.breach_policy.denies_at_cap() {
+                st.spend_usd >= cap
+            } else {
+                st.spend_usd > cap
+            };
+            if breached {
                 return BudgetDecision::DenySpend;
             }
         }

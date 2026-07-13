@@ -1220,6 +1220,7 @@ mod tests {
             key_id: Uuid::new_v4(),
             org_id: org,
             tier: None,
+            skip_shadow: false,
         }))
     }
 
@@ -1321,6 +1322,7 @@ mod tests {
             key_id: Uuid::nil(),
             org_id: DOGFOOD_ORG_ID,
             tier: None,
+            skip_shadow: false,
         }));
         assert!(matches!(require_org(ctx), Err(ApiError::Unauthorized)));
     }
@@ -1353,6 +1355,7 @@ mod tests {
             key_id: Uuid::nil(),
             org_id: DOGFOOD_ORG_ID,
             tier: None,
+            skip_shadow: false,
         }));
         let result = create(State(test_state()), ctx, Json(cyclic_def())).await;
         assert!(
