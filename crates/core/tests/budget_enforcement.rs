@@ -146,6 +146,7 @@ async fn spend_cap_returns_429_after_spend_recorded() {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: tt_core::budget::BreachPolicy::default(),
         },
         Arc::new(raw),
     );
@@ -180,6 +181,7 @@ async fn rate_limit_returns_429_with_retry_after() {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: tt_core::budget::BreachPolicy::default(),
         },
         Arc::new(raw),
     );

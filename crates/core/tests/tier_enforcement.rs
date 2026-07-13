@@ -430,6 +430,7 @@ async fn spend_sink_and_auth_share_same_enforcer_seam() {
                     monthly_request_cap: None,
                     monthly_served_cap: None,
                     l2_cache: true,
+                    breach_policy: tt_core::budget::BreachPolicy::default(),
                 },
                 semantic_cache_disabled: false,
             })
@@ -500,6 +501,7 @@ async fn per_key_spend_cap_denies_through_router() {
                     monthly_request_cap: None,
                     monthly_served_cap: None,
                     l2_cache: true,
+                    breach_policy: tt_core::budget::BreachPolicy::default(),
                 },
                 semantic_cache_disabled: false,
             })

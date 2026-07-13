@@ -162,6 +162,7 @@ impl TierResolver for FixedTierResolver {
                 monthly_request_cap: None,
                 monthly_served_cap: None,
                 l2_cache: self.tier != CallerTier::Free,
+                breach_policy: tt_core::budget::BreachPolicy::default(),
             },
             semantic_cache_disabled: false,
         })

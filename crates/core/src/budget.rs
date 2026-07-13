@@ -26,6 +26,48 @@ use uuid::Uuid;
 /// Length of the rolling request-rate window.
 const RATE_WINDOW_SECS: i64 = 60;
 
+/// What the gateway does when an org's month-to-date spend reaches its
+/// `monthly_cap_usd` (CO-4). Persisted on `org_budget_caps.breach_policy`
+/// (migration 0039); read by the tier resolver alongside the cap + folded into
+/// [`BudgetLimits::breach_policy`]. The enforcement lives in the auth
+/// pre-flight (`check()`) + `complete_once` (the shadow/panel branches).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BreachPolicy {
+    /// Stop accepting new requests (the auth pre-flight returns `DenySpend` at
+    /// `spend >= cap` → 429). Today's behavior + the default. The pricing FAQ's
+    /// "set a cap and we'll stop."
+    #[default]
+    Block,
+    /// Keep serving (no 429), but skip the spend-amplifying routes (`shadow_model`
+    /// and `panel`) until the next month — a breach no longer doubles spend via
+    /// the shadow dispatch. Restricts the auth pre-flight to `DenySpend` only at
+    /// `spend > cap` (an exactly-at-cap request is allowed, then shadow-skipped).
+    PauseShadow,
+}
+
+impl BreachPolicy {
+    /// Parse the `org_budget_caps.breach_policy` string. Fail-soft → `Block`
+    /// (today's behavior) on any unknown/erroring value — never crashes.
+    pub fn from_db_str(s: &str) -> Self {
+        match s.trim() {
+            "pause_shadow" => Self::PauseShadow,
+            _ => Self::Block,
+        }
+    }
+    /// Should the pre-flight block a request whose org is EXACTLY at the cap
+    /// (`spend == cap`)? `Block` → yes (`>=` denies); `PauseShadow` → no (`>`
+    /// denies; the at-cap request reaches `complete_once` to be shadow-skipped).
+    pub fn denies_at_cap(self) -> bool {
+        matches!(self, Self::Block)
+    }
+    /// Should `complete_once` skip the spend-amplifying routes (shadow_model +
+    /// panel) for an at-breach org? Only `PauseShadow`; `Block` orgs never reach
+    /// `complete_once` at-breach (the pre-flight denied them).
+    pub fn skips_shadow_at_breach(self) -> bool {
+        matches!(self, Self::PauseShadow)
+    }
+}
+
 /// Per-org limits. `None` on a field disables that dimension.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BudgetLimits {
@@ -49,6 +91,11 @@ pub struct BudgetLimits {
     /// Whether the L2 semantic cache is available for this tier.
     /// Free is L1-only (`false`); Pro/Team/Scale enable L2 (`true`).
     pub l2_cache: bool,
+    /// CO-4: the org's budget-breach policy (migration 0039). Carries through
+    /// `ResolvedTier.limits`. `Block` (the default) — the off-by-default path
+    /// is byte-identical to pre-CO-4 (the field defaults + the auth-pre-flight's
+    /// `>=` threshold are unchanged).
+    pub breach_policy: BreachPolicy,
 }
 
 impl BudgetLimits {
@@ -67,6 +114,7 @@ impl BudgetLimits {
             // volume at 100 000/month.
             monthly_served_cap: Some(100_000),
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         }
     }
 
@@ -81,6 +129,7 @@ impl BudgetLimits {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: true,
+            breach_policy: BreachPolicy::Block,
         }
     }
 }
@@ -115,6 +164,7 @@ pub fn tier_budget_limits(tier: &str, status: &str) -> BudgetLimits {
             monthly_request_cap: None, // paid tiers bill overage, no hard-stop
             monthly_served_cap: None,  // paid tiers have no COGS ceiling
             l2_cache: true,
+            breach_policy: BreachPolicy::Block,
         },
         "team" | "scale" => BudgetLimits {
             monthly_cap_usd: None,
@@ -122,6 +172,7 @@ pub fn tier_budget_limits(tier: &str, status: &str) -> BudgetLimits {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: true,
+            breach_policy: BreachPolicy::Block,
         },
         // "free", "", "enterprise", unknown → Free caps.
         //
@@ -367,9 +418,18 @@ impl BudgetEnforcer for InMemoryBudgetEnforcer {
         let st = guard.entry(org_id).or_insert_with(|| OrgState::fresh(now));
         st.roll_month(now);
 
-        // Spend cap — pre-flight on accumulated spend.
+        // Spend cap — pre-flight on accumulated spend. CO-4: the BreachPolicy
+        // gates the threshold. Block denies at spend >= cap (429) — today's
+        // behavior + the default. PauseShadow denies only at spend > cap so an
+        // exactly-at-cap request is ALLOWED through to complete_once, which
+        // then skips the shadow/panel routes (no doubled-spend dispatch).
         if let Some(cap) = self.limits.monthly_cap_usd {
-            if st.spend_usd >= cap {
+            let breached = if self.limits.breach_policy.denies_at_cap() {
+                st.spend_usd >= cap
+            } else {
+                st.spend_usd > cap
+            };
+            if breached {
                 return BudgetDecision::DenySpend;
             }
         }
@@ -749,6 +809,73 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    // ── CO-4: BreachPolicy ────────────────────────────────────────────────────
+
+    #[test]
+    fn breach_policy_from_db_str_fail_softs_to_block() {
+        assert_eq!(BreachPolicy::from_db_str("block"), BreachPolicy::Block);
+        assert_eq!(
+            BreachPolicy::from_db_str("pause_shadow"),
+            BreachPolicy::PauseShadow
+        );
+        // Unknown/garbage → Block (today's behavior; never crashes a request).
+        assert_eq!(
+            BreachPolicy::from_db_str("pause_shadows"),
+            BreachPolicy::Block
+        );
+        assert_eq!(BreachPolicy::from_db_str(""), BreachPolicy::Block);
+        assert_eq!(BreachPolicy::from_db_str("DROP TABLE"), BreachPolicy::Block);
+    }
+
+    #[test]
+    fn breach_policy_threshold_helpers() {
+        // Block denies at spend >= cap (today's >= threshold).
+        assert!(BreachPolicy::Block.denies_at_cap());
+        assert!(!BreachPolicy::Block.skips_shadow_at_breach());
+        // PauseShadow denies only at spend > cap (exactly-at-cap allowed through
+        // to complete_once for the shadow-skip).
+        assert!(!BreachPolicy::PauseShadow.denies_at_cap());
+        assert!(BreachPolicy::PauseShadow.skips_shadow_at_breach());
+    }
+
+    #[test]
+    fn pause_shadow_allows_at_cap_but_blocks_over_cap() {
+        // The check() threshold: Block denies at >= , PauseShadow at >.
+        let now = Utc.with_ymd_and_hms(2026, 7, 12, 0, 0, 0).unwrap();
+        let org = Uuid::nil();
+
+        let block = InMemoryBudgetEnforcer::new(BudgetLimits {
+            monthly_cap_usd: Some(10.0),
+            monthly_request_cap: None,
+            monthly_served_cap: None,
+            max_requests_per_min: None,
+            l2_cache: true,
+            breach_policy: BreachPolicy::Block,
+        });
+        // Record exactly-cap spend (the enforcer's own state, not a throwaway).
+        block.record(org, 10.0, now);
+        // Block: spend == cap → DenySpend (429).
+        assert!(matches!(block.check(org, now), BudgetDecision::DenySpend));
+
+        let pause = InMemoryBudgetEnforcer::new(BudgetLimits {
+            monthly_cap_usd: Some(10.0),
+            monthly_request_cap: None,
+            monthly_served_cap: None,
+            max_requests_per_min: None,
+            l2_cache: true,
+            breach_policy: BreachPolicy::PauseShadow,
+        });
+        pause.record(org, 10.0, now);
+        // PauseShadow: spend == cap → Allow (reaches complete_once for the shadow-skip).
+        assert!(matches!(
+            pause.check(org, now),
+            BudgetDecision::Allow { .. }
+        ));
+        // PauseShadow: spend > cap → DenySpend (over-cap still blocked).
+        pause.record(org, 0.01, now); // 10.01 total
+        assert!(matches!(pause.check(org, now), BudgetDecision::DenySpend));
+    }
+
     fn t(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
     }
@@ -779,6 +906,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         e.record(org(), 4.0, now);
@@ -798,6 +926,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -813,6 +942,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -833,6 +963,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         assert!(e.check(org(), now).is_allowed());
@@ -853,6 +984,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let may = t(2026, 5, 31, 23, 0, 0);
         e.record(org(), 2.0, may);
@@ -870,6 +1002,7 @@ mod tests {
             monthly_request_cap: Some(3),
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         // P0-1: the billed counter advances on settle(cached=false), not check.
@@ -888,6 +1021,7 @@ mod tests {
             monthly_request_cap: Some(1),
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let may = t(2026, 5, 31, 23, 0, 0);
         // P0-1: settle (not check) advances the billed counter.
@@ -931,6 +1065,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         let a = Uuid::from_u128(1);
@@ -1044,6 +1179,7 @@ mod tests {
             monthly_request_cap: Some(10_000),
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         };
         let e = InMemoryBudgetEnforcer::new(cap_only);
         let now = t(2026, 5, 1, 0, 0, 0);
@@ -1108,6 +1244,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         };
         let now = t(2026, 6, 1, 0, 0, 0);
 
@@ -1140,6 +1277,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         };
         let now = t(2026, 6, 1, 0, 0, 0);
         let real_org = Uuid::from_u128(99);
@@ -1185,6 +1323,7 @@ mod tests {
             monthly_request_cap: Some(billed),
             monthly_served_cap: Some(served),
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         }
     }
 
@@ -1292,6 +1431,7 @@ mod tests {
             monthly_request_cap: Some(10_000),
             monthly_served_cap: Some(100_000),
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         let org = org();
@@ -1365,6 +1505,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         });
         let now = t(2026, 5, 1, 0, 0, 0);
         let org = org();
@@ -1452,6 +1593,7 @@ mod tests {
             monthly_request_cap: None,
             monthly_served_cap: None,
             l2_cache: false,
+            breach_policy: BreachPolicy::Block,
         }
     }
 
