@@ -522,12 +522,25 @@ async fn tokentrimmer_usage_frame_shape_unchanged_with_include_usage() {
     // (`cache_bust_usd` added by the cache-aware pass lane: the explicit
     // negative-savings entry, so streaming clients see the bust MAGNITUDE and
     // not just the penalty-reduced `saved_usd` headline.)
+    // TR-6: the per-lever breakdown fields now ride the streaming event too
+    // (the streaming CostBreakdown carries the same levers as the non-streaming
+    // response headers).
     for key in [
         "cost_usd",
         "baseline_cost_usd",
         "saved_usd",
         "provider_cache_saved_usd",
         "cache_bust_usd",
+        "compression_saved_usd",
+        "flex_saved_usd",
+        "doc_compaction_saved_usd",
+        "diff_saved_usd",
+        "minify_saved_est_usd",
+        "format_switch_saved_est_usd",
+        "content_compress_saved_est_usd",
+        "doc_vision_saved_est_usd",
+        "summarizer_tax_usd",
+        "batch_forgone_usd",
         "input_tokens",
         "output_tokens",
         "cached_tokens",
@@ -540,8 +553,8 @@ async fn tokentrimmer_usage_frame_shape_unchanged_with_include_usage() {
     let obj = v.as_object().unwrap();
     assert_eq!(
         obj.len(),
-        8,
-        "tokentrimmer.usage frame must carry exactly the 8 documented keys; got {obj:?}"
+        18,
+        "tokentrimmer.usage frame must carry exactly the 18 documented keys; got {obj:?}"
     );
     assert_eq!(v["input_tokens"], 20);
     assert_eq!(v["output_tokens"], 5);
