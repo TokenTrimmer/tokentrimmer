@@ -520,6 +520,7 @@ mod tests {
             key_id: Uuid::new_v4(),
             org_id,
             tier: None,
+            skip_shadow: false,
         };
 
         let req = HttpRequest::builder()

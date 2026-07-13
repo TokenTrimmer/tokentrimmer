@@ -448,6 +448,7 @@ pub async fn verify<S: KeyStore + ?Sized>(
         // (rv-tier-limits-enforcement). Until that layer is wired, `None`
         // causes the gateway to fall back to the 24h conservative default.
         tier: None,
+        skip_shadow: false,
     })
 }
 

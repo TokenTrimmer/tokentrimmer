@@ -242,6 +242,7 @@ pub async fn middleware(
                 key_id: Uuid::nil(),
                 org_id: DOGFOOD_ORG_ID,
                 tier: None,
+                skip_shadow: false,
             });
             org_id = Some(DOGFOOD_ORG_ID);
         } else {
@@ -256,6 +257,11 @@ pub async fn middleware(
     // `dynamic_budget`; otherwise we fall back to the global `budget`
     // enforcer (if any). This preserves today's dev/no-pool behaviour.
     let mut spend_remaining: Option<f64> = None;
+    // CO-4: did the auth pre-flight allow an at-breach PauseShadow org's
+    // request? `complete_once` reads `ctx.skip_shadow` to skip the panel/shadow
+    // dispatch (no doubled spend at exactly-cap).
+    let mut skip_shadow_at_breach = false;
+    let mut breach_policy: Option<crate::budget::BreachPolicy> = None;
     if let Some(org) = org_id {
         let decision = if let Some(resolver) = state.tier_resolver.as_ref() {
             // Tier-aware path: resolve org limits AND the per-key cap (P2), then
@@ -264,6 +270,9 @@ pub async fn middleware(
             // key (fail-open on resolver error; the per-key read is fail-soft to
             // an empty cap — a missing cap never adds enforcement).
             let resolved = resolve_or_free(resolver.as_ref(), org).await;
+            // CO-4: capture the breach policy so the Allow arm below can flag an
+            // at-breach PauseShadow org for the complete_once shadow-skip.
+            breach_policy = Some(resolved.limits.breach_policy);
             // Read the per-key cap only when the request carries a real key id
             // (dogfood/anon stamps carry the nil key → org-only).
             let key_cap = match api_key_id {
@@ -290,7 +299,20 @@ pub async fn middleware(
         match decision {
             BudgetDecision::Allow {
                 spend_remaining_usd,
-            } => spend_remaining = spend_remaining_usd,
+            } => {
+                spend_remaining = spend_remaining_usd;
+                // CO-4: an at-breach PauseShadow org is allowed through at
+                // exactly-cap (spend_remaining == Some(0.0)). Flag it so the
+                // panel/shadow dispatch in complete_once is skipped — a breach
+                // no longer doubles spend via the shadow.
+                if matches!(
+                    breach_policy,
+                    Some(crate::budget::BreachPolicy::PauseShadow)
+                ) && spend_remaining_usd == Some(0.0)
+                {
+                    skip_shadow_at_breach = true;
+                }
+            }
             BudgetDecision::DenySpend => {
                 return Ok(budget_denied_response(
                     "Monthly spend cap reached for this org.",
@@ -347,6 +369,16 @@ pub async fn middleware(
                     None,
                 ));
             }
+        }
+    }
+
+    // CO-4: stamp the at-breach shadow-skip flag on the context before the
+    // request enters the handler (complete_once reads ctx.skip_shadow to drop
+    // the panel/shadow dispatch). `skip_shadow_at_breach` is false for every
+    // non-at-breach / non-PauseShadow path, so the default is unchanged.
+    if skip_shadow_at_breach {
+        if let Some(ctx) = req.extensions_mut().get_mut::<ApiKeyContext>() {
+            ctx.skip_shadow = true;
         }
     }
 

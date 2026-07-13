@@ -544,6 +544,7 @@ fn cache_chat_request_stream(tier: Option<CallerTier>, stream: bool) -> Request<
             key_id: Uuid::nil(),
             org_id: Uuid::nil(),
             tier: Some(t),
+            skip_shadow: false,
         });
     }
     req

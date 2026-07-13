@@ -126,6 +126,7 @@ mod tests {
             key_id: Uuid::nil(),
             org_id: org,
             tier: None,
+            skip_shadow: false,
         }))
     }
 

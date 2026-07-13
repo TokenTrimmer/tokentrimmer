@@ -790,6 +790,7 @@ async fn provider_and_catalog_metrics_recorded() {
         key_id: Uuid::new_v4(),
         org_id: Uuid::new_v4(),
         tier: None,
+        skip_shadow: false,
     });
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

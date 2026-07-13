@@ -942,6 +942,12 @@ pub(crate) struct Prepared {
     pub batch_marked: bool,
     /// Caller tier (per-tier cache TTL).
     pub caller_tier: Option<tt_shared::CallerTier>,
+    /// CO-4: `true` when the auth pre-flight allowed an at-breach PauseShadow
+    /// org's request (spend_remaining == Some(0.0)). The panel branch + the
+    /// shadow dispatch in `complete_once` read this to SKIP the doubled-spend
+    /// routes — a breach no longer 2×-es spend via the shadow. `false` (the
+    /// default) for every non-at-breach / non-PauseShadow / dev path.
+    pub skip_shadow: bool,
     /// Canary traffic-split arm (`canary`/`control`/None). Bound to the
     /// `traffic_split_arm_owned` local the pipeline reads.
     pub traffic_split_arm_owned: Option<String>,
@@ -1107,6 +1113,20 @@ pub(crate) async fn complete_once(
     // majority of requests `prep.panel` is `None` (no panel header), so this is
     // a single cheap `Option::take` + `None` check and the path below is
     // wire-identical to today's single-model completion (off-by-default).
+    //
+    // CO-4: an at-breach PauseShadow org (the auth pre-flight flagged
+    // `skip_shadow`) skips the panel detour — a breach must not double spend
+    // via the fan-out. Drop the config (the request flows through as a
+    // single-model dispatch instead). Also zero the shadow_model route below
+    // + the workflow detour (a shadow-mode workflow doubles upstream spend
+    // by design — workflows.rs:1063) for the same reason.
+    if prep.skip_shadow {
+        prep.panel = None;
+        prep.route_shadow_model = None;
+        prep.workflow = None;
+        prep.warnings
+            .push("budget-breach: shadow/panel/workflow routes skipped (PauseShadow)".to_string());
+    }
     if let Some(cfg) = prep.panel.take() {
         return panel::complete_panel(state, ctx, prep, cfg).await;
     }
@@ -1168,6 +1188,7 @@ pub(crate) async fn complete_once(
         flex_applied,
         batch_marked,
         caller_tier,
+        skip_shadow: _,
         traffic_split_arm_owned,
         route_traffic_pct,
         route_shadow_model,
@@ -2283,9 +2304,9 @@ pub async fn handler(
     // legacy behavior of forwarding the raw Bearer to the upstream provider.
     // That fallback is what keeps `tt_test_*` E2E tests and unauthenticated
     // dev calls working through this handler.
-    let (org_id, api_key_id, caller_tier) = match auth_ctx.as_deref() {
-        Some(c) => (c.org_id, c.key_id, c.tier),
-        None => (Uuid::nil(), Uuid::nil(), None),
+    let (org_id, api_key_id, caller_tier, skip_shadow) = match auth_ctx.as_deref() {
+        Some(c) => (c.org_id, c.key_id, c.tier, c.skip_shadow),
+        None => (Uuid::nil(), Uuid::nil(), None, false),
     };
     // L2 semantic cache is a paid-tier entitlement (BudgetLimits.l2_cache:
     // false for Free, true for Pro/Team/Scale; internal orgs resolve to Scale).
@@ -2359,6 +2380,7 @@ pub async fn handler(
         // so the `prepare` mechanical down-route block is inert (behavior-
         // preserving — `/v1/chat/completions` stays byte-identical).
         false,
+        skip_shadow,
     )
     .await?;
 
@@ -2383,6 +2405,13 @@ pub async fn handler(
                 "workflow-{}: streaming detour unsupported, single-model fallback",
                 cfg.workflow_id
             ));
+        }
+        // CO-4: an at-breach PauseShadow org skips the panel fan-out (no
+        // doubled spend via the streaming arbiter dispatch). Same gate as the
+        // non-streaming complete_once block — drop the panel so the request
+        // flows through as a single-model stream instead.
+        if prep.skip_shadow {
+            prep.panel = None;
         }
         if let Some(cfg) = prep.panel.take() {
             // `complete_panel_streaming` returns `Result<Response, ApiError>`;
@@ -2543,6 +2572,7 @@ pub(crate) async fn prepare(
     retrieval_telemetry: RetrievalTelemetry,
     request_started: Instant,
     is_mechanical: bool,
+    skip_shadow: bool,
 ) -> ApiResult<Prepared> {
     // 2c. Routing engine. Rewrite `req.model` if the org has a matching
     //     enabled route — must happen BEFORE the cache lookup (so L1 keys
@@ -3696,6 +3726,7 @@ pub(crate) async fn prepare(
         flex_applied,
         batch_marked,
         caller_tier,
+        skip_shadow,
         traffic_split_arm_owned,
         route_traffic_pct,
         route_shadow_model,
@@ -3762,6 +3793,7 @@ async fn handle_streaming(
         flex_applied,
         batch_marked: _,
         caller_tier,
+        skip_shadow: _,
         traffic_split_arm_owned,
         route_traffic_pct,
         route_shadow_model: _,
