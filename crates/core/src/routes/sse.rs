@@ -691,6 +691,23 @@ impl TrackedEventStream {
             "saved_usd": saved_usd,
             "provider_cache_saved_usd": prov_cache_saved_usd,
             "cache_bust_usd": cache_bust_usd,
+            // TR-6: per-lever breakdown parity with the non-streaming headers +
+            // the request_logs row. The streaming path computes `breakdown` from
+            // `pass_effects` (same source as the non-streaming path). Most levers
+            // are 0 for streaming in v1 (output shaping never streams; doc passes
+            // are off), but compression + flex + agentic_budget DO ride the
+            // streaming path — so the streaming client sees the same per-lever
+            // attribution as the non-streaming client.
+            "compression_saved_usd": breakdown.compression_saved_usd,
+            "flex_saved_usd": breakdown.flex_saved_usd,
+            "doc_compaction_saved_usd": breakdown.doc_compaction_saved_usd,
+            "diff_saved_usd": breakdown.diff_saved_usd,
+            "minify_saved_est_usd": breakdown.minify_saved_est_usd,
+            "format_switch_saved_est_usd": breakdown.format_switch_saved_est_usd,
+            "content_compress_saved_est_usd": breakdown.content_compress_saved_est_usd,
+            "doc_vision_saved_est_usd": breakdown.doc_vision_saved_est_usd,
+            "summarizer_tax_usd": breakdown.summarizer_tax_usd,
+            "batch_forgone_usd": breakdown.batch_forgone_usd,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_tokens": usage.cached_tokens,
