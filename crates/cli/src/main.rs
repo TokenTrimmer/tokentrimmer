@@ -22,7 +22,7 @@ const COMMAND_GROUPS: &str = "\
 Command groups:
   Run             gateway, proxy, chat, agent, embed, models, batch
   Optimize        inspect, plan, route, recipes, advise, workflow
-  Prove           audit
+  Prove           audit, verify-receipt
   Account         login, logout, whoami, connect
   MCP & tooling   mcp, init, retrieval, context
 
