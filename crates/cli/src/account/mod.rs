@@ -54,7 +54,7 @@ pub fn browser_command_for(os: &str, url: &str) -> Option<(&'static str, Vec<Str
 
 /// Validate + persist a raw key (and optional base URL), printing the result.
 /// Shared by the `--token` and browser login paths.
-fn store_key(raw: &str, base_url: Option<String>) -> anyhow::Result<()> {
+async fn store_key(raw: &str, base_url: Option<String>) -> anyhow::Result<()> {
     let validated = tt_mcp::auth::validate_api_key(Some(raw.to_string()))
         .map_err(|e| anyhow::anyhow!("invalid key: {e}"))?;
     let dir = store::config_dir();
@@ -78,6 +78,8 @@ fn store_key(raw: &str, base_url: Option<String>) -> anyhow::Result<()> {
     } else if validated.starts_with("tt_live_") {
         ui::note("  next: `tt chat` → a real turn that ends with saved $… (or `tt doctor` to verify the setup)");
     }
+    // DX-4: confirm the gateway is reachable (not just that the key format is valid).
+    post_login_health_check(&base).await;
     Ok(())
 }
 
@@ -97,7 +99,7 @@ fn open_browser(url: &str) -> bool {
 
 /// `tt login` with no `--token`: open the dashboard keys page + read the pasted
 /// key (hidden). Interactive only — non-interactive callers use `--token`.
-fn browser_login(base_url: Option<String>, no_browser: bool) -> anyhow::Result<()> {
+async fn browser_login(base_url: Option<String>, no_browser: bool) -> anyhow::Result<()> {
     use std::io::IsTerminal as _;
     // The hidden paste renders on stderr and reads from the controlling
     // terminal; require both stdin and stderr to be a TTY so piped/redirected
@@ -119,18 +121,18 @@ fn browser_login(base_url: Option<String>, no_browser: bool) -> anyhow::Result<(
         .with_prompt("Paste your API key")
         .interact()
         .context("read API key")?;
-    store_key(key.trim(), base_url)
+    store_key(key.trim(), base_url).await
 }
 
 /// `tt login`. With `--token` (or `--token -` for stdin) it stores that key;
 /// without, it runs the browser-assisted flow.
-pub fn login(
+pub async fn login(
     token: Option<String>,
     base_url: Option<String>,
     no_browser: bool,
 ) -> anyhow::Result<()> {
     let Some(tok) = token else {
-        return browser_login(base_url, no_browser);
+        return browser_login(base_url, no_browser).await;
     };
     let stdin = if tok == "-" {
         let mut s = String::new();
@@ -141,11 +143,48 @@ pub fn login(
         None
     };
     let raw = decide_token(Some(tok), stdin)?;
-    store_key(&raw, base_url)
+    store_key(&raw, base_url).await
+}
+
+/// DX-4: after storing a key, hit `/health` + print the resolved base URL so
+/// `tt login` confirms the gateway is reachable (not just that the key format
+/// is valid). Returns `Ok(())` even if the health check fails — the key is
+/// stored either way; a failed health check prints a warning.
+/// DX-4: after storing a key, hit `/health` + print the resolved base URL so
+/// `tt login` confirms the gateway is reachable (not just that the key format
+/// is valid). Returns `Ok(())` even if the health check fails — the key is
+/// stored either way; a failed health check prints a warning.
+async fn post_login_health_check(base_url: &str) {
+    let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let result = client.get(&health_url).send().await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            ui::info(&format!(
+                "✓ Gateway reachable at {base_url} ({})",
+                resp.status()
+            ));
+        }
+        Ok(resp) => {
+            ui::warn(&format!(
+                "Gateway at {base_url} returned {} — the key is stored, but the gateway may be down.",
+                resp.status()
+            ));
+        }
+        Err(e) => {
+            ui::warn(&format!(
+                "Could not reach the gateway at {base_url} ({e}) — the key is stored. \
+                 Run `tt doctor` to diagnose."
+            ));
+        }
+    }
 }
 
 /// `tt whoami` — local only (no network in V0). Exit 1 when no key is configured.
-pub fn whoami() -> anyhow::Result<()> {
+pub async fn whoami(check: bool) -> anyhow::Result<()> {
     let ctx = context::ResolvedContext::load(None, None)?;
     match &ctx.api_key {
         Some(k) => {
@@ -167,6 +206,39 @@ pub fn whoami() -> anyhow::Result<()> {
                 ui::muted().apply_to("config:"),
                 store::config_dir().display()
             );
+            // DX-4: `tt whoami --check` does an authenticated round-trip
+            // (GET /v1/models) so the user knows the key works end-to-end,
+            // not just that it's stored locally.
+            if check {
+                let models_url = format!("{}/v1/models", ctx.base_url.trim_end_matches('/'));
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+                let resp = client
+                    .get(&models_url)
+                    .header("Authorization", format!("Bearer {}", k.expose()))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        ui::info(
+                            "✓ Authenticated round-trip succeeded (GET /v1/models). Key is valid.",
+                        );
+                    }
+                    Ok(r) => {
+                        ui::warn(&format!(
+                            "GET /v1/models returned {} — the key may be revoked or the gateway is misconfigured.",
+                            r.status()
+                        ));
+                    }
+                    Err(e) => {
+                        ui::warn(&format!(
+                            "Could not reach the gateway ({e}) — the key is stored locally but the gateway is unreachable. Run `tt doctor`."
+                        ));
+                    }
+                }
+            }
             Ok(())
         }
         None => {

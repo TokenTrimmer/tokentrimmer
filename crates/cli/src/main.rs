@@ -251,7 +251,12 @@ enum Command {
     /// Remove the locally stored API key (does not revoke it server-side).
     Logout,
     /// Show the resolved API key (masked), its source, and the gateway base URL.
-    Whoami,
+    /// Use `--check` to do an authenticated round-trip (verifies the key works end-to-end).
+    Whoami {
+        /// Do an authenticated round-trip (GET /v1/models) to verify the key works.
+        #[arg(long)]
+        check: bool,
+    },
     /// Diagnose the setup: base-URL reachability, key validity, gateway vs CLI version, MCP config.
     Doctor,
     /// Emit a ready-to-paste code snippet using your stored key + gateway base URL.
@@ -1237,13 +1242,13 @@ async fn main() -> anyhow::Result<()> {
             base_url,
             no_browser,
         } => {
-            tt_cli::account::login(token, base_url, no_browser)?;
+            tt_cli::account::login(token, base_url, no_browser).await?;
         }
         Command::Logout => {
             tt_cli::account::logout()?;
         }
-        Command::Whoami => {
-            tt_cli::account::whoami()?;
+        Command::Whoami { check } => {
+            tt_cli::account::whoami(check).await?;
         }
         Command::Doctor => {
             tt_cli::doctor::run().await?;
