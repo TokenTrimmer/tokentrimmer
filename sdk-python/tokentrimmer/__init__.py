@@ -73,9 +73,12 @@ __all__ = [
     "UnsupportedDocument",
     "EmptyExtraction",
     # Lazily importable — see __getattr__. The callbacks require their framework
-    # extra (`langchain` / `litellm`); BudgetExceeded is dependency-free.
+    # extra (`langchain` / `litellm` / `crewai` / `openai-agents`);
+    # BudgetExceeded is dependency-free.
     "TokenTrimmerCostCallback",
     "TokenTrimmerLiteLLMLogger",
+    "TokenTrimmerBudgetGuard",
+    "TokenTrimmerTracingProcessor",
     "BudgetExceeded",
 ]
 __version__ = "0.3.0"
@@ -89,6 +92,8 @@ __version__ = "0.3.0"
 # dependency-free budget primitive and resolves without any extra.
 _LAZY_LANGCHAIN = {"TokenTrimmerCostCallback"}
 _LAZY_LITELLM = {"TokenTrimmerLiteLLMLogger"}
+_LAZY_CREWAI = {"TokenTrimmerBudgetGuard"}
+_LAZY_OPENAI_AGENTS = {"TokenTrimmerTracingProcessor"}
 
 
 def __getattr__(name: str) -> Any:
@@ -104,4 +109,12 @@ def __getattr__(name: str) -> Any:
         from tokentrimmer.integrations import litellm as _ll
 
         return getattr(_ll, name)
+    if name in _LAZY_CREWAI:
+        from tokentrimmer.integrations import crewai as _ca
+
+        return getattr(_ca, name)
+    if name in _LAZY_OPENAI_AGENTS:
+        from tokentrimmer.integrations import openai_agents as _oa
+
+        return getattr(_oa, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
