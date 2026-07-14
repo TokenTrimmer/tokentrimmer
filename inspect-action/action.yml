@@ -168,6 +168,9 @@ runs:
         {
           echo "$marker"
           cat "$REPORT_FILE"
+          echo ""
+          echo "---"
+          echo "🔍 **Verify any signed receipt** at [tokentrimmer.com/verify](https://tokentrimmer.com/verify) — paste a trace id to confirm the savings offline."
         } > "$body"
 
         existing="$(gh api \
