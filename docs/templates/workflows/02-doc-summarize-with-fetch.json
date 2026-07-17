@@ -1,6 +1,6 @@
 {
   "name": "doc-summarize-with-fetch",
-  "description": "Fetch a document from an allowlisted host, summarize it with a cost-capped Model call, and return the summary. Demonstrates the Http node (host must be a static literal in allowed_hosts) + max_cost_usd per call + the Output collection. The receipt attests the fetch + the summary cost.",
+  "description": "Fetch a document from an allowlisted host, summarize it with a cost-capped Model call, and return the summary. Demonstrates the Http node (host must be a static literal in allowed_hosts) + max_cost_usd per call + the Output collection. Run detail exposes the fetch and summary records; an eligible terminal receipt can be minted on demand as a signed aggregate estimate.",
   "nodes": [
     {
       "id": "in",

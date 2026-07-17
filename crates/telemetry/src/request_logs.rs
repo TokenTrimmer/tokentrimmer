@@ -53,6 +53,22 @@ pub struct RequestLogRow {
     /// nothing), for TT cache hits, and for rows before migration 0016.
     #[serde(default)]
     pub cache_bust_penalty_usd: f64,
+    /// Measured USD saving from the OpenAI Flex service tier. This belongs in
+    /// the durable row because the gateway exposes it in the per-request cost
+    /// breakdown and cloud reports must not silently replace it with a zero.
+    /// `0.0` for non-Flex traffic and rows before migration 0039.
+    #[serde(default)]
+    pub flex_saved_usd: f64,
+    /// Measured USD saving from the lossless Document Lane compaction pass.
+    /// It is a separate attribution component of the gateway's durable
+    /// cost-breakdown contract; `0.0` when the pass did not run.
+    #[serde(default)]
+    pub doc_compaction_saved_usd: f64,
+    /// Realized auxiliary summarizer/judge spend. This is a tax, not a saving,
+    /// and stays separate so net savings and customer-visible cost waterfalls
+    /// can reconcile without hiding the spend. `0.0` when no summarizer ran.
+    #[serde(default)]
+    pub summarizer_tax_usd: f64,
     /// `true` when ANY cache layer served the response (L1 or L2).
     pub cached: bool,
     /// `Some("l1")` / `Some("l2")` / `None`. Matches the SQL CHECK constraint.
@@ -132,7 +148,7 @@ pub struct RequestLogRow {
     #[serde(default)]
     pub batch_forgone_usd: f64,
     /// `true` when a matched route's rewrite was suppressed by a sticky pause
-    /// (research Phase 2.3 auto-pause / `POST /v1/routes/:id/pause`): the
+    /// (research Phase 2.3 auto-pause / `POST /v1/routes/:id/pause?expected_revision=N`): the
     /// request flowed to the ORIGINALLY-requested model with every cost lever
     /// off. The route still attributes (`route_id` is stamped) so paused
     /// traffic is auditable per route; cost == baseline on these rows (no
@@ -491,7 +507,8 @@ pub mod postgres {
                       compression_saved_usd, compression_tokens_removed,
                       doc_vision_saved_est_usd,
                       content_compress_saved_est_usd, content_compress_kind,
-                      l2_matched_entry_id, l2_similarity, l2_verdict)
+                      l2_matched_entry_id, l2_similarity, l2_verdict,
+                      flex_saved_usd, doc_compaction_saved_usd, summarizer_tax_usd)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -515,11 +532,12 @@ pub mod postgres {
                       $43, $44,
                       $45,
                       $46, $47,
-                      $48, $49, $50)"#;
+                      $48, $49, $50,
+                      $51, $52, $53)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 50;
+    pub const INSERT_BIND_COUNT: usize = 53;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -575,6 +593,9 @@ pub mod postgres {
                 .bind(row.l2_matched_entry_id) // $48
                 .bind(row.l2_similarity) // $49
                 .bind(row.l2_verdict.as_deref()) // $50
+                .bind(row.flex_saved_usd) // $51
+                .bind(row.doc_compaction_saved_usd) // $52
+                .bind(row.summarizer_tax_usd) // $53
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -664,6 +685,9 @@ mod tests {
             baseline_cost_usd: 0.0045,
             provider_cache_saved_usd: 0.0,
             cache_bust_penalty_usd: 0.0,
+            flex_saved_usd: 0.0,
+            doc_compaction_saved_usd: 0.0,
+            summarizer_tax_usd: 0.0,
             cached: false,
             cache_layer: None,
             route_id: None,

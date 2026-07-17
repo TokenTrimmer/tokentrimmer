@@ -4,8 +4,9 @@ TokenTrimmer's workflow engine (`crates/core/src/workflow/`) is an in-gateway,
 durable, cost-controlled workflow runtime. A workflow is a JSON graph of nodes
 (LLM calls, agent loops, HTTP calls, transforms, branches, sub-workflows) that
 the gateway executes server-side, applying routing, caching, cost accounting,
-budget caps, and signed receipts to every step — and rolling the cost up into
-one `saved_usd` figure per run.
+and budget caps while rolling the cost up into one `saved_usd` estimate per
+run. Eligible terminal records can be minted on demand as signed estimates;
+they are not automatic per-step receipts or provider-invoice reconciliation.
 
 This page documents the DSL (the node types, the `ModelSelection`, edges,
 `allowed_hosts`, `secrets`), the CRUD + run API, and the SSE event shape. It's
@@ -14,10 +15,15 @@ grounded in `crates/core/src/workflow/types.rs` + `routes/workflows.rs`.
 ## The workflow definition
 
 A workflow is a `WorkflowDefinition` with nodes, edges, entry/exit, an
-allowlist of outbound HTTP hosts, and optionally named secrets. Stored via
+allowlist of outbound HTTP hosts, optional out-of-band triggers, and optionally
+named secrets. Stored via
 `POST /v1/workflows` (CRUD in `routes/workflows.rs`); run via
 `POST /v1/workflows/:id/runs`; estimated (offline cost preview) via
 `POST /v1/workflows/:id/estimate`.
+
+Definition updates are strict at the top level: unknown fields are rejected.
+Clients that read and then update a workflow must preserve `metadata` and
+`triggers` even when they do not render controls for them.
 
 ## Node types (`NodeKind`)
 
@@ -28,14 +34,14 @@ object with a `"type"` discriminant + the variant's fields inlined via
 | `type` | What it does | Cost-relevant fields |
 |--------|---|---|
 | `trigger` | Entry-point; receives the workflow's external input. | — |
-| `model` | A single LLM call. `selection` picks the model/route; `prompt` is the template; `max_cost_usd` (optional) caps THIS call's cost. | `max_cost_usd: Option<f64>` |
-| `agent` | An agentic multi-turn loop with tool access. `max_turns` (default `DEFAULT_MAX_TURNS = 8`), `max_cost_usd`, `tools`. | `max_turns`, `max_cost_usd` |
+| `model` | A single LLM call. `selection` picks the model/route; `prompt` is the template; optional `max_output_tokens` is forwarded as the provider completion limit. | `max_output_tokens`, `max_cost_usd` |
+| `agent` | An agentic multi-turn loop with tool access. `max_turns` (default `DEFAULT_MAX_TURNS = 8`), optional per-turn `max_output_tokens`, `max_cost_usd`, `tools`. | `max_turns`, `max_output_tokens`, `max_cost_usd` |
 | `transform` | A deterministic expression transform (no LLM call). `expr` is the expression string. | — (no LLM cost) |
 | `branch` | A conditional branch; exactly one outgoing edge is followed. `cond` (expression), `when_true`/`when_false` (node ids). | — |
 | `output` | Terminal output-collection node. | — |
 | `http` | An outbound HTTP call to an allowlisted external API. `method`, `url`, `headers`, `body`, `max_response_bytes`. The `url` host MUST be a static literal in `allowed_hosts` (default-deny); only path/query/headers/body may contain `{{template}}` tokens. | `max_response_bytes` (size cap) |
-| `sub_workflow` | Execute another stored workflow as a nested child. `workflow_id`, `version` (unused at MVP — always latest). The parent's remaining budget cap is passed to the child; cost + baseline roll up so `saved_usd` derives without double-counting. | inherits parent cap |
-| `loop` | A bounded loop — runs the `body_workflow_id` sub-workflow up to `max_iters` times, re-checking `cond` (Branch syntax) before each iteration. Termination is GUARANTEED by `max_iters`; `cond` is early-exit. | `max_iters` |
+| `sub_workflow` | Execute another stored workflow as a nested child. `workflow_id`, `version` (unused at MVP — always latest). Cost + baseline roll up so `saved_usd` derives without double-counting. Nested workflows remain compatible for uncapped runs, but capped static admission rejects them because their future graph is not fully known. | nested graph (not capped-admission eligible) |
+| `loop` | A bounded loop — runs the `body_workflow_id` sub-workflow up to `max_iters` times, re-checking `cond` (Branch syntax) before each iteration. Termination is GUARANTEED by `max_iters`; `cond` is early-exit. It remains compatible for uncapped runs but is not capped-admission eligible. | `max_iters` |
 
 ## Model selection (`ModelSelection`)
 
@@ -54,6 +60,29 @@ Edges connect node `id`s. A node with multiple outgoing edges (e.g. `branch`)
 selects the one to follow at runtime; `branch` follows exactly one
 (`when_true` or `when_false`). `loop` re-checks `cond` before each iteration
 using the `branch` syntax.
+
+## Out-of-band triggers
+
+`triggers` is optional. An omitted or empty array means a workflow can only be
+started by a human/API run. The two current invokers are:
+
+```json
+[
+  { "type": "schedule", "interval": "6h" },
+  { "type": "webhook", "token_id": "ops_sync_1" }
+]
+```
+
+- `schedule.interval` uses bounded duration components (`1h`, `6h`, `1d`, or
+  `1d6h`), with a one-hour minimum and 30-day maximum for new or updated
+  definitions. The hosted dispatcher normally picks due work up on an
+  approximate hourly sweep rather than at an exact wall-clock time; startup,
+  leader acquisition, and the configured sweep profile can add pickup jitter.
+  One schedule is allowed per workflow. Existing persisted sub-hour schedules
+  are not rewritten or disabled by this validation change; operators must
+  explicitly inventory and migrate them to one hour or longer.
+- `webhook.token_id` is a non-empty URL-safe identifier. The server derives and
+  verifies the signed webhook URL; secrets never live in the definition.
 
 ## Allowed hosts + secrets
 
@@ -93,13 +122,37 @@ Every `model`/`agent` node's LLM call goes through the SAME chat pipeline as
 `/v1/chat/completions` — cost accounting, routing, caching, the budget
 enforcer, the kill-switch all apply identically. The run rolls the per-node
 cost + baseline into a parent total; `saved_usd` derives without
-double-counting (sub-workflows pass the parent's remaining cap to the child).
+double-counting. Nested graphs retain their legacy uncapped cost rollup, while
+capped static admission rejects loops and sub-workflows before dispatch.
 
-Each completed run is signable as a workflow receipt — `POST /v1/admin/workflow-runs/{run_id}/receipt/sign` returns a frozen, Ed25519-signed receipt + a
-shareable verify URL. The receipt's canonical payload is
+An eligible retained terminal run can be minted on demand as a workflow receipt —
+`POST /v1/admin/workflow-runs/{run_id}/receipt/sign` returns a frozen,
+Ed25519-signed estimate + a shareable verify URL. It is not an automatic receipt
+for every completed run or provider-invoice reconciliation. The receipt's canonical payload is
 `wfr:v1|<org>|<workflow_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>`
 (or `wfr:v2|…|<quality_verdict>` when the run carried a sampled flow-level
 quality-gate verdict).
+
+### Bounded budget admission
+
+`max_output_tokens` is an optional positive integer on `model` and `agent`
+nodes. When present, it is sent as the completion-token limit on each provider
+request (and used by the offline cost estimate). Omitting it keeps historical
+provider-default output behavior, so existing stored definitions remain
+compatible.
+
+When a run requests `max_cost_usd` (from its request or definition budget),
+the gateway performs a fail-closed static admission check before creating a run
+record or dispatching a provider request. Every `model`/`agent` node must then
+have an explicit positive `max_output_tokens`; prompts may contain only
+`{{input}}` references; selections must be statically priceable; agents must
+have `max_turns: 1`; and loops/sub-workflows are not admissible. The directional
+projection must be within the requested cost value. A rejected definition can
+still run without `max_cost_usd`, preserving the legacy uncapped contract.
+
+This admission check and the provider completion parameter are not a spend
+reservation, a runtime cost ceiling, or provider-invoice proof: a dispatched
+turn can settle differently from a catalog estimate.
 
 ### Verifying a workflow receipt
 
@@ -112,13 +165,20 @@ with the share URL can reconstruct the canonical string + check the Ed25519
 signature with that key — offline, no TokenTrimmer network call beyond fetching
 the receipt.
 
-The `tt verify-receipt` CLI dispatches over the **compression** (`vcr:v1|`) +
-**cache-hit** (`l2:v1|`) receipt families (the gateway-signed receipts; the
-families customers verify most). Workflow-receipt (`wfr:`) online verify runs
-via the GET endpoint above; offline CLI verify of `wfr:` is a follow-up (the
-canonical-payload + verify primitives currently live cloud-side; moving them to
-the public `tt_telemetry` crate would make the CLI the single offline-verify
-entry point across all three families).
+`tt verify-receipt` verifies all three currently supported families offline:
+**compression** (`vcr:v1|`), **cache-hit** (`l2:v1|`), and **workflow-run**
+(`wfr:v1|` / `wfr:v2|`). Supply a verifying key obtained and trusted out of
+band; the embedded key can establish only self-consistency. A successful
+signature check establishes that the supplied key signed an unchanged receipt,
+not issuer identity, provider usage, or invoice reconciliation.
+
+The machine-readable structural contract is
+[`receipt-spec/wfr-receipt.schema.json`](receipt-spec/wfr-receipt.schema.json).
+Its checked-in [v1](receipt-spec/wfr-v1.golden.json) and
+[v2](receipt-spec/wfr-v2.golden.json) golden vectors are verified by both the
+public canonical builder and `tt verify-receipt`; they pin JSON field names,
+canonical bytes, and Ed25519 encoding without asserting anything about the
+issuer or financial evidence.
 
 ## Example
 

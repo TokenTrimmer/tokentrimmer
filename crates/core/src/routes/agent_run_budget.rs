@@ -106,7 +106,11 @@ pub(crate) fn would_exceed(accrued_usd: f64, est_next_usd: Option<f64>, cap: Opt
 /// (e.g. local/$0 models, or test models) so callers fall back to the accrued
 /// check. The estimate is directional (token heuristics + catalog pricing), so
 /// it tightens the cap but is not the hard guarantee.
-pub(crate) fn estimate_next_turn_cost(model: &str, messages: &[Message]) -> Option<f64> {
+pub(crate) fn estimate_next_turn_cost(
+    model: &str,
+    messages: &[Message],
+    max_output_tokens: Option<u32>,
+) -> Option<f64> {
     let preview_messages: Vec<tt_preview::types::Message> = messages
         .iter()
         .map(|m| {
@@ -120,7 +124,10 @@ pub(crate) fn estimate_next_turn_cost(model: &str, messages: &[Message]) -> Opti
     let req = tt_preview::PreviewRequest {
         model: model.to_string(),
         messages: preview_messages,
-        max_tokens: None,
+        // `tt-preview` treats this as an explicit completion ceiling and
+        // clamps it to the catalogued model maximum.  Workflow node caps map
+        // to the same `ChatCompletionRequest::max_tokens` field at dispatch.
+        max_tokens: max_output_tokens,
         tools: None,
         stream: None,
         tt_extras: std::collections::HashMap::new(),
@@ -176,7 +183,7 @@ mod tests {
     #[test]
     fn estimate_unknown_model_is_none() {
         // The agent-loop test model "m" is not in any pricing catalog.
-        assert_eq!(estimate_next_turn_cost("m", &[]), None);
+        assert_eq!(estimate_next_turn_cost("m", &[], None), None);
     }
 
     fn tc(name: &str, args: &str, id: &str) -> ToolCall {
@@ -231,7 +238,7 @@ mod tests {
             content: tt_shared::messages::MessageContent::Text("hello world".into()),
             name: None,
         }];
-        let est = estimate_next_turn_cost("gpt-4o-mini", &msgs);
+        let est = estimate_next_turn_cost("gpt-4o-mini", &msgs, None);
         assert!(
             est.is_some(),
             "gpt-4o-mini should resolve in the bundled catalog"

@@ -1,6 +1,6 @@
 {
   "name": "cost-capped-translation",
-  "description": "Detect the input language, branch on whether translation is needed, then translate with a cost-capped Model call. Demonstrates the Branch node + the Transform node (a deterministic no-LLM pass) + per-node max_cost_usd. A translation workflow is a classic per-call cost-sensitivity case \u2014 the receipt shows each step's token_delta.",
+  "description": "Detect the input language, branch on whether translation is needed, then translate with a cost-capped Model call. Demonstrates the Branch node + the Transform node (a deterministic no-LLM pass) + per-node max_cost_usd. A translation workflow is a classic per-call cost-sensitivity case \u2014 the example surfaces each step's token_delta, while an eligible terminal receipt can be minted on demand.",
   "nodes": [
     {
       "id": "in",

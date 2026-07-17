@@ -103,13 +103,18 @@ pub struct WfrReceipt {
 /// `wfr:v2|<org_id>|<workflow_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>|<quality_verdict>`
 ///
 /// Returns `Err` if a string field contains `|` (the field separator, an
-/// injection guard) or if a v2 receipt lacks its `quality_verdict`.
+/// injection guard), if a v2 receipt lacks its `quality_verdict`, or if a v1
+/// receipt carries one. A v1 verdict would be an unsigned extra field and is
+/// outside the published structural contract.
 pub fn canonical_payload(receipt: &WfrReceipt) -> Result<String, WfrReceiptError> {
     if receipt.workflow_id.to_string().contains('|')
         || receipt.run_id.to_string().contains('|')
         || receipt.status.contains('|')
     {
         return Err(WfrReceiptError::PipeInField);
+    }
+    if receipt.canonical_version == CANONICAL_VERSION_V1 && receipt.quality_verdict.is_some() {
+        return Err(WfrReceiptError::UnexpectedQualityVerdict);
     }
     let base = match receipt.canonical_version.as_str() {
         CANONICAL_VERSION_V2 => format!(
@@ -155,6 +160,9 @@ pub enum WfrReceiptError {
     PipeInField,
     /// A v2 receipt lacked its `quality_verdict`.
     MissingQualityVerdict,
+    /// A v1 receipt carried a verdict even though that field is not signed in
+    /// the v1 canonical payload.
+    UnexpectedQualityVerdict,
     /// `canonical_version` was neither `"v1"` nor `"v2"`.
     UnknownVersion(String),
 }
@@ -167,6 +175,9 @@ impl std::fmt::Display for WfrReceiptError {
             ),
             Self::MissingQualityVerdict => f.write_str(
                 "v2 receipt is missing its quality_verdict (a required canonical-payload field)",
+            ),
+            Self::UnexpectedQualityVerdict => f.write_str(
+                "v1 receipt carries a quality_verdict that is outside its signed payload",
             ),
             Self::UnknownVersion(v) => write!(
                 f,
@@ -215,7 +226,20 @@ mod tests {
     //! byte-for-byte (the sign side). If these drift, `tt verify-receipt` and the
     //! cloud mint would disagree.
 
+    use std::collections::BTreeSet;
+
     use super::*;
+    use serde_json::Value;
+
+    const WFR_STRUCTURAL_SCHEMA: &str =
+        include_str!("../../../docs/receipt-spec/wfr-receipt.schema.json");
+    const WFR_V1_GOLDEN: &str = include_str!("../../../docs/receipt-spec/wfr-v1.golden.json");
+    const WFR_V2_GOLDEN: &str = include_str!("../../../docs/receipt-spec/wfr-v2.golden.json");
+
+    const WFR_V1_GOLDEN_PAYLOAD: &str =
+        "wfr:v1|00000000-0000-0000-0000-00000000002a|00000000-0000-0000-0000-0000000000b2|00000000-0000-0000-0000-0000000000a1|70000|180000|110000|completed";
+    const WFR_V2_GOLDEN_PAYLOAD: &str =
+        "wfr:v2|00000000-0000-0000-0000-00000000002a|00000000-0000-0000-0000-0000000000b2|00000000-0000-0000-0000-0000000000a1|70000|180000|110000|completed|equivalent";
 
     fn sample_v1() -> WfrReceipt {
         WfrReceipt {
@@ -234,6 +258,97 @@ mod tests {
             canonical_version: "v1".to_string(),
             quality_verdict: None,
             signed_at: None,
+        }
+    }
+
+    #[test]
+    fn structural_schema_covers_the_current_wfr_wire_contract() {
+        let schema: Value =
+            serde_json::from_str(WFR_STRUCTURAL_SCHEMA).expect("WFR schema must be valid JSON");
+        assert_eq!(
+            schema["$id"],
+            "urn:tokentrimmer:receipt:wfr:structural-schema:v1-v2"
+        );
+        assert_eq!(schema["additionalProperties"], Value::Bool(true));
+        assert_eq!(
+            schema["properties"]["canonical_version"]["enum"],
+            serde_json::json!([CANONICAL_VERSION_V1, CANONICAL_VERSION_V2])
+        );
+
+        let required: BTreeSet<_> = schema["required"]
+            .as_array()
+            .expect("schema required must be an array")
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("schema required names must be strings")
+            })
+            .collect();
+        let expected_required: BTreeSet<_> = [
+            "run_id",
+            "org_id",
+            "workflow_id",
+            "status",
+            "cost_micros",
+            "baseline_micros",
+            "saved_micros",
+            "signature_hex",
+            "verifying_key_hex",
+            "canonical_version",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(required, expected_required);
+
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema properties must be an object");
+        let serialized = serde_json::to_value(sample_v1()).expect("WFR receipt must serialize");
+        for field in serialized
+            .as_object()
+            .expect("serialized WFR receipt must be an object")
+            .keys()
+        {
+            assert!(
+                properties.contains_key(field),
+                "machine-readable schema is missing the serialized WFR field {field}"
+            );
+        }
+
+        // These conditionals mirror the exact canonical-builder distinction:
+        // v1 omits a verdict from its signed bytes; v2 requires a nonempty,
+        // pipe-free verdict as the trailing signed field.
+        assert_eq!(
+            schema["allOf"][0]["then"]["properties"]["quality_verdict"]["type"],
+            "null"
+        );
+        assert_eq!(
+            schema["allOf"][1]["then"]["required"],
+            serde_json::json!(["quality_verdict"])
+        );
+        assert_eq!(
+            schema["allOf"][1]["then"]["properties"]["quality_verdict"]["minLength"],
+            1
+        );
+    }
+
+    #[test]
+    fn checked_in_golden_vectors_verify_and_pin_canonical_payloads() {
+        for (raw, expected_payload) in [
+            (WFR_V1_GOLDEN, WFR_V1_GOLDEN_PAYLOAD),
+            (WFR_V2_GOLDEN, WFR_V2_GOLDEN_PAYLOAD),
+        ] {
+            let receipt: WfrReceipt =
+                serde_json::from_str(raw).expect("golden WFR receipt must deserialize");
+            assert_eq!(
+                canonical_payload(&receipt).expect("golden receipt must build canonical payload"),
+                expected_payload
+            );
+            assert!(
+                verify_with_key(&receipt.verifying_key_hex, &receipt),
+                "golden receipt must verify with its documented test key"
+            );
         }
     }
 
@@ -277,6 +392,16 @@ mod tests {
         assert_eq!(
             canonical_payload(&r),
             Err(WfrReceiptError::MissingQualityVerdict)
+        );
+    }
+
+    #[test]
+    fn v1_with_quality_verdict_is_rejected_by_the_structural_contract() {
+        let mut r = sample_v1();
+        r.quality_verdict = Some("equivalent".to_string());
+        assert_eq!(
+            canonical_payload(&r),
+            Err(WfrReceiptError::UnexpectedQualityVerdict)
         );
     }
 

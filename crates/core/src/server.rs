@@ -168,6 +168,10 @@ pub fn build_router_with_retrieval(
         .route("/ready", get(routes::ready::handler))
         .route("/metrics", get(routes::metrics::handler))
         .route("/v1/models", get(routes::models::handler))
+        // Authenticated, per-process runtime evidence. This is intentionally
+        // distinct from `/v1/models`: catalog metadata does not prove gateway
+        // feature gates, credential readiness, or provider acceptance.
+        .route("/v1/capabilities", get(routes::capabilities::handler))
         .route("/v1/embeddings", post(routes::embeddings::handler))
         // POST creates a new run; GET lists the caller's runs (org-scoped,
         // newest-first, durable Postgres view — no transcript). The bare list

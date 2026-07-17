@@ -176,6 +176,9 @@ mod tests {
     use tt_telemetry::vcr::{sign, verifying_key_hex, VcrReceipt};
     use uuid::Uuid;
 
+    const WFR_V1_GOLDEN: &str = include_str!("../../../docs/receipt-spec/wfr-v1.golden.json");
+    const WFR_V2_GOLDEN: &str = include_str!("../../../docs/receipt-spec/wfr-v2.golden.json");
+
     /// Write a receipt to a temp file + return the path + the signing key's
     /// verifying-key hex (the customer's out-of-band key).
     fn write_test_receipt(
@@ -404,6 +407,23 @@ mod tests {
         );
         run_verify_receipt(path.to_str().unwrap(), &key_hex())
             .expect("a valid WFR v2 receipt verifies via the dispatch path");
+    }
+
+    #[test]
+    fn checked_in_wfr_golden_vectors_verify_via_cli_dispatch() {
+        // These are static cross-language vectors, not test-time signatures.
+        // They pin the documented JSON wire shape, canonical payload bytes,
+        // Ed25519 encoding, and field-presence dispatch together.
+        let dir = tempfile::tempdir().unwrap();
+        for (name, raw) in [
+            ("wfr-v1.golden.json", WFR_V1_GOLDEN),
+            ("wfr-v2.golden.json", WFR_V2_GOLDEN),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, raw).expect("write checked-in WFR vector");
+            run_verify_receipt(path.to_str().unwrap(), &key_hex())
+                .expect("checked-in WFR vector must verify through CLI dispatch");
+        }
     }
 
     #[test]

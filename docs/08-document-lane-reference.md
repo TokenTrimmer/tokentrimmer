@@ -4,9 +4,9 @@ Document Lane is the pre-routing image/document → text distillation seam. A
 request carrying an image or document PDF that would route to a vision
 (expensive) model is, when the route opts in (`RouteAction::document_lane`),
 distilled to text *before* routing — so routing can downgrade to a cheaper text
-model, + the request is billed at text-model rates. The savings is isolated
-(`doc_vision_saved_est_usd`), never folded into the invoice-reconciled
-headline. Source: `crates/core/src/document_lane/` + `crates/core/src/passes/doc_compaction.rs` + `crates/doc-sidecar/`.
+model, + the request is priced using the selected text model's active catalog rate. The savings is isolated
+(`doc_vision_saved_est_usd`), never folded into the catalog-priced gateway
+headline or represented as provider-invoice reconciliation. Source: `crates/core/src/document_lane/` + `crates/core/src/passes/doc_compaction.rs` + `crates/doc-sidecar/`.
 
 This is one of the three differentiated stories (agent cost governance,
 verifiable receipts, **document lane**) — "document tokens are the new silent
@@ -57,7 +57,7 @@ into the baseline like `compression`, NOT the isolated `doc_vision_saved_est_usd
 | Field | What it carries | Where |
 |---|---|---|
 | `doc_compaction_saved_usd` | The lossless document-scaffold compaction saving (D2) — folded into the baseline like `compression` (it IS the baseline). | `passes/mod.rs` → `compute_cost_full` |
-| `doc_vision_saved_est_usd` | The DISTILLATION saving (D4c) — the isolated estimated $ the vision→text model downgrade saved. NEVER part of `cost_usd`/`baseline_cost_usd`/`saved_usd` (those reconcile against the invoice); it's a conservative estimate on its own header. | migration 0032; the isolated `CostBreakdown` field (mirrors `content_compress_saved_est_usd`) |
+| `doc_vision_saved_est_usd` | The DISTILLATION saving (D4c) — the isolated estimated $ the vision→text model downgrade saved. NEVER part of `cost_usd`/`baseline_cost_usd`/`saved_usd` (those are catalog-priced gateway figures, not provider-invoice reconciliation); it's a conservative estimate on its own header. | migration 0032; the isolated `CostBreakdown` field (mirrors `content_compress_saved_est_usd`) |
 
 Both surface on `x-tokentrimmer-*` headers.
 

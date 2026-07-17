@@ -31,6 +31,8 @@ pub(crate) struct IntelligenceSpec {
     pub tools: Vec<Tool>,
     /// Turn cap (1 for Model nodes, N for Agent nodes).
     pub max_turns: u32,
+    /// Optional output ceiling applied to every model turn.
+    pub max_output_tokens: Option<u32>,
     pub max_cost_usd: Option<f64>,
 }
 
@@ -132,6 +134,7 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
             messages,
             spec.tools.clone(),
             spec.max_turns,
+            spec.max_output_tokens,
             spec.max_cost_usd,
             route_ref,
             None, // workflow-level tag threading deferred to Task 6+

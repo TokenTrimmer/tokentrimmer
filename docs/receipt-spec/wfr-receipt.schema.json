@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tokentrimmer:receipt:wfr:structural-schema:v1-v2",
+  "title": "TokenTrimmer workflow-run receipt",
+  "description": "Structural contract for the offline-verifiable workflow-run receipt returned by the shareable receipt GET endpoint. It covers both canonical payload versions; use tt verify-receipt with a trusted out-of-band key to verify the signature.",
+  "$comment": "This schema validates receipt structure only. It does not validate an Ed25519 signature, issuer identity, savings methodology, provider usage, or invoice reconciliation. Unknown additive fields are allowed for forward-compatible response envelopes.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "org_id",
+    "workflow_id",
+    "status",
+    "cost_micros",
+    "baseline_micros",
+    "saved_micros",
+    "signature_hex",
+    "verifying_key_hex",
+    "canonical_version"
+  ],
+  "properties": {
+    "run_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Workflow run UUID; also the receipt primary key."
+    },
+    "org_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Organization UUID, signed as canonical payload field 2."
+    },
+    "workflow_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Workflow UUID, signed as canonical payload field 3."
+    },
+    "status": {
+      "type": "string",
+      "pattern": "^[^|]*$",
+      "description": "Terminal run status. A pipe is forbidden because it is the canonical payload separator."
+    },
+    "cost_micros": {
+      "$ref": "#/$defs/micro_usd",
+      "description": "Recorded catalog-priced run cost in integer micro-USD; signed directly."
+    },
+    "baseline_micros": {
+      "$ref": "#/$defs/micro_usd",
+      "description": "Recorded catalog-priced baseline estimate in integer micro-USD; signed directly."
+    },
+    "saved_micros": {
+      "$ref": "#/$defs/micro_usd",
+      "description": "Recorded catalog-priced net savings estimate in integer micro-USD; signed directly."
+    },
+    "cost_usd": {
+      "type": ["number", "null"],
+      "description": "Convenience display field only; not part of the signature."
+    },
+    "baseline_usd": {
+      "type": ["number", "null"],
+      "description": "Convenience display field only; not part of the signature."
+    },
+    "saved_usd": {
+      "type": ["number", "null"],
+      "description": "Convenience display field only; not part of the signature."
+    },
+    "signature_hex": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{128}$",
+      "description": "Hex-encoded 64-byte Ed25519 signature over the canonical payload."
+    },
+    "verifying_key_hex": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$",
+      "description": "Hex-encoded 32-byte Ed25519 public key. Trust must be established out of band."
+    },
+    "canonical_version": {
+      "type": "string",
+      "enum": ["v1", "v2"],
+      "description": "v1 signs cost fields; v2 additionally signs quality_verdict."
+    },
+    "quality_verdict": {
+      "type": ["string", "null"],
+      "pattern": "^[^|]*$",
+      "description": "Required, non-empty, and signed for v2. Null or omitted for v1."
+    },
+    "signed_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Receipt mint timestamp. It is frozen by the ledger but not part of the canonical payload."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "canonical_version": {
+            "const": "v1"
+          }
+        },
+        "required": ["canonical_version"]
+      },
+      "then": {
+        "properties": {
+          "quality_verdict": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "canonical_version": {
+            "const": "v2"
+          }
+        },
+        "required": ["canonical_version"]
+      },
+      "then": {
+        "required": ["quality_verdict"],
+        "properties": {
+          "quality_verdict": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^|]+$"
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "micro_usd": {
+      "type": "integer"
+    }
+  }
+}

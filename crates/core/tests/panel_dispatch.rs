@@ -207,6 +207,7 @@ async fn panel_header_dispatches_and_bills_one_aggregate_row() {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {

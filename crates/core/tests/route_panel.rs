@@ -356,6 +356,7 @@ fn non_panel_route(name: &str) -> Route {
 fn chat_req(key: &str, panel_header: Option<&str>, cost_limit: Option<&str>) -> Request<Body> {
     let body = json!({
         "model": "model-a",
+        "max_tokens": 64,
         "messages": [{ "role": "user", "content": "deep question" }],
         "stream": false
     });
@@ -479,6 +480,7 @@ async fn header_wins_over_route_panel() {
     // Header best-of-n + tt_extras.panel members (header path reads tt_extras).
     let body = json!({
         "model": "model-a",
+        "max_tokens": 64,
         "messages": [{ "role": "user", "content": "which is best?" }],
         "stream": false,
         "tt_extras": {

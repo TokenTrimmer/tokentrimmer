@@ -14,11 +14,13 @@ TokenTrimmer ships the full substrate to fix this — natively, no SDK change:
    `monthly_cap_usd` (the budget enforcer) + the `CircuitBreaker` (the route
    kill-switch) — set them per org / per key; a runaway agent trips the
    breaker before the bill does.
-3. **Every compression + every saving is signed.** A Verifiable Compression
+3. **Eligible compression events can be signed.** A Verifiable Compression
    Receipt (VCR): `POST /v1/admin/requests/{trace_id}/compression-receipt/sign`
-   mints an Ed25519-signed `{savings, route, model, trace_id, ts}` receipt;
-   `tt verify-receipt --receipt <json> --key-hex <hex>` checks it offline, with
-   a key you pinned. Competitors can reproduce the number; they can't sign it.
+   mints an Ed25519-signed record of a calculated `{savings, route, model,
+   trace_id, ts}` estimate. `tt verify-receipt --receipt <json> --key-hex <hex>`
+   checks that payload offline with a key you pinned. Signature tooling is not
+   exclusive to any vendor; the useful question is what evidence, coverage, and
+   reconciliation a product exposes.
 
 This page wires the shipped pieces into one 5-minute path.
 
@@ -102,18 +104,20 @@ tt mcp install --client claude-code
 # 4. (optional, repo-level) Drop the PR cost-gate + .claude/ hooks into a repo
 cd your-repo && tt init
 
-# 5. Run Claude Code exactly as before — the gateway applies the caps + signs receipts.
+# 5. Run Claude Code exactly as before — the gateway applies configured guards;
+#    eligible compression receipts can be minted on demand.
 claude
 ```
 
 Now every request Claude Code makes flows through the gateway: the org's
 `monthly_cap_usd` + `CircuitBreaker` apply, content-aware compression trims the
 prompt (the isolated `content_compress_saved_est_usd` saving never enters the
-invoice-reconciled headline), and each compression is signable as a VCR.
+catalog-priced `Saved-Usd` headline), and an eligible compression can be
+minted on demand as a VCR signed estimate.
 
-## Proving the savings
+## Reviewing a savings estimate
 
-For any compression, request a signed receipt:
+For an eligible compression, request a signed receipt estimate:
 
 ```bash
 # Mint (cloud admin endpoint, your org asserted):
@@ -126,8 +130,11 @@ tt verify-receipt --receipt receipt.json --key-hex <the-verifying-key-hex>
 ```
 
 The receipt is self-contained: the embedded `verifying_key_hex` +
-`signature` let `tt verify-receipt` check it with no network or DB. Supply the
-key out-of-band (the stronger posture) to defend against a compromised gateway.
+`signature` let `tt verify-receipt` run a mathematical signature check with no
+network or DB. Supply a key out of band (the stronger posture) to establish the
+issuer. That check confirms the signed payload has not changed under that key;
+it does not independently establish the savings math or reconcile a provider
+invoice.
 
 ## What to verify end-to-end before publishing the marketing page
 

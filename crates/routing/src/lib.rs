@@ -15,16 +15,22 @@
 
 pub mod cache;
 pub mod catalog;
+pub mod contract;
 pub mod latency;
 pub mod store;
 pub mod validate;
 
 pub use cache::CachingRoutingStore;
+pub use contract::{
+    canonicalize_route_parts, canonicalize_route_value, CanonicalRoute, RouteValidationIssue,
+    ROUTE_SCHEMA_ID, ROUTE_SCHEMA_VERSION,
+};
 pub use latency::{LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
 #[cfg(feature = "postgres")]
 pub use store::PostgresRoutingStore;
 pub use store::{
-    InMemoryRoutingStore, NewRoute, NewRoutePause, PausedBy, RoutingStore, RoutingStoreError,
+    InMemoryRoutingStore, NewRoute, NewRoutePause, PausedBy, RouteManagementActivation,
+    RouteManagementView, RoutingStore, RoutingStoreError,
 };
 pub use validate::{
     validate_agentic_budget, validate_auto_pause, validate_capability, validate_output_shaping,
@@ -41,6 +47,7 @@ use tt_shared::{ChatCompletionRequest, RequestContext};
 /// caller rewrites `request.model` to [`Route::then::target_model`] (and may
 /// observe the [`Route::id`] for telemetry attribution).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     /// Stable id — used in `request_logs.matched_route_id` for attribution.
     pub id: Uuid,
@@ -58,7 +65,7 @@ pub struct Route {
     /// paused route still MATCHES (attribution + telemetry marker) but every
     /// cost lever is disabled — requests flow to the originally-requested
     /// model (the EXPENSIVE, quality-safe direction) until an explicit
-    /// resume (`POST /v1/routes/:id/resume`). Populated by the store
+    /// resume (`POST /v1/routes/:id/resume?expected_revision=N`). Populated by the store
     /// (`route_pauses` LEFT JOIN / in-memory pause map), never written by
     /// callers; false-omitted keeps `/v1/routes` JSON + any fixtures
     /// byte-stable.
@@ -70,6 +77,7 @@ pub struct Route {
 /// alongside `tt_plan_core::types::RouteConditions` so Plan and Gateway stay
 /// in lockstep.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteConditions {
     /// Match only if `req.model` is in this list. Empty list matches any model.
     #[serde(default)]
@@ -153,6 +161,7 @@ pub struct RouteConditions {
 
 /// What a matching [`Route`] does to the request before dispatch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteAction {
     /// Rewrite to this model. May target a different provider than the request
     /// (V3d-1 cross-provider routing); the target is capability-checked and
@@ -179,9 +188,11 @@ pub struct RouteAction {
     /// shared cache. Default false; omitted from JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_cache: bool,
-    /// Hard per-request ceiling (USD). After this route's rewrite, if the
-    /// rerouted model's estimated cost still exceeds this, the gateway rejects
-    /// the request (402) instead of dispatching. `None` = no ceiling.
+    /// Pre-dispatch estimated-cost admission limit (USD). After this route's
+    /// rewrite, if the rerouted model's static estimate still exceeds this, the
+    /// gateway rejects the request (402) instead of dispatching. It does not
+    /// reserve or settle provider usage, so it is not a runtime or invoice
+    /// ceiling. `None` = no admission limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
     /// Opt the matched request into OpenAI's **Flex** service tier
@@ -335,7 +346,8 @@ pub struct RouteAction {
     /// OPT-IN auto-pause: when true AND the paired-judge pass-rate over the
     /// recent verdict window drops below the floor (with at least
     /// `pause_min_verdicts` classified verdicts), the gateway pauses this
-    /// route's rewrite (sticky; resume via `POST /v1/routes/:id/resume`).
+    /// route's rewrite (sticky; resume via
+    /// `POST /v1/routes/:id/resume?expected_revision=N`).
     /// Default false — no behavior change unless a route enables it; omitted
     /// from JSON when false (back-compat with existing rows).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -394,7 +406,7 @@ pub struct RouteAction {
     /// when `None` (back-compat with existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agentic_budget: Option<AgenticBudget>,
-    /// Trigger + configure the deep-research panel for matched requests. None
+    /// Trigger + configure the Fusion panel for matched requests. None
     /// (default) ⇒ no panel. A panel route is typically modifier-only
     /// (target_model None); if target_model is also set, the panel governs
     /// dispatch and the rewrite is inert (complete_panel branches first).
@@ -420,12 +432,15 @@ pub struct RouteAction {
 /// seam: a self-contained config that detours dispatch. No competitor gateway
 /// has "routing rules that detour into governed, receipted multi-step workflows."
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteWorkflow {
     /// The workflow definition id to trigger (a UUID string in the workflow
     /// definitions table). Validated at route creation for existence + org scope.
     pub workflow_id: String,
-    /// Hard per-run ceiling (USD); the workflow engine's run_max_cost_usd.
-    /// None = inherit the route's max_cost_usd or the workflow's own budget.
+    /// Pre-dispatch workflow admission budget (USD). The workflow engine uses
+    /// it to admit a bounded static plan before dispatch; it is not a runtime
+    /// spending reservation, settlement, or invoice ceiling. `None` falls back
+    /// to the workflow definition's own budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
     /// `"detour"` (default) = the workflow result REPLACES the upstream call.
@@ -437,11 +452,12 @@ pub struct RouteWorkflow {
     pub mode: Option<String>,
 }
 
-/// Deep-research panel config for a route-triggered panel (the same panel
+/// Fusion panel config for a route-triggered panel (the same panel
 /// engine as the X-TokenTrimmer-Panel header). Self-contained (not a re-export
 /// of tt_shared PanelExtras) to keep the routing wire contract explicit and
 /// avoid a tt_shared coupling in this crate — mirrors the AgenticBudget pattern.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutePanel {
     /// "synthesize" | "best-of-n" (or "best_of_n") | "majority". Validated at
     /// route creation against PANEL_STRATEGY_VALUES; parsed authoritatively at
@@ -455,6 +471,8 @@ pub struct RoutePanel {
     pub arbiter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quorum: Option<usize>,
+    /// Fusion pre-dispatch admission budget (USD) for the static fan-out and
+    /// arbitration estimate. This is not a runtime spending or invoice cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
 }
@@ -466,6 +484,7 @@ pub struct RoutePanel {
 /// no new headers, no behavior change). The levers do NOT stack at face value —
 /// the planner (`tt_core::passes::agentic_budget`) nets them per request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgenticBudget {
     /// Sub-lever 1 (lossless): annotate cache_control breakpoints the caller
     /// forgot + restructure static-first. Default true when the mode is set.

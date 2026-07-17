@@ -1,6 +1,6 @@
 {
   "name": "agent-with-tool-budget",
-  "description": "An agentic loop with a hard turn cap (max_turns, clamped [1,32], default 8) + a hard cost ceiling (max_cost_usd) \u2014 the loop terminates as Incomplete with stop_reason=budget_exhausted BEFORE starting a turn that would breach it. The runaway-repeat detector trips on RUNAWAY_REPEAT_THRESHOLD consecutive byte-identical steps (the fastest agent-spend leak \u2014 it catches a stuck loop before a static cost cap). Use this template as the cost-controlled base for any agent-with-tools workflow.",
+  "description": "An agentic loop with a hard turn cap (max_turns, clamped [1,32], default 8) plus a preflight cost-admission cap (max_cost_usd). The loop can terminate as Incomplete with stop_reason=budget_exhausted before starting later work, but this is not a reservation or settlement ceiling: a started turn can still settle above the cap. The runaway-repeat detector trips on RUNAWAY_REPEAT_THRESHOLD consecutive byte-identical steps (the fastest agent-spend leak \u2014 it catches a stuck loop before a static cost cap). Use this template as a bounded-admission starting point, then add runtime reservation/settlement for a true spend ceiling.",
   "nodes": [
     {
       "id": "in",

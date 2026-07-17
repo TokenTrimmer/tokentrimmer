@@ -17,6 +17,15 @@ pub enum ApiError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// A route definition failed strict canonical validation. Unlike a generic
+    /// 400, this is deliberately field-addressable so API clients and the
+    /// dashboard can attach the failure to the exact control that would have
+    /// been silently ignored or changed at runtime.
+    #[error("route definition validation failed")]
+    RouteValidation {
+        issues: Vec<tt_routing::RouteValidationIssue>,
+    },
+
     #[error("unauthorized")]
     Unauthorized,
 
@@ -67,7 +76,7 @@ pub enum ApiError {
     /// The panel feature is disabled (kill-switch). Explicit — never a silent
     /// fallback to single-model, so a panel caller is not surprised by
     /// single-model billing.
-    #[error("deep-research panel is disabled")]
+    #[error("Fusion panel is disabled")]
     PanelDisabled,
 
     /// Too few legs survived to arbitrate.
@@ -80,52 +89,72 @@ pub enum ApiError {
 }
 
 #[derive(Serialize)]
-struct ErrorEnvelope<'a> {
-    error: ErrorBody<'a>,
+struct ErrorEnvelope {
+    error: ErrorBody,
 }
 
 #[derive(Serialize)]
-struct ErrorBody<'a> {
+struct ErrorBody {
     message: String,
     #[serde(rename = "type")]
-    type_: &'a str,
-    code: &'a str,
+    type_: &'static str,
+    code: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    param: Option<&'a str>,
+    param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issues: Option<Vec<tt_routing::RouteValidationIssue>>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, type_, code, message) = match &self {
+        let (status, type_, code, message, param, issues) = match &self {
             ApiError::InvalidRequest(m) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "invalid_request",
                 m.clone(),
+                None,
+                None,
+            ),
+            ApiError::RouteValidation { issues } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+                "route_validation_failed",
+                "Route definition failed canonical validation.".into(),
+                issues.first().map(|issue| issue.field.clone()),
+                Some(issues.clone()),
             ),
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "authentication_error",
                 "invalid_api_key",
                 "Invalid or missing API key".into(),
+                None,
+                None,
             ),
             ApiError::PaymentRequired => (
                 StatusCode::PAYMENT_REQUIRED,
                 "billing_error",
                 "subscription_required",
                 "Subscription required".into(),
+                None,
+                None,
             ),
             ApiError::Forbidden(m) => (
                 StatusCode::FORBIDDEN,
                 "permission_error",
                 "operation_not_permitted",
                 m.clone(),
+                None,
+                None,
             ),
             ApiError::ModelNotFound { model } => (
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
                 "model_not_found",
                 format!("Model '{model}' is not registered with any configured provider"),
+                None,
+                None,
             ),
             ApiError::MissingProviderCredential { provider } => (
                 StatusCode::BAD_REQUEST,
@@ -134,6 +163,8 @@ impl IntoResponse for ApiError {
                 format!(
                     "No upstream credential configured for provider '{provider}'. Add your org's '{provider}' API key in the TokenTrimmer dashboard (Credentials) before sending, routing, or pinning requests to this provider."
                 ),
+                None,
+                None,
             ),
             ApiError::CostLimitExceeded {
                 estimated_usd,
@@ -145,61 +176,84 @@ impl IntoResponse for ApiError {
                 format!(
                     "Estimated request cost ${estimated_usd:.4} exceeds the configured ${ceiling_usd:.4} per-request ceiling."
                 ),
+                None,
+                None,
             ),
             ApiError::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 "rate_limit_exceeded",
                 self.to_string(),
+                None,
+                None,
             ),
             ApiError::RequestTimeout { ms } => (
                 StatusCode::REQUEST_TIMEOUT,
                 "timeout_error",
                 "request_timeout",
                 format!("Request exceeded the {ms} ms X-TokenTrimmer-Timeout-Ms deadline."),
+                None,
+                None,
             ),
-            ApiError::Provider(err) => map_provider_error(err),
+            ApiError::Provider(err) => {
+                let (status, type_, code, message) = map_provider_error(err);
+                (status, type_, code, message, None, None)
+            }
             ApiError::Internal(m) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "internal_error",
                 m.clone(),
+                None,
+                None,
             ),
             ApiError::NotFound(m) => (
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
                 "not_found",
                 m.clone(),
+                None,
+                None,
             ),
             ApiError::ServiceUnavailable(m) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "server_error",
                 "service_unavailable",
                 m.clone(),
+                None,
+                None,
             ),
             ApiError::Conflict(m) => (
                 StatusCode::CONFLICT,
                 "invalid_request_error",
                 "conflict",
                 m.clone(),
+                None,
+                None,
             ),
             ApiError::PanelDisabled => (
                 StatusCode::FORBIDDEN,
                 "permission_error",
                 "panel_disabled",
-                "The deep-research panel is not enabled on this gateway.".into(),
+                "The Fusion panel is not enabled on this gateway.".into(),
+                None,
+                None,
             ),
             ApiError::PanelQuorumUnmet { required, met } => (
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
                 "panel_quorum_unmet",
-                format!("Deep-research panel could not reach quorum: {met} of {required} legs succeeded."),
+                format!("Fusion panel could not reach quorum: {met} of {required} legs succeeded."),
+                None,
+                None,
             ),
             ApiError::PanelStrategyUnsupported { strategy } => (
                 StatusCode::NOT_IMPLEMENTED,
                 "invalid_request_error",
                 "panel_strategy_unsupported",
-                format!("Deep-research panel strategy '{strategy}' is not supported yet."),
+                format!("Fusion panel strategy '{strategy}' is not supported yet."),
+                None,
+                None,
             ),
         };
 
@@ -208,7 +262,8 @@ impl IntoResponse for ApiError {
                 message,
                 type_,
                 code,
-                param: None,
+                param,
+                issues,
             },
         };
         (status, Json(body)).into_response()

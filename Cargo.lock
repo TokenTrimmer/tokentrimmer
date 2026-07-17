@@ -6731,8 +6731,13 @@ name = "tt-routing"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
+ "metrics",
+ "metrics-exporter-prometheus",
  "serde",
  "serde_json",
+ "serde_path_to_error",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",

@@ -216,6 +216,21 @@ fn migrator_includes_batch_jobs_migration() {
     );
 }
 
+#[test]
+fn migrator_includes_gateway_owned_cost_breakdown_columns() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let thirty_ninth = migrations
+        .iter()
+        .find(|m| m.version == 39)
+        .expect("migration version 39 not found");
+    let desc = thirty_ninth.description.to_lowercase();
+    assert!(
+        desc.contains("cost") || desc.contains("breakdown") || desc.contains("columns"),
+        "migration 0039 description is '{}', expected to mention cost/breakdown/columns",
+        thirty_ninth.description,
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -251,6 +266,20 @@ async fn migrate_only_applies_schema() {
     assert!(
         bust_col,
         "request_logs.cache_bust_penalty_usd should exist after migration 0016"
+    );
+    let cost_breakdown_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'request_logs' \
+           AND column_name = ANY(ARRAY[\
+             'flex_saved_usd', 'doc_compaction_saved_usd', 'summarizer_tax_usd'\
+           ])",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query cost-breakdown columns");
+    assert_eq!(
+        cost_breakdown_columns, 3,
+        "gateway-owned cost-breakdown columns should exist after migration 0039"
     );
 }
 
@@ -316,6 +345,9 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         baseline_cost_usd: 0.001,
         provider_cache_saved_usd: 0.0002,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: false,
         cache_layer: None,
         route_id: None,
@@ -438,6 +470,9 @@ async fn request_log_insert_round_trips_batch_columns() {
         baseline_cost_usd: 0.025,
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: false,
         cache_layer: None,
         route_id: None,
@@ -555,6 +590,9 @@ async fn request_logs_insert_round_trips_against_postgres() {
         baseline_cost_usd: 0.0045,
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.000611,
+        doc_compaction_saved_usd: 0.000733,
+        summarizer_tax_usd: 0.000199,
         cached: false,
         cache_layer: None,
         route_id: None,
@@ -608,17 +646,28 @@ async fn request_logs_insert_round_trips_against_postgres() {
         .await
         .expect("PostgresRequestLogWriter::write must succeed (bind chain == placeholders)");
 
-    let (provider, route_paused, minify_est, doc_vision_est, cc_est, cc_kind) =
-        sqlx::query_as::<_, (String, bool, f64, f64, f64, Option<String>)>(
-            "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8, \
+    let (
+        provider,
+        route_paused,
+        minify_est,
+        doc_vision_est,
+        cc_est,
+        cc_kind,
+        flex_saved,
+        doc_compaction_saved,
+        summarizer_tax,
+    ) = sqlx::query_as::<_, (String, bool, f64, f64, f64, Option<String>, f64, f64, f64)>(
+        "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8, \
              doc_vision_saved_est_usd::FLOAT8, \
-             content_compress_saved_est_usd::FLOAT8, content_compress_kind \
+             content_compress_saved_est_usd::FLOAT8, content_compress_kind, \
+             flex_saved_usd::FLOAT8, doc_compaction_saved_usd::FLOAT8, \
+             summarizer_tax_usd::FLOAT8 \
              FROM request_logs WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .expect("fetch row");
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch row");
     assert_eq!(provider, "test-provider");
     assert!(route_paused, "route_paused=true must survive write→read");
     assert!(
@@ -637,6 +686,18 @@ async fn request_logs_insert_round_trips_against_postgres() {
         cc_kind.as_deref(),
         Some("json"),
         "content_compress_kind (TEXT) must round-trip"
+    );
+    assert!(
+        (flex_saved - 0.000611).abs() < 1e-9,
+        "flex_saved_usd must round-trip through NUMERIC(12,6), got {flex_saved}"
+    );
+    assert!(
+        (doc_compaction_saved - 0.000733).abs() < 1e-9,
+        "doc_compaction_saved_usd must round-trip through NUMERIC(12,6), got {doc_compaction_saved}"
+    );
+    assert!(
+        (summarizer_tax - 0.000199).abs() < 1e-9,
+        "summarizer_tax_usd must round-trip through NUMERIC(12,6), got {summarizer_tax}"
     );
 
     sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
@@ -679,6 +740,9 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         baseline_cost_usd: 0.02,
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: false,
         cache_layer: None,
         route_id: None,

@@ -2345,7 +2345,7 @@ async fn run_gateway(config: tt_config::Config) -> anyhow::Result<()> {
         tracing::warn!("no DB pool; routing disabled (chat requests pass through unrouted)");
     }
 
-    // Deep-research panel kill-switch: off by default; set TT_PANEL_ENABLED=1
+    // Fusion panel kill-switch: off by default; set TT_PANEL_ENABLED=1
     // or TT_PANEL_ENABLED=true to enable. Panel requests are rejected with
     // `panel_disabled` (403) unless this is set — never a silent single-model
     // fallback.

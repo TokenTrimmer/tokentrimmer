@@ -52,6 +52,30 @@ fn model_node_with_pinned_model_deserializes() {
 }
 
 #[test]
+fn max_output_tokens_is_an_additive_model_and_agent_wire_field() {
+    let legacy_model = r#"{"id":"n1","type":"model","selection":{"type":"model","model":"gpt-4o-mini"},"prompt":"hi"}"#;
+    let explicit_agent = r#"{"id":"n2","type":"agent","selection":{"type":"model","model":"gpt-4o-mini"},"prompt":"hi","max_output_tokens":64,"tools":[]}"#;
+
+    let legacy = parse(legacy_model).expect("legacy model node remains compatible");
+    assert!(matches!(
+        &legacy.nodes[0].kind,
+        NodeKind::Model {
+            max_output_tokens: None,
+            ..
+        }
+    ));
+
+    let capped = parse(explicit_agent).expect("explicit output cap deserializes");
+    assert!(matches!(
+        &capped.nodes[0].kind,
+        NodeKind::Agent {
+            max_output_tokens: Some(64),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn model_node_with_route_ref_deserializes() {
     let j = r#"{"id":"n1","type":"model","selection":{"type":"route","route_ref":"cheap-for-short"},"prompt":"hi"}"#;
     let def = parse(j).expect("a route-ref selection deserializes");

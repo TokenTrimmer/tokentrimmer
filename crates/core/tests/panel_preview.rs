@@ -260,6 +260,16 @@ async fn preview_panel_returns_estimate_with_zero_dispatch() {
         "total_estimated_cost_usd must be positive"
     );
 
+    // The preview's budget comparison must never be mistaken for the real
+    // Fusion admission gate or runtime/provider readiness.
+    assert_eq!(panel["estimate_evidence"]["scope"], "preview_only");
+    let estimate_reason = panel["estimate_evidence"]["reason"]
+        .as_str()
+        .expect("preview estimate evidence reason");
+    assert!(estimate_reason.contains("does not execute Fusion admission"));
+    assert!(estimate_reason.contains("not a cost reservation"));
+    assert!(estimate_reason.contains("runtime spend ceiling"));
+
     // CRITICAL: zero upstream calls — /v1/preview must remain side-effect-free.
     let dispatches = calls.load(Ordering::Relaxed);
     assert_eq!(

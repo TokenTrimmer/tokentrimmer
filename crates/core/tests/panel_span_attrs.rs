@@ -193,6 +193,7 @@ fn panel_request() -> Request<Body> {
     // the existing panel_dispatch.rs integration tests.
     let body = json!({
         "model": "panel-arbiter",
+        "max_tokens": 64,
         "messages": [{ "role": "user", "content": "research this" }],
         "stream": false,
         "tt_extras": {

@@ -16,6 +16,11 @@
 //! so the preview can work without the AppState registry (the existing behavior
 //! for non-panel requests is byte-identical to before).
 //!
+//! `panel.within_budget` is therefore an indicative comparison within this
+//! dry-run only. It is not Fusion admission, a credential/provider-health or
+//! latency check, a reservation, or a runtime spending ceiling; the additive
+//! `estimate_evidence` object makes that boundary machine-readable.
+//!
 //! ### tt_extras.panel
 //! `PreviewRequest` now accepts a `tt_extras` map. When `tt_extras.panel` is
 //! present, its member list / arbiter override is used (same as the live chat
@@ -159,6 +164,10 @@ pub async fn post_preview(
             },
             "total_estimated_cost_usd": total_estimated_cost_usd,
             "within_budget": within_budget,
+            "estimate_evidence": {
+                "scope": "preview_only",
+                "reason": "This catalog-only dry-run does not execute Fusion admission. within_budget is not a credential, provider-health, or latency check; it is not a cost reservation, runtime spend ceiling, or execution guarantee."
+            },
         });
 
         // Merge the panel object into the base response at the top level.

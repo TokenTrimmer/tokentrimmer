@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::store::{RoutingStore, RoutingStoreError};
+use crate::store::{RouteManagementView, RoutingStore, RoutingStoreError};
 use crate::{Route, RoutingEngine};
 
 /// Default per-org TTL.
@@ -101,6 +101,16 @@ impl RoutingStore for CachingRoutingStore {
         self.inner.list_all_for_org(org_id).await
     }
 
+    async fn list_management_for_org(
+        &self,
+        org_id: Uuid,
+    ) -> Result<Vec<RouteManagementView>, RoutingStoreError> {
+        // Never synthesize a management view from the cached runtime engine:
+        // the engine intentionally omits invalid rows. Delegate to the raw
+        // store so a legacy/manual row stays visible for repair.
+        self.inner.list_management_for_org(org_id).await
+    }
+
     async fn create_route(
         &self,
         org_id: Uuid,
@@ -115,8 +125,24 @@ impl RoutingStore for CachingRoutingStore {
         self.inner.get_route(org_id, id).await
     }
 
-    async fn delete_route(&self, org_id: Uuid, id: Uuid) -> Result<bool, RoutingStoreError> {
-        let removed = self.inner.delete_route(org_id, id).await?;
+    async fn get_management_route(
+        &self,
+        org_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<RouteManagementView>, RoutingStoreError> {
+        self.inner.get_management_route(org_id, id).await
+    }
+
+    async fn delete_route(
+        &self,
+        org_id: Uuid,
+        id: Uuid,
+        expected_revision: i64,
+    ) -> Result<bool, RoutingStoreError> {
+        let removed = self
+            .inner
+            .delete_route(org_id, id, expected_revision)
+            .await?;
         if removed {
             self.invalidate(org_id).await;
         }
@@ -127,9 +153,13 @@ impl RoutingStore for CachingRoutingStore {
         &self,
         org_id: Uuid,
         route_id: Uuid,
+        expected_revision: i64,
         pause: crate::store::NewRoutePause,
     ) -> Result<bool, RoutingStoreError> {
-        let paused = self.inner.pause_route(org_id, route_id, pause).await?;
+        let paused = self
+            .inner
+            .pause_route(org_id, route_id, expected_revision, pause)
+            .await?;
         if paused {
             // Invalidate so the pause takes effect immediately on THIS replica;
             // other replicas converge within the TTL (≤ 60s by default) — same
@@ -139,8 +169,16 @@ impl RoutingStore for CachingRoutingStore {
         Ok(paused)
     }
 
-    async fn resume_route(&self, org_id: Uuid, route_id: Uuid) -> Result<bool, RoutingStoreError> {
-        let resumed = self.inner.resume_route(org_id, route_id).await?;
+    async fn resume_route(
+        &self,
+        org_id: Uuid,
+        route_id: Uuid,
+        expected_revision: i64,
+    ) -> Result<bool, RoutingStoreError> {
+        let resumed = self
+            .inner
+            .resume_route(org_id, route_id, expected_revision)
+            .await?;
         if resumed {
             // Same immediate-on-this-replica / ≤TTL-elsewhere convergence as
             // pause_route.
@@ -292,12 +330,19 @@ mod tests {
             .unwrap();
         // Warm the cache with the rewrite-active engine.
         assert!(!cache.engine_for(org).await.unwrap().routes()[0].paused);
+        let revision = cache
+            .get_management_route(org, created.id)
+            .await
+            .unwrap()
+            .and_then(|route| route.revision)
+            .expect("in-memory management reads carry a revision");
 
         // Pause via the caching store → immediately reflected (no TTL wait).
         assert!(cache
             .pause_route(
                 org,
                 created.id,
+                revision,
                 crate::store::NewRoutePause {
                     paused_by: crate::store::PausedBy::Auto,
                     reason: "auto: test".into(),
@@ -313,7 +358,7 @@ mod tests {
         );
 
         // Resume → immediately reflected again.
-        assert!(cache.resume_route(org, created.id).await.unwrap());
+        assert!(cache.resume_route(org, created.id, revision).await.unwrap());
         assert!(
             !cache.engine_for(org).await.unwrap().routes()[0].paused,
             "resume must invalidate the cached engine"

@@ -2,16 +2,16 @@
 # Deploy: gateway (public) → staging → prod   (Phase 2 automation)
 #
 # Flow (per cloud/docs/superpowers/specs/2026-06-02-local-staging-prod-pipeline-design.md):
-#   CI passes on main ─▶ (workflow_run) job `staging` : migrate staging DB →
-#                       │ (auto, only on CI success)    flyctl deploy fly.staging.toml
-#                  job `prod`      : needs staging + MANUAL APPROVAL (GH Environment)
-#                                    migrate prod DB → flyctl deploy fly.toml
+#   protected main push ─▶ CI jobs + deploy trust policy ─▶ this reusable workflow
+#                         job `staging`: migrate staging DB → deploy staging
+#                         job `prod`: needs staging + MANUAL APPROVAL (GH Environment)
+#                                     migrate prod DB → deploy prod
 #
-#   Staging is gated on a SUCCESSFUL CI run, NOT on a raw push to main: this
-#   workflow triggers via `workflow_run` on completion of the `CI` workflow and
-#   every deploy job carries `github.event.workflow_run.conclusion == 'success'`
-#   (a red/cancelled CI never reaches staging). Deploys check out + ship the exact
-#   commit CI validated (`github.event.workflow_run.head_sha`), not main's tip.
+#   This workflow intentionally has no `workflow_run`, `pull_request`, or manual
+#   trigger. The CI caller gates it on a same-repository protected `main` push,
+#   verifies the pushed SHA is still the protected branch head, and passes only
+#   after every required CI job succeeds. That keeps fork/PR code out of every
+#   job that can read deployment secrets.
 #
 #   The gateway only owns the public.* schema, but it shares ONE Neon DB with the
 #   cloud surfaces, so migrations are applied via the strict `tt gateway
@@ -44,21 +44,16 @@
 name: deploy (gateway)
 
 on:
-  # Gate staging on a SUCCESSFUL CI run instead of a raw push to main. This fires
-  # when the `CI` workflow (ci.yml) completes on the `main` branch; the deploy
-  # jobs then require `workflow_run.conclusion == 'success'`. (PR CI runs carry a
-  # non-main head branch, so the `branches: [main]` filter excludes them.)
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: [main]
-  workflow_dispatch: # allow a manual re-run of the pipeline
-    inputs:
-      deploy_prod:
-        description: "Also deploy production after staging succeeds"
+  # This is a deliberately narrow interface. The CI caller passes only the
+  # three deployment secrets below; never switch this back to `secrets: inherit`.
+  workflow_call:
+    secrets:
+      FLY_API_TOKEN:
         required: false
-        default: false
-        type: boolean
+      STAGING_DATABASE_URL_DIRECT:
+        required: false
+      PROD_DATABASE_URL_DIRECT:
+        required: false
 
 # One deploy at a time; never cancel an in-flight deploy.
 concurrency:
@@ -69,6 +64,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Re-run the caller's policy in the reusable workflow, without repository
+  # secrets, before preflight is eligible to run. It catches a delayed deploy
+  # after a later protected push or allowed force-update: the SHA must still be
+  # the protected-main head at re-verification time before a deploy secret is
+  # materialized on a runner.
+  verify-trust:
+    name: re-verify protected-main deploy trust
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      trusted: ${{ steps.policy.outputs.trusted }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+      - id: policy
+        name: Verify same-repository protected-main head
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/deploy-trigger-policy.mjs
+
   # ── Preflight: are the deploy secrets configured? ────────────────────────────
   # GitHub forbids `secrets` in job-level `if:`, so a tiny job reads them into an
   # output and `staging` gates on it; `prod` cascade-skips via `needs`. When the
@@ -78,10 +96,10 @@ jobs:
   # PROD_DATABASE_URL_DIRECT + the `production` Environment gate — see header).
   preflight:
     name: deploy configured?
-    # Only proceed when the triggering CI run passed (workflow_run) or on a manual
-    # dispatch. A failed/cancelled CI run skips this job, which cascade-skips
-    # staging + prod via `needs`. This is the CI-success gate for the pipeline.
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Defense in depth: even an accidental future caller cannot expose secrets
+    # for a PR, workflow_run, manual dispatch, tag, or non-main branch.
+    needs: verify-trust
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.verify-trust.outputs.trusted == 'true'
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
@@ -107,11 +125,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      # Check out the exact commit CI validated (workflow_run.head_sha), not
-      # main's tip — for workflow_dispatch this falls back to the dispatched ref.
+      # Check out the exact protected-main commit validated by the caller.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -135,7 +152,7 @@ jobs:
       - name: Deploy gateway → tokentrimmer-staging
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          TT_GIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TT_GIT_SHA: ${{ github.sha }}
         run: flyctl deploy --remote-only --config fly.staging.toml --build-arg "TT_GIT_SHA=$TT_GIT_SHA"
 
       - name: Post-deploy staging smoke (wake scale-to-zero, check /health)
@@ -149,16 +166,13 @@ jobs:
   prod:
     name: prod (migrate → deploy)
     needs: staging
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_prod == true }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
     steps:
-      # prod is workflow_dispatch-only, so head_sha is empty here and this falls
-      # back to the dispatched ref — kept symmetric with staging.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -178,7 +192,7 @@ jobs:
       - name: Deploy gateway → tokentrimmer
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          TT_GIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          TT_GIT_SHA: ${{ github.sha }}
         run: flyctl deploy --remote-only --config fly.toml --build-arg "TT_GIT_SHA=$TT_GIT_SHA"
 
       - name: Post-deploy prod smoke

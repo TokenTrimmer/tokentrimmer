@@ -83,9 +83,9 @@ impl DistillCacheStore for NoCache {
 /// another). The cache fails OPEN: any DB error → `None` on get (the node
 /// distills fresh) + a no-op on upsert (the next run re-tries + re-stores).
 ///
-/// Rows expire after 30 days (the table's partial expiry index); a
-/// re-distillation after expiry is byte-identical (the extraction is a
-/// deterministic function of the source bytes).
+/// Rows expire after 30 days (the table has a normal `distilled_at` index for
+/// the expiry sweep); a re-distillation after expiry is byte-identical (the
+/// extraction is a deterministic function of the source bytes).
 pub struct FlowDocDistillCache<'a> {
     pub org_id: Uuid,
     pub pool: &'a sqlx::PgPool,

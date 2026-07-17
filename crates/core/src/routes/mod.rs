@@ -5,6 +5,7 @@ pub mod agent_run;
 pub(crate) mod agent_run_budget;
 pub(crate) mod agent_run_store;
 pub mod batches;
+pub mod capabilities;
 pub mod chat;
 pub mod embeddings;
 pub(crate) mod gateway_tools;

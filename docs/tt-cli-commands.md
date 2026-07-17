@@ -422,7 +422,7 @@ The five curated recipes:
 | --- | --- |
 | `cheap-classification` | Short classification-style prompts → a small model. |
 | `vision-gate` | Image requests pinned to a vision-capable model. |
-| `cost-ceiling` | Downshift expensive calls + a hard per-request cost cap. |
+| `cost-ceiling` | Downshift expensive calls + a pre-dispatch estimated-cost cap. |
 | `outage-fallback` | Provider outages fail over to a backup chain. |
 | `long-context-downshift` | Huge-context prompts → a cheaper long-context model. |
 

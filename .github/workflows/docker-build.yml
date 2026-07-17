@@ -64,4 +64,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
-          provenance: false
+          # BuildKit attaches in-toto/SLSA provenance and an SPDX SBOM
+          # to every pushed GHCR image. PR builds still validate the Dockerfile;
+          # attestations are published only with the immutable image artifact.
+          provenance: mode=max
+          sbom: true

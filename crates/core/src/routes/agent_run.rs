@@ -339,9 +339,46 @@ pub(crate) async fn run_loop_core(
     completer: &dyn TurnCompleter,
     id: uuid::Uuid,
     model: String,
+    messages: Vec<Message>,
+    tools: Vec<tt_shared::messages::Tool>,
+    max_turns: u32,
+    max_cost_usd: Option<f64>,
+    turns_done: u32,
+    summarized_upto: u32,
+    usage: RunUsage,
+    summarizer: Option<&dyn TranscriptSummarizer>,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<RunEvent>>,
+) -> LoopOutcome {
+    run_loop_core_with_output_cap(
+        completer,
+        id,
+        model,
+        messages,
+        tools,
+        max_turns,
+        None,
+        max_cost_usd,
+        turns_done,
+        summarized_upto,
+        usage,
+        summarizer,
+        events,
+    )
+    .await
+}
+
+/// Internal variant used by bounded workflow nodes. Public agent runs continue
+/// through [`run_loop_core`] with `None`, preserving their provider-default
+/// completion behavior and persisted resume wire format.
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_core_with_output_cap(
+    completer: &dyn TurnCompleter,
+    id: uuid::Uuid,
+    model: String,
     mut messages: Vec<Message>,
     tools: Vec<tt_shared::messages::Tool>,
     max_turns: u32,
+    max_output_tokens: Option<u32>,
     max_cost_usd: Option<f64>,
     turns_done: u32,
     mut summarized_upto: u32,
@@ -370,7 +407,7 @@ pub(crate) async fn run_loop_core(
     let mut no_progress = NoProgressTracker::new(RUNAWAY_REPEAT_THRESHOLD);
     while turn < max_turns {
         let est_next = if max_cost_usd.is_some() {
-            estimate_next_turn_cost(&model, &messages)
+            estimate_next_turn_cost(&model, &messages, max_output_tokens)
         } else {
             None
         };
@@ -412,6 +449,7 @@ pub(crate) async fn run_loop_core(
             messages: messages.clone(),
             tools: tools.clone(),
             stream: false,
+            max_tokens: max_output_tokens,
             ..Default::default()
         };
         // A "mechanical" turn digests ONLY read-only tool output (the prior
@@ -662,8 +700,9 @@ pub(crate) struct StoredRun {
     /// The run's pinned summarize policy (turn-0 route). `None` ⇒ summarize off.
     #[serde(default)]
     pub summarize: Option<SummarizeConfig>,
-    /// Hard cost ceiling (USD) carried across pause so resume applies the same
-    /// cap. `#[serde(default)]` for cross-deploy back-compat.
+    /// Cost-admission guard (USD) carried across pause so resume applies the
+    /// same cap. It is not a provider settlement guarantee.
+    /// `#[serde(default)]` preserves cross-deploy back-compat.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
     /// Terminal stop reason; `None` for paused (requires_action) runs.
@@ -1138,9 +1177,10 @@ pub struct CreateRunRequest {
     /// Turn cap; clamped to `[1, 32]`. Defaults to [`DEFAULT_MAX_TURNS`].
     #[serde(default)]
     pub max_turns: Option<u32>,
-    /// Hard ceiling on the run's accumulated served cost (USD). When set, the
-    /// loop terminates as `Incomplete` with `stop_reason = budget_exhausted`
-    /// before starting a turn that would breach it. None => no cost cap.
+    /// Admission guard on the run's accumulated served cost (USD). When set,
+    /// the loop stops before a new turn when accrued cost plus an available
+    /// best-effort estimate reaches the cap; a started turn can settle above it.
+    /// None => no cost cap.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
     /// When true, `POST /v1/agent/runs` streams run events as SSE (slice 3b)
@@ -1164,6 +1204,39 @@ async fn drive_run_loop(
     summarize_cfg: Option<SummarizeConfig>,
     events: Option<&tokio::sync::mpsc::UnboundedSender<RunEvent>>,
 ) -> LoopOutcome {
+    drive_run_loop_with_output_cap(
+        state,
+        identity,
+        id,
+        model,
+        messages,
+        tools,
+        max_turns,
+        None,
+        max_cost_usd,
+        summarize_cfg,
+        events,
+    )
+    .await
+}
+
+/// Variant used by workflow nodes with an explicit per-turn completion cap.
+/// The cap is forwarded unchanged to both preview admission and the provider
+/// request; it remains a request parameter rather than a settlement guarantee.
+#[allow(clippy::too_many_arguments)]
+async fn drive_run_loop_with_output_cap(
+    state: &AppState,
+    identity: RunIdentity,
+    id: Uuid,
+    model: String,
+    messages: Vec<Message>,
+    tools: Vec<tt_shared::messages::Tool>,
+    max_turns: u32,
+    max_output_tokens: Option<u32>,
+    max_cost_usd: Option<f64>,
+    summarize_cfg: Option<SummarizeConfig>,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<RunEvent>>,
+) -> LoopOutcome {
     let base_provider_id = state.registry.resolve(&model).map(|p| p.id().to_string());
     let summarizer_model = summarizer_model(state);
     let base_ctx = base_request_context(&identity);
@@ -1183,13 +1256,14 @@ async fn drive_run_loop(
         .as_ref()
         .map(|s| s as &dyn TranscriptSummarizer);
     let completer = GatewayCompleter { state, identity };
-    run_loop_core(
+    run_loop_core_with_output_cap(
         &completer,
         id,
         model,
         messages,
         tools,
         max_turns,
+        max_output_tokens,
         max_cost_usd,
         0,
         0,
@@ -1226,6 +1300,7 @@ pub(crate) async fn drive_workflow_node(
     messages: Vec<Message>,
     tools: Vec<tt_shared::messages::Tool>,
     max_turns: u32,
+    max_output_tokens: Option<u32>,
     max_cost_usd: Option<f64>,
     route_ref: Option<String>,
     tag: Option<String>,
@@ -1258,7 +1333,7 @@ pub(crate) async fn drive_workflow_node(
         headers: HeaderMap::new(),
         run_id,
     };
-    drive_run_loop(
+    drive_run_loop_with_output_cap(
         state,
         identity,
         run_id,
@@ -1266,6 +1341,7 @@ pub(crate) async fn drive_workflow_node(
         messages,
         tools,
         max_turns,
+        max_output_tokens,
         max_cost_usd,
         None, // no summarizer in W1a workflow nodes
         None, // no SSE event sink
@@ -2252,12 +2328,81 @@ mod tests {
         }
     }
 
+    /// Records the provider-facing completion cap so workflow propagation can
+    /// be checked without a provider, run record, or network dispatch.
+    struct OutputCapRecordingStub {
+        caps: std::sync::Mutex<Vec<Option<u32>>>,
+    }
+
+    #[async_trait]
+    impl TurnCompleter for OutputCapRecordingStub {
+        async fn complete(
+            &self,
+            req: ChatCompletionRequest,
+            _is_mechanical: bool,
+        ) -> Result<(Message, RunUsage), ApiError> {
+            self.caps.lock().unwrap().push(req.max_tokens);
+            Ok((assistant_final(), RunUsage::default()))
+        }
+    }
+
     fn assistant_final() -> Message {
         Message::Assistant {
             content: Some(MessageContent::Text("done".into())),
             tool_calls: vec![],
             name: None,
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_workflow_turn_forwards_its_explicit_output_cap() {
+        let stub = OutputCapRecordingStub {
+            caps: std::sync::Mutex::new(vec![]),
+        };
+        let outcome = run_loop_core_with_output_cap(
+            &stub,
+            Uuid::nil(),
+            "gpt-4o-mini".into(),
+            vec![],
+            vec![],
+            1,
+            Some(37),
+            None,
+            0,
+            0,
+            RunUsage::default(),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(outcome, LoopOutcome::Terminal(_)));
+        assert_eq!(*stub.caps.lock().unwrap(), vec![Some(37)]);
+    }
+
+    #[tokio::test]
+    async fn uncapped_turn_keeps_the_provider_default_output_setting() {
+        let stub = OutputCapRecordingStub {
+            caps: std::sync::Mutex::new(vec![]),
+        };
+        let outcome = run_loop_core(
+            &stub,
+            Uuid::nil(),
+            "gpt-4o-mini".into(),
+            vec![],
+            vec![],
+            1,
+            None,
+            0,
+            0,
+            RunUsage::default(),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(outcome, LoopOutcome::Terminal(_)));
+        assert_eq!(*stub.caps.lock().unwrap(), vec![None]);
     }
 
     fn assistant_toolcall(name: &str) -> Message {

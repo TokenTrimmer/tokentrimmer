@@ -207,6 +207,7 @@ fn panel_req_with_bearer(bearer: &str) -> Request<Body> {
         .body(Body::from(
             json!({
                 "model": "gpt-4o",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": false,
                 "tt_extras": {

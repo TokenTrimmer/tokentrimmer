@@ -965,6 +965,7 @@ async fn synthesize_streaming_panel_cost_incomplete_false() {
         .body(Body::from(
             serde_json::json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "cost_incomplete pin" }],
                 "stream": true,
                 "tt_extras": {
@@ -1485,6 +1486,7 @@ async fn streaming_e2e_synthesize_live_aggregate_row_and_event_order() {
         .body(Body::from(
             serde_json::json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": true,
                 "tt_extras": {
@@ -1609,6 +1611,7 @@ async fn streaming_e2e_best_of_n_replays_chosen_leg_verbatim_no_double_count() {
         .body(Body::from(
             serde_json::json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "which is best?" }],
                 "stream": true,
                 "tt_extras": {
@@ -1748,6 +1751,7 @@ async fn streaming_e2e_quorum_unmet_returns_502_zero_rows_no_stream() {
         .body(Body::from(
             serde_json::json!({
                 "model": "model-a",
+                "max_tokens": 64,
                 "messages": [{ "role": "user", "content": "deep question" }],
                 "stream": true,
                 "tt_extras": {

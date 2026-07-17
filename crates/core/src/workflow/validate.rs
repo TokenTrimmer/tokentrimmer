@@ -14,7 +14,8 @@ use super::types::{ModelSelection, NodeKind, WorkflowDefinition, WorkflowTrigger
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Validate a [`WorkflowDefinition`] against structural and model constraints.
+/// Validate a newly written [`WorkflowDefinition`] against structural and model
+/// constraints.
 ///
 /// `model_exists(model_id)` should return `true` when the given model id is
 /// known to the gateway (i.e. `registry.resolve(model_id).is_some()`).  Only
@@ -22,11 +23,37 @@ use super::types::{ModelSelection, NodeKind, WorkflowDefinition, WorkflowTrigger
 /// selections are accepted without a lookup.  [`ModelSelection::Auto`] is
 /// rejected with an error — callers must pin a model or `route_ref` for W1a.
 ///
+/// New and updated schedule triggers must meet the current one-hour minimum.
+/// Stored definitions execute through `validate_for_execution` so a schedule
+/// persisted before that write-time floor is not silently disabled.
+///
 /// Returns `Ok(())` when the definition is valid, or `Err(errors)` where
 /// `errors` is a **complete** list of all violations found.
 pub fn validate(
     def: &WorkflowDefinition,
     model_exists: &dyn Fn(&str) -> bool,
+) -> Result<(), Vec<String>> {
+    validate_with_schedule_floor(def, model_exists, true)
+}
+
+/// Validate a definition loaded from durable storage before it executes.
+///
+/// This preserves the structural, model, maximum-interval, and webhook checks
+/// from [`validate`], but deliberately permits a sub-hour schedule written
+/// before the current write contract. The only callers load a persisted
+/// definition first; new and updated API writes always use [`validate`]. An
+/// operator must explicitly migrate legacy schedules to one hour or longer.
+pub(crate) fn validate_for_execution(
+    def: &WorkflowDefinition,
+    model_exists: &dyn Fn(&str) -> bool,
+) -> Result<(), Vec<String>> {
+    validate_with_schedule_floor(def, model_exists, false)
+}
+
+fn validate_with_schedule_floor(
+    def: &WorkflowDefinition,
+    model_exists: &dyn Fn(&str) -> bool,
+    enforce_current_schedule_minimum: bool,
 ) -> Result<(), Vec<String>> {
     let mut errors: Vec<String> = Vec::new();
 
@@ -132,6 +159,22 @@ pub fn validate(
                 }
             }
             _ => {}
+        }
+
+        let output_cap = match &node.kind {
+            NodeKind::Model {
+                max_output_tokens, ..
+            }
+            | NodeKind::Agent {
+                max_output_tokens, ..
+            } => *max_output_tokens,
+            _ => None,
+        };
+        if output_cap == Some(0) {
+            errors.push(format!(
+                "node \"{}\": max_output_tokens must be a positive integer when set",
+                node.id
+            ));
         }
     }
 
@@ -298,7 +341,7 @@ pub fn validate(
     // token_id is a non-empty URL-safe string. Empty `triggers` is the default
     // (human-Run only) and is fine.
     // ------------------------------------------------------------------
-    validate_triggers(def, &mut errors);
+    validate_triggers(def, &mut errors, enforce_current_schedule_minimum);
 
     if errors.is_empty() {
         Ok(())
@@ -311,12 +354,28 @@ pub fn validate(
 // CO-2: triggers (schedule/webhook) validation
 // ---------------------------------------------------------------------------
 
+/// The hosted schedule dispatcher normally sweeps hourly.  Accepting a shorter
+/// write-time interval would promise a cadence the dispatcher cannot honor.
+const MIN_SCHEDULE_INTERVAL_SECS: u64 = 60 * 60;
+
+/// The floor enforced before the one-hour write contract. Execution retains it
+/// for legacy definitions so corrupt or impossible sub-five-minute schedules
+/// cannot become runnable through the compatibility path.
+const LEGACY_MIN_SCHEDULE_INTERVAL_SECS: u64 = 5 * 60;
+
 /// Validate the workflow's `triggers` invokers. Empty is the default
 /// (human-Run only) and is fine. At most one `Schedule` (two cadences is
-/// ambiguous). `Schedule.interval` parses to a bounded `Duration` (min 5 min,
-/// max 30 d — no busy-loops, no months-long silent gaps). `Webhook.token_id`
-/// is a non-empty URL-safe string.
-fn validate_triggers(def: &WorkflowDefinition, errors: &mut Vec<String>) {
+/// ambiguous). New or updated `Schedule.interval` values parse to a bounded
+/// `Duration` (min 1 h, max 30 d — no unsupported sub-hour promise or
+/// months-long silent gaps). Stored legacy definitions retain their former
+/// five-minute safety floor during execution. Hosted pickup is an approximate
+/// hourly sweep, not an exact-time trigger. `Webhook.token_id` is a non-empty
+/// URL-safe string.
+fn validate_triggers(
+    def: &WorkflowDefinition,
+    errors: &mut Vec<String>,
+    enforce_current_schedule_minimum: bool,
+) {
     let mut schedule_count = 0;
     for t in &def.triggers {
         match t {
@@ -324,9 +383,15 @@ fn validate_triggers(def: &WorkflowDefinition, errors: &mut Vec<String>) {
                 schedule_count += 1;
                 match parse_interval(interval) {
                     Some(d) => {
-                        if d.as_secs() < 300 {
+                        if enforce_current_schedule_minimum
+                            && d.as_secs() < MIN_SCHEDULE_INTERVAL_SECS
+                        {
                             errors.push(format!(
-                                "schedule interval '{interval}' is below the 5-minute minimum"
+                                "schedule interval '{interval}' is below the 1-hour minimum; hosted schedules use an approximate hourly sweep, not exact-time delivery"
+                            ));
+                        } else if d.as_secs() < LEGACY_MIN_SCHEDULE_INTERVAL_SECS {
+                            errors.push(format!(
+                                "schedule interval '{interval}' is below the 5-minute legacy compatibility minimum"
                             ));
                         } else if d.as_secs() > 30 * 24 * 3600 {
                             errors.push(format!(
@@ -335,7 +400,7 @@ fn validate_triggers(def: &WorkflowDefinition, errors: &mut Vec<String>) {
                         }
                     }
                     None => errors.push(format!(
-                        "schedule interval '{interval}' is not a valid duration (use e.g. '6h', '30m', '1d')"
+                        "schedule interval '{interval}' is not a valid duration (use e.g. '1h', '6h', '1d')"
                     )),
                 }
             }
@@ -360,7 +425,7 @@ fn validate_triggers(def: &WorkflowDefinition, errors: &mut Vec<String>) {
     }
 }
 
-/// Parse a duration string (`"6h"`, `"30m"`, `"1d"`, or a sum like `"1d6h"`)
+/// Parse a duration string (`"1h"`, `"1h30m"`, `"1d"`, or a sum like `"1d6h"`)
 /// into a `Duration`. Returns `None` for garbage. The cloud sweep mirrors the
 /// fixed-`Duration` cadence discipline (no cron crate), so this is the only
 /// schedule grammar in v1.
@@ -517,6 +582,7 @@ mod tests {
                             model: model.to_string(),
                         },
                         prompt: "hello".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -743,6 +809,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn output_token_cap_must_be_positive_for_models_and_agents() {
+        let mut model_def = linear_def("gpt-4o");
+        if let NodeKind::Model {
+            max_output_tokens, ..
+        } = &mut model_def.nodes[1].kind
+        {
+            *max_output_tokens = Some(0);
+        }
+        let model_errors = validate(&model_def, &any_model).unwrap_err();
+        assert!(model_errors
+            .iter()
+            .any(|error| error.contains("max_output_tokens must be a positive integer")));
+
+        let mut agent_def = linear_def("gpt-4o");
+        agent_def.nodes[1].kind = NodeKind::Agent {
+            selection: ModelSelection::Model {
+                model: "gpt-4o".into(),
+            },
+            prompt: "{{input}}".into(),
+            max_turns: Some(1),
+            max_output_tokens: Some(0),
+            max_cost_usd: None,
+            tools: vec![],
+        };
+        let agent_errors = validate(&agent_def, &any_model).unwrap_err();
+        assert!(agent_errors
+            .iter()
+            .any(|error| error.contains("max_output_tokens must be a positive integer")));
+    }
+
     /// An Auto selection on an Agent node is also rejected at validate-time.
     #[test]
     fn auto_selection_on_agent_node_is_error() {
@@ -753,6 +850,7 @@ mod tests {
                 selection: ModelSelection::Auto,
                 prompt: "go".into(),
                 max_turns: None,
+                max_output_tokens: None,
                 max_cost_usd: None,
                 tools: vec![],
             },
@@ -777,6 +875,7 @@ mod tests {
                 },
                 prompt: "go".into(),
                 max_turns: None,
+                max_output_tokens: None,
                 max_cost_usd: None,
                 tools: vec![],
             },
@@ -1135,6 +1234,7 @@ mod tests {
                             model: "bad-model".into(),
                         },
                         prompt: "p".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1525,6 +1625,15 @@ mod tests {
     }
 
     #[test]
+    fn validate_triggers_accepts_the_one_hour_schedule_floor() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "1h".into(),
+        }];
+        assert!(validate(&def, &any_model).is_ok());
+    }
+
+    #[test]
     fn validate_triggers_rejects_garbage_interval() {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
@@ -1541,11 +1650,36 @@ mod tests {
     fn validate_triggers_rejects_interval_below_minimum() {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
-            interval: "1m".into(),
+            interval: "30m".into(),
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("5-minute minimum")),
+            errs.iter().any(|e| {
+                e.contains("1-hour minimum") && e.contains("approximate hourly sweep")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_for_execution_keeps_legacy_sub_hour_schedule_runnable() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "30m".into(),
+        }];
+        assert!(validate_for_execution(&def, &any_model).is_ok());
+    }
+
+    #[test]
+    fn validate_for_execution_keeps_the_preexisting_safety_floor() {
+        let mut def = linear_def("m");
+        def.triggers = vec![WorkflowTrigger::Schedule {
+            interval: "1m".into(),
+        }];
+        let errs = validate_for_execution(&def, &any_model).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("5-minute legacy compatibility minimum")),
             "{errs:?}"
         );
     }

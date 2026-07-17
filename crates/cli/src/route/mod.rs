@@ -143,8 +143,17 @@ pub fn build_new_route(args: &AddArgs) -> anyhow::Result<Value> {
             }),
         );
     }
+    let name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| default_name(args, target.as_deref()));
+    if tt_routing::catalog::is_catalog_route_name(&name) {
+        anyhow::bail!(
+            "names beginning with `catalog:` are reserved for the dashboard catalog enable/repair flow with a fresh owner/admin confirmation"
+        );
+    }
     Ok(json!({
-        "name": args.name.clone().unwrap_or_else(|| default_name(args, target.as_deref())),
+        "name": name,
         "priority": args.priority,
         "enabled": !args.disabled,
         "when": Value::Object(when),
@@ -180,6 +189,19 @@ pub enum RouteCmd {
     // the enum doesn't carry that size on every variant (clippy large_enum_variant).
     Add(Box<AddArgs>),
     Catalog(CatalogCmd),
+}
+
+/// The local CLI can authenticate a tenant key, but it cannot prove the
+/// dashboard control-plane catalog flow's server-issued exact-set nonce or
+/// current owner/admin role. Do not turn `tt route catalog` into a bypass for
+/// that separate authorization boundary.
+fn reject_unbound_catalog_mutation(sub: CatalogCmd) -> anyhow::Result<()> {
+    match sub {
+        CatalogCmd::Enable | CatalogCmd::Disable => anyhow::bail!(
+            "catalog enable/disable is reserved for the authenticated dashboard control-plane flow; use Routes → Catalog so a fresh owner/admin confirmation can be bound to the exact catalog set"
+        ),
+        CatalogCmd::Status => Ok(()),
+    }
 }
 
 /// Dispatch a `tt route` subcommand against the gateway.
@@ -218,9 +240,17 @@ pub async fn run(
             println!("{}", serde_json::to_string_pretty(&route)?);
         }
         RouteCmd::Rm(id) => {
+            let sp = ui::spinner("Loading route revision…");
+            let route: Value = send(
+                http.get(format!("{base}/v1/routes/{}", enc_segment(&id)))
+                    .bearer_auth(&key),
+            )
+            .await?;
+            let revision = mutation_revision(&route)?;
+            drop(sp);
             let sp = ui::spinner("Removing route…");
             let _: Value = send(
-                http.delete(format!("{base}/v1/routes/{}", enc_segment(&id)))
+                http.delete(delete_route_url(&base, &id, revision))
                     .bearer_auth(&key),
             )
             .await?;
@@ -244,6 +274,11 @@ pub async fn run(
             ));
         }
         RouteCmd::Catalog(sub) => {
+            // This guard deliberately precedes even the list request and all
+            // create/delete loops below. Keep CLI catalog mutations fail-closed
+            // until this client can present the same bound intent and live
+            // owner/admin authorization as the control plane.
+            reject_unbound_catalog_mutation(sub)?;
             let sp = ui::spinner("Loading routes…");
             let existing: Value =
                 send(http.get(format!("{base}/v1/routes")).bearer_auth(&key)).await?;
@@ -259,8 +294,10 @@ pub async fn run(
                     // content_compress=true is left alone; a stale row from
                     // before P2a — content_compress=false/absent — is delete +
                     // recreated to pick up the new default-on flag).
-                    let mut existing_by_name: std::collections::HashMap<&str, (&str, bool)> =
-                        std::collections::HashMap::new();
+                    let mut existing_by_name: std::collections::HashMap<
+                        &str,
+                        (&str, bool, &Value),
+                    > = std::collections::HashMap::new();
                     for r in &existing_arr {
                         let Some(name) = r["name"].as_str() else {
                             continue;
@@ -270,12 +307,14 @@ pub async fn run(
                         }
                         let id = r["id"].as_str().unwrap_or("");
                         let cc = r["then"]["content_compress"].as_bool().unwrap_or(false);
-                        existing_by_name.insert(name, (id, cc));
+                        existing_by_name.insert(name, (id, cc, r));
                     }
                     let mut added = 0usize;
                     let mut refreshed = 0usize;
                     for new_route in &catalog {
-                        if let Some((id, cc)) = existing_by_name.get(new_route.name.as_str()) {
+                        if let Some((id, cc, existing)) =
+                            existing_by_name.get(new_route.name.as_str())
+                        {
                             if *cc {
                                 // Already current (content_compress=true): skip.
                                 continue;
@@ -288,8 +327,14 @@ pub async fn run(
                                 "Refreshing catalog route {} (content_compress)…",
                                 new_route.name
                             ));
+                            let revision = mutation_revision(existing).with_context(|| {
+                                format!(
+                                    "catalog route '{}' has no current revision; refusing to replace it",
+                                    new_route.name
+                                )
+                            })?;
                             let _: Value = send(
-                                http.delete(format!("{base}/v1/routes/{}", enc_segment(id)))
+                                http.delete(delete_route_url(&base, id, revision))
                                     .bearer_auth(&key),
                             )
                             .await?;
@@ -332,8 +377,13 @@ pub async fn run(
                         }
                         let id = r["id"].as_str().unwrap_or("");
                         let sp = ui::spinner(&format!("Removing catalog route {name}…"));
+                        let revision = mutation_revision(r).with_context(|| {
+                            format!(
+                                "catalog route '{name}' has no current revision; refusing to delete it"
+                            )
+                        })?;
                         let _: Value = send(
-                            http.delete(format!("{base}/v1/routes/{}", enc_segment(id)))
+                            http.delete(delete_route_url(&base, id, revision))
                                 .bearer_auth(&key),
                         )
                         .await?;
@@ -354,7 +404,9 @@ pub async fn run(
                         })
                         .collect();
                     if catalog_routes.is_empty() {
-                        println!("Down-route catalog: not enabled. Run `tt route catalog enable`.");
+                        println!(
+                            "Down-route catalog: not enabled. Enable or repair it from Dashboard → Routes → Catalog, where an owner/admin confirmation is required."
+                        );
                     } else {
                         ui::heading("DOWN-ROUTE CATALOG");
                         for r in catalog_routes {
@@ -376,6 +428,23 @@ pub async fn run(
 /// a UUID's `-`); the gateway percent-decodes the path param.
 fn enc_segment(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// A route delete is destructive against the shared control-plane table. Only
+/// a positive revision returned by the public management read may authorize
+/// it; a missing/future/malformed response is not safe to guess around.
+fn mutation_revision(route: &Value) -> anyhow::Result<i64> {
+    route["revision"]
+        .as_i64()
+        .filter(|revision| *revision >= 1)
+        .context("gateway response did not include a positive route revision")
+}
+
+fn delete_route_url(base: &str, id: &str, revision: i64) -> String {
+    format!(
+        "{base}/v1/routes/{}?expected_revision={revision}",
+        enc_segment(id),
+    )
 }
 
 /// Send a request; map non-2xx to an error carrying the response body.
@@ -812,6 +881,51 @@ mod tests {
             .decode_utf8()
             .unwrap();
         assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn destructive_route_urls_require_an_observed_positive_revision() {
+        assert_eq!(
+            super::mutation_revision(&json!({ "revision": 7 })).unwrap(),
+            7
+        );
+        for route in [
+            json!({}),
+            json!({ "revision": 0 }),
+            json!({ "revision": "7" }),
+        ] {
+            assert!(super::mutation_revision(&route).is_err(), "{route}");
+        }
+        let url = super::delete_route_url(
+            "https://gateway.example",
+            "550e8400-e29b-41d4-a716-446655440000",
+            7,
+        );
+        assert!(url.ends_with("?expected_revision=7"));
+    }
+
+    #[test]
+    fn route_add_rejects_the_reserved_catalog_namespace_locally() {
+        let error = build_new_route(&AddArgs {
+            name: Some("catalog:openai->gpt-4o-mini".into()),
+            ..base_args()
+        })
+        .expect_err("generic route add must not create a catalog route");
+        assert!(error
+            .to_string()
+            .contains("dashboard catalog enable/repair flow"));
+    }
+
+    #[test]
+    fn cli_catalog_mutations_require_the_control_plane_confirmation_flow() {
+        for mutation in [CatalogCmd::Enable, CatalogCmd::Disable] {
+            let error = reject_unbound_catalog_mutation(mutation)
+                .expect_err("the CLI cannot prove the catalog intent binding");
+            assert!(error
+                .to_string()
+                .contains("authenticated dashboard control-plane flow"));
+        }
+        assert!(reject_unbound_catalog_mutation(CatalogCmd::Status).is_ok());
     }
 }
 

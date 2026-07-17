@@ -11,19 +11,23 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use tt_plan_core::types::{PlanResult, ProposedRoute};
-use tt_routing::{validate_route_has_effect, NewRoute, PostgresRoutingStore, RoutingStore};
+use tt_routing::{
+    canonicalize_route_value, validate_route_has_effect, NewRoute, PostgresRoutingStore,
+    RoutingStore,
+};
 
 use crate::local_audit;
 
 /// Outcome of planning which routes to create.
+#[derive(Debug)]
 pub struct ApplyPlan {
     pub to_create: Vec<NewRoute>,
     pub skipped_noop: Vec<String>,
     pub skipped_existing: Vec<String>,
 }
 
-/// Convert proposed routes (plan-core types) into `tt_routing::NewRoute` specs,
-/// dropping no-ops and names that already exist. Pure — no DB, no IO.
+/// Convert proposed routes (plan-core types) into canonical `tt_routing::NewRoute`
+/// specs, dropping no-ops and names that already exist. Pure — no DB, no IO.
 ///
 /// `tt_plan_core::types::{RouteConditions, RouteAction}` and the
 /// `tt_routing::{RouteConditions, RouteAction}` are MIRRORED but DISTINCT types
@@ -40,6 +44,16 @@ pub fn plan_routes_to_apply(
     let mut skipped_existing = Vec::new();
 
     for r in proposed {
+        // A local plan apply writes directly to Postgres, without the dashboard
+        // control plane's server-bound catalog intent or live owner/admin
+        // re-check. Keep the catalog namespace out of this generic writer;
+        // use the authenticated dashboard catalog enable/repair flow instead.
+        if tt_routing::catalog::is_catalog_route_name(&r.name) {
+            anyhow::bail!(
+                "proposed catalog route '{}' is reserved for the dashboard catalog enable/repair flow with a fresh owner/admin confirmation",
+                r.name
+            );
+        }
         let when: tt_routing::RouteConditions =
             serde_json::from_value(serde_json::to_value(&r.when).context("encode conditions")?)
                 .context("decode conditions as tt_routing::RouteConditions")?;
@@ -55,13 +69,33 @@ pub fn plan_routes_to_apply(
             skipped_existing.push(r.name.clone());
             continue;
         }
-        to_create.push(NewRoute {
+
+        let spec = NewRoute {
             name: r.name.clone(),
             priority: r.priority,
             enabled: r.enabled,
             when,
             then,
-        });
+        };
+        // Plan writeback is a direct Postgres writer, so it cannot rely on
+        // the gateway HTTP handler to enforce the versioned route contract.
+        // Preserve the deliberate no-op skip above, then fail closed on every
+        // other definition the canonical gateway contract would reject.
+        let canonical = canonicalize_route_value(
+            serde_json::to_value(&spec).context("encode route for canonical validation")?,
+        )
+        .map_err(|issues| {
+            let details = issues
+                .iter()
+                .map(|issue| format!("{}: {}", issue.field, issue.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::anyhow!(
+                "proposed route '{}' fails canonical route validation: {details}",
+                r.name
+            )
+        })?;
+        to_create.push(canonical.route);
     }
 
     Ok(ApplyPlan {
@@ -238,6 +272,31 @@ mod tests {
             .expect("ok");
         assert!(plan.to_create.is_empty());
         assert_eq!(plan.skipped_existing, vec!["swap-mini".to_string()]);
+    }
+
+    #[test]
+    fn rejects_effective_route_that_fails_the_canonical_contract() {
+        let err = plan_routes_to_apply(&HashSet::new(), &[proposed("blank-target", Some("   "))])
+            .err()
+            .expect("an effect check alone must not let an invalid route reach Postgres");
+
+        let message = err.to_string();
+        assert!(message.contains("blank-target"));
+        assert!(message.contains("then.target_model"));
+        assert!(message.contains("non-whitespace"));
+    }
+
+    #[test]
+    fn rejects_catalog_managed_route_before_direct_postgres_write() {
+        let error = plan_routes_to_apply(
+            &HashSet::new(),
+            &[proposed("catalog:openai->gpt-4o-mini", Some("gpt-4o-mini"))],
+        )
+        .expect_err("the direct plan writer cannot bypass catalog confirmation");
+
+        assert!(error
+            .to_string()
+            .contains("dashboard catalog enable/repair flow"));
     }
 
     // --- DB-gated integration tests ---

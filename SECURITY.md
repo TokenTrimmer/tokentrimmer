@@ -2,9 +2,15 @@
 
 ## Reporting a vulnerability
 
-Email **security@tokentrimmer.com** with details. We acknowledge within one business day.
+Email **security@tokentrimmer.com** with a description and reproduction. We aim
+to acknowledge reports within 24 hours and triage within 72 hours. These are
+operational targets, not a response or remediation SLA.
 
-For sensitive reports, encrypt with our PGP key (published at `https://tokentrimmer.com/.well-known/security.txt` once production launches).
+The marketing-site source builds the public reporting file at
+<https://tokentrimmer.com/.well-known/security.txt>; verify a live deployment
+before relying on that URL. Its policy link is <https://tokentrimmer.com/trust>.
+No PGP key or encrypted-reporting channel is currently published. Do not send
+live credentials, customer data, or other secrets in an email report.
 
 Please do **not** open public GitHub issues for security vulnerabilities.
 
@@ -31,7 +37,8 @@ The OSS Gateway, Inspect CLI, Plan engine, and SDKs in this repository are in sc
 
 ## Coordinated disclosure
 
-We aim to release a fix within 30 days of confirmation. We will credit reporters in the changelog unless anonymity is requested.
+We do not publish a remediation timeline or reporter-credit commitment in this
+repository. Use the private reporting channel above rather than a public issue.
 
 ## Our security commitments
 

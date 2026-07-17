@@ -9,6 +9,7 @@
 //! - `WHERE id=$1 AND org_id=$2` / `WHERE org_id=$1` org-scope on every query
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -46,6 +47,47 @@ pub(crate) struct WorkflowRunRecord {
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+// ---------------------------------------------------------------------------
+// WorkflowRunIdempotencyBinding
+// ---------------------------------------------------------------------------
+
+/// The durable, gateway-owned binding for one logical workflow invocation.
+///
+/// The public API deliberately never persists the caller's raw
+/// `Idempotency-Key`: [`workflow_run_invocation_key_hash`] domain-separates and
+/// scopes it to its org + workflow before it reaches this record.  The two
+/// request fingerprints make a duplicate safe to replay only when it still
+/// denotes the same canonical input and execution options.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WorkflowRunIdempotencyBinding {
+    pub run_id: Uuid,
+    pub workflow_version: i32,
+    pub input_hash: [u8; 32],
+    pub request_options_hash: [u8; 32],
+}
+
+/// Input used when atomically claiming an idempotency key and creating its
+/// initial `workflow_runs` row.  `run_id` and the persisted run fields come
+/// from the accompanying [`WorkflowRunRecord`].
+#[derive(Debug, Clone)]
+pub(crate) struct NewWorkflowRunIdempotency {
+    pub org_id: Uuid,
+    pub workflow_id: Uuid,
+    pub invocation_key_hash: [u8; 32],
+    pub workflow_version: i32,
+    pub input_hash: [u8; 32],
+    pub request_options_hash: [u8; 32],
+}
+
+/// Result of atomically claiming a stable invocation key.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CreateOrReuseWorkflowRun {
+    /// This caller inserted both the idempotency mapping and its initial run.
+    Created,
+    /// A previous caller already owns the logical invocation.
+    Existing(WorkflowRunIdempotencyBinding),
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +130,15 @@ SELECT definition, version \
 FROM workflow_definitions \
 WHERE id = $1 AND org_id = $2 \
 ORDER BY version DESC \
+LIMIT 1";
+
+/// SELECT one immutable definition version, scoped by `(id, org_id)`.
+/// Durable invocations must execute the version accepted at enqueue time, not
+/// whichever version happens to be latest when a retry arrives.
+pub(crate) const GET_DEFINITION_VERSION_SQL: &str = "\
+SELECT definition, version \
+FROM workflow_definitions \
+WHERE id = $1 AND org_id = $2 AND version = $3 \
 LIMIT 1";
 
 /// SELECT the latest-version row for each definition owned by an org.
@@ -159,6 +210,35 @@ ORDER BY started_at DESC \
 LIMIT $2";
 
 // ---------------------------------------------------------------------------
+// SQL constants — durable run-idempotency mappings
+// ---------------------------------------------------------------------------
+
+/// Insert the gateway-owned stable-invocation mapping.  The mapping foreign
+/// keys are deferrable because [`create_or_reuse_idempotent_run`] inserts this
+/// row and its `workflow_runs` row in one transaction.
+pub(crate) const INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL: &str = "\
+INSERT INTO workflow_run_idempotency \
+  (org_id, workflow_id, invocation_key_hash, workflow_version, input_hash, request_options_hash, run_id) \
+VALUES ($1, $2, $3, $4, $5, $6, $7) \
+ON CONFLICT (org_id, workflow_id, invocation_key_hash) DO NOTHING \
+RETURNING run_id";
+
+/// Strict initial-run insert used only with a durable idempotency mapping.
+/// Unlike [`INSERT_RUN_SQL`], this intentionally has no fail-open conflict
+/// clause: a successful mapping must commit with exactly one corresponding
+/// initial run, or neither row is durable.
+pub(crate) const INSERT_IDEMPOTENT_RUN_SQL: &str = "\
+INSERT INTO workflow_runs \
+  (id, workflow_id, version, org_id, status, inputs, cost_usd, max_cost_usd) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+
+/// Read a mapping by its opaque, org/workflow-scoped stable-key digest.
+pub(crate) const GET_WORKFLOW_RUN_IDEMPOTENCY_SQL: &str = "\
+SELECT run_id, workflow_version, input_hash, request_options_hash \
+FROM workflow_run_idempotency \
+WHERE org_id = $1 AND workflow_id = $2 AND invocation_key_hash = $3";
+
+// ---------------------------------------------------------------------------
 // SQL constants — node runs
 // ---------------------------------------------------------------------------
 
@@ -191,6 +271,73 @@ fn run_record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRunRecord,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
     })
+}
+
+fn idempotency_binding_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<WorkflowRunIdempotencyBinding, sqlx::Error> {
+    use sqlx::Row;
+
+    fn fixed_digest(bytes: Vec<u8>, column: &str) -> Result<[u8; 32], sqlx::Error> {
+        bytes.try_into().map_err(|bytes: Vec<u8>| {
+            sqlx::Error::Protocol(format!(
+                "workflow_run_idempotency {column} has invalid length {}; expected 32",
+                bytes.len()
+            ))
+        })
+    }
+
+    Ok(WorkflowRunIdempotencyBinding {
+        run_id: row.try_get("run_id")?,
+        workflow_version: row.try_get("workflow_version")?,
+        input_hash: fixed_digest(row.try_get("input_hash")?, "input_hash")?,
+        request_options_hash: fixed_digest(
+            row.try_get("request_options_hash")?,
+            "request_options_hash",
+        )?,
+    })
+}
+
+/// Hash a raw stable invocation key before persistence.  The org + workflow
+/// scope lets unrelated workflows reuse a caller key without becoming a
+/// correlation identifier, and the versioned domain prevents a future format
+/// change from silently changing old mappings' meaning.
+#[must_use]
+pub(crate) fn workflow_run_invocation_key_hash(
+    org_id: Uuid,
+    workflow_id: Uuid,
+    invocation_key: &str,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tt.workflow-run-idempotency.v1\0");
+    hasher.update(org_id.as_bytes());
+    hasher.update(workflow_id.as_bytes());
+    hasher.update(invocation_key.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Fingerprint canonical workflow input JSON.  `serde_json::Value` uses a
+/// deterministic object-key order in this workspace, so semantically equal
+/// objects that differ only in wire key order map to the same invocation while
+/// arrays and JSON number forms retain their normal exact semantics.
+pub(crate) fn workflow_run_input_hash(
+    inputs: &serde_json::Value,
+) -> Result<[u8; 32], serde_json::Error> {
+    let canonical = serde_json::to_vec(inputs)?;
+    Ok(Sha256::digest(canonical).into())
+}
+
+/// Fingerprint request options which affect execution but are not workflow
+/// inputs.  `stream` is intentionally excluded: it changes response delivery,
+/// not the logical run, so a reconnect may safely ask for status JSON instead
+/// of starting a second SSE execution.
+pub(crate) fn workflow_run_request_options_hash(
+    max_cost_usd: Option<f64>,
+) -> Result<[u8; 32], serde_json::Error> {
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "max_cost_usd": max_cost_usd,
+    }))?;
+    Ok(Sha256::digest(canonical).into())
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +411,46 @@ pub(crate) async fn get_definition(
     }
 }
 
+/// Fetch one immutable workflow definition version scoped by `(id, org_id)`.
+///
+/// This is intentionally distinct from [`get_definition`]: a durable run
+/// retry must never silently upgrade to the latest definition after an editor
+/// saved a newer version.  Like the existing definition read, a missing row or
+/// decode/database failure returns `None`; callers use their normal 404/503
+/// boundary policy.
+pub(crate) async fn get_definition_version(
+    pool: &PgPool,
+    org_id: Uuid,
+    id: Uuid,
+    version: i32,
+) -> Option<(WorkflowDefinition, i32)> {
+    let result = sqlx::query(GET_DEFINITION_VERSION_SQL)
+        .bind(id) // $1 id     UUID
+        .bind(org_id) // $2 org_id UUID
+        .bind(version) // $3 version INT
+        .fetch_optional(pool)
+        .await;
+    match result {
+        Ok(Some(row)) => {
+            use sqlx::Row;
+            let version: i32 = row.try_get("version").ok()?;
+            let definition_val: serde_json::Value = row.try_get("definition").ok()?;
+            let def: WorkflowDefinition = serde_json::from_value(definition_val).ok()?;
+            Some((def, version))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                workflow_id = %id,
+                workflow_version = version,
+                error = %e,
+                "workflow_definitions version GET failed (best-effort, returning None)"
+            );
+            None
+        }
+    }
+}
+
 /// Return up to `limit` definitions for `org_id` (latest version per id),
 /// ordered by id. Returns an empty `Vec` on DB error (best-effort).
 pub(crate) async fn list_definitions(
@@ -328,6 +515,91 @@ pub(crate) async fn insert_run(pool: &PgPool, rec: &WorkflowRunRecord) {
     }
 }
 
+/// Look up a stable invocation mapping.  This is intentionally strict rather
+/// than best-effort: callers must never fail open and run a second workflow if
+/// idempotency storage is temporarily unavailable.
+pub(crate) async fn get_workflow_run_idempotency(
+    pool: &PgPool,
+    org_id: Uuid,
+    workflow_id: Uuid,
+    invocation_key_hash: &[u8; 32],
+) -> Result<Option<WorkflowRunIdempotencyBinding>, sqlx::Error> {
+    let row = sqlx::query(GET_WORKFLOW_RUN_IDEMPOTENCY_SQL)
+        .bind(org_id) // $1 org_id UUID
+        .bind(workflow_id) // $2 workflow_id UUID
+        .bind(invocation_key_hash.as_slice()) // $3 opaque SHA-256 digest BYTEA
+        .fetch_optional(pool)
+        .await?;
+    row.map(|row| idempotency_binding_from_row(&row))
+        .transpose()
+}
+
+/// Atomically create the run mapping and initial `running` row, or return the
+/// previous mapping.  A transaction is essential here: a timeout after the
+/// gateway accepts a run must leave a durable mapping that a later retry can
+/// reconcile, while any failed initial insert rolls the mapping back rather
+/// than stranding an ambiguous invocation key.
+pub(crate) async fn create_or_reuse_idempotent_run(
+    pool: &PgPool,
+    mapping: &NewWorkflowRunIdempotency,
+    rec: &WorkflowRunRecord,
+) -> Result<CreateOrReuseWorkflowRun, sqlx::Error> {
+    if mapping.org_id != rec.org_id
+        || mapping.workflow_id != rec.workflow_id
+        || mapping.workflow_version != rec.version
+    {
+        return Err(sqlx::Error::Protocol(
+            "workflow idempotency mapping does not match its initial run".into(),
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL)
+        .bind(mapping.org_id) // $1 org_id UUID
+        .bind(mapping.workflow_id) // $2 workflow_id UUID
+        .bind(mapping.invocation_key_hash.as_slice()) // $3 digest BYTEA
+        .bind(mapping.workflow_version) // $4 immutable definition version INT
+        .bind(mapping.input_hash.as_slice()) // $5 canonical input digest BYTEA
+        .bind(mapping.request_options_hash.as_slice()) // $6 execution options digest BYTEA
+        .bind(rec.id) // $7 run_id UUID
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    if inserted.is_some() {
+        // The mapping FK is DEFERRABLE INITIALLY DEFERRED (migration 0040), so
+        // its run reference may be inserted immediately before this row within
+        // the same transaction.  Any run insert/commit failure rolls the mapping
+        // back; this path never leaves a key claimed without a run.
+        sqlx::query(INSERT_IDEMPOTENT_RUN_SQL)
+            .bind(rec.id) // $1 id UUID
+            .bind(rec.workflow_id) // $2 workflow_id UUID
+            .bind(rec.version) // $3 version INT
+            .bind(rec.org_id) // $4 org_id UUID
+            .bind(&rec.status) // $5 status TEXT
+            .bind(&rec.inputs) // $6 inputs JSONB
+            .bind(rec.cost_usd) // $7 cost_usd NUMERIC
+            .bind(rec.max_cost_usd) // $8 max_cost_usd NUMERIC
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(CreateOrReuseWorkflowRun::Created);
+    }
+
+    // `ON CONFLICT DO NOTHING` waits for a concurrent claimant.  A separate
+    // statement under Read Committed is required after that wait so this
+    // transaction sees the winning committed row rather than its pre-insert
+    // statement snapshot.
+    let row = sqlx::query(GET_WORKFLOW_RUN_IDEMPOTENCY_SQL)
+        .bind(mapping.org_id)
+        .bind(mapping.workflow_id)
+        .bind(mapping.invocation_key_hash.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+    let existing = idempotency_binding_from_row(&row)?;
+    tx.commit().await?;
+    Ok(CreateOrReuseWorkflowRun::Existing(existing))
+}
+
 /// Update a workflow run to its terminal state (`finished_at = now()`).
 /// Scoped by `(id, org_id)`. Awaited; errors are warn-and-swallowed.
 #[allow(clippy::too_many_arguments)]
@@ -390,14 +662,8 @@ pub(crate) async fn upsert_quality_verdict(pool: &PgPool, id: Uuid, org_id: Uuid
 /// Wired in W1c dashboard (GET /v1/workflows/:id/runs/:run_id).
 #[allow(dead_code)]
 pub(crate) async fn get_run(pool: &PgPool, id: Uuid, org_id: Uuid) -> Option<WorkflowRunRecord> {
-    let result = sqlx::query(GET_RUN_SQL)
-        .bind(id) // $1 id     UUID
-        .bind(org_id) // $2 org_id UUID
-        .fetch_optional(pool)
-        .await;
-    match result {
-        Ok(Some(row)) => run_record_from_row(&row).ok(),
-        Ok(None) => None,
+    match get_run_strict(pool, id, org_id).await {
+        Ok(run) => run,
         Err(e) => {
             tracing::warn!(
                 run_id = %id,
@@ -407,6 +673,22 @@ pub(crate) async fn get_run(pool: &PgPool, id: Uuid, org_id: Uuid) -> Option<Wor
             None
         }
     }
+}
+
+/// Strict counterpart to [`get_run`].  Idempotency reconciliation uses this
+/// variant so a temporary read failure cannot be mistaken for a missing mapping
+/// and cause a second paid execution.
+pub(crate) async fn get_run_strict(
+    pool: &PgPool,
+    id: Uuid,
+    org_id: Uuid,
+) -> Result<Option<WorkflowRunRecord>, sqlx::Error> {
+    let result = sqlx::query(GET_RUN_SQL)
+        .bind(id) // $1 id     UUID
+        .bind(org_id) // $2 org_id UUID
+        .fetch_optional(pool)
+        .await?;
+    result.map(|row| run_record_from_row(&row)).transpose()
 }
 
 /// Return up to `limit` runs for `org_id`, ordered most-recent first.
@@ -487,8 +769,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        WorkflowRunRecord, FINISH_RUN_SQL, GET_DEFINITION_SQL, GET_RUN_SQL, INSERT_DEFINITION_SQL,
-        INSERT_NODE_RUN_SQL, INSERT_RUN_SQL, LIST_DEFINITIONS_SQL, LIST_RUNS_SQL,
+        create_or_reuse_idempotent_run, get_run_strict, get_workflow_run_idempotency,
+        workflow_run_input_hash, workflow_run_invocation_key_hash,
+        workflow_run_request_options_hash, CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency,
+        WorkflowRunRecord, FINISH_RUN_SQL, GET_DEFINITION_SQL, GET_DEFINITION_VERSION_SQL,
+        GET_RUN_SQL, GET_WORKFLOW_RUN_IDEMPOTENCY_SQL, INSERT_DEFINITION_SQL,
+        INSERT_IDEMPOTENT_RUN_SQL, INSERT_NODE_RUN_SQL, INSERT_RUN_SQL,
+        INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL, LIST_DEFINITIONS_SQL, LIST_RUNS_SQL,
     };
 
     // ------------------------------------------------------------------
@@ -588,6 +875,18 @@ mod tests {
         assert!(
             GET_DEFINITION_SQL.contains("FROM workflow_definitions"),
             "GET_DEFINITION_SQL must query workflow_definitions table"
+        );
+    }
+
+    #[test]
+    fn get_definition_version_sql_scopes_the_immutable_version() {
+        assert!(
+            GET_DEFINITION_VERSION_SQL.contains("WHERE id = $1 AND org_id = $2 AND version = $3"),
+            "GET_DEFINITION_VERSION_SQL must scope by org, workflow, and exact version"
+        );
+        assert!(
+            GET_DEFINITION_VERSION_SQL.contains("FROM workflow_definitions"),
+            "GET_DEFINITION_VERSION_SQL must query workflow_definitions"
         );
     }
 
@@ -727,6 +1026,230 @@ mod tests {
             LIST_RUNS_SQL.contains("saved_usd::float8"),
             "LIST_RUNS_SQL must cast saved_usd to float8"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Durable run-idempotency contract
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn invocation_key_hash_is_scoped_deterministic_and_opaque() {
+        let org = Uuid::from_u128(1);
+        let workflow = Uuid::from_u128(2);
+        let first = workflow_run_invocation_key_hash(org, workflow, "delivery-7");
+        assert_eq!(
+            first,
+            workflow_run_invocation_key_hash(org, workflow, "delivery-7")
+        );
+        assert_ne!(
+            first,
+            workflow_run_invocation_key_hash(org, Uuid::from_u128(3), "delivery-7")
+        );
+        assert_ne!(
+            first,
+            workflow_run_invocation_key_hash(Uuid::from_u128(4), workflow, "delivery-7")
+        );
+        assert_ne!(
+            first,
+            workflow_run_invocation_key_hash(org, workflow, "delivery-8")
+        );
+        assert_ne!(first.as_slice(), b"delivery-7");
+    }
+
+    #[test]
+    fn canonical_input_hash_ignores_object_wire_order_but_binds_value() {
+        let first = workflow_run_input_hash(&serde_json::json!({
+            "event": {"kind": "invoice", "id": 7},
+            "items": ["a", "b"],
+        }))
+        .expect("canonical input serializes");
+        let same_value_different_wire_order = workflow_run_input_hash(&serde_json::json!({
+            "items": ["a", "b"],
+            "event": {"id": 7, "kind": "invoice"},
+        }))
+        .expect("canonical input serializes");
+        let changed_value = workflow_run_input_hash(&serde_json::json!({
+            "event": {"kind": "invoice", "id": 8},
+            "items": ["a", "b"],
+        }))
+        .expect("canonical input serializes");
+
+        assert_eq!(first, same_value_different_wire_order);
+        assert_ne!(first, changed_value);
+    }
+
+    #[test]
+    fn request_options_hash_binds_budget_but_not_stream_transport() {
+        let no_cap = workflow_run_request_options_hash(None).expect("options serialize");
+        let capped = workflow_run_request_options_hash(Some(0.05)).expect("options serialize");
+        assert_ne!(
+            no_cap, capped,
+            "a changed execution cap must not reuse a run"
+        );
+        assert_eq!(
+            capped,
+            workflow_run_request_options_hash(Some(0.05)).expect("options serialize"),
+            "the same logical options must replay deterministically"
+        );
+    }
+
+    #[test]
+    fn idempotency_sql_uses_opaque_org_workflow_scoped_mapping() {
+        assert!(
+            INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL.contains("INSERT INTO workflow_run_idempotency"),
+            "mapping insert must target the gateway-owned mapping table"
+        );
+        assert!(
+            INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL
+                .contains("ON CONFLICT (org_id, workflow_id, invocation_key_hash) DO NOTHING"),
+            "one stable key must create-or-reuse per org + workflow"
+        );
+        assert!(
+            INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL.contains("RETURNING run_id"),
+            "the mapping insert must identify whether this caller owns run creation"
+        );
+        assert!(
+            GET_WORKFLOW_RUN_IDEMPOTENCY_SQL
+                .contains("WHERE org_id = $1 AND workflow_id = $2 AND invocation_key_hash = $3"),
+            "mapping lookup must remain tenant/workflow scoped"
+        );
+        assert!(
+            INSERT_IDEMPOTENT_RUN_SQL.contains("INSERT INTO workflow_runs"),
+            "a claimed mapping must create the initial workflow run"
+        );
+        assert!(
+            !INSERT_IDEMPOTENT_RUN_SQL.contains("ON CONFLICT"),
+            "the mapping/run transaction must fail atomically rather than hide a run insert failure"
+        );
+    }
+
+    #[test]
+    fn idempotency_migration_keeps_version_input_and_run_foreign_keys() {
+        let migration = include_str!("../../migrations/0040_workflow_run_idempotency.up.sql");
+        for fragment in [
+            "CREATE TABLE IF NOT EXISTS workflow_run_idempotency",
+            "invocation_key_hash  BYTEA NOT NULL CHECK (octet_length(invocation_key_hash) = 32)",
+            "input_hash           BYTEA NOT NULL CHECK (octet_length(input_hash) = 32)",
+            "request_options_hash BYTEA NOT NULL CHECK (octet_length(request_options_hash) = 32)",
+            "PRIMARY KEY (org_id, workflow_id, invocation_key_hash)",
+            "FOREIGN KEY (org_id, workflow_id, workflow_version)",
+            "REFERENCES workflow_definitions (org_id, id, version)",
+            "FOREIGN KEY (run_id)",
+            "REFERENCES workflow_runs (id)",
+            "ON DELETE CASCADE",
+            "DEFERRABLE INITIALLY DEFERRED",
+        ] {
+            assert!(
+                migration.contains(fragment),
+                "missing migration contract: {fragment}"
+            );
+        }
+        assert!(
+            !migration.contains("idempotency_key TEXT"),
+            "the raw caller key must never be persisted"
+        );
+    }
+
+    /// DB-gated regression for the timeout/retry boundary: two callers claiming
+    /// the same stable key must create exactly one initial run, while the loser
+    /// receives the winner's durable mapping. This is intentionally ignored in
+    /// the normal unit suite because it needs a clean Postgres schema.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+    async fn idempotent_run_claim_creates_or_reuses_one_durable_run() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        crate::migrate_only(&url)
+            .await
+            .expect("migrate public schema");
+        let pool = crate::connect(&url, 4).await.expect("connect");
+
+        let org = Uuid::new_v4();
+        let workflow = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workflow_definitions (id, org_id, version, definition, content_hash) \
+             VALUES ($1, $2, 1, '{}'::jsonb, 'idempotency-db-test')",
+        )
+        .bind(workflow)
+        .bind(org)
+        .execute(&pool)
+        .await
+        .expect("seed immutable workflow version");
+
+        let key_hash = workflow_run_invocation_key_hash(org, workflow, "delivery-42");
+        let input_hash =
+            workflow_run_input_hash(&serde_json::json!({ "delivery": 42 })).expect("hash input");
+        let request_options_hash =
+            workflow_run_request_options_hash(Some(0.25)).expect("hash options");
+        let first_run = WorkflowRunRecord {
+            id: Uuid::new_v4(),
+            workflow_id: workflow,
+            version: 1,
+            org_id: org,
+            status: "running".to_owned(),
+            inputs: Some(serde_json::json!({ "delivery": 42 })),
+            cost_usd: 0.0,
+            max_cost_usd: Some(0.25),
+            baseline_cost_usd: 0.0,
+            saved_usd: 0.0,
+            error: None,
+            started_at: Utc::now(),
+            finished_at: None,
+        };
+        let second_run = WorkflowRunRecord {
+            id: Uuid::new_v4(),
+            ..first_run.clone()
+        };
+        let first_mapping = NewWorkflowRunIdempotency {
+            org_id: org,
+            workflow_id: workflow,
+            invocation_key_hash: key_hash,
+            workflow_version: 1,
+            input_hash,
+            request_options_hash,
+        };
+        let second_mapping = first_mapping.clone();
+
+        let (first, second) = tokio::join!(
+            create_or_reuse_idempotent_run(&pool, &first_mapping, &first_run),
+            create_or_reuse_idempotent_run(&pool, &second_mapping, &second_run),
+        );
+        let first = first.expect("first claim");
+        let second = second.expect("second claim");
+        assert_eq!(
+            matches!(first, CreateOrReuseWorkflowRun::Created) as usize
+                + matches!(second, CreateOrReuseWorkflowRun::Created) as usize,
+            1,
+            "only one concurrent claimant may create a workflow run"
+        );
+
+        let mapping = get_workflow_run_idempotency(&pool, org, workflow, &key_hash)
+            .await
+            .expect("mapping read")
+            .expect("one durable mapping");
+        assert!(
+            mapping.run_id == first_run.id || mapping.run_id == second_run.id,
+            "mapping must point to one claimant's run"
+        );
+        let mapped_run = get_run_strict(&pool, mapping.run_id, org)
+            .await
+            .expect("mapped run read")
+            .expect("mapping and run commit atomically");
+        assert_eq!(mapped_run.workflow_id, workflow);
+        assert_eq!(mapped_run.version, 1);
+
+        sqlx::query("DELETE FROM workflow_runs WHERE id = ANY($1)")
+            .bind(vec![first_run.id, second_run.id])
+            .execute(&pool)
+            .await
+            .expect("cascade mapping cleanup");
+        sqlx::query(
+            "DELETE FROM workflow_definitions WHERE org_id = $1 AND id = $2 AND version = 1",
+        )
+        .bind(org)
+        .bind(workflow)
+        .execute(&pool)
+        .await
+        .expect("cleanup definition");
     }
 
     // ------------------------------------------------------------------

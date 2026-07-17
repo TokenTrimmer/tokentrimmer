@@ -60,7 +60,7 @@ pub(crate) struct AgentRunRecord {
     pub turns: i32,
     /// Hard turn cap, if set.
     pub max_turns: Option<i32>,
-    /// Hard cost ceiling (USD), if set.
+    /// Preflight cost-admission cap (USD), if set; a started turn can settle above it.
     pub max_cost_usd: Option<f64>,
     /// Accumulated served cost (USD) across all completed turns.
     pub cost_usd: f64,

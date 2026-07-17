@@ -1,0 +1,17 @@
+{
+  "run_id": "00000000-0000-0000-0000-0000000000a1",
+  "org_id": "00000000-0000-0000-0000-00000000002a",
+  "workflow_id": "00000000-0000-0000-0000-0000000000b2",
+  "status": "completed",
+  "cost_micros": 70000,
+  "baseline_micros": 180000,
+  "saved_micros": 110000,
+  "cost_usd": 0.07,
+  "baseline_usd": 0.18,
+  "saved_usd": 0.11,
+  "signature_hex": "152549c3dcd60ff2678734caffec4fd29fbdba644332f9022bf73c50f4175442390bed1e71fb5de05e453126ba97ef7e1d0f7e56bdb3ed9027d840bc9d296404",
+  "verifying_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "canonical_version": "v2",
+  "quality_verdict": "equivalent",
+  "signed_at": "2026-07-15T00:00:00Z"
+}

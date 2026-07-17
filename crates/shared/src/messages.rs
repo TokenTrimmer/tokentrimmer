@@ -70,7 +70,7 @@ pub fn parse_cache_control(
 }
 
 // ---------------------------------------------------------------------------
-// tt_extras.panel types (Phase 1 — deep-research panel)
+// tt_extras.panel types (Fusion panel)
 // ---------------------------------------------------------------------------
 
 /// Per-request panel overrides from `tt_extras.panel`.
@@ -104,7 +104,10 @@ pub struct PanelExtras {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quorum: Option<usize>,
 
-    /// Hard cost ceiling in USD across all legs + arbitration.
+    /// Pre-dispatch admission budget in USD across all legs + arbitration.
+    /// The gateway compares it with a static plan before dispatch; it is not a
+    /// runtime spending cap, reservation, settlement, or provider-invoice
+    /// guarantee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
 }

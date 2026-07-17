@@ -2,7 +2,7 @@
 
 > **Hosted gateway launching soon** *(as of 2026-06-11)* — `https://api.tokentrimmer.com/v1` is not live yet. Self-host with Docker today and use `http://localhost:8080/v1`; every snippet below works unchanged once you swap the base URL. See [`GETTING_STARTED.md`](../GETTING_STARTED.md) for the one-`docker run` quickstart.
 
-Every builder below already speaks the OpenAI wire format. Point it at the TokenTrimmer Gateway instead of the provider and every call comes back with `x-tokentrimmer-cost-usd` / `x-tokentrimmer-baseline-cost-usd` / `x-tokentrimmer-saved-usd` response headers — proof of what the call cost and what routing/caching saved — while the `X-TokenTrimmer-Tag` request header gives per-feature dashboard attribution (hosted). Full header semantics: [Gateway API reference §6](04-gateway-api-reference.md).
+Every builder below already speaks the OpenAI wire format. Point it at the TokenTrimmer Gateway instead of the provider and every call comes back with `x-tokentrimmer-cost-usd` / `x-tokentrimmer-baseline-cost-usd` / `x-tokentrimmer-saved-usd` response headers — versioned, per-request cost and savings estimates for routing/caching — while the `X-TokenTrimmer-Tag` request header gives per-feature dashboard attribution (hosted). Full header semantics: [Gateway API reference §6](04-gateway-api-reference.md).
 
 ## n8n — community node (preferred)
 

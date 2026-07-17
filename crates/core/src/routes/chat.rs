@@ -75,14 +75,15 @@ pub(crate) fn estimate_cost_usd(
         / 1_000_000.0
 }
 
-/// Parse `X-TokenTrimmer-Cost-Limit-Usd` (a positive USD ceiling), if present
-/// and well-formed. Malformed / non-positive values are ignored (no limit).
+/// Parse `X-TokenTrimmer-Cost-Limit-Usd` (a finite, positive USD ceiling), if
+/// present and well-formed. Malformed, non-finite, or non-positive values are
+/// ignored (no limit).
 pub(crate) fn cost_limit_from_header(headers: &HeaderMap) -> Option<f64> {
     headers
         .get("x-tokentrimmer-cost-limit-usd")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
+        .filter(|v| v.is_finite() && *v > 0.0)
 }
 
 /// `X-TokenTrimmer-Provider` — an exact provider id to pin for this request
@@ -259,7 +260,7 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
     use tt_shared::ProviderError;
     match err {
         // Our own 400 validation before even hitting the provider.
-        ApiError::InvalidRequest(_) => true,
+        ApiError::InvalidRequest(_) | ApiError::RouteValidation { .. } => true,
         // Provider returned a deterministic 4xx (but NOT 429).
         ApiError::Provider(pe) => match pe {
             ProviderError::InvalidRequest(_) => true,
@@ -308,6 +309,7 @@ fn error_status_code(err: &ApiError) -> u16 {
     use tt_shared::ProviderError;
     let status: StatusCode = match err {
         ApiError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        ApiError::RouteValidation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
         ApiError::PaymentRequired => StatusCode::PAYMENT_REQUIRED,
         ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -989,7 +991,7 @@ pub(crate) struct Prepared {
     pub judge_source_provider: Option<std::sync::Arc<dyn tt_shared::Provider>>,
     pub judge_source_ctx: Option<RequestContext>,
     pub judge_original_req: Option<ChatCompletionRequest>,
-    /// Resolved deep-research panel config when the request opted in via the
+    /// Resolved Fusion panel config when the request opted in via the
     /// `X-TokenTrimmer-Panel` header (Phase 1). `None` for every default-path
     /// request — the off-by-default invariant: an absent panel header leaves the
     /// single-model path wire-identical (the only added work is parsing one
@@ -997,6 +999,11 @@ pub(crate) struct Prepared {
     /// `Some`, [`complete_once`] branches to [`panel::complete_panel`] BEFORE any
     /// cache / single-flight check (panels are non-deterministic and bypass both).
     pub panel: Option<panel::PanelConfig>,
+    /// Opaque proof that `panel` passed Fusion's static admission gate. This
+    /// travels with the prepared request so both buffered and streaming fan-out
+    /// revalidate the exact work immediately before any upstream dispatch.
+    /// `None` whenever `panel` is `None`.
+    pub panel_admission: Option<panel::PanelAdmission>,
     /// Per-provider credentials for the panel member set, keyed by **provider
     /// id** (spec §6.4 step 4). Resolved in [`prepare`] alongside `panel` using
     /// the same store-then-bearer-fallback pattern as the failover pre-resolution
@@ -1043,7 +1050,7 @@ pub(crate) struct CompletionHeaders {
     pub provider: std::sync::Arc<dyn tt_shared::Provider>,
     /// Pre-dispatch + dispatch warning tokens (comma-joined into the header).
     pub warnings: Vec<String>,
-    /// Deep-research panel attribution object to merge into the serialized
+    /// Fusion panel attribution object to merge into the serialized
     /// response body as `tokentrimmer.panel` (Phase 1). `None` on every
     /// non-panel dispatch — the handler then serializes the typed response
     /// byte-identically (off-by-default). `Some(value)` ONLY on the
@@ -1104,7 +1111,7 @@ pub(crate) async fn complete_once(
     ctx: &RequestContext,
     mut prep: Prepared,
 ) -> ApiResult<CompletionOutcome> {
-    // Deep-research panel branch (Phase 1) — FIRST, before any cache /
+    // Fusion panel branch — FIRST, before any cache /
     // single-flight check. Panels are non-deterministic (two same-model legs
     // must not coalesce) and bill as ONE aggregate row, so they bypass L1/L2 +
     // single-flight entirely (spec §6.5, invariant §2.1.5). `take()` leaves
@@ -1122,13 +1129,17 @@ pub(crate) async fn complete_once(
     // by design — workflows.rs:1063) for the same reason.
     if prep.skip_shadow {
         prep.panel = None;
+        prep.panel_admission = None;
         prep.route_shadow_model = None;
         prep.workflow = None;
         prep.warnings
             .push("budget-breach: shadow/panel/workflow routes skipped (PauseShadow)".to_string());
     }
     if let Some(cfg) = prep.panel.take() {
-        return panel::complete_panel(state, ctx, prep, cfg).await;
+        let admission = prep.panel_admission.take().ok_or_else(|| {
+            ApiError::Internal("panel configuration missing its admission proof".to_string())
+        })?;
+        return panel::complete_panel(state, ctx, prep, cfg, admission).await;
     }
     // Workflow-detour branch (CO-1) — before cache / single-flight, for the
     // same reason as the panel branch: a workflow is non-deterministic (a
@@ -1211,6 +1222,8 @@ pub(crate) async fn complete_once(
         // Already `take`n into the panel branch above (and `None` for the
         // single-model path that reaches here); bind to `_` to stay exhaustive.
         panel: _,
+        // Panel-only; the single-model path never reads it.
+        panel_admission: _,
         // Panel-only; the single-model path never reads it.
         panel_creds: _,
         // Already `take`n into the workflow branch above (and `None` otherwise).
@@ -1982,6 +1995,12 @@ pub(crate) async fn complete_once(
         // Fee-applied, matching the header/span figure — keeps the
         // row-derived TT headline equal to `tt_saved_usd()`.
         cache_bust_penalty_usd: cost_breakdown.cache_bust_penalty_usd,
+        // Persist every cost-breakdown component surfaced by the response so
+        // the dashboard/reporting plane never has to infer a zero from a
+        // missing column. `summarizer_tax_usd` remains a tax, not saving.
+        flex_saved_usd: cost_breakdown.flex_saved_usd,
+        doc_compaction_saved_usd: cost_breakdown.doc_compaction_saved_usd,
+        summarizer_tax_usd: cost_breakdown.summarizer_tax_usd,
         cached: false,
         cache_layer: None,
         route_id: matched_route_id,
@@ -2412,14 +2431,21 @@ pub async fn handler(
         // flows through as a single-model stream instead.
         if prep.skip_shadow {
             prep.panel = None;
+            prep.panel_admission = None;
         }
         if let Some(cfg) = prep.panel.take() {
+            let admission = prep.panel_admission.take().ok_or_else(|| {
+                ApiError::Internal("panel configuration missing its admission proof".to_string())
+            })?;
             // `complete_panel_streaming` returns `Result<Response, ApiError>`;
             // `ApiError` is `IntoResponse`, so a fail-closed error (quorum-unmet
             // 502, arbiter-establishment failure) becomes a proper non-200
             // response — and, critically, returns BEFORE any stream is opened
             // (no 200, no request_logs row).
-            return crate::routes::panel::complete_panel_streaming(&state, &ctx, prep, cfg).await;
+            return crate::routes::panel::complete_panel_streaming(
+                &state, &ctx, prep, cfg, admission,
+            )
+            .await;
         }
         return handle_streaming(&state, &ctx, prep).await;
     }
@@ -2916,7 +2942,7 @@ pub(crate) async fn prepare(
         )?;
     }
 
-    // Deep-research panel resolution + fail-closed budget gate (Phase 1, spec
+    // Fusion panel resolution + fail-closed budget gate (spec
     // §6.4 steps 1-3). Runs HERE, before `Prepared` is built and before any
     // dispatch, so an over-budget / unpriceable / kill-switched panel 4xx/402s
     // with ZERO upstream calls. Off-by-default: an absent `X-TokenTrimmer-Panel`
@@ -2937,7 +2963,7 @@ pub(crate) async fn prepare(
         Some(strategy) => Some(PanelTrigger::Header(strategy)),
         None => route_panel.map(PanelTrigger::Route),
     };
-    let (panel, panel_creds) = if let Some(trigger) = panel_trigger {
+    let (panel, panel_admission, panel_creds) = if let Some(trigger) = panel_trigger {
         // Kill-switch: an explicit panel request on a panel-disabled gateway is a
         // hard 403, never a silent fallback to single-model billing (spec §6.5).
         if !state.panel_enabled {
@@ -3001,19 +3027,19 @@ pub(crate) async fn prepare(
         match cfg {
             // Defensive skip (route strategy unparseable): no panel, no gates,
             // no creds — the request continues on the single-model path.
-            None => (None, std::collections::HashMap::new()),
+            None => (None, None, std::collections::HashMap::new()),
             Some(cfg) => {
-                // Fail-closed budget gate: sums fee-aware estimates over (N members +
-                // arbiter); any unpriceable member or a missing budget ⇒ 402 before any
-                // dispatch. Uses the SAME whole-prompt input-token estimate the
-                // single-model cost ceiling above uses, on the post-routing request.
-                let combined = tt_shared::message_text_for_estimation(req);
-                let panel_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
-                panel::panel_budget_gate(
+                // Fail-closed budget gate: prices the known static Fusion shape
+                // (member fan-out plus strategy-specific arbiter fan-in/output),
+                // including max_completion_tokens when it overrides max_tokens.
+                // Any unpriceable member or a missing budget ⇒ 402 before any
+                // dispatch. This remains an admission estimate, not a runtime
+                // reservation or spending ceiling.
+                let admission = panel::admit_panel_request_with_tokenizer_provider(
                     state,
                     &cfg,
-                    panel_input_tokens,
-                    req.max_tokens,
+                    req,
+                    provider.id(),
                     cost_limit_from_header(headers),
                 )?;
                 // Per-member-provider credential pre-resolution (spec §6.4 step 4),
@@ -3048,11 +3074,11 @@ pub(crate) async fn prepare(
                         creds.insert(pid, c);
                     }
                 }
-                (Some(cfg), creds)
+                (Some(cfg), Some(admission), creds)
             }
         }
     } else {
-        (None, std::collections::HashMap::new())
+        (None, None, std::collections::HashMap::new())
     };
 
     // Normalize the request for the routed provider and collect any pre-dispatch
@@ -3744,6 +3770,7 @@ pub(crate) async fn prepare(
         judge_original_req,
         pre_compression_request_json,
         panel,
+        panel_admission,
         panel_creds,
         workflow: route_workflow,
     })
@@ -3815,6 +3842,7 @@ async fn handle_streaming(
         // non-streaming; the buffered arbiter answer is returned). This is `None`
         // by construction here.
         panel: _,
+        panel_admission: _,
         panel_creds: _,
         // `handle_streaming` is only reached after the handler's streaming guard
         // has already `take`n any `workflow` config (warned + dropped for the
@@ -3865,25 +3893,7 @@ async fn handle_streaming(
                         } else {
                             entry.baseline_cost_usd
                         };
-                        let hit_cost = CostBreakdown {
-                            cost_usd: 0.0,
-                            baseline_cost_usd,
-                            provider_cache_saved_usd: 0.0,
-                            flex_saved_usd: 0.0,
-                            compression_saved_usd: 0.0,
-                            doc_compaction_saved_usd: 0.0,
-                            cache_bust_penalty_usd: 0.0,
-                            summarizer_tax_usd: 0.0,
-                            batch_forgone_usd: 0.0,
-                            minify_saved_est_usd: 0.0,
-                            diff_saved_usd: 0.0,
-                            format_switch_saved_est_usd: 0.0,
-                            diff_failed_cost_usd: 0.0,
-                            // Document Lane vision-avoided saving (D4c sets it).
-                            doc_vision_saved_est_usd: 0.0,
-                            // Cache hit → no dispatch → no content_compress.
-                            content_compress_saved_est_usd: 0.0,
-                        };
+                        let hit_cost = l1_cache_hit_cost_breakdown(baseline_cost_usd);
                         record_request_span_attributes(
                             &entry.response.model,
                             &entry.response.model,
@@ -3900,23 +3910,42 @@ async fn handle_streaming(
                             None,
                             None,
                         );
+                        // Only an envelope-written baseline may become a
+                        // terminal cache cost receipt. A legacy raw response
+                        // remains safely replayable, but its synthetic
+                        // telemetry baseline is not promoted into client-facing
+                        // savings evidence.
+                        let cache_attribution = l1_cache_stream_attribution(&entry);
+                        let cached_model = entry.response.model.clone();
                         let fake = sse::fake_stream_from_response(entry.response);
-                        // L1 hit already logged above; no need for a second row.
+                        // L1 hit already logged above; no need for a second row
+                        // or a live-stream DropGuard. The cache-specific stream
+                        // queues its verified terminal usage receipt before
+                        // `[DONE]` only after the fake stream reaches clean EOF.
                         let mut resp = with_route_matched(
-                            sse::stream_response(fake, &provider, trace_id, None),
+                            sse::cache_hit_stream_response(
+                                fake,
+                                &provider,
+                                trace_id,
+                                cache_attribution,
+                            ),
                             route_matched_name.as_deref(),
                         );
+                        attach_l1_cache_stream_headers(
+                            resp.headers_mut(),
+                            trace_id,
+                            &cached_model,
+                            cache_attribution,
+                        );
                         // P0-1/P0-3: settle the served request as a cache hit.
-                        // This fake-stream path passes `None` log_ctx to
-                        // `stream_response`, which takes the simple-passthrough
-                        // branch with no DropGuard — so the streamed-dispatch
-                        // settle at `sse.rs` NEVER runs here. Settle inline (as
-                        // the non-streaming CacheHit arm does) so the served
-                        // counter advances (the COGS guard) while the billed
-                        // monthly counter does NOT — a streaming cache hit does
-                        // not consume an included request. Without this, a free
-                        // tenant using `stream:true` could serve unbounded cache
-                        // hits and never trip the served ceiling.
+                        // This fake-stream path has no DropGuard, so the
+                        // streamed-dispatch settle at `sse.rs` NEVER runs here.
+                        // Settle inline (as the non-streaming CacheHit arm does)
+                        // so the served counter advances (the COGS guard) while
+                        // the billed monthly counter does NOT — a streaming cache
+                        // hit does not consume an included request. Without this,
+                        // a free tenant using `stream:true` could serve unbounded
+                        // cache hits and never trip the served ceiling.
                         state
                             .spend_sink()
                             .settle(ctx.org_id, ctx.api_key_id, true, Utc::now());
@@ -4735,6 +4764,63 @@ fn attach_warning_tokens(headers: &mut axum::http::HeaderMap, tokens: &[String])
     }
 }
 
+/// The cost shape of a served L1 hit. This is deliberately separate from the
+/// cached entry's original miss cost: the request being served now made no
+/// provider dispatch, so its realized cost is zero and its entire priced
+/// envelope baseline is the TokenTrimmer-attributed saving.
+fn l1_cache_hit_cost_breakdown(baseline_cost_usd: f64) -> CostBreakdown {
+    CostBreakdown {
+        cost_usd: 0.0,
+        baseline_cost_usd,
+        ..Default::default()
+    }
+}
+
+/// A streaming cache receipt is only possible for an envelope that carries the
+/// insertion-time baseline. Do not turn a legacy raw response's token counts
+/// into a claimed dollar saving by re-pricing them at stream time.
+fn l1_cache_stream_attribution(entry: &L1Entry) -> Option<sse::CacheStreamAttribution> {
+    if entry.is_legacy_format() {
+        return None;
+    }
+    let usage = &entry.response.usage;
+    sse::CacheStreamAttribution::l1(
+        entry.baseline_cost_usd,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cached_tokens,
+    )
+}
+
+/// The fake-stream response is assembled in `sse.rs`, but cache provenance is
+/// owned by the chat route. Always identify a served L1 hit as `cache`; emit
+/// dollar headers only when the same stored envelope baseline also backs the
+/// terminal usage receipt.
+fn attach_l1_cache_stream_headers(
+    headers: &mut axum::http::HeaderMap,
+    trace_id: Uuid,
+    model_used: &str,
+    attribution: Option<sse::CacheStreamAttribution>,
+) {
+    if let Some(attribution) = attribution {
+        let cost = l1_cache_hit_cost_breakdown(attribution.baseline_cost_usd());
+        attach_cost_headers(headers, trace_id, "cache", model_used, &cost);
+    } else {
+        if let Ok(v) = trace_id.to_string().parse() {
+            headers.insert("x-tokentrimmer-trace-id", v);
+        }
+        if let Ok(v) = "cache".parse() {
+            headers.insert("x-tokentrimmer-provider", v);
+        }
+        if let Ok(v) = model_used.parse() {
+            headers.insert("x-tokentrimmer-model-used", v);
+        }
+    }
+    if let Ok(v) = "hit-l1".parse() {
+        headers.insert("x-tokentrimmer-cache", v);
+    }
+}
+
 /// Build the response for an L1 cache hit.
 ///
 /// Cost is always 0 on a hit. Baseline is taken from the envelope (set at
@@ -4756,26 +4842,7 @@ fn build_hit_l1_response(entry: L1Entry, trace_id: Uuid) -> Response {
     // A TT cache hit never reaches the provider — the full baseline is
     // TT-attributed (saved == baseline) and there is no provider-side
     // cache discount.
-    let cost = CostBreakdown {
-        cost_usd: 0.0,
-        baseline_cost_usd,
-        provider_cache_saved_usd: 0.0,
-        flex_saved_usd: 0.0,
-        compression_saved_usd: 0.0,
-        doc_compaction_saved_usd: 0.0,
-        cache_bust_penalty_usd: 0.0,
-        summarizer_tax_usd: 0.0,
-        batch_forgone_usd: 0.0,
-        minify_saved_est_usd: 0.0,
-        diff_saved_usd: 0.0,
-        format_switch_saved_est_usd: 0.0,
-        diff_failed_cost_usd: 0.0,
-        // Document Lane vision-avoided saving — the seam that sets a non-zero
-        // value is D4c; a cache hit / non-seam path always books 0.
-        doc_vision_saved_est_usd: 0.0,
-        // Cache hit → no dispatch → no content_compress.
-        content_compress_saved_est_usd: 0.0,
-    };
+    let cost = l1_cache_hit_cost_breakdown(baseline_cost_usd);
     attach_cost_headers(
         http_response.headers_mut(),
         trace_id,
@@ -6691,6 +6758,9 @@ fn request_log_for_l1_hit(
         // upstream prompt cache exists to bust.
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: true,
         cache_layer: Some("l1".into()),
         route_id,
@@ -6783,6 +6853,9 @@ fn request_log_for_l2_hit(
         // upstream prompt cache exists to bust.
         provider_cache_saved_usd: 0.0,
         cache_bust_penalty_usd: 0.0,
+        flex_saved_usd: 0.0,
+        doc_compaction_saved_usd: 0.0,
+        summarizer_tax_usd: 0.0,
         cached: true,
         cache_layer: Some("l2".into()),
         route_id,
@@ -6975,7 +7048,7 @@ pub(crate) struct RouteMatch {
     /// planner is never constructed on the un-opted path, so that path is
     /// byte-identical (off by default, load-bearing).
     pub(crate) agentic_budget: Option<tt_routing::AgenticBudget>,
-    /// The matched route's opt-in **deep-research panel** trigger
+    /// The matched route's opt-in **Fusion panel** trigger
     /// (`RouteAction::panel`). `Some(_)` makes a matched request fan out across
     /// the panel members + arbiter — but only when the caller did NOT send an
     /// explicit `X-TokenTrimmer-Panel` header (the header wins; the route is the
@@ -7107,7 +7180,7 @@ pub(crate) async fn apply_routing(
     // quality gate wins). `req.model` is untouched → `is_downgrade` is false →
     // no judge samples on a paused route → its verdict window freezes → the
     // pause is naturally sticky (plus the durable route_pauses row) until an
-    // explicit POST /v1/routes/:id/resume.
+    // explicit POST /v1/routes/:id/resume?expected_revision=N.
     if m.paused {
         tracing::info!(
             org_id = %ctx.org_id,
@@ -7145,7 +7218,7 @@ pub(crate) async fn apply_routing(
             // elision / routing for savings) — suppressed on a paused route,
             // exactly like compress/flex/format_switch above.
             agentic_budget: None,
-            // The deep-research panel is a COST lever (it fans out across N
+            // The Fusion panel is a COST lever (it fans out across N
             // members + an arbiter) — suppressed on a paused route, so a paused
             // panel route flows to the originally-requested single model.
             panel: None,
@@ -7276,6 +7349,30 @@ mod cache_header_tests {
     use super::*;
     use axum::http::HeaderMap;
 
+    fn l1_entry(version: u32, baseline_cost_usd: f64) -> L1Entry {
+        L1Entry {
+            response: ChatCompletionResponse {
+                id: "chatcmpl-cache-test".into(),
+                object: "chat.completion".into(),
+                created: 1,
+                model: "gpt-4o-mini".into(),
+                choices: vec![],
+                usage: Usage {
+                    prompt_tokens: 5,
+                    completion_tokens: 4,
+                    total_tokens: 9,
+                    cached_tokens: 1,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            },
+            baseline_cost_usd,
+            cost_usd: 0.003,
+            provider_id: "openai".into(),
+            version,
+        }
+    }
+
     fn hv(v: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("x-tokentrimmer-cache", v.parse().unwrap());
@@ -7303,6 +7400,101 @@ mod cache_header_tests {
         );
         assert_eq!(cache_override_from_header(&hv("   ")).unwrap(), None);
         assert!(cache_override_from_header(&hv("nope")).is_err());
+    }
+
+    #[test]
+    fn streaming_l1_receipt_uses_only_a_priced_envelope_baseline() {
+        let priced = l1_entry(1, 0.0045);
+        let attribution = l1_cache_stream_attribution(&priced).expect("priced envelope");
+        assert_eq!(attribution.baseline_cost_usd(), 0.0045);
+
+        // Pre-envelope values have no stored counterfactual. Their historical
+        // synthetic baseline remains telemetry-only and must not become a
+        // terminal savings receipt.
+        assert!(l1_cache_stream_attribution(&l1_entry(0, 0.0045)).is_none());
+        assert!(l1_cache_stream_attribution(&l1_entry(1, -0.0045)).is_none());
+    }
+
+    #[test]
+    fn streaming_l1_headers_match_the_verified_cache_receipt() {
+        let entry = l1_entry(1, 0.0045);
+        let receipt = l1_cache_stream_attribution(&entry);
+        let mut headers = HeaderMap::new();
+        attach_l1_cache_stream_headers(&mut headers, Uuid::nil(), &entry.response.model, receipt);
+
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("hit-l1")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-provider")
+                .and_then(|v| v.to_str().ok()),
+            Some("cache")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-cost-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.000000")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-baseline-cost-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.004500")
+        );
+        assert_eq!(
+            headers
+                .get("x-tokentrimmer-saved-usd")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.004500")
+        );
+
+        let legacy = l1_entry(0, 0.0045);
+        let mut legacy_headers = HeaderMap::new();
+        attach_l1_cache_stream_headers(
+            &mut legacy_headers,
+            Uuid::nil(),
+            &legacy.response.model,
+            l1_cache_stream_attribution(&legacy),
+        );
+        assert_eq!(
+            legacy_headers
+                .get("x-tokentrimmer-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("hit-l1")
+        );
+        assert!(
+            legacy_headers.get("x-tokentrimmer-saved-usd").is_none(),
+            "legacy synthetic baseline must not be surfaced as confirmed savings"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cost_limit_header_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn with_cost_limit(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tokentrimmer-cost-limit-usd", value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn cost_limit_requires_a_finite_positive_number() {
+        assert_eq!(cost_limit_from_header(&with_cost_limit("0.25")), Some(0.25));
+        for invalid in ["0", "-1", "NaN", "inf", "-inf", "not-a-number"] {
+            assert_eq!(
+                cost_limit_from_header(&with_cost_limit(invalid)),
+                None,
+                "{invalid:?} must not turn a request budget into an unbounded limit"
+            );
+        }
     }
 }
 
@@ -9983,6 +10175,9 @@ mod telemetry_drain_tests {
             baseline_cost_usd: 0.001,
             provider_cache_saved_usd: 0.0,
             cache_bust_penalty_usd: 0.0,
+            flex_saved_usd: 0.0,
+            doc_compaction_saved_usd: 0.0,
+            summarizer_tax_usd: 0.0,
             cached: false,
             cache_layer: None,
             route_id: None,

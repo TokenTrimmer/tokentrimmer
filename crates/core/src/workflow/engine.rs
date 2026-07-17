@@ -375,6 +375,7 @@ fn run_workflow_boxed<'a>(
                         NodeKind::Model {
                             selection,
                             prompt,
+                            max_output_tokens,
                             max_cost_usd: node_cap,
                         } => {
                             if matches!(selection, ModelSelection::Auto) {
@@ -405,6 +406,7 @@ fn run_workflow_boxed<'a>(
                                     prompt: substitute(prompt, &trigger_id, &outputs),
                                     tools: vec![],
                                     max_turns: 1,
+                                    max_output_tokens: *max_output_tokens,
                                     max_cost_usd: *node_cap,
                                 },
                             ));
@@ -413,6 +415,7 @@ fn run_workflow_boxed<'a>(
                             selection,
                             prompt,
                             max_turns,
+                            max_output_tokens,
                             max_cost_usd: node_cap,
                             tools,
                         } => {
@@ -444,6 +447,7 @@ fn run_workflow_boxed<'a>(
                                     prompt: substitute(prompt, &trigger_id, &outputs),
                                     tools: tools.clone(),
                                     max_turns: max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+                                    max_output_tokens: *max_output_tokens,
                                     max_cost_usd: *node_cap,
                                 },
                             ));
@@ -1596,6 +1600,9 @@ mod tests {
         responses: HashMap<String, NodeOutput>,
         /// Append-only call log: (node_id, prompt).
         calls: std::sync::Mutex<Vec<(String, String)>>,
+        /// Per-node completion caps captured from the engine's intelligence
+        /// specs before an executor/provider path sees them.
+        output_caps: std::sync::Mutex<Vec<(String, Option<u32>)>>,
         /// workflow_id → WorkflowDefinition registry for sub-workflow loading tests.
         subworkflows: HashMap<Uuid, WorkflowDefinition>,
     }
@@ -1608,6 +1615,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v))
                     .collect(),
                 calls: std::sync::Mutex::new(Vec::new()),
+                output_caps: std::sync::Mutex::new(Vec::new()),
                 subworkflows: HashMap::new(),
             }
         }
@@ -1624,6 +1632,10 @@ mod tests {
         fn calls(&self) -> Vec<(String, String)> {
             self.calls.lock().unwrap().clone()
         }
+
+        fn output_caps(&self) -> Vec<(String, Option<u32>)> {
+            self.output_caps.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -1637,6 +1649,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((node_id.to_string(), spec.prompt.clone()));
+            self.output_caps
+                .lock()
+                .unwrap()
+                .push((node_id.to_string(), spec.max_output_tokens));
             self.responses
                 .get(node_id)
                 .cloned()
@@ -1672,6 +1688,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1682,6 +1699,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{m1}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1741,6 +1759,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "yes path".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1751,6 +1770,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "no path".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1808,6 +1828,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{tr}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -1899,6 +1920,69 @@ mod tests {
         // m1 and m2 each emit one journal entry (Trigger and Output do not).
         let node_ids: Vec<_> = journal_entries.iter().map(|e| e.node_id.as_str()).collect();
         assert_eq!(node_ids, vec!["m1", "m2"]);
+    }
+
+    #[tokio::test]
+    async fn model_and_agent_output_caps_reach_the_executor_intelligence_specs() {
+        let mut def = make_sequential_def();
+        def.nodes[1].kind = NodeKind::Agent {
+            selection: ModelSelection::Model {
+                model: "stub-model".into(),
+            },
+            prompt: "{{input}}".into(),
+            max_turns: Some(1),
+            max_output_tokens: Some(23),
+            max_cost_usd: None,
+            tools: vec![],
+        };
+        if let NodeKind::Model {
+            max_output_tokens, ..
+        } = &mut def.nodes[2].kind
+        {
+            *max_output_tokens = Some(41);
+        }
+        let stub = StubExecutor::new(vec![
+            (
+                "m1",
+                NodeOutput {
+                    content: json!("response_1"),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    model_used: Some("stub-model".into()),
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+            (
+                "m2",
+                NodeOutput {
+                    content: json!("response_2"),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    model_used: Some("stub-model".into()),
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("hello"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        assert_eq!(
+            stub.output_caps(),
+            vec![("m1".into(), Some(23)), ("m2".into(), Some(41))]
+        );
     }
 
     /// budget_cap: after m1 (cost 0.25) the cap of 0.20 is exceeded;
@@ -2487,6 +2571,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2497,6 +2582,7 @@ mod tests {
                             model: "stub-model".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2885,6 +2971,7 @@ mod tests {
                     kind: NodeKind::Model {
                         selection: ModelSelection::Model { model: "s".into() },
                         prompt: "p".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2893,6 +2980,7 @@ mod tests {
                     kind: NodeKind::Model {
                         selection: ModelSelection::Model { model: "s".into() },
                         prompt: "1".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2901,6 +2989,7 @@ mod tests {
                     kind: NodeKind::Model {
                         selection: ModelSelection::Model { model: "s".into() },
                         prompt: "2".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -2909,6 +2998,7 @@ mod tests {
                     kind: NodeKind::Model {
                         selection: ModelSelection::Model { model: "s".into() },
                         prompt: "3".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -3550,6 +3640,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -3930,6 +4021,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4032,6 +4124,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4147,6 +4240,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4237,6 +4331,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4330,6 +4425,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },
@@ -4484,6 +4580,7 @@ mod tests {
                             model: "stub".into(),
                         },
                         prompt: "{{input}}".into(),
+                        max_output_tokens: None,
                         max_cost_usd: None,
                     },
                 },

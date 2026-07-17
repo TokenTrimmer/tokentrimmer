@@ -13,7 +13,10 @@ use futures::stream::{BoxStream, StreamExt};
 use uuid::Uuid;
 
 use tt_core::{
-    routes::panel::{run_panel, ArbiterStrategyKind, LegRole, LegStatus, ModelRef, PanelConfig},
+    routes::panel::{
+        admit_panel_request, run_panel, ArbiterStrategyKind, LegRole, LegStatus, ModelRef,
+        PanelAdmission, PanelConfig,
+    },
     ApiError, AppState, ProviderRegistry,
 };
 use tt_shared::{
@@ -140,16 +143,24 @@ fn test_ctx() -> RequestContext {
     }
 }
 
-fn base_req() -> ChatCompletionRequest {
+fn base_req(model: &str) -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: "mock-leg1".into(),
+        model: model.into(),
         messages: vec![Message::User {
             content: MessageContent::Text("hello".into()),
             name: None,
         }],
         stream: false,
+        max_tokens: Some(100),
         ..Default::default()
     }
+}
+
+/// Exercise the public engine through the same opaque admission proof that
+/// production direct Rust callers must obtain before `run_panel` can fan out.
+fn admission(state: &AppState, cfg: &PanelConfig, req: &ChatCompletionRequest) -> PanelAdmission {
+    admit_panel_request(state, cfg, req, Some(999.0))
+        .expect("priced test panel should pass its explicit admission budget")
 }
 
 // ---------------------------------------------------------------------------
@@ -208,13 +219,16 @@ async fn both_legs_return_three_legs_and_summed_cost() {
         quorum: None,
         max_cost_usd: None,
     };
+    let req = base_req("mock-leg1");
+    let admission = admission(&state, &cfg, &req);
 
     let result = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -279,13 +293,16 @@ async fn all_legs_error_returns_quorum_unmet() {
         quorum: Some(1),
         max_cost_usd: None,
     };
+    let req = base_req("mock-fail");
+    let admission = admission(&state, &cfg, &req);
 
     let err = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -355,13 +372,16 @@ async fn member_missing_cred_is_skipped() {
         quorum: Some(1), // only 1 survivor needed
         max_cost_usd: None,
     };
+    let req = base_req("mock-has-cred");
+    let admission = admission(&state, &cfg, &req);
 
     let result = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -484,13 +504,16 @@ async fn panicked_only_leg_returns_quorum_unmet() {
         quorum: Some(1),
         max_cost_usd: None,
     };
+    let req = base_req("mock-panic");
+    let admission = admission(&state, &cfg, &req);
 
     let err = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -558,13 +581,16 @@ async fn panicked_leg_recorded_as_error_good_leg_counts_for_quorum() {
         quorum: Some(1), // 1 survivor is enough
         max_cost_usd: None,
     };
+    let req = base_req("mock-good");
+    let admission = admission(&state, &cfg, &req);
 
     let result = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await
@@ -725,13 +751,16 @@ async fn arbiter_cross_provider_creds_and_latency() {
         quorum: Some(1),
         max_cost_usd: None,
     };
+    let req = base_req("mock-member");
+    let admission = admission(&state, &cfg, &req);
 
     let result = run_panel(
         &state,
         &ctx,
-        &base_req(),
+        &req,
         &creds,
         &cfg,
+        &admission,
         Duration::from_secs(10),
     )
     .await

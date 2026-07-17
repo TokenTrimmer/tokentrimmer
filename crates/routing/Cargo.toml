@@ -11,19 +11,24 @@ description = "Rule-based routing engine — evaluates per-org routes in priorit
 tt-shared.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_path_to_error.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+metrics = { workspace = true, optional = true }
 uuid.workspace = true
 async-trait.workspace = true
+sha2.workspace = true
+hex.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
 sqlx = { workspace = true, optional = true }
 
 [features]
 default = []
-postgres = ["sqlx"]
+postgres = ["sqlx", "metrics"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+metrics-exporter-prometheus.workspace = true
 
 [lints]
 workspace = true

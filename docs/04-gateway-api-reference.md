@@ -26,6 +26,7 @@ Gateway implements the following OpenAI API endpoints, with the OpenAI request/r
 | `/v1/messages` (Anthropic Messages wire) | POST | ✓ v1 |
 | `/v1/embeddings` | POST | ✓ v1 |
 | `/v1/models` | GET | ✓ v1 |
+| `/v1/capabilities` | GET | ✓ gateway-runtime evidence v1 |
 | `/v1/completions` (legacy) | POST | ✗ not supported |
 | `/v1/responses` (OpenAI Responses API) | POST | ✗ not yet supported — use `/v1/chat/completions` |
 | `/v1/images/generations` | POST | ✗ not supported (v2 candidate) |
@@ -506,6 +507,76 @@ Returns all models accessible to the authenticated key, across all configured pr
 
 The `tokentrimmer` object is the TokenTrimmer extension.
 
+### 5.2 Gateway runtime capabilities
+
+```
+GET /v1/capabilities
+Authorization: Bearer tt_live_...
+```
+
+Returns a versioned, `Cache-Control: private, no-store` snapshot of facts known
+by the **responding gateway process** for a verified live key. Anonymous,
+sandbox (`tt_test_*`), dogfood, and other non-live identities receive the
+normal `401` response. The document never includes an organization ID, key ID,
+provider credential, provider configuration, or secret.
+
+The first version describes only Fusion facts that the gateway itself enforces:
+its kill switch, the effective caller tier, its configured minimum tier, and
+the maximum number of member models. This selected-fields excerpt omits the
+repeated `reason.message`, applicable `source`, and `schema_versions` metadata;
+the cap value is only an example, since the response carries the process's
+configured value:
+
+```json
+{
+  "schema_version": 1,
+  "scope": "gateway_runtime",
+  "snapshot_scope": "responding_process",
+  "generated_at": "2026-07-16T12:00:00.000Z",
+  "features": {
+    "fusion": {
+      "enabled": {
+        "state": "enabled",
+        "source": "gateway_runtime",
+        "reason": { "code": "fusion_kill_switch_enabled" }
+      },
+      "access": {
+        "state": "available",
+        "reason": { "code": "fusion_gateway_gate_passed" }
+      },
+      "current_tier": { "state": "known", "value": "pro" },
+      "minimum_tier": { "state": "known", "value": "pro" },
+      "limits": {
+        "member_models_max": {
+          "value": 8,
+          "enforcement": "gateway_runtime",
+          "reason": { "code": "fusion_member_cap" }
+        }
+      }
+    }
+  },
+  "provider_credentials": { "state": "unknown", "source": "not_negotiated" },
+  "provider_health": { "state": "unknown", "source": "not_negotiated" },
+  "model_support": { "state": "unknown", "source": "not_negotiated" },
+  "modality_support": { "state": "unknown", "source": "not_negotiated" }
+}
+```
+
+`features.fusion.access: "available"` means only that the responding process
+has passed its Fusion kill-switch and tier gate for this key. It is neither a
+reservation nor an execution guarantee: request-time credential, model,
+budget, policy, and upstream-provider checks remain authoritative. Conversely,
+`"unavailable"` includes a machine-readable reason such as
+`fusion_disabled` or `fusion_tier_below_minimum`.
+
+The provider, model, and modality fields are intentionally `unknown`; this
+endpoint does not decrypt or count credentials, probe providers, or negotiate a
+request. In particular, catalog data from `/v1/models` is metadata, not proof
+that a credentialed request will be accepted. `snapshot_scope` also means a
+load-balanced fleet may return different snapshots while configuration or a
+binary rollout is in progress. Clients must execute the real request and handle
+its result rather than using this endpoint as a fleet-wide readiness signal.
+
 ---
 
 ## 6. TokenTrimmer extension headers
@@ -542,8 +613,8 @@ All TokenTrimmer-specific behaviors are controlled via HTTP headers, so the requ
 | `X-TokenTrimmer-Batch-Forgone-Usd` | on dispatched/cached responses — the **forgone** Batch-API discount for batch-eligible requests (advisory `then.batch` route action), priced from the served model's real catalog batch rate. An advisory projection for the future async Batch Lane: the request was dispatched synchronously and billed in full, so this figure is **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for all unmarked traffic. | `0.0125` |
 | `X-TokenTrimmer-Minify-Saved-Est-Usd` | on dispatched/cached responses — the **ESTIMATED** saving from minified-JSON output steering (`then.minify_json` route action): the emitted JSON re-rendered pretty and re-tokenized with the served model's tokenizer, minus the tokens actually emitted, priced at the billed output rate. An estimate of an unmeasurable counterfactual: **never** included in `X-TokenTrimmer-Saved-Usd`. `0.000000` for un-minified traffic, non-JSON responses, and streaming (v1 meters but does not estimate). | `0.000312` |
 | `X-TokenTrimmer-Diff-Saved-Usd` | on dispatched/cached responses — the **measured** saving of an applied `then.diff` patch: tokens of the reconstructed artifact minus the billed patch tokens, priced at the served model's output rate. Both sides are real tokenizer counts on real strings, so this figure **is** included in `X-TokenTrimmer-Saved-Usd` (via the baseline fold) and is itemized here for the methodology breakdown. `0.000000` for all undiffed traffic. | `0.0297` |
-| `X-TokenTrimmer-Format-Switch-Saved-Est-Usd` | on dispatched/cached responses — the **estimated** saving of a validated `then.format_switch` emission: a JSON-equivalent reconstruction minus the emitted body, output-rate-priced. The `Est` in the name is the label: an estimate, **never** included in `X-TokenTrimmer-Saved-Usd` / `Baseline-Cost-Usd` (those reconcile against the provider invoice). `0.000000` for unswitched traffic, whenever the reconstruction is not computable (booked $0), and on cache **hits** of a switched response (the hit still advertises `format_switch:<label>`, but its saving is attributed to the cache — the estimate belongs to the original miss's row, mirroring the diff/compression figures). | `0.0041` |
-| `X-TokenTrimmer-Diff-Failed-Cost-Usd` | on dispatched/cached responses — the realized cost of a FAILED `then.diff` patch attempt on a fail-closed double dispatch. Already **folded into** `X-TokenTrimmer-Cost-Usd` (the retry is real invoice spend for this trace); duplicated here so the retry tax can be unpicked. `0.000000` unless a patch failed on this trace. | `0.0106` |
+| `X-TokenTrimmer-Format-Switch-Saved-Est-Usd` | on dispatched/cached responses — the **estimated** saving of a validated `then.format_switch` emission: a JSON-equivalent reconstruction minus the emitted body, output-rate-priced. The `Est` in the name is the label: an estimate, **never** included in `X-TokenTrimmer-Saved-Usd` / `Baseline-Cost-Usd` (which are catalog-priced gateway figures, not provider-invoice reconciliation). `0.000000` for unswitched traffic, whenever the reconstruction is not computable (booked $0), and on cache **hits** of a switched response (the hit still advertises `format_switch:<label>`, but its saving is attributed to the cache — the estimate belongs to the original miss's row, mirroring the diff/compression figures). | `0.0041` |
+| `X-TokenTrimmer-Diff-Failed-Cost-Usd` | on dispatched/cached responses — the realized cost of a FAILED `then.diff` patch attempt on a fail-closed double dispatch. Already **folded into** `X-TokenTrimmer-Cost-Usd` (the retry is real served usage for this trace; the header remains a catalog-priced gateway figure rather than provider-invoice reconciliation); duplicated here so the retry tax can be unpicked. `0.000000` unless a patch failed on this trace. | `0.0106` |
 | `X-TokenTrimmer-Route-Matched` | the applied route's name, on routed responses (forced or condition-matched) | `cheap-for-short` |
 | `X-TokenTrimmer-Warnings` | on dispatched responses when the gateway altered the request, and on cache-hit responses carrying pre-dispatch tokens | `param_dropped:frequency_penalty,param_dropped:n` |
 | `X-TokenTrimmer-Captured` | present **only** when this trace's body was persisted to the per-org **opt-in encrypted body-capture** sink — i.e. the hosted feature is armed AND your org enabled capture in its settings (the gateway checks the per-org opt-in before stamping the header, so it never appears for orgs that have not opted in). Always `true` when present; **absent** on every default-path response (capture off by default) and on cache-hit replays (no live body to capture). Non-streaming traces persist request **and** response; streaming traces persist the **request** body only. See [§19 — does Gateway log my prompts?](#19-faq) and the [hosted privacy spec](tokentrimmer-architecture-spec-v1.md#161-customer-data). | `true` |
@@ -559,9 +630,9 @@ failover choices). Discounts the provider applies automatically to its own bill
 — prompt-cache read discounts (e.g. OpenAI cached input tokens, Anthropic
 `cache_read_input_tokens`), net of any cache-write premium — are reported
 separately on `X-TokenTrimmer-Provider-Cache-Saved-Usd` and never inflate the
-TokenTrimmer figure, so `Saved-Usd` reconciles against the provider invoice.
-`X-TokenTrimmer-Cost-Usd` always reflects what the provider actually bills
-(cache discounts included).
+TokenTrimmer figure. `Saved-Usd` and `Cost-Usd` are observed gateway usage
+priced from the active catalog; they are not provider-invoice reconciliation,
+which requires a separate period-level import and comparison.
 
 `X-TokenTrimmer-Warnings` is a comma-separated list of tokens, emitted only when
 the gateway altered the request before dispatch. Currently the gateway emits one
@@ -912,11 +983,50 @@ The open-source gateway binary serves a routes API at `/v1/routes` (note: **no `
 GET    /v1/routes              → list all routes
 POST   /v1/routes              → create a route (body identical to §10.2)
 GET    /v1/routes/:id          → fetch one route
-DELETE /v1/routes/:id          → delete a route
-POST   /v1/routes/:id/pause    → sticky-pause the route's rewrite
-POST   /v1/routes/:id/resume   → the ONLY thing that clears a pause
+DELETE /v1/routes/:id?expected_revision=N
+                               → delete only the management-read revision N
+POST   /v1/routes/:id/pause?expected_revision=N
+                               → sticky-pause only management-read revision N
+POST   /v1/routes/:id/resume?expected_revision=N
+                               → clear a pause only on management-read revision N
 GET    /v1/routes/:id/savings  → windowed netted savings (see below)
 ```
+
+#### Activation evidence and legacy-row recovery
+
+`GET /v1/routes` and `GET /v1/routes/:id` are **management reads**. They
+include disabled routes and expose a persisted legacy/manual row even when the
+runtime refuses to execute it. This makes a bad row repairable or deletable
+instead of silently disappearing from the route list.
+
+Each returned route keeps the familiar flattened route fields (`id`, `name`,
+`priority`, `enabled`, `when`, `then`, and optional `paused`) and adds:
+
+```json
+{
+  "revision": 42,
+  "schema_version": 1,
+  "canonical_hash": "sha256:…",
+  "activation": { "state": "active" }
+}
+```
+
+`revision` is an opaque positive generation token. Every stateful single-route
+operation (`DELETE`, `POST …/pause`, and `POST …/resume`) requires the exact
+value from a recent management read as `expected_revision`; a missing,
+malformed, or stale value makes no change (`400` for an invalid/missing token,
+`409` for a newer current row). The CLI re-reads this value before `tt route rm`;
+API clients must do the same rather than retrying a revision-less delete, pause,
+or resume.
+
+`activation.state` is `active` for a canonical enabled definition,
+`disabled` for a canonical disabled definition, or `invalid` for a stored
+definition the gateway will not execute. An invalid row has
+`"canonical_hash": null` and field-addressed `activation.issues`; its raw
+`when`/`then` JSON is returned unchanged for diagnosis. `active` describes
+canonical enabled eligibility, not a bypass of a sticky pause: when
+`"paused": true`, the route still matches for attribution but its cost action
+is suppressed as described below.
 
 #### Pause / resume
 
@@ -929,10 +1039,10 @@ model: the **expensive, quality-safe** direction. **Safety** levers (`redact`,
 `disable_cache`) stay live — pausing a quality gate never disables a privacy
 guardrail. A forced `X-TokenTrimmer-Route` header does **not** bypass a pause.
 
-Pauses are **sticky**: created manually (`POST /v1/routes/:id/pause`) or by the
+Pauses are **sticky**: created manually (`POST /v1/routes/:id/pause?expected_revision=N`) or by the
 opt-in quality auto-pause (`then.auto_pause` — see the
 [routing rules guide](routing-rules-guide.md)), they persist until an explicit
-`POST /v1/routes/:id/resume`. A resume retains the pause record with a
+`POST /v1/routes/:id/resume?expected_revision=N`. A resume retains the pause record with a
 `resumed_at` watermark: the auto-pause evaluator only counts verdicts recorded
 **after** the most recent resume, so a just-resumed route is re-evaluated on
 fresh evidence, never instantly re-paused by its frozen pre-pause window.
@@ -965,10 +1075,15 @@ never silently subtracted:
   "window_end": "2026-06-11T00:00:00Z",
   "paused": false,
   "requests": 1842,
-  "gross_saved_usd": 12.41,      // Σ per-request Saved-Usd over the route's rows
+  "gross_saved_usd": 12.41,      // legacy positive-only compatibility figure
   "judge_tax_usd": 0.83,         // paired-judge calls + baseline reference dispatches
   "shadow_tax_usd": 0.22,        // discarded shadow-arm spend
-  "net_saved_usd": 11.36,        // gross − judge_tax − shadow_tax; MAY BE NEGATIVE
+  "cache_bust_usd": 0.07,        // itemized; already included in legacy/signed rows
+  "net_saved_usd": 11.36,        // legacy gross − judge_tax − shadow_tax; MAY BE NEGATIVE
+  "positive_estimated_savings_usd": 12.06,
+  "estimated_regressions_usd": 0.16,
+  "summarizer_tax_usd": 0.04,    // itemized; already included in signed row values
+  "net_estimated_savings_usd": 10.85, // positive − regressions − judge_tax − shadow_tax
   "unmetered_tax_rows": 3,       // rows whose tax is unmetered (NULL cost) —
                                  // when > 0 the taxes are lower bounds and the
                                  // net is an upper bound
@@ -977,26 +1092,41 @@ never silently subtracted:
 }
 ```
 
-`net_saved_usd` is deliberately **not clamped at zero**: a regressing route
-whose verification spend exceeds its swap saving must show a negative net.
-Per-request figures (`X-TokenTrimmer-Saved-Usd`, `request_logs`) stay gross — a
-single request doesn't carry the amortized measurement tax; netting exists only
-at this aggregate surface. The shipped gateway binary wires the Postgres
-savings source automatically at boot when `DATABASE_URL` is set; without a
-database the endpoint answers `503` (aggregation not configured). An existing
-route with no in-window traffic answers an honest all-zero body, not `404`.
+Both net fields are deliberately **not clamped at zero**. The additive
+`net_estimated_savings_usd` is the recommended route-level estimate: it keeps a
+request that cost more than its counterfactual visible as a regression instead
+of losing it to a per-row positive floor. Per-request figures
+(`X-TokenTrimmer-Saved-Usd`, `request_logs`) do not carry the amortized
+judge/shadow measurement taxes; that netting exists only at this aggregate
+surface. The shipped gateway binary wires the Postgres savings source
+automatically at boot when `DATABASE_URL` is set; without a database the
+endpoint answers `503` (aggregation not configured). An existing route with no
+in-window traffic answers an honest all-zero body, not `404`.
 
 Two semantics to read the numbers with:
 
-- `gross_saved_usd` is the route's **full per-request savings headline**
-  (`X-TokenTrimmer-Saved-Usd`) summed over its rows — model-swap savings plus
-  any L1/L2 cache-hit, Flex, and compression savings on route-attributed
-  requests. It is **not** the model-swap delta alone; notably, a paused route
-  still serves L1/L2 hits (caching is a safety-neutral lever), so a paused
-  route's gross can keep growing from cache hits while its rewrite is
-  suppressed. The `verdicts` block and `net_saved_usd` are the
-  quality-regression signal; the gross line is invoice-reconcilable savings
-  attribution.
+- `gross_saved_usd` and `net_saved_usd` are retained legacy compatibility
+  fields. Their row contribution is `max(baseline_cost_usd - cost_usd -
+  provider_cache_saved_usd - cache_bust_penalty_usd, 0)`, so a costly request
+  is hidden before the route aggregate is formed. They also predate the
+  durable `summarizer_tax_usd` field. They remain useful for existing clients,
+  but are not the complete row-level estimate. A paused route can still accrue
+  cache-hit savings while its rewrite is suppressed; provider-invoice
+  reconciliation remains a separate, period-level process.
+- The signed fields use each route-attributed request's complete delta:
+  `baseline_cost_usd - cost_usd - provider_cache_saved_usd -
+  cache_bust_penalty_usd - summarizer_tax_usd`. The API reports the sum of
+  its positive half as `positive_estimated_savings_usd`, the absolute
+  magnitude of its negative half as `estimated_regressions_usd`, and
+  `net_estimated_savings_usd = positive_estimated_savings_usd -
+  estimated_regressions_usd - judge_tax_usd - shadow_tax_usd`. Cache-bust and
+  summarizer taxes are already inside the signed row values and are itemized
+  only for auditability—do **not** subtract either again. This is a
+  catalog-priced gateway estimate, not provider-invoice reconciliation.
+- `unmetered_tax_rows` identifies only NULL judge/shadow measurement costs.
+  `summarizer_tax_usd` is the sum of durably recorded row values; the gateway
+  does not yet persist a separate marker for an auxiliary summarizer cost that
+  failed to meter, so that unknown amount cannot be inferred from this response.
 - The window buckets `request_logs` rows and `quality_verdicts` rows
   independently by their own timestamps, and a verdict is written by the
   detached judge task seconds-to-minutes after its request — so a request near
@@ -1319,7 +1449,7 @@ Just the base URL and API key. Existing OpenAI SDK code works as-is. TokenTrimme
 If your route has a fallback chain configured, Gateway tries each fallback in order. If no fallback or all fallbacks fail, Gateway returns a 502 with the upstream error preserved.
 
 **Q: How is cost calculated?**
-Tokens used × per-model pricing from our curated pricing table (a snapshot embedded at build time and refreshed on each release, not auto-refreshed). Reported in `X-TokenTrimmer-Cost-Usd` and reconciled against actual provider invoices monthly.
+Tokens used × per-model pricing from our curated pricing table (a snapshot embedded at build time and refreshed on each release, not auto-refreshed). `X-TokenTrimmer-Cost-Usd` and `X-TokenTrimmer-Saved-Usd` are catalog-priced gateway estimates based on observed usage, not provider-invoice reconciliation.
 
 **Q: Does Gateway log my prompts?**
 No, not by default. By default the gateway records only request **metadata** (token counts, model, route, latency) — never prompt or response bodies. There is one opt-in exception: hosted orgs can enable **encrypted body capture** (per org, off unless you turn it on) so the `/logs` replay tooling can show real request/response bodies. When enabled, the gateway:
@@ -1356,9 +1486,9 @@ Change `base_url` and `api_key`. Both OpenRouter and Helicone use OpenAI-compati
 
 ---
 
-## 21. Deep Research Panel
+## 21. Fusion (multi-model panel)
 
-The Deep Research Panel is an opt-in feature that fans out a single request to N member models concurrently, then passes all responses to an arbiter model that synthesizes or selects the best answer. The panel is **off by default** — a request without the trigger header is handled identically to any other request, with zero overhead.
+Fusion is TokenTrimmer's opt-in multi-model panel: it fans one request out to N member models concurrently, then passes their responses to an arbiter model that synthesizes or selects an answer. It is not a web-search, source-capture, or citation-backed Deep Research workflow. The panel is **off by default** — a request without the trigger header is handled identically to any other request, with zero overhead.
 
 ### 21.1 Enabling and trigger
 
@@ -1412,7 +1542,7 @@ On `/v1/chat/completions` and `/v1/responses`, you can fine-tune the panel by in
 | `members` | string[] | gateway default (`TT_PANEL_DEFAULT_MEMBERS`) | Model ids to fan out to. Overrides the gateway default entirely when non-empty. |
 | `arbiter_model` | string | gateway default (`TT_PANEL_DEFAULT_ARBITER`) | Model used for arbitration (Synthesize/BestOfN). |
 | `quorum` | integer | see §21.3 | Minimum legs that must succeed before arbitration. |
-| `max_cost_usd` | float | none | Per-request hard cost ceiling (USD); see §21.5. |
+| `max_cost_usd` | float | none | Per-request preflight budget estimate (USD); see §21.5. |
 
 `/v1/messages` (Anthropic wire) accepts the `X-TokenTrimmer-Panel` header but does **not** accept `tt_extras.panel` — header-only trigger on that ingress.
 
@@ -1540,13 +1670,14 @@ data: [DONE]
 
 The `tokentrimmer.panel` shape is **identical across all three ingresses** — `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` all carry or emit the same object.
 
-### 21.5 Budget gate (required)
+### 21.5 Preflight budget gate (required)
 
-A panel request **requires an explicit cost ceiling**. Provide one via:
+A Fusion panel request **requires an explicit preflight budget**. Provide one via:
+
 - `X-TokenTrimmer-Cost-Limit-Usd` request header (e.g. `0.10`), OR
 - `tt_extras.panel.max_cost_usd` in the body.
 
-The gateway estimates the total cost (Σ all members + arbiter, including fee multipliers) **before any dispatch**. If no ceiling is provided, or if any member model is unpriced, or if the estimate exceeds the ceiling, the request is rejected with `402` before any leg is dispatched. This is fail-closed — a panel can never exceed its declared budget and a budget-less panel is always rejected.
+The request must also provide an explicit member output cap: `max_completion_tokens` takes precedence when supplied, otherwise use `max_tokens`. The gateway estimates the known total cost (all member calls, requested `n` choices, arbiter candidate fan-in, and the fixed Synthesize/Best-of-N arbiter allowance, including fee multipliers) **before any dispatch**. If the budget or output cap is absent, any required model is unpriced, the strategy has unpriced work, or the estimate exceeds the budget, the request is rejected with `402` before any leg is dispatched. In particular, `majority` is currently rejected by the budget gate because its embedding pass has no pricing contract. This is an admission check, not a runtime spend ceiling; treat the configured value as a maximum planned estimate until runtime reservations, settlement, and cancellation are implemented. A budget-less panel is always rejected.
 
 ### 21.6 Billing
 
@@ -1637,7 +1768,7 @@ Authenticate the same way as chat completions (§2): a TokenTrimmer key in `Auth
 | `messages` | array | yes | Initial transcript — system/user messages in OpenAI format. |
 | `tools` | array | no | Tool definitions advertised to the model. Defaults to `[]`. |
 | `max_turns` | integer | no | Turn cap; clamped to `[1, 32]`. Default: 10. |
-| `max_cost_usd` | number | no | Hard ceiling on the run's total accumulated served cost (USD). The run stops as `incomplete` with `stop_reason: "budget_exhausted"` before starting a turn that would breach it. A best-effort next-turn estimate is used to tighten the check before each turn when the model is in the pricing catalog. |
+| `max_cost_usd` | number | no | Admission guard on accumulated served cost (USD). Before a new turn, the run stops as `incomplete` with `stop_reason: "budget_exhausted"` when accrued cost—plus a best-effort estimate when the model is priced—reaches the cap. A turn already started can settle beyond the cap; this is not a reservation/settlement or provider-invoice guarantee. |
 | `stream` | boolean | no | When `true`, the response is a stream of SSE run events (see §23.4). Default `false`. |
 
 ### 23.3 Response (non-streaming)
@@ -1769,7 +1900,7 @@ let outcome = client
     .message(system("You are a helpful assistant."))
     .message(user("Summarize the TokenTrimmer README"))
     .max_turns(5)
-    .max_cost_usd(0.05)   // hard cost ceiling
+    .max_cost_usd(0.05)   // preflight cost-admission cap, not a runtime spend ceiling
     .run(&NoTools)
     .await?;
 
@@ -1877,6 +2008,35 @@ A workflow definition is a JSON object with the following top-level fields:
 | `inputs` | object | no | Freeform input schema / defaults passed to the trigger node. |
 | `budget` | object | no | Run-level cost cap (see §24.6). |
 | `allowed_hosts` | array of strings | no | Per-workflow egress allowlist for Http nodes (default-deny: `[]`). Each entry is a bare hostname (e.g. `"api.example.com"`). Http nodes whose URL host is not an exact member of this list are rejected at definition-save time and again at run time. |
+| `metadata` | JSON value | no | Editor metadata. The engine does not execute it, but clients must preserve it when updating a definition. |
+| `triggers` | array | no | Out-of-band invokers. A `schedule` runs on a bounded interval; a `webhook` enables a signed invocation URL. Omit or send `[]` for human-run-only workflows. |
+
+`POST /v1/workflows` is a strict top-level contract: unknown top-level fields
+are rejected rather than silently discarded. Read-modify-write clients must
+preserve every returned top-level field, including `metadata` and `triggers`.
+
+#### Out-of-band triggers
+
+```json
+"triggers": [
+  { "type": "schedule", "interval": "6h" },
+  { "type": "webhook", "token_id": "ops_sync_1" }
+]
+```
+
+`schedule.interval` accepts bounded duration components such as `"1h"`,
+`"6h"`, `"1d"`, or `"1d6h"`; new or updated definitions must be between one
+hour and 30 days. At most one schedule trigger is allowed per workflow. The
+hosted dispatcher normally picks due work up on an approximate hourly sweep,
+not at an exact wall-clock time; startup, leader acquisition, and the configured
+sweep profile can add pickup jitter. A webhook `token_id` must be a non-empty
+URL-safe identifier (`A-Z`, `a-z`, `0-9`, `_`, `-`). The signing key and final
+URL are managed server-side; do not place a webhook secret in the definition.
+
+Definitions persisted before the one-hour validation floor are not rewritten or
+disabled by this change. Operators must inventory and explicitly migrate any
+stored sub-hour schedule to one hour or longer; those legacy definitions remain
+compatibility-only and do not gain a sub-hour delivery guarantee.
 
 Each edge:
 
@@ -1915,7 +2075,8 @@ Single LLM call.
 |---|---|---|---|
 | `selection` | object | yes | Which model to use (see §24.3). |
 | `prompt` | string | yes | Prompt template; `{{input}}` is replaced with the node's input value. |
-| `max_cost_usd` | number | no | Per-node USD ceiling. |
+| `max_output_tokens` | integer | no | Positive completion-token limit sent to the provider. Omit to retain legacy provider-default output behavior. Required on every model/agent node only when this workflow is admitted under a run-level `max_cost_usd`. |
+| `max_cost_usd` | number | no | Per-node preflight USD admission cap; a started node can settle above it. |
 
 #### `agent`
 
@@ -1937,7 +2098,8 @@ Multi-turn agentic loop with tool access.
 | `selection` | object | yes | Which model to use (see §24.3). |
 | `prompt` | string | yes | Prompt template. |
 | `max_turns` | integer | no | Turn cap for the agent loop. Defaults to 8. |
-| `max_cost_usd` | number | no | Per-node USD ceiling. |
+| `max_output_tokens` | integer | no | Positive per-turn completion-token limit. Omit to retain legacy provider-default output behavior. Required on every model/agent node only when this workflow is admitted under a run-level `max_cost_usd`. |
+| `max_cost_usd` | number | no | Per-node preflight USD admission cap; a started node can settle above it. |
 | `tools` | array | no | Tool definitions advertised to the model. Defaults to `[]`. |
 
 #### `transform`
@@ -2067,15 +2229,18 @@ any recursive call is made.  The guard maintains an ancestors list; if the child
 sub-workflow cycle detected
 ```
 
-**Budget rollup.** The parent passes its remaining run budget down to the child.
-On child success the child's `cost_usd` and `baseline_cost_usd` are folded into
-the parent's running totals.  The child's `saved_usd` is **not** added directly
+**Budget rollup.** For an uncapped legacy execution, a child's `cost_usd` and
+`baseline_cost_usd` are folded into the parent's running totals. The child's
+`saved_usd` is **not** added directly
 — savings are always re-derived as `(accrued_baseline − accrued_cost)` at the
 end of the parent run to prevent double-counting.
 
 **Child failure propagates.** If the child run ends with `Failed` or
 `BudgetExhausted`, the parent run also ends with the same status.  Any cost
 already incurred by the child is included in the parent's reported `cost_usd`.
+A run requesting `max_cost_usd` is instead rejected at static admission before
+dispatch when it contains any `sub_workflow`; this rollup is not a reservation
+or a cost-ceiling guarantee.
 
 **Output mapping.** The SubWorkflow node's output `content` is the child
 workflow's `node_outputs` array serialized as JSON.  Downstream nodes can
@@ -2107,7 +2272,11 @@ Execute a stored body workflow repeatedly while a condition holds (while-semanti
 
 **`max_iters` hard cap (1–100).** Passing `max_iters: 0` or `max_iters > 100` is a validation error.  The cap is the definitive termination guarantee: even an always-true condition cannot cause an infinite loop.
 
-**Budget stop.** At the start of each iteration, if `accrued_cost + loop_cost_so_far >= run_max_cost_usd`, the loop exits early (the condition is not re-evaluated).  The loop node itself still returns `Succeeded`; the budget is tracked at the parent run level.
+**Capped admission.** A public workflow run requesting `max_cost_usd` is
+rejected before dispatch when it contains a `loop`, because the future number
+of body executions cannot be projected as one bounded direct graph. Existing
+uncapped workflows retain loop behavior; this is not a spend reservation or a
+runtime cost-ceiling claim.
 
 **Per-iteration output threading.** After each iteration the body's `node_outputs` array is serialized as JSON and stored under the loop node's id in the output map.  The next iteration's condition evaluation and the body's trigger input both receive this value, so downstream cond expressions (e.g. `{{retry}} != "STOP"`) can react to what the body last produced.
 
@@ -2208,11 +2377,21 @@ Returns a static cost projection for the workflow's latest definition. No model 
 
 Executes the workflow synchronously and returns the result. Bounded by the 60-second gateway timeout.
 
+For durable callers, send a stable Idempotency-Key header. The gateway hashes
+that value before storage and creates or reuses one run per (org, workflow,
+key). The first accepted request binds the key to its immutable workflow
+version, canonical JSON inputs, and max_cost_usd request option. A retry with
+a changed explicit version, inputs, or cost option receives 409; an omitted
+workflow_version on a retry reuses the version accepted first, even if a newer
+definition has since been saved. Clients without Idempotency-Key retain the
+historical behavior: every request creates a fresh run.
+
 **Request body:**
 
 ```json
 {
   "inputs": { "text": "Summarise this document…" },
+  "workflow_version": 3,
   "max_cost_usd": 0.05
 }
 ```
@@ -2220,7 +2399,13 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `inputs` | object | no | Input values passed to the trigger node. |
+| `workflow_version` | integer | no | Exact immutable definition version to execute. Omit for the latest version on a new invocation. `version` is accepted as a compatibility alias. |
 | `max_cost_usd` | number | no | Run-level USD cap. Superseded by `def.budget.max_cost_usd` when that is set. |
+
+Idempotency-Key is optional, must be 1–256 visible bytes, and is never
+returned or stored in raw form. stream is deliberately not part of the logical
+invocation binding: a retry may request status JSON after a lost SSE connection
+without starting a second run.
 
 **Response:**
 
@@ -2247,8 +2432,15 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
 | `status` | string | Terminal status of the run (see values below). |
 | `cost_usd` | number | Total served cost (USD) across all nodes in this run. |
 | `baseline_cost_usd` | number | What the run would have cost without routing — sum of per-node baseline costs (the default/first-ranked model's price). Zero when no model nodes executed. |
-| `saved_usd` | number | `baseline_cost_usd − cost_usd`, floored at 0. Positive values indicate routing saved money; 0 when cost ≥ baseline (e.g. the route was unchanged). Note: this is the run-level indicative figure; a signed/netted authoritative receipt will be minted per-run in a forthcoming release. |
+| `saved_usd` | number | `baseline_cost_usd − cost_usd`, floored at 0. Positive values indicate routing saved money; 0 when cost ≥ baseline (e.g. the route was unchanged). This is a catalog-priced run-level estimate, not provider-invoice reconciliation. An eligible retained terminal run may be minted on demand as a signed estimate; it is not automatic per-run proof. |
 | `node_outputs` | array | Per-node output and cost (see below). |
+
+An exact Idempotency-Key replay returns the existing run_id and current totals
+with 200 for a terminal run or 202 while it is running, plus the
+Idempotent-Replay: true header and a replayed: true response field. It is a
+status/reconciliation response, so node_outputs is empty; use
+GET /v1/workflows/runs/:run_id for the durable run status. It never executes
+the graph again.
 
 **`status` values:**
 
@@ -2269,13 +2461,15 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
       "id": "summarise",
       "type": "model",
       "selection": { "type": "model", "model": "claude-3-5-haiku-20241022" },
-      "prompt": "Summarise this in one sentence: {{input}}"
+      "prompt": "Summarise this in one sentence: {{input}}",
+      "max_output_tokens": 128
     },
     {
       "id": "score",
       "type": "model",
       "selection": { "type": "model", "model": "claude-3-5-haiku-20241022" },
-      "prompt": "Rate the quality of this summary 0–1: {{input}}"
+      "prompt": "Rate the quality of this summary 0–1: {{input}}",
+      "max_output_tokens": 128
     },
     { "id": "done", "type": "output" }
   ],
@@ -2290,7 +2484,10 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
 
 ### 24.6 Budget policy
 
-The `budget` field on a workflow definition sets a hard run-level USD ceiling:
+The `budget` field asks the gateway to perform bounded static budget admission
+before it creates a run record or dispatches a provider request. It is not a
+spend reservation, runtime cost ceiling, or provider-invoice guarantee:
+started provider turns can settle differently from an estimate.
 
 ```json
 { "max_cost_usd": 0.10, "on_exceed": "stop" }
@@ -2298,8 +2495,8 @@ The `budget` field on a workflow definition sets a hard run-level USD ceiling:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `max_cost_usd` | number | none | Maximum USD cost for the entire run. |
-| `on_exceed` | string | `"stop"` | Action when the cap is reached. Only `"stop"` is supported. The run stops before the node that would breach the budget, with status `"budget_exhausted"`. |
+| `max_cost_usd` | number | none | Requested USD value for static admission and runtime guard checks. Capped admission requires each model/agent node to set a positive `max_output_tokens`, only `{{input}}` prompt references, pinned priceable selections, single-turn agents, and no loops/sub-workflows. |
+| `on_exceed` | string | `"stop"` | Action for the runtime guard when it detects a budget condition. Only `"stop"` is supported; it does not change the non-reservation semantics above. |
 
 A `max_cost_usd` can also be supplied per-run in the `POST /v1/workflows/:id/runs` request body. The definition-level budget (`def.budget.max_cost_usd`) takes precedence when both are set.
 

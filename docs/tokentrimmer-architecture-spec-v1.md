@@ -68,7 +68,7 @@ These decisions are locked. Any change to these affects every subsequent section
 5. **Privacy-preserving by default.** Request logs are metadata-only by default — no prompt or response bodies (only token counts, model, timing, route). Two paid features are the exceptions, and both are off unless enabled: the L2 semantic cache **stores full response bodies** (in Postgres, scoped by `org_id`) so it can replay them on a hit, and any feature that generates embeddings — L2 cache lookups and retrieval — **sends the prompt text to OpenAI** (`text-embedding-3-small`) to produce the embedding vector. A customer can additionally opt into **encrypted request/response body capture** for `/logs` replay (per-org, off by default): bodies are encrypted at rest, redacted before storage, size-capped, retention-bounded, and flagged on responses with `X-TokenTrimmer-Captured` (see §16.1).
 6. **Latency budget.** Target sub-30ms gateway overhead (p50) on cache misses. Sub-5ms (p50) on cache hits. Multi-region deployment is non-negotiable.
 7. **Cost discipline on our side.** TokenTrimmer's own LLM and infra costs must be predictable and bounded. We dogfood our own product.
-8. **Honest measurement.** No inflated savings claims. Confidence intervals everywhere. The "savings" number on the dashboard must reconcile to provider invoices.
+8. **Honest measurement.** No inflated savings claims. Confidence intervals everywhere. Dashboard savings are catalog-priced gateway estimates; provider-invoice reconciliation is a separate import/comparison process with its own coverage and drift evidence.
 
 ---
 
@@ -457,17 +457,22 @@ Docs: https://tokentrimmer.com/docs/rules/anthropic-missing-prompt-cache
 
 ### 5.6 GitHub Action integration
 
-Published as `tokentrimmer/inspect-action@v1`. Customer adds it to `.github/workflows/`:
+The shipped action is currently the monorepo subpath, not a published
+`tokentrimmer/inspect-action@v1` Marketplace action. Customer workflows must
+pin the action itself to an immutable full commit SHA:
 
 ```yaml
 - name: TokenTrimmer Inspect
-  uses: tokentrimmer/inspect-action@v1
+  uses: TokenTrimmer/tokentrimmer/inspect-action@117b8d69c01e5a56a6c548355ef9453f6cdfaeac
   with:
-    token: ${{ secrets.TOKENTRIMMER_TOKEN }}
-    fail-on: high   # high | medium | low | never
+    fail-on-cost-increase: true
 ```
 
-Authenticated against the hosted Inspect service for Tier 2/3 rules. Tier 1 rules run locally even without authentication.
+The action runs the local Tier 1 Inspect rules. Its default `tt-cli` is a
+locked source build from the same checked-in immutable source revision; this
+is not a signed release archive or hosted-service authentication contract.
+See `inspect-action/source-build-contract.json` and the action README for the
+current source-build boundary.
 
 ### 5.7 v1 launch rules
 
@@ -632,7 +637,7 @@ where baseline_cost = cost of the request if routed to the customer's
                      declared "baseline model" with no cache
 ```
 
-Customer declares baseline model per org (default: GPT-4o or Claude Sonnet, whichever was their first-used flagship). This is honest, defensible, and reconciles to provider invoices.
+Customer declares baseline model per org (default: GPT-4o or Claude Sonnet, whichever was their first-used flagship). This is an explicit catalog-priced comparison baseline, not provider-invoice reconciliation.
 
 ### 7.6 Data export
 

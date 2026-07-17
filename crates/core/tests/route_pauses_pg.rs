@@ -12,7 +12,7 @@
 //! deliberately do not create it (and `route_pauses` has no FK to it so 0017
 //! applies standalone on OSS deploys). This test therefore creates a minimal
 //! cloud-shaped `routes` table itself, mirroring cloud 0002
-//! (id/org_id/name/priority/conditions/target/enabled/created_at).
+//! (id/org_id/name/priority/conditions/target/enabled/revision/created_at).
 //!
 //! Run locally against an empty Postgres:
 //! ```sh
@@ -38,6 +38,7 @@ const CREATE_ROUTES_TABLE: &str = "CREATE TABLE IF NOT EXISTS routes (
   conditions  JSONB NOT NULL,
   target      JSONB NOT NULL,
   enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+  revision    BIGINT NOT NULL DEFAULT 1,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 )";
 
@@ -90,6 +91,15 @@ async fn pause_row_count(pool: &sqlx::PgPool, route_id: Uuid) -> i64 {
         .expect("count route_pauses")
 }
 
+async fn observed_revision(store: &PostgresRoutingStore, org: Uuid, id: Uuid) -> i64 {
+    store
+        .get_management_route(org, id)
+        .await
+        .expect("read management route")
+        .and_then(|route| route.revision)
+        .expect("Postgres management read must carry a route revision")
+}
+
 /// Ownership + stickiness + LEFT-JOIN surfacing + resume, end to end against
 /// the real SQL.
 #[tokio::test]
@@ -100,6 +110,7 @@ async fn pg_pause_resume_round_trip_and_ownership() {
     let org_b = Uuid::now_v7();
     let created = s.create_route(org_a, new_route("down-a")).await.unwrap();
     assert!(!created.paused, "fresh route is unpaused");
+    let revision = observed_revision(&s, org_a, created.id).await;
 
     // Foreign-org pause: INSERT..SELECT matches no row → Ok(false), NO row.
     let pause = NewRoutePause {
@@ -109,7 +120,9 @@ async fn pg_pause_resume_round_trip_and_ownership() {
         verdicts_in_window: None,
     };
     assert!(
-        !s.pause_route(org_b, created.id, pause).await.unwrap(),
+        !s.pause_route(org_b, created.id, revision, pause)
+            .await
+            .unwrap(),
         "foreign org must not pause"
     );
     assert_eq!(pause_row_count(&pool, created.id).await, 0);
@@ -128,7 +141,10 @@ async fn pg_pause_resume_round_trip_and_ownership() {
         pass_rate: Some(0.75),
         verdicts_in_window: Some(20),
     };
-    assert!(s.pause_route(org_a, created.id, auto_pause).await.unwrap());
+    assert!(s
+        .pause_route(org_a, created.id, revision, auto_pause)
+        .await
+        .unwrap());
     let (by, reason, rate, n): (String, String, Option<f64>, Option<i32>) = sqlx::query_as(
         "SELECT paused_by, reason, pass_rate, verdicts_in_window \
          FROM route_pauses WHERE route_id = $1",
@@ -162,7 +178,10 @@ async fn pg_pause_resume_round_trip_and_ownership() {
         pass_rate: None,
         verdicts_in_window: None,
     };
-    assert!(!s.pause_route(org_a, created.id, second).await.unwrap());
+    assert!(!s
+        .pause_route(org_a, created.id, revision, second)
+        .await
+        .unwrap());
     let kept: String = sqlx::query_scalar("SELECT reason FROM route_pauses WHERE route_id = $1")
         .bind(created.id)
         .fetch_one(&pool)
@@ -174,7 +193,7 @@ async fn pg_pause_resume_round_trip_and_ownership() {
     );
 
     // Foreign org cannot resume.
-    assert!(!s.resume_route(org_b, created.id).await.unwrap());
+    assert!(!s.resume_route(org_b, created.id, revision).await.unwrap());
     assert!(
         s.get_route(org_a, created.id)
             .await
@@ -186,7 +205,7 @@ async fn pg_pause_resume_round_trip_and_ownership() {
     // Owner resume: the record is RETAINED with resumed_at stamped (the
     // auto-pause verdict-window watermark) — NOT deleted — and the route
     // reads unpaused everywhere. A second resume is Ok(false).
-    assert!(s.resume_route(org_a, created.id).await.unwrap());
+    assert!(s.resume_route(org_a, created.id, revision).await.unwrap());
     assert_eq!(
         pause_row_count(&pool, created.id).await,
         1,
@@ -207,7 +226,7 @@ async fn pg_pause_resume_round_trip_and_ownership() {
             .paused
     );
     assert!(!s.list_for_org(org_a).await.unwrap()[0].paused);
-    assert!(!s.resume_route(org_a, created.id).await.unwrap());
+    assert!(!s.resume_route(org_a, created.id, revision).await.unwrap());
 
     // Re-pause AFTER the resume: the resumed watermark row is overwritten by
     // the NEW pause's evidence (resumed_at back to NULL, paused again).
@@ -218,7 +237,9 @@ async fn pg_pause_resume_round_trip_and_ownership() {
         verdicts_in_window: None,
     };
     assert!(
-        s.pause_route(org_a, created.id, repause).await.unwrap(),
+        s.pause_route(org_a, created.id, revision, repause)
+            .await
+            .unwrap(),
         "re-pause after resume must succeed"
     );
     let (reason2, resumed2): (String, Option<chrono::DateTime<chrono::Utc>>) =
@@ -240,7 +261,8 @@ async fn pg_pause_resume_round_trip_and_ownership() {
     // Deleting the route GCs its pause record (no orphaned rows; a recreated
     // route gets a fresh id, so the documented delete-and-recreate edit flow
     // starts clean).
-    assert!(s.delete_route(org_a, created.id).await.unwrap());
+    let revision = observed_revision(&s, org_a, created.id).await;
+    assert!(s.delete_route(org_a, created.id, revision).await.unwrap());
     assert_eq!(
         pause_row_count(&pool, created.id).await,
         0,
@@ -258,11 +280,13 @@ async fn pg_pause_survives_unrelated_route_writes() {
     let org = Uuid::now_v7();
     let r1 = s.create_route(org, new_route("keep-paused")).await.unwrap();
     let r2 = s.create_route(org, new_route("to-delete")).await.unwrap();
+    let r1_revision = observed_revision(&s, org, r1.id).await;
 
     assert!(s
         .pause_route(
             org,
             r1.id,
+            r1_revision,
             NewRoutePause {
                 paused_by: PausedBy::Auto,
                 reason: "auto: regressed".into(),
@@ -275,7 +299,8 @@ async fn pg_pause_survives_unrelated_route_writes() {
 
     // Unrelated dashboard writes.
     let _r3 = s.create_route(org, new_route("new-route")).await.unwrap();
-    assert!(s.delete_route(org, r2.id).await.unwrap());
+    let revision = observed_revision(&s, org, r2.id).await;
+    assert!(s.delete_route(org, r2.id, revision).await.unwrap());
 
     let listed = s.list_all_for_org(org).await.unwrap();
     let kept = listed.iter().find(|r| r.id == r1.id).expect("r1 listed");

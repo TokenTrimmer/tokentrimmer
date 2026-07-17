@@ -31,6 +31,21 @@ The workflows build + publish on tag push — no manual steps beyond the tag.
    cd sdk-typescript && npm run build && node -e "const t = require('./dist/index.js'); console.log('OK')"
    ```
 
+### Inspect action source-build contract
+
+When changing the shipped Inspect action or its default CLI revision, update
+the action release and CLI source pin together in one reviewed change:
+
+1. Set the exact full source SHA in `inspect-action/source-build-contract.json`.
+2. Make `inspect-action/action.yml`'s `tt-version` default and every usable
+   monorepo example in `inspect-action/README.md` match that SHA.
+3. Run `node --test .github/scripts/inspect-action-*.test.mjs` before release.
+
+This contract documents a locked source build only. It is **not** a signed
+release artifact, release-to-SHA provenance record, or checksum/signature for
+a downloaded binary. Those remain external release-owner evidence before a
+published action can be described as supply-chain-attested.
+
 ## Publishing
 
 ### tt-cli 0.2.0 (crates.io)
@@ -41,9 +56,15 @@ git push origin cli-v0.2.0
 ```
 
 This triggers `release-crates.yml` which:
-- Builds `tt-cli` (and the workspace crates) for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`
-- Publishes all `tt-*` crates to crates.io
-- Uploads GitHub Release binaries
+- Verifies the tag matches the checked-in `tt-cli` version and that publishable
+  crates carry their license notices
+- Publishes the workspace crates to crates.io in dependency order
+
+It does **not** currently build or upload platform CLI binaries, checksums,
+signatures, provenance attestations, or a GitHub Release. The Inspect action
+therefore remains a locked source build; do not describe a `cli-v*` tag as a
+signed/downloadable CLI artifact until a separate artifact pipeline and its
+reviewed release-to-SHA evidence exist.
 
 **Requires:** `CARGO_REGISTRY_TOKEN` secret set in the repo settings.
 

@@ -53,6 +53,7 @@ This file is the human-curated counterpart to `.claude/INDEX.md` (auto-generated
 | Audit row schema | `crates/telemetry/src/audit.rs` (AuditEntry, Actor) |
 | Hash-chain rationale | Plan file § "Audit Guarantees" + `docs/tokentrimmer-architecture-spec-v1.md` § 16.3 |
 | OTel setup | `crates/telemetry/src/lib.rs` (stub; init in Week 1 `w1-otel-init`) |
+| Persisted-data inventory / retention | `../cloud/docs/data-inventory.v1.json` + `../cloud/docs/validate-data-inventory.rb` | Cross-repo Postgres, R2, Redis, processor, export, and deletion evidence. |
 
 ### Reporting (cloud-only)
 
