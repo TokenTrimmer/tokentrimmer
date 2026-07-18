@@ -1,9 +1,8 @@
 //! `tt chat` — interactive chat REPL routed through the TokenTrimmer gateway,
-//! surfacing per-turn cost + savings from the gateway's streaming usage event.
+//! surfacing per-turn cost plus bounded request-delta evidence from the
+//! gateway's streaming usage event.
 
 use anyhow::Context as _;
-use serde::Deserialize;
-
 use tt_shared::messages::{Message, MessageContent};
 
 use crate::context::ResolvedContext;
@@ -21,53 +20,175 @@ use command::{osc52_copy, print_help, wrap_osc52_for_mux, ToolsArg, OSC52_MAX_BY
 
 const DEFAULT_CHAT_MODEL: &str = "gpt-4o-mini";
 
-/// Cost/usage payload from the gateway's terminal `tokentrimmer.usage` SSE event.
-#[derive(Debug, Clone, Deserialize)]
+/// Cost/usage evidence accepted by the direct Chat UI.
+///
+/// `legacy_saved_usd` preserves the old positive-only compatibility field. It
+/// must never be used to synthesize a baseline or signed request delta.
+#[derive(Debug, Clone)]
 pub struct UsageInfo {
     pub cost_usd: f64,
-    pub baseline_cost_usd: f64,
-    pub saved_usd: f64,
+    /// `false` when a client-side tool loop received only a subset of its
+    /// successful rounds with parseable served-cost evidence. `cost_usd` is
+    /// then a known lower bound, not the turn's total cost.
+    pub cost_complete: bool,
+    pub baseline_cost_usd: Option<f64>,
+    pub legacy_saved_usd: Option<f64>,
+    pub request_delta_estimate: tt_client::RequestDeltaEstimate,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    #[serde(default)]
     pub cached_tokens: u64,
 }
 
-impl From<tt_client::StreamUsage> for UsageInfo {
-    fn from(u: tt_client::StreamUsage) -> Self {
-        Self {
-            cost_usd: u.cost_usd,
-            baseline_cost_usd: u.baseline_cost_usd,
-            saved_usd: u.saved_usd,
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            cached_tokens: u.cached_tokens,
-        }
+impl UsageInfo {
+    /// Accept a terminal streaming usage event only when its served cost is a
+    /// finite, non-negative amount. Missing/invalid raw delta components stay
+    /// explicitly unmeasured through [`tt_client::RequestDeltaEstimate`].
+    #[must_use]
+    pub fn from_stream_usage(u: tt_client::StreamUsage) -> Option<Self> {
+        Self::from_raw(
+            Some(u.cost_usd),
+            Some(u.baseline_cost_usd),
+            Some(u.saved_usd),
+            u.provider_cache_saved_usd,
+            u.cache_bust_usd,
+            u.summarizer_tax_usd,
+            u.input_tokens,
+            u.output_tokens,
+            u.cached_tokens,
+        )
+    }
+
+    /// Accept a non-streamed gateway response without deriving any missing
+    /// accounting component from legacy `saved_usd`.
+    #[must_use]
+    pub fn from_header_cost(
+        cost: &tt_client::CostInfo,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Option<Self> {
+        Self::from_raw(
+            cost.cost_usd,
+            cost.baseline_cost_usd,
+            cost.saved_usd,
+            cost.provider_cache_saved_usd,
+            cost.cache_bust_usd,
+            cost.summarizer_tax_usd,
+            input_tokens,
+            output_tokens,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_raw(
+        raw_cost_usd: Option<f64>,
+        raw_baseline_cost_usd: Option<f64>,
+        raw_legacy_saved_usd: Option<f64>,
+        provider_cache_saved_usd: Option<f64>,
+        cache_bust_usd: Option<f64>,
+        summarizer_tax_usd: Option<f64>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    ) -> Option<Self> {
+        let cost_usd = finite_nonnegative(raw_cost_usd)?;
+        Some(Self {
+            cost_usd,
+            cost_complete: true,
+            baseline_cost_usd: finite_nonnegative(raw_baseline_cost_usd),
+            legacy_saved_usd: finite_nonnegative(raw_legacy_saved_usd),
+            request_delta_estimate: tt_client::RequestDeltaEstimate::from_components(
+                raw_baseline_cost_usd,
+                raw_cost_usd,
+                provider_cache_saved_usd,
+                cache_bust_usd,
+                summarizer_tax_usd,
+            ),
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        })
     }
 }
 
-/// Muted per-turn footer. `saved …%` only when there is a positive saving.
+fn finite_nonnegative(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+/// Render a signed amount without allowing a sub-cent regression to look like
+/// a zero-valued savings claim.
+fn format_signed_usd(value: f64) -> String {
+    if value < 0.0 {
+        format!("−${:.6}", -value)
+    } else {
+        format!("+${value:.6}")
+    }
+}
+
+/// Muted per-turn footer. The signed request delta is the only savings-like
+/// metric here; the legacy `saved_usd` field is separately labeled as
+/// compatibility-only.
 #[must_use]
-pub fn format_turn_footer(
-    model: &str,
-    in_tok: u64,
-    out_tok: u64,
-    cost_usd: f64,
-    saved_usd: f64,
-    baseline_usd: f64,
-) -> String {
+pub fn format_turn_footer(model: &str, usage: &UsageInfo) -> String {
+    let cost = if usage.cost_complete {
+        format!("${:.4}", usage.cost_usd)
+    } else {
+        format!("${:.4} known cost", usage.cost_usd)
+    };
     let mut s = format!(
-        "{} {} · {} tok · ${:.4}",
+        "{} {} · {} tok · {cost}",
         ui::BULLET,
         model,
-        in_tok + out_tok,
-        cost_usd
+        usage.input_tokens + usage.output_tokens
     );
-    if baseline_usd > 0.0 && saved_usd > 0.0 {
-        let pct = (saved_usd / baseline_usd * 100.0).round();
-        s.push_str(&format!(" · saved {pct:.0}%"));
+    match usage.request_delta_estimate {
+        tt_client::RequestDeltaEstimate::Measured {
+            signed_usd,
+            positive_usd,
+            ..
+        } if positive_usd > 0.0 => {
+            s.push_str(&format!(
+                " · request delta {} (positive estimate)",
+                format_signed_usd(signed_usd)
+            ));
+        }
+        tt_client::RequestDeltaEstimate::Measured {
+            signed_usd,
+            regression_usd,
+            ..
+        } if regression_usd > 0.0 => {
+            s.push_str(&format!(
+                " · request delta {} (regression)",
+                format_signed_usd(signed_usd)
+            ));
+        }
+        tt_client::RequestDeltaEstimate::Measured { .. } => {
+            s.push_str(" · request delta $0.000000 (neutral estimate)");
+        }
+        tt_client::RequestDeltaEstimate::Unmeasured => {
+            s.push_str(" · request delta not measured");
+        }
     }
+    if let Some(saved_usd) = usage.legacy_saved_usd {
+        s.push_str(&format!(
+            " · legacy saved ${saved_usd:.4} (compatibility only)"
+        ));
+    }
+    s.push_str(" · request delta excludes judge/shadow taxes + invoice reconciliation");
     ui::muted().apply_to(s).to_string()
+}
+
+/// Footer for a successful direct Chat turn that has no parseable served-cost
+/// evidence. It deliberately omits cost and token totals rather than
+/// zero-filling either value.
+#[must_use]
+pub fn format_unmeasured_turn_footer(model: &str) -> String {
+    ui::muted()
+        .apply_to(format!(
+            "{} {model} · cost and request delta not measured · request delta excludes judge/shadow taxes + invoice reconciliation",
+            ui::BULLET,
+        ))
+        .to_string()
 }
 
 /// Muted per-turn footer for a `--server-loop` turn. Deliberately carries NO
@@ -163,8 +284,23 @@ impl Conversation {
 pub struct Ledger {
     pub turns: u32,
     pub cost_usd: f64,
+    /// Compatibility-only aggregate of the legacy positive-only
+    /// `saved_usd` field. It is not a signed request delta.
     pub saved_usd: f64,
     pub baseline_usd: f64,
+    /// Direct Chat turns with a complete signed request-delta tuple.
+    pub measured_request_deltas: u32,
+    /// Direct Chat turns missing any raw request-delta component.
+    pub unmeasured_request_deltas: u32,
+    /// Direct Chat turns for which at least one successful gateway response
+    /// lacked parseable served-cost evidence. The session cost is only known
+    /// to be a lower bound when this is nonzero.
+    pub unknown_direct_cost_turns: u32,
+    /// Sum only across measured direct Chat turns. It excludes judge/shadow
+    /// measurement taxes and provider-invoice reconciliation.
+    pub signed_request_delta_usd: f64,
+    pub positive_request_delta_usd: f64,
+    pub regression_request_delta_usd: f64,
     /// Estimated tokens removed from history by `chat::shape` tool-result/arg
     /// trimming. Token counts only — never converted into a USD savings claim
     /// (the gateway attributes no spend to these bytes).
@@ -183,8 +319,39 @@ impl Ledger {
     pub fn add(&mut self, u: &UsageInfo) {
         self.turns += 1;
         self.cost_usd += u.cost_usd;
-        self.saved_usd += u.saved_usd;
-        self.baseline_usd += u.baseline_cost_usd;
+        if !u.cost_complete {
+            self.unknown_direct_cost_turns += 1;
+        }
+        if let Some(saved_usd) = u.legacy_saved_usd {
+            self.saved_usd += saved_usd;
+        }
+        if let Some(baseline_usd) = u.baseline_cost_usd {
+            self.baseline_usd += baseline_usd;
+        }
+        match u.request_delta_estimate {
+            tt_client::RequestDeltaEstimate::Measured {
+                signed_usd,
+                positive_usd,
+                regression_usd,
+                ..
+            } => {
+                self.measured_request_deltas += 1;
+                self.signed_request_delta_usd += signed_usd;
+                self.positive_request_delta_usd += positive_usd;
+                self.regression_request_delta_usd += regression_usd;
+            }
+            tt_client::RequestDeltaEstimate::Unmeasured => {
+                self.unmeasured_request_deltas += 1;
+            }
+        }
+    }
+    /// Record a completed direct Chat turn for which no parseable served cost
+    /// was received. It must remain visibly unmeasured rather than becoming a
+    /// zero-cost/no-delta entry.
+    pub fn add_unmeasured_direct_turn(&mut self) {
+        self.turns += 1;
+        self.unmeasured_request_deltas += 1;
+        self.unknown_direct_cost_turns += 1;
     }
     /// Meter one compaction summary call. HONESTY GUARD: this is real money,
     /// so it raises the headline `cost_usd` (plus the dedicated compaction
@@ -208,15 +375,43 @@ impl Ledger {
     }
     #[must_use]
     pub fn summary(&self) -> String {
-        let pct = if self.baseline_usd > 0.0 {
-            (self.saved_usd / self.baseline_usd * 100.0).round()
+        let spend_label = if self.unknown_direct_cost_turns > 0 {
+            "known spend"
         } else {
-            0.0
+            "spent"
         };
         let mut s = format!(
-            "session: {} turn(s) · ${:.4} spent · saved ${:.4} ({pct:.0}%)",
-            self.turns, self.cost_usd, self.saved_usd
+            "session: {} turn(s) · ${:.4} {spend_label} · legacy saved ${:.4} (compatibility only)",
+            self.turns, self.cost_usd, self.saved_usd,
         );
+        let request_delta_turns = self.measured_request_deltas + self.unmeasured_request_deltas;
+        if request_delta_turns > 0 {
+            if self.measured_request_deltas > 0 {
+                s.push_str(&format!(
+                    " · request delta {} (positive ${:.6}, regression ${:.6}; {}/{} measured)",
+                    format_signed_usd(self.signed_request_delta_usd),
+                    self.positive_request_delta_usd,
+                    self.regression_request_delta_usd,
+                    self.measured_request_deltas,
+                    request_delta_turns,
+                ));
+            } else {
+                s.push_str(" · request delta not measured");
+            }
+            if self.unmeasured_request_deltas > 0 {
+                s.push_str(&format!(
+                    " · {} direct turn(s) not measured",
+                    self.unmeasured_request_deltas
+                ));
+            }
+            s.push_str(" · request delta excludes judge/shadow taxes and invoice reconciliation");
+        }
+        if self.unknown_direct_cost_turns > 0 {
+            s.push_str(&format!(
+                " · {} direct turn(s) cost not measured",
+                self.unknown_direct_cost_turns
+            ));
+        }
         if self.compaction_calls > 0 {
             s.push_str(&format!(
                 " · compaction ${:.4} ({} call(s), est. −{} tok/turn, unbooked)",
@@ -309,24 +504,16 @@ async fn stream_turn(
                 let _ = std::io::stdout().flush();
                 reply.push_str(&t);
             }
-            tt_client::StreamEvent::Usage(u) => usage = Some(UsageInfo::from(u)),
+            tt_client::StreamEvent::Usage(u) => usage = UsageInfo::from_stream_usage(u),
             _ => {} // StreamEvent is #[non_exhaustive] (external crate) → wildcard required
         }
     }
     drop(spinner);
     println!();
     if let Some(u) = &usage {
-        println!(
-            "{}",
-            format_turn_footer(
-                &served_model,
-                u.input_tokens,
-                u.output_tokens,
-                u.cost_usd,
-                u.saved_usd,
-                u.baseline_cost_usd
-            )
-        );
+        println!("{}", format_turn_footer(&served_model, u));
+    } else {
+        println!("{}", format_unmeasured_turn_footer(&served_model));
     }
     Ok((reply, usage))
 }
@@ -340,6 +527,8 @@ async fn do_turn(client: &tt_client::Client, conv: &mut Conversation, ledger: &m
             conv.push_assistant(reply);
             if let Some(u) = usage {
                 ledger.add(&u);
+            } else {
+                ledger.add_unmeasured_direct_turn();
             }
             true
         }
@@ -808,7 +997,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
             "event: tokentrimmer.usage\n",
-            "data: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"input_tokens\":10,\"output_tokens\":2,\"cached_tokens\":0}\n\n",
+            "data: {\"cost_usd\":0.0001,\"baseline_cost_usd\":0.0004,\"saved_usd\":0.0003,\"provider_cache_saved_usd\":0.0001,\"cache_bust_usd\":0.0,\"summarizer_tax_usd\":0.0,\"input_tokens\":10,\"output_tokens\":2,\"cached_tokens\":0}\n\n",
             "data: [DONE]\n\n",
         );
         server.mock(|when, then| {
@@ -832,6 +1021,40 @@ mod tests {
         let u = usage.expect("usage event");
         assert_eq!(u.input_tokens, 10);
         assert_eq!(u.output_tokens, 2);
+        assert!(matches!(
+            u.request_delta_estimate,
+            tt_client::RequestDeltaEstimate::Measured { signed_usd, .. }
+                if (signed_usd - 0.0002).abs() < 1e-12
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_stream_without_usage_records_an_unmeasured_turn() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-tokentrimmer-model-used", "gpt-4o-mini")
+                .body(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+                     data: [DONE]\n\n",
+                );
+        });
+
+        let client = tt_client::Client::new(server.base_url(), "k");
+        let mut conv = Conversation::new("gpt-4o-mini".into(), None);
+        conv.push_user("hi".into());
+        let mut ledger = Ledger::default();
+
+        assert!(do_turn(&client, &mut conv, &mut ledger).await);
+        assert_eq!(ledger.turns, 1);
+        assert_eq!(ledger.cost_usd, 0.0, "unknown cost is never zero-filled");
+        assert_eq!(ledger.unmeasured_request_deltas, 1);
+        assert_eq!(ledger.unknown_direct_cost_turns, 1);
+        let summary = ledger.summary();
+        assert!(summary.contains("known spend"), "{summary}");
+        assert!(summary.contains("cost not measured"), "{summary}");
     }
 
     #[tokio::test]
@@ -880,12 +1103,80 @@ mod tests {
     }
 
     #[test]
-    fn footer_formats_with_savings() {
+    fn footer_formats_signed_request_delta_and_its_boundary() {
         console::set_colors_enabled(false);
-        let s = format_turn_footer("gpt-4o-mini", 10, 20, 0.0001, 0.0003, 0.0004);
-        assert_eq!(s, "· gpt-4o-mini · 30 tok · $0.0001 · saved 75%");
-        let s2 = format_turn_footer("gpt-4o", 5, 5, 0.001, 0.0, 0.0);
-        assert_eq!(s2, "· gpt-4o · 10 tok · $0.0010");
+        let positive = UsageInfo {
+            cost_usd: 0.0001,
+            cost_complete: true,
+            baseline_cost_usd: Some(0.0004),
+            legacy_saved_usd: Some(0.0003),
+            request_delta_estimate: tt_client::RequestDeltaEstimate::from_components(
+                Some(0.0004),
+                Some(0.0001),
+                Some(0.0001),
+                Some(0.0),
+                Some(0.0),
+            ),
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_tokens: 0,
+        };
+        let s = format_turn_footer("gpt-4o-mini", &positive);
+        assert!(
+            s.contains("request delta +$0.000200 (positive estimate)"),
+            "{s}"
+        );
+        assert!(
+            s.contains("legacy saved $0.0003 (compatibility only)"),
+            "{s}"
+        );
+        assert!(
+            s.contains("excludes judge/shadow taxes + invoice reconciliation"),
+            "{s}"
+        );
+        assert!(!s.contains("saved 75%"), "{s}");
+
+        let regression = UsageInfo {
+            cost_usd: 0.001,
+            cost_complete: true,
+            baseline_cost_usd: Some(0.001),
+            legacy_saved_usd: None,
+            request_delta_estimate: tt_client::RequestDeltaEstimate::from_components(
+                Some(0.001),
+                Some(0.001),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0001),
+            ),
+            input_tokens: 5,
+            output_tokens: 5,
+            cached_tokens: 0,
+        };
+        let s2 = format_turn_footer("gpt-4o", &regression);
+        assert!(s2.contains("request delta −$0.000100 (regression)"), "{s2}");
+
+        let unmeasured = UsageInfo {
+            request_delta_estimate: tt_client::RequestDeltaEstimate::Unmeasured,
+            ..regression
+        };
+        let s3 = format_turn_footer("gpt-4o", &unmeasured);
+        assert!(s3.contains("request delta not measured"), "{s3}");
+
+        let partial_cost = UsageInfo {
+            cost_complete: false,
+            request_delta_estimate: tt_client::RequestDeltaEstimate::Unmeasured,
+            ..positive.clone()
+        };
+        let s4 = format_turn_footer("gpt-4o-mini", &partial_cost);
+        assert!(s4.contains("$0.0001 known cost"), "{s4}");
+        assert!(s4.contains("request delta not measured"), "{s4}");
+
+        let s5 = format_unmeasured_turn_footer("gpt-4o-mini");
+        assert!(s5.contains("cost and request delta not measured"), "{s5}");
+        assert!(
+            s5.contains("excludes judge/shadow taxes + invoice reconciliation"),
+            "{s5}"
+        );
     }
 
     #[test]
@@ -919,8 +1210,16 @@ mod tests {
         console::set_colors_enabled(false);
         let u = UsageInfo {
             cost_usd: 0.001,
-            baseline_cost_usd: 0.004,
-            saved_usd: 0.003,
+            cost_complete: true,
+            baseline_cost_usd: Some(0.004),
+            legacy_saved_usd: Some(0.003),
+            request_delta_estimate: tt_client::RequestDeltaEstimate::from_components(
+                Some(0.004),
+                Some(0.001),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+            ),
             input_tokens: 1,
             output_tokens: 1,
             cached_tokens: 0,
@@ -931,7 +1230,12 @@ mod tests {
         assert_eq!(l.turns, 2);
         let s = l.summary();
         assert!(s.contains("2 turn"), "{s}");
-        assert!(s.contains("75%"), "{s}");
+        assert!(
+            s.contains("legacy saved $0.0060 (compatibility only)"),
+            "{s}"
+        );
+        assert!(s.contains("request delta +$0.006000"), "{s}");
+        assert!(s.contains("2/2 measured"), "{s}");
     }
 
     #[test]
