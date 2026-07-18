@@ -43,8 +43,9 @@ fn store(state: &AppState) -> ApiResult<&std::sync::Arc<tt_routing::CachingRouti
 
 /// `catalog:` is owned by the dashboard control plane's set-level, one-time
 /// owner/admin-confirmed materializer. A tenant API key can manage ordinary
-/// routes, but cannot create or remove that namespace through the generic
-/// gateway CRUD surface because it carries no corresponding catalog intent.
+/// routes, but cannot create, remove, or reactivate that namespace through the
+/// generic gateway CRUD surface because it carries no corresponding catalog
+/// intent.
 fn reject_reserved_catalog_name(name: &str) -> ApiResult<()> {
     if is_catalog_route_name(name) {
         return Err(ApiError::RouteValidation {
@@ -247,8 +248,11 @@ pub async fn pause(
 /// `POST /v1/routes/:id/resume?expected_revision=…` — THE explicit re-enable;
 /// nothing else clears a pause (auto or manual). The observed definition
 /// generation is required so a delayed request cannot resume a same-UUID
-/// replacement. `was_paused` reports whether a pause row was actually removed
-/// (false = the current route wasn't paused; still 200).
+/// replacement. Generic tenant-key resume deliberately excludes `catalog:`
+/// rows: those automatic transformations are owned by the dashboard's
+/// set-level, fresh-confirmation catalog flow. `was_paused` reports whether a
+/// pause row was actually removed (false = the current route wasn't paused;
+/// still 200).
 pub async fn resume(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,
@@ -259,6 +263,18 @@ pub async fn resume(
     let expected_revision =
         parse_route_mutation_expected_revision(q.expected_revision.as_deref(), "resume")?;
     let store = store(&state)?;
+    // Pausing a catalog row remains a safe generic suppression, but clearing
+    // that safety pause here would reactivate an automatic transformation
+    // without the catalog flow's fresh owner/admin confirmation. This mirrors
+    // generic DELETE's namespace fence. The following generation-qualified
+    // store mutation still prevents a concurrent definition replacement from
+    // being resumed after this read.
+    let current = store
+        .get_management_route(org, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("no route with id {id}")))?;
+    reject_reserved_catalog_name(&current.name)?;
     let was_paused = store
         .resume_route(org, id, expected_revision)
         .await

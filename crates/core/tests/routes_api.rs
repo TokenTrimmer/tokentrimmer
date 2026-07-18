@@ -641,6 +641,82 @@ async fn pause_resume_endpoints_round_trip() {
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// A catalog route can still be paused through the generic tenant-key path:
+/// suppression is the quality-safe direction. It must not be resumed there,
+/// because that would reactivate a catalog-managed automatic transformation
+/// without the catalog flow's fresh owner/admin confirmation.
+#[tokio::test]
+async fn generic_resume_cannot_reactivate_a_catalog_route() {
+    let id = Uuid::now_v7();
+    let route = Route {
+        id,
+        name: "catalog:openai->gpt-4o-mini".into(),
+        priority: 10,
+        enabled: true,
+        when: RouteConditions {
+            model_in: vec!["gpt-4o".into()],
+            ..Default::default()
+        },
+        then: RouteAction {
+            target_model: Some("gpt-4o-mini".into()),
+            auto_pause: true,
+            ..Default::default()
+        },
+        paused: false,
+    };
+    let (app, key) = app_with_manual_route(route).await;
+
+    let current = app
+        .clone()
+        .oneshot(req("GET", &format!("/v1/routes/{id}"), Some(&key), None))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    let revision = body_json(current).await["revision"]
+        .as_i64()
+        .filter(|revision| *revision >= 1)
+        .expect("manual catalog row has a management revision");
+
+    let paused = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/v1/routes/{id}/pause?expected_revision={revision}"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(paused.status(), StatusCode::OK);
+    assert_eq!(body_json(paused).await["paused"], json!(true));
+
+    let resumed = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            &format!("/v1/routes/{id}/resume?expected_revision={revision}"),
+            Some(&key),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let rejection = body_json(resumed).await;
+    assert_eq!(rejection["error"]["code"], json!("route_validation_failed"));
+    assert_eq!(rejection["error"]["issues"][0]["field"], json!("name"));
+    assert_eq!(
+        rejection["error"]["issues"][0]["code"],
+        json!("reserved_name")
+    );
+
+    let after = app
+        .oneshot(req("GET", &format!("/v1/routes/{id}"), Some(&key), None))
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+    assert_eq!(body_json(after).await["paused"], json!(true));
+}
+
 #[tokio::test]
 async fn pause_resume_require_a_current_positive_route_revision() {
     let (app, key, _served) = app_with_key().await;
