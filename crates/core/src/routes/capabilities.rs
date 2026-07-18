@@ -29,6 +29,15 @@ use crate::{
 /// instead of asking clients to infer a changed meaning from a familiar field.
 pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 
+// These are stable v1 wire codes, not provider observations. Each identifies
+// why the responding process deliberately leaves the corresponding fact
+// unknown rather than inferring readiness from local configuration or catalog
+// metadata.
+const PROVIDER_CREDENTIALS_NOT_INSPECTED_CODE: &str = "provider_credentials_not_inspected";
+const PROVIDER_HEALTH_NOT_PROBED_CODE: &str = "provider_health_not_probed";
+const MODEL_SUPPORT_NOT_NEGOTIATED_CODE: &str = "model_support_not_negotiated";
+const MODALITY_SUPPORT_NOT_NEGOTIATED_CODE: &str = "modality_support_not_negotiated";
+
 /// `GET /v1/capabilities` — a no-store snapshot of the responding gateway
 /// process's known runtime facts for one authenticated `tt_live_*` caller.
 ///
@@ -182,19 +191,19 @@ pub fn build_document(
             },
         },
         provider_credentials: unknown_fact(
-            "provider_credentials_not_inspected",
+            PROVIDER_CREDENTIALS_NOT_INSPECTED_CODE,
             "This endpoint does not decrypt, count, or probe provider credentials. A configured record is not treated as provider readiness.",
         ),
         provider_health: unknown_fact(
-            "provider_health_not_probed",
+            PROVIDER_HEALTH_NOT_PROBED_CODE,
             "This endpoint does not make provider health probes or spend-producing test requests.",
         ),
         model_support: unknown_fact(
-            "model_support_not_negotiated",
+            MODEL_SUPPORT_NOT_NEGOTIATED_CODE,
             "A registered catalog model or provider inference path does not prove this request's credentials, modality, budget, or upstream acceptance. Use it only as metadata, not readiness evidence.",
         ),
         modality_support: unknown_fact(
-            "modality_support_not_negotiated",
+            MODALITY_SUPPORT_NOT_NEGOTIATED_CODE,
             "Modality support is request-specific and is not negotiated by this endpoint.",
         ),
         schema_versions: SchemaVersions {

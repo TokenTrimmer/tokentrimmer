@@ -577,6 +577,21 @@ load-balanced fleet may return different snapshots while configuration or a
 binary rollout is in progress. Clients must execute the real request and handle
 its result rather than using this endpoint as a fleet-wide readiness signal.
 
+For these intentionally unknown facts, version 1 emits the following stable
+`reason.code` values:
+
+| Field | `reason.code` | Meaning |
+| --- | --- | --- |
+| `provider_credentials` | `provider_credentials_not_inspected` | The endpoint did not decrypt, count, or probe credentials. It says nothing about whether a credential is absent, present, valid, or usable. |
+| `provider_health` | `provider_health_not_probed` | The endpoint did not make a provider health probe or spend-producing test request. It says nothing about provider health. |
+| `model_support` | `model_support_not_negotiated` | The endpoint did not negotiate this request's model. Catalog metadata is not request acceptance evidence. |
+| `modality_support` | `modality_support_not_negotiated` | The endpoint did not negotiate this request's modality. It is not modality-support or request-acceptance evidence. |
+
+For every row, `state: "unknown"` and `source: "not_negotiated"` are
+normative: the code describes an omitted observation, never a positive or
+negative readiness result. Clients MUST use the actual request result for any
+credential, provider, model, modality, limit, or execution decision.
+
 ---
 
 ## 6. TokenTrimmer extension headers

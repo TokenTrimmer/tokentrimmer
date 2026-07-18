@@ -84,17 +84,22 @@ async fn body_json(response: axum::response::Response) -> Value {
 }
 
 fn assert_unknown_readiness(body: &Value) {
-    for field in [
-        "provider_credentials",
-        "provider_health",
-        "model_support",
-        "modality_support",
+    for (field, reason_code) in [
+        ("provider_credentials", "provider_credentials_not_inspected"),
+        ("provider_health", "provider_health_not_probed"),
+        ("model_support", "model_support_not_negotiated"),
+        ("modality_support", "modality_support_not_negotiated"),
     ] {
         let fact = body.get(field).expect("capability fact");
         assert_eq!(fact["state"].as_str(), Some("unknown"), "{field}: {fact}");
         assert_eq!(
             fact["source"].as_str(),
             Some("not_negotiated"),
+            "{field}: {fact}"
+        );
+        assert_eq!(
+            fact["reason"]["code"].as_str(),
+            Some(reason_code),
             "{field}: {fact}"
         );
     }
