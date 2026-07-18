@@ -14,7 +14,7 @@
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use async_trait::async_trait;
@@ -65,11 +65,22 @@ struct CountedMock {
     id: &'static str,
     model: &'static str,
     calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl CountedMock {
-    fn new(id: &'static str, model: &'static str, calls: Arc<AtomicUsize>) -> Self {
-        Self { id, model, calls }
+    fn new(
+        id: &'static str,
+        model: &'static str,
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            id,
+            model,
+            calls,
+            requests,
+        }
     }
 }
 
@@ -82,7 +93,7 @@ impl Provider for CountedMock {
         vec![ModelInfo {
             id: self.model.into(),
             provider: self.id.into(),
-            capabilities: vec![Capability::Text],
+            capabilities: vec![Capability::Text, Capability::JsonMode],
             max_input_tokens: 8192,
             max_output_tokens: 8192,
         }]
@@ -111,6 +122,10 @@ impl Provider for CountedMock {
         _ctx: &RequestContext,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        self.requests
+            .lock()
+            .unwrap()
+            .push(serde_json::to_string(&req).expect("serialize panel leg request"));
         Ok(ChatCompletionResponse {
             id: "x".into(),
             object: "chat.completion".into(),
@@ -187,22 +202,28 @@ impl TierResolver for FixedTierResolver {
 /// all sharing `calls`. Models: "model-a", "model-b" (members), "model-arb"
 /// (arbiter). The request's `model` is also "model-a" so the route can match on
 /// `model_equals`.
-fn registry_with_panel_models(calls: &Arc<AtomicUsize>) -> ProviderRegistry {
+fn registry_with_panel_models(
+    calls: &Arc<AtomicUsize>,
+    requests: &Arc<Mutex<Vec<String>>>,
+) -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(CountedMock::new(
         "vendor-a",
         "model-a",
         Arc::clone(calls),
+        Arc::clone(requests),
     )));
     registry.register(Arc::new(CountedMock::new(
         "vendor-b",
         "model-b",
         Arc::clone(calls),
+        Arc::clone(requests),
     )));
     registry.register(Arc::new(CountedMock::new(
         "vendor-arb",
         "model-arb",
         Arc::clone(calls),
+        Arc::clone(requests),
     )));
     registry
 }
@@ -217,7 +238,8 @@ async fn issue_key(store: &InMemoryKeyStore, org: Uuid) -> String {
 
 /// Build an app with `routes` for the caller-org, panel-enabled (configurable),
 /// optional min-tier, optional tier resolver. Returns
-/// (app, key, request_log_writer, telemetry_tracker, call_counter).
+/// (app, key, request_log_writer, telemetry_tracker, call_counter,
+/// upstream_requests).
 async fn app_with_routes(
     routes: Vec<Route>,
     panel_enabled: bool,
@@ -229,9 +251,11 @@ async fn app_with_routes(
     Arc<InMemoryRequestLogWriter>,
     TaskTracker,
     Arc<AtomicUsize>,
+    Arc<Mutex<Vec<String>>>,
 ) {
     let calls = Arc::new(AtomicUsize::new(0));
-    let registry = registry_with_panel_models(&calls);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = registry_with_panel_models(&calls, &requests);
 
     let raw = InMemoryKeyStore::new();
     let org = Uuid::now_v7();
@@ -257,7 +281,7 @@ async fn app_with_routes(
     if let Some(tr) = tier_resolver {
         state = state.with_tier_resolver(tr);
     }
-    (build_router(state), key, writer, tracker, calls)
+    (build_router(state), key, writer, tracker, calls, requests)
 }
 
 /// A modifier-only route (no target_model) whose `then.panel` triggers the
@@ -310,6 +334,15 @@ fn panel_route(name: &str, strategy: &str, paused: bool, max_cost_usd: Option<f6
     }
 }
 
+/// A real route-triggered panel plus a CSV format-switch action. The
+/// composition guard must preserve the schema for every panel leg because the
+/// panel, not the direct completion tail, owns the caller-visible answer.
+fn panel_route_with_format_switch(name: &str) -> Route {
+    let mut route = panel_route(name, "synthesize", false, Some(10.0));
+    route.then.format_switch = Some("csv".into());
+    route
+}
+
 /// A non-panel modifier-only route (compress) — for the off-by-default test.
 fn non_panel_route(name: &str) -> Route {
     Route {
@@ -351,6 +384,16 @@ fn non_panel_route(name: &str) -> Route {
     }
 }
 
+/// A route that opts into only the CSV format switch. A request header can
+/// independently select a Fusion panel, exercising the header-selected owner
+/// rather than the route-panel owner above.
+fn format_switch_only_route(name: &str) -> Route {
+    let mut route = non_panel_route(name);
+    route.then.compress = false;
+    route.then.format_switch = Some("csv".into());
+    route
+}
+
 /// A chat request on "model-a" with optional `X-TokenTrimmer-Panel` header and
 /// optional `X-TokenTrimmer-Cost-Limit-Usd` ceiling. No `tt_extras.panel`.
 fn chat_req(key: &str, panel_header: Option<&str>, cost_limit: Option<&str>) -> Request<Body> {
@@ -374,6 +417,59 @@ fn chat_req(key: &str, panel_header: Option<&str>, cost_limit: Option<&str>) -> 
     b.body(Body::from(body.to_string())).unwrap()
 }
 
+fn csv_response_format() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "items",
+            "strict": false,
+            "schema": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "qty": {"type": "integer"}
+                    },
+                    "required": ["name", "qty"]
+                }
+            }
+        }
+    })
+}
+
+/// A non-streaming, switch-eligible request. When `panel_header` is present,
+/// the supplied `tt_extras.panel` config gives the header-selected panel its
+/// member/arbiter models.
+fn chat_req_with_csv_schema(key: &str, panel_header: Option<&str>) -> Request<Body> {
+    let mut body = json!({
+        "model": "model-a",
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": "list the inventory" }],
+        "stream": false,
+        "response_format": csv_response_format(),
+    });
+    if panel_header.is_some() {
+        body["tt_extras"] = json!({
+            "panel": {
+                "members": ["model-a", "model-b"],
+                "arbiter_model": "model-arb"
+            }
+        });
+    }
+
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {key}"))
+        .header("x-tokentrimmer-cost-limit-usd", "10.0");
+    if let Some(strategy) = panel_header {
+        builder = builder.header("x-tokentrimmer-panel", strategy);
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
 async fn body_json(resp: axum::response::Response) -> Value {
     let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
@@ -395,6 +491,45 @@ fn hdr(resp: &axum::http::Response<Body>, name: &str) -> Option<String> {
         .map(String::from)
 }
 
+fn warning_tokens(resp: &axum::http::Response<Body>) -> Vec<String> {
+    hdr(resp, "x-tokentrimmer-warnings")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The panel owns its response, so member fan-out legs must retain the
+/// caller's json_schema and no panel leg may receive the direct-path CSV
+/// instruction. The arbiter builds its own synthetic synthesis prompt, so it
+/// intentionally has no caller `response_format`; that is distinct from a
+/// format-switch mutation of the caller/member request.
+fn assert_panel_legs_keep_structured_request(requests: &Arc<Mutex<Vec<String>>>) {
+    let recorded = requests.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        3,
+        "synthesize panel must dispatch two member legs plus one arbiter leg"
+    );
+    let mut member_legs = 0;
+    for request in recorded.iter() {
+        let request: Value = serde_json::from_str(request).expect("recorded request JSON");
+        if request["model"] != "model-arb" {
+            member_legs += 1;
+            assert!(
+                request["response_format"].is_object(),
+                "member leg must retain caller response_format: {request}"
+            );
+        }
+        assert!(
+            !request.to_string().contains("Respond ONLY with CSV data"),
+            "panel leg must not receive direct format-switch instruction: {request}"
+        );
+    }
+    assert_eq!(member_legs, 2, "expected two original-request member legs");
+}
+
 // ===========================================================================
 // TEST 1: Route triggers panel (NO header) ⇒ 200 + tokentrimmer.panel +
 // one provider='panel' request_logs row with matched_route_id set.
@@ -404,7 +539,8 @@ fn hdr(resp: &axum::http::Response<Body>, name: &str) -> Option<String> {
 async fn route_triggers_panel_without_header() {
     let route = panel_route("research", "synthesize", false, Some(10.0));
     let route_id = route.id;
-    let (app, key, writer, tracker, _calls) = app_with_routes(vec![route], true, None, None).await;
+    let (app, key, writer, tracker, _calls, _requests) =
+        app_with_routes(vec![route], true, None, None).await;
 
     // NO panel header — the route's `then.panel` is the only trigger.
     let resp = app
@@ -474,7 +610,7 @@ async fn route_triggers_panel_without_header() {
 #[tokio::test]
 async fn header_wins_over_route_panel() {
     let route = panel_route("research", "synthesize", false, Some(10.0));
-    let (app, key, _writer, _tracker, _calls) =
+    let (app, key, _writer, _tracker, _calls, _requests) =
         app_with_routes(vec![route], true, None, None).await;
 
     // Header best-of-n + tt_extras.panel members (header path reads tt_extras).
@@ -517,13 +653,101 @@ async fn header_wins_over_route_panel() {
 }
 
 // ===========================================================================
+// FORMAT-SWITCH COMPOSITION: a panel owns the final response, so an otherwise
+// eligible route switch must not mutate the panel legs or claim an aggregate
+// switched output. Route and header panel selection are separate ingress paths.
+// ===========================================================================
+
+#[tokio::test]
+async fn route_panel_skips_format_switch_without_mutating_legs_or_claiming_output() {
+    let route = panel_route_with_format_switch("research-format-switch");
+    let (app, key, writer, tracker, _calls, requests) =
+        app_with_routes(vec![route], true, None, None).await;
+
+    let resp = app
+        .oneshot(chat_req_with_csv_schema(&key, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "route panel must still run");
+    let warnings = warning_tokens(&resp);
+    assert!(
+        warnings
+            .iter()
+            .any(|token| token == "format_switch_skipped:panel"),
+        "route panel must explain the composition skip, got {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|token| token == "format_switch:csv"),
+        "panel response must not advertise a switch it cannot validate: {warnings:?}"
+    );
+    assert_eq!(
+        hdr(&resp, "x-tokentrimmer-format-switch-saved-est-usd").as_deref(),
+        Some("0.000000"),
+        "panel aggregate must not book a format-switch estimate"
+    );
+
+    let body = body_json(resp).await;
+    assert!(
+        body["tokentrimmer"]["panel"].is_object(),
+        "route-selected panel must own the response, got {body}"
+    );
+    assert_panel_legs_keep_structured_request(&requests);
+
+    let rows = drain_rows(&writer, tracker).await;
+    assert_eq!(rows.len(), 1, "panel writes one aggregate row");
+    assert_eq!(rows[0].format_switched, None);
+    assert_eq!(rows[0].format_switch_saved_est_usd, 0.0);
+}
+
+#[tokio::test]
+async fn header_panel_skips_route_format_switch_without_mutating_legs_or_claiming_output() {
+    let route = format_switch_only_route("format-switch");
+    let (app, key, writer, tracker, _calls, requests) =
+        app_with_routes(vec![route], true, None, None).await;
+
+    let resp = app
+        .oneshot(chat_req_with_csv_schema(&key, Some("synthesize")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "header panel must still run");
+    let warnings = warning_tokens(&resp);
+    assert!(
+        warnings
+            .iter()
+            .any(|token| token == "format_switch_skipped:panel"),
+        "header-selected panel must explain the composition skip, got {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|token| token == "format_switch:csv"),
+        "header panel response must not advertise a switch it cannot validate: {warnings:?}"
+    );
+    assert_eq!(
+        hdr(&resp, "x-tokentrimmer-format-switch-saved-est-usd").as_deref(),
+        Some("0.000000"),
+        "header-panel aggregate must not book a format-switch estimate"
+    );
+
+    let body = body_json(resp).await;
+    assert!(
+        body["tokentrimmer"]["panel"].is_object(),
+        "header-selected panel must own the response, got {body}"
+    );
+    assert_panel_legs_keep_structured_request(&requests);
+
+    let rows = drain_rows(&writer, tracker).await;
+    assert_eq!(rows.len(), 1, "panel writes one aggregate row");
+    assert_eq!(rows[0].format_switched, None);
+    assert_eq!(rows[0].format_switch_saved_est_usd, 0.0);
+}
+
+// ===========================================================================
 // TEST 3a: Kill-switch off ⇒ a route-triggered panel 403s (D3), zero dispatch.
 // ===========================================================================
 
 #[tokio::test]
 async fn route_panel_kill_switch_returns_403() {
     let route = panel_route("research", "synthesize", false, Some(10.0));
-    let (app, key, writer, tracker, calls) =
+    let (app, key, writer, tracker, calls, _requests) =
         app_with_routes(vec![route], false /* panel disabled */, None, None).await;
 
     let resp = app
@@ -559,7 +783,7 @@ async fn route_panel_kill_switch_returns_403() {
 async fn route_panel_entitlement_blocks_free_caller() {
     let route = panel_route("research", "synthesize", false, Some(10.0));
     // min_tier = Pro; the issued key's org has no FixedTierResolver → Free fallback.
-    let (app, key, _writer, _tracker, calls) =
+    let (app, key, _writer, _tracker, calls, _requests) =
         app_with_routes(vec![route], true, Some(CallerTier::Pro), None).await;
 
     let resp = app
@@ -596,7 +820,8 @@ async fn route_panel_entitlement_blocks_free_caller() {
 async fn route_panel_over_budget_returns_402() {
     // No header cost-limit — the route's own max_cost_usd is the ceiling.
     let route = panel_route("research", "synthesize", false, Some(0.000001));
-    let (app, key, writer, tracker, calls) = app_with_routes(vec![route], true, None, None).await;
+    let (app, key, writer, tracker, calls, _requests) =
+        app_with_routes(vec![route], true, None, None).await;
 
     let resp = app
         .clone()
@@ -630,7 +855,8 @@ async fn route_panel_over_budget_returns_402() {
 #[tokio::test]
 async fn paused_panel_route_does_not_trigger_panel() {
     let route = panel_route("research", "synthesize", true /* paused */, Some(10.0));
-    let (app, key, writer, tracker, _calls) = app_with_routes(vec![route], true, None, None).await;
+    let (app, key, writer, tracker, _calls, _requests) =
+        app_with_routes(vec![route], true, None, None).await;
 
     let resp = app
         .clone()
@@ -671,7 +897,8 @@ async fn paused_panel_route_does_not_trigger_panel() {
 #[tokio::test]
 async fn no_panel_route_no_header_is_single_model() {
     let route = non_panel_route("compress-only");
-    let (app, key, writer, tracker, _calls) = app_with_routes(vec![route], true, None, None).await;
+    let (app, key, writer, tracker, _calls, _requests) =
+        app_with_routes(vec![route], true, None, None).await;
 
     let resp = app
         .clone()

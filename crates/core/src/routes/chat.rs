@@ -2576,6 +2576,78 @@ pub async fn handler(
     }
 }
 
+/// The non-direct response owner that makes a route format switch inapplicable.
+///
+/// A Fusion panel and a workflow detour bypass the direct completion tail where
+/// a switch is validated, advertised, and assigned its isolated estimate. The
+/// request must therefore stay in its caller-requested structured form before
+/// either owner fans it out or consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatSwitchResponseOwner {
+    FusionPanel,
+    WorkflowDetour,
+}
+
+impl FormatSwitchResponseOwner {
+    const fn skip_reason(self) -> &'static str {
+        match self {
+            Self::FusionPanel => "panel",
+            Self::WorkflowDetour => "workflow",
+        }
+    }
+}
+
+/// Result of deciding and, only when safe, applying a route format switch.
+///
+/// Keeping mutation in this one helper makes the composition contract
+/// testable: every skipped outcome leaves the request byte-identical and has
+/// no plan that a response-owning branch could later advertise or book.
+enum RouteFormatSwitchPreparation {
+    NotRequested,
+    Applied(crate::shaping::format_switch::FormatSwitchPlan),
+    Skipped(&'static str),
+}
+
+/// Apply an eligible route format switch, unless another response owner takes
+/// the request first.
+///
+/// Streaming intentionally bypasses the owner guard so the established
+/// `format_switch_skipped:streaming` planner token remains the first reason.
+/// Likewise, a shadow workflow is passed as no owner: its direct response
+/// still follows the normal format-switch contract.
+fn prepare_route_format_switch(
+    req: &mut ChatCompletionRequest,
+    route_format_switch: Option<&str>,
+    response_owner: Option<FormatSwitchResponseOwner>,
+    diff_applies: bool,
+) -> RouteFormatSwitchPreparation {
+    let Some(requested) = route_format_switch else {
+        return RouteFormatSwitchPreparation::NotRequested;
+    };
+
+    if !req.stream {
+        if let Some(owner) = response_owner {
+            return RouteFormatSwitchPreparation::Skipped(owner.skip_reason());
+        }
+    }
+    if diff_applies {
+        return RouteFormatSwitchPreparation::Skipped("conflict");
+    }
+
+    match crate::shaping::format_switch::plan_format_switch(req, Some(requested)) {
+        Some(crate::shaping::ShapeDecision::Apply(plan)) => {
+            crate::shaping::format_switch::apply_format_switch_request(req, &plan);
+            RouteFormatSwitchPreparation::Applied(plan)
+        }
+        Some(crate::shaping::ShapeDecision::Skip(reason)) => {
+            RouteFormatSwitchPreparation::Skipped(reason)
+        }
+        // `requested` is Some above, so the planner cannot return None. Keep
+        // the default explicitly fail-open if that invariant ever changes.
+        None => RouteFormatSwitchPreparation::NotRequested,
+    }
+}
+
 /// Run the shared per-request setup for a chat completion and bundle the result
 /// into a [`Prepared`] for the streaming arm / [`complete_once`] / the
 /// server-side agent loop.
@@ -3124,32 +3196,45 @@ pub(crate) async fn prepare(
     // applies, response_format is None and the downgrade no-ops) and before
     // cache-key derivation (the mutated request hashes to its own L1 key).
     // Both planners gate on `req.stream` internally, so the streaming branch
-    // below is untouched by construction. format_switch × diff is
-    // config-rejected at route creation (`validate_output_shaping`);
-    // defensively, if both somehow apply, diff wins and the switch is skipped
-    // with the `conflict` token.
+    // below is untouched by construction. A resolved, non-shadow Fusion panel
+    // or workflow detour owns the final response instead of the direct
+    // dispatch, so format-switch must not mutate the request for an output
+    // path that cannot validate, advertise, or book that switch. This applies
+    // equally to route- and header-selected panels because both resolve to
+    // `panel` above. `skip_shadow` means complete_once deliberately drops
+    // those owners and takes the direct path, so it remains eligible. Finally,
+    // format_switch × diff is config-rejected at route creation
+    // (`validate_output_shaping`); defensively, if both somehow apply, diff
+    // wins and the switch is skipped with the `conflict` token.
     let diff_decision = crate::shaping::diff::plan_diff(req, route_diff);
-    let format_switch_requested =
-        if matches!(diff_decision, Some(crate::shaping::ShapeDecision::Apply(_)))
-            && route_format_switch.is_some()
-        {
-            warnings.push("format_switch_skipped:conflict".to_string());
-            crate::metrics::record_format_switch_skip("conflict");
-            None
-        } else {
-            route_format_switch.as_deref()
-        };
+    let format_switch_owner = if !skip_shadow && panel.is_some() {
+        Some(FormatSwitchResponseOwner::FusionPanel)
+    } else if !skip_shadow
+        && route_workflow
+            .as_ref()
+            .is_some_and(|cfg| cfg.mode.as_deref() != Some("shadow"))
+    {
+        Some(FormatSwitchResponseOwner::WorkflowDetour)
+    } else {
+        None
+    };
+    let diff_applies = matches!(
+        diff_decision.as_ref(),
+        Some(crate::shaping::ShapeDecision::Apply(_))
+    );
     let mut format_switch_plan: Option<crate::shaping::format_switch::FormatSwitchPlan> = None;
-    match crate::shaping::format_switch::plan_format_switch(req, format_switch_requested) {
-        Some(crate::shaping::ShapeDecision::Apply(p)) => {
-            crate::shaping::format_switch::apply_format_switch_request(req, &p);
-            format_switch_plan = Some(p);
-        }
-        Some(crate::shaping::ShapeDecision::Skip(r)) => {
+    match prepare_route_format_switch(
+        req,
+        route_format_switch.as_deref(),
+        format_switch_owner,
+        diff_applies,
+    ) {
+        RouteFormatSwitchPreparation::Applied(p) => format_switch_plan = Some(p),
+        RouteFormatSwitchPreparation::Skipped(r) => {
             warnings.push(format!("format_switch_skipped:{r}"));
             crate::metrics::record_format_switch_skip(r);
         }
-        None => {}
+        RouteFormatSwitchPreparation::NotRequested => {}
     }
     let mut diff_plan: Option<crate::shaping::diff::DiffPlan> = None;
     match diff_decision {
@@ -9676,6 +9761,32 @@ mod output_shaping_tests {
         }
     }
 
+    /// A flat non-strict schema that would normally make the CSV switch
+    /// eligible. Composition tests use it to prove an owner guard, rather than
+    /// a schema gate, left the request untouched.
+    fn csv_switch_request() -> ChatCompletionRequest {
+        let mut req = req_with_messages(vec![sys("Return the inventory."), user("list items")]);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".into(),
+            json_schema: Some(serde_json::json!({
+                "name": "items",
+                "strict": false,
+                "schema": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "qty": {"type": "integer"}
+                        },
+                        "required": ["name", "qty"]
+                    }
+                }
+            })),
+        });
+        req
+    }
+
     fn assistant_text_response(texts: &[&str]) -> ChatCompletionResponse {
         ChatCompletionResponse {
             id: "r".into(),
@@ -10261,6 +10372,80 @@ mod output_shaping_tests {
             &mut req, None, None, &p, None, "r", &mut w
         ));
         assert!(w.is_empty());
+    }
+
+    /// A workflow detour replaces the direct completion before its
+    /// response-side format-switch validator, token, and estimate machinery
+    /// can run. The guard must therefore leave the caller schema and prompt
+    /// byte-identical and yield no plan that could become an output claim.
+    #[test]
+    fn workflow_detour_skips_format_switch_without_mutation_or_output_plan() {
+        let mut req = csv_switch_request();
+        let before = serde_json::to_string(&req).unwrap();
+
+        let outcome = prepare_route_format_switch(
+            &mut req,
+            Some("csv"),
+            Some(FormatSwitchResponseOwner::WorkflowDetour),
+            false,
+        );
+
+        assert!(matches!(
+            outcome,
+            RouteFormatSwitchPreparation::Skipped("workflow")
+        ));
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            before,
+            "workflow detour must retain response_format and add no switch instruction"
+        );
+    }
+
+    /// Shadow workflows keep the direct response path, so they retain the
+    /// established opt-in format-switch behavior.
+    #[test]
+    fn shadow_workflow_keeps_direct_format_switch_behavior() {
+        let mut req = csv_switch_request();
+
+        let outcome = prepare_route_format_switch(&mut req, Some("csv"), None, false);
+
+        assert!(matches!(
+            outcome,
+            RouteFormatSwitchPreparation::Applied(ref plan) if plan.label == "csv"
+        ));
+        assert!(
+            req.response_format.is_none(),
+            "direct switch drops the schema"
+        );
+        assert!(
+            serde_json::to_string(&req)
+                .unwrap()
+                .contains("Respond ONLY with CSV data"),
+            "direct switch appends its deterministic instruction"
+        );
+    }
+
+    /// Streaming remains planner-owned: an otherwise real panel must preserve
+    /// the existing `streaming` reason rather than changing observability to a
+    /// response-owner reason.
+    #[test]
+    fn panel_streaming_keeps_existing_format_switch_streaming_reason() {
+        let mut req = csv_switch_request();
+        req.stream = true;
+        let before = serde_json::to_string(&req).unwrap();
+
+        let outcome = prepare_route_format_switch(
+            &mut req,
+            Some("csv"),
+            Some(FormatSwitchResponseOwner::FusionPanel),
+            false,
+        );
+
+        assert!(matches!(
+            outcome,
+            RouteFormatSwitchPreparation::Skipped("streaming")
+        ));
+        assert_eq!(serde_json::to_string(&req).unwrap(), before);
     }
 }
 
