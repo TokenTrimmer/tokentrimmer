@@ -55,12 +55,15 @@ pub struct Extraction {
 
 impl Extraction {
     /// Whether every span is lossless (a text layer). Lossless extractions skip
-    /// the D4c quality judge; a single lossy span forces the gate.
+    /// the D4c quality judge; a single lossy span forces the gate. An empty
+    /// span list is never evidence of a lossless extraction.
     #[must_use]
     pub fn is_lossless(&self) -> bool {
-        self.spans
-            .iter()
-            .all(|s| s.fidelity == SpanFidelity::Lossless)
+        !self.spans.is_empty()
+            && self
+                .spans
+                .iter()
+                .all(|s| s.fidelity == SpanFidelity::Lossless)
     }
 }
 
@@ -121,7 +124,7 @@ async fn request_extraction(
         return None;
     }
     let wire = response.json::<WireResponse>().await.ok()?;
-    Some(wire.into_extraction())
+    wire.into_extraction()
 }
 
 /// The sidecar's on-the-wire response. Deserialized leniently (unknown fields
@@ -148,8 +151,22 @@ struct WireSpan {
 }
 
 impl WireResponse {
-    fn into_extraction(self) -> Extraction {
-        Extraction {
+    /// A 2xx response is usable only when it proves that the sidecar actually
+    /// extracted content. Some sidecar engines intentionally use 200 + an
+    /// empty result for unsupported input / unavailable OCR; treating that as
+    /// a success would replace a user's raw part with empty text. Keep the
+    /// schema lenient for future engines and span kinds, but require this
+    /// minimal evidence before allowing a substitution.
+    fn into_extraction(self) -> Option<Extraction> {
+        if self.text.trim().is_empty()
+            || self.spans.is_empty()
+            || self.pages == 0
+            || !self.spans.iter().any(|span| span.chars > 0)
+        {
+            return None;
+        }
+
+        Some(Extraction {
             text: self.text,
             pages: self.pages,
             spans: self
@@ -161,7 +178,7 @@ impl WireResponse {
                     chars: s.chars,
                 })
                 .collect(),
-        }
+        })
     }
 }
 
@@ -198,7 +215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ok_200_parses_into_some() {
+    async fn structurally_valid_future_engine_and_span_kind_parse() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/extract");
@@ -208,10 +225,10 @@ mod tests {
                     serde_json::json!({
                         "text": "Hello TokenTrimmer",
                         "pages": 2,
-                        "engine": "pdf-extract",
+                        "engine": "future-extractor-v9",
                         "spans": [
                             { "kind": "lossless", "page": 0, "chars": 11 },
-                            { "kind": "lossy", "page": 1, "chars": 7 }
+                            { "kind": "future-span-kind", "page": 1, "chars": 7 }
                         ]
                     })
                     .to_string(),
@@ -227,14 +244,140 @@ mod tests {
         .await;
 
         mock.assert();
-        let extraction = got.expect("a 200 must parse into Some");
+        let extraction = got.expect("a structurally valid 200 must parse into Some");
         assert_eq!(extraction.text, "Hello TokenTrimmer");
         assert_eq!(extraction.pages, 2);
         assert_eq!(extraction.spans.len(), 2);
         assert_eq!(extraction.spans[0].fidelity, SpanFidelity::Lossless);
         assert_eq!(extraction.spans[0].chars, 11);
         assert_eq!(extraction.spans[1].fidelity, SpanFidelity::Lossy);
+        assert_eq!(
+            extraction.spans[1].fidelity,
+            SpanFidelity::Lossy,
+            "an unknown span kind is accepted but conservatively gated as lossy"
+        );
         assert!(!extraction.is_lossless(), "one lossy span => not lossless");
+    }
+
+    #[test]
+    fn response_requires_nonblank_text_nonempty_spans_positive_pages_and_nonzero_chars() {
+        let span = || WireSpan {
+            kind: "lossless".to_string(),
+            page: 0,
+            chars: 1,
+        };
+        let invalid_responses = [
+            WireResponse {
+                text: " \t".to_string(),
+                spans: vec![span()],
+                pages: 1,
+            },
+            WireResponse {
+                text: "text".to_string(),
+                spans: vec![],
+                pages: 1,
+            },
+            WireResponse {
+                text: "text".to_string(),
+                spans: vec![span()],
+                pages: 0,
+            },
+            WireResponse {
+                text: "text".to_string(),
+                spans: vec![WireSpan {
+                    kind: "lossless".to_string(),
+                    page: 0,
+                    chars: 0,
+                }],
+                pages: 1,
+            },
+        ];
+
+        for wire in invalid_responses {
+            assert!(wire.into_extraction().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_object_200_fails_open_to_none() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/extract");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("{}");
+        });
+
+        let got = extract(
+            &client(),
+            Some(&server.base_url()),
+            "application/pdf",
+            "AAAA",
+        )
+        .await;
+
+        mock.assert();
+        assert!(got.is_none(), "an empty 200 response is not an extraction");
+    }
+
+    #[tokio::test]
+    async fn empty_unsupported_200_fails_open_to_none() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/extract");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "text": "",
+                        "pages": 0,
+                        "engine": "unsupported",
+                        "spans": []
+                    })
+                    .to_string(),
+                );
+        });
+
+        let got = extract(
+            &client(),
+            Some(&server.base_url()),
+            "application/pdf",
+            "AAAA",
+        )
+        .await;
+
+        mock.assert();
+        assert!(
+            got.is_none(),
+            "a 200 unsupported-input result must not replace the raw part"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_ocr_unavailable_200_fails_open_to_none() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/extract");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "text": "   ",
+                        "pages": 1,
+                        "engine": "ocr_unavailable",
+                        "spans": []
+                    })
+                    .to_string(),
+                );
+        });
+
+        let got = extract(&client(), Some(&server.base_url()), "image/png", "AAAA").await;
+
+        mock.assert();
+        assert!(
+            got.is_none(),
+            "a 200 OCR-unavailable result must not replace the raw part"
+        );
     }
 
     #[tokio::test]
@@ -321,5 +464,16 @@ mod tests {
         assert_eq!(fidelity_from_kind("lossless"), SpanFidelity::Lossless);
         assert_eq!(fidelity_from_kind("lossy"), SpanFidelity::Lossy);
         assert_eq!(fidelity_from_kind("mystery"), SpanFidelity::Lossy);
+    }
+
+    #[test]
+    fn empty_extraction_is_not_lossless() {
+        let extraction = Extraction {
+            text: "text".to_string(),
+            spans: vec![],
+            pages: 1,
+        };
+
+        assert!(!extraction.is_lossless());
     }
 }
