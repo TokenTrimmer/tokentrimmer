@@ -57,8 +57,10 @@ fn validate_with_schedule_floor(
 ) -> Result<(), Vec<String>> {
     let mut errors: Vec<String> = Vec::new();
 
-    // Build a set of all declared node ids for O(1) lookup.
-    let node_ids: HashSet<&str> = def.nodes.iter().map(|n| n.id.as_str()).collect();
+    // Validate node identity and ordinary-edge invariants before any graph
+    // traversal. Kahn's maps are keyed by node id, so duplicate ids would
+    // collapse distinct nodes and can manufacture a false cycle.
+    let (node_ids, graph_structure_is_valid) = validate_graph_structure(def, &mut errors);
 
     // ------------------------------------------------------------------
     // 1. Exactly one Trigger node.
@@ -91,14 +93,17 @@ fn validate_with_schedule_floor(
     // ------------------------------------------------------------------
     // 3. Edge endpoints reference existing node ids.
     // ------------------------------------------------------------------
+    let mut references_are_valid = true;
     for edge in &def.edges {
         if !node_ids.contains(edge.from.as_str()) {
+            references_are_valid = false;
             errors.push(format!(
                 "edge references unknown source node id \"{}\"",
                 edge.from
             ));
         }
         if !node_ids.contains(edge.to.as_str()) {
+            references_are_valid = false;
             errors.push(format!(
                 "edge references unknown target node id \"{}\"",
                 edge.to
@@ -117,12 +122,14 @@ fn validate_with_schedule_floor(
         } = &node.kind
         {
             if !node_ids.contains(when_true.as_str()) {
+                references_are_valid = false;
                 errors.push(format!(
                     "Branch node \"{}\" when_true references unknown node id \"{}\"",
                     node.id, when_true
                 ));
             }
             if !node_ids.contains(when_false.as_str()) {
+                references_are_valid = false;
                 errors.push(format!(
                     "Branch node \"{}\" when_false references unknown node id \"{}\"",
                     node.id, when_false
@@ -333,7 +340,12 @@ fn validate_with_schedule_floor(
     // infinite-loop-inducing as one through def.edges.  We treat both as
     // directed arcs in the adjacency map.
     // ------------------------------------------------------------------
-    check_cycles(def, &mut errors);
+    // A traversal is only meaningful once identity, ordinary-edge, and
+    // endpoint invariants hold. In particular, duplicate ids would collapse
+    // Kahn's HashMaps and report a fabricated cycle for malformed input.
+    if graph_structure_is_valid && references_are_valid {
+        check_cycles(def, &mut errors);
+    }
 
     // ------------------------------------------------------------------
     // CO-2: triggers (schedule/webhook) — optional invokers. At most one
@@ -348,6 +360,59 @@ fn validate_with_schedule_floor(
     } else {
         Err(errors)
     }
+}
+
+/// Validate the graph facts that must be true before a node-id-keyed traversal
+/// can safely reason about the definition. Ordinary `Edge`s are distinct from
+/// Branch arms: branch arm targets remain part of cycle detection, while only
+/// duplicate ordinary `from` → `to` pairs are rejected here.
+fn validate_graph_structure<'a>(
+    def: &'a WorkflowDefinition,
+    errors: &mut Vec<String>,
+) -> (HashSet<&'a str>, bool) {
+    let mut node_ids = HashSet::with_capacity(def.nodes.len());
+    let mut edge_pairs = HashSet::with_capacity(def.edges.len());
+    let mut is_valid = true;
+
+    for (index, node) in def.nodes.iter().enumerate() {
+        if node.id.trim().is_empty() {
+            is_valid = false;
+            errors.push(format!(
+                "node {} has a blank or whitespace-only id",
+                index + 1
+            ));
+            continue;
+        }
+        if !node_ids.insert(node.id.as_str()) {
+            is_valid = false;
+            errors.push(format!("node id \"{}\" is duplicated", node.id));
+        }
+    }
+
+    for (index, edge) in def.edges.iter().enumerate() {
+        if edge.from == edge.to {
+            is_valid = false;
+            errors.push(format!(
+                "edge {} connects node \"{}\" to itself",
+                index + 1,
+                edge.from
+            ));
+        }
+        // The tuple is collision-free even when imported node ids contain
+        // arbitrary separators; `map` does not make a second ordinary edge
+        // distinct for execution ordering.
+        if !edge_pairs.insert((edge.from.as_str(), edge.to.as_str())) {
+            is_valid = false;
+            errors.push(format!(
+                "edge {} duplicates an ordinary connection from \"{}\" to \"{}\"",
+                index + 1,
+                edge.from,
+                edge.to
+            ));
+        }
+    }
+
+    (node_ids, is_valid)
 }
 
 // ---------------------------------------------------------------------------
@@ -742,9 +807,9 @@ mod tests {
         );
     }
 
-    /// A self-loop (a→a) must also be caught.
+    /// Ordinary self-edges are structural errors, not cycle-analysis input.
     #[test]
-    fn self_loop_is_cycle_error() {
+    fn ordinary_self_edge_is_rejected_before_cycle_processing() {
         let def = WorkflowDefinition {
             triggers: vec![],
             id: Uuid::nil(),
@@ -792,8 +857,106 @@ mod tests {
         let errs = validate(&def, &any_model).unwrap_err();
         let combined = errs.join("\n");
         assert!(
-            combined.contains("cycle"),
-            "expected self-loop to be reported as cycle; got: {combined}"
+            combined.contains("connects node \"x\" to itself"),
+            "expected self-edge rejection; got: {combined}"
+        );
+        assert!(
+            !combined.contains("cycle"),
+            "invalid ordinary edge must not enter cycle analysis; got: {combined}"
+        );
+    }
+
+    #[test]
+    fn blank_or_whitespace_node_ids_are_rejected() {
+        for id in ["", " \t\n "] {
+            let mut def = linear_def("gpt-4o");
+            def.nodes[0].id = id.to_string();
+            let errs = validate(&def, &any_model).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|error| error.contains("blank or whitespace-only id")),
+                "id {id:?} should be rejected: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_node_ids_do_not_enter_collapsed_cycle_analysis() {
+        let mut def = linear_def("gpt-4o");
+        // Retain an output node and only valid ordinary endpoints. Before the
+        // identity gate, Kahn's id-keyed maps collapsed these two `m` nodes and
+        // falsely reported a cycle because it visited two map entries for three
+        // declared nodes.
+        def.nodes[2].id = "m".into();
+        def.edges.truncate(1);
+
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("node id \"m\" is duplicated"),
+            "expected duplicate-id rejection; got: {combined}"
+        );
+        assert!(
+            !combined.contains("cycle"),
+            "duplicate ids must not be passed to collapsed Kahn maps: {combined}"
+        );
+    }
+
+    #[test]
+    fn duplicate_ordered_ordinary_edges_are_rejected_before_cycle_processing() {
+        let mut def = linear_def("gpt-4o");
+        def.edges.push(Edge {
+            from: "t".into(),
+            to: "m".into(),
+            map: Some("a separately configured map is still the same edge".into()),
+        });
+
+        let errs = validate(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        assert!(
+            combined.contains("duplicates an ordinary connection from \"t\" to \"m\""),
+            "expected duplicate-edge rejection; got: {combined}"
+        );
+        assert!(
+            !combined.contains("cycle"),
+            "invalid ordinary edges must not enter cycle analysis; got: {combined}"
+        );
+    }
+
+    #[test]
+    fn validate_for_execution_shares_identity_and_ordinary_edge_invariants() {
+        let mut def = linear_def("gpt-4o");
+        def.nodes[0].id = "   ".into();
+        def.nodes[2].id = "m".into();
+        def.edges = vec![
+            Edge {
+                from: "m".into(),
+                to: "m".into(),
+                map: None,
+            },
+            Edge {
+                from: "m".into(),
+                to: "m".into(),
+                map: Some("different map does not make a distinct edge".into()),
+            },
+        ];
+
+        let errs = validate_for_execution(&def, &any_model).unwrap_err();
+        let combined = errs.join("\n");
+        for expected in [
+            "blank or whitespace-only id",
+            "node id \"m\" is duplicated",
+            "connects node \"m\" to itself",
+            "duplicates an ordinary connection from \"m\" to \"m\"",
+        ] {
+            assert!(
+                combined.contains(expected),
+                "expected {expected:?} from execution validation; got: {combined}"
+            );
+        }
+        assert!(
+            !combined.contains("cycle"),
+            "execution validation must also skip collapsed cycle analysis: {combined}"
         );
     }
 
