@@ -128,6 +128,8 @@ pub(crate) fn estimate_next_turn_cost(
         // clamps it to the catalogued model maximum.  Workflow node caps map
         // to the same `ChatCompletionRequest::max_tokens` field at dispatch.
         max_tokens: max_output_tokens,
+        max_completion_tokens: None,
+        n: None,
         tools: None,
         stream: None,
         tt_extras: std::collections::HashMap::new(),

@@ -1313,6 +1313,111 @@ fn arbiter_input_tokens(
         .checked_add(ARBITER_PROMPT_OVERHEAD_TOKENS)
 }
 
+/// Per-leg view of Fusion's known static dispatch-cost plan.
+///
+/// This is intentionally crate-private: HTTP preview can expose the same
+/// plan that admission uses without turning the dry-run into an admission
+/// proof. A `None` component means the corresponding known work cannot be
+/// priced safely; `total_cost_usd` is then also `None`.
+#[derive(Debug)]
+pub(crate) struct PanelCostBreakdown {
+    pub member_costs: Vec<Option<f64>>,
+    pub arbiter_cost: Option<f64>,
+    pub total_cost_usd: Option<f64>,
+}
+
+/// Price each known component of Fusion's static dispatch plan.
+///
+/// This is the single implementation behind both [`estimate_panel_cost`] and
+/// the side-effect-free preview endpoint. It prices every requested member
+/// choice, then the worst-case known arbiter fan-in/output shape. It does not
+/// perform config admission, credential lookup, provider-health checks,
+/// reservations, or dispatch.
+pub(crate) fn estimate_panel_cost_breakdown(
+    state: &AppState,
+    cfg: &PanelConfig,
+    estimate: PanelAdmissionEstimate,
+) -> PanelCostBreakdown {
+    let Some(member_output_tokens) = estimate.member_output_tokens() else {
+        return PanelCostBreakdown {
+            member_costs: vec![None; cfg.members.len()],
+            arbiter_cost: None,
+            total_cost_usd: None,
+        };
+    };
+    let Some(member_choice_count) = estimate.member_choice_count() else {
+        return PanelCostBreakdown {
+            member_costs: vec![None; cfg.members.len()],
+            arbiter_cost: None,
+            total_cost_usd: None,
+        };
+    };
+
+    let member_costs: Vec<Option<f64>> = cfg
+        .members
+        .iter()
+        .map(|member| {
+            estimate_model_dispatch(
+                state,
+                member,
+                estimate.input_tokens,
+                member_output_tokens,
+                member_choice_count,
+            )
+        })
+        .collect();
+
+    let arbiter_cost = match cfg.strategy {
+        ArbiterStrategyKind::Synthesize => arbiter_input_tokens(
+            estimate.input_tokens,
+            cfg.members.len(),
+            member_output_tokens,
+        )
+        .and_then(|input_tokens| {
+            estimate_model_dispatch(
+                state,
+                &cfg.arbiter_model,
+                input_tokens,
+                SYNTHESIZE_ARBITER_OUTPUT_TOKENS,
+                1,
+            )
+        }),
+        ArbiterStrategyKind::BestOfN => arbiter_input_tokens(
+            estimate.input_tokens,
+            cfg.members.len(),
+            member_output_tokens,
+        )
+        .and_then(|input_tokens| {
+            estimate_model_dispatch(
+                state,
+                &cfg.arbiter_model,
+                input_tokens,
+                BEST_OF_N_ARBITER_OUTPUT_TOKENS,
+                1,
+            )
+        }),
+        // Majority performs an embedding pass whose provider/model and token
+        // pricing are not represented by PanelConfig. Do not use the unused
+        // LLM arbiter field as a proxy: it could undercount the real work.
+        ArbiterStrategyKind::Majority => None,
+    };
+
+    let total_cost_usd = member_costs
+        .iter()
+        .copied()
+        .chain(std::iter::once(arbiter_cost))
+        .try_fold(0.0_f64, |total, cost| {
+            let total = total + cost?;
+            (total.is_finite() && total >= 0.0).then_some(total)
+        });
+
+    PanelCostBreakdown {
+        member_costs,
+        arbiter_cost,
+        total_cost_usd,
+    }
+}
+
 /// Estimated total cost for the known Fusion dispatch plan, in USD.
 ///
 /// Every configured member is included because credentials are resolved after
@@ -1332,55 +1437,7 @@ pub fn estimate_panel_cost(
     cfg: &PanelConfig,
     estimate: PanelAdmissionEstimate,
 ) -> Option<f64> {
-    let member_output_tokens = estimate.member_output_tokens()?;
-    let member_choice_count = estimate.member_choice_count()?;
-
-    let member_cost = cfg.members.iter().try_fold(0.0_f64, |total, member| {
-        let cost = estimate_model_dispatch(
-            state,
-            member,
-            estimate.input_tokens,
-            member_output_tokens,
-            member_choice_count,
-        )?;
-        let total = total + cost;
-        (total.is_finite() && total >= 0.0).then_some(total)
-    })?;
-
-    let (arbiter_input_tokens, arbiter_output_tokens, arbiter_choice_count) = match cfg.strategy {
-        ArbiterStrategyKind::Synthesize => (
-            arbiter_input_tokens(
-                estimate.input_tokens,
-                cfg.members.len(),
-                member_output_tokens,
-            )?,
-            SYNTHESIZE_ARBITER_OUTPUT_TOKENS,
-            1,
-        ),
-        ArbiterStrategyKind::BestOfN => (
-            arbiter_input_tokens(
-                estimate.input_tokens,
-                cfg.members.len(),
-                member_output_tokens,
-            )?,
-            BEST_OF_N_ARBITER_OUTPUT_TOKENS,
-            1,
-        ),
-        // Majority performs an embedding pass whose provider/model and token
-        // pricing are not represented by PanelConfig. Do not use the unused
-        // LLM arbiter field as a proxy: it could undercount the real work.
-        ArbiterStrategyKind::Majority => return None,
-    };
-    let arbiter_cost = estimate_model_dispatch(
-        state,
-        &cfg.arbiter_model,
-        arbiter_input_tokens,
-        arbiter_output_tokens,
-        arbiter_choice_count,
-    )?;
-
-    let total = member_cost + arbiter_cost;
-    (total.is_finite() && total >= 0.0).then_some(total)
+    estimate_panel_cost_breakdown(state, cfg, estimate).total_cost_usd
 }
 
 /// Gate: reject a panel request when its static plan exceeds the configured

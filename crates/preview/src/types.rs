@@ -16,6 +16,14 @@ pub struct PreviewRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Newer OpenAI output cap. Panel preview gives this precedence over
+    /// `max_tokens`, matching Fusion admission and provider dispatch.
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
+    /// Number of completions requested per member for a Fusion panel. The
+    /// base preview remains its existing single-completion catalog projection.
+    #[serde(default)]
+    pub n: Option<u32>,
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
     /// Honored for tier accounting but ignored for the preview calc itself.
