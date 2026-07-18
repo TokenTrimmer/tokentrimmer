@@ -657,6 +657,9 @@ pub struct StreamLogContext {
     /// to `pricing` when `None`.
     pub baseline_pricing: Option<ModelPricing>,
     pub route_id: Option<Uuid>,
+    /// Immutable `route_versions.id` captured with the matched runtime route.
+    /// Nullable for unrouted / legacy-ledger traffic; never a mutable revision.
+    pub route_version_id: Option<i64>,
     pub tag: Option<String>,
     pub request_started: Instant,
     /// Spend sink — realized streamed spend is recorded through this into the
@@ -1120,6 +1123,7 @@ pub fn stream_response(
             let provider_id_log = ctx.provider_id.clone();
             let model = ctx.model.clone();
             let route_id = ctx.route_id;
+            let route_version_id = ctx.route_version_id;
             let tag = ctx.tag.clone();
             let request_started = ctx.request_started;
             let log_trace_id = ctx.trace_id;
@@ -1317,6 +1321,7 @@ pub fn stream_response(
                     cached: false,
                     cache_layer: None,
                     route_id,
+                    route_version_id,
                     latency_ms: request_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
                     upstream_latency_ms: None,
                     status: 200,

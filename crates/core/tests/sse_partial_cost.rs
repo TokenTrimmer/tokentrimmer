@@ -177,6 +177,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
             effective_at: chrono::Utc::now(),
         }),
         route_id: None,
+        route_version_id: None,
         tag: None,
         request_started: std::time::Instant::now(),
         spend_sink: tt_core::budget::SpendSink::None,
@@ -346,6 +347,7 @@ async fn sse_routed_stream_logs_baseline_against_original_model() {
     ctx.pricing = Some(cheap);
     ctx.baseline_pricing = Some(expensive);
     ctx.route_id = Some(Uuid::now_v7());
+    ctx.route_version_id = Some(9_876_543_210);
 
     let chunks: Vec<Result<ChatCompletionChunk, ProviderError>> =
         vec![Ok(content_chunk("hi")), Ok(finish_chunk(42))];
@@ -363,6 +365,11 @@ async fn sse_routed_stream_logs_baseline_against_original_model() {
         "routed stream baseline ({}) should exceed routed cost ({})",
         row.baseline_cost_usd,
         row.cost_usd
+    );
+    assert_eq!(
+        row.route_version_id,
+        Some(9_876_543_210),
+        "SSE DropGuard must preserve the immutable route-version ID"
     );
 }
 

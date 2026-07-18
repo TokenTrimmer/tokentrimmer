@@ -588,6 +588,7 @@ async fn try_l1_hit(
     trace_id: Uuid,
     request_started: Instant,
     matched_route_id: Option<Uuid>,
+    matched_route_version_id: Option<i64>,
     route_paused: bool,
     retrieval_tokens_saved: i64,
     route_matched_name: Option<&str>,
@@ -609,6 +610,7 @@ async fn try_l1_hit(
                         trace_id,
                         request_started,
                         matched_route_id,
+                        matched_route_version_id,
                         route_paused,
                         retrieval_tokens_saved,
                     ),
@@ -715,6 +717,7 @@ async fn try_l2_hit(
     trace_id: Uuid,
     request_started: Instant,
     matched_route_id: Option<Uuid>,
+    matched_route_version_id: Option<i64>,
     route_paused: bool,
     retrieval_tokens_saved: i64,
     route_matched_name: Option<&str>,
@@ -851,6 +854,7 @@ async fn try_l2_hit(
                     trace_id,
                     request_started,
                     matched_route_id,
+                    matched_route_version_id,
                     route_paused,
                     baseline_cost_usd,
                     retrieval_tokens_saved,
@@ -902,6 +906,10 @@ pub(crate) struct Prepared {
     pub route_matched_name: Option<String>,
     /// Matched route id for the `request_logs` row.
     pub matched_route_id: Option<Uuid>,
+    /// Immutable `route_versions.id` captured with the matched route during
+    /// the cached runtime refresh. NULL is honest for unrouted / legacy-ledger
+    /// requests; this is never derived from a mutable route revision.
+    pub matched_route_version_id: Option<i64>,
     /// Paused-route passthrough marker.
     pub route_paused: bool,
     /// Originally-requested model (pre-routing) — `gen_ai.request.model`.
@@ -1182,6 +1190,7 @@ pub(crate) async fn complete_once(
         skip_l2,
         route_matched_name,
         matched_route_id,
+        matched_route_version_id,
         route_paused,
         requested_model,
         requested_pricing,
@@ -1259,6 +1268,7 @@ pub(crate) async fn complete_once(
                 trace_id,
                 request_started,
                 matched_route_id,
+                matched_route_version_id,
                 route_paused,
                 retrieval_telemetry.tokens_saved,
                 route_matched_name.as_deref(),
@@ -1304,6 +1314,7 @@ pub(crate) async fn complete_once(
                 trace_id,
                 request_started,
                 matched_route_id,
+                matched_route_version_id,
                 route_paused,
                 retrieval_telemetry.tokens_saved,
                 route_matched_name.as_deref(),
@@ -1370,6 +1381,7 @@ pub(crate) async fn complete_once(
                                                 trace_id,
                                                 request_started,
                                                 matched_route_id,
+                                                matched_route_version_id,
                                                 route_paused,
                                                 retrieval_telemetry.tokens_saved,
                                             ),
@@ -2004,6 +2016,7 @@ pub(crate) async fn complete_once(
         cached: false,
         cache_layer: None,
         route_id: matched_route_id,
+        route_version_id: matched_route_version_id,
         latency_ms: request_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
         upstream_latency_ms: None,
         status: 200,
@@ -2632,6 +2645,10 @@ pub(crate) async fn prepare(
     };
     let route_match = apply_routing(state, ctx, req, forced_route.as_deref()).await?;
     let matched_route_id = route_match.as_ref().map(|m| m.route_id);
+    // This is the immutable ledger ID captured with the runtime route cache
+    // refresh. It is nullable by design; never fall back to a mutable route
+    // revision when a legacy/skewed ledger cannot provide an identity.
+    let matched_route_version_id = route_match.as_ref().and_then(|m| m.route_version_id);
     // The matched route is sticky-PAUSED: apply_routing suppressed the rewrite
     // and every cost lever (req.model is untouched). Captured before
     // `route_match` is consumed; drives the warnings token + metric +
@@ -3738,6 +3755,7 @@ pub(crate) async fn prepare(
         skip_l2,
         route_matched_name,
         matched_route_id,
+        matched_route_version_id,
         route_paused,
         requested_model,
         requested_pricing,
@@ -3798,6 +3816,7 @@ async fn handle_streaming(
         skip_l2: _,
         route_matched_name,
         matched_route_id,
+        matched_route_version_id,
         route_paused,
         requested_model,
         requested_pricing,
@@ -3876,6 +3895,7 @@ async fn handle_streaming(
                                 trace_id,
                                 request_started,
                                 matched_route_id,
+                                matched_route_version_id,
                                 route_paused,
                                 retrieval_telemetry.tokens_saved,
                             ),
@@ -4174,6 +4194,7 @@ async fn handle_streaming(
                     provider.pricing(&served_model)
                 },
                 route_id: matched_route_id,
+                route_version_id: matched_route_version_id,
                 tag: ctx.tag.clone(),
                 request_started,
                 spend_sink: state.spend_sink(),
@@ -6727,6 +6748,7 @@ fn request_log_for_l1_hit(
     trace_id: Uuid,
     request_started: Instant,
     route_id: Option<Uuid>,
+    route_version_id: Option<i64>,
     route_paused: bool,
     retrieval_tokens_saved: i64,
 ) -> RequestLogRow {
@@ -6764,6 +6786,7 @@ fn request_log_for_l1_hit(
         cached: true,
         cache_layer: Some("l1".into()),
         route_id,
+        route_version_id,
         latency_ms: clamp_latency_ms(request_started),
         upstream_latency_ms: None,
         status: 200,
@@ -6831,6 +6854,7 @@ fn request_log_for_l2_hit(
     trace_id: Uuid,
     request_started: Instant,
     route_id: Option<Uuid>,
+    route_version_id: Option<i64>,
     route_paused: bool,
     baseline_cost_usd: f64,
     retrieval_tokens_saved: i64,
@@ -6859,6 +6883,7 @@ fn request_log_for_l2_hit(
         cached: true,
         cache_layer: Some("l2".into()),
         route_id,
+        route_version_id,
         latency_ms: clamp_latency_ms(request_started),
         upstream_latency_ms: None,
         status: 200,
@@ -6945,6 +6970,9 @@ pub(crate) fn opt_tokens_i32(v: Option<u64>) -> Option<i32> {
 /// declared no failover targets.
 pub(crate) struct RouteMatch {
     pub(crate) route_id: Uuid,
+    /// Immutable `public.route_versions.id` captured in the same cached runtime
+    /// route refresh as this definition. Never a mutable route revision.
+    pub(crate) route_version_id: Option<i64>,
     pub(crate) route_name: String,
     /// The matched route is sticky-PAUSED (quality regression / manual pause):
     /// the rewrite was suppressed and every cost lever below is disabled —
@@ -7169,6 +7197,10 @@ pub(crate) async fn apply_routing(
             None => return Ok(None),
         },
     };
+    // The cached engine preserves the ledger ID that the store captured in the
+    // same database snapshot as `m`. Missing ledger provenance stays NULL; a
+    // route revision is intentionally not a substitute.
+    let route_version_id = engine.route_version_id(m.id);
     // Sticky pause (research Phase 2.3): a paused route still MATCHES — the
     // request attributes to it (route_id stamped, warnings token, request_logs
     // marker) — but the rewrite and every other COST lever are suppressed, so
@@ -7196,6 +7228,7 @@ pub(crate) async fn apply_routing(
         return Ok(Some(RouteMatch {
             batch: false,
             route_id: m.id,
+            route_version_id,
             route_name: m.name.clone(),
             paused: true,
             // ALL cost levers off (fail-safe expensive direction):
@@ -7311,6 +7344,7 @@ pub(crate) async fn apply_routing(
     );
     Ok(Some(RouteMatch {
         route_id,
+        route_version_id,
         route_name,
         paused: false,
         fallbacks,
@@ -7377,6 +7411,41 @@ mod cache_header_tests {
         let mut h = HeaderMap::new();
         h.insert("x-tokentrimmer-cache", v.parse().unwrap());
         h
+    }
+
+    fn request_context() -> RequestContext {
+        RequestContext {
+            trace_id: Uuid::nil(),
+            org_id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            credentials: ProviderCredentials {
+                api_key: SecretString::new("test"),
+                base_url: None,
+                extra_headers: vec![],
+            },
+            tag: None,
+            deadline: None,
+            run_id: None,
+            node_id: None,
+        }
+    }
+
+    #[test]
+    fn l1_hit_log_preserves_matched_immutable_route_version() {
+        let ctx = request_context();
+        let route_id = Uuid::now_v7();
+        let row = request_log_for_l1_hit(
+            &l1_entry(1, 0.0045),
+            &ctx,
+            Uuid::now_v7(),
+            Instant::now(),
+            Some(route_id),
+            Some(9_876_543_210),
+            false,
+            0,
+        );
+        assert_eq!(row.route_id, Some(route_id));
+        assert_eq!(row.route_version_id, Some(9_876_543_210));
     }
 
     #[test]
@@ -7981,6 +8050,40 @@ mod l2_baseline_tests {
             prompt_cache_min_tokens: None,
             effective_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn l2_hit_log_preserves_matched_immutable_route_version() {
+        let ctx = RequestContext {
+            trace_id: Uuid::nil(),
+            org_id: Uuid::nil(),
+            api_key_id: Uuid::nil(),
+            credentials: ProviderCredentials {
+                api_key: SecretString::new("test"),
+                base_url: None,
+                extra_headers: vec![],
+            },
+            tag: None,
+            deadline: None,
+            run_id: None,
+            node_id: None,
+        };
+        let route_id = Uuid::now_v7();
+        let row = request_log_for_l2_hit(
+            &entry(Some(0.0123)),
+            &ctx,
+            Uuid::now_v7(),
+            Instant::now(),
+            Some(route_id),
+            Some(9_876_543_210),
+            false,
+            0.0123,
+            0,
+            0.97,
+            L2VerifyDecision::Confident,
+        );
+        assert_eq!(row.route_id, Some(route_id));
+        assert_eq!(row.route_version_id, Some(9_876_543_210));
     }
 
     /// The row's stored catalog baseline is authoritative — current pricing
@@ -10181,6 +10284,7 @@ mod telemetry_drain_tests {
             cached: false,
             cache_layer: None,
             route_id: None,
+            route_version_id: None,
             latency_ms: 50,
             upstream_latency_ms: None,
             status: 200,

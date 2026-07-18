@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     canonicalize_route_value, Route, RouteAction, RouteConditions, RouteValidationIssue,
-    ROUTE_SCHEMA_VERSION,
+    RuntimeRoute, ROUTE_SCHEMA_VERSION,
 };
 
 /// Fields needed to create a route; the store assigns the `id`.
@@ -81,6 +81,27 @@ pub trait RoutingStore: Send + Sync + std::fmt::Debug {
     /// Fetch the enabled-and-current route list for `org_id`. Returns
     /// `Ok(vec![])` when the org has no routes — not an error.
     async fn list_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError>;
+
+    /// Fetch enabled runtime routes with the immutable route-version ledger ID
+    /// captured alongside each definition. Stores that do not own (or cannot
+    /// see) the cloud `route_versions` ledger inherit the explicit unversioned
+    /// fallback: gateway telemetry records NULL rather than mistaking the
+    /// mutable route `revision` for a historical identity.
+    ///
+    /// Production Postgres overrides this with one snapshot-consistent SELECT
+    /// over `routes` plus its matching `route_versions` record. The default
+    /// preserves compatibility for in-memory/custom stores.
+    async fn list_runtime_for_org(
+        &self,
+        org_id: Uuid,
+    ) -> Result<Vec<RuntimeRoute>, RoutingStoreError> {
+        Ok(self
+            .list_for_org(org_id)
+            .await?
+            .into_iter()
+            .map(RuntimeRoute::unversioned)
+            .collect())
+    }
 
     /// Legacy typed management accessor: all canonical routes, including
     /// disabled ones. Because its `Route` return type cannot represent a
@@ -676,6 +697,55 @@ mod pg {
     use super::*;
     use sqlx::PgPool;
 
+    // One statement captures the executable definition and the immutable
+    // ledger record visible with it. The ledger ordering is its identity
+    // (`route_versions.id`), not `routes.revision`: revision is only an
+    // optimistic-concurrency token and must never become request provenance.
+    //
+    // A normal Postgres statement reads both relations from one MVCC snapshot.
+    // Thus a route refresh cannot pair an old definition with a newer ledger
+    // record (or vice versa) from a concurrent committed mutation.
+    const RUNTIME_ROUTE_ROWS_SQL: &str = r#"
+        SELECT r.id, r.name, r.priority, r.conditions, r.target,
+               rv.id AS route_version_id,
+               (p.route_id IS NOT NULL) AS paused
+          FROM public.routes r
+          LEFT JOIN LATERAL (
+              SELECT v.id
+                FROM public.route_versions v
+               WHERE v.org_id = r.org_id
+                 AND v.route_id = r.id
+               ORDER BY v.id DESC
+               LIMIT 1
+          ) rv ON TRUE
+          LEFT JOIN public.route_pauses p
+            ON p.route_id = r.id AND p.resumed_at IS NULL
+         WHERE r.org_id = $1 AND r.enabled = TRUE
+         ORDER BY r.priority DESC, r.created_at ASC
+    "#;
+
+    // Rolling-deploy compatibility for a gateway released before the cloud
+    // route-version migration is present. The fallback remains honest: it
+    // reads only the runtime route and returns NULL provenance; it never
+    // substitutes the mutable `routes.revision` as an invented version ID.
+    const RUNTIME_ROUTE_ROWS_WITHOUT_LEDGER_SQL: &str = r#"
+        SELECT r.id, r.name, r.priority, r.conditions, r.target,
+               NULL::BIGINT AS route_version_id,
+               (p.route_id IS NOT NULL) AS paused
+          FROM public.routes r
+          LEFT JOIN public.route_pauses p
+            ON p.route_id = r.id AND p.resumed_at IS NULL
+         WHERE r.org_id = $1 AND r.enabled = TRUE
+         ORDER BY r.priority DESC, r.created_at ASC
+    "#;
+
+    fn route_versions_table_is_absent(error: &sqlx::Error) -> bool {
+        error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .is_some_and(|code| code == "42P01") // undefined_table
+    }
+
     /// Reads the `routes` table written by the cloud dashboard / tt-api admin
     /// endpoints. Schema lives in tokentrimmer-cloud
     /// (`crates/api/migrations/0002_routes.up.sql`):
@@ -724,19 +794,45 @@ mod pg {
     #[async_trait]
     impl RoutingStore for PostgresRoutingStore {
         async fn list_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
-            let rows = sqlx::query_as::<_, RouteRow>(
-                "SELECT r.id, r.name, r.priority, r.conditions, r.target, \
-                        (p.route_id IS NOT NULL) AS paused \
-                 FROM routes r LEFT JOIN route_pauses p ON p.route_id = r.id AND p.resumed_at IS NULL \
-                 WHERE r.org_id = $1 AND r.enabled = TRUE \
-                 ORDER BY r.priority DESC, r.created_at ASC",
-            )
-            .bind(org_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| RoutingStoreError::Backend(e.to_string()))?;
+            Ok(self
+                .list_runtime_for_org(org_id)
+                .await?
+                .into_iter()
+                .map(|runtime| runtime.route)
+                .collect())
+        }
 
-            Ok(rows.into_iter().filter_map(RouteRow::into_route).collect())
+        async fn list_runtime_for_org(
+            &self,
+            org_id: Uuid,
+        ) -> Result<Vec<RuntimeRoute>, RoutingStoreError> {
+            let rows = match sqlx::query_as::<_, RouteRow>(RUNTIME_ROUTE_ROWS_SQL)
+                .bind(org_id)
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) if route_versions_table_is_absent(&error) => {
+                    // Keep routing live across a cloud/public migration skew.
+                    // The explicit warning makes NULL provenance observable;
+                    // no request is mislabeled with a mutable revision.
+                    tracing::warn!(
+                        org_id = %org_id,
+                        "route version ledger table is unavailable; loading runtime routes without immutable version provenance"
+                    );
+                    sqlx::query_as::<_, RouteRow>(RUNTIME_ROUTE_ROWS_WITHOUT_LEDGER_SQL)
+                        .bind(org_id)
+                        .fetch_all(&self.pool)
+                        .await
+                        .map_err(|fallback| RoutingStoreError::Backend(fallback.to_string()))?
+                }
+                Err(error) => return Err(RoutingStoreError::Backend(error.to_string())),
+            };
+
+            Ok(rows
+                .into_iter()
+                .filter_map(RouteRow::into_runtime_route)
+                .collect())
         }
 
         async fn list_all_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
@@ -979,11 +1075,22 @@ mod pg {
         priority: i32,
         conditions: sqlx::types::Json<serde_json::Value>,
         target: sqlx::types::Json<serde_json::Value>,
+        /// `public.route_versions.id` captured by the same runtime SELECT.
+        /// Nullable during ledger-unavailable / legacy compatibility mode.
+        route_version_id: Option<i64>,
         /// `route_pauses` LEFT JOIN: `(p.route_id IS NOT NULL)`.
         paused: bool,
     }
 
     impl RouteRow {
+        fn into_runtime_route(self) -> Option<RuntimeRoute> {
+            let route_version_id = self.route_version_id;
+            self.into_route().map(|route| RuntimeRoute {
+                route,
+                route_version_id,
+            })
+        }
+
         fn into_route(self) -> Option<Route> {
             let canonical = match crate::canonicalize_route_parts(
                 Some(crate::ROUTE_SCHEMA_VERSION),
@@ -1111,6 +1218,7 @@ mod pg {
                 target: sqlx::types::Json(serde_json::json!({
                     "target_model": 7,
                 })),
+                route_version_id: None,
                 paused: false,
             };
 
@@ -1123,6 +1231,22 @@ mod pg {
                     .render()
                     .contains("tt_route_invalid_persisted_rows_total"),
                 "runtime invalid-row counter must be exposed to the installed recorder"
+            );
+        }
+
+        #[test]
+        fn runtime_query_uses_immutable_ledger_id_without_revision_fallback() {
+            assert!(RUNTIME_ROUTE_ROWS_SQL.contains("FROM public.route_versions"));
+            assert!(RUNTIME_ROUTE_ROWS_SQL.contains("rv.id AS route_version_id"));
+            assert!(RUNTIME_ROUTE_ROWS_SQL.contains("ORDER BY v.id DESC"));
+            assert!(RUNTIME_ROUTE_ROWS_SQL.contains("LIMIT 1"));
+            assert!(
+                !RUNTIME_ROUTE_ROWS_SQL.contains("revision"),
+                "runtime provenance must use immutable ledger ordering, never mutable routes.revision"
+            );
+            assert!(
+                RUNTIME_ROUTE_ROWS_WITHOUT_LEDGER_SQL.contains("NULL::BIGINT AS route_version_id"),
+                "rolling-deploy fallback must preserve unknown provenance as NULL"
             );
         }
     }

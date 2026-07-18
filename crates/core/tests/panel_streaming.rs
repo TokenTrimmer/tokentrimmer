@@ -576,7 +576,10 @@ fn panel_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         // Priced so the streamed cost is nonzero — the Known plan must discard it.
         pricing: Some(priced()),
         baseline_pricing: Some(priced()),
-        route_id: None,
+        // Simulate a panel triggered by a matched route: the aggregate stream
+        // must retain the exact immutable definition that selected it.
+        route_id: Some(Uuid::from_u128(0x42)),
+        route_version_id: Some(9_876_543_210),
         tag: None,
         request_started: std::time::Instant::now(),
         spend_sink: tt_core::budget::SpendSink::None,
@@ -635,6 +638,12 @@ async fn panel_aggregate_row_single_provider_panel_no_double_count() {
         "aggregate row model must be the arbiter model"
     );
     assert!(!row.cached, "panel aggregate row must be cached == false");
+    assert_eq!(row.route_id, Some(Uuid::from_u128(0x42)));
+    assert_eq!(
+        row.route_version_id,
+        Some(9_876_543_210),
+        "streamed panel aggregate must preserve the matched immutable route version"
+    );
     // Σ legs ($0.010) + Known arbiter ($0.002) = $0.012. The replayed leg's
     // streamed cost is NOT added (no double-count under ArbiterCostPlan::Known).
     assert!(
@@ -823,6 +832,7 @@ fn panel_log_ctx_live(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext
         pricing: Some(priced()),
         baseline_pricing: Some(priced()),
         route_id: None,
+        route_version_id: None,
         tag: None,
         request_started: std::time::Instant::now(),
         spend_sink: tt_core::budget::SpendSink::None,

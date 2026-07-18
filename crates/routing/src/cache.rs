@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::store::{RouteManagementView, RoutingStore, RoutingStoreError};
-use crate::{Route, RoutingEngine};
+use crate::{Route, RoutingEngine, RuntimeRoute};
 
 /// Default per-org TTL.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -69,8 +69,12 @@ impl CachingRoutingStore {
         }
 
         // Refresh.
-        let routes = self.inner.list_for_org(org_id).await?;
-        let engine = Arc::new(RoutingEngine::with_routes(routes));
+        // The production store captures a route definition and its immutable
+        // `route_versions.id` in one database snapshot. Preserve that pairing
+        // inside the cached engine; do not re-read a mutable route revision on
+        // individual requests.
+        let routes = self.inner.list_runtime_for_org(org_id).await?;
+        let engine = Arc::new(RoutingEngine::with_runtime_routes(routes));
         let mut g = self.cache.write().await;
         g.insert(
             org_id,
@@ -95,6 +99,14 @@ impl RoutingStore for CachingRoutingStore {
     async fn list_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
         let engine = self.engine_for(org_id).await?;
         Ok(engine.routes().to_vec())
+    }
+
+    async fn list_runtime_for_org(
+        &self,
+        org_id: Uuid,
+    ) -> Result<Vec<RuntimeRoute>, RoutingStoreError> {
+        let engine = self.engine_for(org_id).await?;
+        Ok(engine.runtime_routes())
     }
 
     async fn list_all_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
@@ -194,6 +206,29 @@ mod tests {
     use crate::store::InMemoryRoutingStore;
     use crate::{RouteAction, RouteConditions};
 
+    #[derive(Debug)]
+    struct VersionedStore {
+        routes: Vec<RuntimeRoute>,
+    }
+
+    #[async_trait::async_trait]
+    impl RoutingStore for VersionedStore {
+        async fn list_for_org(&self, _org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
+            Ok(self
+                .routes
+                .iter()
+                .map(|runtime| runtime.route.clone())
+                .collect())
+        }
+
+        async fn list_runtime_for_org(
+            &self,
+            _org_id: Uuid,
+        ) -> Result<Vec<RuntimeRoute>, RoutingStoreError> {
+            Ok(self.routes.clone())
+        }
+    }
+
     fn route(name: &str, target: &str) -> Route {
         Route {
             id: Uuid::now_v7(),
@@ -229,6 +264,32 @@ mod tests {
             },
             paused: false,
         }
+    }
+
+    /// The cache must retain a ledger identity supplied by its backing store;
+    /// dropping it here would make a correctly captured Postgres snapshot turn
+    /// into a NULL request trace before the route engine evaluates it.
+    #[tokio::test]
+    async fn cache_preserves_immutable_runtime_route_version() {
+        let org = Uuid::now_v7();
+        let runtime_route = route("versioned", "m1");
+        let route_id = runtime_route.id;
+        let cache = CachingRoutingStore::with_ttl(
+            Arc::new(VersionedStore {
+                routes: vec![RuntimeRoute {
+                    route: runtime_route,
+                    route_version_id: Some(9_876_543_210),
+                }],
+            }) as Arc<dyn RoutingStore>,
+            Duration::from_secs(60),
+        );
+
+        let engine = cache.engine_for(org).await.unwrap();
+        assert_eq!(engine.route_version_id(route_id), Some(9_876_543_210));
+        let copied = cache.list_runtime_for_org(org).await.unwrap();
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].route.id, route_id);
+        assert_eq!(copied[0].route_version_id, Some(9_876_543_210));
     }
 
     #[tokio::test]

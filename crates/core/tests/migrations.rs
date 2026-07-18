@@ -231,6 +231,40 @@ fn migrator_includes_gateway_owned_cost_breakdown_columns() {
     );
 }
 
+#[test]
+fn migrator_includes_route_version_request_provenance() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_first = migrations
+        .iter()
+        .find(|m| m.version == 41)
+        .expect("migration version 41 not found");
+    let desc = forty_first.description.to_lowercase();
+    assert!(
+        desc.contains("route") && desc.contains("version"),
+        "migration 0041 description is '{}', expected to mention route-version provenance",
+        forty_first.description,
+    );
+
+    let up = include_str!("../migrations/0041_request_logs_route_version_provenance.up.sql");
+    assert!(
+        up.contains("route_version_id BIGINT"),
+        "route version must be a nullable BIGINT"
+    );
+    assert!(
+        up.contains("request_logs_org_route_version_ts_idx"),
+        "migration must make immutable-version trace reads indexable"
+    );
+    assert!(
+        !up.to_ascii_lowercase()
+            .contains("references public.route_versions"),
+        "public migration must not require the cloud-owned route_versions table"
+    );
+    assert!(
+        !up.to_ascii_lowercase().contains("update request_logs"),
+        "historical request rows must remain honestly unlinked"
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -280,6 +314,18 @@ async fn migrate_only_applies_schema() {
     assert_eq!(
         cost_breakdown_columns, 3,
         "gateway-owned cost-breakdown columns should exist after migration 0039"
+    );
+    let route_version_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='request_logs' \
+         AND column_name='route_version_id' AND data_type='bigint')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query route version provenance column");
+    assert!(
+        route_version_column,
+        "request_logs.route_version_id BIGINT should exist after migration 0041"
     );
 }
 
@@ -351,6 +397,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         cached: false,
         cache_layer: None,
         route_id: None,
+        route_version_id: None,
         latency_ms: 5,
         upstream_latency_ms: None,
         status: 200,
@@ -476,6 +523,7 @@ async fn request_log_insert_round_trips_batch_columns() {
         cached: false,
         cache_layer: None,
         route_id: None,
+        route_version_id: None,
         latency_ms: 5,
         upstream_latency_ms: None,
         status: 200,
@@ -596,6 +644,9 @@ async fn request_logs_insert_round_trips_against_postgres() {
         cached: false,
         cache_layer: None,
         route_id: None,
+        // Pin a real immutable-ledger-shaped BIGINT through the full writer
+        // bind chain; this must not be confused with a route revision.
+        route_version_id: Some(9_876_543_210),
         latency_ms: 800,
         upstream_latency_ms: Some(750),
         status: 200,
@@ -656,12 +707,27 @@ async fn request_logs_insert_round_trips_against_postgres() {
         flex_saved,
         doc_compaction_saved,
         summarizer_tax,
-    ) = sqlx::query_as::<_, (String, bool, f64, f64, f64, Option<String>, f64, f64, f64)>(
+        route_version_id,
+    ) = sqlx::query_as::<
+        _,
+        (
+            String,
+            bool,
+            f64,
+            f64,
+            f64,
+            Option<String>,
+            f64,
+            f64,
+            f64,
+            Option<i64>,
+        ),
+    >(
         "SELECT provider, route_paused, minify_saved_est_usd::FLOAT8, \
              doc_vision_saved_est_usd::FLOAT8, \
              content_compress_saved_est_usd::FLOAT8, content_compress_kind, \
              flex_saved_usd::FLOAT8, doc_compaction_saved_usd::FLOAT8, \
-             summarizer_tax_usd::FLOAT8 \
+             summarizer_tax_usd::FLOAT8, route_version_id \
              FROM request_logs WHERE id = $1",
     )
     .bind(id)
@@ -698,6 +764,11 @@ async fn request_logs_insert_round_trips_against_postgres() {
     assert!(
         (summarizer_tax - 0.000199).abs() < 1e-9,
         "summarizer_tax_usd must round-trip through NUMERIC(12,6), got {summarizer_tax}"
+    );
+    assert_eq!(
+        route_version_id,
+        Some(9_876_543_210),
+        "immutable route-version ID must round-trip as BIGINT"
     );
 
     sqlx::query("DELETE FROM request_logs WHERE tag = 'db-t0-bind-chain'")
@@ -746,6 +817,7 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         cached: false,
         cache_layer: None,
         route_id: None,
+        route_version_id: None,
         latency_ms: 5,
         upstream_latency_ms: None,
         status: 200,

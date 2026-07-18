@@ -2061,6 +2061,7 @@ pub(crate) async fn complete_panel(
             cached: false,
             cache_layer: None,
             route_id: prep.matched_route_id,
+            route_version_id: prep.matched_route_version_id,
             latency_ms: prep
                 .request_started
                 .elapsed()
@@ -2400,6 +2401,7 @@ pub(crate) async fn complete_panel_streaming(
         pricing: arbiter_pricing.clone(),
         baseline_pricing: arbiter_pricing,
         route_id: prep.matched_route_id,
+        route_version_id: prep.matched_route_version_id,
         tag: ctx.tag.clone(),
         request_started: prep.request_started,
         spend_sink: state.spend_sink(),

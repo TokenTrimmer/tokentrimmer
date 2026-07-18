@@ -73,6 +73,32 @@ pub struct Route {
     pub paused: bool,
 }
 
+/// A route together with the immutable version-ledger record that described
+/// this exact runtime definition when it was loaded.
+///
+/// `route_version_id` is deliberately separate from [`Route`]: the latter is
+/// the stable public routing contract, while this is gateway-only execution
+/// provenance. It is the `BIGINT` primary key of the cloud-owned
+/// `public.route_versions` append-only ledger, **never** the mutable
+/// `routes.revision` concurrency token. `None` truthfully represents a
+/// legacy/unavailable ledger rather than fabricating a version from revision.
+#[derive(Debug, Clone)]
+pub struct RuntimeRoute {
+    pub route: Route,
+    pub route_version_id: Option<i64>,
+}
+
+impl RuntimeRoute {
+    /// Wrap a route whose immutable ledger provenance is unavailable.
+    #[must_use]
+    pub fn unversioned(route: Route) -> Self {
+        Self {
+            route,
+            route_version_id: None,
+        }
+    }
+}
+
 /// Match conditions for a [`Route`]. v1 supports four predicates — extend
 /// alongside `tt_plan_core::types::RouteConditions` so Plan and Gateway stay
 /// in lockstep.
@@ -596,6 +622,10 @@ pub fn sticky_traffic_split(org_id: Uuid, idempotency_key: &str, traffic_pct: u3
 #[derive(Debug, Clone, Default)]
 pub struct RoutingEngine {
     routes: Vec<Route>,
+    /// Immutable ledger identity captured with each runtime route refresh.
+    /// Kept out of [`Route`] so route JSON / callers retain their established
+    /// public shape; only the gateway execution path consumes it.
+    route_version_ids: std::collections::HashMap<Uuid, Option<i64>>,
 }
 
 impl RoutingEngine {
@@ -608,14 +638,37 @@ impl RoutingEngine {
     /// Construct from a collection of routes. Internally sorted descending by
     /// priority — the order the caller passes them in does not matter.
     pub fn with_routes(routes: impl IntoIterator<Item = Route>) -> Self {
-        let mut v: Vec<Route> = routes.into_iter().collect();
+        Self::with_runtime_routes(routes.into_iter().map(RuntimeRoute::unversioned))
+    }
+
+    /// Construct from runtime routes plus their immutable ledger identities.
+    ///
+    /// The routing decision still operates on [`Route`], while
+    /// [`Self::route_version_id`] exposes the matching snapshot for request-log
+    /// provenance. The IDs are captured together by the backing store; this
+    /// method merely preserves that association through the cache/engine.
+    pub fn with_runtime_routes(routes: impl IntoIterator<Item = RuntimeRoute>) -> Self {
+        let mut route_version_ids = std::collections::HashMap::new();
+        let mut v = Vec::new();
+        for RuntimeRoute {
+            route,
+            route_version_id,
+        } in routes
+        {
+            route_version_ids.insert(route.id, route_version_id);
+            v.push(route);
+        }
         v.sort_by_key(|r| std::cmp::Reverse(r.priority));
-        Self { routes: v }
+        Self {
+            routes: v,
+            route_version_ids,
+        }
     }
 
     /// Add a route in-place and re-sort. Hot-path callers should prefer
     /// [`RoutingEngine::with_routes`] to amortize the sort.
     pub fn add(&mut self, route: Route) {
+        self.route_version_ids.insert(route.id, None);
         self.routes.push(route);
         self.routes.sort_by_key(|r| std::cmp::Reverse(r.priority));
     }
@@ -623,6 +676,30 @@ impl RoutingEngine {
     /// All routes, descending priority order.
     pub fn routes(&self) -> &[Route] {
         &self.routes
+    }
+
+    /// Immutable ledger ID captured with `route_id` during the same runtime
+    /// refresh. `None` means the ledger was unavailable or had no exact
+    /// snapshot; callers must persist NULL, never substitute `revision`.
+    #[must_use]
+    pub fn route_version_id(&self, route_id: Uuid) -> Option<i64> {
+        self.route_version_ids.get(&route_id).copied().flatten()
+    }
+
+    /// Clone the engine's routes with their captured immutable ledger IDs.
+    /// This is used only when a caching store itself is used as another
+    /// store's backing source; hot-path route evaluation reads the engine
+    /// directly and performs no allocation.
+    #[must_use]
+    pub fn runtime_routes(&self) -> Vec<RuntimeRoute> {
+        self.routes
+            .iter()
+            .cloned()
+            .map(|route| RuntimeRoute {
+                route_version_id: self.route_version_id(route.id),
+                route,
+            })
+            .collect()
     }
 
     /// Find the first matching route for `(req, ctx)`. Returns `None` when no

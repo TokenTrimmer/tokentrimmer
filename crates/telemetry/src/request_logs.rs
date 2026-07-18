@@ -74,6 +74,14 @@ pub struct RequestLogRow {
     /// `Some("l1")` / `Some("l2")` / `None`. Matches the SQL CHECK constraint.
     pub cache_layer: Option<String>,
     pub route_id: Option<Uuid>,
+    /// Immutable `public.route_versions.id` captured with the matched runtime
+    /// definition. This is a nullable BIGINT ledger identity, deliberately
+    /// distinct from the mutable route revision used for optimistic
+    /// concurrency. `None` means no route matched or the ledger was
+    /// unavailable/legacy at route-cache refresh time; it is never synthesized
+    /// from `route_id` or a revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_version_id: Option<i64>,
     pub latency_ms: i32,
     pub upstream_latency_ms: Option<i32>,
     pub status: i32,
@@ -508,7 +516,8 @@ pub mod postgres {
                       doc_vision_saved_est_usd,
                       content_compress_saved_est_usd, content_compress_kind,
                       l2_matched_entry_id, l2_similarity, l2_verdict,
-                      flex_saved_usd, doc_compaction_saved_usd, summarizer_tax_usd)
+                      flex_saved_usd, doc_compaction_saved_usd, summarizer_tax_usd,
+                      route_version_id)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -533,11 +542,12 @@ pub mod postgres {
                       $45,
                       $46, $47,
                       $48, $49, $50,
-                      $51, $52, $53)"#;
+                      $51, $52, $53,
+                      $54)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 53;
+    pub const INSERT_BIND_COUNT: usize = 54;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -596,6 +606,7 @@ pub mod postgres {
                 .bind(row.flex_saved_usd) // $51
                 .bind(row.doc_compaction_saved_usd) // $52
                 .bind(row.summarizer_tax_usd) // $53
+                .bind(row.route_version_id) // $54
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -691,6 +702,7 @@ mod tests {
             cached: false,
             cache_layer: None,
             route_id: None,
+            route_version_id: None,
             latency_ms: 800,
             upstream_latency_ms: Some(750),
             status: 200,
@@ -873,6 +885,28 @@ mod tests {
         // NULL-vs-0: a reported zero survives as Some(0), not None.
         assert_eq!(rows[1].cache_read_input_tokens, Some(0));
         assert_eq!(rows[1].cache_creation_input_tokens, None);
+    }
+
+    /// Immutable route-version provenance is additive: a live ledger BIGINT
+    /// survives the in-memory writer/serde boundary, while pre-0041 JSON that
+    /// omits it remains an honest NULL rather than acquiring a derived value.
+    #[tokio::test]
+    async fn route_version_provenance_round_trips_and_legacy_omits_to_null() {
+        let writer = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.route_version_id = Some(9_876_543_210);
+        writer.write(row.clone()).await.unwrap();
+
+        assert_eq!(writer.rows()[0].route_version_id, Some(9_876_543_210));
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("route_version_id"), "{json}");
+
+        let legacy = serde_json::to_string(&sample_row()).unwrap();
+        let decoded: RequestLogRow = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(
+            decoded.route_version_id, None,
+            "legacy request-log JSON must not fabricate a route version"
+        );
     }
 
     /// Legacy JSON (rows serialized before migration 0015) deserializes with
