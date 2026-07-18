@@ -146,6 +146,92 @@ pub fn panel_max_members() -> usize {
 }
 
 impl PanelConfig {
+    /// Validate a resolved panel before it can enter the dispatch engine.
+    ///
+    /// [`PanelConfig::resolve`] calls this after merging header/default inputs,
+    /// but the fields are public for intentional direct-engine construction.
+    /// Keep the same validation at the shared admission boundary so a direct
+    /// caller cannot mint or revalidate a [`PanelAdmission`] for blank,
+    /// duplicated, over-cap, invalid-quorum, or invalid-budget work.
+    pub fn validate_for_dispatch(&self) -> ApiResult<()> {
+        if self.members.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "panel requires at least one member model".to_string(),
+            ));
+        }
+
+        let max = panel_max_members();
+        if self.members.len() > max {
+            return Err(ApiError::InvalidRequest(format!(
+                "panel: {} members exceeds the maximum of {}",
+                self.members.len(),
+                max
+            )));
+        }
+
+        let mut member_identities = std::collections::HashSet::with_capacity(self.members.len());
+        for member in &self.members {
+            let model = member.model.trim();
+            if model.is_empty() {
+                return Err(ApiError::InvalidRequest(
+                    "panel member model must not be blank".to_string(),
+                ));
+            }
+            let provider = member.provider.as_deref().map(str::trim);
+            if provider.is_some_and(str::is_empty) {
+                return Err(ApiError::InvalidRequest(
+                    "panel member provider must not be blank when specified".to_string(),
+                ));
+            }
+            if !member_identities.insert((model, provider.unwrap_or_default())) {
+                return Err(ApiError::InvalidRequest(format!(
+                    "panel member {model:?} is configured more than once"
+                )));
+            }
+        }
+
+        if self.arbiter_model.model.trim().is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "panel arbiter model must not be blank".to_string(),
+            ));
+        }
+        if self
+            .arbiter_model
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider.trim().is_empty())
+        {
+            return Err(ApiError::InvalidRequest(
+                "panel arbiter provider must not be blank when specified".to_string(),
+            ));
+        }
+
+        if let Some(quorum) = self.quorum {
+            if quorum == 0 {
+                return Err(ApiError::InvalidRequest(
+                    "panel quorum must be at least one".to_string(),
+                ));
+            }
+            if quorum > self.members.len() {
+                return Err(ApiError::InvalidRequest(format!(
+                    "panel quorum {quorum} exceeds the {} configured members",
+                    self.members.len()
+                )));
+            }
+        }
+
+        if self
+            .max_cost_usd
+            .is_some_and(|budget| !budget.is_finite() || budget <= 0.0)
+        {
+            return Err(ApiError::InvalidRequest(
+                "panel max_cost_usd must be a finite number greater than zero".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Resolve a complete [`PanelConfig`] from its three input sources.
     ///
     /// Precedence (highest → lowest):
@@ -178,21 +264,6 @@ impl PanelConfig {
             defaults.members.clone()
         };
 
-        if members.is_empty() {
-            return Err(ApiError::InvalidRequest(
-                "panel requires at least one member model".to_string(),
-            ));
-        }
-
-        let max = panel_max_members();
-        if members.len() > max {
-            return Err(ApiError::InvalidRequest(format!(
-                "panel: {} members exceeds the maximum of {}",
-                members.len(),
-                max
-            )));
-        }
-
         // Arbiter: extras override defaults.
         let arbiter_model = if let Some(e) = extras {
             if let Some(ref am) = e.arbiter_model {
@@ -207,74 +278,20 @@ impl PanelConfig {
             defaults.arbiter_model.clone()
         };
 
-        // Fail closed before any provider resolution or dispatch. Dashboard
-        // validation is only a convenience layer: clients can send the API
-        // payload directly, and defaults may be configured outside the UI.
-        let mut member_identities = std::collections::HashSet::with_capacity(members.len());
-        for member in &members {
-            let model = member.model.trim();
-            if model.is_empty() {
-                return Err(ApiError::InvalidRequest(
-                    "panel member model must not be blank".to_string(),
-                ));
-            }
-            let provider = member.provider.as_deref().map(str::trim);
-            if provider.is_some_and(str::is_empty) {
-                return Err(ApiError::InvalidRequest(
-                    "panel member provider must not be blank when specified".to_string(),
-                ));
-            }
-            if !member_identities.insert((model, provider.unwrap_or_default())) {
-                return Err(ApiError::InvalidRequest(format!(
-                    "panel member {model:?} is configured more than once"
-                )));
-            }
-        }
-
-        if arbiter_model.model.trim().is_empty() {
-            return Err(ApiError::InvalidRequest(
-                "panel arbiter model must not be blank".to_string(),
-            ));
-        }
-        if arbiter_model
-            .provider
-            .as_deref()
-            .is_some_and(|provider| provider.trim().is_empty())
-        {
-            return Err(ApiError::InvalidRequest(
-                "panel arbiter provider must not be blank when specified".to_string(),
-            ));
-        }
-
         let quorum = extras.and_then(|e| e.quorum);
-        if let Some(quorum) = quorum {
-            if quorum == 0 {
-                return Err(ApiError::InvalidRequest(
-                    "panel quorum must be at least one".to_string(),
-                ));
-            }
-            if quorum > members.len() {
-                return Err(ApiError::InvalidRequest(format!(
-                    "panel quorum {quorum} exceeds the {} configured members",
-                    members.len()
-                )));
-            }
-        }
-
         let max_cost_usd = extras.and_then(|e| e.max_cost_usd);
-        if max_cost_usd.is_some_and(|budget| !budget.is_finite() || budget <= 0.0) {
-            return Err(ApiError::InvalidRequest(
-                "panel max_cost_usd must be a finite number greater than zero".to_string(),
-            ));
-        }
-
-        Ok(PanelConfig {
+        let config = PanelConfig {
             strategy,
             members,
             arbiter_model,
             quorum,
             max_cost_usd,
-        })
+        };
+        // Fail closed before any provider resolution or dispatch. Dashboard
+        // validation is only a convenience layer: clients can send the API
+        // payload directly, and defaults may be configured outside the UI.
+        config.validate_for_dispatch()?;
+        Ok(config)
     }
 }
 
@@ -1428,6 +1445,7 @@ fn validate_panel_admission(
     tokenizer_provider_id: &str,
     request_budget: Option<f64>,
 ) -> Result<(), ApiError> {
+    cfg.validate_for_dispatch()?;
     panel_budget_gate(
         state,
         cfg,
@@ -2712,6 +2730,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_engine_admission_rejects_invalid_public_config_literals() {
+        let state = AppState::with_default_providers();
+        let req = direct_engine_admission_request(1);
+
+        let mut blank_member = direct_engine_admission_config(Some(1_000.0));
+        blank_member.members[0].model = "   ".to_string();
+
+        let mut duplicate_member = direct_engine_admission_config(Some(1_000.0));
+        let duplicate = duplicate_member.members[0].clone();
+        duplicate_member.members.push(duplicate);
+
+        let mut impossible_quorum = direct_engine_admission_config(Some(1_000.0));
+        impossible_quorum.quorum = Some(2);
+
+        let invalid_config_budget = direct_engine_admission_config(Some(0.0));
+
+        let mut over_cap = direct_engine_admission_config(Some(1_000.0));
+        over_cap.members = (0..=panel_max_members())
+            .map(|index| ModelRef {
+                model: format!("direct-member-{index}"),
+                provider: None,
+            })
+            .collect();
+
+        for (cfg, expected) in [
+            (blank_member, "member model must not be blank"),
+            (duplicate_member, "configured more than once"),
+            (impossible_quorum, "quorum 2 exceeds"),
+            (
+                invalid_config_budget,
+                "max_cost_usd must be a finite number greater than zero",
+            ),
+            (over_cap, "exceeds the maximum"),
+        ] {
+            let error = match admit_panel_request(&state, &cfg, &req, Some(1_000.0)) {
+                Ok(_) => {
+                    panic!("direct literals must pass static config validation before admission")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                matches!(&error, ApiError::InvalidRequest(message) if message.contains(expected)),
+                "expected InvalidRequest containing {expected:?}, got {error:?}"
+            );
+        }
+    }
+
     /// The public engine cannot be called with a forged proof, and a real proof
     /// is checked again against the request/config that will actually fan out.
     /// This stays entirely static: no mock provider or integration harness is
@@ -2755,6 +2821,25 @@ mod tests {
             .await,
             Err(ApiError::CostLimitExceeded { .. })
         ));
+
+        cfg.max_cost_usd = Some(0.10);
+        let duplicate = cfg.members[0].clone();
+        cfg.members.push(duplicate);
+        let error = run_panel(
+            &state,
+            &ctx,
+            &cheap,
+            &creds,
+            &cfg,
+            &admission,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("post-admission invalid config must stop before fan-out");
+        assert!(
+            matches!(&error, ApiError::InvalidRequest(message) if message.contains("configured more than once")),
+            "expected duplicate-member admission error, got {error:?}"
+        );
     }
 
     #[test]
