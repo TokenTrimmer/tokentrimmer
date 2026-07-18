@@ -314,7 +314,8 @@ pub fn record_diff(outcome: &'static str, reason: &'static str) {
 
 /// Count one Fusion panel request. `strategy` is the panel strategy
 /// name (bounded cardinality — e.g. `"consensus"`, `"best_of"`); `outcome` ∈
-/// `success|quorum_unmet|disabled|strategy_unsupported|error` (bounded).
+/// `success|quorum_unmet|credential_preflight|disabled|strategy_unsupported|error`
+/// (bounded).
 pub fn record_panel_request(strategy: &str, outcome: &str) {
     metrics::counter!(
         "tt_panel_requests_total",

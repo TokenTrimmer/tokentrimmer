@@ -83,6 +83,17 @@ pub enum ApiError {
     #[error("panel quorum unmet: {met} of {required} legs succeeded")]
     PanelQuorumUnmet { required: usize, met: usize },
 
+    /// The request-local resolved credentials cannot start the configured
+    /// panel before any upstream member or arbiter dispatch.
+    #[error(
+        "panel credential preflight failed: {credentialed} credentialed member legs for quorum {required} (arbiter credential missing: {missing_arbiter})"
+    )]
+    PanelCredentialPreflight {
+        required: usize,
+        credentialed: usize,
+        missing_arbiter: bool,
+    },
+
     /// A panel strategy requested but not implemented in this build.
     #[error("panel strategy not supported: {strategy}")]
     PanelStrategyUnsupported { strategy: String },
@@ -244,6 +255,25 @@ impl IntoResponse for ApiError {
                 "upstream_error",
                 "panel_quorum_unmet",
                 format!("Fusion panel could not reach quorum: {met} of {required} legs succeeded."),
+                None,
+                None,
+            ),
+            ApiError::PanelCredentialPreflight {
+                required,
+                credentialed,
+                missing_arbiter,
+            } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "panel_credentials_unavailable",
+                format!(
+                    "Fusion panel cannot start: {credentialed} of {required} required member legs have configured provider credentials.{}",
+                    if *missing_arbiter {
+                        " A configured credential is also required for the selected arbiter provider."
+                    } else {
+                        ""
+                    }
+                ),
                 None,
                 None,
             ),

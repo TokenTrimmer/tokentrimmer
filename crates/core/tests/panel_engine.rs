@@ -52,15 +52,24 @@ use serde_json::{json, Value};
 use tokio_util::task::TaskTracker;
 use tower::util::ServiceExt;
 
+use tt_auth::{
+    keys::{issue, Environment},
+    InMemoryKeyStore, InMemoryProviderCredentialStore,
+};
 use tt_cache::embed::MockEmbedder;
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_shared::{
+    context::{ProviderCredentials, SecretString},
     messages::{Choice, Message, MessageContent},
     pricing::Capability,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingsRequest,
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
-use tt_telemetry::request_logs::InMemoryRequestLogWriter;
+use tt_telemetry::{
+    audit::{Actor, InMemoryAuditWriter},
+    request_logs::InMemoryRequestLogWriter,
+};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Shared helpers (mirrors panel_dispatch.rs)
@@ -80,6 +89,29 @@ async fn drain_rows(
     tracker.close();
     tracker.wait().await;
     writer.rows()
+}
+
+fn upstream_credential(api_key: &str) -> ProviderCredentials {
+    ProviderCredentials {
+        api_key: SecretString::new(api_key.to_string()),
+        base_url: None,
+        extra_headers: Vec::new(),
+    }
+}
+
+async fn issue_live_key(store: &InMemoryKeyStore, org: Uuid) -> String {
+    let audit = InMemoryAuditWriter::new();
+    issue(
+        store,
+        &audit,
+        org,
+        "panel-preflight",
+        Environment::Live,
+        Actor::System,
+    )
+    .await
+    .expect("issue test live key")
+    .plaintext
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +323,117 @@ fn app_two_providers() -> (
         .with_request_log_writer(writer.clone())
         .with_telemetry_tracker(tracker.clone());
     (build_router(state), writer, tracker, calls_a, calls_b)
+}
+
+// ============================================================================
+// Credential preflight: a verified org can have enough member credentials but
+// no credential for the distinct LLM arbiter. Both buffered and streaming
+// requests must return a deterministic 400 before any provider call or
+// request-log write; the source TokenTrimmer bearer must never reach vendor-c.
+// ============================================================================
+
+#[tokio::test]
+async fn missing_verified_org_arbiter_credential_fails_before_buffered_or_streaming_dispatch() {
+    let calls_a = Arc::new(AtomicUsize::new(0));
+    let calls_b = Arc::new(AtomicUsize::new(0));
+    let calls_c = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(CountedMock::new(
+        "vendor-a",
+        "model-a",
+        Arc::clone(&calls_a),
+    )));
+    registry.register(Arc::new(CountedMock::new(
+        "vendor-b",
+        "model-b",
+        Arc::clone(&calls_b),
+    )));
+    registry.register(Arc::new(CountedMock::new(
+        "vendor-c",
+        "model-arb",
+        Arc::clone(&calls_c),
+    )));
+
+    let org = Uuid::now_v7();
+    let key_store = Arc::new(InMemoryKeyStore::new());
+    let bearer = issue_live_key(key_store.as_ref(), org).await;
+    let credential_store = Arc::new(InMemoryProviderCredentialStore::new());
+    credential_store.insert(org, "vendor-a", upstream_credential("vendor-a-key"));
+    credential_store.insert(org, "vendor-b", upstream_credential("vendor-b-key"));
+    // Intentionally omit vendor-c. The live TokenTrimmer bearer is not an
+    // upstream vendor-c key and must not be forwarded as one.
+
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let tracker = TaskTracker::new();
+    let app = build_router(
+        AppState::new(registry)
+            .with_panel_enabled(true)
+            .with_key_store(key_store)
+            .with_credential_store(credential_store)
+            .with_request_log_writer(writer.clone())
+            .with_telemetry_tracker(tracker.clone()),
+    );
+
+    for stream in [false, true] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("x-tokentrimmer-panel", "synthesize")
+            .header("x-tokentrimmer-cost-limit-usd", "10.0")
+            .body(Body::from(
+                json!({
+                    "model": "model-a",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "deep question" }],
+                    "stream": stream,
+                    "tt_extras": {
+                        "panel": {
+                            "members": ["model-a", "model-b"],
+                            "arbiter_model": "model-arb",
+                            "quorum": 2
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("build panel request");
+
+        let response = app.clone().oneshot(req).await.expect("route response");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "missing arbiter credential must fail before {} dispatch",
+            if stream { "streaming" } else { "buffered" }
+        );
+        let body = body_json(response).await;
+        assert_eq!(
+            body["error"]["code"], "panel_credentials_unavailable",
+            "missing arbiter credential must use the stable preflight code, got {body}"
+        );
+    }
+
+    assert_eq!(
+        calls_a.load(Ordering::Relaxed),
+        0,
+        "member vendor-a must not dispatch before credential preflight"
+    );
+    assert_eq!(
+        calls_b.load(Ordering::Relaxed),
+        0,
+        "member vendor-b must not dispatch before credential preflight"
+    );
+    assert_eq!(
+        calls_c.load(Ordering::Relaxed),
+        0,
+        "arbiter vendor-c must never receive the source bearer as a fallback"
+    );
+    let rows = drain_rows(&writer, tracker).await;
+    assert!(
+        rows.is_empty(),
+        "credential-preflight rejects must write no request-log rows"
+    );
 }
 
 // ============================================================================

@@ -295,6 +295,77 @@ impl PanelConfig {
     }
 }
 
+/// Return the effective member quorum after [`PanelConfig::validate_for_dispatch`]
+/// has established that the configuration is structurally valid.
+pub(crate) fn required_panel_quorum(cfg: &PanelConfig) -> usize {
+    cfg.quorum.unwrap_or(match cfg.strategy {
+        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
+        ArbiterStrategyKind::Synthesize | ArbiterStrategyKind::BestOfN => 1,
+    })
+}
+
+/// Reject a Fusion configuration that cannot start with the credentials already
+/// resolved for this request.
+///
+/// This checks only the request-local provider-id → credential map: enough
+/// configured member *legs* must be eligible to meet quorum, and the LLM
+/// arbiter used by Synthesize/Best-of-N must have an explicitly mapped
+/// credential. It does not contact providers or validate credentials, reserve
+/// spend, establish runtime readiness, or guarantee a successful execution.
+///
+/// Missing credentials for additional members remain representable as
+/// [`LegStatus::SkippedNoCred`] once this fence proves that the remaining
+/// credentialed legs can meet quorum. Provider IDs are intentionally resolved
+/// by the same registry lookup used by fan-out; optional `ModelRef::provider`
+/// pins are not interpreted differently at this seam.
+pub(crate) fn validate_panel_credential_preflight(
+    state: &AppState,
+    cfg: &PanelConfig,
+    creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+) -> ApiResult<()> {
+    cfg.validate_for_dispatch()?;
+
+    let mut credentialed_members = 0;
+    for member in &cfg.members {
+        let provider =
+            state
+                .registry
+                .resolve(&member.model)
+                .ok_or_else(|| ApiError::ModelNotFound {
+                    model: member.model.clone(),
+                })?;
+        if creds.contains_key(provider.id()) {
+            credentialed_members += 1;
+        }
+    }
+
+    let missing_arbiter = match cfg.strategy {
+        ArbiterStrategyKind::Synthesize | ArbiterStrategyKind::BestOfN => {
+            let provider = state
+                .registry
+                .resolve(&cfg.arbiter_model.model)
+                .ok_or_else(|| ApiError::ModelNotFound {
+                    model: cfg.arbiter_model.model.clone(),
+                })?;
+            !creds.contains_key(provider.id())
+        }
+        // Majority uses the embedding path rather than the configured LLM
+        // arbiter, so this map cannot make a meaningful arbiter claim here.
+        ArbiterStrategyKind::Majority => false,
+    };
+
+    let required = required_panel_quorum(cfg);
+    if credentialed_members < required || missing_arbiter {
+        return Err(ApiError::PanelCredentialPreflight {
+            required,
+            credentialed: credentialed_members,
+            missing_arbiter,
+        });
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // PanelDefaults — gateway-level defaults from env vars
 // ---------------------------------------------------------------------------
@@ -583,11 +654,11 @@ pub trait ArbiterStrategy {
     /// Run arbitration over the completed `legs` and return the final answer.
     ///
     /// `request` is the original caller request (used as the user prompt
-    /// context).  `state` and `ctx` give access to the provider registry and
-    /// the request's credential / deadline context.  `creds` is the same
-    /// provider-id → credential map passed to `run_panel`; the arbiter
-    /// implementation uses it to substitute the correct credential when the
-    /// arbiter model is on a different provider than `ctx.credentials`.
+    /// context). `state` and `ctx` give access to the provider registry and
+    /// the request's credential / deadline context. `creds` is the same
+    /// provider-id → credential map passed to `run_panel`; an LLM arbiter
+    /// requires its own explicit map entry and never inherits
+    /// `ctx.credentials` as a fallback.
     async fn arbitrate(
         &self,
         request: &ChatCompletionRequest,
@@ -623,6 +694,27 @@ pub trait ArbiterStrategy {
             outcome.detail,
         ))
     }
+}
+
+/// Build an arbiter request context from the credential explicitly resolved
+/// for that provider. Arbiter dispatch must never inherit the source provider's
+/// credential when the map is incomplete.
+fn panel_context_for_provider(
+    ctx: &RequestContext,
+    provider_id: &str,
+    creds: &std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
+) -> Result<RequestContext, ApiError> {
+    let credentials =
+        creds
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| ApiError::MissingProviderCredential {
+                provider: provider_id.to_string(),
+            })?;
+    Ok(RequestContext {
+        credentials,
+        ..ctx.clone()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -708,27 +800,20 @@ impl ArbiterStrategy for Synthesize {
                 model: self.arbiter_model.model.clone(),
             })?;
 
-        // Substitute the arbiter provider's credential when present in the creds
-        // map (mirrors the per-member credential substitution in run_panel).
-        let mut arb_ctx_owned;
-        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
-            arb_ctx_owned = ctx.clone();
-            arb_ctx_owned.credentials = c.clone();
-            &arb_ctx_owned
-        } else {
-            ctx
-        };
+        let arb_ctx = panel_context_for_provider(ctx, provider.id(), creds)?;
 
         // Derive the arbiter deadline from the caller's remaining budget when
         // available; otherwise use a bounded default. The outer route
         // TimeoutLayer (60 s) caps all requests regardless.
         let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
-        let measured =
-            crate::measurement::measured_single_dispatch(&provider, arbiter_req, arb_ctx, deadline)
-                .await
-                .map_err(|e| {
-                    ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}"))
-                })?;
+        let measured = crate::measurement::measured_single_dispatch(
+            &provider,
+            arbiter_req,
+            &arb_ctx,
+            deadline,
+        )
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}")))?;
 
         Ok(ArbiterOutcome {
             response: measured.response,
@@ -808,20 +893,12 @@ impl ArbiterStrategy for Synthesize {
                 model: self.arbiter_model.model.clone(),
             })?;
 
-        // Substitute the arbiter provider's credential when present in the creds map.
-        let mut arb_ctx_owned;
-        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
-            arb_ctx_owned = ctx.clone();
-            arb_ctx_owned.credentials = c.clone();
-            &arb_ctx_owned
-        } else {
-            ctx
-        };
+        let arb_ctx = panel_context_for_provider(ctx, provider.id(), creds)?;
 
         let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
         let stream = tokio::time::timeout(
             deadline,
-            provider.chat_completion_stream(arbiter_req, arb_ctx),
+            provider.chat_completion_stream(arbiter_req, &arb_ctx),
         )
         .await
         .map_err(|_| ApiError::ServiceUnavailable("arbiter stream establishment timed out".into()))?
@@ -917,27 +994,20 @@ impl ArbiterStrategy for BestOfN {
                 model: self.arbiter_model.model.clone(),
             })?;
 
-        // Substitute the arbiter provider's credential when present in the creds
-        // map (mirrors the per-member credential substitution in run_panel).
-        let mut arb_ctx_owned;
-        let arb_ctx: &RequestContext = if let Some(c) = creds.get(provider.id()) {
-            arb_ctx_owned = ctx.clone();
-            arb_ctx_owned.credentials = c.clone();
-            &arb_ctx_owned
-        } else {
-            ctx
-        };
+        let arb_ctx = panel_context_for_provider(ctx, provider.id(), creds)?;
 
         // Derive the arbiter deadline from the caller's remaining budget when
         // available; otherwise use a bounded default. The outer route
         // TimeoutLayer (60 s) caps all requests regardless.
         let deadline = arb_ctx.deadline.unwrap_or(Duration::from_secs(120));
-        let measured =
-            crate::measurement::measured_single_dispatch(&provider, arbiter_req, arb_ctx, deadline)
-                .await
-                .map_err(|e| {
-                    ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}"))
-                })?;
+        let measured = crate::measurement::measured_single_dispatch(
+            &provider,
+            arbiter_req,
+            &arb_ctx,
+            deadline,
+        )
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(format!("arbiter dispatch failed: {e}")))?;
 
         // Extract the judge's assistant text.
         let judge_text = measured
@@ -1724,10 +1794,7 @@ async fn run_panel_legs_and_quorum(
     }
 
     // 2. Quorum check.
-    let required = cfg.quorum.unwrap_or(match cfg.strategy {
-        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
-        _ => 1,
-    });
+    let required = required_panel_quorum(cfg);
     let met = legs_out
         .iter()
         .filter(|l| matches!(l.status, LegStatus::Ok))
@@ -1742,8 +1809,10 @@ async fn run_panel_legs_and_quorum(
 
 /// Fan-out all panel member legs concurrently, enforce quorum, then arbitrate.
 ///
-/// `creds` maps **provider id** → credentials for that provider.  Members
-/// whose provider id is absent from `creds` are recorded as
+/// `creds` maps **provider id** → credentials for that provider. Before any
+/// member can dispatch, the engine verifies that credentialed member legs can
+/// meet quorum and that an LLM arbiter has an explicit mapped credential.
+/// Additional members whose provider id is absent are then recorded as
 /// [`LegStatus::SkippedNoCred`] and do not count toward quorum. `admission`
 /// must come from [`admit_panel_request`]; it is revalidated before any member
 /// leg can be dispatched.
@@ -1761,12 +1830,10 @@ pub async fn run_panel(
     // shaping/config mutation between ingress and dispatch must not turn a
     // cheap admission into an expensive fan-out.
     admission.revalidate(state, cfg, base_req)?;
+    validate_panel_credential_preflight(state, cfg, creds)?;
     let (mut legs_out, leg_cost_total) =
         run_panel_legs_and_quorum(state, ctx, base_req, creds, cfg, deadline).await?;
-    let required = cfg.quorum.unwrap_or(match cfg.strategy {
-        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
-        _ => 1,
-    });
+    let required = required_panel_quorum(cfg);
     let met = legs_out
         .iter()
         .filter(|l| matches!(l.status, LegStatus::Ok))
@@ -2060,8 +2127,9 @@ pub(crate) async fn complete_panel(
     // single-model dispatch (which returns before the spend/settle/log block).
     // Panel member credentials were pre-resolved per-provider in `prepare`
     // (`panel_creds`, spec §6.4 step 4) — NOT `failover_creds`, which is only
-    // populated on a failover route. A member whose provider id is absent here
-    // is recorded by `run_panel` as `skipped_no_cred` (never dispatched/billed).
+    // populated on a failover route. `run_panel` fences the map before any
+    // dispatch; only extra members beyond a credentialed quorum can be recorded
+    // as `skipped_no_cred` (never dispatched/billed).
     let result = match run_panel(
         state,
         ctx,
@@ -2078,6 +2146,7 @@ pub(crate) async fn complete_panel(
             // Bounded outcome label for the request-level panel counter.
             let outcome = match &e {
                 ApiError::PanelQuorumUnmet { .. } => "quorum_unmet",
+                ApiError::PanelCredentialPreflight { .. } => "credential_preflight",
                 ApiError::PanelStrategyUnsupported { .. } => "strategy_unsupported",
                 _ => "error",
             };
@@ -2322,6 +2391,14 @@ pub(crate) async fn complete_panel_streaming(
     // `run_panel_legs_and_quorum` is private so this is the only streaming
     // route to fan-out. Revalidate before it can make an upstream call.
     admission.revalidate(state, &cfg, &prep.req)?;
+    if let Err(error) = validate_panel_credential_preflight(state, &cfg, &prep.panel_creds) {
+        let outcome = match &error {
+            ApiError::PanelCredentialPreflight { .. } => "credential_preflight",
+            _ => "error",
+        };
+        crate::metrics::record_panel_request(cfg.strategy.as_str(), outcome);
+        return Err(error);
+    }
 
     // Per-leg / arbiter deadline: mirror `complete_panel`'s derivation.
     let deadline = prep
@@ -2339,6 +2416,7 @@ pub(crate) async fn complete_panel_streaming(
             Err(e) => {
                 let outcome = match &e {
                     ApiError::PanelQuorumUnmet { .. } => "quorum_unmet",
+                    ApiError::PanelCredentialPreflight { .. } => "credential_preflight",
                     ApiError::PanelStrategyUnsupported { .. } => "strategy_unsupported",
                     _ => "error",
                 };
@@ -2349,10 +2427,7 @@ pub(crate) async fn complete_panel_streaming(
 
     // Recompute quorum required/met for the PanelStreamLog span attributes
     // (legs is already quorum-checked inside the helper).
-    let required = cfg.quorum.unwrap_or(match cfg.strategy {
-        ArbiterStrategyKind::Majority => (cfg.members.len() / 2) + 1,
-        _ => 1,
-    });
+    let required = required_panel_quorum(&cfg);
     let met = legs
         .iter()
         .filter(|l| matches!(l.status, LegStatus::Ok))

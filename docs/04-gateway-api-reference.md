@@ -1735,7 +1735,7 @@ From the billing and overage meter perspective a panel counts as **one request**
 
 | Metric | Labels | Description |
 |---|---|---|
-| `panel_requests_total` | `strategy`, `outcome` (`success`/`quorum_unmet`/`strategy_unsupported`/`error`) | One increment per panel request attempt |
+| `panel_requests_total` | `strategy`, `outcome` (`success`/`quorum_unmet`/`credential_preflight`/`strategy_unsupported`/`error`) | One increment per panel request attempt |
 | `panel_legs_total` | `role` (`leg`/`arbiter`), `status` (`ok`/`error`/`timeout`/`skipped_no_cred`) | One increment per dispatched leg |
 
 ---

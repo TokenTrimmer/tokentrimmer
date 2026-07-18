@@ -303,6 +303,7 @@ fn is_deterministic_client_error(err: &ApiError) -> bool {
         // Config-dependent (org may add the credential / raise the ceiling) —
         // must not negative-cache.
         | ApiError::MissingProviderCredential { .. }
+        | ApiError::PanelCredentialPreflight { .. }
         | ApiError::CostLimitExceeded { .. }
         | ApiError::RateLimited { .. }
         | ApiError::RequestTimeout { .. }
@@ -331,6 +332,7 @@ fn error_status_code(err: &ApiError) -> u16 {
         ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
         ApiError::ModelNotFound { .. } => StatusCode::NOT_FOUND,
         ApiError::MissingProviderCredential { .. } => StatusCode::BAD_REQUEST,
+        ApiError::PanelCredentialPreflight { .. } => StatusCode::BAD_REQUEST,
         ApiError::CostLimitExceeded { .. } => StatusCode::PAYMENT_REQUIRED,
         ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
         ApiError::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
@@ -3355,10 +3357,12 @@ pub(crate) async fn prepare(
                 // keyed by provider id. Mirrors the failover pre-resolution pattern
                 // (distinct providers, first-seen order, resolve each once): the
                 // raw-Bearer fallback is allowed ONLY for the source provider (the bearer
-                // IS its key); cross-provider members with no stored org credential are
-                // simply absent here and `run_panel` records them as `skipped_no_cred`
-                // (never dispatched, never billed). The arbiter provider is included so
-                // arbitration can dispatch on a member-distinct provider.
+                // IS its key); cross-provider members with no stored org credential stay
+                // absent. The following request-local preflight rejects an impossible
+                // quorum or missing LLM-arbiter credential before dispatch; only extra
+                // members beyond that feasible quorum can later be `skipped_no_cred`.
+                // The arbiter provider is included so arbitration can dispatch on a
+                // member-distinct provider.
                 let mut provider_ids: Vec<String> = Vec::new();
                 for m in cfg
                     .members
@@ -3383,6 +3387,11 @@ pub(crate) async fn prepare(
                         creds.insert(pid, c);
                     }
                 }
+                // This is a credential-map feasibility fence, not a provider-health,
+                // credential-validity, reservation, or runtime-readiness probe. It runs
+                // before `Prepared` exists, so an impossible panel opens no upstream
+                // request and creates no panel result/log row.
+                panel::validate_panel_credential_preflight(state, &cfg, &creds)?;
                 (Some(cfg), Some(admission), creds)
             }
         }

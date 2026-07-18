@@ -367,7 +367,8 @@ async fn best_of_n_streaming_replay_yields_known_plan_and_chosen_leg() {
 
     let state = AppState::new(registry);
     let ctx = test_ctx();
-    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert("mock-provider-judge".to_string(), test_creds("judge-key"));
 
     let legs = vec![
         make_ok_leg(0, "Answer from leg 0"),
@@ -426,7 +427,11 @@ async fn synthesize_streaming_yields_live_plan_and_streamed_chunks() {
 
     let state = AppState::new(registry);
     let ctx = test_ctx();
-    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert(
+        "mock-streaming-provider".to_string(),
+        test_creds("arbiter-key"),
+    );
 
     // Two ok member legs (Synthesize requires at least one).
     let legs = vec![
@@ -457,6 +462,49 @@ async fn synthesize_streaming_yields_live_plan_and_streamed_chunks() {
     assert_eq!(
         text, "Synthesized",
         "streamed text must equal the concatenation of the mock arbiter's chunks"
+    );
+}
+
+/// The live arbiter stream also requires the explicitly mapped provider
+/// credential; it must not inherit the source request's credential.
+#[tokio::test]
+async fn synthesize_streaming_requires_explicit_arbiter_credential() {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockStreamingArbiter {
+        id: "mock-streaming-provider",
+        model: "mock-synth",
+        chunks: vec!["should", "not", "dispatch"],
+    }));
+
+    let state = AppState::new(registry);
+    let ctx = test_ctx();
+    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let legs = vec![
+        make_ok_leg(0, "First candidate answer"),
+        make_ok_leg(1, "Second candidate answer"),
+    ];
+    let strategy = Synthesize {
+        arbiter_model: ModelRef {
+            model: "mock-synth".to_string(),
+            provider: None,
+        },
+    };
+
+    let error = match strategy
+        .arbitrate_streaming(&base_req(), &legs, &state, &ctx, &creds)
+        .await
+    {
+        Ok(_) => panic!("unmapped streaming arbiter must not inherit source credentials"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            &error,
+            tt_core::ApiError::MissingProviderCredential { provider }
+                if provider == "mock-streaming-provider"
+        ),
+        "expected explicit missing-arbiter credential error, got {error:?}"
     );
 }
 

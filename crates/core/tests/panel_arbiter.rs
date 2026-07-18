@@ -17,7 +17,7 @@ use tt_core::{
         ArbiterStrategyKind, BestOfN, LegResult, LegRole, LegStatus, Majority, ModelRef,
         PanelConfig, PanelDefaults,
     },
-    AppState, ProviderRegistry,
+    ApiError, AppState, ProviderRegistry,
 };
 use tt_shared::{
     context::{ProviderCredentials, SecretString},
@@ -341,7 +341,8 @@ async fn best_of_n_judge_picks_candidate_2() {
 
     let state = AppState::new(registry);
     let ctx = test_ctx();
-    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert("mock-provider-judge".to_string(), test_creds("judge-key"));
 
     // Build 3 ok member legs with distinct answers (leg_index matches slice pos).
     let legs = vec![
@@ -396,6 +397,48 @@ async fn best_of_n_judge_picks_candidate_2() {
     assert!(
         !outcome.detail.fell_back,
         "fell_back must be false when judge response is valid"
+    );
+}
+
+/// Direct strategy callers must supply the arbiter's credential explicitly;
+/// `ctx.credentials` is intentionally not a cross-provider fallback.
+#[tokio::test]
+async fn best_of_n_requires_explicit_arbiter_credential() {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockJudge {
+        id: "mock-provider-judge",
+        model: "mock-judge",
+        judge_response: "1",
+    }));
+
+    let state = AppState::new(registry);
+    let ctx = test_ctx();
+    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let legs = vec![
+        make_ok_leg(0, "Answer from leg 0"),
+        make_ok_leg(1, "Answer from leg 1"),
+    ];
+    let strategy = BestOfN {
+        arbiter_model: ModelRef {
+            model: "mock-judge".to_string(),
+            provider: None,
+        },
+    };
+
+    let error = match strategy
+        .arbitrate(&base_req(), &legs, &state, &ctx, &creds)
+        .await
+    {
+        Ok(_) => panic!("an unmapped arbiter must not inherit the source credential"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            &error,
+            ApiError::MissingProviderCredential { provider } if provider == "mock-provider-judge"
+        ),
+        "expected explicit missing-arbiter credential error, got {error:?}"
     );
 }
 
@@ -638,7 +681,8 @@ async fn best_of_n_garbage_judge_falls_back_to_first_leg() {
 
     let state = AppState::new(registry);
     let ctx = test_ctx();
-    let creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    let mut creds: HashMap<String, ProviderCredentials> = HashMap::new();
+    creds.insert("mock-provider-judge".to_string(), test_creds("judge-key"));
 
     let legs = vec![
         make_ok_leg(0, "First answer"),
