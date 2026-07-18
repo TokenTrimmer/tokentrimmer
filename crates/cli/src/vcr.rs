@@ -47,8 +47,12 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
     // Family dispatch by field-presence (the JSON fields are the dispatch key;
     // the signed canonical payload's prefix — `vcr:v1|` / `l2:v1|` / `wfr:v1|` —
     // is the disjointness guarantee). Order matters:
-    //   - WFR carries `canonical_version` + `signature_hex` (the discriminator —
-    //     checked before VCR, since a WFR also carries a `verifying_key_hex`).
+    //   - A savings bundle carries `plan_input` or `expected_result`; it belongs
+    //     to `tt verify-bundle`, never this receipt verifier.
+    //   - WFR reserves any own `canonical_version` field, even if it is
+    //     malformed or a future version. Do not let serde's permissive VCR
+    //     deserializer silently ignore that WFR discriminator and verify it as
+    //     a VCR.
     //   - L2 carries `matched_entry_id` + `verdict` (checked before VCR, since
     //     L2 shares the `signature`/`verifying_key_hex` names).
     //   - VCR carries `signature` + `verifying_key_hex` (or `route`+`schema`).
@@ -57,12 +61,20 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
     // receipt family without a `--kind` flag.
     let peek: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("parse receipt JSON {receipt_path}"))?;
-    let is_wfr = (peek.get("canonical_version").and_then(|v| v.as_str()) == Some("v1")
-        || peek.get("canonical_version").and_then(|v| v.as_str()) == Some("v2"))
-        && peek.get("signature_hex").is_some();
-    let is_l2 = peek.get("matched_entry_id").is_some() && peek.get("verdict").is_some();
+    let fields = peek.as_object();
+    let is_bundle = fields.is_some_and(|object| {
+        object.contains_key("plan_input") || object.contains_key("expected_result")
+    });
+    let is_wfr = fields.is_some_and(|object| object.contains_key("canonical_version"));
+    let is_l2 = fields.is_some_and(|object| {
+        object.contains_key("matched_entry_id") && object.contains_key("verdict")
+    });
 
-    if is_wfr {
+    if is_bundle {
+        anyhow::bail!(
+            "receipt appears to be a savings bundle; verify it with `tt verify-bundle {receipt_path}`"
+        );
+    } else if is_wfr {
         verify_wfr_receipt(&raw, &peek, key_hex)
     } else if is_l2 {
         verify_l2_receipt(&raw, &peek, key_hex)
@@ -191,6 +203,16 @@ mod tests {
         path
     }
 
+    fn write_test_json(
+        dir: &std::path::Path,
+        name: &str,
+        value: &serde_json::Value,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+        path
+    }
+
     fn key_hex() -> String {
         verifying_key_hex(&ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]))
     }
@@ -260,6 +282,57 @@ mod tests {
         let path = write_test_receipt(dir.path(), "receipt.json", &sign_receipt());
         run_verify_receipt(path.to_str().unwrap(), "not-hex")
             .expect_err("a malformed key hex must error (verify returns false → bail)");
+    }
+
+    #[test]
+    fn vcr_with_any_wfr_discriminator_never_falls_through_to_vcr() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, canonical_version) in [
+            ("current", serde_json::json!("v1")),
+            ("future", serde_json::json!("v999")),
+            ("malformed", serde_json::json!({ "version": "v1" })),
+        ] {
+            // VcrReceipt ignores unknown JSON fields when deserializing. Without
+            // field-reserved dispatch this otherwise-valid VCR would verify.
+            let mut receipt = serde_json::to_value(sign_receipt()).unwrap();
+            receipt["canonical_version"] = canonical_version;
+            let path = write_test_json(dir.path(), &format!("vcr-wfr-{name}.json"), &receipt);
+
+            let err = run_verify_receipt(path.to_str().unwrap(), &key_hex())
+                .expect_err("a WFR-marked VCR must not use legacy VCR verification");
+            assert!(
+                format!("{err:#}").contains("parse WFR receipt JSON"),
+                "{name} WFR discriminator must take the WFR verifier: {err:#}",
+            );
+        }
+    }
+
+    #[test]
+    fn vcr_with_bundle_discriminator_is_directed_to_verify_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        for (field, value_kind, value) in [
+            ("plan_input", "object", serde_json::json!({})),
+            ("plan_input", "null", serde_json::Value::Null),
+            ("expected_result", "object", serde_json::json!({})),
+            ("expected_result", "empty string", serde_json::json!("")),
+        ] {
+            // These are otherwise-valid VCRs, so this specifically proves an
+            // own bundle discriminator cannot be ignored by VCR deserialization.
+            let mut receipt = serde_json::to_value(sign_receipt()).unwrap();
+            receipt[field] = value;
+            let path = write_test_json(
+                dir.path(),
+                &format!("vcr-bundle-{field}-{value_kind}.json"),
+                &receipt,
+            );
+
+            let err = run_verify_receipt(path.to_str().unwrap(), &key_hex())
+                .expect_err("a bundle-marked VCR must not use VCR verification");
+            assert!(
+                format!("{err:#}").contains("tt verify-bundle"),
+                "{field} ({value_kind}) must direct the user to the bundle verifier: {err:#}",
+            );
+        }
     }
 
     // ── L2 (semantic-cache-hit) receipt dispatch + verify ────────────────────
