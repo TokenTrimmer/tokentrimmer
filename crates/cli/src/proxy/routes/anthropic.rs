@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use crate::proxy::config::{Config, Mode};
 use crate::proxy::forward;
 use crate::proxy::preview;
-use crate::proxy::session::{LogLine, SessionLog};
+use crate::proxy::session::{gateway_accounting_from_headers, LogLine, SessionLog};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -51,6 +51,7 @@ pub async fn post_messages(
     let preview_headers = preview::fetch(&state.http, &state.config, &body).await;
     match forward::forward_post(&state.http, &upstream, headers, body).await {
         Ok(resp) => {
+            let accounting = gateway_accounting_from_headers(&resp.headers);
             let _ = state.log.append(&LogLine {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 mode: match state.config.mode {
@@ -62,11 +63,7 @@ pub async fn post_messages(
                 model: None,
                 input_tokens: None,
                 output_tokens: None,
-                cost_usd: resp
-                    .headers
-                    .get("x-tokentrimmer-cost-usd")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse().ok()),
+                cost_usd: accounting.cost_usd,
                 preview_cost_usd: None,
                 cache_layer: resp
                     .headers
@@ -78,11 +75,8 @@ pub async fn post_messages(
                 suggested_savings_usd: preview_headers
                     .as_ref()
                     .and_then(|p| p.suggested_savings_usd),
-                realized_savings_usd: resp
-                    .headers
-                    .get("x-tokentrimmer-saved-usd")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse().ok()),
+                realized_savings_usd: accounting.realized_savings_usd,
+                request_delta_estimate: accounting.request_delta_estimate,
                 trace_id: resp
                     .headers
                     .get("x-tokentrimmer-trace-id")
