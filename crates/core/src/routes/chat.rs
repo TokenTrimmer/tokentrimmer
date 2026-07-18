@@ -3181,7 +3181,19 @@ pub(crate) async fn prepare(
     // `flex_not_applied:<model>` warning is surfaced. `flex_applied` drives the
     // cost computation below so savings attribute to the `flex` source. Evaluated
     // against the FINAL served provider/model (post-routing/pin/failover-primary).
-    let flex_applied = maybe_apply_flex(req, route_flex, provider.as_ref(), &mut warnings);
+    //
+    // A selected Fusion panel clones this base request into each independently
+    // priced member leg. Flex is intentionally a single-dispatch tier: applying
+    // the primary model's eligibility to every member would forward
+    // `service_tier="flex"` without a per-leg eligibility/accounting contract.
+    // Suppress the route-originated opt-in whenever an actual panel was admitted;
+    // the panel aggregate consequently makes no Flex billing claim either.
+    let flex_applied = if route_flex && panel.is_some() {
+        warnings.push("flex_not_applied:panel".to_string());
+        false
+    } else {
+        maybe_apply_flex(req, route_flex, provider.as_ref(), &mut warnings)
+    };
 
     // Advisory batch-eligibility marker (route action, research Phase 2.1):
     // never mutates the request or detours dispatch — the gateway is
