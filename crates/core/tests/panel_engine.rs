@@ -369,7 +369,9 @@ async fn fail_closed_budget_returns_402_with_zero_dispatches() {
 /// The body-level `tt_extras.panel.max_cost_usd` ingress must reach the same
 /// pre-dispatch gate as the request header. The returned admission-limit value
 /// distinguishes a parsed body budget from the separate fail-closed
-/// no-budget rejection.
+/// no-budget rejection. One explicit member keeps this ingress test independent
+/// of an ambient `TT_PANEL_MAX_MEMBERS=1`; the fixed Synthesize arbiter output
+/// still makes the `$0.001` body budget over-limit.
 #[tokio::test]
 async fn body_panel_budget_returns_402_with_zero_dispatches() {
     let (app, writer, tracker, calls) = app_single_provider(false, true);
@@ -388,7 +390,7 @@ async fn body_panel_budget_returns_402_with_zero_dispatches() {
                 "stream": false,
                 "tt_extras": {
                     "panel": {
-                        "members": ["gpt-4o", "gpt-4o-mini"],
+                        "members": ["gpt-4o"],
                         "arbiter_model": "gpt-4o",
                         "max_cost_usd": 0.001
                     }
