@@ -14,6 +14,7 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::json;
+use tokio_util::task::TaskTracker;
 use tower::util::ServiceExt;
 
 use tt_auth::{
@@ -24,6 +25,7 @@ use tt_cache::memory::InMemoryL1Cache;
 use tt_core::{build_router, AppState, ProviderRegistry};
 use tt_routing::{
     CachingRoutingStore, InMemoryRoutingStore, Route, RouteAction, RouteConditions, RoutingStore,
+    RoutingStoreError, RuntimeRoute,
 };
 use tt_shared::{
     messages::{Choice, Message, MessageContent},
@@ -32,12 +34,47 @@ use tt_shared::{
     EmbeddingsResponse, ModelInfo, ModelPricing, Provider, ProviderError, RequestContext, Usage,
 };
 use tt_telemetry::audit::{Actor, InMemoryAuditWriter};
+use tt_telemetry::request_logs::InMemoryRequestLogWriter;
 use uuid::Uuid;
 
 /// Provider that records the model it was asked to serve.
 struct RecordingProvider {
     served_models: Arc<Mutex<Vec<String>>>,
     calls: Arc<AtomicUsize>,
+}
+
+/// Test-only store that supplies the route definition and its immutable ledger
+/// identity together. Its plain route accessor deliberately omits the ID, so
+/// the integration test proves the production cache asks for runtime routes.
+#[derive(Debug)]
+struct VersionedRuntimeStore {
+    org_id: Uuid,
+    routes: Vec<RuntimeRoute>,
+}
+
+#[async_trait]
+impl RoutingStore for VersionedRuntimeStore {
+    async fn list_for_org(&self, org_id: Uuid) -> Result<Vec<Route>, RoutingStoreError> {
+        Ok(if org_id == self.org_id {
+            self.routes
+                .iter()
+                .map(|runtime| runtime.route.clone())
+                .collect()
+        } else {
+            Vec::new()
+        })
+    }
+
+    async fn list_runtime_for_org(
+        &self,
+        org_id: Uuid,
+    ) -> Result<Vec<RuntimeRoute>, RoutingStoreError> {
+        Ok(if org_id == self.org_id {
+            self.routes.clone()
+        } else {
+            Vec::new()
+        })
+    }
 }
 
 #[async_trait]
@@ -253,6 +290,78 @@ async fn route_rewrites_model_when_org_has_matching_rule() {
             .unwrap(),
         "gpt-4o-mini"
     );
+}
+
+/// A normal cache-miss request must retain the immutable ledger identity that
+/// arrived with its route definition. This exercises the real runtime-store →
+/// cache → engine → route-match → normal request-log path; the value is not a
+/// route revision and cannot be reconstructed from the public `Route` shape.
+#[tokio::test]
+async fn normal_routed_cache_miss_logs_immutable_runtime_route_version() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let served = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        served_models: Arc::clone(&served),
+        calls: Arc::clone(&calls),
+    }));
+
+    let raw_store = InMemoryKeyStore::new();
+    let org_id = Uuid::now_v7();
+    let plaintext = issue_key_for(&raw_store, org_id).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw_store);
+    let route_id = Uuid::now_v7();
+    let route_version_id = 9_876_543_210_i64;
+    let routing = Arc::new(CachingRoutingStore::new(Arc::new(VersionedRuntimeStore {
+        org_id,
+        routes: vec![RuntimeRoute {
+            route: Route {
+                paused: false,
+                id: route_id,
+                name: "versioned-downgrade".into(),
+                priority: 100,
+                enabled: true,
+                when: RouteConditions {
+                    model_in: vec!["gpt-4o".into()],
+                    ..Default::default()
+                },
+                then: RouteAction {
+                    target_model: Some("gpt-4o-mini".into()),
+                    ..Default::default()
+                },
+            },
+            route_version_id: Some(route_version_id),
+        }],
+    }) as Arc<dyn RoutingStore>));
+    let writer = Arc::new(InMemoryRequestLogWriter::new());
+    let tracker = TaskTracker::new();
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_routing_store(routing)
+            .with_request_log_writer(writer.clone())
+            .with_telemetry_tracker(tracker.clone()),
+    );
+
+    let response = app
+        .oneshot(chat_request("gpt-4o", &plaintext))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "normal request dispatches once"
+    );
+    assert_eq!(served.lock().unwrap().as_slice(), ["gpt-4o-mini"]);
+
+    tracker.close();
+    tracker.wait().await;
+    let rows = writer.rows();
+    assert_eq!(rows.len(), 1, "normal request writes one telemetry row");
+    assert!(!rows[0].cached, "this is the normal cache-miss log path");
+    assert_eq!(rows[0].route_id, Some(route_id));
+    assert_eq!(rows[0].route_version_id, Some(route_version_id));
 }
 
 #[tokio::test]
