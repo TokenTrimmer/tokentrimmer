@@ -1,12 +1,13 @@
-//! D4c — the pre-routing document-lane distillation seam.
+//! D4c — the post-route-match document-lane distillation seam.
 //!
-//! Invoked in `prepare()` AFTER routing (so the matched route's
-//! `RouteAction::document_lane` opt-in is known) but BEFORE `SplitRequest::compute`
-//! (so the cache-stable prefix + L1/L2 keys are derived from the DISTILLED
-//! request). When the route opted in + the request carries document/image
-//! content parts, the sidecar distills each to text; the parts are swapped for
-//! `ContentPart::Text` so routing can downgrade to a text model + the request
-//! is billed at text-model rates. The isolated `doc_vision_saved_est_usd`
+//! Invoked in `prepare()` after route/canary selection (so the matched route's
+//! `RouteAction::document_lane` opt-in and candidate target are known), but
+//! before target-provider rebind, pinning, panel admission, failover, and
+//! `SplitRequest::compute` (so cache keys derive from the converted request).
+//! When the route opted in + the request carries document/image content parts,
+//! the sidecar distills each to text; the parts are swapped for `ContentPart::Text`
+//! only after every conversion succeeds, so a route can safely retain its
+//! text-model downgrade. The isolated `doc_vision_saved_est_usd`
 //! saving (D4c-v2) is booked from the [`DistillBookkeeping`] the seam returns —
 //! the raw image tokens the request WOULD have sent vs the distilled text tokens
 //! it now sends, priced at the served model's input rate via D0's

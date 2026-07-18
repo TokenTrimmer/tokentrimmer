@@ -929,12 +929,13 @@ pub(crate) struct Prepared {
     pub diff_plan: Option<crate::shaping::diff::DiffPlan>,
     /// Aggregated request-pass effects threaded into the cost computation.
     pub pass_effects: PassEffects,
-    /// Document Lane D4c-v2: the pre-routing distillation seam's bookkeeping (raw
-    /// image tokens the distilled-away image parts would have spent vs the
-    /// distilled text tokens they now spend). All-zero when the route did not opt
-    /// in / the sidecar is disabled / nothing distilled → `complete_once` prices
-    /// it via D0's `document_projection::project` (Gemini guard + fail-open to $0)
-    /// into the isolated `doc_vision_saved_est_usd` counterfactual.
+    /// Document Lane D4c-v2: the post-route-match, pre-provider-rebind
+    /// distillation seam's bookkeeping (raw image tokens the distilled-away image
+    /// parts would have spent vs the distilled text tokens they now spend).
+    /// All-zero when the route did not opt in / the sidecar is disabled / an
+    /// incomplete transaction preserved raw media → `complete_once` prices it via
+    /// D0's `document_projection::project` (Gemini guard + fail-open to $0) into
+    /// the isolated `doc_vision_saved_est_usd` counterfactual.
     pub doc_distill_booking: crate::document_lane::seam::DistillBookkeeping,
     /// Content-aware compression flywheel label (P1a): the dominant content kind
     /// the content_compress backend compacted (`json`/`csv`/`log`), or `None`
@@ -1800,7 +1801,7 @@ pub(crate) async fn complete_once(
         shape_effects,
     );
     // Document Lane D4c-v2: price the isolated vision-avoided saving from the
-    // pre-routing seam's bookkeeping (raw image tokens the distilled-away image
+    // post-match seam's bookkeeping (raw image tokens the distilled-away image
     // parts WOULD have spent vs the distilled text tokens they now spend) via
     // D0's `document_projection::project`, at the served model's input rate.
     // `project` applies the Gemini direction guard ($0 for Gemini — page-images
@@ -1809,7 +1810,10 @@ pub(crate) async fn complete_once(
     // no-image path), or a $0 projection → the field stays at its compute_cost_full
     // default of 0.0. NEVER folded into cost_usd/baseline/tt_saved_usd (it is a
     // counterfactual the request never sent — not invoice-reconcilable).
-    if doc_distill_booking.distilled_parts > 0 {
+    // A fallback may serve a different model than the one used to distill the
+    // request. Its image/text token formulas can differ, so fail open to $0
+    // rather than price a counterfactual with the wrong model's rate.
+    if doc_distill_booking.distilled_parts > 0 && response.model == req.model {
         if let Some(p) = pricing.as_ref() {
             let proj = tt_preview::document_projection::project(
                 doc_distill_booking.raw_image_tokens,
@@ -2069,7 +2073,7 @@ pub(crate) async fn complete_once(
         compression_tokens_removed: pass_effects.compression_tokens_removed as i64,
         // Document Lane D4c-v2: ISOLATED, ESTIMATED vision-avoided saving (own
         // column, migration 0032; never folded into cost/baseline/saved). Priced
-        // from the pre-routing seam's DistillBooking via D0's
+        // from the post-match seam's DistillBooking via D0's
         // document_projection::project (Gemini guard + fail-open); $0 when the
         // route did not opt in / the sidecar is disabled / nothing distilled.
         doc_vision_saved_est_usd: cost_breakdown.doc_vision_saved_est_usd,
@@ -2674,6 +2678,27 @@ fn non_direct_response_owner(
     None
 }
 
+/// Restore a raw-media request to the caller-selected dispatch path when the
+/// optional Document Lane transaction cannot safely support the route rewrite.
+///
+/// The route remains attributed, but no target-model rewrite, route/header
+/// fallback, or shadow dispatch may carry an unconverted document/image into a
+/// text-oriented path. Keeping this in one helper makes the rollback complete
+/// and preserves the original request bytes except for later independent safety
+/// transforms such as redaction.
+fn rollback_document_lane_route_rewrite(
+    req: &mut ChatCompletionRequest,
+    requested_model: &str,
+    model_was_rewritten: &mut bool,
+    route_fallbacks: &mut Vec<String>,
+    route_shadow_model: &mut Option<String>,
+) {
+    req.model = requested_model.to_string();
+    *model_was_rewritten = false;
+    route_fallbacks.clear();
+    *route_shadow_model = None;
+}
+
 /// Result of deciding and, only when safe, applying a route diff.
 ///
 /// Keeping the raw mutation inside this owner-aware helper prevents a panel or
@@ -2865,13 +2890,13 @@ pub(crate) async fn prepare(
     // request-pass pipeline never runs and the request is byte-for-byte
     // unchanged.
     let route_doc_compaction = route_match.as_ref().is_some_and(|m| m.doc_compaction);
-    // A matched route opting into the Document Lane pre-routing distillation
-    // seam (`RouteAction::document_lane`, D4c). When true the gateway distills
-    // inline document/image content parts to text BEFORE `SplitRequest::compute`
-    // (so the cache-stable prefix + L1/L2 keys derive from the distilled request
-    // + routing can downgrade to a text model). When false (the default) the
-    // seam never runs — zero behavior change. Fail-open when the sidecar is
-    // disabled (`TT_DOC_SIDECAR_URL` unset) or errors.
+    // A matched route opting into the Document Lane distillation seam
+    // (`RouteAction::document_lane`, D4c). It runs after the route/canary choice
+    // (the opt-in and candidate target are now known) but before target-provider
+    // rebind, pinning, panel admission, failover, and cache preparation. Only a
+    // complete all-media conversion retains the target rewrite; otherwise raw
+    // media and the caller model are restored. When false (the default), the
+    // seam never runs — zero behavior change.
     let route_document_lane = route_match.as_ref().is_some_and(|m| m.document_lane);
     // A matched route opting into the content-aware compression pass
     // (`RouteAction::content_compress`, P1a). When false (the default — no route
@@ -2924,7 +2949,7 @@ pub(crate) async fn prepare(
     // revert to the originally-requested model when the split assigns this
     // request to the control arm.
     let route_traffic_pct = route_match.as_ref().and_then(|m| m.traffic_pct);
-    let route_shadow_model = route_match.as_ref().and_then(|m| m.shadow_model.clone());
+    let mut route_shadow_model = route_match.as_ref().and_then(|m| m.shadow_model.clone());
     let route_target_model = route_match.as_ref().map(|m| m.target_model.clone());
     // Per-request cost ceiling (V3d-2b) + the token estimate, captured before
     // `route_match` is consumed below.
@@ -2935,6 +2960,13 @@ pub(crate) async fn prepare(
         .unwrap_or(0);
     // Ordered fallback model ids from the matched route (empty = no failover).
     let mut route_fallbacks: Vec<String> = route_match.map(|m| m.fallbacks).unwrap_or_default();
+    // An incomplete/suppressed Document Lane conversion restores the original
+    // model and must also suppress any later header fallback override. Otherwise
+    // raw media could still reach a text fallback after the route chain itself
+    // was cleared.
+    let mut document_lane_blocks_fallbacks = false;
+    let mut document_lane_warning: Option<&'static str> = None;
+    let mut doc_distill_booking = crate::document_lane::seam::DistillBookkeeping::default();
 
     // ── Canary traffic split (#454) ──────────────────────────────────────────
     //
@@ -3024,6 +3056,72 @@ pub(crate) async fn prepare(
         }
     }
 
+    // Document Lane D4c — after route/canary selection but before any
+    // target-provider rebind, provider pin, panel admission, or failover/cache
+    // setup. A complete transaction can safely keep the target rewrite because
+    // every lane-targeted media part is now text. A disabled/failed/partial
+    // sidecar transaction instead restores the raw request's caller model and
+    // drops route/header fallbacks and shadow work, so raw media cannot leak to a
+    // text target. Fusion panels and non-shadow workflow detours own their own
+    // response/model compositions; they receive the raw request and explicitly
+    // suppress this direct-path optimization rather than inheriting its booking.
+    if route_document_lane && crate::document_lane::seam::request_has_lane_targeted_parts(req) {
+        let owner = non_direct_response_owner(
+            panel::panel_from_header(headers).is_some() || route_panel.is_some(),
+            route_workflow.as_ref(),
+            req.stream,
+            skip_shadow,
+        );
+        if let Some(owner) = owner {
+            document_lane_warning = Some(owner);
+            document_lane_blocks_fallbacks = true;
+            rollback_document_lane_route_rewrite(
+                req,
+                &requested_model,
+                &mut model_was_rewritten,
+                &mut route_fallbacks,
+                &mut route_shadow_model,
+            );
+        } else {
+            let harness = crate::document_lane::seam::DistillHarness::from_env();
+            let distill_model = req.model.clone();
+            match crate::document_lane::seam::distill_request_parts_with_outcome(
+                &harness,
+                &distill_model,
+                req,
+            )
+            .await
+            {
+                crate::document_lane::seam::RequestDistillOutcome::Complete { booking } => {
+                    tracing::info!(
+                        target: "tokentrimmer.document_lane",
+                        distilled_parts = booking.distilled_parts,
+                        raw_image_tokens = booking.raw_image_tokens,
+                        distilled_text_tokens = booking.distilled_text_tokens,
+                        "document-lane seam distilled every media part to text"
+                    );
+                    doc_distill_booking = booking;
+                }
+                crate::document_lane::seam::RequestDistillOutcome::Incomplete => {
+                    document_lane_warning = Some("incomplete");
+                    document_lane_blocks_fallbacks = true;
+                    rollback_document_lane_route_rewrite(
+                        req,
+                        &requested_model,
+                        &mut model_was_rewritten,
+                        &mut route_fallbacks,
+                        &mut route_shadow_model,
+                    );
+                }
+                crate::document_lane::seam::RequestDistillOutcome::NoEligibleParts => {
+                    // The predicate above already proved otherwise. Preserve a
+                    // fail-open no-op if a future request representation makes
+                    // the scan and transaction disagree.
+                }
+            }
+        }
+    }
+
     if model_was_rewritten {
         // Provider may change when a route crosses providers (V3d-1); the
         // registry is the source of truth.
@@ -3085,9 +3183,11 @@ pub(crate) async fn prepare(
         // path re-resolves the primary candidate by model id and so cannot honor a
         // pinned primary provider. The pin wins (single-provider dispatch).
         route_fallbacks.clear();
-    } else if let Some(chain) = fallback_override_from_header(headers) {
-        // `X-TokenTrimmer-Fallback` overrides the route-derived chain (no pin).
-        route_fallbacks = chain;
+    } else if !document_lane_blocks_fallbacks {
+        if let Some(chain) = fallback_override_from_header(headers) {
+            // `X-TokenTrimmer-Fallback` overrides the route-derived chain (no pin).
+            route_fallbacks = chain;
+        }
     }
 
     // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header.
@@ -3264,6 +3364,9 @@ pub(crate) async fn prepare(
         let name = route_matched_name.as_deref().unwrap_or("unknown");
         warnings.push(format!("route_paused:{name}"));
     }
+    if let Some(reason) = document_lane_warning {
+        warnings.push(format!("document_lane_not_applied:{reason}"));
+    }
 
     // ── Request-side output shaping (research Phase 3.3 + 3.4) ──────────────
     //
@@ -3428,40 +3531,6 @@ pub(crate) async fn prepare(
     // them on the all-volatile (pre-split) path.
     let pass_model = req.model.clone();
     let pass_pricing = provider.pricing(&pass_model);
-    // Document Lane D4c — the pre-routing distillation seam. When the matched
-    // route opted in (`route_document_lane`), distill inline document/image
-    // content parts to text BEFORE the pass pipeline, so the cache-stable prefix
-    // + L1/L2 keys derive from the DISTILLED request + routing can downgrade to
-    // a text model. Fail-open: sidecar disabled / error → the request stays
-    // verbatim (no distillation, no downgrade — byte-identical to the no-document-
-    // lane path). When `route_document_lane` is false (the default), the seam
-    // early-returns with zero work. The seam returns the `DistillBookkeeping`
-    // (raw-image-tokens vs distilled-text-tokens, D4c-v2); the isolated
-    // `doc_vision_saved_est_usd` saving is priced from it below, after
-    // `compute_cost_full` builds the breakdown (D0's `document_projection::project`,
-    // served-model input rate, Gemini guard — fail-open to $0 when no pricing /
-    // nothing distilled).
-    let mut doc_distill_booking = crate::document_lane::seam::DistillBookkeeping::default();
-    if route_document_lane {
-        let harness = crate::document_lane::seam::DistillHarness::from_env();
-        doc_distill_booking =
-            crate::document_lane::seam::distill_request_parts(&harness, &pass_model, req).await;
-        if doc_distill_booking.distilled_parts > 0 {
-            tracing::info!(
-                target: "tokentrimmer.document_lane",
-                distilled_parts = doc_distill_booking.distilled_parts,
-                raw_image_tokens = doc_distill_booking.raw_image_tokens,
-                distilled_text_tokens = doc_distill_booking.distilled_text_tokens,
-                "document-lane seam distilled document/image parts to text"
-            );
-            // The downgrade is the route's `target_model` rewrite (apply_routing
-            // already set req.model to the text model); the seam's job is to
-            // swap the image/document parts for text so the text model receives
-            // processable input — done above. No capability-flag re-flip is
-            // needed (the `has_documents` condition matched pre-routing; the
-            // rewrite is the downgrade — see #307).
-        }
-    }
     let pass_cx = crate::passes::PassContext {
         provider_id: provider.id(),
         model: &pass_model,
@@ -5474,7 +5543,7 @@ pub(crate) struct CostBreakdown {
     /// when no diff failed.
     pub diff_failed_cost_usd: f64,
     /// ESTIMATED vision-avoided saving from the Document Lane seam (D4): when the
-    /// pre-routing distillation seam swaps an image/document part for distilled
+    /// post-route-match distillation seam swaps an image/document part for distilled
     /// TEXT, the request that actually dispatched never contained the image, so
     /// this saving is a COUNTERFACTUAL (the raw image tokens that WOULD have been
     /// billed minus the distilled text tokens, priced at the input rate; $0 for
@@ -5920,7 +5989,7 @@ pub(crate) fn compute_cost_full(
         diff_saved_usd: diff_saved_usd * fee_multiplier,
         format_switch_saved_est_usd: shape.format_switch_saved_est_usd * fee_multiplier,
         diff_failed_cost_usd: shape.diff_failed_cost_usd * fee_multiplier,
-        // Document Lane (D4a): always 0 — the pre-routing distillation seam that
+        // Document Lane (D4a): always 0 — the post-match distillation seam that
         // books a non-zero vision-avoided saving on this isolated field is D4c.
         // Isolated: NOT folded into cost_usd/baseline_cost_usd above.
         doc_vision_saved_est_usd: 0.0,
@@ -7209,12 +7278,13 @@ pub(crate) struct RouteMatch {
     /// content_compress request-pass pipeline before dispatch; off by default
     /// (no pass runs otherwise). A COST lever: suppressed on a paused route.
     pub(crate) content_compress: bool,
-    /// The matched route opted into the Document Lane pre-routing distillation
+    /// The matched route opted into the Document Lane post-match distillation
     /// seam (`RouteAction::document_lane`, Document Lane D4c). When true the
-    /// gateway distills image/document content parts to text BEFORE routing
-    /// (so the route can downgrade to a text model) + books the isolated
-    /// `doc_vision_saved_est_usd`. A COST lever: suppressed on a paused route.
-    /// Off by default (no distillation runs otherwise).
+    /// gateway converts every eligible media part before target-provider setup;
+    /// an incomplete transaction restores the caller model and raw request, and
+    /// a complete transaction may keep the text-model downgrade + book the
+    /// isolated `doc_vision_saved_est_usd`. A COST lever: suppressed on a paused
+    /// route. Off by default (no distillation runs otherwise).
     pub(crate) document_lane: bool,
     /// The matched route opted into the request-redaction guardrail
     /// (`RouteAction::redact`). When true the gateway redacts PII/secrets from

@@ -1,7 +1,8 @@
 //! Fail-open client for the out-of-process document `doc-sidecar` service.
 //!
-//! The gateway calls [`extract`] to turn an image/document part into text before
-//! routing (the D4c seam). Everything here is **fail-open**: if the sidecar is
+//! The gateway calls [`extract`] to turn an image/document part into text after
+//! route matching but before target-provider setup (the D4c seam). Everything
+//! here is **fail-open**: if the sidecar is
 //! not configured, unreachable, slow, errors, or returns anything unexpected,
 //! [`extract`] yields `None` and the caller keeps the request verbatim. A
 //! document distillation is a pure *optimization* — it must never be able to
@@ -24,7 +25,7 @@ use super::SpanFidelity;
 pub const SIDECAR_URL_ENV: &str = "TT_DOC_SIDECAR_URL";
 
 /// Hard ceiling on a single sidecar round-trip. Kept short: the seam is on the
-/// pre-routing hot path, and a distillation is optional, so a slow sidecar must
+/// post-match hot path, and a distillation is optional, so a slow sidecar must
 /// fail open rather than delay the request. `pub(crate)` so the D4c seam builds
 /// its own `reqwest::Client` with the same bound (a single source of truth for
 /// the fail-open timeout).
