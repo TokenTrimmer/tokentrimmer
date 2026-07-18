@@ -407,6 +407,11 @@ async fn failover_logs_fallback_providers_cache_token_counts() {
     );
     assert_eq!(row.model, "fallback-model");
     assert_eq!(
+        row.requested_model.as_deref(),
+        Some("gpt-4o"),
+        "the row must retain the pre-routing caller model, not the fallback served model"
+    );
+    assert_eq!(
         row.cache_read_input_tokens,
         Some(8),
         "fallback provider's raw cache reads must be persisted"

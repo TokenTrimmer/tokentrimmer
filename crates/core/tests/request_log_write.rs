@@ -307,6 +307,7 @@ async fn chat_miss_writes_request_log_row() {
     assert_eq!(rows.len(), 1, "expected exactly one telemetry row");
     let r = &rows[0];
     assert_eq!(r.provider, "test-provider");
+    assert_eq!(r.requested_model.as_deref(), Some("test-1"));
     assert_eq!(r.model, "test-1");
     assert_eq!(r.input_tokens, 120);
     assert_eq!(r.output_tokens, 60);
@@ -401,6 +402,7 @@ async fn l1_hit_writes_request_log_with_cache_layer_l1() {
         hit.provider, "test-provider",
         "envelope preserved provider id"
     );
+    assert_eq!(hit.requested_model.as_deref(), Some("test-1"));
     assert_eq!(hit.model, "test-1");
     assert_eq!(hit.status, 200);
     // TT cache hit = no provider call at serve time → provider-cache token

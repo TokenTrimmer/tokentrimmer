@@ -28,6 +28,12 @@ pub struct RequestLogRow {
     pub api_key_id: Uuid,
     pub ts: DateTime<Utc>,
     pub provider: String,
+    /// Exact model ID the caller supplied before route matching, rewrites,
+    /// cache lookup, and failover. `None` for legacy/older-writer rows, which
+    /// historical `model_in` evidence must treat as uncovered rather than
+    /// infer from the final served [`Self::model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
     pub model: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
@@ -517,7 +523,7 @@ pub mod postgres {
                       content_compress_saved_est_usd, content_compress_kind,
                       l2_matched_entry_id, l2_similarity, l2_verdict,
                       flex_saved_usd, doc_compaction_saved_usd, summarizer_tax_usd,
-                      route_version_id)
+                      route_version_id, requested_model)
                    VALUES
                      ($1, $2, $3, $4, $5, $6,
                       $7, $8, $9,
@@ -543,11 +549,11 @@ pub mod postgres {
                       $46, $47,
                       $48, $49, $50,
                       $51, $52, $53,
-                      $54)"#;
+                      $54, $55)"#;
 
     /// Number of `.bind(...)` calls in [`PostgresRequestLogWriter::write`].
     /// Must stay in sync with [`INSERT_SQL`] and the actual bind chain.
-    pub const INSERT_BIND_COUNT: usize = 54;
+    pub const INSERT_BIND_COUNT: usize = 55;
 
     #[async_trait]
     impl RequestLogWriter for PostgresRequestLogWriter {
@@ -607,6 +613,7 @@ pub mod postgres {
                 .bind(row.doc_compaction_saved_usd) // $52
                 .bind(row.summarizer_tax_usd) // $53
                 .bind(row.route_version_id) // $54
+                .bind(row.requested_model.as_deref()) // $55
                 .execute(&self.pool)
                 .await
                 .map_err(classify_sqlx_error)?;
@@ -688,6 +695,7 @@ mod tests {
             api_key_id: Uuid::nil(),
             ts: Utc::now(),
             provider: "openai".into(),
+            requested_model: None,
             model: "gpt-4o".into(),
             input_tokens: 100,
             output_tokens: 50,
@@ -906,6 +914,30 @@ mod tests {
         assert_eq!(
             decoded.route_version_id, None,
             "legacy request-log JSON must not fabricate a route version"
+        );
+    }
+
+    /// The caller-model snapshot is additive: a newly written row preserves
+    /// the exact pre-routing model, while legacy JSON that predates migration
+    /// 0042 remains NULL rather than deriving it from the final served model.
+    #[tokio::test]
+    async fn requested_model_snapshot_round_trips_and_legacy_omits_to_null() {
+        let writer = InMemoryRequestLogWriter::new();
+        let mut row = sample_row();
+        row.requested_model = Some("gpt-4o".into());
+        row.model = "gpt-4o-mini".into();
+        writer.write(row.clone()).await.unwrap();
+
+        assert_eq!(writer.rows()[0].requested_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(writer.rows()[0].model, "gpt-4o-mini");
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("requested_model"), "{json}");
+
+        let legacy = serde_json::to_string(&sample_row()).unwrap();
+        let decoded: RequestLogRow = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(
+            decoded.requested_model, None,
+            "legacy request-log JSON must not infer a caller model from the served model"
         );
     }
 

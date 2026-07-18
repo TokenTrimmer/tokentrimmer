@@ -604,6 +604,7 @@ async fn try_l1_hit(
     tracker: Option<&tokio_util::task::TaskTracker>,
     request_log_writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
     trace_id: Uuid,
+    requested_model: &str,
     request_started: Instant,
     matched_route_id: Option<Uuid>,
     matched_route_version_id: Option<i64>,
@@ -625,6 +626,7 @@ async fn try_l1_hit(
                     request_log_for_l1_hit(
                         &entry,
                         ctx,
+                        requested_model,
                         trace_id,
                         request_started,
                         matched_route_id,
@@ -733,6 +735,7 @@ async fn try_l2_hit(
     current_pricing: Option<&ModelPricing>,
     request_log_writer: Option<&std::sync::Arc<dyn RequestLogWriter>>,
     trace_id: Uuid,
+    requested_model: &str,
     request_started: Instant,
     matched_route_id: Option<Uuid>,
     matched_route_version_id: Option<i64>,
@@ -869,6 +872,7 @@ async fn try_l2_hit(
                 request_log_for_l2_hit(
                     &entry,
                     ctx,
+                    requested_model,
                     trace_id,
                     request_started,
                     matched_route_id,
@@ -1292,6 +1296,7 @@ pub(crate) async fn complete_once(
                 state.telemetry_tracker.as_ref(),
                 state.request_log_writer.as_ref(),
                 trace_id,
+                &requested_model,
                 request_started,
                 matched_route_id,
                 matched_route_version_id,
@@ -1338,6 +1343,7 @@ pub(crate) async fn complete_once(
                 current_pricing.as_ref(),
                 state.request_log_writer.as_ref(),
                 trace_id,
+                &requested_model,
                 request_started,
                 matched_route_id,
                 matched_route_version_id,
@@ -1404,6 +1410,7 @@ pub(crate) async fn complete_once(
                                             request_log_for_l1_hit(
                                                 &entry,
                                                 ctx,
+                                                &requested_model,
                                                 trace_id,
                                                 request_started,
                                                 matched_route_id,
@@ -2027,6 +2034,10 @@ pub(crate) async fn complete_once(
         api_key_id: ctx.api_key_id,
         ts: Utc::now(),
         provider: provider_id.clone(),
+        // Preserve the exact matcher input separately from the final served
+        // model so historical `model_in` evidence never has to infer it from
+        // routing/failover output.
+        requested_model: Some(requested_model.clone()),
         model: model_used.clone(),
         input_tokens: response.usage.prompt_tokens as i32,
         output_tokens: response.usage.completion_tokens as i32,
@@ -4200,6 +4211,7 @@ async fn handle_streaming(
                             request_log_for_l1_hit(
                                 &entry,
                                 ctx,
+                                &requested_model,
                                 trace_id,
                                 request_started,
                                 matched_route_id,
@@ -4488,6 +4500,7 @@ async fn handle_streaming(
                 api_key_id: ctx.api_key_id,
                 trace_id,
                 provider_id: provider.id().to_string(),
+                requested_model: requested_model.clone(),
                 model: served_model.clone(),
                 input_tokens: estimated_input_tokens,
                 cached_tokens: 0,
@@ -7080,6 +7093,7 @@ fn maybe_spawn_l2_hit_judge(
 fn request_log_for_l1_hit(
     entry: &L1Entry,
     ctx: &RequestContext,
+    requested_model: &str,
     trace_id: Uuid,
     request_started: Instant,
     route_id: Option<Uuid>,
@@ -7105,6 +7119,7 @@ fn request_log_for_l1_hit(
         api_key_id: ctx.api_key_id,
         ts: Utc::now(),
         provider: provider_id,
+        requested_model: Some(requested_model.to_owned()),
         model: entry.response.model.clone(),
         input_tokens: entry.response.usage.prompt_tokens as i32,
         output_tokens: entry.response.usage.completion_tokens as i32,
@@ -7186,6 +7201,7 @@ fn request_log_for_l1_hit(
 fn request_log_for_l2_hit(
     entry: &CacheEntry,
     ctx: &RequestContext,
+    requested_model: &str,
     trace_id: Uuid,
     request_started: Instant,
     route_id: Option<Uuid>,
@@ -7202,6 +7218,7 @@ fn request_log_for_l2_hit(
         api_key_id: ctx.api_key_id,
         ts: Utc::now(),
         provider: "cache".into(),
+        requested_model: Some(requested_model.to_owned()),
         model: entry.model.clone(),
         input_tokens: entry.input_tokens as i32,
         output_tokens: entry.output_tokens as i32,
@@ -7773,6 +7790,7 @@ mod cache_header_tests {
         let row = request_log_for_l1_hit(
             &l1_entry(1, 0.0045),
             &ctx,
+            "caller-model",
             Uuid::now_v7(),
             Instant::now(),
             Some(route_id),
@@ -7782,6 +7800,7 @@ mod cache_header_tests {
         );
         assert_eq!(row.route_id, Some(route_id));
         assert_eq!(row.route_version_id, Some(9_876_543_210));
+        assert_eq!(row.requested_model.as_deref(), Some("caller-model"));
     }
 
     #[test]
@@ -8408,6 +8427,7 @@ mod l2_baseline_tests {
         let row = request_log_for_l2_hit(
             &entry(Some(0.0123)),
             &ctx,
+            "caller-model",
             Uuid::now_v7(),
             Instant::now(),
             Some(route_id),
@@ -8420,6 +8440,7 @@ mod l2_baseline_tests {
         );
         assert_eq!(row.route_id, Some(route_id));
         assert_eq!(row.route_version_id, Some(9_876_543_210));
+        assert_eq!(row.requested_model.as_deref(), Some("caller-model"));
     }
 
     /// The row's stored catalog baseline is authoritative — current pricing
@@ -10850,6 +10871,7 @@ mod telemetry_drain_tests {
             api_key_id: Uuid::nil(),
             ts: Utc::now(),
             provider: "openai".into(),
+            requested_model: None,
             model: "gpt-4o".into(),
             input_tokens: 10,
             output_tokens: 5,

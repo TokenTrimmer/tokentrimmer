@@ -389,6 +389,7 @@ async fn l2_hit_serves_cached_response_without_provider_call() {
     let row = &rows[0];
     assert_eq!(row.cache_layer.as_deref(), Some("l2"));
     assert!(row.cached);
+    assert_eq!(row.requested_model.as_deref(), Some("counting-1"));
     assert_eq!(row.cache_read_input_tokens, None);
     assert_eq!(row.cache_creation_input_tokens, None);
 }

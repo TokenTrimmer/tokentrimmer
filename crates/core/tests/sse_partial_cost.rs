@@ -148,6 +148,7 @@ fn make_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         api_key_id: Uuid::nil(),
         trace_id: Uuid::nil(),
         provider_id: "mock".into(),
+        requested_model: "caller-stream-model".into(),
         model: "test-model".into(),
         input_tokens: 20,
         cached_tokens: 0,
@@ -262,6 +263,7 @@ async fn sse_truncated_drop_writes_row_with_truncated_true() {
     );
     assert_eq!(row.input_tokens, 20);
     assert_eq!(row.provider, "mock");
+    assert_eq!(row.requested_model.as_deref(), Some("caller-stream-model"));
     assert_eq!(row.model, "test-model");
 }
 

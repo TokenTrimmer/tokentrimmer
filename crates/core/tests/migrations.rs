@@ -265,6 +265,39 @@ fn migrator_includes_route_version_request_provenance() {
     );
 }
 
+#[test]
+fn migrator_includes_requested_model_snapshot_provenance() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_second = migrations
+        .iter()
+        .find(|m| m.version == 42)
+        .expect("migration version 42 not found");
+    let desc = forty_second.description.to_lowercase();
+    assert!(
+        desc.contains("requested") && desc.contains("model"),
+        "migration 0042 description is '{}', expected to mention requested-model provenance",
+        forty_second.description,
+    );
+
+    let up = include_str!("../migrations/0042_request_logs_requested_model_snapshot.up.sql");
+    assert!(
+        up.contains("requested_model TEXT"),
+        "requested-model snapshots must be nullable TEXT"
+    );
+    assert!(
+        up.contains("request_logs_org_requested_model_ts_idx"),
+        "migration must make snapshot-scoped historical reads indexable"
+    );
+    assert!(
+        !up.to_ascii_lowercase().contains("update request_logs"),
+        "historical request rows must remain honestly without a caller-model snapshot"
+    );
+    assert!(
+        !up.contains("DEFAULT "),
+        "an unknown historical caller model must remain NULL, not acquire a default"
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]
@@ -327,6 +360,18 @@ async fn migrate_only_applies_schema() {
         route_version_column,
         "request_logs.route_version_id BIGINT should exist after migration 0041"
     );
+    let requested_model_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='request_logs' \
+         AND column_name='requested_model' AND data_type='text')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query requested-model snapshot column");
+    assert!(
+        requested_model_column,
+        "request_logs.requested_model TEXT should exist after migration 0042"
+    );
 }
 
 #[test]
@@ -383,6 +428,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
+        requested_model: Some("caller-model".into()),
         model: "test-1".into(),
         input_tokens: 120,
         output_tokens: 60,
@@ -440,6 +486,7 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
     unreported.id = Uuid::now_v7();
     unreported.cache_read_input_tokens = None;
     unreported.cache_creation_input_tokens = None;
+    unreported.requested_model = None;
     let unreported_id = unreported.id;
     writer.write(unreported).await.expect("insert unreported");
 
@@ -453,8 +500,8 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
     let fetch = |id: Uuid| {
         let pool = pool.clone();
         async move {
-            sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
-                "SELECT cache_read_input_tokens, cache_creation_input_tokens \
+            sqlx::query_as::<_, (Option<i32>, Option<i32>, Option<String>)>(
+                "SELECT cache_read_input_tokens, cache_creation_input_tokens, requested_model \
                  FROM request_logs WHERE id = $1",
             )
             .bind(id)
@@ -464,15 +511,18 @@ async fn request_log_insert_round_trips_provider_cache_token_columns() {
         }
     };
 
-    assert_eq!(fetch(reported_id).await, (Some(80), Some(20)));
+    assert_eq!(
+        fetch(reported_id).await,
+        (Some(80), Some(20), Some("caller-model".into()))
+    );
     assert_eq!(
         fetch(unreported_id).await,
-        (None, None),
-        "unreported must persist as SQL NULL"
+        (None, None, None),
+        "unreported cache telemetry and requested-model snapshot must persist as SQL NULL"
     );
     assert_eq!(
         fetch(zero_id).await,
-        (Some(0), Some(0)),
+        (Some(0), Some(0), Some("caller-model".into())),
         "an explicit provider-reported zero must persist as 0, not NULL"
     );
 
@@ -509,6 +559,7 @@ async fn request_log_insert_round_trips_batch_columns() {
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
+        requested_model: None,
         model: "batch-eligible".into(),
         input_tokens: 1000,
         output_tokens: 500,
@@ -630,6 +681,7 @@ async fn request_logs_insert_round_trips_against_postgres() {
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
+        requested_model: None,
         model: "test-1".into(),
         input_tokens: 100,
         output_tokens: 50,
@@ -803,6 +855,7 @@ async fn request_log_insert_round_trips_output_shaping_columns() {
         api_key_id: Uuid::nil(),
         ts: chrono::Utc::now(),
         provider: "test-provider".into(),
+        requested_model: None,
         model: "shaped".into(),
         input_tokens: 1000,
         output_tokens: 50,

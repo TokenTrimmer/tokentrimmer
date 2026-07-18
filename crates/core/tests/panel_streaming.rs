@@ -617,6 +617,7 @@ fn panel_log_ctx(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext {
         api_key_id: Uuid::nil(),
         trace_id: Uuid::nil(),
         provider_id: "panel".into(),
+        requested_model: "caller-panel-model".into(),
         model: "panel-arbiter".into(),
         input_tokens: 20,
         cached_tokens: 0,
@@ -685,6 +686,7 @@ async fn panel_aggregate_row_single_provider_panel_no_double_count() {
         row.model, "panel-arbiter",
         "aggregate row model must be the arbiter model"
     );
+    assert_eq!(row.requested_model.as_deref(), Some("caller-panel-model"));
     assert!(!row.cached, "panel aggregate row must be cached == false");
     assert_eq!(row.route_id, Some(Uuid::from_u128(0x42)));
     assert_eq!(
@@ -872,6 +874,7 @@ fn panel_log_ctx_live(writer: Arc<InMemoryRequestLogWriter>) -> StreamLogContext
         api_key_id: Uuid::nil(),
         trace_id: Uuid::nil(),
         provider_id: "panel".into(),
+        requested_model: "caller-panel-model".into(),
         model: "panel-arbiter".into(),
         // 20 input tokens → nonzero input cost even when output_tokens == 0.
         input_tokens: 20,

@@ -14,6 +14,9 @@ use tt_routing::{RouteConditions, ROUTE_SCHEMA_ID, ROUTE_SCHEMA_VERSION};
 const CORPUS: &str = include_str!(
     "../../../docs/route-preview-contract/tokentrimmer.route-preview-coverage.v1.corpus.json"
 );
+const V2_CORPUS: &str = include_str!(
+    "../../../docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json"
+);
 const CORPUS_FORMAT_ID: &str = "tokentrimmer.route-preview-coverage-corpus";
 const CORPUS_FORMAT_VERSION: u32 = 1;
 
@@ -119,25 +122,102 @@ const EXPECTED_CONDITIONS: [(&str, CoverageClassification, &str); 13] = [
     ),
 ];
 
+const V2_EXPECTED_CONDITIONS: [(&str, CoverageClassification, &str); 13] = [
+    (
+        "model_in",
+        CoverageClassification::Exact,
+        "requested_model_snapshot_retained",
+    ),
+    (
+        "input_tokens_lt",
+        CoverageClassification::Approximate,
+        "realized_input_tokens_not_gateway_estimate",
+    ),
+    (
+        "input_tokens_gt",
+        CoverageClassification::Approximate,
+        "realized_input_tokens_not_gateway_estimate",
+    ),
+    ("tag_equals", CoverageClassification::Exact, "tag_retained"),
+    (
+        "has_images",
+        CoverageClassification::Unavailable,
+        "image_presence_not_retained",
+    ),
+    (
+        "has_audio",
+        CoverageClassification::Unavailable,
+        "audio_presence_not_retained",
+    ),
+    (
+        "has_documents",
+        CoverageClassification::Unavailable,
+        "document_presence_not_retained",
+    ),
+    (
+        "content_type",
+        CoverageClassification::Unavailable,
+        "content_type_not_retained",
+    ),
+    (
+        "prompt_contains_any_of",
+        CoverageClassification::Unavailable,
+        "prompt_content_not_retained",
+    ),
+    (
+        "estimated_cost_gt",
+        CoverageClassification::Unavailable,
+        "gateway_cost_estimate_not_retained",
+    ),
+    (
+        "estimated_cost_lt",
+        CoverageClassification::Unavailable,
+        "gateway_cost_estimate_not_retained",
+    ),
+    (
+        "upstream_latency_ms_p95_gt",
+        CoverageClassification::Unavailable,
+        "live_latency_not_retained",
+    ),
+    (
+        "not_reasoning_class",
+        CoverageClassification::Unavailable,
+        "reasoning_classification_not_retained",
+    ),
+];
+
 #[test]
 fn v1_corpus_covers_each_canonical_route_condition_once() {
+    assert_corpus(CORPUS, CORPUS_FORMAT_VERSION, EXPECTED_CONDITIONS);
+}
+
+#[test]
+fn v2_corpus_covers_each_canonical_route_condition_once() {
+    assert_corpus(V2_CORPUS, 2, V2_EXPECTED_CONDITIONS);
+}
+
+fn assert_corpus(
+    raw: &str,
+    expected_version: u32,
+    expected_conditions: [(&str, CoverageClassification, &str); 13],
+) {
     let corpus: RoutePreviewCoverageCorpus =
-        serde_json::from_str(CORPUS).expect("route-preview coverage corpus must remain valid JSON");
+        serde_json::from_str(raw).expect("route-preview coverage corpus must remain valid JSON");
 
     assert_eq!(corpus.corpus.id, CORPUS_FORMAT_ID);
-    assert_eq!(corpus.corpus.version, CORPUS_FORMAT_VERSION);
+    assert_eq!(corpus.corpus.version, expected_version);
     assert_eq!(corpus.route_contract.id, ROUTE_SCHEMA_ID);
     assert_eq!(corpus.route_contract.version, ROUTE_SCHEMA_VERSION);
     assert_eq!(
         corpus.conditions.len(),
-        EXPECTED_CONDITIONS.len(),
+        expected_conditions.len(),
         "the corpus must carry exactly one entry for every canonical condition"
     );
 
     let canonical_fields = canonical_route_condition_fields();
     let mut seen_fields = HashSet::new();
     for (actual, (field, classification, reason_id)) in
-        corpus.conditions.iter().zip(EXPECTED_CONDITIONS)
+        corpus.conditions.iter().zip(expected_conditions)
     {
         assert!(
             seen_fields.insert(actual.field.as_str()),

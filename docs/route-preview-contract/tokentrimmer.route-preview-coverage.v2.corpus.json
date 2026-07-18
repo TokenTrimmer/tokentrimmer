@@ -1,0 +1,77 @@
+{
+  "corpus": {
+    "id": "tokentrimmer.route-preview-coverage-corpus",
+    "version": 2
+  },
+  "route_contract": {
+    "id": "tokentrimmer.route.v1",
+    "version": 1
+  },
+  "conditions": [
+    {
+      "field": "model_in",
+      "classification": "exact",
+      "reason_id": "requested_model_snapshot_retained"
+    },
+    {
+      "field": "input_tokens_lt",
+      "classification": "approximate",
+      "reason_id": "realized_input_tokens_not_gateway_estimate"
+    },
+    {
+      "field": "input_tokens_gt",
+      "classification": "approximate",
+      "reason_id": "realized_input_tokens_not_gateway_estimate"
+    },
+    {
+      "field": "tag_equals",
+      "classification": "exact",
+      "reason_id": "tag_retained"
+    },
+    {
+      "field": "has_images",
+      "classification": "unavailable",
+      "reason_id": "image_presence_not_retained"
+    },
+    {
+      "field": "has_audio",
+      "classification": "unavailable",
+      "reason_id": "audio_presence_not_retained"
+    },
+    {
+      "field": "has_documents",
+      "classification": "unavailable",
+      "reason_id": "document_presence_not_retained"
+    },
+    {
+      "field": "content_type",
+      "classification": "unavailable",
+      "reason_id": "content_type_not_retained"
+    },
+    {
+      "field": "prompt_contains_any_of",
+      "classification": "unavailable",
+      "reason_id": "prompt_content_not_retained"
+    },
+    {
+      "field": "estimated_cost_gt",
+      "classification": "unavailable",
+      "reason_id": "gateway_cost_estimate_not_retained"
+    },
+    {
+      "field": "estimated_cost_lt",
+      "classification": "unavailable",
+      "reason_id": "gateway_cost_estimate_not_retained"
+    },
+    {
+      "field": "upstream_latency_ms_p95_gt",
+      "classification": "unavailable",
+      "reason_id": "live_latency_not_retained"
+    },
+    {
+      "field": "not_reasoning_class",
+      "classification": "unavailable",
+      "reason_id": "reasoning_classification_not_retained"
+    }
+  ]
+}

@@ -2189,6 +2189,10 @@ pub(crate) async fn complete_panel(
             ts: Utc::now(),
             // Decision-A sentinel: one stamped provider for the aggregate row.
             provider: "panel".to_string(),
+            // The aggregate panel's served model is the arbiter, but routing
+            // evaluated `model_in` against this caller model before the panel
+            // detour. Persist the latter separately for historical evidence.
+            requested_model: Some(prep.requested_model.clone()),
             model: arbiter_model.clone(),
             input_tokens: served.usage.prompt_tokens as i32,
             output_tokens: served.usage.completion_tokens as i32,
@@ -2544,6 +2548,9 @@ pub(crate) async fn complete_panel_streaming(
         // Provider sentinel "panel" — the DropGuard forces the row provider to
         // "panel" for a panel context anyway; this also picks the tokenizer.
         provider_id: "panel".to_string(),
+        // Preserve the pre-routing matcher input rather than substituting the
+        // panel arbiter's served model.
+        requested_model: prep.requested_model.clone(),
         model: arbiter_model.clone(),
         input_tokens: estimated_input_tokens,
         // Panels never cache.

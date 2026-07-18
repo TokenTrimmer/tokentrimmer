@@ -648,6 +648,10 @@ pub struct StreamLogContext {
     pub api_key_id: Uuid,
     pub trace_id: Uuid,
     pub provider_id: String,
+    /// Exact caller model captured before routing; persisted separately from
+    /// the final served `model` so stream rows can support snapshot-scoped
+    /// historical `model_in` evidence.
+    pub requested_model: String,
     pub model: String,
     pub input_tokens: i32,
     pub cached_tokens: i32,
@@ -1121,6 +1125,7 @@ pub fn stream_response(
             let org_id = ctx.org_id;
             let api_key_id = ctx.api_key_id;
             let provider_id_log = ctx.provider_id.clone();
+            let requested_model = ctx.requested_model.clone();
             let model = ctx.model.clone();
             let route_id = ctx.route_id;
             let route_version_id = ctx.route_version_id;
@@ -1288,6 +1293,7 @@ pub fn stream_response(
                     api_key_id,
                     ts: Utc::now(),
                     provider: row_provider,
+                    requested_model: Some(requested_model),
                     model: row_model,
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
