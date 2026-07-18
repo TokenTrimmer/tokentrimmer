@@ -212,6 +212,22 @@ pub(crate) fn enforce_cost_limit(
     Ok(())
 }
 
+/// Preserve the public 402 cost-limit envelope when the failover dispatcher
+/// exhausts a chain because a known-priced candidate exceeds an applicable
+/// request ceiling. Provider failures retain the existing upstream mapping.
+fn map_failover_error(error: crate::failover::FailoverError) -> ApiError {
+    match error {
+        crate::failover::FailoverError::Provider(error) => ApiError::from(error),
+        crate::failover::FailoverError::CostLimitExceeded {
+            estimated_usd,
+            ceiling_usd,
+        } => ApiError::CostLimitExceeded {
+            estimated_usd,
+            ceiling_usd,
+        },
+    }
+}
+
 /// TTL for negative-cache entries (deterministic 4xx errors).
 ///
 /// Short by design: a client error cached for too long would prevent legitimate
@@ -970,6 +986,12 @@ pub(crate) struct Prepared {
     pub failover_candidates: Vec<String>,
     /// Per-provider credentials for the failover candidate set.
     pub failover_creds: std::collections::HashMap<String, ProviderCredentials>,
+    /// Applicable route/header cost ceilings for each failover candidate. The
+    /// route keeps its historical match-time input estimate; the header
+    /// re-estimates the full final prompt with each resolved candidate's
+    /// provider tokenizer. `None` means neither ceiling applies; unknown
+    /// candidate pricing remains permissive.
+    pub failover_cost_check: Option<crate::failover::CandidateCostCheck>,
     /// Route-derived fallback chain (its `is_empty()` selects single vs failover
     /// dispatch — the pipeline reads `route_fallbacks.is_empty()` verbatim).
     pub route_fallbacks: Vec<String>,
@@ -1215,6 +1237,7 @@ pub(crate) async fn complete_once(
         route_shadow_model,
         failover_candidates,
         failover_creds,
+        failover_cost_check,
         route_fallbacks,
         mut warnings,
         request_timeout,
@@ -1483,9 +1506,10 @@ pub(crate) async fn complete_once(
                     required: &cap_required,
                     estimated_tokens: cap_est_tokens,
                 }),
+                failover_cost_check,
             )
             .await
-            .map_err(ApiError::from)
+            .map_err(map_failover_error)
         }
     });
 
@@ -3145,20 +3169,6 @@ pub(crate) async fn prepare(
                 }
             }
         }
-        // Per-request cost ceiling (V3d-2b): reject when the rerouted model's
-        // estimated cost still exceeds the route's max_cost_usd. Permissive when
-        // pricing is unknown (can't prove an exceedance).
-        if let Some(ceiling) = route_max_cost_usd {
-            if let Some(pr) = provider.pricing(&req.model) {
-                let routed_cost = estimate_cost_usd(&pr, route_input_tokens, req.max_tokens);
-                if routed_cost > ceiling {
-                    return Err(ApiError::CostLimitExceeded {
-                        estimated_usd: routed_cost,
-                        ceiling_usd: ceiling,
-                    });
-                }
-            }
-        }
     }
 
     // 2d. Explicit provider pin (X-TokenTrimmer-Provider) — overrides the
@@ -3190,22 +3200,56 @@ pub(crate) async fn prepare(
         }
     }
 
-    // Per-request cost ceiling from the `X-TokenTrimmer-Cost-Limit-Usd` header.
-    // Applies to every request (routed or not), priced on the final model.
-    // Estimate input tokens from the ENTIRE prompt (system + all turns), matching
-    // the streaming/failover paths — counting only the last user message would
-    // undercount multi-turn / large-system-prompt requests and let an over-limit
-    // request slip past the cap.
-    {
-        let combined = tt_shared::message_text_for_estimation(req);
-        let cl_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
+    // Cost ceilings are evaluated only after an explicit provider pin has
+    // settled the actual primary provider. The route ceiling retains its
+    // existing rewrite-only scope (including active modifier-only routes),
+    // while the header applies to every request. The route keeps its original
+    // match-time input estimate; the header prices the whole final prompt.
+    let header_cost_limit = cost_limit_from_header(headers);
+    let combined = tt_shared::message_text_for_estimation(req);
+    let header_input_tokens = tt_tokenize::estimate_tokens(provider.id(), &combined);
+    let primary_pricing = provider.pricing(&req.model);
+    if model_was_rewritten {
         enforce_cost_limit(
-            cost_limit_from_header(headers),
-            provider.pricing(&req.model).as_ref(),
-            cl_input_tokens,
+            route_max_cost_usd,
+            primary_pricing.as_ref(),
+            route_input_tokens,
             req.max_tokens,
         )?;
     }
+    enforce_cost_limit(
+        header_cost_limit,
+        primary_pricing.as_ref(),
+        header_input_tokens,
+        req.max_tokens,
+    )?;
+
+    // The primary is now admitted before any cache lookup. When a chain is
+    // configured, carry the same independent constraints into its candidates.
+    // The route constraint keeps its historical match estimate; the header
+    // constraint is re-estimated from the final prompt for each candidate's
+    // tokenizer before it can obtain credentials, enter a breaker trial, or
+    // make an upstream call.
+    let route_failover_cost = if model_was_rewritten {
+        route_max_cost_usd.map(|ceiling_usd| crate::failover::RouteCostConstraint {
+            ceiling_usd,
+            input_tokens: route_input_tokens,
+            max_tokens: req.max_tokens,
+        })
+    } else {
+        None
+    };
+    let header_failover_cost =
+        header_cost_limit.map(|ceiling_usd| crate::failover::HeaderCostConstraint {
+            ceiling_usd,
+            max_tokens: req.max_tokens,
+        });
+    let failover_cost_check = (!route_fallbacks.is_empty()
+        && (route_failover_cost.is_some() || header_failover_cost.is_some()))
+    .then_some(crate::failover::CandidateCostCheck {
+        route: route_failover_cost,
+        header: header_failover_cost,
+    });
 
     // Fusion panel resolution + fail-closed budget gate (spec
     // §6.4 steps 1-3). Runs HERE, before `Prepared` is built and before any
@@ -3846,9 +3890,13 @@ pub(crate) async fn prepare(
     };
 
     // For a failover chain, pre-resolve upstream credentials for every distinct
-    // provider in the candidate set. The raw-Bearer fallback is allowed only for
-    // the source provider (the bearer is its key); cross-provider candidates with
-    // no stored credential are skipped during dispatch.
+    // candidate provider that is not already known to exceed a request ceiling.
+    // The ordered model list stays intact so the dispatcher can record the
+    // precise cost rejection, but an over-ceiling cross-provider fallback must
+    // not trigger a needless credential-store lookup. The raw-Bearer fallback
+    // is allowed only for the source provider (the bearer is its key);
+    // cross-provider candidates with no stored credential are skipped during
+    // dispatch.
     let (failover_candidates, failover_creds): (
         Vec<String>,
         std::collections::HashMap<String, tt_shared::context::ProviderCredentials>,
@@ -3859,10 +3907,18 @@ pub(crate) async fn prepare(
             .chain(route_fallbacks.iter().cloned())
             .collect();
         // Distinct candidate providers, first-seen order — resolve each one's
-        // credential once.
+        // credential once. Known-priced candidates that fail the route/header
+        // admission check remain in `candidates` for dispatch-time diagnostics,
+        // but are deliberately omitted here so their credentials are never read.
         let mut provider_ids: Vec<String> = Vec::new();
         for m in &candidates {
             if let Some(p) = state.registry.resolve(m) {
+                if failover_cost_check
+                    .and_then(|cost_check| cost_check.violation_for(p.as_ref(), m, req))
+                    .is_some()
+                {
+                    continue;
+                }
                 let pid = p.id().to_string();
                 if !provider_ids.contains(&pid) {
                     provider_ids.push(pid);
@@ -4017,6 +4073,7 @@ pub(crate) async fn prepare(
         route_shadow_model,
         failover_candidates,
         failover_creds,
+        failover_cost_check,
         route_fallbacks,
         warnings,
         request_timeout,
@@ -4086,6 +4143,7 @@ async fn handle_streaming(
         route_shadow_model: _,
         failover_candidates,
         failover_creds,
+        failover_cost_check,
         route_fallbacks,
         warnings,
         request_timeout,
@@ -4273,9 +4331,10 @@ async fn handle_streaming(
                         required: &cap_required,
                         estimated_tokens: cap_est_tokens,
                     }),
+                    failover_cost_check,
                 )
                 .await
-                .map_err(ApiError::from)
+                .map_err(map_failover_error)
             }
         })
         .await;

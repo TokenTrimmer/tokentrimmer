@@ -3,10 +3,11 @@
 //! through. Cost is estimated pre-flight from the requested model's pricing and
 //! the request's `max_tokens`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use futures::stream::{BoxStream, StreamExt};
@@ -87,6 +88,81 @@ impl Provider for RecordingProvider {
                 index: 0,
                 message: Message::Assistant {
                     content: Some(MessageContent::Text("ok".into())),
+                    tool_calls: vec![],
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 5,
+                total_tokens: 10,
+                cached_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        })
+    }
+    async fn chat_completion_stream(
+        &self,
+        _req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Ok(futures::stream::iter(vec![]).boxed())
+    }
+    async fn embeddings(
+        &self,
+        _req: EmbeddingsRequest,
+        _ctx: &RequestContext,
+    ) -> Result<EmbeddingsResponse, ProviderError> {
+        Err(ProviderError::Unsupported("no".into()))
+    }
+}
+
+/// An id-only provider selectable only via `X-TokenTrimmer-Provider`. It
+/// intentionally prices the routed model far above the normal provider, so a
+/// test can prove the route ceiling is evaluated after pinning.
+struct ExpensivePinnedProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for ExpensivePinnedProvider {
+    fn id(&self) -> &'static str {
+        "expensive-pin"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![]
+    }
+    fn pricing(&self, _model: &str) -> Option<ModelPricing> {
+        Some(ModelPricing {
+            input_per_million: 0.1,
+            output_per_million: 1_000.0,
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            batch_input_per_million: None,
+            batch_output_per_million: None,
+            flex_input_per_million: None,
+            flex_output_per_million: None,
+            prompt_cache_min_tokens: None,
+            effective_at: Utc::now(),
+        })
+    }
+    async fn chat_completion(
+        &self,
+        req: ChatCompletionRequest,
+        _ctx: &RequestContext,
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-expensive-pin".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: req.model,
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text("should not dispatch".into())),
                     tool_calls: vec![],
                     name: None,
                 },
@@ -309,5 +385,102 @@ async fn reroute_then_block_on_ceiling() {
     assert_eq!(
         served.lock().unwrap().clone(),
         vec!["gpt-4o-mini".to_string()]
+    );
+}
+
+/// A provider pin is resolved after routing and can therefore change the
+/// price of the routed model. The route's own ceiling must be re-evaluated on
+/// that pinned provider before anything is dispatched.
+#[tokio::test]
+async fn route_ceiling_is_rechecked_after_provider_pin() {
+    let served = Arc::new(Mutex::new(Vec::new()));
+    let pinned_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RecordingProvider {
+        served: Arc::clone(&served),
+    }));
+    registry.register(Arc::new(ExpensivePinnedProvider {
+        calls: Arc::clone(&pinned_calls),
+    }));
+
+    let raw = InMemoryKeyStore::new();
+    let org = Uuid::now_v7();
+    let key = issue_key_for(&raw, org).await;
+    let key_store: Arc<dyn KeyStore> = Arc::new(raw);
+
+    let backing = Arc::new(InMemoryRoutingStore::new());
+    backing.set_routes(
+        org,
+        vec![Route {
+            paused: false,
+            id: Uuid::now_v7(),
+            name: "downgrade-and-cap-after-pin".into(),
+            priority: 100,
+            enabled: true,
+            when: RouteConditions {
+                model_in: vec!["gpt-4o".into()],
+                ..Default::default()
+            },
+            then: RouteAction {
+                workflow: None,
+                format_switch: None,
+                diff: false,
+                auto_pause: false,
+                pause_floor_pass_rate: None,
+                pause_min_verdicts: None,
+                minify_json: false,
+                reasoning_max_effort: None,
+                reasoning_budget_tokens: None,
+                agentic_budget: None,
+                target_model: Some("gpt-4o-mini".into()),
+                fallbacks: Vec::new(),
+                disable_cache: false,
+                // gpt-4o-mini at the normal provider is ~$0.00006 for this
+                // request; the pinned provider is ~$0.1.
+                max_cost_usd: Some(0.0008),
+                flex: false,
+                batch: false,
+                compress: false,
+                doc_compaction: false,
+                document_lane: false,
+                content_compress: false,
+                redact: false,
+                traffic_pct: None,
+                shadow_model: None,
+                panel: None,
+            },
+        }],
+    );
+    let routing = Arc::new(CachingRoutingStore::new(backing as Arc<dyn RoutingStore>));
+    let app = build_router(
+        AppState::new(registry)
+            .with_key_store(key_store)
+            .with_routing_store(routing),
+    );
+
+    let mut request = chat_req("gpt-4o", &key, 100);
+    request
+        .headers_mut()
+        .insert("x-tokentrimmer-provider", "expensive-pin".parse().unwrap());
+
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "the route ceiling must use the pinned provider's price"
+    );
+    let bytes = to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("JSON error body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON error response");
+    assert_eq!(body["error"]["code"], "cost_limit_exceeded", "got {body}");
+    assert!(
+        served.lock().unwrap().is_empty(),
+        "the normal routed provider must not be dispatched"
+    );
+    assert_eq!(
+        pinned_calls.load(Ordering::Relaxed),
+        0,
+        "the over-ceiling pinned provider must not be dispatched"
     );
 }

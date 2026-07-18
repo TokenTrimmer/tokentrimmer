@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use futures::stream::BoxStream;
@@ -28,6 +28,22 @@ struct MockProvider {
     models: &'static [&'static str],
     fails: bool,
     calls: Arc<AtomicUsize>,
+    pricing: ModelPricing,
+}
+
+fn mock_pricing(input_per_million: f64, output_per_million: f64) -> ModelPricing {
+    ModelPricing {
+        input_per_million,
+        output_per_million,
+        cached_input_per_million: None,
+        cache_write_per_million: None,
+        batch_input_per_million: None,
+        batch_output_per_million: None,
+        flex_input_per_million: None,
+        flex_output_per_million: None,
+        prompt_cache_min_tokens: None,
+        effective_at: Utc::now(),
+    }
 }
 
 #[async_trait]
@@ -48,18 +64,7 @@ impl Provider for MockProvider {
             .collect()
     }
     fn pricing(&self, _model: &str) -> Option<ModelPricing> {
-        Some(ModelPricing {
-            input_per_million: 0.1,
-            output_per_million: 0.1,
-            cached_input_per_million: None,
-            cache_write_per_million: None,
-            batch_input_per_million: None,
-            batch_output_per_million: None,
-            flex_input_per_million: None,
-            flex_output_per_million: None,
-            prompt_cache_min_tokens: None,
-            effective_at: Utc::now(),
-        })
+        Some(self.pricing.clone())
     }
     async fn chat_completion(
         &self,
@@ -126,6 +131,34 @@ fn req(model: &str, fallback_header: Option<&str>) -> Request<Body> {
     b.body(Body::from(body.to_string())).unwrap()
 }
 
+fn cost_limited_fallback_request(model: &str, fallback: &str) -> Request<Body> {
+    let body = json!({
+        "model": model,
+        "messages": [{"role":"user","content":"hi"}],
+        "max_tokens": 100,
+        "stream": false,
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-tokentrimmer-fallback", fallback)
+        .header("x-tokentrimmer-cost-limit-usd", "0.001")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn error_code(resp: axum::response::Response) -> String {
+    let bytes = to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("error response body");
+    serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON error response")["error"]
+        ["code"]
+        .as_str()
+        .expect("error code")
+        .to_owned()
+}
+
 fn served_model(resp: &axum::http::Response<Body>) -> Option<String> {
     resp.headers()
         .get("x-tokentrimmer-model-used")
@@ -143,12 +176,14 @@ async fn fallback_header_enables_failover_without_route() {
         models: &["m-primary"],
         fails: true,
         calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
     }));
     registry.register(Arc::new(MockProvider {
         id: "backup",
         models: &["m-backup"],
         fails: false,
         calls: Arc::clone(&backup_calls),
+        pricing: mock_pricing(0.1, 0.1),
     }));
     // No routing store — the header alone supplies the chain.
     let app = build_router(AppState::new(registry));
@@ -173,6 +208,51 @@ async fn fallback_header_enables_failover_without_route() {
     );
 }
 
+/// The header ceiling is a per-request bound, not a primary-only admission
+/// check: after the cheap primary returns a retryable 503, a known-priced
+/// expensive header fallback must return the normal 402 without dispatching.
+#[tokio::test]
+async fn cost_limit_header_blocks_priced_fallback_after_primary_503() {
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let backup_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(MockProvider {
+        id: "primary",
+        models: &["m-primary"],
+        fails: true,
+        calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
+    }));
+    registry.register(Arc::new(MockProvider {
+        id: "expensive-backup",
+        models: &["m-backup"],
+        fails: false,
+        calls: Arc::clone(&backup_calls),
+        pricing: mock_pricing(0.1, 1_000.0),
+    }));
+    let app = build_router(AppState::new(registry));
+
+    let resp = app
+        .oneshot(cost_limited_fallback_request("m-primary", "m-backup"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "the cost-limited fallback chain must surface the normal 402"
+    );
+    assert_eq!(error_code(resp).await, "cost_limit_exceeded");
+    assert!(
+        primary_calls.load(Ordering::Relaxed) >= 1,
+        "the cheap primary must be attempted before recovery"
+    );
+    assert_eq!(
+        backup_calls.load(Ordering::Relaxed),
+        0,
+        "an over-ceiling header fallback must not be dispatched"
+    );
+}
+
 #[tokio::test]
 async fn provider_pin_suppresses_fallback_header() {
     // A provider pin wins over X-TokenTrimmer-Fallback: the request dispatches to
@@ -187,18 +267,21 @@ async fn provider_pin_suppresses_fallback_header() {
         models: &["m-primary"],
         fails: false,
         calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
     }));
     registry.register(Arc::new(MockProvider {
         id: "pinned",
         models: &["m-pinned"],
         fails: false,
         calls: Arc::clone(&pinned_calls),
+        pricing: mock_pricing(0.1, 0.1),
     }));
     registry.register(Arc::new(MockProvider {
         id: "other",
         models: &["m-other"],
         fails: false,
         calls: Arc::clone(&other_calls),
+        pricing: mock_pricing(0.1, 0.1),
     }));
     let app = build_router(AppState::new(registry));
 
@@ -243,18 +326,21 @@ async fn fallback_header_overrides_route_chain() {
         models: &["gpt-4o", "primary-model"],
         fails: true,
         calls: Arc::clone(&primary_calls),
+        pricing: mock_pricing(0.1, 0.1),
     }));
     registry.register(Arc::new(MockProvider {
         id: "routefb",
         models: &["route-fb"],
         fails: false,
         calls: Arc::clone(&routefb_calls),
+        pricing: mock_pricing(0.1, 0.1),
     }));
     registry.register(Arc::new(MockProvider {
         id: "hdrfb",
         models: &["hdr-fb"],
         fails: false,
         calls: Arc::clone(&hdrfb_calls),
+        pricing: mock_pricing(0.1, 0.1),
     }));
 
     // Route rewrites gpt-4o → primary-model with its OWN fallback chain [route-fb].

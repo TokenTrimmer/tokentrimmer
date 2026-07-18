@@ -24,9 +24,8 @@ use tt_shared::{
 use crate::middleware::trace::TraceId;
 use crate::routes::chat::{
     apply_provider_override, apply_routing, attach_cost_headers, compute_cost,
-    cost_limit_from_header, enforce_cost_limit, estimate_cost_usd, provider_override_from_header,
-    resolve_credentials, resolve_credentials_for, timeout_ms_from_header, with_request_timeout,
-    CostBreakdown,
+    cost_limit_from_header, enforce_cost_limit, provider_override_from_header, resolve_credentials,
+    resolve_credentials_for, timeout_ms_from_header, with_request_timeout, CostBreakdown,
 };
 use crate::{ApiError, ApiResult, AppState};
 
@@ -172,6 +171,14 @@ pub async fn handler(
     let route_match = apply_routing(&state, &ctx, &mut synth, None).await?;
     req.model = synth.model; // adopt the routed model
     let matched = route_match.is_some();
+    // Keep the route's original matcher estimate for its per-request ceiling.
+    // It is evaluated only after an optional provider pin settles the actual
+    // serving provider below.
+    let route_max_cost_usd = route_match.as_ref().and_then(|m| m.max_cost_usd);
+    let route_input_tokens = route_match
+        .as_ref()
+        .map(|m| m.input_tokens_estimate)
+        .unwrap_or(0);
     if matched {
         provider = state
             .registry
@@ -187,22 +194,6 @@ pub async fn handler(
                     return Err(ApiError::MissingProviderCredential {
                         provider: provider.id().to_string(),
                     })
-                }
-            }
-        }
-        // Post-rewrite cost ceiling (V3d-2b). Output tokens are 0 for embeddings.
-        if let Some(ceiling) = route_match.as_ref().and_then(|m| m.max_cost_usd) {
-            if let Some(pr) = provider.pricing(&req.model) {
-                let tokens = route_match
-                    .as_ref()
-                    .map(|m| m.input_tokens_estimate)
-                    .unwrap_or(0);
-                let routed_cost = estimate_cost_usd(&pr, tokens, None);
-                if routed_cost > ceiling {
-                    return Err(ApiError::CostLimitExceeded {
-                        estimated_usd: routed_cost,
-                        ceiling_usd: ceiling,
-                    });
                 }
             }
         }
@@ -223,6 +214,19 @@ pub async fn handler(
     provider = pinned_provider;
     if let Some(c) = pin_creds {
         ctx.credentials = c;
+    }
+
+    // A pin can select a different provider and therefore a different price
+    // for the routed model. Preserve the route ceiling's existing matched-route
+    // scope, but apply it only after that final provider selection. Output
+    // tokens are zero for embeddings; unknown pricing remains permissive.
+    if matched {
+        enforce_cost_limit(
+            route_max_cost_usd,
+            provider.pricing(&req.model).as_ref(),
+            route_input_tokens,
+            None,
+        )?;
     }
 
     // BYO-only (P0 #9): same dispatch-time guard as chat.rs — the serving
