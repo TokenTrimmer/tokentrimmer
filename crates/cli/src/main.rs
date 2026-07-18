@@ -20,7 +20,7 @@ use tt_cli::eval_shadow::EvalAction;
 /// list keeps each command's one-line description.
 const COMMAND_GROUPS: &str = "\
 Command groups:
-  Run             gateway, proxy, chat, agent, embed, models, batch
+  Run             gateway, proxy, chat, agent, embed, models, capabilities, batch
   Optimize        inspect, plan, route, recipes, advise, workflow
   Prove           audit, verify-receipt
   Account         login, logout, whoami, connect
@@ -311,6 +311,20 @@ enum Command {
     },
     /// List the gateway's model catalog (context windows, capabilities, pricing).
     Models {
+        #[arg(long)]
+        tt_api_key: Option<String>,
+        #[arg(long)]
+        tt_api_base: Option<String>,
+    },
+    /// Show one authenticated gateway process's bounded runtime capability snapshot.
+    ///
+    /// This is advisory evidence for that responding process only. It does not
+    /// prove fleet consistency, provider/model/credential readiness, later
+    /// request success, route activation, or execution.
+    Capabilities {
+        /// Print the normalized bounded snapshot as JSON.
+        #[arg(long)]
+        json: bool,
         #[arg(long)]
         tt_api_key: Option<String>,
         #[arg(long)]
@@ -1294,6 +1308,13 @@ async fn main() -> anyhow::Result<()> {
             tt_api_base,
         } => {
             tt_cli::catalog::run(tt_api_key, tt_api_base).await?;
+        }
+        Command::Capabilities {
+            json,
+            tt_api_key,
+            tt_api_base,
+        } => {
+            tt_cli::capabilities::run(tt_api_key, tt_api_base, json).await?;
         }
         Command::Advise {
             path,
