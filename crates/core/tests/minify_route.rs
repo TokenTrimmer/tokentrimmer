@@ -44,6 +44,8 @@ use tt_telemetry::request_logs::{InMemoryRequestLogWriter, RequestLogRow, Reques
 use uuid::Uuid;
 
 const MODEL: &str = "minify-model";
+const PANEL_MEMBER: &str = "minify-panel-member";
+const PANEL_ARBITER: &str = "minify-panel-arbiter";
 const INSTRUCTION_FRAGMENT: &str = "emit it minified";
 
 /// A sizable JSON value so the pretty-vs-minified tokenizer delta is clearly
@@ -69,7 +71,7 @@ impl Provider for MinifyRecordingProvider {
         "minifyrec"
     }
     fn models(&self) -> Vec<ModelInfo> {
-        [MODEL, "other-model"]
+        [MODEL, "other-model", PANEL_MEMBER, PANEL_ARBITER]
             .into_iter()
             .map(|id| ModelInfo {
                 id: id.into(),
@@ -254,6 +256,7 @@ async fn harness() -> Harness {
         AppState::new(registry)
             .with_key_store(key_store)
             .with_routing_store(routing)
+            .with_panel_enabled(true)
             .with_request_log_writer(log_writer.clone() as Arc<dyn RequestLogWriter>),
     );
     Harness {
@@ -279,6 +282,38 @@ fn chat_request(model: &str, bearer: &str, stream: bool) -> Request<Body> {
                     {"role": "user", "content": "List the items."}
                 ],
                 "stream": stream,
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// A header-selected Fusion panel on a minify-only route. The panel config is
+/// deliberately request-scoped (`tt_extras.panel`) so this exercises the
+/// header path rather than a route `then.panel` trigger.
+fn header_panel_request(bearer: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("x-tokentrimmer-panel", "synthesize")
+        .header("x-tokentrimmer-cost-limit-usd", "10.0")
+        .body(Body::from(
+            json!({
+                "model": MODEL,
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "system", "content": "You are an API."},
+                    {"role": "user", "content": "List the items."}
+                ],
+                "stream": false,
+                "tt_extras": {
+                    "panel": {
+                        "members": [MODEL, PANEL_MEMBER],
+                        "arbiter_model": PANEL_ARBITER
+                    }
+                }
             })
             .to_string(),
         ))
@@ -313,6 +348,24 @@ fn last_system_text(dispatched: &Arc<Mutex<Vec<Vec<Message>>>>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn dispatch_contains_instruction(messages: &[Message]) -> bool {
+    messages.iter().any(|message| match message {
+        Message::System {
+            content: MessageContent::Text(text),
+        } => text.contains(INSTRUCTION_FRAGMENT),
+        Message::System {
+            content: MessageContent::Parts(parts),
+        } => parts.iter().any(|part| {
+            matches!(
+                part,
+                tt_shared::messages::ContentPart::Text { text }
+                    if text.contains(INSTRUCTION_FRAGMENT)
+            )
+        }),
+        _ => false,
+    })
 }
 
 /// Wait for the fire-and-forget request-log task, then snapshot the rows.
@@ -458,6 +511,59 @@ async fn minify_route_streaming_injects_but_books_zero() {
         rows[0].minify_saved_est_usd, 0.0,
         "streaming books $0 in v1 (metered only)"
     );
+}
+
+/// A resolved header Fusion panel owns the caller-visible answer. The
+/// minify-only route must not inject its direct-response instruction into any
+/// member or arbiter prompt, and must surface an explicit no-op warning.
+#[tokio::test]
+async fn header_panel_skips_minify_for_all_fusion_legs() {
+    let h = harness().await;
+    let resp = h
+        .app
+        .clone()
+        .oneshot(header_panel_request(&h.key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let warnings = warnings_of(&resp);
+    assert!(
+        warnings
+            .split(',')
+            .any(|warning| warning == "minify_skipped:panel"),
+        "header-selected panel must report the explicit minify no-op, got {warnings:?}"
+    );
+    assert!(
+        !warnings
+            .split(',')
+            .any(|warning| warning == "output_minified"),
+        "the panel path must not claim a minify action, got {warnings:?}"
+    );
+    assert_eq!(
+        header_f64(&resp, "x-tokentrimmer-minify-saved-est-usd"),
+        0.0,
+        "panel aggregate must carry no direct-response minify estimate"
+    );
+
+    let dispatched = h.dispatched.lock().unwrap();
+    assert_eq!(
+        dispatched.len(),
+        3,
+        "two member legs plus one synthesize arbiter must dispatch"
+    );
+    assert!(
+        dispatched
+            .iter()
+            .all(|messages| !dispatch_contains_instruction(messages)),
+        "no Fusion member or arbiter prompt may inherit minify steering: {dispatched:?}"
+    );
+    drop(dispatched);
+
+    let rows = rows_after(&h.log_writer, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].provider, "panel");
+    assert_eq!(rows[0].minify_saved_est_usd, 0.0);
 }
 
 /// (d) An unrouted request dispatches byte-identical: no instruction, no

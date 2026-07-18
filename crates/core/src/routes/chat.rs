@@ -2648,6 +2648,82 @@ fn prepare_route_format_switch(
     }
 }
 
+/// The response owner that bypasses the direct-completion tail for request
+/// transformations that rely on that tail to reconstruct or account for their
+/// result.
+///
+/// A selected Fusion panel owns both streaming and non-streaming responses.
+/// A workflow only owns a non-streaming response: streaming workflow detours
+/// deliberately fall through to the direct streaming path. `skip_shadow`
+/// likewise deliberately drops either detour and preserves the direct path.
+fn non_direct_response_owner(
+    panel_selected: bool,
+    workflow: Option<&tt_routing::RouteWorkflow>,
+    request_stream: bool,
+    skip_shadow: bool,
+) -> Option<&'static str> {
+    if skip_shadow {
+        return None;
+    }
+    if panel_selected {
+        return Some("panel");
+    }
+    if !request_stream && workflow.is_some_and(|cfg| cfg.mode.as_deref() != Some("shadow")) {
+        return Some("workflow");
+    }
+    None
+}
+
+/// Result of deciding and, only when safe, applying a route diff.
+///
+/// Keeping the raw mutation inside this owner-aware helper prevents a panel or
+/// workflow detour from inheriting the patch-only prompt / dropped response
+/// contract that only the direct completion tail knows how to reconstruct.
+enum RouteDiffPreparation {
+    NotRequested,
+    Applied(crate::shaping::diff::DiffPlan),
+    Skipped(&'static str),
+}
+
+/// Apply an eligible route diff unless another response owner takes the
+/// request first.
+///
+/// The planner retains precedence for streaming so existing
+/// `diff_skipped:streaming` observability remains unchanged. A shadow workflow
+/// is passed as no owner because its caller-visible response is still direct.
+fn prepare_route_diff(
+    req: &mut ChatCompletionRequest,
+    requested: bool,
+    response_owner: Option<&'static str>,
+) -> RouteDiffPreparation {
+    if !requested {
+        return RouteDiffPreparation::NotRequested;
+    }
+    if !req.stream {
+        if let Some(owner) = response_owner {
+            return RouteDiffPreparation::Skipped(owner);
+        }
+    }
+
+    match crate::shaping::diff::plan_diff(req, true) {
+        Some(crate::shaping::ShapeDecision::Apply(plan)) => {
+            // No pre-mutation clone is kept: the fail-closed re-emit is
+            // derived from the DISPATCHED request at the failure site
+            // (`unapply_diff_request` — drop the instruction, restore the
+            // plan's response_format) so it inherits every dispatch-path
+            // normalization. A pre-pipeline clone would bypass the redaction
+            // guardrail on a redact+diff route and dispatch un-flexed bytes
+            // that `compute_cost_full` prices at flex rates.
+            crate::shaping::diff::apply_diff_request(req, &plan);
+            RouteDiffPreparation::Applied(plan)
+        }
+        Some(crate::shaping::ShapeDecision::Skip(reason)) => RouteDiffPreparation::Skipped(reason),
+        // `requested` is true above, so the planner cannot return None. Keep
+        // the default explicitly fail-open if that invariant ever changes.
+        None => RouteDiffPreparation::NotRequested,
+    }
+}
+
 /// Run the shared per-request setup for a chat completion and bundle the result
 /// into a [`Prepared`] for the streaming arm / [`complete_once`] / the
 /// server-side agent loop.
@@ -3195,18 +3271,25 @@ pub(crate) async fn prepare(
     // erase the json_schema shape the csv planner reads; once a switch/diff
     // applies, response_format is None and the downgrade no-ops) and before
     // cache-key derivation (the mutated request hashes to its own L1 key).
-    // Both planners gate on `req.stream` internally, so the streaming branch
-    // below is untouched by construction. A resolved, non-shadow Fusion panel
-    // or workflow detour owns the final response instead of the direct
-    // dispatch, so format-switch must not mutate the request for an output
-    // path that cannot validate, advertise, or book that switch. This applies
-    // equally to route- and header-selected panels because both resolve to
-    // `panel` above. `skip_shadow` means complete_once deliberately drops
-    // those owners and takes the direct path, so it remains eligible. Finally,
+    // The diff and format planners gate on `req.stream` internally, so their
+    // streaming behavior remains planner-owned. A resolved, non-shadow Fusion
+    // panel or workflow detour owns the final response instead of the direct
+    // dispatch, so transformations that rely on the direct response tail must
+    // not mutate the request for an output path that cannot validate,
+    // reconstruct, advertise, or book them. This applies equally to route- and
+    // header-selected panels because both resolve to `panel` above.
+    // `skip_shadow` means complete_once deliberately drops those owners and
+    // takes the direct path, so it remains eligible. Finally,
     // format_switch × diff is config-rejected at route creation
     // (`validate_output_shaping`); defensively, if both somehow apply, diff
     // wins and the switch is skipped with the `conflict` token.
-    let diff_decision = crate::shaping::diff::plan_diff(req, route_diff);
+    let response_owner = non_direct_response_owner(
+        panel.is_some(),
+        route_workflow.as_ref(),
+        req.stream,
+        skip_shadow,
+    );
+    let diff_preparation = prepare_route_diff(req, route_diff, response_owner);
     let format_switch_owner = if !skip_shadow && panel.is_some() {
         Some(FormatSwitchResponseOwner::FusionPanel)
     } else if !skip_shadow
@@ -3218,10 +3301,7 @@ pub(crate) async fn prepare(
     } else {
         None
     };
-    let diff_applies = matches!(
-        diff_decision.as_ref(),
-        Some(crate::shaping::ShapeDecision::Apply(_))
-    );
+    let diff_applies = matches!(&diff_preparation, RouteDiffPreparation::Applied(_));
     let mut format_switch_plan: Option<crate::shaping::format_switch::FormatSwitchPlan> = None;
     match prepare_route_format_switch(
         req,
@@ -3237,24 +3317,13 @@ pub(crate) async fn prepare(
         RouteFormatSwitchPreparation::NotRequested => {}
     }
     let mut diff_plan: Option<crate::shaping::diff::DiffPlan> = None;
-    match diff_decision {
-        Some(crate::shaping::ShapeDecision::Apply(p)) => {
-            // No pre-mutation clone is kept: the fail-closed re-emit is
-            // derived from the DISPATCHED request at the failure site
-            // (`unapply_diff_request` — drop the instruction, restore the
-            // plan's response_format) so it inherits every dispatch-path
-            // normalization. A pre-pipeline clone would bypass the
-            // redaction guardrail on a redact+diff route and dispatch
-            // un-flexed bytes that `compute_cost_full` prices at flex
-            // rates.
-            crate::shaping::diff::apply_diff_request(req, &p);
-            diff_plan = Some(p);
+    match diff_preparation {
+        RouteDiffPreparation::Applied(plan) => diff_plan = Some(plan),
+        RouteDiffPreparation::Skipped(reason) => {
+            warnings.push(format!("diff_skipped:{reason}"));
+            crate::metrics::record_diff("skipped", reason);
         }
-        Some(crate::shaping::ShapeDecision::Skip(r)) => {
-            warnings.push(format!("diff_skipped:{r}"));
-            crate::metrics::record_diff("skipped", r);
-        }
-        None => {}
+        RouteDiffPreparation::NotRequested => {}
     }
 
     maybe_downgrade_response_format(req, provider.as_ref(), &mut warnings);
@@ -3303,7 +3372,13 @@ pub(crate) async fn prepare(
     // suffix is deterministic-on-ingress, so no provider prompt-cache bust is
     // booked (redaction precedent). `minify_applied` drives the per-response
     // ESTIMATE (non-streaming only), the metric, and judge eligibility.
-    let minify_applied = maybe_minify_json(req, route_minify, provider.as_ref(), &mut warnings);
+    let minify_applied = prepare_route_minify_json(
+        req,
+        route_minify,
+        provider.as_ref(),
+        response_owner,
+        &mut warnings,
+    );
 
     // Class-gated reasoning-token cap (route action, research Phase 3.2):
     // lowers OpenAI-style `reasoning_effort` / Anthropic-style thinking
@@ -4536,6 +4611,32 @@ fn maybe_mark_batch_eligible(
 /// when rewording.
 pub(crate) const MINIFY_JSON_INSTRUCTION: &str =
     "\n\nWhen responding with JSON, emit it minified: no indentation, no newlines, and no spaces between JSON tokens.";
+
+/// Apply the minify route action only when the direct completion path owns the
+/// caller-visible response.
+///
+/// A Fusion panel fans out the prepared request (including a header-selected
+/// panel), while a non-shadow workflow consumes it for its own result. Neither
+/// path has the direct tail's minify validation or accounting contract, so a
+/// requested action becomes an explicit no-op rather than silently steering
+/// those internal prompts. Streaming panels are still response owners; a
+/// streaming workflow is not, because that detour falls through to direct
+/// streaming. `response_owner` encodes those distinctions.
+fn prepare_route_minify_json(
+    req: &mut ChatCompletionRequest,
+    requested: bool,
+    provider: &dyn tt_shared::Provider,
+    response_owner: Option<&'static str>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if requested {
+        if let Some(owner) = response_owner {
+            warnings.push(format!("minify_skipped:{owner}"));
+            return false;
+        }
+    }
+    maybe_minify_json(req, requested, provider, warnings)
+}
 
 /// Apply the minify-JSON route action: append [`MINIFY_JSON_INSTRUCTION`] to
 /// the LAST system message (inserting one at index 0 when the request has
@@ -9787,6 +9888,24 @@ mod output_shaping_tests {
         req
     }
 
+    /// A request that is otherwise eligible for the diff patch contract.
+    fn diff_ready_request() -> ChatCompletionRequest {
+        let mut req = req_with_messages(vec![sys("Edit precisely."), user("revise this")]);
+        req.tt_extras.insert(
+            crate::shaping::diff::TT_EXTRA_DIFF_PRIOR.to_string(),
+            serde_json::json!("x".repeat(crate::shaping::diff::MIN_PRIOR_CHARS + 1)),
+        );
+        req
+    }
+
+    fn workflow_config(mode: Option<&str>) -> tt_routing::RouteWorkflow {
+        tt_routing::RouteWorkflow {
+            workflow_id: "00000000-0000-0000-0000-000000000001".into(),
+            max_cost_usd: None,
+            mode: mode.map(str::to_string),
+        }
+    }
+
     fn assistant_text_response(texts: &[&str]) -> ChatCompletionResponse {
         ChatCompletionResponse {
             id: "r".into(),
@@ -10446,6 +10565,132 @@ mod output_shaping_tests {
             RouteFormatSwitchPreparation::Skipped("streaming")
         ));
         assert_eq!(serde_json::to_string(&req).unwrap(), before);
+    }
+
+    #[test]
+    fn response_owner_gate_keeps_only_real_direct_paths_eligible() {
+        let detour = workflow_config(None);
+        let shadow = workflow_config(Some("shadow"));
+
+        assert_eq!(
+            non_direct_response_owner(true, None, false, false),
+            Some("panel"),
+            "a non-streaming Fusion panel owns its response"
+        );
+        assert_eq!(
+            non_direct_response_owner(true, None, true, false),
+            Some("panel"),
+            "a streaming Fusion panel still owns its response"
+        );
+        assert_eq!(
+            non_direct_response_owner(false, Some(&detour), false, false),
+            Some("workflow"),
+            "a non-shadow workflow replaces the direct non-streaming response"
+        );
+        assert_eq!(
+            non_direct_response_owner(false, Some(&detour), true, false),
+            None,
+            "streaming workflow detours fall through to direct streaming"
+        );
+        assert_eq!(
+            non_direct_response_owner(false, Some(&shadow), false, false),
+            None,
+            "shadow workflow results are not caller-visible"
+        );
+        assert_eq!(
+            non_direct_response_owner(true, None, false, true),
+            None,
+            "skip_shadow deliberately takes the direct path"
+        );
+    }
+
+    #[test]
+    fn response_owners_skip_minify_without_mutating_internal_prompts() {
+        let provider = ShapeProvider {
+            schema: true,
+            drops: &[],
+        };
+
+        for owner in ["panel", "workflow"] {
+            let mut req = req_with_messages(vec![sys("Keep the original prompt."), user("hi")]);
+            let before = serde_json::to_string(&req).unwrap();
+            let mut warnings = Vec::new();
+            let applied =
+                prepare_route_minify_json(&mut req, true, &provider, Some(owner), &mut warnings);
+
+            assert!(
+                !applied,
+                "{owner} must not inherit direct-response minify steering"
+            );
+            assert_eq!(
+                serde_json::to_string(&req).unwrap(),
+                before,
+                "{owner} request must remain byte-identical"
+            );
+            assert_eq!(warnings, vec![format!("minify_skipped:{owner}")]);
+        }
+
+        let mut direct = req_with_messages(vec![sys("Direct response."), user("hi")]);
+        let mut warnings = Vec::new();
+        assert!(prepare_route_minify_json(
+            &mut direct,
+            true,
+            &provider,
+            None,
+            &mut warnings,
+        ));
+        assert_eq!(warnings, vec!["output_minified".to_string()]);
+        assert!(direct.messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::System {
+                    content: MessageContent::Text(text),
+                } if text.contains(MINIFY_JSON_INSTRUCTION)
+            )
+        }));
+    }
+
+    #[test]
+    fn response_owners_skip_diff_without_dropping_the_caller_contract() {
+        for owner in ["panel", "workflow"] {
+            let mut req = diff_ready_request();
+            let before = serde_json::to_string(&req).unwrap();
+
+            let outcome = prepare_route_diff(&mut req, true, Some(owner));
+
+            assert!(matches!(outcome, RouteDiffPreparation::Skipped(reason) if reason == owner));
+            assert_eq!(
+                serde_json::to_string(&req).unwrap(),
+                before,
+                "{owner} must retain diff_prior and avoid the patch instruction"
+            );
+        }
+
+        let mut direct = diff_ready_request();
+        let outcome = prepare_route_diff(&mut direct, true, None);
+        assert!(matches!(outcome, RouteDiffPreparation::Applied(_)));
+        assert!(
+            !direct
+                .tt_extras
+                .contains_key(crate::shaping::diff::TT_EXTRA_DIFF_PRIOR),
+            "the direct patch dispatch consumes the explicit prior"
+        );
+        assert!(matches!(
+            direct.messages.last(),
+            Some(Message::System {
+                content: MessageContent::Text(text),
+            }) if text == crate::shaping::diff::DIFF_INSTRUCTION
+        ));
+
+        let mut streaming_panel = diff_ready_request();
+        streaming_panel.stream = true;
+        let before = serde_json::to_string(&streaming_panel).unwrap();
+        let outcome = prepare_route_diff(&mut streaming_panel, true, Some("panel"));
+        assert!(matches!(
+            outcome,
+            RouteDiffPreparation::Skipped("streaming")
+        ));
+        assert_eq!(serde_json::to_string(&streaming_panel).unwrap(), before);
     }
 }
 
