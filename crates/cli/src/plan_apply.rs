@@ -1,5 +1,6 @@
-//! Local `tt plan --apply`: write the projected routes to the gateway's
-//! Postgres `routes` table and emit a signed `plan.applied` audit row.
+//! Local `tt plan --apply`: write projected routes as disabled drafts to the
+//! gateway's Postgres `routes` table and emit a signed `plan.applied` audit
+//! row.
 
 use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
@@ -26,8 +27,9 @@ pub struct ApplyPlan {
     pub skipped_existing: Vec<String>,
 }
 
-/// Convert proposed routes (plan-core types) into canonical `tt_routing::NewRoute`
-/// specs, dropping no-ops and names that already exist. Pure — no DB, no IO.
+/// Convert proposed routes (plan-core types) into canonical, disabled-draft
+/// `tt_routing::NewRoute` specs, dropping no-ops and names that already exist.
+/// Pure — no DB, no IO.
 ///
 /// `tt_plan_core::types::{RouteConditions, RouteAction}` and the
 /// `tt_routing::{RouteConditions, RouteAction}` are MIRRORED but DISTINCT types
@@ -70,10 +72,15 @@ pub fn plan_routes_to_apply(
             continue;
         }
 
+        // Plan proposals are advisory. This direct Postgres writer has no
+        // control-plane activation confirmation, so it must never carry an
+        // enabled proposal into a live route. Materialize every effective new
+        // proposal as a disabled draft; the normal Dashboard/control-plane
+        // activation flow performs the separate, freshly confirmed enable.
         let spec = NewRoute {
             name: r.name.clone(),
             priority: r.priority,
-            enabled: r.enabled,
+            enabled: false,
             when,
             then,
         };
@@ -106,8 +113,9 @@ pub fn plan_routes_to_apply(
 }
 
 /// Apply the proposed routes for `org_id`: validate + dedup, confirm,
-/// idempotently create, then emit a signed `plan.applied` audit entry to
-/// `chain_path`. `signing_key` + `chain_path` are injected for testability.
+/// idempotently create disabled drafts, then emit a signed `plan.applied` audit
+/// entry to `chain_path`. `signing_key` + `chain_path` are injected for
+/// testability.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_routes(
     pool: &PgPool,
@@ -146,12 +154,12 @@ pub async fn apply_routes(
     }
 
     crate::ui::note(&format!(
-        "about to create {} route(s) for org {org_id}:",
+        "about to create {} disabled draft route(s) for org {org_id}:",
         plan.to_create.len()
     ));
     for r in &plan.to_create {
         let tgt = r.then.target_model.as_deref().unwrap_or("(modifier-only)");
-        crate::ui::note(&format!("  + {} → {}", r.name, tgt));
+        crate::ui::note(&format!("  + {} → {} (disabled draft)", r.name, tgt));
     }
 
     if !assume_yes {
@@ -160,7 +168,10 @@ pub async fn apply_routes(
                 "refusing to apply without confirmation on a non-interactive stdin — pass --yes to proceed"
             );
         }
-        print!("Apply these {} route(s)? [y/N] ", plan.to_create.len());
+        print!(
+            "Create these {} disabled draft route(s)? [y/N] ",
+            plan.to_create.len()
+        );
         std::io::stdout().flush().ok();
         let mut line = String::new();
         std::io::stdin()
@@ -183,7 +194,7 @@ pub async fn apply_routes(
         created.push(name);
     }
     crate::ui::ok(&format!(
-        "created {} route(s); the gateway applies them on its next refresh (~60s)",
+        "created {} disabled draft route(s); they are not live. Activate them through the normal control-plane/Dashboard route activation flow after fresh confirmation.",
         created.len()
     ));
 
@@ -197,7 +208,7 @@ pub async fn apply_routes(
         local_audit::append_entry(chain_path, signing_key, org_id, "plan.applied", payload)
             .with_context(|| {
                 format!(
-            "{} route(s) were created and are live, but recording the plan.applied proof failed",
+            "{} route(s) were created as disabled drafts, but recording the plan.applied proof failed",
             created.len()
         )
             })?;
@@ -254,6 +265,31 @@ mod tests {
             .expect("ok");
         assert_eq!(plan.to_create.len(), 1);
         assert_eq!(plan.to_create[0].name, "swap-mini");
+        assert!(
+            !plan.to_create[0].enabled,
+            "effective proposals must materialize as disabled drafts"
+        );
+    }
+
+    #[test]
+    fn enabled_and_disabled_proposals_both_materialize_as_disabled_drafts() {
+        let enabled = proposed("enabled-proposal", Some("gpt-4o-mini"));
+        let mut disabled = proposed("disabled-proposal", Some("gpt-4o-mini"));
+        disabled.enabled = false;
+
+        let plan = plan_routes_to_apply(&HashSet::new(), &[enabled, disabled]).expect("ok");
+
+        assert_eq!(
+            plan.to_create
+                .iter()
+                .map(|route| route.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["enabled-proposal", "disabled-proposal"]
+        );
+        assert!(
+            plan.to_create.iter().all(|route| !route.enabled),
+            "the local writer must create only disabled drafts regardless of proposal state"
+        );
     }
 
     #[test]
@@ -413,6 +449,10 @@ mod tests {
             .expect("list");
         assert_eq!(after_first.len(), 1);
         assert_eq!(after_first[0].name, "swap-mini-itest");
+        assert!(
+            !after_first[0].enabled,
+            "local plan apply must persist an enabled proposal as a disabled draft"
+        );
 
         apply_routes(
             &pool,
