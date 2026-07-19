@@ -629,9 +629,11 @@ async fn try_l1_hit(
                         requested_model,
                         trace_id,
                         request_started,
-                        matched_route_id,
-                        matched_route_version_id,
-                        route_paused,
+                        RouteLogAttribution {
+                            route_id: matched_route_id,
+                            route_version_id: matched_route_version_id,
+                            paused: route_paused,
+                        },
                         retrieval_tokens_saved,
                     ),
                 );
@@ -1413,9 +1415,11 @@ pub(crate) async fn complete_once(
                                                 &requested_model,
                                                 trace_id,
                                                 request_started,
-                                                matched_route_id,
-                                                matched_route_version_id,
-                                                route_paused,
+                                                RouteLogAttribution {
+                                                    route_id: matched_route_id,
+                                                    route_version_id: matched_route_version_id,
+                                                    paused: route_paused,
+                                                },
                                                 retrieval_telemetry.tokens_saved,
                                             ),
                                         );
@@ -4214,9 +4218,11 @@ async fn handle_streaming(
                                 &requested_model,
                                 trace_id,
                                 request_started,
-                                matched_route_id,
-                                matched_route_version_id,
-                                route_paused,
+                                RouteLogAttribution {
+                                    route_id: matched_route_id,
+                                    route_version_id: matched_route_version_id,
+                                    paused: route_paused,
+                                },
                                 retrieval_telemetry.tokens_saved,
                             ),
                         );
@@ -7090,15 +7096,20 @@ fn maybe_spawn_l2_hit_judge(
 /// stored in the envelope (e.g. `"openai"`) is preserved so the
 /// dashboard's per-provider breakdowns include cache hits; the cache
 /// label only surfaces via the `cache_layer` column.
+#[derive(Debug, Clone, Copy)]
+struct RouteLogAttribution {
+    route_id: Option<Uuid>,
+    route_version_id: Option<i64>,
+    paused: bool,
+}
+
 fn request_log_for_l1_hit(
     entry: &L1Entry,
     ctx: &RequestContext,
     requested_model: &str,
     trace_id: Uuid,
     request_started: Instant,
-    route_id: Option<Uuid>,
-    route_version_id: Option<i64>,
-    route_paused: bool,
+    route: RouteLogAttribution,
     retrieval_tokens_saved: i64,
 ) -> RequestLogRow {
     let baseline = if entry.is_legacy_format() {
@@ -7135,8 +7146,8 @@ fn request_log_for_l1_hit(
         summarizer_tax_usd: 0.0,
         cached: true,
         cache_layer: Some("l1".into()),
-        route_id,
-        route_version_id,
+        route_id: route.route_id,
+        route_version_id: route.route_version_id,
         latency_ms: clamp_latency_ms(request_started),
         upstream_latency_ms: None,
         status: 200,
@@ -7161,7 +7172,7 @@ fn request_log_for_l1_hit(
         // could not have saved anything on a request that never billed.
         batch_eligible: false,
         batch_forgone_usd: 0.0,
-        route_paused,
+        route_paused: route.paused,
         // TT cache hit — nothing dispatched, nothing minify-estimated.
         minify_saved_est_usd: 0.0,
         // TT cache hit — the serve performed no shaping dispatch; the
@@ -7793,9 +7804,11 @@ mod cache_header_tests {
             "caller-model",
             Uuid::now_v7(),
             Instant::now(),
-            Some(route_id),
-            Some(9_876_543_210),
-            false,
+            RouteLogAttribution {
+                route_id: Some(route_id),
+                route_version_id: Some(9_876_543_210),
+                paused: false,
+            },
             0,
         );
         assert_eq!(row.route_id, Some(route_id));

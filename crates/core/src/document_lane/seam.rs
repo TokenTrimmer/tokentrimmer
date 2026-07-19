@@ -139,9 +139,10 @@ pub(crate) enum RequestDistillOutcome {
 }
 
 impl RequestDistillOutcome {
-    /// Return booking only for a complete transaction. This is a compatibility
-    /// bridge for callers that only book savings; routing should inspect the
-    /// enum itself to distinguish `NoEligibleParts` from `Incomplete`.
+    /// Return booking only for a complete transaction in focused seam tests.
+    /// Production routing inspects the enum so it can distinguish
+    /// `NoEligibleParts` from `Incomplete`.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn booking(&self) -> DistillBookkeeping {
         match self {
@@ -208,19 +209,6 @@ pub(crate) async fn distill_part(
         text: extraction.text,
         lossless,
     }
-}
-
-/// Compatibility wrapper for callers that only need savings booking. Use
-/// [`distill_request_parts_with_outcome`] when behavior depends on whether a
-/// request lacked media or failed to convert it.
-pub(crate) async fn distill_request_parts(
-    harness: &DistillHarness,
-    model: &str,
-    req: &mut ChatCompletionRequest,
-) -> DistillBookkeeping {
-    distill_request_parts_with_outcome(harness, model, req)
-        .await
-        .booking()
 }
 
 /// Walk the request's messages + atomically swap every lane-targeted inline
