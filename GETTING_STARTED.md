@@ -385,7 +385,7 @@ resp = client.chat.completions.create(
 print(resp.tt.cost_usd, resp.tt.cache, resp.tt.trace_id)
 ```
 
-**TypeScript** (package `@tokentrimmer/client`; `openai ^6.44.0` is a **peer dependency** — install it alongside: `npm i @tokentrimmer/client openai`):
+**TypeScript** (package `@tokentrimmer/client`; `openai ^6.45.0` is a **peer dependency** — install it alongside: `npm i @tokentrimmer/client openai`):
 
 ```ts
 import { TokenTrimmer } from '@tokentrimmer/client';
