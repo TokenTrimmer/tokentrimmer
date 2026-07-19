@@ -1799,20 +1799,19 @@ mod tests {
         assert_eq!(reemitted, plan_side_json);
     }
 
-    /// Back-compat: legacy JSON still carrying the removed `force_cache_layer`
-    /// key deserializes fine (serde ignores the unknown field) and re-serializes
-    /// without it. Guards persisted routes written before the removal.
+    /// The v1 route contract is strict: legacy JSON still carrying the removed
+    /// `force_cache_layer` key must be rejected rather than silently changing
+    /// meaning when it is canonicalized and persisted.
     #[test]
-    fn route_action_legacy_force_cache_layer_is_ignored() {
+    fn route_action_legacy_force_cache_layer_is_rejected() {
         let legacy =
             r#"{"target_model":"claude-3-5-haiku","fallbacks":["x"],"force_cache_layer":"l1"}"#;
-        let a: RouteAction = serde_json::from_str(legacy).unwrap();
-        assert_eq!(a.target_model.as_deref(), Some("claude-3-5-haiku"));
-        assert_eq!(a.fallbacks, vec!["x"]);
-        let j = serde_json::to_string(&a).unwrap();
+        let error = serde_json::from_str::<RouteAction>(legacy)
+            .expect_err("removed route-action fields must not be silently ignored");
+        let message = error.to_string();
         assert!(
-            !j.contains("force_cache_layer"),
-            "obsolete key must not be re-emitted: {j}"
+            message.contains("unknown field `force_cache_layer`"),
+            "unexpected deserialization error: {message}"
         );
     }
 
