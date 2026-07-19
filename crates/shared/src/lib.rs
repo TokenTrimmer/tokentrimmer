@@ -38,7 +38,8 @@ pub use model_catalog::{model_catalog, ModelCatalog};
 pub use pricing::{CacheWriteTier, ModelInfo, ModelPricing};
 pub use provider::Provider;
 pub use request_delta::{
-    estimate_request_delta_v1, RequestDeltaEstimate, RequestDeltaInput, REQUEST_DELTA_ESTIMATE_V1,
+    estimate_request_delta_v1, RequestDeltaEstimate, RequestDeltaInput, RequestDeltaReceiptError,
+    RequestDeltaReceiptFields, REQUEST_DELTA_ESTIMATE_V1,
 };
 pub use url_guard::{
     filter_extra_headers, filter_outbound_headers, find_denied_header, find_outbound_denied_header,

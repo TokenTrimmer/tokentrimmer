@@ -687,7 +687,8 @@ async fn persist_run_results(
 /// per-turn-judge precedent at `agent_run.rs:2091`, which re-dispatches the
 /// ORIGINAL request to its source provider for the reference answer). The
 /// verdict is written to `workflow_runs.quality_verdict` via
-/// [`store::upsert_quality_verdict`] (the cloud mint reads it to sign `wfr:v2`).
+/// [`store::upsert_quality_verdict`] (the cloud mint reads it for the current
+/// quality-bearing workflow receipt version).
 ///
 /// **Fail-open + opt-in:** off by default (`judge_config.sample_rate == 0`); a
 /// judge error / timeout / disabled-config records `NotSampled` (nothing

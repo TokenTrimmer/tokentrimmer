@@ -128,10 +128,21 @@ capped static admission rejects loops and sub-workflows before dispatch.
 An eligible retained terminal run can be minted on demand as a workflow receipt —
 `POST /v1/admin/workflow-runs/{run_id}/receipt/sign` returns a frozen,
 Ed25519-signed estimate + a shareable verify URL. It is not an automatic receipt
-for every completed run or provider-invoice reconciliation. The receipt's canonical payload is
-`wfr:v1|<org>|<workflow_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>`
-(or `wfr:v2|…|<quality_verdict>` when the run carried a sampled flow-level
-quality-gate verdict).
+for every completed run or provider-invoice reconciliation. Current mints use
+`wfr:v3` without a sampled quality verdict and `wfr:v4` with one:
+
+```
+wfr:v3|<org>|<workflow_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<signed_request_delta_micros>|<formula>|<eligible_requests>|<measured_requests>|<status>
+wfr:v4|<the same v3 fields>|<quality_verdict>
+```
+
+The formula is exactly `tt.request-delta-estimate.v1`; coverage must be
+nonempty and complete (`measured_requests == eligible_requests`), and
+`saved_micros` is the positive-only projection
+`max(signed_request_delta_micros, 0)`. A regression therefore remains visible
+as a negative signed delta instead of becoming an apparent zero-savings run.
+An incomplete or empty cohort does not mint. Already-frozen `wfr:v1`/`wfr:v2`
+receipts retain their historical canonical bytes and remain verifiable.
 
 ### Bounded budget admission
 
@@ -159,15 +170,17 @@ turn can settle differently from a catalog estimate.
 The mint returns a self-contained `VerifyReceiptResponse` (from the public GET
 endpoint `GET /v1/workflow-runs/{run_id}/receipt?expires=&sig=`) exposing every
 canonical-payload field — `org_id`, `workflow_id`, `run_id`, `cost_micros`,
-`baseline_micros`, `saved_micros`, `status`, `canonical_version`,
-`quality_verdict`, `signature_hex`, + the embedded `verifying_key_hex`. Any party
-with the share URL can reconstruct the canonical string + check the Ed25519
-signature with that key — offline, no TokenTrimmer network call beyond fetching
-the receipt.
+`baseline_micros`, `saved_micros`, the signed request-delta formula, result, and
+coverage fields, `status`, `canonical_version`, `quality_verdict`,
+`signature_hex`, + the embedded `verifying_key_hex`. New evidence fields are
+null/absent on legacy receipts. Any party with the share URL can reconstruct the
+canonical string + check the Ed25519 signature with that key — offline, no
+TokenTrimmer network call beyond fetching the receipt.
 
 `tt verify-receipt` verifies all four currently supported families offline:
 **compression** (`vcr:v1|`), **cache-hit** (`l2:v1|`), **workflow-run**
-(`wfr:v1|` / `wfr:v2|`), and top-level **agent-run** (`arr:v1|`). ARR
+(`wfr:v1|` through `wfr:v4|`), and top-level **agent-run** (`arr:v1|` /
+`arr:v2|`). ARR
 deliberately has no `workflow_id`; see
 [`07-agent-runs-api-reference.md`](07-agent-runs-api-reference.md) for its
 canonical fields and mint boundary. Supply a verifying key obtained and trusted
@@ -177,11 +190,13 @@ not issuer identity, provider usage, or invoice reconciliation.
 
 The machine-readable structural contract is
 [`receipt-spec/wfr-receipt.schema.json`](receipt-spec/wfr-receipt.schema.json).
-Its checked-in [v1](receipt-spec/wfr-v1.golden.json) and
-[v2](receipt-spec/wfr-v2.golden.json) golden vectors are verified by both the
+Its checked-in [v1](receipt-spec/wfr-v1.golden.json),
+[v2](receipt-spec/wfr-v2.golden.json),
+[v3](receipt-spec/wfr-v3.golden.json), and
+[v4](receipt-spec/wfr-v4.golden.json) golden vectors are verified by both the
 public canonical builder and `tt verify-receipt`; they pin JSON field names,
 canonical bytes, and Ed25519 encoding without asserting anything about the
-issuer or financial evidence.
+issuer or provider-invoice evidence.
 
 ## Example
 

@@ -84,15 +84,24 @@ eligible terminal record may be minted on demand as a signed receipt estimate.
 ### Agent-run receipt (ARR)
 
 The mint endpoint returns a share URL whose public response has the top-level
-agent-run receipt (`ARR`) shape. Its Ed25519 canonical payload is:
+agent-run receipt (`ARR`) shape. Current mints use this Ed25519 canonical
+payload:
 
 ```
-arr:v1|<org_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>
+arr:v2|<org_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<signed_request_delta_micros>|<formula>|<eligible_requests>|<measured_requests>|<status>
 ```
 
 ARR deliberately has no `workflow_id`: it attests a top-level agent run rather
 than a workflow child. The `*_micros` values are signed integer micro-USD
-inputs; convenience USD fields and `signed_at` are not signed. Use
+inputs. The formula is exactly `tt.request-delta-estimate.v1`; coverage must be
+nonempty and complete; and `saved_micros` equals
+`max(signed_request_delta_micros, 0)`, preserving regressions as negative signed
+deltas. An incomplete or empty cohort does not mint. Already-frozen `arr:v1`
+receipts retain their historical canonical bytes. Convenience USD fields and
+`signed_at` are not signed. The machine-readable contract and checked-in
+[v1](receipt-spec/arr-v1.golden.json) and
+[v2](receipt-spec/arr-v2.golden.json) vectors live under `docs/receipt-spec`.
+Use
 `tt verify-receipt --receipt receipt.json --key-hex <a-key-obtained-out-of-band>`
 to verify the signature offline. Signature validity does not establish issuer
 identity, current mint eligibility, savings math, provider usage, or invoice

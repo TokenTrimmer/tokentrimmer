@@ -4,8 +4,8 @@
 //! producing a `QualityVerdict` a per-flow attestation can carry.
 //!
 //! BACKLOG item #5 (flow-level end-to-end quality gate), Slice 1 (public): the
-//! pure gate logic + the fail-open detached spawn. The canonical-payload bump
-//! (`wfr:v2`), the ledger column, + the mint endpoint land in Slice 2 (cloud).
+//! pure gate logic + the fail-open detached spawn. The quality-bearing receipt
+//! version, ledger column, + mint endpoint live in cloud.
 //!
 //! # What this is
 //!
@@ -63,11 +63,11 @@ pub const VERDICT_INCONCLUSIVE: &str = "inconclusive";
 pub const VERDICT_NOT_SAMPLED: &str = "not_sampled";
 
 /// The flow-level quality gate's verdict for a workflow run. Folded into the
-/// per-flow attestation (the `wfr:v2` receipt, Slice 2) as the stable code.
+/// per-flow attestation (currently the `wfr:v4` receipt) as the stable code.
 ///
 /// `NotSampled` is the default (gate off, sample-rate 0, run not sampled, or
 /// the run failed before producing a final answer) — a pre-gate / un-sampled
-/// run carries no verdict, so the receipt stays `wfr:v1` (backward-compat).
+/// run carries no verdict, so the current receipt uses its no-verdict form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityVerdict {
     /// The run was sampled + `judge_paired` judged the final answer's recall of
@@ -80,7 +80,7 @@ pub enum QualityVerdict {
     Inconclusive,
     /// The gate was off / the run was not sampled / the run produced no final
     /// answer (failed, budget-exhausted, or no `Output` node). The receipt
-    /// carries NO quality verdict (stays `wfr:v1`).
+    /// carries NO quality verdict.
     NotSampled,
 }
 
@@ -109,9 +109,8 @@ impl QualityVerdict {
         }
     }
 
-    /// Whether this verdict should be carried on a `wfr:v2` receipt (vs the
-    /// v1 shape, which carries no quality verdict). `NotSampled` → v1 (the
-    /// backward-compat default); any sampled verdict → v2.
+    /// Whether this verdict should be carried on a quality-bearing workflow
+    /// receipt. `NotSampled` omits it; any sampled verdict includes it.
     #[must_use]
     pub fn carries_on_receipt(self) -> bool {
         !matches!(self, Self::NotSampled)

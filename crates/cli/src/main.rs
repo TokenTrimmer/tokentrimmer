@@ -167,14 +167,11 @@ enum Command {
         /// Path to a bundle JSON produced by `tt plan --emit-bundle`.
         path: String,
     },
-    /// Verify a TokenTrimmer Verifiable Compression Receipt (VCR) OFFLINE: check
-    /// the Ed25519 signature over the canonical `vcr:v1|…` payload against a
-    /// verifying-key hex you supply out-of-band. Prints PASS/FAIL + the receipt
-    /// fields and exits non-zero on any mismatch (tampered receipt, wrong key,
-    /// unknown schema version).
+    /// Verify a TokenTrimmer VCR, L2, WFR, or ARR receipt OFFLINE against a
+    /// verifying-key hex supplied out-of-band. Prints PASS/FAIL + the signed
+    /// fields and exits non-zero on tampering, a wrong key, or unknown version.
     VerifyReceipt {
-        /// Path to a VCR JSON receipt (produced by the cloud
-        /// `POST /v1/admin/requests/{trace_id}/compression-receipt/sign` endpoint).
+        /// Path to a JSON receipt produced by a TokenTrimmer receipt mint.
         #[arg(long, value_name = "PATH")]
         receipt: String,
         /// Hex-encoded 32-byte Ed25519 verifying (public) key, supplied

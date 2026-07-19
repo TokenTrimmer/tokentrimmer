@@ -6,10 +6,10 @@
 //!   - a **VCR** (`vcr:v1|…` canonical payload) — compression savings.
 //!   - an **L2 receipt** (`l2:v1|…` canonical payload) — semantic-cache hit
 //!     provenance (`matched_entry_id` / `similarity` / `verdict`).
-//!   - a **WFR receipt** (`wfr:v1|…` / `wfr:v2|…` canonical payload) — workflow
-//!     run cost + savings (+ optional quality verdict).
-//!   - an **ARR receipt** (`arr:v1|…` canonical payload) — top-level agent-run
-//!     cost + savings.
+//!   - a **WFR receipt** (`wfr:v1|…` through `wfr:v4|…`) — workflow-run cost,
+//!     request-delta evidence, and optional quality verdict.
+//!   - an **ARR receipt** (`arr:v1|…` / `arr:v2|…`) — top-level agent-run cost
+//!     and request-delta evidence.
 //!
 //! The sign side of each lives in the cloud mint-on-demand endpoint
 //! (`POST /v1/admin/requests/{trace_id}/{compression,l2}-receipt/sign`, which
@@ -32,6 +32,10 @@ use anyhow::Context;
 
 use tt_telemetry::vcr::VcrReceipt;
 
+mod run_receipt;
+
+use run_receipt::{verify_arr_receipt, verify_wfr_receipt};
+
 /// Fields unique to the L2 receipt family. Any one of these claims L2 family
 /// ownership before the permissive VCR deserializer gets a chance to ignore it.
 const L2_RECEIPT_MARKERS: [&str; 5] = [
@@ -44,7 +48,7 @@ const L2_RECEIPT_MARKERS: [&str; 5] = [
 
 /// The receipt family selected from owned JSON discriminator fields. Keep the
 /// run-receipt variants separate: both ARR and WFR carry `canonical_version`,
-/// but only WFR carries a `workflow_id` (and its v2-only `quality_verdict`).
+/// but only WFR carries a `workflow_id` (and its v2/v4 `quality_verdict`).
 /// Every canonical-version-bearing object is reserved by one of these two
 /// paths so serde's permissive VCR parser can never silently ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +70,7 @@ fn receipt_family(peek: &serde_json::Value) -> ReceiptFamily {
     }
 
     if object.contains_key("canonical_version") {
-        // WFR owns its workflow relationship and its v2-only field even when
+        // WFR owns its workflow relationship and its v2/v4 field even when
         // those values are malformed. Everything else in the canonical-version
         // namespace is routed to ARR. Both parsers fail closed on malformed or
         // future shapes; neither can fall through to VCR.
@@ -181,74 +185,6 @@ fn verify_l2_receipt(raw: &str, _peek: &serde_json::Value, key_hex: &str) -> any
     }
 }
 
-/// Verify a WFR (workflow-run) receipt (v1 cost-only or v2 cost + quality verdict).
-/// Money fields are already integer micro-USD, so there's no float
-/// canonicalization (unlike VCR/L2) — the canonical payload is built from the
-/// `*_micros` integers directly.
-fn verify_wfr_receipt(raw: &str, _peek: &serde_json::Value, key_hex: &str) -> anyhow::Result<()> {
-    let receipt: tt_telemetry::wfr_receipt::WfrReceipt =
-        serde_json::from_str(raw).context("parse WFR receipt JSON")?;
-    crate::ui::note(&format!(
-        "WFR-receipt {} for org {} workflow {} run {} (status {})",
-        receipt.canonical_version,
-        receipt.org_id,
-        receipt.workflow_id,
-        receipt.run_id,
-        receipt.status,
-    ));
-    crate::ui::note(&format!(
-        "cost_micros: {}, baseline_micros: {}, saved_micros: {}{}",
-        receipt.cost_micros,
-        receipt.baseline_micros,
-        receipt.saved_micros,
-        receipt
-            .quality_verdict
-            .as_deref()
-            .map(|q| format!(", quality_verdict: {q}"))
-            .unwrap_or_default(),
-    ));
-
-    if tt_telemetry::wfr_receipt::verify_with_key(key_hex, &receipt) {
-        crate::ui::ok("PASS: signature verifies against the supplied verifying key");
-        Ok(())
-    } else {
-        crate::ui::error("FAIL: signature does not verify (tampered receipt, wrong key, unknown canonical version, an empty/pipe-containing status, or a v2 receipt missing its quality_verdict)");
-        anyhow::bail!(
-            "WFR-receipt verification failed for run_id={}",
-            receipt.run_id
-        );
-    }
-}
-
-/// Verify an ARR (top-level agent-run) receipt. Like WFR, ARR signs the raw
-/// micro-USD integers directly; unlike WFR, it deliberately has no
-/// `workflow_id` and only supports canonical version v1.
-fn verify_arr_receipt(raw: &str, _peek: &serde_json::Value, key_hex: &str) -> anyhow::Result<()> {
-    let receipt: tt_telemetry::arr_receipt::AgentRunReceipt =
-        serde_json::from_str(raw).context("parse ARR receipt JSON")?;
-    crate::ui::note(&format!(
-        "ARR-receipt {} for org {} agent run {} (status {})",
-        receipt.canonical_version, receipt.org_id, receipt.run_id, receipt.status,
-    ));
-    crate::ui::note(&format!(
-        "cost_micros: {}, baseline_micros: {}, saved_micros: {}",
-        receipt.cost_micros, receipt.baseline_micros, receipt.saved_micros,
-    ));
-
-    if tt_telemetry::arr_receipt::verify_with_key(key_hex, &receipt) {
-        crate::ui::ok("PASS: signature verifies against the supplied verifying key");
-        Ok(())
-    } else {
-        crate::ui::error(
-            "FAIL: signature does not verify (tampered receipt, wrong key, or unknown canonical version)",
-        );
-        anyhow::bail!(
-            "ARR-receipt verification failed for run_id={}",
-            receipt.run_id
-        );
-    }
-}
-
 /// Read a receipt from a path (the `--receipt <path>` surface). Kept as a
 /// separate helper so a future `--receipt-stdin` variant can share the verify
 /// path.
@@ -267,7 +203,10 @@ mod tests {
 
     const WFR_V1_GOLDEN: &str = include_str!("../../../docs/receipt-spec/wfr-v1.golden.json");
     const WFR_V2_GOLDEN: &str = include_str!("../../../docs/receipt-spec/wfr-v2.golden.json");
+    const WFR_V3_GOLDEN: &str = include_str!("../../../docs/receipt-spec/wfr-v3.golden.json");
+    const WFR_V4_GOLDEN: &str = include_str!("../../../docs/receipt-spec/wfr-v4.golden.json");
     const ARR_V1_GOLDEN: &str = include_str!("../../../docs/receipt-spec/arr-v1.golden.json");
+    const ARR_V2_GOLDEN: &str = include_str!("../../../docs/receipt-spec/arr-v2.golden.json");
 
     /// Write a receipt to a temp file + return the path + the signing key's
     /// verifying-key hex (the customer's out-of-band key).
@@ -603,6 +542,7 @@ mod tests {
         use ed25519_dalek::Signer as _;
         // Sign over the canonical payload the way the cloud mint does, using the
         // same fixed test key as the other families so key_hex() verifies it.
+        let request_delta = matches!(canonical_version, "v3" | "v4");
         let mut receipt = WfrReceipt {
             run_id: Uuid::from_u128(0xa1),
             org_id: Uuid::from_u128(42),
@@ -611,9 +551,15 @@ mod tests {
             cost_micros: 70_000,
             baseline_micros: 180_000,
             saved_micros: 110_000,
+            signed_request_delta_micros: request_delta.then_some(110_000),
+            request_delta_formula_version: request_delta
+                .then(|| tt_shared::REQUEST_DELTA_ESTIMATE_V1.to_string()),
+            request_delta_eligible_requests: request_delta.then_some(2),
+            request_delta_measured_requests: request_delta.then_some(2),
             cost_usd: None,
             baseline_usd: None,
             saved_usd: None,
+            signed_request_delta_usd: None,
             signature_hex: String::new(),
             verifying_key_hex: String::new(),
             canonical_version: canonical_version.to_string(),
@@ -660,6 +606,19 @@ mod tests {
     }
 
     #[test]
+    fn wfr_v3_and_v4_receipts_verify_via_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, receipt) in [
+            ("wfr-v3.json", sample_wfr_receipt("v3", None)),
+            ("wfr-v4.json", sample_wfr_receipt("v4", Some("equivalent"))),
+        ] {
+            let path = write_test_wfr_receipt(dir.path(), name, &receipt);
+            run_verify_receipt(path.to_str().unwrap(), &key_hex())
+                .expect("a request-delta WFR verifies through CLI dispatch");
+        }
+    }
+
+    #[test]
     fn checked_in_wfr_golden_vectors_verify_via_cli_dispatch() {
         // These are static cross-language vectors, not test-time signatures.
         // They pin the documented JSON wire shape, canonical payload bytes,
@@ -668,6 +627,8 @@ mod tests {
         for (name, raw) in [
             ("wfr-v1.golden.json", WFR_V1_GOLDEN),
             ("wfr-v2.golden.json", WFR_V2_GOLDEN),
+            ("wfr-v3.golden.json", WFR_V3_GOLDEN),
+            ("wfr-v4.golden.json", WFR_V4_GOLDEN),
         ] {
             let path = dir.path().join(name);
             std::fs::write(&path, raw).expect("write checked-in WFR vector");
@@ -755,9 +716,14 @@ mod tests {
             cost_micros: 70_000,
             baseline_micros: 180_000,
             saved_micros: 110_000,
+            signed_request_delta_micros: None,
+            request_delta_formula_version: None,
+            request_delta_eligible_requests: None,
+            request_delta_measured_requests: None,
             cost_usd: None,
             baseline_usd: None,
             saved_usd: None,
+            signed_request_delta_usd: None,
             signature_hex: String::new(),
             verifying_key_hex: String::new(),
             canonical_version: "v1".to_string(),
@@ -792,10 +758,40 @@ mod tests {
     #[test]
     fn checked_in_arr_golden_vector_verifies_via_cli_dispatch() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("arr-v1.golden.json");
-        std::fs::write(&path, ARR_V1_GOLDEN).expect("write checked-in ARR vector");
-        run_verify_receipt(path.to_str().unwrap(), &key_hex())
-            .expect("checked-in ARR vector must verify through CLI dispatch");
+        for (name, raw) in [
+            ("arr-v1.golden.json", ARR_V1_GOLDEN),
+            ("arr-v2.golden.json", ARR_V2_GOLDEN),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, raw).expect("write checked-in ARR vector");
+            run_verify_receipt(path.to_str().unwrap(), &key_hex())
+                .expect("checked-in ARR vector must verify through CLI dispatch");
+        }
+    }
+
+    #[test]
+    fn request_delta_formula_or_signed_money_tampering_fails_cli_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, raw, field, replacement) in [
+            (
+                "wfr-v3-formula-tampered.json",
+                WFR_V3_GOLDEN,
+                "request_delta_formula_version",
+                serde_json::json!("tt.request-delta-estimate.v2"),
+            ),
+            (
+                "arr-v2-delta-tampered.json",
+                ARR_V2_GOLDEN,
+                "signed_request_delta_micros",
+                serde_json::json!(-49_999),
+            ),
+        ] {
+            let mut receipt_json: serde_json::Value = serde_json::from_str(raw).unwrap();
+            receipt_json[field] = replacement;
+            let path = write_test_json(dir.path(), name, &receipt_json);
+            run_verify_receipt(path.to_str().unwrap(), &key_hex())
+                .expect_err("tampered request-delta evidence must not verify");
+        }
     }
 
     #[test]

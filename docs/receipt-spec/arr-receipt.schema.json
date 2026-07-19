@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:tokentrimmer:receipt:arr:structural-schema:v1",
+  "$id": "urn:tokentrimmer:receipt:arr:structural-schema:v1-v2",
   "title": "TokenTrimmer agent-run receipt",
-  "description": "Structural contract for the offline-verifiable top-level agent-run receipt returned by the shareable receipt GET endpoint. Use tt verify-receipt with a trusted out-of-band key to verify the signature.",
+  "description": "Structural contract for offline-verifiable top-level agent-run receipts. v1 is legacy; v2 signs the strict request-delta formula, complete coverage, and signed result. Use tt verify-receipt with a trusted out-of-band key to verify the signature.",
   "$comment": "This schema validates receipt structure only. It does not validate an Ed25519 signature, issuer identity, savings methodology, provider usage, or invoice reconciliation. Unknown additive fields are allowed for forward-compatible response envelopes.",
   "type": "object",
   "required": [
@@ -41,7 +41,25 @@
     },
     "saved_micros": {
       "$ref": "#/$defs/micro_usd",
-      "description": "Recorded catalog-priced net savings estimate in integer micro-USD; signed directly."
+      "description": "Positive-only request delta in integer micro-USD; v2 requires max(signed_request_delta_micros, 0)."
+    },
+    "signed_request_delta_micros": {
+      "type": ["integer", "null"],
+      "description": "Signed v2 request delta in micro-USD; regressions remain negative."
+    },
+    "request_delta_formula_version": {
+      "type": ["string", "null"],
+      "description": "Exact v2 request-delta formula identifier."
+    },
+    "request_delta_eligible_requests": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Non-truncated requests in the signed run cohort."
+    },
+    "request_delta_measured_requests": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Strictly measured requests; v2 requires complete nonempty coverage."
     },
     "cost_usd": {
       "type": ["number", "null"],
@@ -55,6 +73,10 @@
       "type": ["number", "null"],
       "description": "Convenience display field only; not part of the signature."
     },
+    "signed_request_delta_usd": {
+      "type": ["number", "null"],
+      "description": "Convenience signed request delta only; not part of the signature."
+    },
     "signature_hex": {
       "type": "string",
       "pattern": "^[0-9A-Fa-f]{128}$",
@@ -67,8 +89,8 @@
     },
     "canonical_version": {
       "type": "string",
-      "enum": ["v1"],
-      "description": "The canonical payload version; v1 is the currently supported format."
+      "enum": ["v1", "v2"],
+      "description": "v1 is legacy; v2 signs strict request-delta formula, coverage, and signed money."
     },
     "signed_at": {
       "type": ["string", "null"],
@@ -76,6 +98,43 @@
       "description": "Receipt mint timestamp. It is frozen by the ledger but not part of the canonical payload."
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "canonical_version": { "const": "v1" } },
+        "required": ["canonical_version"]
+      },
+      "then": {
+        "properties": {
+          "signed_request_delta_micros": { "type": "null" },
+          "signed_request_delta_usd": { "type": "null" },
+          "request_delta_formula_version": { "type": "null" },
+          "request_delta_eligible_requests": { "type": "null" },
+          "request_delta_measured_requests": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "canonical_version": { "const": "v2" } },
+        "required": ["canonical_version"]
+      },
+      "then": {
+        "required": [
+          "signed_request_delta_micros",
+          "request_delta_formula_version",
+          "request_delta_eligible_requests",
+          "request_delta_measured_requests"
+        ],
+        "properties": {
+          "signed_request_delta_micros": { "type": "integer" },
+          "request_delta_formula_version": { "const": "tt.request-delta-estimate.v1" },
+          "request_delta_eligible_requests": { "type": "integer", "minimum": 1 },
+          "request_delta_measured_requests": { "type": "integer", "minimum": 1 }
+        }
+      }
+    }
+  ],
   "additionalProperties": true,
   "$defs": {
     "uuid": {
