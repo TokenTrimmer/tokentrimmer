@@ -29,6 +29,16 @@ use anyhow::Context;
 
 use tt_telemetry::vcr::VcrReceipt;
 
+/// Fields unique to the L2 receipt family. Any one of these claims L2 family
+/// ownership before the permissive VCR deserializer gets a chance to ignore it.
+const L2_RECEIPT_MARKERS: [&str; 5] = [
+    "matched_entry_id",
+    "similarity",
+    "verdict",
+    "served_cost_usd",
+    "baseline_cost_usd",
+];
+
 /// `tt verify-receipt --receipt <path> --key-hex <hex>` entry point. Reads the
 /// receipt JSON, dispatches to the right family by field-presence,
 /// reconstructs the canonical payload, verifies the signature, and prints
@@ -53,8 +63,10 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
     //     malformed or a future version. Do not let serde's permissive VCR
     //     deserializer silently ignore that WFR discriminator and verify it as
     //     a VCR.
-    //   - L2 carries `matched_entry_id` + `verdict` (checked before VCR, since
-    //     L2 shares the `signature`/`verifying_key_hex` names).
+    //   - L2 reserves every L2-only field (checked before VCR, since L2 shares
+    //     the `signature`/`verifying_key_hex` names). A partial/malformed L2
+    //     shape must fail its own parser, never become a verified VCR because
+    //     serde permissively ignores its unknown field.
     //   - VCR carries `signature` + `verifying_key_hex` (or `route`+`schema`).
     // Peek as a Value so a mismatch is a clean "unknown receipt type" error,
     // not a deserialization panic. This keeps the one CLI verifying every
@@ -66,8 +78,10 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
         object.contains_key("plan_input") || object.contains_key("expected_result")
     });
     let is_wfr = fields.is_some_and(|object| object.contains_key("canonical_version"));
-    let is_l2 = fields.is_some_and(|object| {
-        object.contains_key("matched_entry_id") && object.contains_key("verdict")
+    let has_l2_marker = fields.is_some_and(|object| {
+        L2_RECEIPT_MARKERS
+            .iter()
+            .any(|field| object.contains_key(*field))
     });
 
     if is_bundle {
@@ -76,7 +90,7 @@ pub fn run_verify_receipt(receipt_path: &str, key_hex: &str) -> anyhow::Result<(
         );
     } else if is_wfr {
         verify_wfr_receipt(&raw, &peek, key_hex)
-    } else if is_l2 {
+    } else if has_l2_marker {
         verify_l2_receipt(&raw, &peek, key_hex)
     } else {
         verify_vcr_receipt(&raw, &peek, key_hex)
@@ -335,9 +349,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vcr_with_any_l2_marker_never_falls_through_to_vcr() {
+        let dir = tempfile::tempdir().unwrap();
+        for (field, value) in [
+            ("matched_entry_id", serde_json::json!(Uuid::from_u128(7))),
+            ("similarity", serde_json::json!(0.9312)),
+            ("verdict", serde_json::json!("verified")),
+            ("served_cost_usd", serde_json::json!(0.0)),
+            ("baseline_cost_usd", serde_json::json!(0.0117)),
+        ] {
+            // VcrReceipt ignores unknown JSON fields when deserializing. Each
+            // lone L2 marker must therefore claim L2 ownership before that
+            // fallback can verify the original VCR signature.
+            let mut receipt = serde_json::to_value(sign_receipt()).unwrap();
+            receipt[field] = value;
+            let path = write_test_json(dir.path(), &format!("vcr-l2-{field}.json"), &receipt);
+
+            let err = run_verify_receipt(path.to_str().unwrap(), &key_hex())
+                .expect_err("an L2-marked VCR must not use VCR verification");
+            assert!(
+                format!("{err:#}").contains("parse L2 receipt JSON"),
+                "{field} must take the L2 parser: {err:#}",
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_and_wfr_remain_ahead_of_l2_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bundle = serde_json::to_value(sign_receipt()).unwrap();
+        bundle["plan_input"] = serde_json::json!({});
+        bundle["matched_entry_id"] = serde_json::json!(Uuid::from_u128(7));
+        let bundle_path = write_test_json(dir.path(), "bundle-before-l2.json", &bundle);
+        let bundle_err = run_verify_receipt(bundle_path.to_str().unwrap(), &key_hex())
+            .expect_err("a bundle must retain priority over an L2 marker");
+        assert!(format!("{bundle_err:#}").contains("tt verify-bundle"));
+
+        let mut wfr = serde_json::to_value(sign_receipt()).unwrap();
+        wfr["canonical_version"] = serde_json::json!("v1");
+        wfr["matched_entry_id"] = serde_json::json!(Uuid::from_u128(7));
+        let wfr_path = write_test_json(dir.path(), "wfr-before-l2.json", &wfr);
+        let wfr_err = run_verify_receipt(wfr_path.to_str().unwrap(), &key_hex())
+            .expect_err("a WFR marker must retain priority over an L2 marker");
+        assert!(format!("{wfr_err:#}").contains("parse WFR receipt JSON"));
+    }
+
     // ── L2 (semantic-cache-hit) receipt dispatch + verify ────────────────────
-    // The same `tt verify-receipt` CLI verifies an L2 receipt (dispatched by
-    // field-presence: matched_entry_id + verdict). Mirrors the VCR tests.
+    // The same `tt verify-receipt` CLI verifies a complete L2 receipt while
+    // reserving every L2-only field before permissive VCR deserialization.
 
     use tt_telemetry::l2_receipt::{
         sign as sign_l2, L2Receipt, L2_SCHEMA_VERSION, VERDICT_VERIFIED,
