@@ -136,28 +136,15 @@ impl RequestDeltaEstimate {
         else {
             return Self::Unmeasured;
         };
-
-        if [
-            baseline_cost_usd,
-            cost_usd,
-            provider_cache_saved_usd,
-            cache_bust_usd,
-            summarizer_tax_usd,
-        ]
-        .into_iter()
-        .any(|value| !value.is_finite() || value < 0.0)
-        {
+        let Some(estimate) = tt_shared::estimate_request_delta_v1(tt_shared::RequestDeltaInput {
+            baseline_cost_usd: Some(baseline_cost_usd),
+            cost_usd: Some(cost_usd),
+            provider_cache_saved_usd: Some(provider_cache_saved_usd),
+            cache_bust_penalty_usd: Some(cache_bust_usd),
+            summarizer_tax_usd: Some(summarizer_tax_usd),
+        }) else {
             return Self::Unmeasured;
-        }
-
-        let signed_usd = baseline_cost_usd
-            - cost_usd
-            - provider_cache_saved_usd
-            - cache_bust_usd
-            - summarizer_tax_usd;
-        if !signed_usd.is_finite() {
-            return Self::Unmeasured;
-        }
+        };
 
         Self::Measured {
             baseline_cost_usd,
@@ -165,9 +152,9 @@ impl RequestDeltaEstimate {
             provider_cache_saved_usd,
             cache_bust_usd,
             summarizer_tax_usd,
-            signed_usd,
-            positive_usd: signed_usd.max(0.0),
-            regression_usd: (-signed_usd).max(0.0),
+            signed_usd: estimate.signed_request_delta_usd,
+            positive_usd: estimate.positive_request_delta_usd,
+            regression_usd: estimate.regression_request_delta_usd,
         }
     }
 }

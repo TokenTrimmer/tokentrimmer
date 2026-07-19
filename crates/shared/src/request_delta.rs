@@ -1,0 +1,146 @@
+//! Versioned, request-level catalog savings-estimate boundary.
+//!
+//! This module owns the pure arithmetic shared by the gateway core, Rust
+//! client, CLI, and any corpus mirror. It does not select a cohort or price,
+//! allocate judge/shadow tax, or reconcile a provider invoice.
+
+/// Stable identifier for the request-level formula and its public corpus.
+pub const REQUEST_DELTA_ESTIMATE_V1: &str = "tt.request-delta-estimate.v1";
+
+/// Complete raw inputs for one gateway-recorded request delta.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RequestDeltaInput {
+    pub baseline_cost_usd: Option<f64>,
+    pub cost_usd: Option<f64>,
+    pub provider_cache_saved_usd: Option<f64>,
+    pub cache_bust_penalty_usd: Option<f64>,
+    pub summarizer_tax_usd: Option<f64>,
+}
+
+/// A measured signed request delta. Absence from [`estimate_request_delta_v1`]
+/// means at least one input was missing or invalid; it never means zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RequestDeltaEstimate {
+    pub signed_request_delta_usd: f64,
+    pub positive_request_delta_usd: f64,
+    pub regression_request_delta_usd: f64,
+}
+
+/// Apply `tt.request-delta-estimate.v1` to one complete request.
+///
+/// Every component must be present, finite, and non-negative. Rejecting the
+/// whole row prevents a rolling deploy or malformed transport value from being
+/// silently zero-filled into a customer-facing money claim.
+#[must_use]
+pub fn estimate_request_delta_v1(input: RequestDeltaInput) -> Option<RequestDeltaEstimate> {
+    let components = [
+        input.baseline_cost_usd?,
+        input.cost_usd?,
+        input.provider_cache_saved_usd?,
+        input.cache_bust_penalty_usd?,
+        input.summarizer_tax_usd?,
+    ];
+    if components
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return None;
+    }
+
+    let signed_request_delta_usd =
+        components[0] - components[1] - components[2] - components[3] - components[4];
+    if !signed_request_delta_usd.is_finite() {
+        return None;
+    }
+
+    Some(RequestDeltaEstimate {
+        signed_request_delta_usd,
+        positive_request_delta_usd: signed_request_delta_usd.max(0.0),
+        regression_request_delta_usd: (-signed_request_delta_usd).max(0.0),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct Corpus {
+        formula_version: String,
+        vectors: Vec<Vector>,
+    }
+
+    #[derive(Deserialize)]
+    struct Vector {
+        id: String,
+        input: CorpusInput,
+        expected: Expected,
+    }
+
+    #[derive(Deserialize)]
+    struct CorpusInput {
+        baseline_cost_usd: Option<f64>,
+        cost_usd: Option<f64>,
+        provider_cache_saved_usd: Option<f64>,
+        cache_bust_penalty_usd: Option<f64>,
+        summarizer_tax_usd: Option<f64>,
+    }
+
+    #[derive(Deserialize)]
+    struct Expected {
+        state: String,
+        signed_request_delta_usd: Option<f64>,
+        positive_request_delta_usd: Option<f64>,
+        regression_request_delta_usd: Option<f64>,
+    }
+
+    #[test]
+    fn public_corpus_matches_the_runtime_formula() {
+        let corpus: Corpus = serde_json::from_str(include_str!(
+            "../../../docs/savings-estimate-contract/tokentrimmer.request-delta-estimate.v1.corpus.json"
+        ))
+        .expect("request-delta corpus must parse");
+        assert_eq!(corpus.formula_version, REQUEST_DELTA_ESTIMATE_V1);
+
+        for vector in corpus.vectors {
+            let actual = estimate_request_delta_v1(RequestDeltaInput {
+                baseline_cost_usd: vector.input.baseline_cost_usd,
+                cost_usd: vector.input.cost_usd,
+                provider_cache_saved_usd: vector.input.provider_cache_saved_usd,
+                cache_bust_penalty_usd: vector.input.cache_bust_penalty_usd,
+                summarizer_tax_usd: vector.input.summarizer_tax_usd,
+            });
+            match vector.expected.state.as_str() {
+                "measured" => {
+                    let actual = actual.unwrap_or_else(|| panic!("{} must be measured", vector.id));
+                    assert_close(
+                        actual.signed_request_delta_usd,
+                        vector.expected.signed_request_delta_usd.unwrap(),
+                        &vector.id,
+                    );
+                    assert_close(
+                        actual.positive_request_delta_usd,
+                        vector.expected.positive_request_delta_usd.unwrap(),
+                        &vector.id,
+                    );
+                    assert_close(
+                        actual.regression_request_delta_usd,
+                        vector.expected.regression_request_delta_usd.unwrap(),
+                        &vector.id,
+                    );
+                }
+                "unmeasured" => assert!(actual.is_none(), "{} must be unmeasured", vector.id),
+                state => panic!("unknown corpus state {state}"),
+            }
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64, id: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{id}: {actual} != {expected}"
+        );
+    }
+}

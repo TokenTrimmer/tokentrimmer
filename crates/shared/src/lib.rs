@@ -1,6 +1,7 @@
 //! Shared types, errors, and traits for the TokenTrimmer workspace.
 //!
-//! No business logic lives here — only the contracts that other crates implement.
+//! This crate owns cross-crate contracts and small, pure calculations that are
+//! part of those contracts. It does not own request orchestration or I/O.
 //! See `docs/02-provider-adapter-guide.md` for the Provider trait.
 
 pub mod batch_advisor;
@@ -15,6 +16,7 @@ pub mod model_catalog;
 pub mod pricing;
 pub mod provider;
 pub mod providers;
+pub mod request_delta;
 pub mod url_guard;
 pub mod usage;
 
@@ -35,6 +37,9 @@ pub use messages::{
 pub use model_catalog::{model_catalog, ModelCatalog};
 pub use pricing::{CacheWriteTier, ModelInfo, ModelPricing};
 pub use provider::Provider;
+pub use request_delta::{
+    estimate_request_delta_v1, RequestDeltaEstimate, RequestDeltaInput, REQUEST_DELTA_ESTIMATE_V1,
+};
 pub use url_guard::{
     filter_extra_headers, filter_outbound_headers, find_denied_header, find_outbound_denied_header,
     validate_provider_url, UrlGuardError,

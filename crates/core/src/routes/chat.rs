@@ -5676,12 +5676,14 @@ impl CostBreakdown {
     /// `flex_saved_usd` isolates the flex component for the methodology
     /// breakdown).
     pub fn tt_saved_usd(&self) -> f64 {
-        (self.baseline_cost_usd
-            - self.cost_usd
-            - self.provider_cache_saved_usd
-            - self.cache_bust_penalty_usd
-            - self.summarizer_tax_usd)
-            .max(0.0)
+        tt_shared::estimate_request_delta_v1(tt_shared::RequestDeltaInput {
+            baseline_cost_usd: Some(self.baseline_cost_usd),
+            cost_usd: Some(self.cost_usd),
+            provider_cache_saved_usd: Some(self.provider_cache_saved_usd),
+            cache_bust_penalty_usd: Some(self.cache_bust_penalty_usd),
+            summarizer_tax_usd: Some(self.summarizer_tax_usd),
+        })
+        .map_or(0.0, |estimate| estimate.positive_request_delta_usd)
     }
 }
 
