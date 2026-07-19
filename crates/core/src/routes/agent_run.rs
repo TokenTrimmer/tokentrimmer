@@ -3042,7 +3042,7 @@ mod tests {
     // ----- eligible_tool_ordinals + token_true_ok (slice 2c-1 Task 4) -----
 
     #[test]
-    fn eligible_ordinals_keeps_recent_and_respects_watermark() {
+    fn eligible_ordinals_preserves_recent_blocks_and_respects_watermark() {
         // messages: A(tc) T0 A(tc) T1 A(tc) T2 A(tc) T3  (4 tool blocks)
         let msgs = vec![
             assistant_toolcall("find_route_for"),
@@ -3059,6 +3059,9 @@ mod tests {
         assert_eq!(eligible_tool_ordinals(&msgs, 0, 2), vec![1, 3]);
         // watermark=1 → T0 already done → only T1 (index 3).
         assert_eq!(eligible_tool_ordinals(&msgs, 1, 2), vec![3]);
+        // The structured control only permits keep>=3: with 3 blocks, only
+        // the oldest is eligible; with 4 (or more), every block is preserved.
+        assert_eq!(eligible_tool_ordinals(&msgs, 0, 3), vec![1]);
         // keep_recent_pairs >= tool count → nothing eligible.
         assert!(eligible_tool_ordinals(&msgs, 0, 4).is_empty());
         assert!(eligible_tool_ordinals(&msgs, 0, 9).is_empty());
