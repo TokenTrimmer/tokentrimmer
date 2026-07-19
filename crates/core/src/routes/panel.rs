@@ -7,7 +7,7 @@
 //!
 //! # Types produced (consumed by Tasks 3–7)
 //! - [`ArbiterStrategyKind`] — the three dispatch strategies
-//! - [`ModelRef`]            — a model + optional provider pin
+//! - [`ModelRef`]            — a model plus a reserved, unsupported provider field
 //! - [`PanelConfig`]         — resolved, complete panel configuration
 //! - [`PanelAdmission`]      — opaque proof of static pre-dispatch admission
 //! - [`PanelDefaults`]       — gateway-level defaults sourced from env vars
@@ -83,19 +83,22 @@ impl ArbiterStrategyKind {
 }
 
 // ---------------------------------------------------------------------------
-// ModelRef — a model + optional provider pin
+// ModelRef — a model plus a reserved provider field
 // ---------------------------------------------------------------------------
 
-/// A model reference with an optional explicit provider.
+/// A model reference resolved through the gateway's standard provider registry.
 ///
-/// `"model-id"` without a provider → the gateway resolves the provider via
-/// its standard registry. `"model-id"` with `provider = Some("openai")` →
-/// dispatch is pinned to that provider.
+/// Fusion currently supports model-only resolution. `provider` is reserved for
+/// a future implementation of provider pinning; panel admission rejects every
+/// `Some(_)` value so a configuration can never declare a provider different
+/// from the one that dispatch will use.
 #[derive(Clone, Debug, Default)]
 pub struct ModelRef {
     pub model: String,
     pub provider: Option<String>,
 }
+
+const PANEL_PROVIDER_PINS_UNSUPPORTED: &str = "panel provider pins are not supported";
 
 // ---------------------------------------------------------------------------
 // PanelConfig — resolved, complete panel configuration
@@ -152,7 +155,8 @@ impl PanelConfig {
     /// but the fields are public for intentional direct-engine construction.
     /// Keep the same validation at the shared admission boundary so a direct
     /// caller cannot mint or revalidate a [`PanelAdmission`] for blank,
-    /// duplicated, over-cap, invalid-quorum, or invalid-budget work.
+    /// provider-pinned, duplicated, over-cap, invalid-quorum, or invalid-budget
+    /// work.
     pub fn validate_for_dispatch(&self) -> ApiResult<()> {
         if self.members.is_empty() {
             return Err(ApiError::InvalidRequest(
@@ -171,38 +175,34 @@ impl PanelConfig {
 
         let mut member_identities = std::collections::HashSet::with_capacity(self.members.len());
         for member in &self.members {
+            if member.provider.is_some() {
+                return Err(ApiError::InvalidRequest(
+                    PANEL_PROVIDER_PINS_UNSUPPORTED.to_string(),
+                ));
+            }
+
             let model = member.model.trim();
             if model.is_empty() {
                 return Err(ApiError::InvalidRequest(
                     "panel member model must not be blank".to_string(),
                 ));
             }
-            let provider = member.provider.as_deref().map(str::trim);
-            if provider.is_some_and(str::is_empty) {
-                return Err(ApiError::InvalidRequest(
-                    "panel member provider must not be blank when specified".to_string(),
-                ));
-            }
-            if !member_identities.insert((model, provider.unwrap_or_default())) {
+            if !member_identities.insert(model) {
                 return Err(ApiError::InvalidRequest(format!(
                     "panel member {model:?} is configured more than once"
                 )));
             }
         }
 
+        if self.arbiter_model.provider.is_some() {
+            return Err(ApiError::InvalidRequest(
+                PANEL_PROVIDER_PINS_UNSUPPORTED.to_string(),
+            ));
+        }
+
         if self.arbiter_model.model.trim().is_empty() {
             return Err(ApiError::InvalidRequest(
                 "panel arbiter model must not be blank".to_string(),
-            ));
-        }
-        if self
-            .arbiter_model
-            .provider
-            .as_deref()
-            .is_some_and(|provider| provider.trim().is_empty())
-        {
-            return Err(ApiError::InvalidRequest(
-                "panel arbiter provider must not be blank when specified".to_string(),
             ));
         }
 
@@ -315,9 +315,9 @@ pub(crate) fn required_panel_quorum(cfg: &PanelConfig) -> usize {
 ///
 /// Missing credentials for additional members remain representable as
 /// [`LegStatus::SkippedNoCred`] once this fence proves that the remaining
-/// credentialed legs can meet quorum. Provider IDs are intentionally resolved
-/// by the same registry lookup used by fan-out; optional `ModelRef::provider`
-/// pins are not interpreted differently at this seam.
+/// credentialed legs can meet quorum. Accepted panel configs are model-only:
+/// [`PanelConfig::validate_for_dispatch`] rejects `ModelRef::provider` until
+/// every panel seam implements provider-pinning semantics.
 pub(crate) fn validate_panel_credential_preflight(
     state: &AppState,
     cfg: &PanelConfig,
@@ -725,7 +725,8 @@ fn panel_context_for_provider(
 /// single prompt asking the arbiter model to synthesize one best answer, then
 /// dispatch exactly one [`crate::measurement::measured_single_dispatch`] call.
 pub struct Synthesize {
-    /// The arbiter model (and optional provider pin) to use for synthesis.
+    /// The arbiter model to use for synthesis. Its `ModelRef::provider` field
+    /// is reserved and rejected for panels until pinning works at every seam.
     pub arbiter_model: ModelRef,
 }
 
@@ -916,7 +917,8 @@ impl ArbiterStrategy for Synthesize {
 /// candidate answer by number, then return that leg's original response
 /// verbatim — no paraphrasing or synthesis.
 pub struct BestOfN {
-    /// The arbiter model (and optional provider pin) used as the judge.
+    /// The arbiter model used as the judge. Its `ModelRef::provider` field is
+    /// reserved and rejected for panels until pinning works at every seam.
     pub arbiter_model: ModelRef,
 }
 
@@ -2886,6 +2888,12 @@ mod tests {
 
         let invalid_config_budget = direct_engine_admission_config(Some(0.0));
 
+        let mut member_provider_pin = direct_engine_admission_config(Some(1_000.0));
+        member_provider_pin.members[0].provider = Some("unregistered-provider".to_string());
+
+        let mut arbiter_provider_pin = direct_engine_admission_config(Some(1_000.0));
+        arbiter_provider_pin.arbiter_model.provider = Some("openai".to_string());
+
         let mut over_cap = direct_engine_admission_config(Some(1_000.0));
         over_cap.members = (0..=panel_max_members())
             .map(|index| ModelRef {
@@ -2902,6 +2910,8 @@ mod tests {
                 invalid_config_budget,
                 "max_cost_usd must be a finite number greater than zero",
             ),
+            (member_provider_pin, PANEL_PROVIDER_PINS_UNSUPPORTED),
+            (arbiter_provider_pin, PANEL_PROVIDER_PINS_UNSUPPORTED),
             (over_cap, "exceeds the maximum"),
         ] {
             let error = match admit_panel_request(&state, &cfg, &req, Some(1_000.0)) {
@@ -2962,6 +2972,24 @@ mod tests {
         ));
 
         cfg.max_cost_usd = Some(0.10);
+        cfg.members[0].provider = Some("unregistered-provider".to_string());
+        let error = run_panel(
+            &state,
+            &ctx,
+            &cheap,
+            &creds,
+            &cfg,
+            &admission,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("post-admission provider pin must stop before fan-out");
+        assert!(
+            matches!(&error, ApiError::InvalidRequest(message) if message.as_str() == PANEL_PROVIDER_PINS_UNSUPPORTED),
+            "expected provider-pin admission error, got {error:?}"
+        );
+
+        cfg.members[0].provider = None;
         let duplicate = cfg.members[0].clone();
         cfg.members.push(duplicate);
         let error = run_panel(
