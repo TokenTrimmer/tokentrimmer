@@ -73,10 +73,11 @@
   "devDependencies": {
     "@opentelemetry/api": "^1.9.0",
     "@types/node": "^26.1.0",
+    "@vitest/coverage-v8": "4.1.9",
     "openai": "^6.45.0",
     "typescript": "^6.0.3",
     "unpdf": "^1.6.2",
-    "vitest": "^4.1.9"
+    "vitest": "4.1.9"
   },
   "engines": {
     "node": ">=18"

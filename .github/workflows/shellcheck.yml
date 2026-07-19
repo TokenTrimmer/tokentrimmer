@@ -17,6 +17,9 @@ on:
       - 'scripts/benchmarks/**/*.sh'
       - '.github/workflows/shellcheck.yml'
 
+permissions:
+  contents: read
+
 jobs:
   shellcheck:
     name: shellcheck scripts
@@ -24,6 +27,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: Lint scripts (severity=warning)

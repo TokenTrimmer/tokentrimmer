@@ -46,6 +46,14 @@ yanked = "deny"
 # blocker preventing a fix, and (c) a re-check date. Next scheduled re-check for
 # all entries: 2026-09-15 (~3 months out). Do not add an entry without these.
 ignore = [
+    # --- spin 0.9.8 yanked ---------------------------------------------------
+    # `spin` 0.9.8 is pulled by axum -> multer 3.1.0, whose current release and
+    # upstream branch constrain `spin` to the 0.9 line. It has been yanked but
+    # has no RustSec advisory, and no non-yanked 0.9.x replacement exists.
+    # Keep the global yanked policy at deny and exempt this exact version only;
+    # remove the exemption when multer releases support for spin >= 0.10.
+    # Re-check 2026-08-19.
+    { crate = "spin@0.9.8", reason = "transitive via axum -> multer; no non-yanked 0.9.x exists; re-check 2026-08-19" },
     # --- rustls-webpki cert/CRL parsing panics --------------------------------
     # All four are transitive via sentry -> rustls 0.22, which pins
     # rustls-webpki to the 0.102.x line; the fixes only exist on >= 0.103.x,

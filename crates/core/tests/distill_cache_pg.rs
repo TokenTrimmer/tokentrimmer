@@ -34,7 +34,8 @@ const CREATE_CACHE_TABLE: &str = "CREATE TABLE IF NOT EXISTS public.flow_doc_dis
     engine         TEXT        NOT NULL,
     distilled_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 )";
-const CREATE_CACHE_KEY_IDX: &str = "CREATE UNIQUE INDEX IF NOT EXISTS flow_doc_distill_cache_key_uq \
+const CREATE_CACHE_KEY_IDX: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS flow_doc_distill_cache_key_uq \
      ON public.flow_doc_distill_cache (org_id, content_hash, COALESCE(caller_key, ''))";
 const CREATE_EXPIRY_IDX: &str = "CREATE INDEX IF NOT EXISTS flow_doc_distill_cache_expiry_idx \
      ON public.flow_doc_distill_cache (distilled_at)";

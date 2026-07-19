@@ -36,10 +36,14 @@
     "n8n-workflow": "*"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "4.1.8",
     "n8n-workflow": "^1",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.8",
+    "vitest": "4.1.8",
     "@types/node": "^25.9.2"
+  },
+  "overrides": {
+    "form-data": "4.0.6"
   },
   "engines": {
     "node": ">=20.12"

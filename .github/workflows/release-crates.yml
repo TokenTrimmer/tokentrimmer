@@ -34,10 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Verify each publishable crate ships LICENSE + NOTICE
         run: ./scripts/sync-licenses.sh --check
       - name: Verify tag matches tt-cli manifest version
@@ -51,7 +52,10 @@ jobs:
             exit 1
           fi
           echo "ok: tag ${GITHUB_REF_NAME} matches tt-cli manifest version ${manifest_version}"
-      - name: Publish in topological order
+      # Trusted publishing requires one-time crates.io publisher configuration
+      # for every crate in this chain. Keep the scoped token path until that
+      # external migration is completed as one coordinated release operation.
+      - name: Publish in topological order # zizmor: ignore[use-trusted-publishing] external crates.io setup is not yet configured
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
