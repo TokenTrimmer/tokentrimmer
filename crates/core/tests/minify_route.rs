@@ -546,19 +546,20 @@ async fn header_panel_skips_minify_for_all_fusion_legs() {
         "panel aggregate must carry no direct-response minify estimate"
     );
 
-    let dispatched = h.dispatched.lock().unwrap();
-    assert_eq!(
-        dispatched.len(),
-        3,
-        "two member legs plus one synthesize arbiter must dispatch"
-    );
-    assert!(
-        dispatched
-            .iter()
-            .all(|messages| !dispatch_contains_instruction(messages)),
-        "no Fusion member or arbiter prompt may inherit minify steering: {dispatched:?}"
-    );
-    drop(dispatched);
+    {
+        let dispatched = h.dispatched.lock().unwrap();
+        assert_eq!(
+            dispatched.len(),
+            3,
+            "two member legs plus one synthesize arbiter must dispatch"
+        );
+        assert!(
+            dispatched
+                .iter()
+                .all(|messages| !dispatch_contains_instruction(messages)),
+            "no Fusion member or arbiter prompt may inherit minify steering: {dispatched:?}"
+        );
+    }
 
     let rows = rows_after(&h.log_writer, 1).await;
     assert_eq!(rows.len(), 1);
