@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tokentrimmer:receipt:arr:structural-schema:v1",
+  "title": "TokenTrimmer agent-run receipt",
+  "description": "Structural contract for the offline-verifiable top-level agent-run receipt returned by the shareable receipt GET endpoint. Use tt verify-receipt with a trusted out-of-band key to verify the signature.",
+  "$comment": "This schema validates receipt structure only. It does not validate an Ed25519 signature, issuer identity, savings methodology, provider usage, or invoice reconciliation. Unknown additive fields are allowed for forward-compatible response envelopes.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "org_id",
+    "status",
+    "cost_micros",
+    "baseline_micros",
+    "saved_micros",
+    "signature_hex",
+    "verifying_key_hex",
+    "canonical_version"
+  ],
+  "properties": {
+    "run_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Top-level agent-run UUID; also the receipt primary key. There is intentionally no workflow_id."
+    },
+    "org_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Organization UUID, signed as canonical payload field 2."
+    },
+    "status": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^|]+$",
+      "description": "Nonempty terminal agent-run status. The cloud mint currently has its own terminal-status allowlist; this offline structural contract accepts any nonempty pipe-free status so a valid receipt remains verifiable if that issuer-side allowlist evolves. A pipe is forbidden because it is the canonical payload separator."
+    },
+    "cost_micros": {
+      "$ref": "#/$defs/micro_usd",
+      "description": "Recorded catalog-priced run cost in integer micro-USD; signed directly."
+    },
+    "baseline_micros": {
+      "$ref": "#/$defs/micro_usd",
+      "description": "Recorded catalog-priced baseline estimate in integer micro-USD; signed directly."
+    },
+    "saved_micros": {
+      "$ref": "#/$defs/micro_usd",
+      "description": "Recorded catalog-priced net savings estimate in integer micro-USD; signed directly."
+    },
+    "cost_usd": {
+      "type": ["number", "null"],
+      "description": "Convenience display field only; not part of the signature."
+    },
+    "baseline_usd": {
+      "type": ["number", "null"],
+      "description": "Convenience display field only; not part of the signature."
+    },
+    "saved_usd": {
+      "type": ["number", "null"],
+      "description": "Convenience display field only; not part of the signature."
+    },
+    "signature_hex": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{128}$",
+      "description": "Hex-encoded 64-byte Ed25519 signature over the canonical payload."
+    },
+    "verifying_key_hex": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$",
+      "description": "Hex-encoded 32-byte Ed25519 public key. Trust must be established out of band."
+    },
+    "canonical_version": {
+      "type": "string",
+      "enum": ["v1"],
+      "description": "The canonical payload version; v1 is the currently supported format."
+    },
+    "signed_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Receipt mint timestamp. It is frozen by the ledger but not part of the canonical payload."
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "micro_usd": {
+      "type": "integer"
+    }
+  }
+}

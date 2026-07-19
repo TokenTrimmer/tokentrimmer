@@ -26,16 +26,17 @@
 //!
 //! # Domain separation
 //! `wfr:v1|` / `wfr:v2|` is disjoint from `vcr:v1|` (compressions),
-//! `l2:v1|` (semantic-cache hits), `att:` (attestations), `pdf:v1|` (PDF
-//! reports), and the bare-32B audit hash. A signature from one family can NEVER
-//! be mis-validated as another.
+//! `l2:v1|` (semantic-cache hits), `arr:v1|` (top-level agent runs), `att:`
+//! (attestations), `pdf:v1|` (PDF reports), and the bare-32B audit hash. A
+//! signature from one family can NEVER be mis-validated as another.
 
 use uuid::Uuid;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 /// The domain-separation prefix for workflow-run receipts. Disjoint from
-/// `vcr:v1|` / `l2:v1|` / `att:` / `pdf:v1|` / the bare-32B audit hash.
+/// `vcr:v1|` / `l2:v1|` / `arr:v1|` / `att:` / `pdf:v1|` / the bare-32B audit
+/// hash.
 pub const WFR_PREFIX: &str = "wfr:";
 
 /// The canonical version tag carried in the payload. `v1` = the original

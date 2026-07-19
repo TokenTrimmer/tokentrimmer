@@ -9,7 +9,7 @@ slice 1b for client (non-gateway) tools. Source: `crates/core/src/routes/agent_r
 A run is the canonical surface for "an agent that cost-controls itself": each
 turn's cost is accounted + the loop stops on three honest signals (turn cap,
 cost cap, runaway-repeat detection). Eligible retained terminal runs can be
-minted on demand as signed estimates (`POST /v1/agent-runs/{run_id}/receipt/sign`
+minted on demand as signed estimates (`POST /v1/admin/agent-runs/{run_id}/receipt/sign`
 in cloud) and verified offline with `tt verify-receipt`; this is not universal
 receipt or provider-invoice proof.
 
@@ -81,11 +81,28 @@ Gateway (read-only) tool calls execute inline; their results append as
 `Message::Tool`. The run rolls into a catalog-priced `saved_usd` estimate; an
 eligible terminal record may be minted on demand as a signed receipt estimate.
 
+### Agent-run receipt (ARR)
+
+The mint endpoint returns a share URL whose public response has the top-level
+agent-run receipt (`ARR`) shape. Its Ed25519 canonical payload is:
+
+```
+arr:v1|<org_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>
+```
+
+ARR deliberately has no `workflow_id`: it attests a top-level agent run rather
+than a workflow child. The `*_micros` values are signed integer micro-USD
+inputs; convenience USD fields and `signed_at` are not signed. Use
+`tt verify-receipt --receipt receipt.json --key-hex <a-key-obtained-out-of-band>`
+to verify the signature offline. Signature validity does not establish issuer
+identity, current mint eligibility, savings math, provider usage, or invoice
+reconciliation.
+
 ## Related
 
 - `crates/core/src/routes/agent_run.rs` — the source of truth (run status, SSE events, the pausable loop, `CreateRunRequest`).
 - `crates/core/src/routes/agent_run_budget.rs` — `StopReason`, the `would_exceed`/`estimate_next_turn_cost`/`NoProgressTracker` (runaway detection) budget logic.
 - `crates/core/src/routes/agent_run_store.rs` — the persisted run store (the pausable slice 1b).
-- The cloud receipt endpoint — `POST /v1/agent-runs/{run_id}/receipt/sign` — mints a signed estimate on demand for an eligible retained terminal run.
+- The cloud receipt endpoint — `POST /v1/admin/agent-runs/{run_id}/receipt/sign` — mints an ARR signed estimate on demand for an eligible retained terminal run.
 - `docs/coding-agents.md` — the coding-agent wedge (the runtime `$` cap + kill-switch the loop rides).
 - `docs/05-workflow-dsl-reference.md` — the `agent` workflow node (a workflow DSL equivalent of this loop, with `max_turns` / `max_cost_usd` / `tools`).

@@ -165,10 +165,13 @@ with the share URL can reconstruct the canonical string + check the Ed25519
 signature with that key — offline, no TokenTrimmer network call beyond fetching
 the receipt.
 
-`tt verify-receipt` verifies all three currently supported families offline:
-**compression** (`vcr:v1|`), **cache-hit** (`l2:v1|`), and **workflow-run**
-(`wfr:v1|` / `wfr:v2|`). Supply a verifying key obtained and trusted out of
-band; the embedded key can establish only self-consistency. A successful
+`tt verify-receipt` verifies all four currently supported families offline:
+**compression** (`vcr:v1|`), **cache-hit** (`l2:v1|`), **workflow-run**
+(`wfr:v1|` / `wfr:v2|`), and top-level **agent-run** (`arr:v1|`). ARR
+deliberately has no `workflow_id`; see
+[`07-agent-runs-api-reference.md`](07-agent-runs-api-reference.md) for its
+canonical fields and mint boundary. Supply a verifying key obtained and trusted
+out of band; the embedded key can establish only self-consistency. A successful
 signature check establishes that the supplied key signed an unchanged receipt,
 not issuer identity, provider usage, or invoice reconciliation.
 
