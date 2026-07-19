@@ -17,10 +17,11 @@ const PROVIDER_CACHE_SAVED_HEADER: &str = "x-tokentrimmer-provider-cache-saved-u
 const CACHE_BUST_HEADER: &str = "x-tokentrimmer-cache-bust-usd";
 const SUMMARIZER_TAX_HEADER: &str = "x-tokentrimmer-summarizer-tax-usd";
 
-/// The per-response gateway estimate, measured only when every component of
-/// `baseline - cost - provider-cache - cache-bust - summarizer-tax` is present
-/// and valid. It intentionally excludes judge/shadow measurement taxes and
-/// provider-invoice reconciliation.
+/// The proxy's stable JSONL projection of the shared request-delta estimate.
+///
+/// Its field names predate the first-party client type, so this intentionally
+/// remains a serialization adapter. All validation and five-component math
+/// comes from [`tt_client::RequestDeltaEstimate`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RequestDeltaEstimate {
@@ -37,32 +38,29 @@ pub enum RequestDeltaEstimate {
     Unmeasured,
 }
 
-impl RequestDeltaEstimate {
-    fn measured(
-        baseline_usd: f64,
-        cost_usd: f64,
-        provider_cache_saved_usd: f64,
-        cache_bust_penalty_usd: f64,
-        summarizer_tax_usd: f64,
-    ) -> Self {
-        let signed_usd = baseline_usd
-            - cost_usd
-            - provider_cache_saved_usd
-            - cache_bust_penalty_usd
-            - summarizer_tax_usd;
-        if !signed_usd.is_finite() {
-            return Self::Unmeasured;
-        }
-
-        Self::Measured {
-            baseline_usd,
-            cost_usd,
-            provider_cache_saved_usd,
-            cache_bust_penalty_usd,
-            summarizer_tax_usd,
-            signed_usd,
-            positive_usd: signed_usd.max(0.0),
-            regression_usd: (-signed_usd).max(0.0),
+impl From<tt_client::RequestDeltaEstimate> for RequestDeltaEstimate {
+    fn from(estimate: tt_client::RequestDeltaEstimate) -> Self {
+        match estimate {
+            tt_client::RequestDeltaEstimate::Measured {
+                baseline_cost_usd,
+                cost_usd,
+                provider_cache_saved_usd,
+                cache_bust_usd,
+                summarizer_tax_usd,
+                signed_usd,
+                positive_usd,
+                regression_usd,
+            } => Self::Measured {
+                baseline_usd: baseline_cost_usd,
+                cost_usd,
+                provider_cache_saved_usd,
+                cache_bust_penalty_usd: cache_bust_usd,
+                summarizer_tax_usd,
+                signed_usd,
+                positive_usd,
+                regression_usd,
+            },
+            tt_client::RequestDeltaEstimate::Unmeasured => Self::Unmeasured,
         }
     }
 }
@@ -81,28 +79,14 @@ pub(crate) struct GatewayAccounting {
 pub(crate) fn gateway_accounting_from_headers(headers: &HeaderMap) -> GatewayAccounting {
     let cost_usd = nonnegative_finite_header(headers, COST_HEADER);
     let realized_savings_usd = nonnegative_finite_header(headers, LEGACY_SAVED_HEADER);
-    let request_delta_estimate = match (
+    let request_delta_estimate = tt_client::RequestDeltaEstimate::from_components(
         nonnegative_finite_header(headers, BASELINE_COST_HEADER),
         cost_usd,
         nonnegative_finite_header(headers, PROVIDER_CACHE_SAVED_HEADER),
         nonnegative_finite_header(headers, CACHE_BUST_HEADER),
         nonnegative_finite_header(headers, SUMMARIZER_TAX_HEADER),
-    ) {
-        (
-            Some(baseline_usd),
-            Some(cost_usd),
-            Some(provider_cache_saved_usd),
-            Some(cache_bust_penalty_usd),
-            Some(summarizer_tax_usd),
-        ) => RequestDeltaEstimate::measured(
-            baseline_usd,
-            cost_usd,
-            provider_cache_saved_usd,
-            cache_bust_penalty_usd,
-            summarizer_tax_usd,
-        ),
-        _ => RequestDeltaEstimate::Unmeasured,
-    };
+    )
+    .into();
 
     GatewayAccounting {
         cost_usd,
@@ -254,6 +238,17 @@ mod tests {
         let accounting = gateway_accounting_from_headers(&complete_headers());
         assert_eq!(accounting.cost_usd, Some(0.0006));
         assert_eq!(accounting.realized_savings_usd, Some(0.0001));
+        assert_eq!(
+            accounting.request_delta_estimate,
+            RequestDeltaEstimate::from(tt_client::RequestDeltaEstimate::from_components(
+                Some(0.0010),
+                Some(0.0006),
+                Some(0.0001),
+                Some(0.0001),
+                Some(0.0001),
+            )),
+            "proxy header accounting must retain the client estimate semantics"
+        );
         match accounting.request_delta_estimate {
             RequestDeltaEstimate::Measured {
                 signed_usd,
@@ -299,19 +294,99 @@ mod tests {
     }
 
     #[test]
+    fn proxy_projection_preserves_client_delta_and_unmeasured_state() {
+        let client_estimate = tt_client::RequestDeltaEstimate::from_components(
+            Some(0.001),
+            Some(0.0008),
+            Some(0.0001),
+            Some(0.0001),
+            Some(0.0002),
+        );
+        let tt_client::RequestDeltaEstimate::Measured {
+            baseline_cost_usd,
+            cost_usd,
+            provider_cache_saved_usd,
+            cache_bust_usd,
+            summarizer_tax_usd,
+            signed_usd,
+            positive_usd,
+            regression_usd,
+        } = client_estimate
+        else {
+            panic!("complete components must produce a client estimate");
+        };
+        assert_eq!(
+            RequestDeltaEstimate::from(client_estimate),
+            RequestDeltaEstimate::Measured {
+                baseline_usd: baseline_cost_usd,
+                cost_usd,
+                provider_cache_saved_usd,
+                cache_bust_penalty_usd: cache_bust_usd,
+                summarizer_tax_usd,
+                signed_usd,
+                positive_usd,
+                regression_usd,
+            }
+        );
+        assert_eq!(
+            RequestDeltaEstimate::from(tt_client::RequestDeltaEstimate::Unmeasured),
+            RequestDeltaEstimate::Unmeasured
+        );
+    }
+
+    #[test]
+    fn jsonl_serialization_keeps_proxy_field_names_for_client_estimates() {
+        let measured = RequestDeltaEstimate::from(tt_client::RequestDeltaEstimate::Measured {
+            baseline_cost_usd: 0.5,
+            cost_usd: 0.75,
+            provider_cache_saved_usd: 0.0,
+            cache_bust_usd: 0.0,
+            summarizer_tax_usd: 0.0,
+            signed_usd: -0.25,
+            positive_usd: 0.0,
+            regression_usd: 0.25,
+        });
+        let measured_json = serde_json::to_value(log_line(measured)).unwrap();
+        let expected_measured = serde_json::json!({
+            "state": "measured",
+            "baseline_usd": 0.5,
+            "cost_usd": 0.75,
+            "provider_cache_saved_usd": 0.0,
+            "cache_bust_penalty_usd": 0.0,
+            "summarizer_tax_usd": 0.0,
+            "signed_usd": -0.25,
+            "positive_usd": 0.0,
+            "regression_usd": 0.25,
+        });
+        assert_eq!(serde_json::to_value(measured).unwrap(), expected_measured);
+        assert_eq!(measured_json["request_delta_estimate"], expected_measured);
+
+        let unmeasured = RequestDeltaEstimate::Unmeasured;
+        let unmeasured_json = serde_json::to_value(log_line(unmeasured)).unwrap();
+        let expected_unmeasured = serde_json::json!({ "state": "unmeasured" });
+        assert_eq!(
+            serde_json::to_value(unmeasured).unwrap(),
+            expected_unmeasured
+        );
+        assert_eq!(
+            unmeasured_json["request_delta_estimate"],
+            expected_unmeasured
+        );
+    }
+
+    #[test]
     fn append_writes_measured_and_unmeasured_jsonl_and_updates_rollup() {
         let d = tempfile::tempdir().unwrap();
         let log = SessionLog::new(d.path()).unwrap();
-        log.append(&log_line(RequestDeltaEstimate::Measured {
-            baseline_usd: 0.001,
-            cost_usd: 0.0008,
-            provider_cache_saved_usd: 0.0001,
-            cache_bust_penalty_usd: 0.0001,
-            summarizer_tax_usd: 0.0002,
-            signed_usd: -0.0002,
-            positive_usd: 0.0,
-            regression_usd: 0.0002,
-        }))
+        log.append(&log_line(RequestDeltaEstimate::from(
+            tt_client::RequestDeltaEstimate::from_components(
+                Some(0.001),
+                Some(0.0008),
+                Some(0.0001),
+                Some(0.0001),
+                Some(0.0002),
+            ),
+        )))
         .unwrap();
         log.append(&log_line(RequestDeltaEstimate::Unmeasured))
             .unwrap();
