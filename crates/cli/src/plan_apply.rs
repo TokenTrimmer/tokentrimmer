@@ -313,8 +313,7 @@ mod tests {
     #[test]
     fn rejects_effective_route_that_fails_the_canonical_contract() {
         let err = plan_routes_to_apply(&HashSet::new(), &[proposed("blank-target", Some("   "))])
-            .err()
-            .expect("an effect check alone must not let an invalid route reach Postgres");
+            .expect_err("an effect check alone must not let an invalid route reach Postgres");
 
         let message = err.to_string();
         assert!(message.contains("blank-target"));
