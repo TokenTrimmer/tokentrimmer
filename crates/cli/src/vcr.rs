@@ -212,7 +212,7 @@ fn verify_wfr_receipt(raw: &str, _peek: &serde_json::Value, key_hex: &str) -> an
         crate::ui::ok("PASS: signature verifies against the supplied verifying key");
         Ok(())
     } else {
-        crate::ui::error("FAIL: signature does not verify (tampered receipt, wrong key, unknown canonical version, or a v2 receipt missing its quality_verdict)");
+        crate::ui::error("FAIL: signature does not verify (tampered receipt, wrong key, unknown canonical version, an empty/pipe-containing status, or a v2 receipt missing its quality_verdict)");
         anyhow::bail!(
             "WFR-receipt verification failed for run_id={}",
             receipt.run_id
@@ -688,6 +688,36 @@ mod tests {
             format!("{err:#}").contains("WFR-receipt verification failed"),
             "the error names the WFR failure: {err:#}"
         );
+    }
+
+    #[test]
+    fn wfr_receipt_fails_when_a_legacy_empty_status_payload_is_signed() {
+        use ed25519_dalek::Signer as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut receipt = sample_wfr_receipt("v2", Some("equivalent"));
+        receipt.status.clear();
+
+        // Sign the malformed legacy bytes directly. The current canonicalizer
+        // must reject this receipt before its otherwise-valid Ed25519 signature
+        // can produce a CLI PASS.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let legacy_payload = format!(
+            "wfr:v2|{}|{}|{}|{}|{}|{}||equivalent",
+            receipt.org_id,
+            receipt.workflow_id,
+            receipt.run_id,
+            receipt.cost_micros,
+            receipt.baseline_micros,
+            receipt.saved_micros,
+        );
+        receipt.signature_hex = hex::encode(key.sign(legacy_payload.as_bytes()).to_bytes());
+        receipt.verifying_key_hex = hex::encode(key.verifying_key().to_bytes());
+
+        let path = write_test_wfr_receipt(dir.path(), "wfr-empty-status.json", &receipt);
+        let err = run_verify_receipt(path.to_str().unwrap(), &key_hex())
+            .expect_err("an empty-status WFR must fail despite a legacy-valid signature");
+        assert!(format!("{err:#}").contains("WFR-receipt verification failed"));
     }
 
     #[test]

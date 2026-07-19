@@ -58,7 +58,7 @@ pub struct WfrReceipt {
     pub org_id: Uuid,
     /// Workflow the run belongs to — canonical-payload field 3.
     pub workflow_id: Uuid,
-    /// Terminal status at seal time — canonical-payload field 8.
+    /// Nonempty terminal status at seal time — canonical-payload field 8.
     pub status: String,
     /// Actual run cost in micro-USD — canonical-payload field 5.
     pub cost_micros: i64,
@@ -103,11 +103,14 @@ pub struct WfrReceipt {
 /// Format (v2):
 /// `wfr:v2|<org_id>|<workflow_id>|<run_id>|<cost_micros>|<baseline_micros>|<saved_micros>|<status>|<quality_verdict>`
 ///
-/// Returns `Err` if a string field contains `|` (the field separator, an
-/// injection guard), if a v2 receipt lacks its `quality_verdict`, or if a v1
-/// receipt carries one. A v1 verdict would be an unsigned extra field and is
-/// outside the published structural contract.
+/// Returns `Err` if `status` is empty, a string field contains `|` (the field
+/// separator, an injection guard), a v2 receipt lacks its `quality_verdict`, or
+/// a v1 receipt carries one. A v1 verdict would be an unsigned extra field and
+/// is outside the published structural contract.
 pub fn canonical_payload(receipt: &WfrReceipt) -> Result<String, WfrReceiptError> {
+    if receipt.status.is_empty() {
+        return Err(WfrReceiptError::EmptyStatus);
+    }
     if receipt.workflow_id.to_string().contains('|')
         || receipt.run_id.to_string().contains('|')
         || receipt.status.contains('|')
@@ -157,6 +160,8 @@ pub fn canonical_payload(receipt: &WfrReceipt) -> Result<String, WfrReceiptError
 /// Errors building/verifying a workflow-run receipt.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WfrReceiptError {
+    /// A required canonical status field was empty.
+    EmptyStatus,
     /// A string field contained the `|` separator.
     PipeInField,
     /// A v2 receipt lacked its `quality_verdict`.
@@ -171,6 +176,9 @@ pub enum WfrReceiptError {
 impl std::fmt::Display for WfrReceiptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EmptyStatus => {
+                f.write_str("receipt status must be non-empty in the canonical payload")
+            }
             Self::PipeInField => f.write_str(
                 "field contained pipe character '|' which is the payload field separator",
             ),
@@ -274,6 +282,14 @@ mod tests {
         assert_eq!(
             schema["properties"]["canonical_version"]["enum"],
             serde_json::json!([CANONICAL_VERSION_V1, CANONICAL_VERSION_V2])
+        );
+        assert_eq!(
+            schema["properties"]["status"]["minLength"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            schema["properties"]["status"]["pattern"],
+            serde_json::json!("^[^|]+$")
         );
 
         let required: BTreeSet<_> = schema["required"]
@@ -421,6 +437,47 @@ mod tests {
         let mut r = sample_v1();
         r.status = "ok|injected".to_string();
         assert_eq!(canonical_payload(&r), Err(WfrReceiptError::PipeInField));
+    }
+
+    #[test]
+    fn empty_status_is_rejected_by_canonical_payload_and_verification() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+
+        let mut v1 = sample_v1();
+        v1.status.clear();
+        assert_eq!(canonical_payload(&v1), Err(WfrReceiptError::EmptyStatus));
+        let legacy_v1_payload = format!(
+            "{WFR_PREFIX}{CANONICAL_VERSION_V1}|{}|{}|{}|{}|{}|{}|",
+            v1.org_id,
+            v1.workflow_id,
+            v1.run_id,
+            v1.cost_micros,
+            v1.baseline_micros,
+            v1.saved_micros,
+        );
+        v1.signature_hex = hex::encode(key.sign(legacy_v1_payload.as_bytes()).to_bytes());
+        v1.verifying_key_hex = hex::encode(key.verifying_key().to_bytes());
+        assert!(!verify_with_key(&v1.verifying_key_hex, &v1));
+
+        let mut v2 = sample_v1();
+        v2.canonical_version = CANONICAL_VERSION_V2.to_string();
+        v2.quality_verdict = Some("equivalent".to_string());
+        v2.status.clear();
+        assert_eq!(canonical_payload(&v2), Err(WfrReceiptError::EmptyStatus));
+        let legacy_v2_payload = format!(
+            "{WFR_PREFIX}{CANONICAL_VERSION_V2}|{}|{}|{}|{}|{}|{}||equivalent",
+            v2.org_id,
+            v2.workflow_id,
+            v2.run_id,
+            v2.cost_micros,
+            v2.baseline_micros,
+            v2.saved_micros,
+        );
+        v2.signature_hex = hex::encode(key.sign(legacy_v2_payload.as_bytes()).to_bytes());
+        v2.verifying_key_hex = hex::encode(key.verifying_key().to_bytes());
+        assert!(!verify_with_key(&v2.verifying_key_hex, &v2));
     }
 
     #[test]

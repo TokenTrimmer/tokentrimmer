@@ -32,8 +32,9 @@
     },
     "status": {
       "type": "string",
-      "pattern": "^[^|]*$",
-      "description": "Terminal run status. A pipe is forbidden because it is the canonical payload separator."
+      "minLength": 1,
+      "pattern": "^[^|]+$",
+      "description": "Nonempty terminal run status. A pipe is forbidden because it is the canonical payload separator."
     },
     "cost_micros": {
       "$ref": "#/$defs/micro_usd",
