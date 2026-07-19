@@ -1,0 +1,1428 @@
+{
+  "$comment": "Structural bundle v1 contract generated from tt_plan_core::SavingsBundle and its nested replay wire types. Structure alone does not prove signature integrity, issuer identity, math replay, provider usage, or invoice reconciliation.",
+  "$defs": {
+    "Actor": {
+      "description": "Who caused an audit event.",
+      "oneOf": [
+        {
+          "description": "A human user identified by UUID.",
+          "properties": {
+            "type": {
+              "enum": [
+                "user"
+              ],
+              "type": "string"
+            },
+            "user_id": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "user_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An API key identified by UUID.",
+          "properties": {
+            "key_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "api_key"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "key_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An internal system process.",
+          "properties": {
+            "type": {
+              "enum": [
+                "system"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An unauthenticated caller.",
+          "properties": {
+            "type": {
+              "enum": [
+                "anonymous"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Aggregates": {
+      "description": "Point-estimate aggregates the replay produces.",
+      "properties": {
+        "cache_hit_rate_projected": {
+          "description": "Fraction of requests projected to be cache hits, 0–1.",
+          "format": "double",
+          "type": "number"
+        },
+        "l2_per_class": {
+          "description": "Per-[`L2TaskClass`] L2 effectiveness breakdown. Empty when L2 projection was skipped (no embeddings). `#[serde(default)]` keeps older plan_runs rows / snapshots byte-identical (they decode to an empty Vec).",
+          "items": {
+            "$ref": "#/$defs/PerClassL2Metrics"
+          },
+          "type": "array"
+        },
+        "l2_poisoning_candidates": {
+          "default": 0,
+          "description": "Count of L2 hits the cache-poisoning heuristic flagged as suspicious — high similarity but historical outcomes diverged substantially (different `finish_reason` and/or `output_tokens` outside the per-request tolerance). Aggregated across the entire threshold sweep — see [`crate::l2_projection`] for the heuristic.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "l2_projections": {
+          "default": [],
+          "description": "One [`L2Projection`] per threshold in [`PlanConfig::l2_threshold_sweep`], in input order. Empty when no request in the window carries an embedding (L2 projection skipped).",
+          "items": {
+            "$ref": "#/$defs/L2Projection"
+          },
+          "type": "array"
+        },
+        "p50_latency_ms_projected": {
+          "description": "p50 latency, ms — preserved from baseline in v1 (model swap latency projection lands in a follow-up).",
+          "format": "double",
+          "type": "number"
+        },
+        "p95_latency_ms_projected": {
+          "description": "p95 latency, ms — preserved from baseline in v1.",
+          "format": "double",
+          "type": "number"
+        },
+        "projected_savings_pct": {
+          "description": "`projected_savings_usd / total_baseline_cost_usd * 100` (0–100).",
+          "format": "double",
+          "type": "number"
+        },
+        "projected_savings_usd": {
+          "description": "`max(0, baseline - projected)` — never negative.",
+          "format": "double",
+          "type": "number"
+        },
+        "requests_rerouted": {
+          "description": "Requests that matched a proposed route and were re-projected.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "requests_unchanged": {
+          "description": "Requests that did not match any proposed route.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "requests_unprice_able": {
+          "description": "Requests that matched a route but the target model lacked a pricing entry — counted as unchanged for cost (conservative).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_baseline_cost_usd": {
+          "description": "Sum of `baseline_cost_usd` across all replayed requests.",
+          "format": "double",
+          "type": "number"
+        },
+        "total_projected_cost_usd": {
+          "description": "Sum of projected costs across all replayed requests.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "cache_hit_rate_projected",
+        "p50_latency_ms_projected",
+        "p95_latency_ms_projected",
+        "projected_savings_pct",
+        "projected_savings_usd",
+        "requests_rerouted",
+        "requests_unchanged",
+        "requests_unprice_able",
+        "total_baseline_cost_usd",
+        "total_projected_cost_usd"
+      ],
+      "type": "object"
+    },
+    "AuditEntry": {
+      "description": "A single entry in the hash-chained audit log.\n\nFields are stable: the hash chain covers a canonical serialization of a subset of them (see [`canonical_payload_bytes`]). Do not reorder or rename without updating the chain computation.",
+      "properties": {
+        "actor": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Actor"
+            }
+          ],
+          "description": "Actor that caused the event."
+        },
+        "event": {
+          "description": "Free-form event name (e.g. `\"api_key.created\"`).",
+          "type": "string"
+        },
+        "hash": {
+          "description": "Hex-encoded BLAKE3 hash of `prev_hash_bytes || canonical_json(payload_to_sign)`.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Unique entry identifier (UUIDv4).",
+          "format": "uuid",
+          "type": "string"
+        },
+        "org_id": {
+          "description": "Organization this entry belongs to.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "payload": {
+          "description": "Arbitrary structured payload; covered by the hash chain."
+        },
+        "prev_hash": {
+          "description": "Hex-encoded BLAKE3 hash of the previous entry (64 × `0` for genesis).",
+          "type": "string"
+        },
+        "seq": {
+          "description": "Monotonic per-org sequence number (0-based, gap-free).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "signature": {
+          "description": "Hex-encoded Ed25519 signature over the 32-byte raw hash.",
+          "type": "string"
+        },
+        "timestamp": {
+          "description": "Wall-clock time the entry was written (UTC, RFC 3339).",
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "actor",
+        "event",
+        "hash",
+        "id",
+        "org_id",
+        "payload",
+        "prev_hash",
+        "seq",
+        "signature",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "BundleAttestation": {
+      "description": "Signed audit-chain reference carried inside a savings bundle.",
+      "properties": {
+        "entries": {
+          "description": "Signed, hash-chained audit entries.",
+          "items": {
+            "$ref": "#/$defs/AuditEntry"
+          },
+          "type": "array"
+        },
+        "verifying_key": {
+          "description": "Hex-encoded Ed25519 verifying key for [`Self::entries`].",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entries",
+        "verifying_key"
+      ],
+      "type": "object"
+    },
+    "ConfidenceIntervals": {
+      "description": "95% bootstrap CIs for the headline metrics.",
+      "properties": {
+        "cache_hit_rate_95": {
+          "description": "`(lo, hi)` for projected cache hit rate, 0–1.",
+          "items": [
+            {
+              "format": "double",
+              "type": "number"
+            },
+            {
+              "format": "double",
+              "type": "number"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "p50_latency_ms_95": {
+          "default": [
+            0.0,
+            0.0
+          ],
+          "description": "`(lo, hi)` for projected p50 request latency, milliseconds. Zero when the input has no latency observations.",
+          "items": [
+            {
+              "format": "double",
+              "type": "number"
+            },
+            {
+              "format": "double",
+              "type": "number"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "p95_latency_ms_95": {
+          "default": [
+            0.0,
+            0.0
+          ],
+          "description": "`(lo, hi)` for projected p95 request latency, milliseconds. Zero when the input has no latency observations.",
+          "items": [
+            {
+              "format": "double",
+              "type": "number"
+            },
+            {
+              "format": "double",
+              "type": "number"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "savings_pct_95": {
+          "description": "`(lo, hi)` for projected savings percentage, 0–100.",
+          "items": [
+            {
+              "format": "double",
+              "type": "number"
+            },
+            {
+              "format": "double",
+              "type": "number"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "savings_usd_95": {
+          "description": "`(lo, hi)` for projected total savings, USD.",
+          "items": [
+            {
+              "format": "double",
+              "type": "number"
+            },
+            {
+              "format": "double",
+              "type": "number"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        }
+      },
+      "required": [
+        "cache_hit_rate_95",
+        "savings_pct_95",
+        "savings_usd_95"
+      ],
+      "type": "object"
+    },
+    "JudgeVerdict": {
+      "description": "Per-sample judge verdict.",
+      "oneOf": [
+        {
+          "description": "Proposed response is interchangeable with the original.",
+          "enum": [
+            "acceptable"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Proposed response is materially worse than the original.",
+          "enum": [
+            "degraded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Judge declined to classify (model refusal, parse failure, etc.). Counted toward neither acceptable nor degraded but recorded in the total. A high `Unclear` share surfaces as a user-visible caveat.",
+          "enum": [
+            "unclear"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "L2Projection": {
+      "description": "One row of the L2 (semantic) cache sensitivity sweep. Produced by [`crate::l2_projection::project_l2_hits`] — one per threshold in [`PlanConfig::l2_threshold_sweep`].",
+      "properties": {
+        "poisoning_candidates": {
+          "default": 0,
+          "description": "Count of L2 hits the cache-poisoning heuristic flagged as suspicious **at this threshold** — high similarity but historical outcomes diverged. Reported per-threshold so the risk is shown against the threshold that produced it (a higher threshold typically yields fewer, tighter matches and so fewer candidates). See [`crate::l2_projection`] for the heuristic.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "projected_l2_hit_rate": {
+          "description": "`projected_l2_hits / total` (0–1, 0 when `total == 0`).",
+          "format": "double",
+          "type": "number"
+        },
+        "projected_l2_hits": {
+          "description": "Number of requests projected to hit the L2 cache at this threshold.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threshold": {
+          "description": "Cosine-similarity threshold this row was computed at.",
+          "format": "float",
+          "type": "number"
+        },
+        "total": {
+          "description": "Total requests considered (only requests carrying an `embedding` participate — others are skipped before counting).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "projected_l2_hit_rate",
+        "projected_l2_hits",
+        "threshold",
+        "total"
+      ],
+      "type": "object"
+    },
+    "L2TaskClass": {
+      "description": "The L2 task class of a replayed request — the plan-core mirror of the gateway's `JudgeTaskClass` / `tt_cache::TaskClass`, kept here so the Plan can report L2 effectiveness per class without depending on those crates.\n\n`#[non_exhaustive]` so additional classes can be added without breaking downstream match arms.",
+      "oneOf": [
+        {
+          "description": "`POST /v1/chat/completions` — the only class in the v1 corpus.",
+          "enum": [
+            "chat_completions"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ModelPricing": {
+      "description": "USD-per-million pricing for one model. Mirrors `tt_shared::pricing::ModelPricing` but without the `effective_at` field — the replay engine assumes the caller has already picked the right historical rate for each request.",
+      "properties": {
+        "batch_input_per_million": {
+          "description": "USD per 1M batch (async Batch API) input tokens. `None` = no batch tier; a batch-eligibility route targeting such a model projects NO discount (never a fabricated 0.5×). Skipped from JSON when `None` so existing snapshots / persisted plan inputs stay byte-identical.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "batch_output_per_million": {
+          "description": "USD per 1M batch (async Batch API) output tokens. See [`Self::batch_input_per_million`].",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cached_input_per_million": {
+          "description": "USD per 1M cached input tokens. `None` means \"no cache discount on this model\"; the replay then charges cached input at the full rate.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "flex_input_per_million": {
+          "description": "USD per 1M input tokens under OpenAI's **Flex** service tier (`service_tier=\"flex\"`), mirroring `tt_shared::pricing::ModelPricing`. `None` = no Flex tier; a `flex` route targeting such a model projects NO discount (never a fabricated 0.5×). PRESENCE is the eligibility gate. Skipped from JSON when `None` so existing snapshots / persisted plan inputs stay byte-identical.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "flex_output_per_million": {
+          "description": "USD per 1M output tokens under the Flex service tier. See [`Self::flex_input_per_million`].",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "input_per_million": {
+          "description": "USD per 1M input tokens (non-cached).",
+          "format": "double",
+          "type": "number"
+        },
+        "output_per_million": {
+          "description": "USD per 1M output tokens.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "input_per_million",
+        "output_per_million"
+      ],
+      "type": "object"
+    },
+    "PerClassL2Metrics": {
+      "description": "Per-task-class L2 effectiveness, aggregated across the whole threshold sweep. Lets the Plan answer \"how well does the L2 cache work for this class of request?\" — hits vs. considered, plus the poisoning-candidate count.",
+      "properties": {
+        "considered": {
+          "description": "Requests of this class that carried an embedding (the L2-eligible denominator), summed across every threshold in the sweep.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "hits": {
+          "description": "Projected L2 hits for this class, summed across every threshold.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "misses": {
+          "description": "Projected L2 misses for this class (`considered - hits`), summed across every threshold.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "poisoning_candidates": {
+          "description": "Count of **distinct** requests of this class that the poisoning heuristic flagged at any threshold (deduped across the sweep, mirroring the top-level aggregate).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "task_class": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/L2TaskClass"
+            }
+          ],
+          "description": "The task class these metrics are for."
+        }
+      },
+      "required": [
+        "considered",
+        "hits",
+        "misses",
+        "poisoning_candidates",
+        "task_class"
+      ],
+      "type": "object"
+    },
+    "PerRouteBreakdown": {
+      "description": "One row of the per-route attribution table.",
+      "properties": {
+        "baseline_cost_usd": {
+          "description": "Sum of baseline costs for matched requests.",
+          "format": "double",
+          "type": "number"
+        },
+        "matched": {
+          "description": "Count of requests matched by this route.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "projected_cost_usd": {
+          "description": "Sum of projected costs for matched requests.",
+          "format": "double",
+          "type": "number"
+        },
+        "route_id": {
+          "description": "Route the bucket belongs to.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "route_name": {
+          "description": "Echoed `name` for human-readable rendering.",
+          "type": "string"
+        },
+        "savings_usd": {
+          "description": "`max(0, baseline - projected)`.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "baseline_cost_usd",
+        "matched",
+        "projected_cost_usd",
+        "route_id",
+        "route_name",
+        "savings_usd"
+      ],
+      "type": "object"
+    },
+    "PlanConfig": {
+      "description": "Configuration knobs that affect projection but aren't per-route. Today this carries the L1 cache TTL the [`crate::cache_projection`] module uses plus the L2 (semantic) projection knobs consumed by [`crate::l2_projection`].",
+      "properties": {
+        "l1_ttl_seconds": {
+          "default": null,
+          "description": "L1 cache TTL, seconds. `None` disables L1 projection entirely.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "l2_threshold_sweep": {
+          "default": [
+            0.8500000238418579,
+            0.8999999761581421,
+            0.9200000166893005,
+            0.949999988079071
+          ],
+          "description": "L2 cosine-similarity thresholds to evaluate in a single replay pass. Each entry produces an independent [`L2Projection`] row in the [`Aggregates::l2_projections`] sweep. Default is the `0.85 / 0.90 / 0.92 / 0.95` sensitivity sweep described in `docs/03-plan-replay-design.md` §6.2.",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "l2_ttl_seconds": {
+          "default": null,
+          "description": "L2 cache TTL, seconds. `None` disables L2 projection entirely (the replay loop also short-circuits when no request carries an embedding).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PlanInput": {
+      "description": "The full input to a Plan replay.",
+      "properties": {
+        "bootstrap_iterations": {
+          "description": "Bootstrap iterations. Default 10,000 per `docs/03-plan-replay-design.md` §8.1; tests may lower for speed.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "config": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/PlanConfig"
+            }
+          ],
+          "default": {
+            "l1_ttl_seconds": null,
+            "l2_threshold_sweep": [
+              0.8500000238418579,
+              0.8999999761581421,
+              0.9200000166893005,
+              0.949999988079071
+            ],
+            "l2_ttl_seconds": null
+          },
+          "description": "Optional non-route config (cache settings, etc.)."
+        },
+        "org_id": {
+          "description": "Tenant the plan is being computed for.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "plan_id": {
+          "description": "Stable identifier for the plan run — flows through to the result so the audit row can reference it.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "pricing": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ModelPricing"
+          },
+          "description": "Pricing for every model the proposed routes might rewrite to. A missing entry causes the request to be counted as \"unchanged\" (conservative projection — see invariant #3 in the task spec).",
+          "type": "object"
+        },
+        "proposed_routes": {
+          "description": "The proposed routes to evaluate. Evaluated in priority-descending order; first match wins.",
+          "items": {
+            "$ref": "#/$defs/ProposedRoute"
+          },
+          "type": "array"
+        },
+        "requests": {
+          "description": "The condensed historical telemetry rows to replay.",
+          "items": {
+            "$ref": "#/$defs/RequestLog"
+          },
+          "type": "array"
+        },
+        "seed": {
+          "description": "Deterministic seed for the bootstrap CI computation.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_end": {
+          "description": "Exclusive upper bound of the replay window (open interval).",
+          "format": "date-time",
+          "type": "string"
+        },
+        "window_start": {
+          "description": "Inclusive lower bound of the replay window (closed interval).",
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "bootstrap_iterations",
+        "org_id",
+        "plan_id",
+        "pricing",
+        "proposed_routes",
+        "requests",
+        "seed",
+        "window_end",
+        "window_start"
+      ],
+      "type": "object"
+    },
+    "PlanResult": {
+      "description": "The Plan replay result — what gets serialized to `plan_runs` and surfaced to the user in the CLI / dashboard.",
+      "properties": {
+        "aggregates": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Aggregates"
+            }
+          ],
+          "description": "Point-estimate aggregates over the whole sample."
+        },
+        "caveats": {
+          "description": "Human-readable warnings (small sample size, missing pricing, etc.).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "confidence_intervals": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ConfidenceIntervals"
+            }
+          ],
+          "description": "95% confidence intervals from bootstrap resampling."
+        },
+        "org_id": {
+          "description": "Echoed from the input.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "per_route_breakdown": {
+          "description": "Per-route attribution. Sorted by `route_id` for determinism.",
+          "items": {
+            "$ref": "#/$defs/PerRouteBreakdown"
+          },
+          "type": "array"
+        },
+        "plan_id": {
+          "description": "Echoed from the input.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "proposed_routes": {
+          "description": "The proposed routes that produced this projection, echoed from [`PlanInput::proposed_routes`]. Carried on the result so the apply path ([`crate::apply::apply_plan`]) can persist them to the Gateway routing config in the same transaction as the status flip — without this the result has no record of *what* to apply.\n\n`#[serde(default)]` so plan_runs rows persisted before this field existed (which stored only the projection output) still deserialize; they decode to an empty Vec, and applying such a row writes no routes (matching today's no-op behavior rather than crashing).",
+          "items": {
+            "$ref": "#/$defs/ProposedRoute"
+          },
+          "type": "array"
+        },
+        "quality": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QualityResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Tier 3 LLM-judge quality score. `None` when quality scoring was not requested (the common case — replays default to projection-only). Populated by [`crate::quality::score_quality`] when the caller opts in via body logging + budget. Skipped from serialized output when `None` so existing snapshots / persisted rows stay byte-identical."
+        },
+        "sample_size": {
+          "description": "Number of requests the replay actually evaluated.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window_end": {
+          "description": "Echoed from the input.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "window_start": {
+          "description": "Echoed from the input.",
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "aggregates",
+        "caveats",
+        "confidence_intervals",
+        "org_id",
+        "per_route_breakdown",
+        "plan_id",
+        "sample_size",
+        "window_end",
+        "window_start"
+      ],
+      "type": "object"
+    },
+    "ProposedRoute": {
+      "description": "A route in the proposed config: when conditions match, route to `target_model`.",
+      "properties": {
+        "enabled": {
+          "description": "Disabled routes never match.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Stable identifier — used as the bucket key in per-route breakdown.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "name": {
+          "description": "Human-readable name, surfaced in the report.",
+          "type": "string"
+        },
+        "priority": {
+          "description": "Higher numbers win — evaluated descending; first match takes effect.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "then": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/RouteAction"
+            }
+          ],
+          "description": "What to do when matched."
+        },
+        "when": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/RouteConditions"
+            }
+          ],
+          "description": "AND-ed conditions. See [`RouteConditions`]."
+        }
+      },
+      "required": [
+        "enabled",
+        "id",
+        "name",
+        "priority",
+        "then",
+        "when"
+      ],
+      "type": "object"
+    },
+    "QualityResult": {
+      "description": "Aggregated quality result attached to a `PlanResult`.",
+      "properties": {
+        "acceptable_count": {
+          "description": "Count of `Acceptable` verdicts.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "caveats": {
+          "description": "Human-readable warnings (small sample, high `Unclear` share, etc.).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "degraded_count": {
+          "description": "Count of `Degraded` verdicts.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "degraded_pct": {
+          "description": "`degraded_count / (acceptable_count + degraded_count) × 100` (0–100). Defined over *classified* samples only — `Unclear` is excluded from the denominator because by definition we don't know its valence.",
+          "format": "double",
+          "type": "number"
+        },
+        "risk_band": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/RiskBand"
+            }
+          ],
+          "description": "Aggregate band — feeds the user-facing red/yellow/green pill."
+        },
+        "sample_size": {
+          "description": "Number of requests the judge actually scored.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "sampled_examples": {
+          "description": "Per-sample scores, in stable order. Bounded by [`QualityConfig::total_samples`].",
+          "items": {
+            "$ref": "#/$defs/SampleScore"
+          },
+          "type": "array"
+        },
+        "unclear_count": {
+          "description": "Count of `Unclear` verdicts.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "acceptable_count",
+        "caveats",
+        "degraded_count",
+        "degraded_pct",
+        "risk_band",
+        "sample_size",
+        "sampled_examples",
+        "unclear_count"
+      ],
+      "type": "object"
+    },
+    "RequestLog": {
+      "description": "One historical `request_logs` row, condensed to what the replay needs.\n\nMirrors `crates/core/migrations/0001_request_logs.up.sql` for the fields the replay reads. Embedding / vector fields are intentionally absent in v1; semantic-cache (L2) projection lands in a follow-up backlog item (ADR-008 covers the embedding choice).",
+      "properties": {
+        "baseline_cost_usd": {
+          "description": "Cost the org would have paid without any TokenTrimmer routing/caching — used as the savings denominator.",
+          "format": "double",
+          "type": "number"
+        },
+        "body": {
+          "description": "Raw request prompt text. Only populated when the org has opted into body logging (ADR-009 / spec §11). Required for Tier 3 quality scoring — [`crate::quality::score_quality`] skips any sampled row that lacks it. `#[serde(default, skip_serializing_if = ...)]` keeps older snapshots / persisted rows byte-identical.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cache_layer": {
+          "description": "`\"l1\"` | `\"l2\"` | `None`. Constrained to the same set as the DB CHECK.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cached": {
+          "description": "Whether TokenTrimmer's L1/L2 cache served the response.",
+          "type": "boolean"
+        },
+        "cached_tokens": {
+          "description": "Of `input_tokens`, how many were cached (provider-native prompt cache).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cost_usd": {
+          "description": "Cost the org actually paid for this request, USD.",
+          "format": "double",
+          "type": "number"
+        },
+        "diff_saved_usd": {
+          "description": "Measured output-diff savings, USD, that the gateway REALIZED on this request at serve time (research Phase 3.4 — reconstructed-artifact minus billed-patch tokens, the `request_logs.diff_saved_usd` column). Replay cannot forward-project diff for traffic that didn't use it (the row carries no prior artifact to re-derive a patch from); this carries the ALREADY-realized number so the Plan can attribute per-lever ROI for a `diff` route. It is already reflected in this row's `baseline_cost_usd - cost_usd`, so the Plan surfaces it as a caveat and never folds it on top (double-count guard). `None`/absent for rows that predate the column or were served without diff. Skipped from JSON when `None` so existing snapshots / persisted inputs stay byte-identical.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "embedding": {
+          "default": null,
+          "description": "Embedding of the request (typically the last user message), as produced by the embedding model named in ADR-008 (`text-embedding-3-small`, 1536-dim L2-normalized). `None` when the historical row predates the embedding pipeline or the tenant opted out — such requests are skipped by L2 projection.\n\nAppended at the end of the struct with `#[serde(default)]` so older serialized payloads continue to deserialize unchanged.",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "finish_reason": {
+          "default": null,
+          "description": "Provider-reported finish reason (`\"stop\"`, `\"length\"`, `\"tool_use\"`, …). Used by the L2 cache-poisoning heuristic — when absent on either side of a candidate pair the heuristic degrades gracefully and the \"divergent finish reason\" signal is skipped for that pair.\n\nAppended at the end of the struct with `#[serde(default)]` so older serialized payloads continue to deserialize unchanged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable primary key for ordering during replay.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "input_tokens": {
+          "description": "Input tokens charged on the baseline run.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "latency_ms": {
+          "description": "End-to-end latency observed by the client, ms.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "matched_route_id": {
+          "description": "The route id that matched in the baseline config, if any.",
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "minify_saved_est_usd": {
+          "description": "Estimated minified-JSON whitespace savings, USD (research Phase 3.1 — the gateway's pretty-vs-emitted re-tokenize estimate, the `request_logs.minify_saved_est_usd` column). A LABELED ESTIMATE, never invoice-reconciled: the Plan surfaces it as an estimated caveat for a `minify_json` route and NEVER folds it into the projected-savings headline (mirroring the runtime contract). `None`/absent when not estimated. Skipped from JSON when `None` (back-compat).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Provider-side model id (e.g. `\"claude-3-5-sonnet\"`).",
+          "type": "string"
+        },
+        "org_id": {
+          "description": "Tenant the request belongs to.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "output_tokens": {
+          "description": "Output tokens charged on the baseline run.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "provider": {
+          "description": "Upstream provider name (e.g. `\"anthropic\"`).",
+          "type": "string"
+        },
+        "response_body": {
+          "description": "Raw response text from the original baseline run. Pairs with `body` for Tier 3 quality scoring. Same opt-in + back-compat constraints.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "HTTP status the gateway returned.",
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tag": {
+          "description": "Free-form tag for per-feature attribution.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_class": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/L2TaskClass"
+            }
+          ],
+          "default": "chat_completions",
+          "description": "The L2 task class this request belongs to — used by the L2 projection to break down per-class effectiveness. Defaults to [`L2TaskClass::ChatCompletions`] for the v1 chat-completions corpus and for older serialized rows that predate this field."
+        },
+        "ts": {
+          "description": "Wall-clock time the request was served at.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "upstream_latency_ms": {
+          "description": "Upstream-only latency, ms — `None` if not recorded.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "baseline_cost_usd",
+        "cached",
+        "cached_tokens",
+        "cost_usd",
+        "id",
+        "input_tokens",
+        "latency_ms",
+        "model",
+        "org_id",
+        "output_tokens",
+        "provider",
+        "status",
+        "ts"
+      ],
+      "type": "object"
+    },
+    "RiskBand": {
+      "description": "Aggregate risk classification per `docs/03-plan-replay-design.md` §7.4 (task-spec thresholds: `≤5%` / `(5%, 15%]` / `>15%`).",
+      "oneOf": [
+        {
+          "description": "Degraded share of *classified* (non-Unclear) samples ≤ 5%.",
+          "enum": [
+            "low"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Degraded share in `(5%, 15%]`.",
+          "enum": [
+            "medium"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Degraded share > 15%.",
+          "enum": [
+            "high"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RouteAction": {
+      "description": "What a matching [`ProposedRoute`] does.\n\nField order matches `tt_routing::RouteAction` so the two types produce identical JSON for the same logical value — a requirement for the Plan apply round-trip (a `ProposedRoute` serialized by the Plan engine and then deserialized by the Gateway must carry all fields without loss or reordering). The `flex` flag IS mirrored (COST-7) — it is a real ~50% rate cut the replay PROJECTS (see [`crate::cost::project_flex_cost`]), so it must round-trip. KNOWN EXCEPTION: the gateway's `compress` flag is still not mirrored here (pre-existing drift; it is false-omitted on the wire, so identity holds whenever it is unset). The `route_action_cross_type_lockstep_guard` test below fails to compile when `tt_routing::RouteAction` grows a field, so any future addition must explicitly decide the mirror question.",
+      "properties": {
+        "auto_pause": {
+          "description": "Mirror of `tt_routing::RouteAction::auto_pause`. The quality circuit breaker is a runtime-only guardrail (the gateway sticky-pauses the route when its live paired-judge pass-rate regresses below the floor); replay has no live verdict stream, so the engine does not simulate pauses — it treats the route as always active and projects the route's FULL savings (the same not-yet-modeled assumption it already makes for `traffic_pct`; a real pause can only shrink realized savings, never change quality). Present so a `tt_routing::RouteAction` carrying `auto_pause` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping it on read. Omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "batch": {
+          "description": "Mirror of `tt_routing::RouteAction::batch`. Replay PROJECTS the discount the Batch Lane would deliver (target priced at its catalog batch rate — see [`crate::cost::project_batch_cost`]) and surfaces a per-run caveat counting the affected requests — the live gateway is synchronous today and does NOT realize this discount (advisory marker; the async Batch Lane is a later phase). Same serde gating as the gateway side (omitted when false).",
+          "type": "boolean"
+        },
+        "diff": {
+          "description": "Mirror of `tt_routing::RouteAction::diff` (research Phase 3.4 — opt-in anchored search/replace patch responses with fail-closed full re-emit). Carried for lossless wire round-trip; replay does not model output shaping (no projection — savings for this lever are REALIZED at runtime from real tokenizer counts, but a historical `RequestLog` row carries no prior artifact to re-derive them from). Same serde gating as the gateway side: omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "disable_cache": {
+          "description": "Mirror of `tt_routing::RouteAction::disable_cache`. The replay engine does not yet model cache opt-out (follow-up); present for lossless round-trip.",
+          "type": "boolean"
+        },
+        "fallbacks": {
+          "description": "Ordered fallback model ids, mirroring `tt_routing::RouteAction::fallbacks`. The replay engine does not yet simulate fallback firing (follow-up: extend the replay matcher to account for fallback paths); the field is present so a `tt_routing::RouteAction` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping fallbacks on read.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "flex": {
+          "description": "Mirror of `tt_routing::RouteAction::flex` — opt the matched request into OpenAI's Flex service tier (`service_tier=\"flex\"`), billed at ~50% of standard. UNLIKE the advisory Batch Lane, the gateway applies Flex in-band and the discount is REALIZED, so replay PROJECTS it: a flex route whose served model carries a catalog Flex rate is priced at that rate via [`crate::cost::project_flex_cost`] (the exact shape/precision of `project_batch_cost`), the delta folds into projected savings, and a per-run caveat counts the affected requests. A served model with no Flex rate projects NO discount (never a fabricated 0.5×) and is caveated as inapplicable — mirroring the gateway's `flex_not_applied:<model>` behavior. Same serde gating as the gateway side: omitted when false (back-compat — existing plan JSON/snapshots stay byte-identical).",
+          "type": "boolean"
+        },
+        "format_switch": {
+          "description": "Mirror of `tt_routing::RouteAction::format_switch` (research Phase 3.3 — opt-in CSV/bare emission instead of verbose JSON). Carried for lossless wire round-trip; replay does not model output shaping (no projection — savings for this lever are ESTIMATED at runtime only and never fold into invoice-reconciled figures). Same serde gating as the gateway side: omitted from JSON when `None` (back-compat).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_cost_usd": {
+          "description": "Mirror of `tt_routing::RouteAction::max_cost_usd`. A matched request whose projected cost exceeds this would be rejected at runtime — replay counts it unchanged (no savings) and surfaces a caveat.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "minify_json": {
+          "description": "Mirror of `tt_routing::RouteAction::minify_json`. Carried, NOT modeled: the per-request minify saving is a runtime ESTIMATE grounded in the actual emitted JSON (pretty re-render re-tokenized with the served model's tokenizer), which is not derivable from a historical `RequestLog` row — so replay projects nothing for it (like `redact`/`shadow_model`). Present so a `tt_routing::RouteAction` carrying `minify_json` round-trips losslessly. Omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "pause_floor_pass_rate": {
+          "description": "Mirror of `tt_routing::RouteAction::pause_floor_pass_rate`. See `auto_pause`. Omitted from JSON when `None` (back-compat).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "pause_min_verdicts": {
+          "description": "Mirror of `tt_routing::RouteAction::pause_min_verdicts`. See `auto_pause`. Omitted from JSON when `None` (back-compat).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reasoning_budget_tokens": {
+          "description": "Mirror of `tt_routing::RouteAction::reasoning_budget_tokens`. Carried, NOT modeled — see `reasoning_max_effort`. Omitted when `None` (back-compat).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reasoning_max_effort": {
+          "description": "Mirror of `tt_routing::RouteAction::reasoning_max_effort`. Carried, NOT modeled: the reasoning-token cap books $0 at runtime (unspent thinking tokens are only statistically visible) and `RequestLog` carries no reasoning-spend signal to replay against. Omitted when `None` (back-compat).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redact": {
+          "description": "Mirror of `tt_routing::RouteAction::redact`. The request-redaction guardrail is a runtime-only SAFETY transform (it strips PII/secrets from the outbound prompt); the replay engine does not model it (no cost/savings effect to project). Present so a `tt_routing::RouteAction` carrying `redact` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping the flag on read. Same serde gating as the gateway side: omitted from JSON when false (back-compat).",
+          "type": "boolean"
+        },
+        "shadow_model": {
+          "description": "Mirror of `tt_routing::RouteAction::shadow_model`. Shadow mode is a runtime-only side-channel (the gateway dispatches the candidate, discards its response, and records its cost separately); it never changes the served response, so the replay engine does not model it. Present so a `tt_routing::RouteAction` carrying `shadow_model` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping it on read. Omitted from JSON when `None` (back-compat).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_model": {
+          "description": "Rewrite to this model. May target a different provider than the request (V3d-1). Cost projection resolves the target's own provider from the pricing table; a target absent from the table is counted unchanged.\n\n`None` = **modifier-only route** (mirrors `tt_routing::RouteAction`): keep the caller's chosen model and apply only this action's other then-effects. Replay treats the served/effective model as the ORIGINAL request model, so the model-rewrite cost delta is 0 and ONLY the modifier levers (flex/batch/diff/minify, …) project. Existing route JSON always carries `target_model`, so it deserializes to `Some`; omitting it yields `None`. Same serde gating as `tt_routing::RouteAction` so the wire form stays byte-identical (`Some(\"x\")` → `{\"target_model\":\"x\"}`, `None` → key omitted).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "traffic_pct": {
+          "description": "Mirror of `tt_routing::RouteAction::traffic_pct`. A canary split — when `Some(pct)`, only a deterministic `pct`% of matched requests take the rewrite at runtime (chosen by `tt_routing::sticky_traffic_split`); the rest pass through unchanged. The replay engine does not yet model the split (a follow-up would re-derive the per-request arm via the same sticky hash from the logged idempotency key, so projected savings match the fraction that actually routed); the field is present so a `tt_routing::RouteAction` carrying `traffic_pct` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping the split on read. Omitted from JSON when `None` (back-compat).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RouteConditions": {
+      "description": "Match conditions for a [`ProposedRoute`]. v1 supports: `model_in`, `input_tokens_lt`, `input_tokens_gt`, `tag_equals`. Empty / `None` fields match anything; all non-empty fields are AND-ed.",
+      "properties": {
+        "content_type": {
+          "description": "Mirror of `tt_routing::RouteConditions::content_type` (content-aware compression, P1a). Carried for lossless wire round-trip only — NOT projectable in replay (Plan has no live content classifier over the historical `RequestLog` row), so a route carrying it is a conservative non-match in `routing::matches_conditions`, keeping Plan from over-projecting savings on a content-type route.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimated_cost_gt": {
+          "description": "Mirror of `tt_routing::RouteConditions::estimated_cost_gt`. Evaluated against `RequestLog.baseline_cost_usd` (the request's logged cost on its original model) — accurately projectable, unlike modality/topic.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "estimated_cost_lt": {
+          "description": "Mirror of `tt_routing::RouteConditions::estimated_cost_lt`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "has_audio": {
+          "description": "Mirror of `tt_routing::RouteConditions::has_audio`. See `has_images`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "has_documents": {
+          "description": "Mirror of `tt_routing::RouteConditions::has_documents` (Document Lane D4a). Like the other modality mirrors, not evaluable in replay (RequestLog records no modality) — a conservative non-match in `routing::matches_conditions`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "has_images": {
+          "description": "Mirror of `tt_routing::RouteConditions::has_images`. Not evaluable in replay (RequestLog records no modality) — see `routing::matches_conditions`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "input_tokens_gt": {
+          "default": null,
+          "description": "Match only if `req.input_tokens > this`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_tokens_lt": {
+          "default": null,
+          "description": "Match only if `req.input_tokens < this`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model_in": {
+          "default": [],
+          "description": "Match only if `req.model` is in this list. Empty list matches any model.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "not_reasoning_class": {
+          "description": "Mirror of `tt_routing::RouteConditions::not_reasoning_class`. Carried for lossless wire round-trip only — NOT evaluable in replay (Plan has no reasoning-class classifier). A route carrying this condition is treated as a conservative non-match in `routing::matches_conditions`, so Plan never over-projects savings on a catalog route.",
+          "type": "boolean"
+        },
+        "prompt_contains_any_of": {
+          "description": "Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. Replay matches against `RequestLog.body` when present, else conservative no-match.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tag_equals": {
+          "default": null,
+          "description": "Match only if `req.tag == Some(this)`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "upstream_latency_ms_p95_gt": {
+          "description": "Mirror of `tt_routing::RouteConditions::upstream_latency_ms_p95_gt`. Carried for lossless wire round-trip only — NOT projectable in replay: the gateway's live in-process p95 window does not exist for historical `RequestLog` rows. Like the modality mirrors, a route carrying this condition is treated as a conservative non-match in `routing::matches_conditions`, so Plan never over-projects savings on a latency route.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SampleScore": {
+      "description": "One sampled request's score.",
+      "properties": {
+        "reason": {
+          "description": "Best-effort one-line reason from the judge. Trimmed to 200 chars.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Stable identifier of the source [`RequestLog`].",
+          "format": "uuid",
+          "type": "string"
+        },
+        "verdict": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/JudgeVerdict"
+            }
+          ],
+          "description": "The judge's classification."
+        }
+      },
+      "required": [
+        "reason",
+        "request_id",
+        "verdict"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:tokentrimmer:savings-bundle:structural-schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "A self-contained, offline-reproducible savings bundle.",
+  "properties": {
+    "attestation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BundleAttestation"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional signed audit-chain reference checked by the bundle verifier."
+    },
+    "created_at": {
+      "description": "RFC 3339 production timestamp (informational only).",
+      "type": "string"
+    },
+    "expected_result": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/PlanResult"
+        }
+      ],
+      "description": "Expected replay output, compared with a fresh replay by the verifier."
+    },
+    "plan_input": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/PlanInput"
+        }
+      ],
+      "description": "Complete deterministic replay input, including pricing and RNG seed."
+    },
+    "schema_version": {
+      "const": 1,
+      "description": "Schema version — see [`BUNDLE_SCHEMA_VERSION`].",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "tool_version": {
+      "description": "The `tt` version that produced the bundle (informational only).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "created_at",
+    "expected_result",
+    "plan_input",
+    "schema_version",
+    "tool_version"
+  ],
+  "title": "TokenTrimmer reproducible savings bundle",
+  "type": "object"
+}

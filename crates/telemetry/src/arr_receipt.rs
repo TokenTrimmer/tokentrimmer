@@ -44,6 +44,7 @@ pub const CANONICAL_VERSION_V2: &str = "v2";
 /// `VerifyReceiptResponse` JSON shape. The raw micro-USD fields are the
 /// canonical payload inputs; convenience `*_usd` values and `signed_at` are
 /// intentionally not signed.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct AgentRunReceipt {
     /// Agent run UUID (also the receipt primary key).
@@ -60,16 +61,16 @@ pub struct AgentRunReceipt {
     /// `max(signed_request_delta_micros, 0)`.
     pub saved_micros: i64,
     /// Signed v2 request delta; regressions remain negative.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_request_delta_micros: Option<i64>,
     /// Exact v2 request formula identifier.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_delta_formula_version: Option<String>,
     /// Non-truncated requests in the v2 run cohort.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_delta_eligible_requests: Option<i64>,
     /// Strictly measured requests in the v2 run cohort.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_delta_measured_requests: Option<i64>,
     /// Convenience display value only; not part of the signature.
     #[serde(default)]
@@ -81,7 +82,7 @@ pub struct AgentRunReceipt {
     #[serde(default)]
     pub saved_usd: Option<f64>,
     /// Convenience signed request delta in USD; not part of the signature.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_request_delta_usd: Option<f64>,
     /// Hex-encoded 64-byte Ed25519 signature over [`canonical_payload`].
     pub signature_hex: String,

@@ -98,7 +98,9 @@ nonempty and complete; and `saved_micros` equals
 `max(signed_request_delta_micros, 0)`, preserving regressions as negative signed
 deltas. An incomplete or empty cohort does not mint. Already-frozen `arr:v1`
 receipts retain their historical canonical bytes. Convenience USD fields and
-`signed_at` are not signed. The machine-readable contract and checked-in
+`signed_at` are not signed. The generated
+[machine-readable contract index](receipt-spec/receipt-contracts.manifest.json),
+structural contract, and checked-in
 [v1](receipt-spec/arr-v1.golden.json) and
 [v2](receipt-spec/arr-v2.golden.json) vectors live under `docs/receipt-spec`.
 Use

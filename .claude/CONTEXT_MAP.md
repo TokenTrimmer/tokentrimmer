@@ -54,7 +54,7 @@ This file is the human-curated counterpart to `.claude/INDEX.md` (auto-generated
 | Hash-chain rationale | Plan file § "Audit Guarantees" + `docs/tokentrimmer-architecture-spec-v1.md` § 16.3 |
 | OTel setup | `crates/telemetry/src/lib.rs` (stub; init in Week 1 `w1-otel-init`) |
 | Persisted-data inventory / retention | `../cloud/docs/data-inventory.v1.json` + `../cloud/docs/validate-data-inventory.rb` | Cross-repo Postgres, R2, Redis, processor, export, and deletion evidence. |
-| Workflow/agent run receipt formats | `crates/telemetry/src/{wfr_receipt,arr_receipt}.rs`, `crates/shared/src/request_delta.rs`, `docs/receipt-spec/` | Canonical payloads, strict request-delta evidence, schemas, and golden vectors. |
+| Receipt/bundle formats and generated TS contracts | `crates/telemetry/src/{vcr,l2_receipt,wfr_receipt,arr_receipt}.rs`, `crates/cli/src/bundle.rs`, `crates/ts-types/`, `docs/receipt-spec/` | Canonical payloads, replay bundle, Rust-derived schemas/TS, deterministic vectors, and drift gates. |
 
 ### Reporting (cloud-only)
 

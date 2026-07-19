@@ -1,0 +1,73 @@
+{
+  "$comment": "Structural VCR v1 contract generated from tt_telemetry::vcr::VcrReceipt. Structure alone does not prove signature integrity, issuer identity, math replay, provider usage, or invoice reconciliation.",
+  "$id": "urn:tokentrimmer:receipt:vcr:structural-schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "A signed Verifiable Compression Receipt. Serialized as JSON (the structured `tt::vcr::receipt` log carries it); `tt verify-receipt --receipt <json>` deserializes + verifies it offline.\n\n`signature` is a hex-encoded 64-byte Ed25519 signature over the canonical payload (see [`canonical_payload`]). `verifying_key_hex` is the hex-encoded 32-byte Ed25519 public key the receipt was signed with, embedded so the receipt is self-identifying (the customer does NOT need to look up the key).",
+  "properties": {
+    "model": {
+      "description": "The served model id (post-routing/pin).",
+      "type": "string"
+    },
+    "org_id": {
+      "description": "The org whose request was compressed (joins `request_logs.org_id`).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "route": {
+      "description": "The matched route's reserved name (e.g. `catalog:openai->gpt-4o-mini`) or the user route name. Lets the customer attribute the saving to a route decision.",
+      "type": "string"
+    },
+    "savings_usd": {
+      "description": "The ISOLATED estimated saving in USD (mirrors `content_compress_saved_est_usd`: an estimate, NOT the invoice-reconciled headline). Canonicalized to integer micros in the signed payload.",
+      "format": "double",
+      "type": "number"
+    },
+    "schema_version": {
+      "const": 1,
+      "description": "See [`VCR_SCHEMA_VERSION`].",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "signature": {
+      "description": "Hex-encoded 64-byte Ed25519 signature over [`canonical_payload`].",
+      "pattern": "^[0-9A-Fa-f]{128}$",
+      "type": "string"
+    },
+    "token_delta": {
+      "description": "The pipeline-MEASURED input-token delta: negative = tokens removed (the compression's effect). Signed so a future audit-neutral transform round-trips honestly (a positive delta would be a rejected transform → no receipt is emitted).",
+      "format": "int64",
+      "type": "integer"
+    },
+    "trace_id": {
+      "description": "The request's `trace_id` (joins `request_logs.trace_id` + `quality_verdicts.request_id` when RUNG 3 gold accumulates — P2c).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ts": {
+      "description": "RFC 3339 timestamp the receipt was produced (informational; explicitly NOT part of any reproduction check beyond signature validity).",
+      "format": "date-time",
+      "type": "string"
+    },
+    "verifying_key_hex": {
+      "description": "Hex-encoded 32-byte Ed25519 verifying (public) key the receipt was signed with. Embedded so verification needs no external key lookup.",
+      "pattern": "^[0-9A-Fa-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "model",
+    "org_id",
+    "route",
+    "savings_usd",
+    "schema_version",
+    "signature",
+    "token_delta",
+    "trace_id",
+    "ts",
+    "verifying_key_hex"
+  ],
+  "title": "TokenTrimmer compression receipt",
+  "type": "object"
+}

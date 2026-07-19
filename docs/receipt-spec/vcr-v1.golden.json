@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "org_id": "00000000-0000-0000-0000-00000000002a",
+  "trace_id": "00000000-0000-0000-0000-000000000063",
+  "route": "catalog:openai->gpt-4o-mini",
+  "model": "gpt-4o-mini",
+  "token_delta": -1200,
+  "savings_usd": 0.0034,
+  "ts": "2026-07-06T20:00:00Z",
+  "verifying_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "signature": "5d62d2c43cdecccd8b5f564400277fc9a38a2abee12f9447e5d577dc067f2cdd59e3872b18e23f229f471d67e05b2e02ed56be64162741d582600dfa32a33707"
+}

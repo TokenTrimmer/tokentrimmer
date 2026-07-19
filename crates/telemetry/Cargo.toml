@@ -20,6 +20,7 @@ sha2.workspace = true
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars = { workspace = true, optional = true }
 chrono.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
@@ -38,6 +39,7 @@ sqlx = { workspace = true, optional = true }
 [features]
 default = []
 postgres = ["dep:sqlx"]
+contract-schema = ["dep:schemars"]
 
 [dev-dependencies]
 tokio = { workspace = true }

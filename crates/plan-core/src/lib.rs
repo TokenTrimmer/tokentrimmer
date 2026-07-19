@@ -17,6 +17,7 @@
 
 pub mod apply;
 pub mod bootstrap;
+pub mod bundle;
 pub mod cache_projection;
 pub mod cost;
 pub mod error;
@@ -28,6 +29,7 @@ pub mod routing;
 pub mod types;
 
 pub use apply::{apply_plan, ApplyError, InMemoryPlanStore, PlanStore};
+pub use bundle::{BundleAttestation, SavingsBundle, BUNDLE_SCHEMA_VERSION};
 pub use error::PlanError;
 pub use pricing::{catalog_pricing_table, catalog_pricing_table_at};
 pub use quality::{

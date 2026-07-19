@@ -13,6 +13,7 @@ tt-telemetry.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
@@ -29,6 +30,10 @@ uuid.workspace = true
 # constraint in the repo memory.
 rand = "=0.8.6"
 rand_chacha = "=0.3.1"
+
+[features]
+default = []
+contract-schema = ["dep:schemars", "tt-telemetry/contract-schema"]
 
 [dev-dependencies]
 insta.workspace = true

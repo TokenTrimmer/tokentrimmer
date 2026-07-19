@@ -51,6 +51,7 @@ pub const CANONICAL_VERSION_V4: &str = "v4";
 /// canonicalization). The `verifying_key_hex` + `signature_hex` make the
 /// receipt offline-verifiable with no key lookup (mirrors `VcrReceipt` /
 /// `L2Receipt`). The convenience `*_usd` fields are NOT part of the signature.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct WfrReceipt {
     /// The workflow run ID (also the receipt primary key).
@@ -69,16 +70,16 @@ pub struct WfrReceipt {
     /// `max(signed_request_delta_micros, 0)`.
     pub saved_micros: i64,
     /// Signed v3/v4 request delta. A regression remains negative.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_request_delta_micros: Option<i64>,
     /// Exact formula identifier signed by v3/v4.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_delta_formula_version: Option<String>,
     /// Non-truncated requests in the signed run cohort (v3/v4 only).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_delta_eligible_requests: Option<i64>,
     /// Strictly measured requests in that cohort (v3/v4 only).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_delta_measured_requests: Option<i64>,
     /// Convenience: cost_micros / 1_000_000. NOT part of the signature.
     #[serde(default)]
@@ -90,7 +91,7 @@ pub struct WfrReceipt {
     #[serde(default)]
     pub saved_usd: Option<f64>,
     /// Convenience signed request delta in USD. NOT part of the signature.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_request_delta_usd: Option<f64>,
     /// Hex-encoded 64-byte Ed25519 signature over [`canonical_payload`].
     pub signature_hex: String,

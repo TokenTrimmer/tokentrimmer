@@ -1,122 +1,22 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Structural WFR v1-v4 contract generated from tt_telemetry::wfr_receipt::WfrReceipt. Structure alone does not prove signature integrity, issuer identity, math replay, provider usage, or invoice reconciliation.",
   "$id": "urn:tokentrimmer:receipt:wfr:structural-schema:v1-v4",
-  "title": "TokenTrimmer workflow-run receipt",
-  "description": "Structural contract for offline-verifiable workflow-run receipts. v1/v2 are legacy positive-only formats; v3/v4 sign the strict request-delta formula, complete coverage, and signed result. Use tt verify-receipt with a trusted out-of-band key to verify the signature.",
-  "$comment": "This schema validates receipt structure only. It does not validate an Ed25519 signature, issuer identity, savings methodology, provider usage, or invoice reconciliation. Unknown additive fields are allowed for forward-compatible response envelopes.",
-  "type": "object",
-  "required": [
-    "run_id",
-    "org_id",
-    "workflow_id",
-    "status",
-    "cost_micros",
-    "baseline_micros",
-    "saved_micros",
-    "signature_hex",
-    "verifying_key_hex",
-    "canonical_version"
-  ],
-  "properties": {
-    "run_id": {
-      "$ref": "#/$defs/uuid",
-      "description": "Workflow run UUID; also the receipt primary key."
-    },
-    "org_id": {
-      "$ref": "#/$defs/uuid",
-      "description": "Organization UUID, signed as canonical payload field 2."
-    },
-    "workflow_id": {
-      "$ref": "#/$defs/uuid",
-      "description": "Workflow UUID, signed as canonical payload field 3."
-    },
-    "status": {
-      "type": "string",
-      "minLength": 1,
-      "pattern": "^[^|]+$",
-      "description": "Nonempty terminal run status. A pipe is forbidden because it is the canonical payload separator."
-    },
-    "cost_micros": {
-      "$ref": "#/$defs/micro_usd",
-      "description": "Recorded catalog-priced run cost in integer micro-USD; signed directly."
-    },
-    "baseline_micros": {
-      "$ref": "#/$defs/micro_usd",
-      "description": "Recorded catalog-priced baseline estimate in integer micro-USD; signed directly."
-    },
-    "saved_micros": {
-      "$ref": "#/$defs/micro_usd",
-      "description": "Positive-only request delta in integer micro-USD; for v3/v4 it must equal max(signed_request_delta_micros, 0)."
-    },
-    "signed_request_delta_micros": {
-      "type": ["integer", "null"],
-      "description": "Signed request delta in micro-USD. Required and signed by v3/v4; regressions remain negative."
-    },
-    "request_delta_formula_version": {
-      "type": ["string", "null"],
-      "description": "Exact request-delta formula identifier. v3/v4 require tt.request-delta-estimate.v1."
-    },
-    "request_delta_eligible_requests": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "description": "Non-truncated requests in the signed run cohort."
-    },
-    "request_delta_measured_requests": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "description": "Strictly measured requests. v3/v4 require a nonempty, completely measured cohort."
-    },
-    "cost_usd": {
-      "type": ["number", "null"],
-      "description": "Convenience display field only; not part of the signature."
-    },
-    "baseline_usd": {
-      "type": ["number", "null"],
-      "description": "Convenience display field only; not part of the signature."
-    },
-    "saved_usd": {
-      "type": ["number", "null"],
-      "description": "Convenience display field only; not part of the signature."
-    },
-    "signed_request_delta_usd": {
-      "type": ["number", "null"],
-      "description": "Convenience signed request delta only; not part of the signature."
-    },
-    "signature_hex": {
-      "type": "string",
-      "pattern": "^[0-9A-Fa-f]{128}$",
-      "description": "Hex-encoded 64-byte Ed25519 signature over the canonical payload."
-    },
-    "verifying_key_hex": {
-      "type": "string",
-      "pattern": "^[0-9A-Fa-f]{64}$",
-      "description": "Hex-encoded 32-byte Ed25519 public key. Trust must be established out of band."
-    },
-    "canonical_version": {
-      "type": "string",
-      "enum": ["v1", "v2", "v3", "v4"],
-      "description": "v1/v2 are legacy; v3/v4 sign request-delta formula, coverage, and signed money. v2/v4 append quality_verdict."
-    },
-    "quality_verdict": {
-      "type": ["string", "null"],
-      "pattern": "^[^|]*$",
-      "description": "Required, non-empty, and signed for v2/v4. Null or omitted for v1/v3."
-    },
-    "signed_at": {
-      "type": ["string", "null"],
-      "format": "date-time",
-      "description": "Receipt mint timestamp. It is frozen by the ledger but not part of the canonical payload."
-    }
-  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
   "allOf": [
     {
       "if": {
         "properties": {
           "canonical_version": {
-            "enum": ["v1", "v3"]
+            "enum": [
+              "v1",
+              "v3"
+            ]
           }
         },
-        "required": ["canonical_version"]
+        "required": [
+          "canonical_version"
+        ]
       },
       "then": {
         "properties": {
@@ -130,18 +30,59 @@
       "if": {
         "properties": {
           "canonical_version": {
-            "enum": ["v2", "v4"]
+            "enum": [
+              "v2",
+              "v4"
+            ]
           }
         },
-        "required": ["canonical_version"]
+        "required": [
+          "canonical_version"
+        ]
       },
       "then": {
-        "required": ["quality_verdict"],
         "properties": {
           "quality_verdict": {
-            "type": "string",
             "minLength": 1,
-            "pattern": "^[^|]+$"
+            "pattern": "^[^|]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "quality_verdict"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "canonical_version": {
+            "enum": [
+              "v1",
+              "v2"
+            ]
+          }
+        },
+        "required": [
+          "canonical_version"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request_delta_eligible_requests": {
+            "type": "null"
+          },
+          "request_delta_formula_version": {
+            "type": "null"
+          },
+          "request_delta_measured_requests": {
+            "type": "null"
+          },
+          "signed_request_delta_micros": {
+            "type": "null"
+          },
+          "signed_request_delta_usd": {
+            "type": "null"
           }
         }
       }
@@ -150,54 +91,198 @@
       "if": {
         "properties": {
           "canonical_version": {
-            "enum": ["v1", "v2"]
+            "enum": [
+              "v3",
+              "v4"
+            ]
           }
         },
-        "required": ["canonical_version"]
+        "required": [
+          "canonical_version"
+        ]
       },
       "then": {
         "properties": {
-          "signed_request_delta_micros": { "type": "null" },
-          "signed_request_delta_usd": { "type": "null" },
-          "request_delta_formula_version": { "type": "null" },
-          "request_delta_eligible_requests": { "type": "null" },
-          "request_delta_measured_requests": { "type": "null" }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "canonical_version": {
-            "enum": ["v3", "v4"]
+          "request_delta_eligible_requests": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "request_delta_formula_version": {
+            "const": "tt.request-delta-estimate.v1"
+          },
+          "request_delta_measured_requests": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "signed_request_delta_micros": {
+            "type": "integer"
           }
         },
-        "required": ["canonical_version"]
-      },
-      "then": {
         "required": [
           "signed_request_delta_micros",
           "request_delta_formula_version",
           "request_delta_eligible_requests",
           "request_delta_measured_requests"
-        ],
-        "properties": {
-          "signed_request_delta_micros": { "type": "integer" },
-          "request_delta_formula_version": { "const": "tt.request-delta-estimate.v1" },
-          "request_delta_eligible_requests": { "type": "integer", "minimum": 1 },
-          "request_delta_measured_requests": { "type": "integer", "minimum": 1 }
-        }
+        ]
       }
     }
   ],
-  "additionalProperties": true,
-  "$defs": {
-    "uuid": {
-      "type": "string",
-      "format": "uuid"
-    },
-    "micro_usd": {
+  "description": "A signed workflow-run receipt as deserialized from the cloud `VerifyReceiptResponse` JSON shape. Money fields are integer micro-USD (`i64`) — they are the canonical-payload inputs directly (no float canonicalization). The `verifying_key_hex` + `signature_hex` make the receipt offline-verifiable with no key lookup (mirrors `VcrReceipt` / `L2Receipt`). The convenience `*_usd` fields are NOT part of the signature.",
+  "properties": {
+    "baseline_micros": {
+      "description": "Baseline cost (without TokenTrimmer) in micro-USD — field 6.",
+      "format": "int64",
       "type": "integer"
+    },
+    "baseline_usd": {
+      "default": null,
+      "description": "Convenience: baseline_micros / 1_000_000. NOT part of the signature.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "canonical_version": {
+      "description": "Canonical schema version (`v1`/`v2` legacy or `v3`/`v4` request-delta).",
+      "enum": [
+        "v1",
+        "v2",
+        "v3",
+        "v4"
+      ],
+      "type": "string"
+    },
+    "cost_micros": {
+      "description": "Actual run cost in micro-USD — canonical-payload field 5.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "cost_usd": {
+      "default": null,
+      "description": "Convenience: cost_micros / 1_000_000. NOT part of the signature.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "org_id": {
+      "description": "Org that owns the run — canonical-payload field 2.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "quality_verdict": {
+      "default": null,
+      "description": "The flow-level quality-gate verdict a v2/v4 receipt was minted with (`equivalent` / `degraded` / `inconclusive`), or `None` for a v1/v3 (not-sampled) receipt. Part of the v2/v4 canonical payload's trailing field.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request_delta_eligible_requests": {
+      "description": "Non-truncated requests in the signed run cohort (v3/v4 only).",
+      "format": "int64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "request_delta_formula_version": {
+      "description": "Exact formula identifier signed by v3/v4.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request_delta_measured_requests": {
+      "description": "Strictly measured requests in that cohort (v3/v4 only).",
+      "format": "int64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "run_id": {
+      "description": "The workflow run ID (also the receipt primary key).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "saved_micros": {
+      "description": "Positive-only request delta in micro-USD. For v3/v4 it must equal `max(signed_request_delta_micros, 0)`.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "saved_usd": {
+      "default": null,
+      "description": "Convenience: saved_micros / 1_000_000. NOT part of the signature.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "signature_hex": {
+      "description": "Hex-encoded 64-byte Ed25519 signature over [`canonical_payload`].",
+      "pattern": "^[0-9A-Fa-f]{128}$",
+      "type": "string"
+    },
+    "signed_at": {
+      "default": null,
+      "description": "RFC3339 timestamp the receipt was first minted (frozen by DB).",
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "signed_request_delta_micros": {
+      "description": "Signed v3/v4 request delta. A regression remains negative.",
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "signed_request_delta_usd": {
+      "description": "Convenience signed request delta in USD. NOT part of the signature.",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "status": {
+      "description": "Nonempty terminal status at seal time — canonical-payload field 8.",
+      "minLength": 1,
+      "pattern": "^[^|]+$",
+      "type": "string"
+    },
+    "verifying_key_hex": {
+      "description": "Hex-encoded 32-byte Ed25519 verifying (public) key. Embedded so verification needs no external key lookup.",
+      "pattern": "^[0-9A-Fa-f]{64}$",
+      "type": "string"
+    },
+    "workflow_id": {
+      "description": "Workflow the run belongs to — canonical-payload field 3.",
+      "format": "uuid",
+      "type": "string"
     }
-  }
+  },
+  "required": [
+    "baseline_micros",
+    "canonical_version",
+    "cost_micros",
+    "org_id",
+    "run_id",
+    "saved_micros",
+    "signature_hex",
+    "status",
+    "verifying_key_hex",
+    "workflow_id"
+  ],
+  "title": "TokenTrimmer workflow-run receipt",
+  "type": "object"
 }

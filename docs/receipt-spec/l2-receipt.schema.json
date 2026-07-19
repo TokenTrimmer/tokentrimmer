@@ -1,0 +1,86 @@
+{
+  "$comment": "Structural L2 v1 contract generated from tt_telemetry::l2_receipt::L2Receipt. Structure alone does not prove signature integrity, issuer identity, math replay, provider usage, or invoice reconciliation.",
+  "$id": "urn:tokentrimmer:receipt:l2:structural-schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "A signed L2-hit provenance receipt. Serialized as JSON; `tt verify-receipt` deserializes + verifies it offline (dispatching on the `l2:v1` prefix in the canonical payload — the CLI routes by family).\n\n`signature` is a hex-encoded 64-byte Ed25519 signature over the canonical payload. `verifying_key_hex` is the hex-encoded 32-byte public key the receipt was signed with, embedded so verification needs no key lookup (mirrors `VcrReceipt`).",
+  "properties": {
+    "baseline_cost_usd": {
+      "description": "The baseline cost (USD) the hit saved — what the request would have cost at the served model's list price. Canonicalized to micros.",
+      "format": "double",
+      "type": "number"
+    },
+    "matched_entry_id": {
+      "description": "The cache entry the query matched (`cache_entries.id`). Lets the customer attribute the hit to a specific prior request's answer.",
+      "format": "uuid",
+      "type": "string"
+    },
+    "org_id": {
+      "description": "The org whose cache was served (joins `request_logs.org_id`).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "description": "See [`L2_SCHEMA_VERSION`].",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "served_cost_usd": {
+      "description": "The served cost (USD) — $0 for a pure cache hit. Canonicalized to integer micros.",
+      "format": "double",
+      "type": "number"
+    },
+    "signature": {
+      "description": "Hex-encoded 64-byte Ed25519 signature over [`canonical_payload`].",
+      "pattern": "^[0-9A-Fa-f]{128}$",
+      "type": "string"
+    },
+    "similarity": {
+      "description": "The cosine similarity of the match (0.0–1.0). Canonicalized to integer micros in the signed payload.",
+      "format": "float",
+      "type": "number"
+    },
+    "trace_id": {
+      "description": "The hit request's `trace_id` (joins `request_logs.trace_id`).",
+      "format": "uuid",
+      "type": "string"
+    },
+    "ts": {
+      "description": "RFC 3339 timestamp the receipt was produced (informational; explicitly NOT part of any reproduction check beyond signature validity).",
+      "format": "date-time",
+      "type": "string"
+    },
+    "verdict": {
+      "description": "The verify-gate verdict code (`confident` / `verified` / `unverifiable` / `rejected`). NOT the served decision's raw f32 agreement — that's a telemetry detail, not part of the provenance contract.",
+      "enum": [
+        "confident",
+        "verified",
+        "unverifiable",
+        "rejected"
+      ],
+      "type": "string"
+    },
+    "verifying_key_hex": {
+      "description": "Hex-encoded 32-byte Ed25519 verifying (public) key the receipt was signed with. Embedded so verification needs no external key lookup.",
+      "pattern": "^[0-9A-Fa-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "baseline_cost_usd",
+    "matched_entry_id",
+    "org_id",
+    "schema_version",
+    "served_cost_usd",
+    "signature",
+    "similarity",
+    "trace_id",
+    "ts",
+    "verdict",
+    "verifying_key_hex"
+  ],
+  "title": "TokenTrimmer L2 cache-hit receipt",
+  "type": "object"
+}

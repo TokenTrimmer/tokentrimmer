@@ -188,7 +188,9 @@ out of band; the embedded key can establish only self-consistency. A successful
 signature check establishes that the supplied key signed an unchanged receipt,
 not issuer identity, provider usage, or invoice reconciliation.
 
-The machine-readable structural contract is
+The generated machine-readable contract index is
+[`receipt-spec/receipt-contracts.manifest.json`](receipt-spec/receipt-contracts.manifest.json),
+with the WFR structural schema at
 [`receipt-spec/wfr-receipt.schema.json`](receipt-spec/wfr-receipt.schema.json).
 Its checked-in [v1](receipt-spec/wfr-v1.golden.json),
 [v2](receipt-spec/wfr-v2.golden.json),
@@ -196,7 +198,8 @@ Its checked-in [v1](receipt-spec/wfr-v1.golden.json),
 [v4](receipt-spec/wfr-v4.golden.json) golden vectors are verified by both the
 public canonical builder and `tt verify-receipt`; they pin JSON field names,
 canonical bytes, and Ed25519 encoding without asserting anything about the
-issuer or provider-invoice evidence.
+issuer or provider-invoice evidence. Rust generation drift and an independent
+JavaScript forged-fixture verifier are blocking CI checks.
 
 ## Example
 

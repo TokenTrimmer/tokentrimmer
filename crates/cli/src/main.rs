@@ -3095,8 +3095,7 @@ async fn run_plan(
             ),
             None => None,
         };
-        let bundle =
-            tt_cli::bundle::SavingsBundle::new(input_snapshot, result.clone(), attestation_ref);
+        let bundle = tt_cli::bundle::new_bundle(input_snapshot, result.clone(), attestation_ref);
         tt_cli::bundle::write_bundle(std::path::Path::new(bundle_path), &bundle)?;
         tt_cli::ui::note(&format!(
             "wrote reproducible savings bundle to {bundle_path}  (verify: tt verify-bundle {bundle_path})"

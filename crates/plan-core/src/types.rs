@@ -20,6 +20,7 @@ use uuid::Uuid;
 /// the replay reads. Embedding / vector fields are intentionally absent in
 /// v1; semantic-cache (L2) projection lands in a follow-up backlog item
 /// (ADR-008 covers the embedding choice).
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestLog {
     /// Stable primary key for ordering during replay.
@@ -123,6 +124,7 @@ pub struct RequestLog {
 ///
 /// `#[non_exhaustive]` so additional classes can be added without breaking
 /// downstream match arms.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -151,6 +153,7 @@ impl L2TaskClass {
 /// Per-task-class L2 effectiveness, aggregated across the whole threshold
 /// sweep. Lets the Plan answer "how well does the L2 cache work for this class
 /// of request?" — hits vs. considered, plus the poisoning-candidate count.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PerClassL2Metrics {
     /// The task class these metrics are for.
@@ -171,6 +174,7 @@ pub struct PerClassL2Metrics {
 
 /// A route in the proposed config: when conditions match, route to
 /// `target_model`.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposedRoute {
     /// Stable identifier — used as the bucket key in per-route breakdown.
@@ -190,6 +194,7 @@ pub struct ProposedRoute {
 /// Match conditions for a [`ProposedRoute`]. v1 supports: `model_in`,
 /// `input_tokens_lt`, `input_tokens_gt`, `tag_equals`. Empty / `None`
 /// fields match anything; all non-empty fields are AND-ed.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteConditions {
     /// Match only if `req.model` is in this list. Empty list matches any model.
@@ -269,6 +274,7 @@ pub struct RouteConditions {
 /// `route_action_cross_type_lockstep_guard` test below fails to compile when
 /// `tt_routing::RouteAction` grows a field, so any future addition must
 /// explicitly decide the mirror question.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteAction {
     /// Rewrite to this model. May target a different provider than the request
@@ -424,6 +430,7 @@ pub type PricingTable = HashMap<String, ModelPricing>;
 /// `tt_shared::pricing::ModelPricing` but without the `effective_at` field
 /// — the replay engine assumes the caller has already picked the right
 /// historical rate for each request.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
     /// USD per 1M input tokens (non-cached).
@@ -461,6 +468,7 @@ pub struct ModelPricing {
 /// this carries the L1 cache TTL the [`crate::cache_projection`] module
 /// uses plus the L2 (semantic) projection knobs consumed by
 /// [`crate::l2_projection`].
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanConfig {
     /// L1 cache TTL, seconds. `None` disables L1 projection entirely.
@@ -498,6 +506,7 @@ fn default_l2_threshold_sweep() -> Vec<f32> {
 }
 
 /// The full input to a Plan replay.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanInput {
     /// Stable identifier for the plan run — flows through to the result so
@@ -530,6 +539,7 @@ pub struct PlanInput {
 
 /// The Plan replay result — what gets serialized to `plan_runs` and
 /// surfaced to the user in the CLI / dashboard.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanResult {
     /// Echoed from the input.
@@ -572,6 +582,7 @@ pub struct PlanResult {
 }
 
 /// Point-estimate aggregates the replay produces.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Aggregates {
     /// Sum of `baseline_cost_usd` across all replayed requests.
@@ -616,6 +627,7 @@ pub struct Aggregates {
 }
 
 /// 95% bootstrap CIs for the headline metrics.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfidenceIntervals {
     /// `(lo, hi)` for projected total savings, USD.
@@ -635,6 +647,7 @@ pub struct ConfidenceIntervals {
 }
 
 /// One row of the per-route attribution table.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerRouteBreakdown {
     /// Route the bucket belongs to.
@@ -653,6 +666,7 @@ pub struct PerRouteBreakdown {
 
 /// Result of projecting L1 cache hits over a request window. See
 /// [`crate::cache_projection::project_l1_hits`].
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheProjection {
     /// Total requests considered.
@@ -666,6 +680,7 @@ pub struct CacheProjection {
 /// One row of the L2 (semantic) cache sensitivity sweep. Produced by
 /// [`crate::l2_projection::project_l2_hits`] — one per threshold in
 /// [`PlanConfig::l2_threshold_sweep`].
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct L2Projection {
     /// Cosine-similarity threshold this row was computed at.

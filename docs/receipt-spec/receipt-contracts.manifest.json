@@ -1,0 +1,160 @@
+{
+  "contract": "tokentrimmer.proof-contracts.v1",
+  "families": [
+    {
+      "canonical_prefixes": [
+        "vcr:v1"
+      ],
+      "family": "vcr",
+      "kind": "ed25519_receipt",
+      "mint": "POST /v1/admin/requests/{trace_id}/compression-receipt/sign",
+      "schema": "docs/receipt-spec/vcr-receipt.schema.json",
+      "vectors": [
+        "docs/receipt-spec/vcr-v1.golden.json"
+      ],
+      "verify": "tt verify-receipt",
+      "versions": [
+        "v1"
+      ]
+    },
+    {
+      "canonical_prefixes": [
+        "l2:v1"
+      ],
+      "family": "l2",
+      "kind": "ed25519_receipt",
+      "mint": "POST /v1/admin/requests/{trace_id}/l2-receipt/sign",
+      "schema": "docs/receipt-spec/l2-receipt.schema.json",
+      "vectors": [
+        "docs/receipt-spec/l2-v1.golden.json"
+      ],
+      "verify": "tt verify-receipt",
+      "versions": [
+        "v1"
+      ]
+    },
+    {
+      "canonical_prefixes": [
+        "wfr:v1",
+        "wfr:v2",
+        "wfr:v3",
+        "wfr:v4"
+      ],
+      "family": "wfr",
+      "kind": "ed25519_receipt",
+      "mint": "POST /v1/admin/workflow-runs/{run_id}/receipt/sign",
+      "schema": "docs/receipt-spec/wfr-receipt.schema.json",
+      "share": "GET /v1/workflow-runs/{run_id}/receipt?expires=&sig=",
+      "vectors": [
+        "docs/receipt-spec/wfr-v1.golden.json",
+        "docs/receipt-spec/wfr-v2.golden.json",
+        "docs/receipt-spec/wfr-v3.golden.json",
+        "docs/receipt-spec/wfr-v4.golden.json"
+      ],
+      "verify": "tt verify-receipt",
+      "versions": [
+        "v1",
+        "v2",
+        "v3",
+        "v4"
+      ]
+    },
+    {
+      "canonical_prefixes": [
+        "arr:v1",
+        "arr:v2"
+      ],
+      "family": "arr",
+      "kind": "ed25519_receipt",
+      "mint": "POST /v1/admin/agent-runs/{run_id}/receipt/sign",
+      "schema": "docs/receipt-spec/arr-receipt.schema.json",
+      "share": "GET /v1/agent-runs/{run_id}/receipt?expires=&sig=",
+      "vectors": [
+        "docs/receipt-spec/arr-v1.golden.json",
+        "docs/receipt-spec/arr-v2.golden.json"
+      ],
+      "verify": "tt verify-receipt",
+      "versions": [
+        "v1",
+        "v2"
+      ]
+    },
+    {
+      "family": "savings_bundle",
+      "kind": "deterministic_replay_bundle",
+      "mint": "tt plan --emit-bundle",
+      "schema": "docs/receipt-spec/savings-bundle.schema.json",
+      "vectors": [
+        "docs/receipt-spec/savings-bundle-v1.golden.json"
+      ],
+      "verify": "tt verify-bundle",
+      "versions": [
+        "v1"
+      ]
+    }
+  ],
+  "files": [
+    {
+      "path": "bindings/receipt-contracts.generated.ts",
+      "sha256": "1885265032bdc102b00787f0d4d3027f6dc4c8f37993c5e3133ed18827df2c79"
+    },
+    {
+      "path": "docs/receipt-spec/arr-receipt.schema.json",
+      "sha256": "1c187fdf72f9ffca7459efac29ecfe0360933b00e6f8a372abff65fcbad569d9"
+    },
+    {
+      "path": "docs/receipt-spec/arr-v1.golden.json",
+      "sha256": "6cf7a61f607474561963cccaee4681a914eeb9860bc5edf3756b41d4cd441ee2"
+    },
+    {
+      "path": "docs/receipt-spec/arr-v2.golden.json",
+      "sha256": "aa63a71bc9a476f5fea584eb209fb97be413d212954a67525c8f932b733273d3"
+    },
+    {
+      "path": "docs/receipt-spec/l2-receipt.schema.json",
+      "sha256": "d0c6bf198b26106208812282f0efc3f8ef5656a0204417f2adddd05affa51ae2"
+    },
+    {
+      "path": "docs/receipt-spec/l2-v1.golden.json",
+      "sha256": "f655b9aa59dce6762228039c7387abf6aa5e653098adc20838fa536b8cdae1cb"
+    },
+    {
+      "path": "docs/receipt-spec/savings-bundle-v1.golden.json",
+      "sha256": "ba1709a62a3c30056a9137120ffdbff8370185da4e2b71967015b731aee753e6"
+    },
+    {
+      "path": "docs/receipt-spec/savings-bundle.schema.json",
+      "sha256": "6fb681304191772c7239efc4647e4d4fe1d3c0b631e227233fccebcd9dd1c215"
+    },
+    {
+      "path": "docs/receipt-spec/vcr-receipt.schema.json",
+      "sha256": "de4be842e8e8c0f7a1340968d2376c53bbff9d839d4bf21cacc422905ab35883"
+    },
+    {
+      "path": "docs/receipt-spec/vcr-v1.golden.json",
+      "sha256": "932915a830b8a98a9bf3283e022a82013f64adbc6218b85f66364400664ebda9"
+    },
+    {
+      "path": "docs/receipt-spec/wfr-receipt.schema.json",
+      "sha256": "9399162b4dfa939dba63058825f6984fd5bf658840860debed6fd3e53f655e15"
+    },
+    {
+      "path": "docs/receipt-spec/wfr-v1.golden.json",
+      "sha256": "19e11e357d3ac523dcb2c7447ef375c3d00405fb85e2b38f9d950b667707dcca"
+    },
+    {
+      "path": "docs/receipt-spec/wfr-v2.golden.json",
+      "sha256": "bf4927802d5c270d3c65ebc0f82a909418e560ae9a8f3a5c08b8ae561da5c2dd"
+    },
+    {
+      "path": "docs/receipt-spec/wfr-v3.golden.json",
+      "sha256": "7d22bfd5feae026da2abd6a30cd508bb28dfbe483dde4dddfa34bcfeb22c14c0"
+    },
+    {
+      "path": "docs/receipt-spec/wfr-v4.golden.json",
+      "sha256": "dc5f608564c14f7bfb7e75592de828f3c4b447de34e687f3cdfc2c7bcf98ec90"
+    }
+  ],
+  "generated_from": "Rust wire types, canonicalizers, signers, and deterministic replay",
+  "typescript": "bindings/receipt-contracts.generated.ts"
+}

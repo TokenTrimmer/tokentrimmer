@@ -64,6 +64,7 @@ pub const VCR_SCHEMA_VERSION: u32 = 1;
 /// payload (see [`canonical_payload`]). `verifying_key_hex` is the hex-encoded
 /// 32-byte Ed25519 public key the receipt was signed with, embedded so the
 /// receipt is self-identifying (the customer does NOT need to look up the key).
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct VcrReceipt {
     /// See [`VCR_SCHEMA_VERSION`].
