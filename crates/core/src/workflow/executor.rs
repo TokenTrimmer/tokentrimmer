@@ -13,6 +13,7 @@ use tt_shared::messages::{Message, MessageContent, Tool};
 use crate::{
     error::ApiError,
     routes::agent_run::{self, LoopOutcome},
+    routes::agent_run_budget::estimate_next_turn_cost,
     workflow::types::{ModelSelection, NodeOutput, WorkflowDefinition},
     AppState,
 };
@@ -34,6 +35,31 @@ pub(crate) struct IntelligenceSpec {
     /// Optional output ceiling applied to every model turn.
     pub max_output_tokens: Option<u32>,
     pub max_cost_usd: Option<f64>,
+}
+
+/// Project the single provider turn represented by a bounded workflow node.
+///
+/// The workflow admission gate currently permits capped Model nodes and
+/// single-turn Agent nodes only when they use a pinned model, a declared output
+/// cap, and no tools. Returning `None` for every other shape keeps this helper
+/// honest if an internal caller bypasses that route-level gate. The engine uses
+/// the result as an in-memory reservation before launch, then settles against
+/// the executor's actual `NodeOutput.cost_usd`.
+pub(crate) fn reservation_cost_usd(spec: &IntelligenceSpec) -> Option<f64> {
+    if spec.max_turns != 1
+        || !spec.tools.is_empty()
+        || !matches!(spec.max_output_tokens, Some(value) if value > 0)
+    {
+        return None;
+    }
+    let ModelSelection::Model { model } = &spec.selection else {
+        return None;
+    };
+    let messages = [Message::User {
+        content: MessageContent::Text(spec.prompt.clone()),
+        name: None,
+    }];
+    estimate_next_turn_cost(model, &messages, spec.max_output_tokens)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,5 +274,31 @@ mod tests {
         // Auto: let the gateway decide; no model pin, no forced route.
         assert_eq!(model, "");
         assert_eq!(route, None);
+    }
+
+    #[test]
+    fn reservation_requires_the_exact_priceable_single_turn_shape() {
+        let mut spec = IntelligenceSpec {
+            selection: ModelSelection::Model {
+                model: "gpt-4o-mini".into(),
+            },
+            prompt: "hello".into(),
+            tools: vec![],
+            max_turns: 1,
+            max_output_tokens: Some(64),
+            max_cost_usd: None,
+        };
+
+        assert!(reservation_cost_usd(&spec).is_some_and(|cost| cost > 0.0));
+        spec.max_output_tokens = None;
+        assert_eq!(reservation_cost_usd(&spec), None);
+        spec.max_output_tokens = Some(64);
+        spec.max_turns = 2;
+        assert_eq!(reservation_cost_usd(&spec), None);
+        spec.max_turns = 1;
+        spec.selection = ModelSelection::Route {
+            route_ref: "dynamic".into(),
+        };
+        assert_eq!(reservation_cost_usd(&spec), None);
     }
 }

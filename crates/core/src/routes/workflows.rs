@@ -77,8 +77,9 @@ fn db_pool(state: &AppState) -> ApiResult<&sqlx::PgPool> {
 
 /// Invocation surfaces sharing workflow execution must all pass this gate
 /// before they allocate a run record or construct an executor. The static
-/// check is intentionally only an admission estimate, never a reservation or
-/// runtime settlement ceiling.
+/// check is intentionally only admission; the engine separately performs
+/// in-memory per-node reservation/settlement for an admitted capped run, but
+/// neither layer is a provider-invoice ceiling.
 #[derive(Clone, Copy)]
 enum WorkflowBudgetAdmissionPath {
     Direct,
@@ -1255,8 +1256,9 @@ pub(crate) async fn complete_workflow(
 
     // Budget admission happens before any run record or provider dispatch. A
     // capped route must have explicitly output-bounded direct intelligence
-    // nodes with input-only prompts; this is not a reservation or runtime
-    // spending guarantee.
+    // nodes with input-only prompts. The executor later serializes capped
+    // intelligence nodes and reserves their directional estimates, but a
+    // started node's routed provider work can still settle above that estimate.
     let run_max_cost = cfg.max_cost_usd.or(def.budget.max_cost_usd);
     admit_workflow_budget_before_dispatch(
         WorkflowBudgetAdmissionPath::Detour,

@@ -157,13 +157,20 @@ the gateway performs a fail-closed static admission check before creating a run
 record or dispatching a provider request. Every `model`/`agent` node must then
 have an explicit positive `max_output_tokens`; prompts may contain only
 `{{input}}` references; selections must be statically priceable; agents must
-have `max_turns: 1`; and loops/sub-workflows are not admissible. The directional
-projection must be within the requested cost value. A rejected definition can
-still run without `max_cost_usd`, preserving the legacy uncapped contract.
+have `max_turns: 1` and no tools; and loops/sub-workflows are not admissible.
+Tool-bearing agents fail closed because the preview does not price serialized
+tool schemas or gateway-tool work. The directional projection must be within
+the requested cost value. A rejected definition can still run without
+`max_cost_usd`, preserving the legacy uncapped contract.
 
-This admission check and the provider completion parameter are not a spend
-reservation, a runtime cost ceiling, or provider-invoice proof: a dispatched
-turn can settle differently from a catalog estimate.
+After admission, ready `model`/`agent` siblings in a capped wave run in stable
+sequence rather than concurrently. Before each launch, the engine reserves its
+priceable single-turn preview against the budget remaining after prior actual
+node cost, then settles that reservation to the returned cost before considering
+the next sibling. This is an in-memory directional reservation, not a hard
+runtime or provider-invoice ceiling: a provider call already started can settle
+above its estimate, including route-selected work not represented by the static
+node preview. Uncapped waves retain concurrent execution.
 
 ### Verifying a workflow receipt
 

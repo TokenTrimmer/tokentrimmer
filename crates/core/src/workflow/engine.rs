@@ -31,12 +31,14 @@
 //!
 //! # Budget cap
 //!
-//! Before each Model or Agent node the engine calls
-//! `budget_reached(accrued, run_max_cost_usd)`.  If the cap is already met the
-//! run stops with `WfStatus::BudgetExhausted` without invoking the executor.
-//! The budget cap is purely accrued-cost-based (no look-ahead estimate) so that
-//! any node that exceeds the cap on its own still records a run; the NEXT node
-//! is what gets blocked.
+//! A capped Model/Agent wave is serialized. Before each launch the engine
+//! reserves the shared preview estimate when the node has the exact priceable
+//! single-turn shape, then settles the reservation against actual node cost
+//! before considering its sibling. If the cap is already met or the next
+//! reservation does not fit, the run stops with `WfStatus::BudgetExhausted`
+//! without invoking that node. A started node's routed provider work can still
+//! settle above its directional estimate; provider/invoice hard-ceiling work
+//! remains separate.
 //!
 //! # Branch reachability
 //!
@@ -48,8 +50,9 @@
 //!
 //! # Limitations (W1a MVP)
 //!
-//! - Model/Agent nodes in the same wave run concurrently (W3a-1 Task 2);
-//!   control nodes (Trigger, Transform, Branch, Output) are always sequential.
+//! - Uncapped Model/Agent nodes in the same wave run concurrently (W3a-1 Task
+//!   2); capped waves serialize reservation/settlement. Control nodes (Trigger,
+//!   Transform, Branch, Output) are always sequential.
 //! - A single explicit `def.edges` arc from a Branch node is treated as
 //!   unconditional; avoid adding explicit outgoing edges from Branch nodes.
 //! - The topo order is defensive: if validate somehow missed a cycle the engine
@@ -69,7 +72,7 @@ use crate::routes::agent_run_budget::budget_reached;
 use crate::workflow::distill_cache::{CachedDistill, DistillCacheKey};
 pub(crate) use crate::workflow::distill_cache::{DistillCacheStore, FlowDocDistillCache, NoCache};
 use crate::workflow::events::WfEvent;
-use crate::workflow::executor::{IntelligenceSpec, NodeExecutor};
+use crate::workflow::executor::{reservation_cost_usd, IntelligenceSpec, NodeExecutor};
 use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
 use crate::workflow::schedule;
 use crate::workflow::types::{ModelSelection, Node, NodeKind, NodeOutput, WorkflowDefinition};
@@ -332,16 +335,8 @@ fn run_workflow_boxed<'a>(
                         )),
                     };
                 }
-                // HARD BUDGET GATE — checked once before launching any node in the wave.
-                //
-                // GUARANTEE: no Model/Agent node is ever LAUNCHED when accrued >= cap.
-                // OVERSHOOT BOUND: if the gate passes (accrued < cap), ALL nodes in
-                // the wave launch concurrently. Their individual costs are unknown
-                // pre-launch, so accrued may overshoot the cap by up to
-                // sum(launched-node costs) before the gate is re-checked at the start
-                // of the next wave. Per-node cost reservation is not attempted (costs
-                // are unknown until completion). This is the endorsed bound for
-                // concurrent execution; the guarantee is "never launch past cap".
+                // HARD BUDGET GATE — checked before building or launching the wave.
+                // Capped waves receive an additional per-node reservation below.
                 if budget_reached(accrued, run_max_cost_usd) {
                     let saved_usd = (accrued_baseline - accrued).max(0.0);
                     emit(WfEvent::RunDone {
@@ -456,15 +451,56 @@ fn run_workflow_boxed<'a>(
                     }
                 }
 
-                // Fix #4: emit NodeStart for all concurrent nodes BEFORE launch
-                // so streaming clients see every node start before any NodeDone.
-                for (node_id, _) in &specs {
-                    emit(WfEvent::NodeStart {
-                        node_id: node_id.clone(),
-                    });
-                }
-                // Run all specs concurrently; results returned in stable topo order.
-                let results = schedule::run_concurrent_model_wave(executor, &specs).await;
+                // Uncapped waves retain parallel execution. Capped waves launch
+                // in stable order so each node's preview reservation can be
+                // settled against actual cost before its sibling is considered.
+                // This removes sibling-wave overshoot; a started node's routed
+                // provider work may still settle above its reservation.
+                let mut reservation_blocked = false;
+                let results = if let Some(cap) = run_max_cost_usd {
+                    let mut settled_for_launch = accrued;
+                    let mut sequential = Vec::with_capacity(specs.len());
+                    for (node_id, spec) in &specs {
+                        if budget_reached(settled_for_launch, Some(cap)) {
+                            reservation_blocked = true;
+                            break;
+                        }
+                        if let Some(reserved) = reservation_cost_usd(spec) {
+                            let remaining = (cap - settled_for_launch).max(0.0);
+                            if !reserved.is_finite() || reserved < 0.0 || reserved > remaining {
+                                reservation_blocked = true;
+                                break;
+                            }
+                        }
+                        emit(WfEvent::NodeStart {
+                            node_id: node_id.clone(),
+                        });
+                        let outcome = executor.run_intelligence(node_id, spec).await;
+                        let failed = outcome.is_err();
+                        if let Ok(out) = &outcome {
+                            settled_for_launch += out.cost_usd;
+                        }
+                        sequential.push(schedule::ConcurrentNodeResult {
+                            node_id: node_id.clone(),
+                            outcome,
+                        });
+                        if failed {
+                            // Unlike an uncapped concurrent wave, no sibling has
+                            // launched yet, so stop rather than creating more spend.
+                            break;
+                        }
+                    }
+                    sequential
+                } else {
+                    // Fix #4: emit NodeStart for all concurrent nodes BEFORE
+                    // launch so streaming clients see every start before a done.
+                    for (node_id, _) in &specs {
+                        emit(WfEvent::NodeStart {
+                            node_id: node_id.clone(),
+                        });
+                    }
+                    schedule::run_concurrent_model_wave(executor, &specs).await
+                };
 
                 // DETERMINISTIC FOLD: NodeDone events + journal entries emitted
                 // in stable topo order, never inside the concurrent futures.
@@ -528,6 +564,23 @@ fn run_workflow_boxed<'a>(
                         saved_usd,
                         node_outputs: collected_outputs,
                         error: Some(format!("node \"{err_node_id}\" failed: {err_msg}")),
+                    };
+                }
+                if reservation_blocked {
+                    let saved_usd = (accrued_baseline - accrued).max(0.0);
+                    emit(WfEvent::RunDone {
+                        status: "budget_exhausted".to_string(),
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                    });
+                    return WorkflowRunResult {
+                        status: WfStatus::BudgetExhausted,
+                        cost_usd: accrued,
+                        baseline_cost_usd: accrued_baseline,
+                        saved_usd,
+                        node_outputs: collected_outputs,
+                        error: None,
                     };
                 }
             }
@@ -2943,7 +2996,73 @@ mod tests {
         );
     }
 
-    /// Hard-budget gate under concurrency.
+    /// A capped wave reserves and settles nodes one at a time. The first node's
+    /// realized cost leaves less than the second node's priceable reservation,
+    /// so the sibling is never launched. Before reservation both siblings ran
+    /// concurrently and the wave could settle above the shared cap.
+    #[tokio::test]
+    async fn capped_wave_settles_before_reserving_the_next_sibling() {
+        let mut def = make_diamond_def(); // t → {mb, mc} → out
+        for node in &mut def.nodes {
+            if let NodeKind::Model {
+                selection,
+                max_output_tokens,
+                ..
+            } = &mut node.kind
+            {
+                *selection = ModelSelection::Model {
+                    model: "gpt-4o-mini".into(),
+                };
+                *max_output_tokens = Some(64);
+            }
+        }
+        let stub = StubExecutor::new(vec![
+            (
+                "mb",
+                NodeOutput {
+                    content: json!("b"),
+                    cost_usd: 0.499_999_9,
+                    baseline_cost_usd: 0.5,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+            (
+                "mc",
+                NodeOutput {
+                    content: json!("c"),
+                    cost_usd: 0.05,
+                    baseline_cost_usd: 0.05,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            Some(0.5),
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::BudgetExhausted);
+        assert!((result.cost_usd - 0.499_999_9).abs() < 1e-12);
+        assert_eq!(
+            stub.called_nodes(),
+            vec!["mb"],
+            "mc must not launch after mb settlement leaves too little for its reservation"
+        );
+    }
+
+    /// Hard-budget gate before a capped wave.
     ///
     /// A "prior" node brings accrued to exactly the cap (1.0).  The next wave
     /// contains 3 Model nodes each costing 0.40.  The gate fires BEFORE
@@ -2951,8 +3070,6 @@ mod tests {
     ///
     /// # Gate guarantee
     /// No Model/Agent node is ever launched when `accrued >= run_max_cost_usd`.
-    /// Overshoot is bounded by the costs of nodes launched while `accrued < cap`
-    /// (pre-launch costs are unknown, so all-or-nothing per wave is enforced).
     #[tokio::test]
     async fn hard_budget_under_concurrency() {
         // Workflow: t → prior → {n1, n2, n3} → out

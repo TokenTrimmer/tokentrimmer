@@ -36,7 +36,7 @@ guarantee.
 - **`max_cost_usd` per Model/Agent node** — an admission estimate used to avoid
   starting a turn predicted to breach that node's cap. It is not a settled
   provider-invoice figure or a whole-workflow hard-spend guarantee; retries,
-  unpriced behavior, and reservation/settlement remain separate controls.
+  unpriced behavior, and provider-hard settlement remain separate controls.
 - **`selection: { type: "route", route_ref: "<route>" }`** — down-routes the call to a cheaper same-family model (the catalog's flagship→mini mappings). Auto-pauses on recall-drop below 0.90.
 - **`max_turns` (Agent)** — clamped to `[1, 32]`, default 8.
 - **`max_response_bytes` (Http)** — bounds the fetched payload.

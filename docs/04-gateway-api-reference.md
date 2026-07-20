@@ -2500,9 +2500,13 @@ the graph again.
 ### 24.6 Budget policy
 
 The `budget` field asks the gateway to perform bounded static budget admission
-before it creates a run record or dispatches a provider request. It is not a
-spend reservation, runtime cost ceiling, or provider-invoice guarantee:
-started provider turns can settle differently from an estimate.
+before it creates a run record or dispatches a provider request. An admitted
+capped wave then runs priceable single-turn nodes sequentially: each directional
+preview is reserved against the remaining value and settled to actual node cost
+before the next sibling can launch. This in-memory reservation is not a hard
+runtime cost ceiling or provider-invoice guarantee: a started provider turn can
+settle differently from its estimate, including route-selected work not
+represented by the static node preview.
 
 ```json
 { "max_cost_usd": 0.10, "on_exceed": "stop" }
@@ -2510,8 +2514,8 @@ started provider turns can settle differently from an estimate.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `max_cost_usd` | number | none | Requested USD value for static admission and runtime guard checks. Capped admission requires each model/agent node to set a positive `max_output_tokens`, only `{{input}}` prompt references, pinned priceable selections, single-turn agents, and no loops/sub-workflows. |
-| `on_exceed` | string | `"stop"` | Action for the runtime guard when it detects a budget condition. Only `"stop"` is supported; it does not change the non-reservation semantics above. |
+| `max_cost_usd` | number | none | Requested USD value for static admission and runtime reservation checks. Capped admission requires each model/agent node to set a positive `max_output_tokens`, only `{{input}}` prompt references, pinned priceable selections, single-turn agents without tools, and no loops/sub-workflows. |
+| `on_exceed` | string | `"stop"` | Action for the runtime guard when it detects a budget condition. Only `"stop"` is supported; it does not make a started call or provider invoice hard-capped. |
 
 A `max_cost_usd` can also be supplied per-run in the `POST /v1/workflows/:id/runs` request body. The definition-level budget (`def.budget.max_cost_usd`) takes precedence when both are set.
 

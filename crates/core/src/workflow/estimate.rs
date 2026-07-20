@@ -35,6 +35,9 @@ pub(crate) enum WorkflowBudgetAdmissionError {
     /// A capped run cannot project a prompt that consumes a prior node output
     /// or any other runtime template value.
     DynamicPromptNodes { node_ids: Vec<String> },
+    /// The preview engine does not include tool schemas or gateway-tool work in
+    /// its node price, so a tool-bearing agent cannot be reserved honestly.
+    ToolBearingAgentNodes { node_ids: Vec<String> },
     /// At least one node cannot be safely priced before dispatch.
     UnpriceableNodes { node_ids: Vec<String> },
     /// The aggregate estimate itself is not a finite currency amount.
@@ -60,6 +63,11 @@ impl std::fmt::Display for WorkflowBudgetAdmissionError {
             Self::DynamicPromptNodes { node_ids } => write!(
                 f,
                 "workflow budget preflight only supports {{{{input}}}} prompt references; node(s) use other template references: {}",
+                node_ids.join(", ")
+            ),
+            Self::ToolBearingAgentNodes { node_ids } => write!(
+                f,
+                "workflow budget preflight cannot reserve tool-bearing agent node(s): {}",
                 node_ids.join(", ")
             ),
             Self::UnpriceableNodes { node_ids } => write!(
@@ -147,12 +155,30 @@ pub(crate) fn admit_budgeted_workflow(
         });
     }
 
+    // `tt-preview` presently prices the message text plus completion ceiling,
+    // not the serialized tool definitions or any gateway-tool work. Admitting
+    // those nodes under a numeric cap would create a reservation known to be
+    // incomplete. Uncapped execution retains the existing agent behavior.
+    let tool_bearing_agent_nodes: Vec<String> = def
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            NodeKind::Agent { tools, .. } if !tools.is_empty() => Some(node.id.clone()),
+            _ => None,
+        })
+        .collect();
+    if !tool_bearing_agent_nodes.is_empty() {
+        return Err(WorkflowBudgetAdmissionError::ToolBearingAgentNodes {
+            node_ids: tool_bearing_agent_nodes,
+        });
+    }
+
     // The current estimator walks direct Model/Agent nodes once. A nested
     // workflow or loop hides its future graph, and a multi-turn agent can
     // dispatch more than the single turn this estimator prices. With a cap,
     // treating any of those as a complete projection would weaken the
     // fail-closed admission boundary. Keep uncapped legacy execution intact;
-    // reservation/settlement remains a separate runtime concern.
+    // provider-hard settlement remains a separate runtime concern.
     let mut node_ids: Vec<String> = def
         .nodes
         .iter()
@@ -367,6 +393,7 @@ fn has_non_input_template_ref(template: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tt_shared::messages::{Tool, ToolFunction};
     use uuid::Uuid;
 
     use super::*;
@@ -730,6 +757,39 @@ mod tests {
         assert_eq!(
             admit_budgeted_workflow(&def, &inputs, Some(projected)),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn budget_admission_rejects_tool_schemas_the_preview_does_not_price() {
+        let def = def_with_first_model_replaced(NodeKind::Agent {
+            selection: ModelSelection::Model {
+                model: "gpt-4o-mini".into(),
+            },
+            prompt: "Analyze: {{input}}".into(),
+            max_turns: Some(1),
+            max_output_tokens: Some(64),
+            max_cost_usd: None,
+            tools: vec![Tool {
+                r#type: "function".into(),
+                function: ToolFunction {
+                    name: "lookup".into(),
+                    description: Some("Look up a value".into()),
+                    parameters: json!({"type": "object"}),
+                },
+            }],
+        });
+
+        assert_eq!(
+            admit_budgeted_workflow(&def, &json!("test"), Some(1.0)),
+            Err(WorkflowBudgetAdmissionError::ToolBearingAgentNodes {
+                node_ids: vec!["m1".to_string()],
+            })
+        );
+        assert_eq!(
+            admit_budgeted_workflow(&def, &json!("test"), None),
+            Ok(()),
+            "uncapped tool-bearing agents retain their existing behavior"
         );
     }
 
