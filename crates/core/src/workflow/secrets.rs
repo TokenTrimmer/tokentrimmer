@@ -184,6 +184,10 @@ WHERE org_id = $1 \
 ORDER BY name ASC \
 LIMIT $2";
 
+const DELETE_SECRET_SQL: &str = "\
+DELETE FROM workflow_secrets \
+WHERE org_id = $1 AND name = $2";
+
 /// Internal encrypted row used to derive safe picker metadata. The ciphertext
 /// is deliberately private to this module and is never serialized.
 pub(crate) struct WorkflowSecretRow {
@@ -286,6 +290,22 @@ pub(crate) async fn list_secret_rows(
             })
         })
         .collect()
+}
+
+/// Delete one org/name-bound ciphertext row. The operation is deliberately
+/// idempotent: a retry after a lost `204` remains successful, and a name that
+/// belongs only to another org is indistinguishable from an absent name.
+pub(crate) async fn delete_secret(
+    pool: &PgPool,
+    org_id: Uuid,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(DELETE_SECRET_SQL)
+        .bind(org_id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 impl WorkflowSecretRow {
@@ -400,6 +420,13 @@ mod tests {
         assert!(LIST_SECRET_ROWS_SQL.contains("ORDER BY name ASC"));
         assert!(LIST_SECRET_ROWS_SQL.contains("LIMIT $2"));
         assert!(!LIST_SECRET_ROWS_SQL.contains("SELECT *"));
+    }
+
+    #[test]
+    fn secret_delete_query_is_exactly_org_and_name_scoped() {
+        assert!(DELETE_SECRET_SQL.starts_with("DELETE FROM workflow_secrets"));
+        assert!(DELETE_SECRET_SQL.contains("WHERE org_id = $1 AND name = $2"));
+        assert!(!DELETE_SECRET_SQL.contains("RETURNING"));
     }
 
     #[test]

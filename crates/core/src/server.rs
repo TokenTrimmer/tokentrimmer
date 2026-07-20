@@ -240,6 +240,10 @@ pub fn build_router_with_retrieval(
             post(routes::workflows::set_workflow_secret)
                 .get(routes::workflows::list_workflow_secrets),
         )
+        .route(
+            "/v1/workflows/secrets/:name",
+            axum::routing::delete(routes::workflows::delete_workflow_secret),
+        )
         .route("/v1/workflows/:id", get(routes::workflows::get))
         .route(
             "/v1/workflows/:id/estimate",

@@ -2653,6 +2653,21 @@ master key; it does not validate the credential with a downstream provider.
 `unavailable` means this gateway has no configured master key. Names are still
 security-sensitive metadata and should not be cached or copied into prompts.
 
+#### `DELETE /v1/workflows/secrets/:name` — delete a per-org secret
+
+Idempotently removes the named ciphertext for the authenticated org and
+returns `204 No Content`, including when the name is already absent. `name`
+must match `^[A-Z0-9_]{1,64}$`; an invalid name returns `400`. Deletion does
+not require `TT_MASTER_KEY`, does not rewrite stored workflow versions, and
+does not disclose whether another org has the same name.
+
+Deleting a referenced name takes effect immediately. Every retained workflow
+version and durable trigger that later reaches that definition will fail its
+secret preflight before the current definition executes a node. A recursive
+child still preflights only when the child begins, so earlier parent work may
+already have run. Recreate the same name with `POST` to restore future runs;
+the previous value is not recoverable through this API.
+
 #### Using secrets in Http nodes
 
 Reference a stored secret in any `headers` value or `body` string using
@@ -2689,6 +2704,9 @@ preflight when that child begins; earlier parent nodes may already have run.
 - **AAD-bound ciphertext.** Each secret's ciphertext is bound to `(org_id, name)`
   via AEAD additional-data; copying a ciphertext row to a different org or
   renaming the secret causes a decryption failure rather than a silent decrypt.
+- **Deletion is fail-closed, not a definition rewrite.** Removing a name leaves
+  historical definitions intact and makes their next execution fail secret
+  preflight. The endpoint is idempotent so transport retries are safe.
 
 ---
 

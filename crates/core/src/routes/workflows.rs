@@ -46,7 +46,8 @@ use crate::{
         executor::GatewayNodeExecutor,
         node_run_store,
         secrets::{
-            is_valid_secret_name, list_secret_rows, load_secrets, master_key_from_env, store_secret,
+            delete_secret, is_valid_secret_name, list_secret_rows, load_secrets,
+            master_key_from_env, store_secret,
         },
         store::{self, WorkflowRunRecord},
         types::content_hash,
@@ -1577,6 +1578,31 @@ pub async fn set_workflow_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `DELETE /v1/workflows/secrets/:name` — idempotently remove one encrypted
+/// secret for the caller's org. A master key is not required to delete the
+/// ciphertext. Stored workflow versions are not rewritten: any retained
+/// reference fails closed at that definition's next preflight.
+pub async fn delete_workflow_secret(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    let org = require_org(ctx)?;
+    if !is_valid_secret_name(&name) {
+        return Err(ApiError::InvalidRequest(
+            "secret name must match ^[A-Z0-9_]{1,64}$ \
+             (uppercase letters, digits, and underscore only)"
+                .into(),
+        ));
+    }
+    let pool = db_pool(&state)?;
+    delete_secret(pool, org, &name).await.map_err(|error| {
+        tracing::error!(%org, %error, "workflow secret DELETE failed");
+        ApiError::Internal("failed to delete workflow secret".into())
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2091,6 +2117,30 @@ mod tests {
         assert!(
             matches!(result, Err(ApiError::Unauthorized)),
             "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_workflow_secret_anon_returns_unauthorized() {
+        let result =
+            delete_workflow_secret(State(test_state()), None, Path("MY_KEY".to_string())).await;
+        assert!(
+            matches!(result, Err(ApiError::Unauthorized)),
+            "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_workflow_secret_rejects_bad_name_before_db_lookup() {
+        let result = delete_workflow_secret(
+            State(test_state()),
+            real_org_ctx(Uuid::new_v4()),
+            Path("bad-name".to_string()),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::InvalidRequest(_))),
+            "expected InvalidRequest, got {result:?}"
         );
     }
 

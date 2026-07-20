@@ -113,6 +113,7 @@ started by a human/API run. The two current invokers are:
 | `GET /v1/workflows/runs/:run_id/nodes` | Read up to 500 best-effort node-journal rows, labeled from the exact executed definition. New rows include gateway node-envelope timing; legacy rows expose only post-run persistence time. Neither is provider-attempt timing or replay. |
 | `GET /v1/workflows/secrets` | List up to 500 org-scoped secret names, decryptability states, and timestamps; never returns values/ciphertext and is `private, no-store`. |
 | `POST /v1/workflows/secrets` | Store or rotate a 1–65,536-byte org-scoped secret value. |
+| `DELETE /v1/workflows/secrets/:name` | Idempotently delete one org-scoped secret; stored versions remain intact and fail closed if they still reference it. |
 
 ## SSE events (a run's streaming surface)
 
