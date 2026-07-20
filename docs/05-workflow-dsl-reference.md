@@ -119,10 +119,10 @@ started by a human/API run. The two current invokers are:
 | `POST /v1/workflows/:id/environments/development/publish` | Optimistically publish one exact retained draft version to development. |
 | `POST /v1/workflows/:id/environments/:environment/promote` | Optimistically copy the exact current development release to staging, or staging release to production. |
 | `POST /v1/workflows/:id/environments/:environment/rollback` | Optimistically append a rollback to a version previously released in that same environment. |
-| `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls; optional positive `workflow_version` selects an exact retained definition, otherwise latest). |
-| `POST /v1/workflows/:id/runs` | Run synchronously (returns the run + the rolled-up `saved_usd`). |
+| `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls). Mutually exclusive `workflow_version` and `workflow_environment` selectors choose an exact retained definition or exact current development/staging/production release; omission preserves latest-version behavior. |
+| `POST /v1/workflows/:id/runs` | Run synchronously. The same mutually exclusive version/environment selectors apply; environment-bound runs persist exact release revision provenance, while omission preserves latest-version behavior. Returns the run plus rolled-up `saved_usd`. |
 | `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
-| `GET /v1/workflows/runs/:run_id` | Read one org-scoped durable run and its immutable definition version. |
+| `GET /v1/workflows/runs/:run_id` | Read one org-scoped durable run, its immutable definition version, and optional exact environment/release-revision provenance. |
 | `GET /v1/workflows/runs/:run_id/nodes` | Read up to 500 best-effort node-journal rows, labeled from the exact executed definition. New rows include gateway node-envelope timing; legacy rows expose only post-run persistence time. Neither is provider-attempt timing or replay. |
 | `GET /v1/workflows/secrets` | List up to 500 org-scoped secret names, decryptability states, and timestamps; never returns values/ciphertext and is `private, no-store`. |
 | `POST /v1/workflows/secrets` | Store or rotate a 1–65,536-byte org-scoped secret value. |

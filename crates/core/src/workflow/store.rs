@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::types::WorkflowDefinition;
+use super::{release_store::WorkflowEnvironment, types::WorkflowDefinition};
 
 // ---------------------------------------------------------------------------
 // WorkflowRunRecord
@@ -33,6 +33,9 @@ pub(crate) struct WorkflowRunRecord {
     pub workflow_id: Uuid,
     pub version: i32,
     pub org_id: Uuid,
+    /// Exact environment release selected for this run. `None` denotes the
+    /// legacy latest-version or explicit immutable-version path.
+    pub release: Option<WorkflowRunReleaseProvenance>,
     /// Snake-case status string: `"running"`, `"completed"`, `"failed"`.
     pub status: String,
     pub inputs: Option<serde_json::Value>,
@@ -47,6 +50,12 @@ pub(crate) struct WorkflowRunRecord {
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkflowRunReleaseProvenance {
+    pub environment: WorkflowEnvironment,
+    pub revision: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -190,8 +199,9 @@ LIMIT $2";
 /// makes the call idempotent against duplicate run ids.
 pub(crate) const INSERT_RUN_SQL: &str = "\
 INSERT INTO workflow_runs \
-  (id, workflow_id, version, org_id, status, inputs, cost_usd, max_cost_usd) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+  (id, workflow_id, version, org_id, status, inputs, cost_usd, max_cost_usd, \
+   release_environment, release_revision) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
 ON CONFLICT (id) DO NOTHING";
 
 /// UPDATE a run to its terminal state (`finished_at = now()`).
@@ -221,7 +231,7 @@ SELECT id, workflow_id, version, org_id, status, inputs, \
        cost_usd::float8 AS cost_usd, max_cost_usd::float8 AS max_cost_usd, \
        baseline_cost_usd::float8 AS baseline_cost_usd, \
        saved_usd::float8 AS saved_usd, \
-       error, started_at, finished_at \
+       release_environment, release_revision, error, started_at, finished_at \
 FROM workflow_runs \
 WHERE id = $1 AND org_id = $2";
 
@@ -234,7 +244,7 @@ SELECT id, workflow_id, version, org_id, status, inputs, \
        cost_usd::float8 AS cost_usd, max_cost_usd::float8 AS max_cost_usd, \
        baseline_cost_usd::float8 AS baseline_cost_usd, \
        saved_usd::float8 AS saved_usd, \
-       error, started_at, finished_at \
+       release_environment, release_revision, error, started_at, finished_at \
 FROM workflow_runs \
 WHERE org_id = $1 AND workflow_id = $2 \
 ORDER BY started_at DESC \
@@ -260,8 +270,9 @@ RETURNING run_id";
 /// initial run, or neither row is durable.
 pub(crate) const INSERT_IDEMPOTENT_RUN_SQL: &str = "\
 INSERT INTO workflow_runs \
-  (id, workflow_id, version, org_id, status, inputs, cost_usd, max_cost_usd) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+  (id, workflow_id, version, org_id, status, inputs, cost_usd, max_cost_usd, \
+   release_environment, release_revision) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
 
 /// Read a mapping by its opaque, org/workflow-scoped stable-key digest.
 pub(crate) const GET_WORKFLOW_RUN_IDEMPOTENCY_SQL: &str = "\
@@ -273,6 +284,26 @@ WHERE org_id = $1 AND workflow_id = $2 AND invocation_key_hash = $3";
 // Row mapping helpers
 // ---------------------------------------------------------------------------
 
+fn run_release_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<WorkflowRunReleaseProvenance>, sqlx::Error> {
+    use sqlx::Row;
+    let environment = row.try_get::<Option<String>, _>("release_environment")?;
+    let revision = row.try_get::<Option<i32>, _>("release_revision")?;
+    match (environment, revision) {
+        (None, None) => Ok(None),
+        (Some(environment), Some(revision)) if revision > 0 => {
+            Ok(Some(WorkflowRunReleaseProvenance {
+                environment: WorkflowEnvironment::parse(&environment)?,
+                revision,
+            }))
+        }
+        _ => Err(sqlx::Error::Protocol(
+            "workflow run has invalid release provenance".into(),
+        )),
+    }
+}
+
 fn run_record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRunRecord, sqlx::Error> {
     use sqlx::Row;
     Ok(WorkflowRunRecord {
@@ -280,6 +311,7 @@ fn run_record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRunRecord,
         workflow_id: row.try_get("workflow_id")?,
         version: row.try_get("version")?,
         org_id: row.try_get("org_id")?,
+        release: run_release_from_row(row)?,
         status: row.try_get("status")?,
         inputs: row.try_get("inputs")?,
         cost_usd: row.try_get("cost_usd")?,
@@ -352,10 +384,19 @@ pub(crate) fn workflow_run_input_hash(
 /// of starting a second SSE execution.
 pub(crate) fn workflow_run_request_options_hash(
     max_cost_usd: Option<f64>,
+    environment: Option<WorkflowEnvironment>,
 ) -> Result<[u8; 32], serde_json::Error> {
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "max_cost_usd": max_cost_usd,
-    }))?;
+    // Preserve the exact pre-environment canonical bytes for legacy callers so
+    // an idempotent retry created before this field existed still reconciles.
+    let canonical = match environment {
+        Some(environment) => serde_json::to_vec(&serde_json::json!({
+            "max_cost_usd": max_cost_usd,
+            "workflow_environment": environment.as_str(),
+        }))?,
+        None => serde_json::to_vec(&serde_json::json!({
+            "max_cost_usd": max_cost_usd,
+        }))?,
+    };
     Ok(Sha256::digest(canonical).into())
 }
 
@@ -586,6 +627,8 @@ pub(crate) async fn insert_run(pool: &PgPool, rec: &WorkflowRunRecord) {
         .bind(&rec.inputs) // $6 inputs       JSONB
         .bind(rec.cost_usd) // $7 cost_usd     NUMERIC
         .bind(rec.max_cost_usd) // $8 max_cost_usd NUMERIC
+        .bind(rec.release.map(|release| release.environment.as_str())) // $9 closed environment
+        .bind(rec.release.map(|release| release.revision)) // $10 exact release revision
         .execute(pool)
         .await;
     if let Err(e) = result {
@@ -661,6 +704,8 @@ pub(crate) async fn create_or_reuse_idempotent_run(
             .bind(&rec.inputs) // $6 inputs JSONB
             .bind(rec.cost_usd) // $7 cost_usd NUMERIC
             .bind(rec.max_cost_usd) // $8 max_cost_usd NUMERIC
+            .bind(rec.release.map(|release| release.environment.as_str())) // $9 closed environment
+            .bind(rec.release.map(|release| release.revision)) // $10 exact release revision
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -813,19 +858,24 @@ pub(crate) async fn list_workflow_runs(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use sha2::Sha256;
     use uuid::Uuid;
 
-    use crate::workflow::types::{BudgetPolicy, WorkflowDefinition};
+    use crate::workflow::{
+        release_store::WorkflowEnvironment,
+        types::{BudgetPolicy, WorkflowDefinition},
+    };
 
     use super::{
         create_or_reuse_idempotent_run, get_definition_version_record, get_run_strict,
-        get_workflow_run_idempotency, insert_definition, list_definition_versions,
+        get_workflow_run_idempotency, insert_definition, insert_run, list_definition_versions,
         workflow_run_input_hash, workflow_run_invocation_key_hash,
         workflow_run_request_options_hash, CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency,
-        WorkflowRunRecord, FINISH_RUN_SQL, GET_DEFINITION_SQL, GET_DEFINITION_VERSION_SQL,
-        GET_RUN_SQL, GET_WORKFLOW_RUN_IDEMPOTENCY_SQL, INSERT_DEFINITION_SQL,
-        INSERT_IDEMPOTENT_RUN_SQL, INSERT_RUN_SQL, INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL,
-        LIST_DEFINITIONS_SQL, LIST_DEFINITION_VERSIONS_SQL, LIST_WORKFLOW_RUNS_SQL,
+        WorkflowRunRecord, WorkflowRunReleaseProvenance, FINISH_RUN_SQL, GET_DEFINITION_SQL,
+        GET_DEFINITION_VERSION_SQL, GET_RUN_SQL, GET_WORKFLOW_RUN_IDEMPOTENCY_SQL,
+        INSERT_DEFINITION_SQL, INSERT_IDEMPOTENT_RUN_SQL, INSERT_RUN_SQL,
+        INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL, LIST_DEFINITIONS_SQL, LIST_DEFINITION_VERSIONS_SQL,
+        LIST_WORKFLOW_RUNS_SQL,
     };
 
     // ------------------------------------------------------------------
@@ -839,6 +889,7 @@ mod tests {
             workflow_id: Uuid::nil(),
             version: 1,
             org_id: Uuid::nil(),
+            release: None,
             status: "running".to_string(),
             inputs: None,
             cost_usd: 0.0,
@@ -865,6 +916,7 @@ mod tests {
             workflow_id: Uuid::nil(),
             version: 2,
             org_id: Uuid::nil(),
+            release: None,
             status: "completed".to_string(),
             inputs: Some(serde_json::json!({"prompt": "hello"})),
             cost_usd: 0.05,
@@ -1153,16 +1205,31 @@ mod tests {
 
     #[test]
     fn request_options_hash_binds_budget_but_not_stream_transport() {
-        let no_cap = workflow_run_request_options_hash(None).expect("options serialize");
-        let capped = workflow_run_request_options_hash(Some(0.05)).expect("options serialize");
+        let no_cap = workflow_run_request_options_hash(None, None).expect("options serialize");
+        let capped =
+            workflow_run_request_options_hash(Some(0.05), None).expect("options serialize");
         assert_ne!(
             no_cap, capped,
             "a changed execution cap must not reuse a run"
         );
         assert_eq!(
             capped,
-            workflow_run_request_options_hash(Some(0.05)).expect("options serialize"),
+            workflow_run_request_options_hash(Some(0.05), None).expect("options serialize"),
             "the same logical options must replay deterministically"
+        );
+        let production =
+            workflow_run_request_options_hash(Some(0.05), Some(WorkflowEnvironment::Production))
+                .expect("environment options serialize");
+        assert_ne!(capped, production, "the release selector must be bound");
+
+        let legacy_bytes = serde_json::to_vec(&serde_json::json!({
+            "max_cost_usd": 0.05,
+        }))
+        .expect("legacy options serialize");
+        let legacy_digest: [u8; 32] = <Sha256 as sha2::Digest>::digest(legacy_bytes).into();
+        assert_eq!(
+            capped, legacy_digest,
+            "omitting an environment must preserve pre-existing mapping hashes"
         );
     }
 
@@ -1223,6 +1290,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn release_provenance_migration_binds_environment_revision_and_version() {
+        let migration =
+            include_str!("../../migrations/0044_workflow_run_release_provenance.up.sql");
+        for fragment in [
+            "ADD COLUMN release_environment TEXT",
+            "ADD COLUMN release_revision INT",
+            "workflow_runs_release_pair_check",
+            "workflow_runs_release_provenance_fk",
+            "org_id,",
+            "workflow_id,",
+            "release_environment,",
+            "release_revision,",
+            "version",
+            "REFERENCES workflow_environment_releases",
+            "workflow_version",
+        ] {
+            assert!(
+                migration.contains(fragment),
+                "missing run release-provenance contract: {fragment}"
+            );
+        }
+        assert!(INSERT_RUN_SQL.contains("release_environment"));
+        assert!(INSERT_RUN_SQL.contains("release_revision"));
+        assert!(INSERT_IDEMPOTENT_RUN_SQL.contains("release_environment"));
+        assert!(GET_RUN_SQL.contains("release_environment"));
+        assert!(LIST_WORKFLOW_RUNS_SQL.contains("release_revision"));
+    }
+
     /// DB-gated regression for the timeout/retry boundary: two callers claiming
     /// the same stable key must create exactly one initial run, while the loser
     /// receives the winner's durable mapping. This is intentionally ignored in
@@ -1252,12 +1348,13 @@ mod tests {
         let input_hash =
             workflow_run_input_hash(&serde_json::json!({ "delivery": 42 })).expect("hash input");
         let request_options_hash =
-            workflow_run_request_options_hash(Some(0.25)).expect("hash options");
+            workflow_run_request_options_hash(Some(0.25), None).expect("hash options");
         let first_run = WorkflowRunRecord {
             id: Uuid::new_v4(),
             workflow_id: workflow,
             version: 1,
             org_id: org,
+            release: None,
             status: "running".to_owned(),
             inputs: Some(serde_json::json!({ "delivery": 42 })),
             cost_usd: 0.0,
@@ -1565,6 +1662,62 @@ mod tests {
                 .is_empty()
         );
 
+        let exact_production = release_store::get_current_release(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Production,
+        )
+        .await
+        .expect("read exact production pointer")
+        .expect("production release exists");
+        assert_eq!(exact_production.revision, 1);
+        assert_eq!(exact_production.workflow_version, 2);
+
+        let release_run_id = Uuid::new_v4();
+        let release_run = WorkflowRunRecord {
+            id: release_run_id,
+            workflow_id: guarded_workflow_id,
+            version: exact_production.workflow_version,
+            org_id: org_a,
+            release: Some(WorkflowRunReleaseProvenance {
+                environment: exact_production.environment,
+                revision: exact_production.revision,
+            }),
+            status: "running".to_owned(),
+            inputs: Some(serde_json::json!({})),
+            cost_usd: 0.0,
+            max_cost_usd: None,
+            baseline_cost_usd: 0.0,
+            saved_usd: 0.0,
+            error: None,
+            started_at: Utc::now(),
+            finished_at: None,
+        };
+        insert_run(&pool, &release_run).await;
+        let persisted_release_run = get_run_strict(&pool, release_run_id, org_a)
+            .await
+            .expect("read environment-bound run")
+            .expect("environment-bound run persists");
+        assert_eq!(persisted_release_run.version, 2);
+        assert_eq!(persisted_release_run.release, release_run.release);
+
+        let mismatched_release_run = sqlx::query(
+            "INSERT INTO workflow_runs \
+             (id, workflow_id, version, org_id, status, inputs, cost_usd, \
+              release_environment, release_revision) \
+             VALUES ($1, $2, 1, $3, 'running', '{}'::jsonb, 0, 'production', 1)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(guarded_workflow_id)
+        .bind(org_a)
+        .execute(&pool)
+        .await;
+        assert!(
+            mismatched_release_run.is_err(),
+            "a run version must match the exact referenced release revision"
+        );
+
         let rollback = release_store::rollback_environment(
             &pool,
             org_a,
@@ -1620,6 +1773,12 @@ mod tests {
         .await
         .expect("stale rollback")
         .is_none());
+
+        sqlx::query("DELETE FROM workflow_runs WHERE id = $1")
+            .bind(release_run_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup environment-bound run");
 
         for org in [org_a, org_b] {
             sqlx::query("DELETE FROM workflow_definitions WHERE org_id = $1 AND id = $2")

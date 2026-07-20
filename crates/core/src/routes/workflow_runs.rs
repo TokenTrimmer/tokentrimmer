@@ -49,6 +49,8 @@ pub struct WorkflowRunView {
     pub id: Uuid,
     pub workflow_id: Uuid,
     pub version: i32,
+    pub workflow_environment: Option<&'static str>,
+    pub release_revision: Option<i32>,
     pub status: String,
     pub inputs: Option<serde_json::Value>,
     pub cost_usd: f64,
@@ -62,10 +64,13 @@ pub struct WorkflowRunView {
 
 impl From<WorkflowRunRecord> for WorkflowRunView {
     fn from(record: WorkflowRunRecord) -> Self {
+        let release = record.release;
         Self {
             id: record.id,
             workflow_id: record.workflow_id,
             version: record.version,
+            workflow_environment: release.map(|release| release.environment.as_str()),
+            release_revision: release.map(|release| release.revision),
             status: record.status,
             inputs: record.inputs,
             cost_usd: record.cost_usd,
@@ -307,8 +312,10 @@ fn node_run_view(
 
 #[cfg(test)]
 mod tests {
-    use super::{node_descriptor, node_run_view};
+    use super::{node_descriptor, node_run_view, WorkflowRunView};
     use crate::workflow::node_run_store::WorkflowNodeRunRecord;
+    use crate::workflow::release_store::WorkflowEnvironment;
+    use crate::workflow::store::{WorkflowRunRecord, WorkflowRunReleaseProvenance};
     use crate::workflow::types::{
         BudgetPolicy, ModelSelection, Node, NodeKind, WorkflowDefinition,
     };
@@ -399,5 +406,32 @@ mod tests {
         assert_eq!(legacy.finished_at, None);
         assert_eq!(legacy.duration_ms, None);
         assert_eq!(legacy.legacy_recorded_at, Some(started_at));
+    }
+
+    #[test]
+    fn run_view_exposes_exact_optional_release_provenance() {
+        let record = WorkflowRunRecord {
+            id: Uuid::new_v4(),
+            workflow_id: Uuid::new_v4(),
+            version: 7,
+            org_id: Uuid::new_v4(),
+            release: Some(WorkflowRunReleaseProvenance {
+                environment: WorkflowEnvironment::Production,
+                revision: 3,
+            }),
+            status: "completed".into(),
+            inputs: Some(serde_json::json!({})),
+            cost_usd: 0.01,
+            max_cost_usd: None,
+            baseline_cost_usd: 0.02,
+            saved_usd: 0.01,
+            error: None,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+        };
+        let view = WorkflowRunView::from(record);
+        assert_eq!(view.version, 7);
+        assert_eq!(view.workflow_environment, Some("production"));
+        assert_eq!(view.release_revision, Some(3));
     }
 }

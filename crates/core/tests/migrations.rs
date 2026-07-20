@@ -327,6 +327,34 @@ fn migrator_includes_workflow_environment_release_ledger() {
     );
 }
 
+#[test]
+fn migrator_includes_workflow_run_release_provenance() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_fourth = migrations
+        .iter()
+        .find(|migration| migration.version == 44)
+        .expect("migration version 44 not found");
+    let description = forty_fourth.description.to_lowercase();
+    assert!(
+        description.contains("workflow")
+            && description.contains("run")
+            && description.contains("release")
+            && description.contains("provenance"),
+        "migration 0044 description is '{}', expected workflow-run release provenance",
+        forty_fourth.description,
+    );
+
+    let up = include_str!("../migrations/0044_workflow_run_release_provenance.up.sql");
+    assert!(up.contains("ADD COLUMN release_environment TEXT"));
+    assert!(up.contains("ADD COLUMN release_revision INT"));
+    assert!(up.contains("workflow_runs_release_pair_check"));
+    assert!(up.contains("workflow_runs_release_provenance_fk"));
+    assert!(up.contains("REFERENCES workflow_environment_releases"));
+    assert!(up.contains("release_environment,"));
+    assert!(up.contains("release_revision,"));
+    assert!(up.contains("workflow_version"));
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]

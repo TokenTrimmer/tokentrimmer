@@ -111,6 +111,17 @@ JOIN workflow_environment_releases r \
 WHERE s.org_id = $1 AND s.workflow_id = $2 \
 ORDER BY s.environment";
 
+pub(crate) const GET_CURRENT_RELEASE_SQL: &str = "\
+SELECT s.environment, s.revision, s.workflow_version, d.content_hash, \
+       r.action, r.source_environment, r.source_revision, r.created_at \
+FROM workflow_environment_state s \
+JOIN workflow_definitions d \
+  ON d.org_id = s.org_id AND d.id = s.workflow_id AND d.version = s.workflow_version \
+JOIN workflow_environment_releases r \
+  ON r.org_id = s.org_id AND r.workflow_id = s.workflow_id \
+ AND r.environment = s.environment AND r.revision = s.revision \
+WHERE s.org_id = $1 AND s.workflow_id = $2 AND s.environment = $3";
+
 pub(crate) const LIST_RELEASE_HISTORY_SQL: &str = "\
 SELECT r.environment, r.revision, r.workflow_version, d.content_hash, \
        r.action, r.source_environment, r.source_revision, r.created_at \
@@ -270,6 +281,35 @@ pub(crate) async fn list_current_releases(
         .collect()
 }
 
+pub(crate) async fn get_current_release(
+    pool: &PgPool,
+    org_id: Uuid,
+    workflow_id: Uuid,
+    environment: WorkflowEnvironment,
+) -> Result<Option<WorkflowEnvironmentRelease>, sqlx::Error> {
+    sqlx::query(GET_CURRENT_RELEASE_SQL)
+        .bind(org_id)
+        .bind(workflow_id)
+        .bind(environment.as_str())
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(|row| {
+            let mutation = mutation_from_row(row)?;
+            Ok(WorkflowEnvironmentRelease {
+                environment: mutation.environment,
+                revision: mutation.revision,
+                workflow_version: mutation.workflow_version,
+                content_hash: mutation.content_hash,
+                action: mutation.action,
+                source_environment: mutation.source_environment,
+                source_revision: mutation.source_revision,
+                created_at: mutation.created_at,
+            })
+        })
+        .transpose()
+}
+
 pub(crate) async fn list_release_history(
     pool: &PgPool,
     org_id: Uuid,
@@ -404,6 +444,24 @@ mod tests {
         assert!(LIST_RELEASE_HISTORY_SQL.contains("r.workflow_id = $2"));
         assert!(LIST_RELEASE_HISTORY_SQL.contains("ORDER BY r.revision DESC"));
         assert!(LIST_RELEASE_HISTORY_SQL.contains("LIMIT $4"));
+    }
+
+    #[test]
+    fn current_release_lookup_is_exact_and_tenant_scoped() {
+        for fragment in [
+            "s.org_id = $1",
+            "s.workflow_id = $2",
+            "s.environment = $3",
+            "r.revision = s.revision",
+            "d.version = s.workflow_version",
+        ] {
+            assert!(
+                GET_CURRENT_RELEASE_SQL.contains(fragment),
+                "current release lookup missing {fragment}"
+            );
+        }
+        assert!(!GET_CURRENT_RELEASE_SQL.contains("ORDER BY"));
+        assert!(!GET_CURRENT_RELEASE_SQL.contains("LIMIT"));
     }
 
     #[test]

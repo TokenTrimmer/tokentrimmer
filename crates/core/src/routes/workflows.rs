@@ -45,11 +45,12 @@ use crate::{
         events::WfEvent,
         executor::GatewayNodeExecutor,
         node_run_store,
+        release_store::{self, WorkflowEnvironment},
         secrets::{
             delete_secret, is_valid_secret_name, list_secret_rows, load_secrets,
             master_key_from_env, store_secret,
         },
-        store::{self, WorkflowRunRecord},
+        store::{self, WorkflowRunRecord, WorkflowRunReleaseProvenance},
         types::content_hash,
         validate,
     },
@@ -205,6 +206,43 @@ pub struct WorkflowDefMetaView {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Closed environment selector for one explicit Estimate or Run request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowExecutionEnvironment {
+    Development,
+    Staging,
+    Production,
+}
+
+impl WorkflowExecutionEnvironment {
+    const fn as_store(self) -> WorkflowEnvironment {
+        match self {
+            Self::Development => WorkflowEnvironment::Development,
+            Self::Staging => WorkflowEnvironment::Staging,
+            Self::Production => WorkflowEnvironment::Production,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        self.as_store().as_str()
+    }
+
+    const fn from_store(environment: WorkflowEnvironment) -> Self {
+        match environment {
+            WorkflowEnvironment::Development => Self::Development,
+            WorkflowEnvironment::Staging => Self::Staging,
+            WorkflowEnvironment::Production => Self::Production,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedWorkflowRelease {
+    environment: WorkflowExecutionEnvironment,
+    revision: i32,
+}
+
 /// `POST /v1/workflows/:id/estimate` request body.
 #[derive(Debug, Deserialize)]
 pub struct EstimateRequest {
@@ -214,11 +252,20 @@ pub struct EstimateRequest {
     /// latest version is used for backward compatibility.
     #[serde(default, alias = "version")]
     pub workflow_version: Option<i32>,
+    /// Optional current release pointer to estimate. Mutually exclusive with
+    /// `workflow_version`; the exact resolved version is immutable afterward.
+    #[serde(default)]
+    pub workflow_environment: Option<WorkflowExecutionEnvironment>,
 }
 
 /// `POST /v1/workflows/:id/estimate` response.
 #[derive(Debug, Serialize)]
 pub struct EstimateResponse {
+    pub workflow_version: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_environment: Option<WorkflowExecutionEnvironment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_revision: Option<i32>,
     pub projected_cost_usd: f64,
     pub per_node: Vec<NodeEstimateView>,
     pub warnings: Vec<String>,
@@ -242,6 +289,10 @@ pub struct CreateRunRequest {
     /// the version accepted by the original request.
     #[serde(default, alias = "version")]
     pub workflow_version: Option<i32>,
+    /// Optional current environment release to execute. This is mutually
+    /// exclusive with `workflow_version` and does not change trigger defaults.
+    #[serde(default)]
+    pub workflow_environment: Option<WorkflowExecutionEnvironment>,
     /// Optional run-level USD budget cap. Superseded by
     /// `def.budget.max_cost_usd` when that is set.
     #[serde(default)]
@@ -256,6 +307,11 @@ pub struct CreateRunRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateRunResponse {
     pub run_id: Uuid,
+    pub workflow_version: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_environment: Option<WorkflowExecutionEnvironment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_revision: Option<i32>,
     pub status: String,
     pub cost_usd: f64,
     pub baseline_cost_usd: f64,
@@ -315,6 +371,100 @@ fn validate_requested_workflow_version(version: Option<i32>) -> ApiResult<()> {
     Ok(())
 }
 
+fn validate_workflow_execution_selector(
+    version: Option<i32>,
+    environment: Option<WorkflowExecutionEnvironment>,
+) -> ApiResult<()> {
+    validate_requested_workflow_version(version)?;
+    if version.is_some() && environment.is_some() {
+        return Err(ApiError::InvalidRequest(
+            "workflow_version and workflow_environment are mutually exclusive".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_workflow_execution_definition(
+    pool: &sqlx::PgPool,
+    org: Uuid,
+    workflow_id: Uuid,
+    version: Option<i32>,
+    environment: Option<WorkflowExecutionEnvironment>,
+) -> ApiResult<(
+    workflow::types::WorkflowDefinition,
+    i32,
+    Option<ResolvedWorkflowRelease>,
+)> {
+    validate_workflow_execution_selector(version, environment)?;
+    if let Some(environment) = environment {
+        let release =
+            release_store::get_current_release(pool, org, workflow_id, environment.as_store())
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        %workflow_id,
+                        workflow_environment = environment.as_str(),
+                        %error,
+                        "workflow environment execution selector lookup failed"
+                    );
+                    ApiError::ServiceUnavailable(
+                        "workflow release state is temporarily unavailable".into(),
+                    )
+                })?
+                .ok_or_else(|| {
+                    ApiError::NotFound(format!(
+                        "no {environment_name} release for workflow {workflow_id}",
+                        environment_name = environment.as_str()
+                    ))
+                })?;
+        let record =
+            store::get_definition_version_record(pool, org, workflow_id, release.workflow_version)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        %workflow_id,
+                        workflow_environment = environment.as_str(),
+                        workflow_version = release.workflow_version,
+                        %error,
+                        "released workflow definition lookup failed"
+                    );
+                    ApiError::ServiceUnavailable(
+                        "released workflow definition is temporarily unavailable".into(),
+                    )
+                })?
+                .ok_or_else(|| {
+                    ApiError::Internal("workflow release references a missing definition".into())
+                })?;
+        if record.content_hash != release.content_hash {
+            return Err(ApiError::Internal(
+                "workflow release definition metadata is inconsistent".into(),
+            ));
+        }
+        return Ok((
+            record.definition,
+            record.version,
+            Some(ResolvedWorkflowRelease {
+                environment,
+                revision: release.revision,
+            }),
+        ));
+    }
+
+    let selected = match version {
+        Some(version) => store::get_definition_version(pool, org, workflow_id, version)
+            .await
+            .ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "no workflow with id {workflow_id} at version {version}"
+                ))
+            })?,
+        None => store::get_definition(pool, org, workflow_id)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {workflow_id}")))?,
+    };
+    Ok((selected.0, selected.1, None))
+}
+
 /// A duplicate logical invocation is a status/reconciliation response, never
 /// another workflow execution. The existing run endpoint remains the durable
 /// detail/status surface; `node_outputs` is intentionally empty here because a
@@ -325,11 +475,16 @@ fn workflow_run_replay_response(run: WorkflowRunRecord) -> Response {
     } else {
         StatusCode::ACCEPTED
     };
+    let selected_release = run.release;
     let mut response = (
         status,
         Json(CreateRunReplayResponse {
             run: CreateRunResponse {
                 run_id: run.id,
+                workflow_version: run.version,
+                workflow_environment: selected_release
+                    .map(|release| WorkflowExecutionEnvironment::from_store(release.environment)),
+                release_revision: selected_release.map(|release| release.revision),
                 status: run.status,
                 cost_usd: run.cost_usd,
                 baseline_cost_usd: run.baseline_cost_usd,
@@ -667,23 +822,23 @@ pub async fn estimate(
     Json(body): Json<EstimateRequest>,
 ) -> ApiResult<Json<EstimateResponse>> {
     let org = require_org(ctx)?;
-    validate_requested_workflow_version(body.workflow_version)?;
     let pool = db_pool(&state)?;
 
-    let (def, _version) = match body.workflow_version {
-        Some(version) => store::get_definition_version(pool, org, id, version)
-            .await
-            .ok_or_else(|| {
-                ApiError::NotFound(format!("no workflow with id {id} at version {version}"))
-            })?,
-        None => store::get_definition(pool, org, id)
-            .await
-            .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))?,
-    };
+    let (def, version, release) = resolve_workflow_execution_definition(
+        pool,
+        org,
+        id,
+        body.workflow_version,
+        body.workflow_environment,
+    )
+    .await?;
 
     let est = estimate::estimate_workflow(&def, &body.inputs);
 
     Ok(Json(EstimateResponse {
+        workflow_version: version,
+        workflow_environment: release.map(|release| release.environment),
+        release_revision: release.map(|release| release.revision),
         projected_cost_usd: est.projected_cost_usd,
         per_node: est
             .per_node
@@ -940,10 +1095,14 @@ pub async fn create_run(
     let CreateRunRequest {
         inputs,
         workflow_version: requested_workflow_version,
+        workflow_environment: requested_workflow_environment,
         max_cost_usd,
         stream,
     } = body;
-    validate_requested_workflow_version(requested_workflow_version)?;
+    validate_workflow_execution_selector(
+        requested_workflow_version,
+        requested_workflow_environment,
+    )?;
 
     // A supplied key is resolved before reading the latest definition. That is
     // what lets a lost response safely reconcile to its original immutable
@@ -952,12 +1111,15 @@ pub async fn create_run(
     let input_hash = store::workflow_run_input_hash(&inputs).map_err(|error| {
         ApiError::InvalidRequest(format!("workflow inputs cannot be canonicalized: {error}"))
     })?;
-    let request_options_hash =
-        store::workflow_run_request_options_hash(max_cost_usd).map_err(|error| {
-            ApiError::InvalidRequest(format!(
-                "workflow execution options cannot be canonicalized: {error}"
-            ))
-        })?;
+    let request_options_hash = store::workflow_run_request_options_hash(
+        max_cost_usd,
+        requested_workflow_environment.map(WorkflowExecutionEnvironment::as_store),
+    )
+    .map_err(|error| {
+        ApiError::InvalidRequest(format!(
+            "workflow execution options cannot be canonicalized: {error}"
+        ))
+    })?;
     let idempotency_key_hash = idempotency_key
         .as_deref()
         .map(|key| store::workflow_run_invocation_key_hash(org, id, key));
@@ -987,16 +1149,14 @@ pub async fn create_run(
     }
 
     // --- Load the accepted immutable version + defense-in-depth validate ----
-    let (def, version) = match requested_workflow_version {
-        Some(version) => store::get_definition_version(pool, org, id, version).await,
-        None => store::get_definition(pool, org, id).await,
-    }
-    .ok_or_else(|| {
-        let detail = requested_workflow_version
-            .map(|version| format!("no workflow with id {id} at version {version}"))
-            .unwrap_or_else(|| format!("no workflow with id {id}"));
-        ApiError::NotFound(detail)
-    })?;
+    let (def, version, release) = resolve_workflow_execution_definition(
+        pool,
+        org,
+        id,
+        requested_workflow_version,
+        requested_workflow_environment,
+    )
+    .await?;
 
     {
         let registry = state.registry.clone();
@@ -1018,6 +1178,10 @@ pub async fn create_run(
         workflow_id: def.id,
         version,
         org_id: org,
+        release: release.map(|release| WorkflowRunReleaseProvenance {
+            environment: release.environment.as_store(),
+            revision: release.revision,
+        }),
         status: "running".to_string(),
         inputs: Some(inputs.clone()),
         cost_usd: 0.0,
@@ -1129,6 +1293,9 @@ pub async fn create_run(
         }
         Ok(Json(CreateRunResponse {
             run_id,
+            workflow_version: version,
+            workflow_environment: release.map(|release| release.environment),
+            release_revision: release.map(|release| release.revision),
             status: status_str.to_string(),
             cost_usd: result.cost_usd,
             baseline_cost_usd: result.baseline_cost_usd,
@@ -1925,12 +2092,54 @@ mod tests {
         }))
         .expect("exact estimate request");
         assert_eq!(exact.workflow_version, Some(7));
+        assert_eq!(exact.workflow_environment, None);
 
         let legacy: EstimateRequest = serde_json::from_value(serde_json::json!({
             "version": 6
         }))
         .expect("legacy estimate version alias");
         assert_eq!(legacy.workflow_version, Some(6));
+
+        let released: EstimateRequest = serde_json::from_value(serde_json::json!({
+            "inputs": {},
+            "workflow_environment": "production"
+        }))
+        .expect("environment estimate selector");
+        assert_eq!(released.workflow_version, None);
+        assert_eq!(
+            released.workflow_environment,
+            Some(WorkflowExecutionEnvironment::Production)
+        );
+        assert!(
+            serde_json::from_value::<EstimateRequest>(serde_json::json!({
+                "workflow_environment": "preview"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_execution_selectors_are_closed_and_mutually_exclusive() {
+        for environment in [
+            WorkflowExecutionEnvironment::Development,
+            WorkflowExecutionEnvironment::Staging,
+            WorkflowExecutionEnvironment::Production,
+        ] {
+            assert!(validate_workflow_execution_selector(None, Some(environment)).is_ok());
+            assert_eq!(
+                WorkflowExecutionEnvironment::from_store(environment.as_store()),
+                environment
+            );
+        }
+        assert!(validate_workflow_execution_selector(Some(4), None).is_ok());
+        assert!(matches!(
+            validate_workflow_execution_selector(
+                Some(4),
+                Some(WorkflowExecutionEnvironment::Production)
+            ),
+            Err(ApiError::InvalidRequest(message))
+                if message.contains("mutually exclusive")
+        ));
     }
 
     #[test]
@@ -2104,6 +2313,7 @@ mod tests {
         let body = EstimateRequest {
             inputs: serde_json::Value::Null,
             workflow_version: None,
+            workflow_environment: None,
         };
         let result = estimate(State(test_state()), None, Path(Uuid::nil()), Json(body)).await;
         assert!(
@@ -2265,6 +2475,7 @@ mod tests {
         let body = CreateRunRequest {
             inputs: serde_json::Value::Null,
             workflow_version: None,
+            workflow_environment: None,
             max_cost_usd: None,
             stream: false,
         };

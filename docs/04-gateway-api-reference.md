@@ -2522,19 +2522,24 @@ successful transition increments the target revision, its expected revision
 must be at most 2,147,483,646.
 
 This contract does not constitute human approval, and it does not silently
-change legacy latest-version Estimate/Run or durable-trigger behavior.
-Environment-aware execution selection and attributable approval/audit remain
-separate gates.
+change legacy latest-version Estimate/Run or durable-trigger behavior. Direct
+Estimate/Run callers may opt into the explicit environment selector below;
+automatic trigger activation and attributable approval remain separate gates.
 
 ---
 
 #### `POST /v1/workflows/:id/estimate` — pre-run cost projection
 
-Returns a static cost projection for the workflow's latest definition. No model calls are made.
+Returns a static cost projection without making model calls. By default it
+uses the workflow's latest definition.
 
 Set optional positive `workflow_version` (legacy alias: `version`) to estimate
-that exact retained org-owned definition instead of latest. An absent version
-returns `404`; zero or a negative version returns `400` before storage access.
+that exact retained org-owned definition instead of latest. Alternatively set
+`workflow_environment` to `development`, `staging`, or `production` to resolve
+that environment's exact current immutable release. The two selectors are
+mutually exclusive. A missing requested version or environment release returns
+`404`; zero/negative versions and unknown environments return `400` before
+execution.
 
 **Request body:**
 
@@ -2542,10 +2547,17 @@ returns `404`; zero or a negative version returns `400` before storage access.
 { "inputs": {}, "workflow_version": 3 }
 ```
 
+```json
+{ "inputs": {}, "workflow_environment": "production" }
+```
+
 **Response:**
 
 ```json
 {
+  "workflow_version": 3,
+  "workflow_environment": "production",
+  "release_revision": 2,
   "projected_cost_usd": 0.0012,
   "per_node": [
     { "node_id": "summarise", "model": "claude-3-5-haiku-20241022", "cost_usd": 0.0008 },
@@ -2566,18 +2578,20 @@ Executes the workflow synchronously and returns the result. Bounded by the 60-se
 For durable callers, send a stable Idempotency-Key header. The gateway hashes
 that value before storage and creates or reuses one run per (org, workflow,
 key). The first accepted request binds the key to its immutable workflow
-version, canonical JSON inputs, and max_cost_usd request option. A retry with
-a changed explicit version, inputs, or cost option receives 409; an omitted
-workflow_version on a retry reuses the version accepted first, even if a newer
-definition has since been saved. Clients without Idempotency-Key retain the
-historical behavior: every request creates a fresh run.
+version, canonical JSON inputs, max_cost_usd request option, and explicit
+environment selector when supplied. A retry with changed inputs, cost, explicit
+version, or environment receives 409. Repeating the same environment selector
+reuses the version accepted first even if that pointer has since advanced.
+Legacy retries without `workflow_environment` preserve their pre-existing
+fingerprint and behavior. Clients without Idempotency-Key retain the historical
+behavior: every request creates a fresh run.
 
 **Request body:**
 
 ```json
 {
   "inputs": { "text": "Summarise this document…" },
-  "workflow_version": 3,
+  "workflow_environment": "production",
   "max_cost_usd": 0.05
 }
 ```
@@ -2586,6 +2600,7 @@ historical behavior: every request creates a fresh run.
 |---|---|---|---|
 | `inputs` | object | no | Input values passed to the trigger node. |
 | `workflow_version` | integer | no | Exact immutable definition version to execute. Omit for the latest version on a new invocation. `version` is accepted as a compatibility alias. |
+| `workflow_environment` | string | no | Exact current `development`, `staging`, or `production` release to resolve before execution. Mutually exclusive with `workflow_version`; it does not change schedule/webhook or route-detour defaults. |
 | `max_cost_usd` | number | no | Run-level USD cap. Superseded by `def.budget.max_cost_usd` when that is set. |
 
 Idempotency-Key is optional, must be 1–256 visible bytes, and is never
@@ -2598,6 +2613,9 @@ without starting a second run.
 ```json
 {
   "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "workflow_version": 3,
+  "workflow_environment": "production",
+  "release_revision": 2,
   "status": "completed",
   "cost_usd": 0.00312,
   "baseline_cost_usd": 0.00480,
@@ -2615,6 +2633,9 @@ without starting a second run.
 | Field | Type | Description |
 |---|---|---|
 | `run_id` | string (UUID) | The run's unique identifier. |
+| `workflow_version` | integer | Exact immutable definition version that executed. |
+| `workflow_environment` | string | Present only when the caller selected an environment; the closed development/staging/production value resolved before execution. |
+| `release_revision` | integer | Present with `workflow_environment`; exact immutable release-ledger revision bound to the run. |
 | `status` | string | Terminal status of the run (see values below). |
 | `cost_usd` | number | Total served cost (USD) across all nodes in this run. |
 | `baseline_cost_usd` | number | What the run would have cost without routing — sum of per-node baseline costs (the default/first-ranked model's price). Zero when no model nodes executed. |
@@ -2626,7 +2647,9 @@ with 200 for a terminal run or 202 while it is running, plus the
 Idempotent-Replay: true header and a replayed: true response field. It is a
 status/reconciliation response, so node_outputs is empty; use
 GET /v1/workflows/runs/:run_id for the durable run status. It never executes
-the graph again.
+the graph again. Recent-run and single-run reads likewise expose
+`workflow_environment` plus `release_revision` only for environment-bound runs;
+legacy latest/exact-version rows retain null provenance.
 
 #### `GET /v1/workflows/runs/:run_id/nodes` — inspect the retained node journal
 
