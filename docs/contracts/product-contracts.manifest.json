@@ -12,6 +12,18 @@
       "write": "POST /v1/routes"
     },
     {
+      "compatibility_corpus": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json",
+      "family": "route_preview_coverage",
+      "id": "tokentrimmer.route-preview-coverage-corpus",
+      "route_contract_id": "tokentrimmer.route.v1",
+      "route_contract_versions": [
+        1
+      ],
+      "versions": [
+        2
+      ]
+    },
+    {
       "family": "workflow_definition",
       "id": "tokentrimmer.workflow-definition.v1",
       "read": "GET /v1/workflows/{id}",
@@ -57,6 +69,10 @@
       "sha256": "9cdfb331ddca915d5ec7042c84eb166c8588e9299964b64aa4af47a35dbf33d8"
     },
     {
+      "path": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json",
+      "sha256": "0117bbf51a4215c4b75952eec492f8e044bd15503a33973dd781a1efc5108738"
+    },
+    {
       "path": "docs/workflow-contract/workflow-definition-v1.golden.json",
       "sha256": "abf86966f51a0e2080d19c8407904f5910162ec818603218bac6b8539923f45a"
     },
@@ -69,6 +85,6 @@
       "sha256": "fbf5d47faf86b82b200bb161d6a7a715fb1a9a62c484025a91604f73ab7d573e"
     }
   ],
-  "generated_from": "Authoritative Rust route parser, workflow definition/write types, and gateway capability response type",
+  "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, and gateway capability response type",
   "typescript": "bindings/product-contracts.generated.ts"
 }

@@ -11,7 +11,9 @@ The public routing crate verifies that the authoritative copy has exactly one
 entry for every canonical `RouteConditions` field. Hosted consumers should
 vendor the exact bytes paired with their pinned public revision, reject an
 unknown corpus or route-contract version, and use the stable `reason_id` rather
-than comparing explanatory prose.
+than comparing explanatory prose. The current v2 corpus is also hashed in
+`docs/contracts/product-contracts.manifest.json`, so pinned consumers can use
+the same product-contract drift gate as route schemas and generated wire types.
 
 ## Format
 

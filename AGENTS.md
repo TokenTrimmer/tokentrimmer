@@ -47,12 +47,12 @@ Full local CI mirror:
 - Logging: `tracing` crate. NEVER `println!`/`eprintln!` in library code.
 - Async: `tokio`. Stream types: `futures::Stream`.
 - Wire types: live in `crates/shared/src/`. Use those, do not redefine.
-- Proof-contract TS bindings: `crates/ts-types` derives JSON Schema from the
-  real VCR/L2/WFR/ARR/bundle Rust wires, then emits
-  `bindings/receipt-contracts.generated.ts`; CI regenerates and byte-compares
-  schemas, TypeScript, vectors, and the manifest. Route/workflow/capability and
-  other wire families remain outside this generator—do not imply whole-API
-  binding coverage.
+- Contract TS bindings: `crates/ts-types` derives JSON Schema from the real
+  VCR/L2/WFR/ARR/bundle, route, workflow, and gateway-capability Rust wires,
+  then emits the receipt and product TypeScript bindings; CI regenerates and
+  byte-compares schemas, TypeScript, vectors, compatibility artifacts, and both
+  manifests. Other API families remain outside this generator—do not imply
+  whole-API binding coverage.
 - OpenAPI: emitted via `utoipa` on Axum routes.
 - Provider adapters: each in its own crate at `crates/providers/<name>/`. Stateless beyond HTTP client + pricing table.
 - File size target: keep new `.rs` modules under 800 lines. Legacy oversized

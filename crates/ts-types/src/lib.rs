@@ -28,6 +28,8 @@ const GENERATED_TS_PATH: &str = "bindings/receipt-contracts.generated.ts";
 const MANIFEST_PATH: &str = "docs/receipt-spec/receipt-contracts.manifest.json";
 const PRODUCT_TS_PATH: &str = "bindings/product-contracts.generated.ts";
 const PRODUCT_MANIFEST_PATH: &str = "docs/contracts/product-contracts.manifest.json";
+const ROUTE_PREVIEW_V2_PATH: &str =
+    "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json";
 const FIXED_KEY_BYTES: [u8; 32] = [7; 32];
 const FIXED_KEY_HEX: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
 
@@ -71,6 +73,18 @@ pub fn generate_artifacts() -> Result<Vec<GeneratedArtifact>> {
         "docs/workflow-contract/workflow-definition-v1.golden.json",
         &workflow_definition_vector(),
     )?);
+    // Preview coverage is a public-owned compatibility decision paired with
+    // the canonical route field inventory. Its Rust corpus test enforces the
+    // semantics; including the exact bytes here makes pin consumers verify the
+    // same artifact through the product manifest instead of an ad-hoc copy.
+    product_artifacts.push(GeneratedArtifact {
+        relative_path: ROUTE_PREVIEW_V2_PATH.into(),
+        bytes: include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json"
+        ))
+        .to_vec(),
+    });
     product_artifacts.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     let product_manifest = product_manifest_artifact(&product_artifacts)?;
 
@@ -559,7 +573,7 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
         .collect::<Vec<_>>();
     let manifest = json!({
         "contract": "tokentrimmer.product-contracts.v1",
-        "generated_from": "Authoritative Rust route parser, workflow definition/write types, and gateway capability response type",
+        "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, and gateway capability response type",
         "typescript": PRODUCT_TS_PATH,
         "contracts": [
             {
@@ -569,6 +583,14 @@ fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<Generate
                 "schema": "docs/route-contract/route-write.schema.json",
                 "compatibility_corpus": "docs/route-contract/tokentrimmer.route.v1.corpus.json",
                 "write": "POST /v1/routes"
+            },
+            {
+                "family": "route_preview_coverage",
+                "id": "tokentrimmer.route-preview-coverage-corpus",
+                "versions": [2],
+                "route_contract_id": tt_routing::ROUTE_SCHEMA_ID,
+                "route_contract_versions": [tt_routing::ROUTE_SCHEMA_VERSION],
+                "compatibility_corpus": ROUTE_PREVIEW_V2_PATH
             },
             {
                 "family": "workflow_definition",

@@ -14,7 +14,13 @@ const manifest = load('docs/contracts/product-contracts.manifest.json');
 assert(manifest.contract === 'tokentrimmer.product-contracts.v1', 'unknown product manifest');
 
 const families = new Map(manifest.contracts.map((contract) => [contract.family, contract]));
-for (const family of ['route', 'workflow_definition', 'workflow_write', 'gateway_capabilities']) {
+for (const family of [
+  'route',
+  'route_preview_coverage',
+  'workflow_definition',
+  'workflow_write',
+  'gateway_capabilities',
+]) {
   assert(families.has(family), `missing product contract family: ${family}`);
 }
 
@@ -40,6 +46,26 @@ assert(
 );
 assert(route.$defs.RouteAction.additionalProperties === false, 'route action must reject unknown fields');
 assert('content_compress' in route.$defs.RouteAction.properties, 'live route action field missing');
+
+const routePreviewFamily = families.get('route_preview_coverage');
+const routePreview = load(routePreviewFamily.compatibility_corpus);
+assert(routePreview.corpus.id === routePreviewFamily.id, 'route-preview corpus id drift');
+assert(routePreview.corpus.version === 2, 'route-preview corpus version drift');
+assert(routePreview.route_contract.id === families.get('route').id, 'route-preview route id drift');
+assert(routePreview.route_contract.version === 1, 'route-preview route version drift');
+const previewFields = routePreview.conditions.map((condition) => condition.field);
+const routeConditionFields = Object.keys(route.$defs.RouteConditions.properties);
+assert(new Set(previewFields).size === previewFields.length, 'duplicate route-preview condition');
+assert(
+  JSON.stringify([...previewFields].sort()) === JSON.stringify([...routeConditionFields].sort()),
+  'route-preview corpus must classify every canonical route condition exactly once',
+);
+assert(
+  routePreview.conditions.every((condition) =>
+    ['exact', 'approximate', 'unavailable'].includes(condition.classification) &&
+    /^[a-z0-9]+(?:_[a-z0-9]+)*$/.test(condition.reason_id)),
+  'invalid route-preview classification or reason id',
+);
 
 const workflow = load(families.get('workflow_definition').schema);
 const workflowWrite = load(families.get('workflow_write').schema);
