@@ -110,7 +110,8 @@ jobs:
     # and Redis (the L1 cache round-trip). These back the #[ignore]d,
     # TEST_DATABASE_URL/DATABASE_URL/REDIS_URL-gated tests that the other jobs
     # never run: PostgresKeyStore, the pgvector L2 cache + tenant isolation,
-    # the migrate-only path, and the BYO credential-store wiring.
+    # the migrate-only path, immutable workflow-version history, and the BYO
+    # credential-store wiring.
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -152,6 +153,13 @@ jobs:
       # is itself one of the ignored tests we want covered, and it's idempotent.
       - name: Apply migrations (tt-core migrate_only)
         run: cargo test -p tt-core --test migrations -- --include-ignored migrate_only_applies_schema
+      # Exact retained-definition reads and newest-first history must stay
+      # bounded and tenant-scoped against the migrated production schema.
+      - name: tt-core workflow version history (ignored)
+        run: >-
+          cargo test -p tt-core --lib
+          workflow::store::tests::definition_version_history_is_exact_bounded_and_org_scoped
+          -- --include-ignored --exact
       # Postgres key store: issue -> validate -> revoke -> cross-org isolation.
       # PostgresKeyStore is gated behind tt-auth's `postgres` feature, which the
       # default workspace build does not enable — so scope + feature it here.
