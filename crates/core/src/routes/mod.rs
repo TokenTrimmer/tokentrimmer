@@ -21,6 +21,7 @@ pub mod routes_api;
 pub mod spend_api;
 pub mod sse;
 pub mod workflow_runs;
+pub mod workflow_versions;
 pub mod workflows;
 
 /// Graft the `tokentrimmer.panel` attribution from a chat-completions response body

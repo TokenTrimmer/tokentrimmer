@@ -110,6 +110,9 @@ started by a human/API run. The two current invokers are:
 |---|---|
 | `POST /v1/workflows` | Create a workflow (CRUD; `id` + `version` optional). |
 | `GET /v1/workflows` | List workflow definitions (metadata). |
+| `GET /v1/workflows/:id` | Read the latest org-owned definition. |
+| `GET /v1/workflows/:id/versions` | List at most 100 newest-first immutable version metadata rows, with explicit truncation and `private, no-store`. |
+| `GET /v1/workflows/:id/versions/:version` | Read one exact retained definition plus authoritative hash/timestamp metadata with `private, no-store`. |
 | `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls; computes the projected cost from the graph + pricing). |
 | `POST /v1/workflows/:id/runs` | Run synchronously (returns the run + the rolled-up `saved_usd`). |
 | `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
@@ -118,6 +121,10 @@ started by a human/API run. The two current invokers are:
 | `GET /v1/workflows/secrets` | List up to 500 org-scoped secret names, decryptability states, and timestamps; never returns values/ciphertext and is `private, no-store`. |
 | `POST /v1/workflows/secrets` | Store or rotate a 1–65,536-byte org-scoped secret value. |
 | `DELETE /v1/workflows/secrets/:name` | Idempotently delete one org-scoped secret; stored versions remain intact and fail closed if they still reference it. |
+
+The immutable version reads support bounded history inspection and exact
+client-side comparison only. They do not create draft/published semantics,
+environment promotion, approval, or a rollback mutation.
 
 ## SSE events (a run's streaming surface)
 

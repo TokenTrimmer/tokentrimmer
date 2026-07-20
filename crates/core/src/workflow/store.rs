@@ -104,6 +104,23 @@ pub(crate) struct WorkflowDefMeta {
     pub created_at: DateTime<Utc>,
 }
 
+/// Immutable version metadata exposed by the bounded workflow-history API.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WorkflowDefinitionVersionMeta {
+    pub version: i32,
+    pub content_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One exact immutable definition plus its authoritative storage metadata.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowDefinitionVersionRecord {
+    pub definition: WorkflowDefinition,
+    pub version: i32,
+    pub content_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
 // ---------------------------------------------------------------------------
 // SQL constants — definitions
 // ---------------------------------------------------------------------------
@@ -136,10 +153,18 @@ LIMIT 1";
 /// Durable invocations must execute the version accepted at enqueue time, not
 /// whichever version happens to be latest when a retry arrives.
 pub(crate) const GET_DEFINITION_VERSION_SQL: &str = "\
-SELECT definition, version \
+SELECT definition, version, content_hash, created_at \
 FROM workflow_definitions \
 WHERE id = $1 AND org_id = $2 AND version = $3 \
 LIMIT 1";
+
+/// SELECT bounded immutable version metadata for one org-owned definition.
+pub(crate) const LIST_DEFINITION_VERSIONS_SQL: &str = "\
+SELECT version, content_hash, created_at \
+FROM workflow_definitions \
+WHERE id = $1 AND org_id = $2 \
+ORDER BY version DESC \
+LIMIT $3";
 
 /// SELECT the latest-version row for each definition owned by an org.
 /// `DISTINCT ON (id)` with `ORDER BY id, version DESC` picks the row with
@@ -439,6 +464,66 @@ pub(crate) async fn get_definition_version(
     }
 }
 
+/// Strictly fetch one immutable version for the read-only version-history API.
+///
+/// Unlike the execution helper above, this preserves database and decode errors
+/// so the HTTP layer can return a generic failure instead of misreporting a
+/// temporary storage problem as a missing version.
+pub(crate) async fn get_definition_version_record(
+    pool: &PgPool,
+    org_id: Uuid,
+    id: Uuid,
+    version: i32,
+) -> Result<Option<WorkflowDefinitionVersionRecord>, sqlx::Error> {
+    let row = sqlx::query(GET_DEFINITION_VERSION_SQL)
+        .bind(id)
+        .bind(org_id)
+        .bind(version)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|row| {
+        use sqlx::Row;
+        let definition_value: serde_json::Value = row.try_get("definition")?;
+        let definition = serde_json::from_value(definition_value).map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "workflow definition {id} version {version} failed to decode: {error}"
+            ))
+        })?;
+        Ok(WorkflowDefinitionVersionRecord {
+            definition,
+            version: row.try_get("version")?,
+            content_hash: row.try_get("content_hash")?,
+            created_at: row.try_get("created_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// Strictly list up to `limit` immutable versions for one org-owned workflow.
+pub(crate) async fn list_definition_versions(
+    pool: &PgPool,
+    org_id: Uuid,
+    id: Uuid,
+    limit: i64,
+) -> Result<Vec<WorkflowDefinitionVersionMeta>, sqlx::Error> {
+    let rows = sqlx::query(LIST_DEFINITION_VERSIONS_SQL)
+        .bind(id)
+        .bind(org_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|row| {
+            use sqlx::Row;
+            Ok(WorkflowDefinitionVersionMeta {
+                version: row.try_get("version")?,
+                content_hash: row.try_get("content_hash")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
 /// Return up to `limit` definitions for `org_id` (latest version per id),
 /// ordered by id. Returns an empty `Vec` on DB error (best-effort).
 pub(crate) async fn list_definitions(
@@ -721,14 +806,17 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
+    use crate::workflow::types::{BudgetPolicy, WorkflowDefinition};
+
     use super::{
-        create_or_reuse_idempotent_run, get_run_strict, get_workflow_run_idempotency,
-        workflow_run_input_hash, workflow_run_invocation_key_hash,
-        workflow_run_request_options_hash, CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency,
-        WorkflowRunRecord, FINISH_RUN_SQL, GET_DEFINITION_SQL, GET_DEFINITION_VERSION_SQL,
-        GET_RUN_SQL, GET_WORKFLOW_RUN_IDEMPOTENCY_SQL, INSERT_DEFINITION_SQL,
-        INSERT_IDEMPOTENT_RUN_SQL, INSERT_RUN_SQL, INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL,
-        LIST_DEFINITIONS_SQL, LIST_WORKFLOW_RUNS_SQL,
+        create_or_reuse_idempotent_run, get_definition_version_record, get_run_strict,
+        get_workflow_run_idempotency, list_definition_versions, workflow_run_input_hash,
+        workflow_run_invocation_key_hash, workflow_run_request_options_hash,
+        CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency, WorkflowRunRecord, FINISH_RUN_SQL,
+        GET_DEFINITION_SQL, GET_DEFINITION_VERSION_SQL, GET_RUN_SQL,
+        GET_WORKFLOW_RUN_IDEMPOTENCY_SQL, INSERT_DEFINITION_SQL, INSERT_IDEMPOTENT_RUN_SQL,
+        INSERT_RUN_SQL, INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL, LIST_DEFINITIONS_SQL,
+        LIST_DEFINITION_VERSIONS_SQL, LIST_WORKFLOW_RUNS_SQL,
     };
 
     // ------------------------------------------------------------------
@@ -841,6 +929,21 @@ mod tests {
             GET_DEFINITION_VERSION_SQL.contains("FROM workflow_definitions"),
             "GET_DEFINITION_VERSION_SQL must query workflow_definitions"
         );
+        for column in ["content_hash", "created_at"] {
+            assert!(
+                GET_DEFINITION_VERSION_SQL.contains(column),
+                "GET_DEFINITION_VERSION_SQL must return {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_definition_versions_sql_is_org_scoped_bounded_and_newest_first() {
+        assert!(LIST_DEFINITION_VERSIONS_SQL.contains("WHERE id = $1 AND org_id = $2"));
+        assert!(LIST_DEFINITION_VERSIONS_SQL.contains("ORDER BY version DESC"));
+        assert!(LIST_DEFINITION_VERSIONS_SQL.contains("LIMIT $3"));
+        assert!(LIST_DEFINITION_VERSIONS_SQL.contains("content_hash"));
+        assert!(LIST_DEFINITION_VERSIONS_SQL.contains("created_at"));
     }
 
     #[test]
@@ -1203,5 +1306,89 @@ mod tests {
         .execute(&pool)
         .await
         .expect("cleanup definition");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL (empty Postgres) — run with --include-ignored"]
+    async fn definition_version_history_is_exact_bounded_and_org_scoped() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        crate::migrate_only(&url)
+            .await
+            .expect("migrate public schema");
+        let pool = crate::connect(&url, 4).await.expect("connect");
+        let workflow_id = Uuid::new_v4();
+        let org_a = Uuid::new_v4();
+        let org_b = Uuid::new_v4();
+        let definition = |name: &str| WorkflowDefinition {
+            id: workflow_id,
+            version: 0,
+            name: name.to_owned(),
+            nodes: vec![],
+            edges: vec![],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
+            triggers: vec![],
+        };
+
+        for (org, version, name, hash) in [
+            (org_a, 1, "org-a-v1", "hash-a1"),
+            (org_a, 2, "org-a-v2", "hash-a2"),
+            (org_b, 1, "org-b-v1", "hash-b1"),
+        ] {
+            sqlx::query(
+                "INSERT INTO workflow_definitions \
+                 (id, org_id, version, definition, content_hash) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(workflow_id)
+            .bind(org)
+            .bind(version)
+            .bind(serde_json::to_value(definition(name)).expect("serialize definition"))
+            .bind(hash)
+            .execute(&pool)
+            .await
+            .expect("seed workflow version");
+        }
+
+        let org_a_versions = list_definition_versions(&pool, org_a, workflow_id, 101)
+            .await
+            .expect("list org A versions");
+        assert_eq!(
+            org_a_versions
+                .iter()
+                .map(|row| (row.version, row.content_hash.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "hash-a2"), (1, "hash-a1")]
+        );
+
+        let exact = get_definition_version_record(&pool, org_a, workflow_id, 1)
+            .await
+            .expect("read exact org A version")
+            .expect("org A version exists");
+        assert_eq!(exact.version, 1);
+        assert_eq!(exact.content_hash, "hash-a1");
+        assert_eq!(exact.definition.name, "org-a-v1");
+        assert!(get_definition_version_record(&pool, org_a, workflow_id, 3)
+            .await
+            .expect("read absent version")
+            .is_none());
+
+        let other_org = get_definition_version_record(&pool, org_b, workflow_id, 1)
+            .await
+            .expect("read exact org B version")
+            .expect("org B version exists");
+        assert_eq!(other_org.definition.name, "org-b-v1");
+        assert_eq!(other_org.content_hash, "hash-b1");
+
+        for org in [org_a, org_b] {
+            sqlx::query("DELETE FROM workflow_definitions WHERE org_id = $1 AND id = $2")
+                .bind(org)
+                .bind(workflow_id)
+                .execute(&pool)
+                .await
+                .expect("cleanup workflow versions");
+        }
     }
 }

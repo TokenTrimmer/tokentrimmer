@@ -2003,7 +2003,7 @@ The run's total **served cost** (sum of `x-tokentrimmer-cost-usd` across all tur
 
 ## 24. Workflow Engine
 
-The workflow engine lets you define and execute multi-step, multi-node AI pipelines as a DAG of typed nodes. Each node is an LLM call, an agentic loop, a conditional branch, a deterministic transform, or an output collector. Workflows are versioned: every `POST /v1/workflows` stores a new immutable version; reads always return the latest.
+The workflow engine lets you define and execute multi-step, multi-node AI pipelines as a DAG of typed nodes. Each node is an LLM call, an agentic loop, a conditional branch, a deterministic transform, or an output collector. Workflows are versioned: every `POST /v1/workflows` stores a new immutable version. The ordinary definition read returns latest, while the bounded version-history endpoints expose exact retained versions read-only.
 
 **Authentication:** a real `tt_live_*` key in `Authorization: Bearer …`. Dogfood keys and anonymous callers receive `401`. Requires Postgres; returns `503` when the pool is absent.
 
@@ -2361,6 +2361,45 @@ Returns the latest version of each workflow definition owned by the authenticate
 #### `GET /v1/workflows/:id` — get latest workflow definition
 
 Returns the full workflow definition for the latest version of the given id, scoped to the authenticated org. Returns `404` when the id does not exist or belongs to another org. The returned `version` field reflects the authoritative DB version.
+
+---
+
+#### `GET /v1/workflows/:id/versions` — list immutable definition versions
+
+Returns newest-first metadata for at most 100 retained versions of exactly one
+org-owned workflow. The handler fetches one extra row to set `truncated` and
+never returns another org's existence or metadata. The response is
+`Cache-Control: private, no-store`.
+
+```json
+{
+  "object": "list",
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "data": [
+    {
+      "version": 3,
+      "content_hash": "a1b2c3d4...",
+      "created_at": "2026-06-28T12:00:00Z"
+    }
+  ],
+  "truncated": false
+}
+```
+
+Returns `404` for an absent or differently owned workflow, `500` on a storage
+read/decode failure, and `503` when Postgres is unavailable.
+
+#### `GET /v1/workflows/:id/versions/:version` — get one immutable version
+
+Returns the exact retained definition and its authoritative version,
+`content_hash`, and `created_at` metadata. `version` must be a positive integer.
+The definition's embedded `version` is patched from the database row, and the
+response is `Cache-Control: private, no-store`. An absent, unowned, or
+non-retained version returns `404`.
+
+These endpoints are a read-only history/diff foundation. They do not define a
+draft/published state, promote an environment, approve a change, or perform a
+rollback.
 
 ---
 

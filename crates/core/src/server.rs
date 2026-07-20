@@ -244,6 +244,14 @@ pub fn build_router_with_retrieval(
             "/v1/workflows/secrets/:name",
             axum::routing::delete(routes::workflows::delete_workflow_secret),
         )
+        .route(
+            "/v1/workflows/:id/versions",
+            get(routes::workflow_versions::list_versions),
+        )
+        .route(
+            "/v1/workflows/:id/versions/:version",
+            get(routes::workflow_versions::get_version),
+        )
         .route("/v1/workflows/:id", get(routes::workflows::get))
         .route(
             "/v1/workflows/:id/estimate",
