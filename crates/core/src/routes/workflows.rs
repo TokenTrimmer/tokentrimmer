@@ -42,7 +42,7 @@ use crate::{
         self,
         engine::{self, WfStatus},
         estimate,
-        events::WfEvent,
+        events::{WfEvent, WorkflowRunStartEnvironment, WorkflowRunStartRelease},
         executor::GatewayNodeExecutor,
         node_run_store,
         release_store::{self, WorkflowEnvironment},
@@ -1318,12 +1318,26 @@ pub async fn create_run(
         // `secrets` was loaded before the branch so both paths share one DB call.
         let owned_state = state.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WfEvent>();
-        // P0-8: emit `run.start { run_id }` BEFORE the engine runs, so the
-        // client's Seal-receipt affordance (which gates on run_id) is reachable
-        // during + after the run. The engine itself doesn't know run_id (it's
-        // minted here in the caller); the terminal `run.done` carries the
-        // totals. `let _ =` because a closed client socket is not a run failure.
-        let _ = tx.send(WfEvent::RunStart { run_id });
+        // P0-8: emit authoritative id/version/release provenance BEFORE the
+        // engine runs, so the client can validate the accepted execution target
+        // and wire up Seal-receipt before `run.done`. The nested release keeps
+        // environment+revision paired. `let _ =` because a closed client socket
+        // is not a run failure.
+        let workflow_release = release.map(|release| WorkflowRunStartRelease {
+            environment: match release.environment {
+                WorkflowExecutionEnvironment::Development => {
+                    WorkflowRunStartEnvironment::Development
+                }
+                WorkflowExecutionEnvironment::Staging => WorkflowRunStartEnvironment::Staging,
+                WorkflowExecutionEnvironment::Production => WorkflowRunStartEnvironment::Production,
+            },
+            revision: release.revision,
+        });
+        let _ = tx.send(WfEvent::RunStart {
+            run_id,
+            workflow_version: version,
+            workflow_release,
+        });
         tokio::spawn(async move {
             let executor = GatewayNodeExecutor {
                 state: &owned_state,

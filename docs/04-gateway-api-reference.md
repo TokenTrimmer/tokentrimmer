@@ -2642,6 +2642,22 @@ without starting a second run.
 | `saved_usd` | number | `baseline_cost_usd − cost_usd`, floored at 0. Positive values indicate routing saved money; 0 when cost ≥ baseline (e.g. the route was unchanged). This is a catalog-priced run-level estimate, not provider-invoice reconciliation. An eligible retained terminal run may be minted on demand as a signed estimate; it is not automatic per-run proof. |
 | `node_outputs` | array | Per-node output and cost (see below). |
 
+With `"stream": true`, the response is a named SSE stream. Before any node
+event or provider work, `run.start` carries the run id and exact accepted
+immutable definition version. An environment-bound run additionally carries a
+single nested `workflow_release` object, so environment and release revision
+cannot be separated on the wire:
+
+```text
+event: run.start
+data: {"type":"run.start","run_id":"550e8400-e29b-41d4-a716-446655440000","workflow_version":3,"workflow_release":{"environment":"production","revision":2}}
+```
+
+Selector-free and exact-version streams omit `workflow_release`. Clients should
+validate this first event against their request before presenting release
+provenance; a malformed or mismatched event does not mean the already accepted
+run was cancelled, so reconcile it through the retained run endpoint.
+
 An exact Idempotency-Key replay returns the existing run_id and current totals
 with 200 for a terminal run or 202 while it is running, plus the
 Idempotent-Replay: true header and a replayed: true response field. It is a
