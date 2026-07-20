@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use super::secrets::required_secret_names;
 use super::types::{ModelSelection, NodeKind, WorkflowDefinition, WorkflowTrigger};
 
 // ---------------------------------------------------------------------------
@@ -274,6 +275,13 @@ fn validate_with_schedule_floor(
                 ));
             }
         }
+    }
+
+    // Secret references are syntactic definition metadata. Reject malformed
+    // names on both write and execution validation; actual availability is a
+    // runtime preflight because secrets rotate independently of definitions.
+    if let Err(secret_errors) = required_secret_names(def) {
+        errors.extend(secret_errors);
     }
 
     // ------------------------------------------------------------------
@@ -1506,6 +1514,24 @@ mod tests {
             validate(&def2, &any_model).is_ok(),
             "host in allowed_hosts should pass validation"
         );
+    }
+
+    #[test]
+    fn http_secret_reference_names_are_validated_at_definition_write() {
+        let def = http_def(
+            "https://api.example.com/x",
+            vec!["api.example.com".to_string()],
+            vec![(
+                "authorization".to_string(),
+                "Bearer {{secrets.bad-name}}".to_string(),
+            )],
+            None,
+        );
+        let errors = validate(&def, &any_model).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("invalid secret reference")));
+        assert!(errors.iter().all(|error| !error.contains("bad-name")));
     }
 
     /// An Http node with an http:// (non-https) url must be rejected.

@@ -95,7 +95,10 @@ started by a human/API run. The two current invokers are:
   adversarially tested).
 - **`secrets`**: named secrets referenced by `{{secrets.NAME}}` templates in
   `http` node headers/body. BYO-secrets (the gateway never has OAuth custody);
-  see `workflow/secrets.rs` + the workflow-secrets migration.
+  see `workflow/secrets.rs` + the workflow-secrets migration. Invalid names are
+  rejected with the definition; missing or unusable references fail closed
+  before the current definition executes any node. Recursive child definitions
+  preflight when the child begins, after any earlier parent work.
 
 ## API surface
 
@@ -108,6 +111,8 @@ started by a human/API run. The two current invokers are:
 | `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
 | `GET /v1/workflows/runs/:run_id` | Read one org-scoped durable run and its immutable definition version. |
 | `GET /v1/workflows/runs/:run_id/nodes` | Read up to 500 best-effort node-journal rows, labeled from the exact executed definition. New rows include gateway node-envelope timing; legacy rows expose only post-run persistence time. Neither is provider-attempt timing or replay. |
+| `GET /v1/workflows/secrets` | List up to 500 org-scoped secret names, decryptability states, and timestamps; never returns values/ciphertext and is `private, no-store`. |
+| `POST /v1/workflows/secrets` | Store or rotate a 1–65,536-byte org-scoped secret value. |
 
 ## SSE events (a run's streaming surface)
 

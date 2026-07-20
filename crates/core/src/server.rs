@@ -237,7 +237,8 @@ pub fn build_router_with_retrieval(
         // ordering documents intent).
         .route(
             "/v1/workflows/secrets",
-            post(routes::workflows::set_workflow_secret),
+            post(routes::workflows::set_workflow_secret)
+                .get(routes::workflows::list_workflow_secrets),
         )
         .route("/v1/workflows/:id", get(routes::workflows::get))
         .route(

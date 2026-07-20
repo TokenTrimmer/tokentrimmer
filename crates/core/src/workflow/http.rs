@@ -341,11 +341,14 @@ mod tests {
     }
 
     #[test]
-    fn substitute_with_secrets_missing_secret_is_empty() {
+    fn substitute_with_secrets_missing_secret_is_defensively_empty() {
         let secrets = HashMap::new();
         let outputs = HashMap::new();
 
         let result = substitute_with_secrets("Bearer {{secrets.MISSING}}", "t", &outputs, &secrets);
+        // The engine preflight prevents this helper from dispatching an Http
+        // node with a missing reference. Keep the wire helper non-panicking as
+        // a final defensive fallback.
         assert_eq!(result, "Bearer ");
     }
 

@@ -2198,7 +2198,10 @@ and again at run time if the host is not allowlisted.
 `headers` value or `body` string. At run time the gateway substitutes the
 decrypted value before the request is made. The secret value never appears in
 logs, the node journal, or any API response. Store secrets with
-`POST /v1/workflows/secrets` (see §24.7).
+`POST /v1/workflows/secrets` (see §24.7). Before executing any node in the
+current workflow definition, the engine verifies that every referenced secret
+is available and decryptable; otherwise the run fails with zero cost and no
+HTTP dispatch.
 
 **Allowlist enforcement** is applied at definition-save time (`POST /v1/workflows`)
 and again at run time. A workflow with an `http` node whose host is absent from
@@ -2599,14 +2602,14 @@ returned in any response or log.**
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | yes | Secret name. Must match `^[A-Z0-9_]{1,64}$` (uppercase letters, digits, and underscore). |
-| `value` | string | yes | Plaintext secret value. Encrypted before storage; never echoed. |
+| `value` | string | yes | Plaintext secret value, 1–65,536 UTF-8 bytes. Encrypted before storage; never echoed. |
 
 **Status codes:**
 
 | Code | Meaning |
 |---|---|
 | `204 No Content` | Secret stored (or rotated) successfully. |
-| `400 Bad Request` | `name` does not match `^[A-Z0-9_]{1,64}$`. |
+| `400 Bad Request` | `name` is invalid, or `value` is empty or larger than 65,536 UTF-8 bytes. |
 | `401 Unauthorized` | Missing or invalid bearer token, or dogfood key. |
 | `503 Service Unavailable` | `TT_MASTER_KEY` not configured on this gateway instance. |
 
@@ -2623,6 +2626,33 @@ curl -X POST https://gateway.tokentrimmer.com/v1/workflows/secrets \
 Secrets are scoped to the authenticated org. Each org's secrets are isolated:
 a secret named `MY_KEY` for org A cannot be read or decrypted by org B.
 
+#### `GET /v1/workflows/secrets` — list safe secret metadata
+
+Returns at most 500 names in ascending order for the authenticated org. The
+response contains no secret value, ciphertext, hash, length, or key material,
+and carries `Cache-Control: private, no-store`.
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "name": "EXAMPLE_API_KEY",
+      "state": "ready",
+      "created_at": "2026-07-19T12:00:00Z",
+      "rotated_at": null
+    }
+  ],
+  "truncated": false
+}
+```
+
+`ready` means only that the ciphertext decrypts under this gateway's current
+master key; it does not validate the credential with a downstream provider.
+`unusable` means a master key is configured but the row does not decrypt.
+`unavailable` means this gateway has no configured master key. Names are still
+security-sensitive metadata and should not be cached or copied into prompts.
+
 #### Using secrets in Http nodes
 
 Reference a stored secret in any `headers` value or `body` string using
@@ -2636,9 +2666,10 @@ Reference a stored secret in any `headers` value or `body` string using
 ```
 
 At run time the gateway resolves `{{secrets.NAME}}` to the decrypted value
-before making the HTTP request. If a referenced secret has not been stored,
-the token resolves to an empty string (the request is still made; the
-downstream service will likely reject it).
+before making the HTTP request. Missing, undecryptable, or unavailable
+references fail closed before the current workflow executes its Trigger or any
+provider/HTTP node. A recursively invoked child definition performs its own
+preflight when that child begins; earlier parent nodes may already have run.
 
 #### Security model
 

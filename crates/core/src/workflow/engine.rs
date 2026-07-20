@@ -75,6 +75,7 @@ use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{reservation_cost_usd, IntelligenceSpec, NodeExecutor};
 use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
 use crate::workflow::schedule;
+use crate::workflow::secrets::required_secret_names;
 use crate::workflow::types::{ModelSelection, Node, NodeKind, NodeOutput, WorkflowDefinition};
 
 // ---------------------------------------------------------------------------
@@ -217,7 +218,57 @@ fn run_workflow_boxed<'a>(
                 let _ = tx.send(ev);
             }
         };
-        // ---- 1. Find the Trigger node -----------------------------------------
+
+        // ---- 1. Fail-closed Http secret preflight -----------------------------
+        // This runs before the Trigger or any provider/HTTP work. Recursive
+        // child definitions perform the same check when the child begins.
+        let required_secrets = match required_secret_names(def) {
+            Ok(names) => names,
+            Err(errors) => {
+                emit(WfEvent::RunDone {
+                    status: "failed".to_string(),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                });
+                return WorkflowRunResult {
+                    status: WfStatus::Failed,
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                    node_outputs: vec![],
+                    error: Some(format!(
+                        "workflow secret preflight failed: {}",
+                        errors.join("; ")
+                    )),
+                };
+            }
+        };
+        let missing_secrets = required_secrets
+            .into_iter()
+            .filter(|name| !secrets.contains_key(name))
+            .collect::<Vec<_>>();
+        if !missing_secrets.is_empty() {
+            emit(WfEvent::RunDone {
+                status: "failed".to_string(),
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+            });
+            return WorkflowRunResult {
+                status: WfStatus::Failed,
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+                node_outputs: vec![],
+                error: Some(format!(
+                    "workflow secret preflight failed: missing or unusable secret(s): {}",
+                    missing_secrets.join(", ")
+                )),
+            };
+        }
+
+        // ---- 2. Find the Trigger node -----------------------------------------
         let trigger_id = match def
             .nodes
             .iter()
@@ -242,10 +293,10 @@ fn run_workflow_boxed<'a>(
             }
         };
 
-        // ---- 2. Build union adjacency list ------------------------------------
+        // ---- 3. Build union adjacency list ------------------------------------
         let adj = build_union_adj(def);
 
-        // ---- 3. Topological sort (defensive; validate already checked) --------
+        // ---- 4. Topological sort (defensive; validate already checked) --------
         let topo_order = match topo_sort(def, &adj) {
             Ok(order) => order,
             Err(e) => {
@@ -266,10 +317,10 @@ fn run_workflow_boxed<'a>(
             }
         };
 
-        // ---- 4. Node lookup map -----------------------------------------------
+        // ---- 5. Node lookup map -----------------------------------------------
         let node_map: HashMap<&str, &Node> = def.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
-        // ---- 5. Run state -------------------------------------------------------
+        // ---- 6. Run state -------------------------------------------------------
         let mut outputs: HashMap<String, NodeOutput> = HashMap::new();
         let mut collected_outputs: Vec<(String, NodeOutput)> = Vec::new();
         let mut accrued: f64 = 0.0;
@@ -3855,6 +3906,72 @@ mod tests {
                 "secret leaked into node_outputs[{nid}]: {content_str}"
             );
         }
+    }
+
+    /// Missing Http secrets fail before the Trigger or Http node is executed.
+    /// The unavailable name may be reported as safe metadata, but no wire call
+    /// or node journal entry is allowed.
+    #[tokio::test]
+    async fn missing_http_secret_fails_before_any_node() {
+        let def = WorkflowDefinition {
+            triggers: vec![],
+            id: Uuid::nil(),
+            version: 1,
+            name: "missing_secret".into(),
+            nodes: vec![
+                Node {
+                    id: "t".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "h".into(),
+                    kind: NodeKind::Http {
+                        method: "GET".into(),
+                        url: "https://api.example.com/x".into(),
+                        headers: vec![(
+                            "authorization".into(),
+                            "Bearer {{secrets.MISSING_KEY}}".into(),
+                        )],
+                        body: None,
+                        max_response_bytes: None,
+                    },
+                },
+            ],
+            edges: vec![Edge {
+                from: "t".into(),
+                to: "h".into(),
+                map: None,
+            }],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec!["other-host.com".into()],
+            metadata: serde_json::Value::Null,
+        };
+
+        let stub = StubExecutor::new(vec![]);
+        let mut journal_entries = Vec::new();
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("input"),
+            None,
+            |entry| journal_entries.push(entry),
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Failed);
+        assert_eq!(result.cost_usd, 0.0);
+        assert!(journal_entries.is_empty());
+        assert!(stub.called_nodes().is_empty());
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("MISSING_KEY")));
     }
 
     // ---- Task 1 (W3a-3): StubExecutor::load_subworkflow registry ----------------

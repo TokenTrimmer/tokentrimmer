@@ -23,7 +23,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -45,7 +45,9 @@ use crate::{
         events::WfEvent,
         executor::GatewayNodeExecutor,
         node_run_store,
-        secrets::{is_valid_secret_name, load_secrets, master_key_from_env, store_secret},
+        secrets::{
+            is_valid_secret_name, list_secret_rows, load_secrets, master_key_from_env, store_secret,
+        },
         store::{self, WorkflowRunRecord},
         types::content_hash,
         validate,
@@ -485,6 +487,35 @@ pub struct SetWorkflowSecretRequest {
     pub name: String,
     /// The plaintext secret value. Encrypted at rest; **never returned**.
     pub value: String,
+}
+
+const WORKFLOW_SECRET_INVENTORY_LIMIT: usize = 500;
+const MAX_WORKFLOW_SECRET_VALUE_BYTES: usize = 64 * 1024;
+
+/// Safe secret metadata for management and workflow pickers. `ready` means
+/// only that the stored ciphertext decrypts with this gateway's current master
+/// key; it does not validate the credential with any downstream provider.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSecretState {
+    Ready,
+    Unusable,
+    Unavailable,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowSecretView {
+    pub name: String,
+    pub state: WorkflowSecretState,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListWorkflowSecretsResponse {
+    pub object: &'static str,
+    pub data: Vec<WorkflowSecretView>,
+    pub truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,8 +1039,8 @@ pub async fn create_run(
     };
 
     // --- Load org secrets once (both sync + streaming paths) -----------------
-    // Empty map when TT_MASTER_KEY is absent — Http nodes without secrets work,
-    // {{secrets.*}} refs just resolve to "".
+    // Empty map when TT_MASTER_KEY is absent — workflows without Http secret
+    // refs still work; referenced secrets fail closed in the engine preflight.
     let secrets = match master_key_from_env() {
         Some(master) => load_secrets(pool, org, &master).await,
         None => std::collections::HashMap::new(),
@@ -1453,11 +1484,62 @@ pub(crate) async fn run_workflow_shadow(
     Ok(())
 }
 
+/// `GET /v1/workflows/secrets` — return a bounded, deterministic inventory of
+/// safe metadata for the caller's org. Values, ciphertext, hashes, lengths,
+/// and key material are never returned. Successful responses are no-store.
+pub async fn list_workflow_secrets(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+) -> ApiResult<Response> {
+    let org = require_org(ctx)?;
+    let pool = db_pool(&state)?;
+    let mut rows = list_secret_rows(pool, org, (WORKFLOW_SECRET_INVENTORY_LIMIT + 1) as i64)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%org, %error, "workflow secret inventory read failed");
+            ApiError::ServiceUnavailable(
+                "workflow secret inventory is temporarily unavailable".into(),
+            )
+        })?;
+    let truncated = rows.len() > WORKFLOW_SECRET_INVENTORY_LIMIT;
+    rows.truncate(WORKFLOW_SECRET_INVENTORY_LIMIT);
+
+    let master = master_key_from_env();
+    let data = rows
+        .into_iter()
+        .map(|row| {
+            let state = match master.as_ref() {
+                Some(master) if row.is_decryptable(master, org) => WorkflowSecretState::Ready,
+                Some(_) => WorkflowSecretState::Unusable,
+                None => WorkflowSecretState::Unavailable,
+            };
+            WorkflowSecretView {
+                name: row.name,
+                state,
+                created_at: row.created_at,
+                rotated_at: row.rotated_at,
+            }
+        })
+        .collect();
+
+    let mut response = Json(ListWorkflowSecretsResponse {
+        object: "list",
+        data,
+        truncated,
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    Ok(response)
+}
+
 /// `POST /v1/workflows/secrets` — encrypt and upsert a named secret for the
 /// caller's org.
 ///
 /// * `name` must match `^[A-Z0-9_]{1,64}$` (the charset used by
 ///   `{{secrets.NAME}}` template references in Http nodes) → 400 otherwise.
+/// * `value` must contain 1–65,536 UTF-8 bytes → 400 otherwise.
 /// * Returns 503 when `TT_MASTER_KEY` is absent (secret storage not configured).
 /// * Returns 204 on success. **The value is never echoed in any response or log.**
 pub async fn set_workflow_secret(
@@ -1472,6 +1554,11 @@ pub async fn set_workflow_secret(
              (uppercase letters, digits, and underscore only)"
                 .into(),
         ));
+    }
+    if body.value.is_empty() || body.value.len() > MAX_WORKFLOW_SECRET_VALUE_BYTES {
+        return Err(ApiError::InvalidRequest(format!(
+            "secret value must contain 1–{MAX_WORKFLOW_SECRET_VALUE_BYTES} UTF-8 bytes"
+        )));
     }
     let master = master_key_from_env().ok_or_else(|| {
         ApiError::ServiceUnavailable("secret storage not configured (TT_MASTER_KEY absent)".into())
@@ -1976,6 +2063,63 @@ mod tests {
             matches!(result, Err(ApiError::InvalidRequest(_))),
             "expected InvalidRequest for bad name, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn set_workflow_secret_rejects_empty_and_oversize_values_before_key_lookup() {
+        let org = Uuid::new_v4();
+        for value in [
+            String::new(),
+            "x".repeat(MAX_WORKFLOW_SECRET_VALUE_BYTES + 1),
+        ] {
+            let body = SetWorkflowSecretRequest {
+                name: "MY_KEY".into(),
+                value,
+            };
+            let result =
+                set_workflow_secret(State(test_state()), real_org_ctx(org), Json(body)).await;
+            assert!(
+                matches!(result, Err(ApiError::InvalidRequest(_))),
+                "expected InvalidRequest for invalid value size, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_workflow_secrets_anon_returns_unauthorized() {
+        let result = list_workflow_secrets(State(test_state()), None).await;
+        assert!(
+            matches!(result, Err(ApiError::Unauthorized)),
+            "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_secret_inventory_serializes_only_safe_metadata() {
+        let view = WorkflowSecretView {
+            name: "MY_KEY".into(),
+            state: WorkflowSecretState::Ready,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            rotated_at: None,
+        };
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["name"], "MY_KEY");
+        assert_eq!(json["state"], "ready");
+        assert!(json.get("created_at").is_some());
+        assert!(json.get("rotated_at").is_some());
+        for forbidden in [
+            "value",
+            "secret",
+            "secret_enc",
+            "ciphertext",
+            "hash",
+            "length",
+        ] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "unexpected field {forbidden}"
+            );
+        }
     }
 
     /// With a valid name but no TT_MASTER_KEY the handler returns 503.
