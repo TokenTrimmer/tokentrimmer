@@ -17,6 +17,7 @@ pub mod cache;
 pub mod catalog;
 pub mod contract;
 pub mod latency;
+mod matcher;
 pub mod store;
 pub mod validate;
 
@@ -26,6 +27,10 @@ pub use contract::{
     RouteWriteRequest, ROUTE_SCHEMA_ID, ROUTE_SCHEMA_VERSION,
 };
 pub use latency::{LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
+pub use matcher::{
+    evaluate_route_conditions, RouteConditionDecision, RouteConditionEvaluation,
+    RouteConditionField, RouteConditionOutcome, RouteFeatureEvidence, RouteFeatureSnapshot,
+};
 #[cfg(feature = "postgres")]
 pub use store::PostgresRoutingStore;
 pub use store::{
@@ -99,9 +104,8 @@ impl RuntimeRoute {
     }
 }
 
-/// Match conditions for a [`Route`]. v1 supports four predicates — extend
-/// alongside `tt_plan_core::types::RouteConditions` so Plan and Gateway stay
-/// in lockstep.
+/// Match conditions for a [`Route`]. Keep these fields in lockstep with
+/// [`RouteConditionField`] and the published route-preview coverage corpus.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -633,6 +637,54 @@ pub struct RoutingEngine {
     route_version_ids: std::collections::HashMap<Uuid, Option<i64>>,
 }
 
+/// Why one route candidate was or was not selected during priority evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteCandidateOutcome {
+    /// Disabled routes cannot be selected.
+    Disabled,
+    /// At least one active condition did not match or lacked evidence.
+    ConditionsDidNotMatch,
+    /// This is the first enabled match in canonical priority order.
+    Selected,
+    /// The conditions matched, but a higher-priority candidate already won.
+    ShadowedByHigherPriority,
+}
+
+/// Value-free condition and priority decision for one route candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouteCandidateDecision {
+    /// Stable route identifier.
+    pub route_id: Uuid,
+    /// Immutable route-version ledger identifier captured with the definition.
+    pub route_version_id: Option<i64>,
+    /// Priority value used for winner order.
+    pub priority: u32,
+    /// Candidate disposition after condition and priority evaluation.
+    pub outcome: RouteCandidateOutcome,
+    /// Every canonical condition decision, without observed feature values.
+    pub conditions: RouteConditionEvaluation,
+}
+
+/// Canonical condition/priority trace for one route selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouteDecisionTrace {
+    /// Candidates in the exact order evaluated by the live engine.
+    pub candidates: Vec<RouteCandidateDecision>,
+    /// Winning route, or `None` when no enabled candidate matched.
+    pub selected_route_id: Option<Uuid>,
+    /// Winning immutable version, or `None` when unavailable/no route matched.
+    pub selected_route_version_id: Option<i64>,
+}
+
+/// Canonical winner plus its value-free decision trace.
+pub struct RoutingEvaluation<'a> {
+    /// First enabled matching route in canonical priority order.
+    pub matched_route: Option<&'a Route>,
+    /// Condition and priority decisions for every candidate.
+    pub trace: RouteDecisionTrace,
+}
+
 impl RoutingEngine {
     /// Construct an empty engine. Use [`RoutingEngine::with_routes`] for the
     /// common case of building from a stored config.
@@ -641,7 +693,9 @@ impl RoutingEngine {
     }
 
     /// Construct from a collection of routes. Internally sorted descending by
-    /// priority — the order the caller passes them in does not matter.
+    /// priority; equal-priority routes preserve the caller's order. The
+    /// production store supplies creation order, so that tie order is part of
+    /// the live selection contract.
     pub fn with_routes(routes: impl IntoIterator<Item = Route>) -> Self {
         Self::with_runtime_routes(routes.into_iter().map(RuntimeRoute::unversioned))
     }
@@ -775,18 +829,72 @@ impl RoutingEngine {
         observed_p95_ms: Option<u32>,
         is_reasoning_class: bool,
     ) -> Option<&Route> {
-        self.routes.iter().find(|r| {
-            r.enabled
-                && matches(
-                    r,
-                    req,
-                    ctx,
-                    input_tokens_estimate,
-                    estimated_cost_usd,
-                    observed_p95_ms,
-                    is_reasoning_class,
-                )
-        })
+        let snapshot = RouteFeatureSnapshot::for_engine(
+            &self.routes,
+            req,
+            ctx,
+            input_tokens_estimate,
+            estimated_cost_usd,
+            observed_p95_ms,
+            is_reasoning_class,
+        );
+        self.evaluate_snapshot(&snapshot)
+    }
+
+    /// Select the first enabled route matching one canonical feature snapshot.
+    ///
+    /// Retained/partial callers can construct a conservative snapshot with
+    /// [`RouteFeatureSnapshot::from_retained_features`]; any active condition
+    /// whose required feature is unavailable blocks that candidate.
+    #[must_use]
+    pub fn evaluate_snapshot(&self, snapshot: &RouteFeatureSnapshot) -> Option<&Route> {
+        self.routes
+            .iter()
+            .find(|route| route.enabled && matcher::route_conditions_match(&route.when, snapshot))
+    }
+
+    /// Evaluate all route candidates using the same condition routine as
+    /// [`Self::evaluate_snapshot`] and retain a value-free priority trace.
+    #[must_use]
+    pub fn evaluate_snapshot_with_trace(
+        &self,
+        snapshot: &RouteFeatureSnapshot,
+    ) -> RoutingEvaluation<'_> {
+        let mut matched_route = None;
+        let mut candidates = Vec::with_capacity(self.routes.len());
+
+        for route in &self.routes {
+            let conditions = evaluate_route_conditions(&route.when, snapshot);
+            let outcome = if !route.enabled {
+                RouteCandidateOutcome::Disabled
+            } else if !conditions.matches() {
+                RouteCandidateOutcome::ConditionsDidNotMatch
+            } else if matched_route.is_none() {
+                matched_route = Some(route);
+                RouteCandidateOutcome::Selected
+            } else {
+                RouteCandidateOutcome::ShadowedByHigherPriority
+            };
+            candidates.push(RouteCandidateDecision {
+                route_id: route.id,
+                route_version_id: self.route_version_id(route.id),
+                priority: route.priority,
+                outcome,
+                conditions,
+            });
+        }
+
+        let selected_route_id = matched_route.map(|route| route.id);
+        let selected_route_version_id =
+            selected_route_id.and_then(|route_id| self.route_version_id(route_id));
+        RoutingEvaluation {
+            matched_route,
+            trace: RouteDecisionTrace {
+                candidates,
+                selected_route_id,
+                selected_route_version_id,
+            },
+        }
     }
 
     /// Returns `true` when at least one **enabled** route in this engine carries
@@ -808,96 +916,6 @@ impl RoutingEngine {
     pub fn find_by_name(&self, name: &str) -> Option<&Route> {
         self.routes.iter().find(|r| r.enabled && r.name == name)
     }
-}
-
-fn matches(
-    r: &Route,
-    req: &ChatCompletionRequest,
-    ctx: &RequestContext,
-    input_tokens: u32,
-    estimated_cost_usd: Option<f64>,
-    observed_p95_ms: Option<u32>,
-    is_reasoning_class: bool,
-) -> bool {
-    let c = &r.when;
-    if !c.model_in.is_empty() && !c.model_in.iter().any(|m| m == &req.model) {
-        return false;
-    }
-    if let Some(t) = c.input_tokens_lt {
-        if input_tokens >= t {
-            return false;
-        }
-    }
-    if let Some(t) = c.input_tokens_gt {
-        if input_tokens <= t {
-            return false;
-        }
-    }
-    if let Some(t) = c.estimated_cost_gt {
-        // Unknown cost never matches a cost condition.
-        if !matches!(estimated_cost_usd, Some(cost) if cost > t) {
-            return false;
-        }
-    }
-    if let Some(t) = c.estimated_cost_lt {
-        if !matches!(estimated_cost_usd, Some(cost) if cost < t) {
-            return false;
-        }
-    }
-    if let Some(t) = c.upstream_latency_ms_p95_gt {
-        // Live, gateway-observed p95 (in-process window). `None` = insufficient
-        // samples for this `(provider, model)` (cold start) or no tracker wired
-        // — which must NOT match, so a fresh/unknown primary never gates on a
-        // fabricated signal. Only an observed p95 STRICTLY above the threshold
-        // fires the route, shifting traffic off a genuinely-slow primary.
-        if !matches!(observed_p95_ms, Some(p95) if p95 > t) {
-            return false;
-        }
-    }
-    // not_reasoning_class: route explicitly opted out of Math/Code/Legal/Medical
-    // traffic. If the signal says this IS reasoning-class, block the match.
-    if c.not_reasoning_class && is_reasoning_class {
-        return false;
-    }
-    if let Some(tag) = &c.tag_equals {
-        if ctx.tag.as_deref() != Some(tag.as_str()) {
-            return false;
-        }
-    }
-    if let Some(want) = c.has_images {
-        if tt_shared::capability_check::request_has_images(req) != want {
-            return false;
-        }
-    }
-    if let Some(want) = c.has_audio {
-        if tt_shared::capability_check::request_has_audio(req) != want {
-            return false;
-        }
-    }
-    if let Some(want) = c.has_documents {
-        if tt_shared::capability_check::request_has_documents(req) != want {
-            return false;
-        }
-    }
-    if let Some(want) = &c.content_type {
-        // The request's dominant content kind must equal the targeted kind. An
-        // unclassifiable request (no block large enough) never matches.
-        let got = tt_shared::capability_check::request_dominant_content_kind(req);
-        if got.map(|k| k.as_str()) != Some(want.as_str()) {
-            return false;
-        }
-    }
-    if !c.prompt_contains_any_of.is_empty() {
-        let text = tt_shared::capability_check::request_input_text(req).to_lowercase();
-        if !c
-            .prompt_contains_any_of
-            .iter()
-            .any(|kw| text.contains(&kw.to_lowercase()))
-        {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -1221,6 +1239,170 @@ mod tests {
             .evaluate(&make_req("gpt-4o"), &make_ctx(None), 100)
             .unwrap();
         assert_eq!(m.then.target_model.as_deref(), Some("high-target"));
+    }
+
+    #[test]
+    fn decision_trace_uses_the_live_winner_and_exposes_no_feature_values() {
+        let mut disabled = make_route(
+            "private-disabled-route",
+            100,
+            vec!["sensitive-model"],
+            "never",
+        );
+        disabled.enabled = false;
+        disabled.when.tag_equals = Some("sensitive-tag".into());
+
+        let nonmatching = make_route(
+            "private-nonmatching-route",
+            90,
+            vec!["different-model"],
+            "never",
+        );
+
+        let mut selected = make_route(
+            "private-selected-route",
+            80,
+            vec!["sensitive-model"],
+            "winner",
+        );
+        selected.when.prompt_contains_any_of = vec!["private-prompt".into()];
+
+        let shadowed = make_route(
+            "private-shadowed-route",
+            70,
+            vec!["sensitive-model"],
+            "shadowed",
+        );
+
+        let ids = [disabled.id, nonmatching.id, selected.id, shadowed.id];
+        let engine = RoutingEngine::with_runtime_routes([
+            RuntimeRoute {
+                route: shadowed,
+                route_version_id: Some(704),
+            },
+            RuntimeRoute {
+                route: selected,
+                route_version_id: Some(803),
+            },
+            RuntimeRoute {
+                route: nonmatching,
+                route_version_id: Some(902),
+            },
+            RuntimeRoute {
+                route: disabled,
+                route_version_id: Some(1_001),
+            },
+        ]);
+        let request = ChatCompletionRequest {
+            model: "sensitive-model".into(),
+            messages: vec![Message::User {
+                content: MessageContent::Text("PRIVATE-PROMPT customer material".into()),
+                name: None,
+            }],
+            ..serde_json::from_str(r#"{"model":"placeholder","messages":[]}"#).unwrap()
+        };
+        let snapshot = RouteFeatureSnapshot::from_request(
+            &request,
+            &make_ctx(Some("sensitive-tag")),
+            100,
+            None,
+            None,
+            false,
+        );
+
+        let direct = engine.evaluate_snapshot(&snapshot).map(|route| route.id);
+        let evaluated = engine.evaluate_snapshot_with_trace(&snapshot);
+
+        assert_eq!(direct, Some(ids[2]));
+        assert_eq!(evaluated.matched_route.map(|route| route.id), direct);
+        assert_eq!(evaluated.trace.selected_route_id, direct);
+        assert_eq!(evaluated.trace.selected_route_version_id, Some(803));
+        assert_eq!(
+            evaluated
+                .trace
+                .candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.route_id,
+                    candidate.route_version_id,
+                    candidate.outcome
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (ids[0], Some(1_001), RouteCandidateOutcome::Disabled),
+                (
+                    ids[1],
+                    Some(902),
+                    RouteCandidateOutcome::ConditionsDidNotMatch
+                ),
+                (ids[2], Some(803), RouteCandidateOutcome::Selected),
+                (
+                    ids[3],
+                    Some(704),
+                    RouteCandidateOutcome::ShadowedByHigherPriority
+                ),
+            ]
+        );
+        assert!(evaluated.trace.candidates.iter().all(|candidate| {
+            candidate.conditions.decisions.len() == RouteConditionField::ALL.len()
+        }));
+
+        let serialized = serde_json::to_string(&evaluated.trace).unwrap();
+        for private_value in [
+            "private-disabled-route",
+            "private-nonmatching-route",
+            "private-selected-route",
+            "private-shadowed-route",
+            "sensitive-model",
+            "sensitive-tag",
+            "private-prompt",
+            "customer material",
+        ] {
+            assert!(!serialized.contains(private_value), "{serialized}");
+        }
+    }
+
+    #[test]
+    fn equal_priority_trace_preserves_store_order() {
+        let first = make_route("created-first", 10, vec!["gpt-4o"], "first");
+        let second = make_route("created-second", 10, vec!["gpt-4o"], "second");
+        let ids = [first.id, second.id];
+        let engine = RoutingEngine::with_runtime_routes([
+            RuntimeRoute {
+                route: first,
+                route_version_id: Some(11),
+            },
+            RuntimeRoute {
+                route: second,
+                route_version_id: Some(12),
+            },
+        ]);
+        let snapshot = RouteFeatureSnapshot::from_retained_features("gpt-4o".into(), 10, None);
+
+        let evaluated = engine.evaluate_snapshot_with_trace(&snapshot);
+
+        assert_eq!(evaluated.trace.selected_route_id, Some(ids[0]));
+        assert_eq!(
+            evaluated
+                .trace
+                .candidates
+                .iter()
+                .map(|candidate| candidate.route_id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(
+            evaluated
+                .trace
+                .candidates
+                .iter()
+                .map(|candidate| candidate.outcome)
+                .collect::<Vec<_>>(),
+            vec![
+                RouteCandidateOutcome::Selected,
+                RouteCandidateOutcome::ShadowedByHigherPriority,
+            ]
+        );
     }
 
     #[test]

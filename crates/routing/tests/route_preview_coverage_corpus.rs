@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use serde::Deserialize;
-use tt_routing::{RouteConditions, ROUTE_SCHEMA_ID, ROUTE_SCHEMA_VERSION};
+use tt_routing::{RouteConditionField, RouteConditions, ROUTE_SCHEMA_ID, ROUTE_SCHEMA_VERSION};
 
 const CORPUS: &str = include_str!(
     "../../../docs/route-preview-contract/tokentrimmer.route-preview-coverage.v1.corpus.json"
@@ -279,7 +279,17 @@ fn canonical_route_condition_fields() -> HashSet<String> {
         .as_object()
         .expect("RouteConditions must serialize as an object");
 
-    fields.keys().cloned().collect::<HashSet<_>>()
+    let struct_fields = fields.keys().cloned().collect::<HashSet<_>>();
+    let enum_fields = RouteConditionField::ALL
+        .into_iter()
+        .map(|field| field.as_str().to_owned())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        enum_fields, struct_fields,
+        "RouteConditionField must stay in lockstep with RouteConditions"
+    );
+
+    struct_fields
 }
 
 fn is_reason_id(value: &str) -> bool {
