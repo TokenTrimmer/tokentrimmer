@@ -208,7 +208,7 @@
     },
     "RouteConditions": {
       "additionalProperties": false,
-      "description": "Match conditions for a [`Route`]. v1 supports four predicates — extend alongside `tt_plan_core::types::RouteConditions` so Plan and Gateway stay in lockstep.",
+      "description": "Match conditions for a [`Route`]. Keep these fields in lockstep with [`RouteConditionField`] and the published route-preview coverage corpus.",
       "properties": {
         "content_type": {
           "description": "Match only if the request's DOMINANT content kind (the classified kind of its largest text block — see [`tt_shared::capability_check::request_dominant_content_kind`]) equals this lowercase [`ContentKind`](tt_shared::content_kind::ContentKind) string (`\"json\"`, `\"csv\"`, `\"log\"`, `\"code\"`, `\"diff\"`, `\"prose\"`) — the content-aware compression routing signal (P1a). Lets a route target, e.g., `content_type=code` to opt code-dominant traffic into a compressor. `None` ignores. A request with no block large enough to classify never matches a `content_type` condition (an unclassifiable request is not \"of\" any kind).",

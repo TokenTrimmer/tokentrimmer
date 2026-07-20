@@ -66,7 +66,7 @@
     },
     {
       "path": "docs/route-contract/route-write.schema.json",
-      "sha256": "9cdfb331ddca915d5ec7042c84eb166c8588e9299964b64aa4af47a35dbf33d8"
+      "sha256": "610731d29f7c559d9d80012c2ebc31eabbb8c4d0e0751aa7ac1f130a8a195a6d"
     },
     {
       "path": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json",
