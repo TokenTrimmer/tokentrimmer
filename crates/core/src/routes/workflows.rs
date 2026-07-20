@@ -111,15 +111,18 @@ fn admit_workflow_budget_before_dispatch(
 // Request / response types
 // ---------------------------------------------------------------------------
 
-/// `POST /v1/workflows` request body.  Both `id` and `version` are optional:
-/// if `id` is absent a new `UUIDv4` is generated; `version` is ignored (the
-/// store computes the next version atomically via `MAX(version)+1`).
+/// `POST /v1/workflows` request body. `id` and `version` are optional: if `id`
+/// is absent a new `UUIDv4` is generated, while `version` remains ignored.
+/// `expected_latest_version` is a write-only optimistic precondition: `0`
+/// requires no retained version, and a positive value must match the current
+/// latest version before the immutable next version is appended.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkflowRequest {
     pub id: Option<Uuid>,
     pub version: Option<u32>,
+    pub expected_latest_version: Option<u32>,
     pub name: String,
     pub nodes: Vec<workflow::types::Node>,
     pub edges: Vec<workflow::types::Edge>,
@@ -140,6 +143,19 @@ pub struct CreateWorkflowRequest {
     /// disables production automations.
     #[serde(default)]
     pub triggers: Vec<workflow::types::WorkflowTrigger>,
+}
+
+fn expected_latest_workflow_version(value: Option<u32>) -> Result<Option<i32>, ApiError> {
+    value
+        .map(|version| {
+            i32::try_from(version).map_err(|_| {
+                ApiError::InvalidRequest(format!(
+                    "expected_latest_version must be between 0 and {}",
+                    i32::MAX
+                ))
+            })
+        })
+        .transpose()
 }
 
 impl CreateWorkflowRequest {
@@ -525,7 +541,8 @@ pub struct ListWorkflowSecretsResponse {
 
 /// `POST /v1/workflows` — validate + store a workflow definition.
 ///
-/// Ordering: `require_org` → assemble def → `validate` (400) →
+/// Ordering: `require_org` → validate the optional write precondition →
+/// assemble def → `validate` (400) →
 /// `db_pool` (503) → `insert_definition`.  This lets callers see a useful
 /// validation error without needing a live database.
 pub async fn create(
@@ -534,6 +551,7 @@ pub async fn create(
     Json(body): Json<CreateWorkflowRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateWorkflowResponse>)> {
     let org = require_org(ctx)?;
+    let expected_latest_version = expected_latest_workflow_version(body.expected_latest_version)?;
 
     // Assemble a full WorkflowDefinition from the request body.  The conversion
     // deliberately carries every accepted top-level field, including triggers.
@@ -548,7 +566,7 @@ pub async fn create(
     let pool = db_pool(&state)?;
 
     let hash = content_hash(&def);
-    let version = store::insert_definition(pool, org, &def, &hash)
+    let version = store::insert_definition(pool, org, &def, &hash, expected_latest_version)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -560,7 +578,7 @@ pub async fn create(
         })?
         .ok_or_else(|| {
             ApiError::Conflict(format!(
-                "workflow id {} version conflict: a concurrent insert won the race; retry",
+                "workflow id {} version conflict: the expected latest version was stale or a concurrent insert won; reload before retrying",
                 def.id
             ))
         })?;
@@ -1641,6 +1659,7 @@ mod tests {
         CreateWorkflowRequest {
             id: None,
             version: None,
+            expected_latest_version: None,
             name: "cyclic".to_string(),
             nodes: vec![
                 Node {
@@ -1696,6 +1715,7 @@ mod tests {
         CreateWorkflowRequest {
             id: None,
             version: None,
+            expected_latest_version: None,
             name: "valid".to_string(),
             nodes: vec![
                 Node {
@@ -1804,6 +1824,7 @@ mod tests {
         let body: CreateWorkflowRequest = serde_json::from_value(serde_json::json!({
             "id": id,
             "version": 7,
+            "expected_latest_version": 6,
             "name": "triggered workflow",
             "nodes": [
                 { "id": "trigger", "type": "trigger" },
@@ -1817,6 +1838,7 @@ mod tests {
         }))
         .expect("the canonical create/update trigger payload deserializes");
 
+        assert_eq!(body.expected_latest_version, Some(6));
         let def = body.into_definition();
         assert_eq!(def.id, id);
         assert_eq!(def.version, 7);
@@ -1866,6 +1888,20 @@ mod tests {
             error.contains("unknown field `trigers`"),
             "unexpected serde error: {error}"
         );
+    }
+
+    #[test]
+    fn optimistic_write_precondition_accepts_persistable_versions_only() {
+        assert_eq!(expected_latest_workflow_version(None).unwrap(), None);
+        assert_eq!(expected_latest_workflow_version(Some(0)).unwrap(), Some(0));
+        assert_eq!(
+            expected_latest_workflow_version(Some(i32::MAX as u32)).unwrap(),
+            Some(i32::MAX)
+        );
+        assert!(matches!(
+            expected_latest_workflow_version(Some(i32::MAX as u32 + 1)),
+            Err(ApiError::InvalidRequest(_))
+        ));
     }
 
     #[test]

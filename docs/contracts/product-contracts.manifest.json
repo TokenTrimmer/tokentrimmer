@@ -58,7 +58,7 @@
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "ff0f752791cc68eee29b44f54da9d75815fc7d3d2676874ae86dab04ad2a62b3"
+      "sha256": "822501da8a255f3361cd42a1fd53e112c6b5f9174586b97d358b5501aca78d37"
     },
     {
       "path": "docs/capability-contract/gateway-capabilities.schema.json",
@@ -82,7 +82,7 @@
     },
     {
       "path": "docs/workflow-contract/workflow-write.schema.json",
-      "sha256": "fbf5d47faf86b82b200bb161d6a7a715fb1a9a62c484025a91604f73ab7d573e"
+      "sha256": "6263646bc1c186474d6fa3c3cd005b45498e20e5d3c2cbfc6b58e40c357651f4"
     }
   ],
   "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, and gateway capability response type",

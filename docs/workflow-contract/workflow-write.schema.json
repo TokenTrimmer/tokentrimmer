@@ -568,7 +568,7 @@
   "$id": "urn:tokentrimmer:workflow:write-schema:v1",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "`POST /v1/workflows` request body.  Both `id` and `version` are optional: if `id` is absent a new `UUIDv4` is generated; `version` is ignored (the store computes the next version atomically via `MAX(version)+1`).",
+  "description": "`POST /v1/workflows` request body. `id` and `version` are optional: if `id` is absent a new `UUIDv4` is generated, while `version` remains ignored. `expected_latest_version` is a write-only optimistic precondition: `0` requires no retained version, and a positive value must match the current latest version before the immutable next version is appended.",
   "properties": {
     "allowed_hosts": {
       "default": [],
@@ -594,6 +594,14 @@
         "$ref": "#/$defs/Edge"
       },
       "type": "array"
+    },
+    "expected_latest_version": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
     },
     "id": {
       "format": "uuid",

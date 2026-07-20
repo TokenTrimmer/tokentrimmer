@@ -6,7 +6,7 @@ The public generator owns three workflow artifacts:
   Rust `WorkflowDefinition` type.
 - `workflow-write.schema.json` comes from the exact `POST /v1/workflows`
   `CreateWorkflowRequest` parser, including its optional write-only identity
-  fields.
+  fields and optional optimistic `expected_latest_version` precondition.
 - `workflow-definition-v1.golden.json` is serialized from a real Rust workflow
   definition covering typed model selection, output-token and cost admission
   fields, edges, metadata, budget, and a schedule trigger.

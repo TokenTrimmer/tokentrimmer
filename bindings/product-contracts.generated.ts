@@ -258,6 +258,7 @@ export type WorkflowWriteRequest = {
   allowed_hosts?: Array<string>;
   budget?: BudgetPolicy;
   edges: Array<Edge>;
+  expected_latest_version?: number | null;
   id?: string | null;
   inputs?: unknown;
   metadata?: unknown;

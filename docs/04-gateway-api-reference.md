@@ -2320,6 +2320,13 @@ The `selection` field on `model` and `agent` nodes determines how the model is r
 
 Validates and stores a workflow definition. If the `id` is new, version 1 is created. If the `id` already exists (for the same org), the next version is computed atomically.
 
+`expected_latest_version` is an optional write-only optimistic precondition. `0`
+means the org/workflow must have no retained version; a positive value must
+match its current latest version. A mismatch or a concurrent writer returns
+`409` and appends no row. Omitting the field retains the legacy unconditional
+append behavior. The ordinary `version` definition field remains ignored for
+write concurrency and is not a substitute for this precondition.
+
 **Request body:** a workflow definition object (§24.1).
 
 **Response (`201 Created`):**
@@ -2332,7 +2339,7 @@ Validates and stores a workflow definition. If the `id` is new, version 1 is cre
 }
 ```
 
-**Error codes:** `400` with a list of validation errors (e.g. cycle detected, unknown model, Auto selection); `409` on a concurrent-insert version conflict (retry); `500` on a DB write error; `503` when Postgres is unavailable.
+**Error codes:** `400` with a list of validation errors (including an unrepresentable precondition); `409` when `expected_latest_version` is stale or a concurrent insert wins (reload before retrying); `500` on a DB write error; `503` when Postgres is unavailable.
 
 ---
 

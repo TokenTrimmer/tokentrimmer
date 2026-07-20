@@ -126,15 +126,21 @@ pub(crate) struct WorkflowDefinitionVersionRecord {
 // ---------------------------------------------------------------------------
 
 /// INSERT a new definition version, computing the next version atomically as
-/// `COALESCE(MAX(version), 0) + 1` for the `(id, org_id)` pair.
+/// `COALESCE(MAX(version), 0) + 1` for the `(id, org_id)` pair. When `$5` is
+/// present, the insert proceeds only if it equals that org/workflow's current
+/// latest version (`0` means no retained version exists yet).
 /// `ON CONFLICT (org_id, id, version) DO NOTHING` guards against concurrent races
 /// and matches the `PRIMARY KEY (org_id, id, version)` from migration 0028.
 /// Returns the inserted version via `RETURNING version`.
 pub(crate) const INSERT_DEFINITION_SQL: &str = "\
-WITH next_v AS (\
-  SELECT COALESCE(MAX(version), 0) + 1 AS v \
+WITH current_version AS (\
+  SELECT MAX(version) AS latest_version \
   FROM workflow_definitions \
   WHERE id = $1 AND org_id = $2\
+), next_v AS (\
+  SELECT COALESCE(latest_version, 0) + 1 AS v \
+  FROM current_version \
+  WHERE $5::INT IS NULL OR COALESCE(latest_version, 0) = $5\
 ) \
 INSERT INTO workflow_definitions (id, org_id, version, definition, content_hash) \
 SELECT $1, $2, v, $3, $4 FROM next_v \
@@ -362,13 +368,15 @@ pub(crate) fn workflow_run_request_options_hash(
 ///
 /// Returns:
 /// - `Ok(Some(version))` — row inserted; `version` is the atomically computed version.
-/// - `Ok(None)` — ON CONFLICT fired (another insert of the same `(org_id, id, version)` won the race).
+/// - `Ok(None)` — the expected-latest precondition failed, or another insert of
+///   the same `(org_id, id, version)` won the race.
 /// - `Err(e)` — Postgres error.
 pub(crate) async fn insert_definition(
     pool: &PgPool,
     org_id: Uuid,
     def: &WorkflowDefinition,
     content_hash: &str,
+    expected_latest_version: Option<i32>,
 ) -> Result<Option<i32>, sqlx::Error> {
     let definition_json = serde_json::to_value(def).map_err(|e| {
         sqlx::Error::Protocol(format!(
@@ -380,6 +388,7 @@ pub(crate) async fn insert_definition(
         .bind(org_id) // $2 org_id        UUID
         .bind(definition_json) // $3 definition    JSONB
         .bind(content_hash) // $4 content_hash  TEXT
+        .bind(expected_latest_version) // $5 optional optimistic base version
         .fetch_optional(pool)
         .await?;
     match row {
@@ -810,13 +819,13 @@ mod tests {
 
     use super::{
         create_or_reuse_idempotent_run, get_definition_version_record, get_run_strict,
-        get_workflow_run_idempotency, list_definition_versions, workflow_run_input_hash,
-        workflow_run_invocation_key_hash, workflow_run_request_options_hash,
-        CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency, WorkflowRunRecord, FINISH_RUN_SQL,
-        GET_DEFINITION_SQL, GET_DEFINITION_VERSION_SQL, GET_RUN_SQL,
-        GET_WORKFLOW_RUN_IDEMPOTENCY_SQL, INSERT_DEFINITION_SQL, INSERT_IDEMPOTENT_RUN_SQL,
-        INSERT_RUN_SQL, INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL, LIST_DEFINITIONS_SQL,
-        LIST_DEFINITION_VERSIONS_SQL, LIST_WORKFLOW_RUNS_SQL,
+        get_workflow_run_idempotency, insert_definition, list_definition_versions,
+        workflow_run_input_hash, workflow_run_invocation_key_hash,
+        workflow_run_request_options_hash, CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency,
+        WorkflowRunRecord, FINISH_RUN_SQL, GET_DEFINITION_SQL, GET_DEFINITION_VERSION_SQL,
+        GET_RUN_SQL, GET_WORKFLOW_RUN_IDEMPOTENCY_SQL, INSERT_DEFINITION_SQL,
+        INSERT_IDEMPOTENT_RUN_SQL, INSERT_RUN_SQL, INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL,
+        LIST_DEFINITIONS_SQL, LIST_DEFINITION_VERSIONS_SQL, LIST_WORKFLOW_RUNS_SQL,
     };
 
     // ------------------------------------------------------------------
@@ -896,6 +905,14 @@ mod tests {
         assert!(
             INSERT_DEFINITION_SQL.contains("ON CONFLICT (org_id, id, version) DO NOTHING"),
             "INSERT_DEFINITION_SQL must guard against concurrent inserts with the org_id PK"
+        );
+        assert!(
+            INSERT_DEFINITION_SQL.contains("$5::INT IS NULL"),
+            "INSERT_DEFINITION_SQL must retain backward-compatible unconditional writes"
+        );
+        assert!(
+            INSERT_DEFINITION_SQL.contains("COALESCE(latest_version, 0) = $5"),
+            "INSERT_DEFINITION_SQL must atomically enforce the optional latest-version precondition"
         );
         assert!(
             INSERT_DEFINITION_SQL.contains("INSERT INTO workflow_definitions"),
@@ -1391,6 +1408,82 @@ mod tests {
         assert_eq!(other_org.definition.name, "org-b-v1");
         assert_eq!(other_org.content_hash, "hash-b1");
 
+        // The same clean-schema regression also proves the optimistic write
+        // boundary used by Dashboard edits: one matching writer advances the
+        // immutable sequence, while a stale or concurrent peer appends no row.
+        let guarded_workflow_id = Uuid::new_v4();
+        let guarded_definition = |name: &str| WorkflowDefinition {
+            id: guarded_workflow_id,
+            version: 0,
+            name: name.to_owned(),
+            nodes: vec![],
+            edges: vec![],
+            inputs: serde_json::Value::Null,
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
+            triggers: vec![],
+        };
+        let first = insert_definition(
+            &pool,
+            org_a,
+            &guarded_definition("guarded-v1"),
+            "guarded-hash-v1",
+            Some(0),
+        )
+        .await
+        .expect("create with no-existing-version precondition");
+        assert_eq!(first, Some(1));
+
+        let left_definition = guarded_definition("guarded-v2-left");
+        let right_definition = guarded_definition("guarded-v2-right");
+        let (left, right) = tokio::join!(
+            insert_definition(
+                &pool,
+                org_a,
+                &left_definition,
+                "guarded-hash-v2-left",
+                Some(1),
+            ),
+            insert_definition(
+                &pool,
+                org_a,
+                &right_definition,
+                "guarded-hash-v2-right",
+                Some(1),
+            ),
+        );
+        let left = left.expect("left conditional writer");
+        let right = right.expect("right conditional writer");
+        assert_eq!(
+            usize::from(left == Some(2)) + usize::from(right == Some(2)),
+            1,
+            "exactly one concurrent writer may advance expected version 1"
+        );
+        assert_eq!(
+            insert_definition(
+                &pool,
+                org_a,
+                &guarded_definition("stale-write"),
+                "guarded-hash-stale",
+                Some(1),
+            )
+            .await
+            .expect("stale conditional writer"),
+            None,
+            "a stale expected version must append no immutable row"
+        );
+        let guarded_versions = list_definition_versions(&pool, org_a, guarded_workflow_id, 10)
+            .await
+            .expect("list conditionally written versions");
+        assert_eq!(
+            guarded_versions
+                .iter()
+                .map(|row| row.version)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
         for org in [org_a, org_b] {
             sqlx::query("DELETE FROM workflow_definitions WHERE org_id = $1 AND id = $2")
                 .bind(org)
@@ -1399,5 +1492,11 @@ mod tests {
                 .await
                 .expect("cleanup workflow versions");
         }
+        sqlx::query("DELETE FROM workflow_definitions WHERE org_id = $1 AND id = $2")
+            .bind(org_a)
+            .bind(guarded_workflow_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup conditionally written versions");
     }
 }

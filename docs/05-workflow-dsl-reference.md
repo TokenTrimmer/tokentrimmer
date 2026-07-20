@@ -108,7 +108,7 @@ started by a human/API run. The two current invokers are:
 
 | Method + path | What |
 |---|---|
-| `POST /v1/workflows` | Create a workflow (CRUD; `id` + `version` optional). |
+| `POST /v1/workflows` | Append an immutable workflow version (`id`/legacy `version` optional); optional write-only `expected_latest_version` (`0` = absent) rejects stale/concurrent writers with `409`. |
 | `GET /v1/workflows` | List workflow definitions (metadata). |
 | `GET /v1/workflows/:id` | Read the latest org-owned definition. |
 | `GET /v1/workflows/:id/versions` | List at most 100 newest-first immutable version metadata rows, with explicit truncation and `private, no-store`. |
