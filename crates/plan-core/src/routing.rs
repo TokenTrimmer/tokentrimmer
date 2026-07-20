@@ -2,7 +2,43 @@
 //! by priority descending), return the first enabled route whose
 //! conditions all match. Pure function — no state, no side effects.
 
-use crate::types::{ProposedRoute, RequestLog, RouteConditions};
+use crate::{
+    error::PlanError,
+    types::{ProposedRoute, RequestLog, RouteConditions},
+};
+use tt_routing::{route_conditions_match, RouteFeatureSnapshot};
+
+pub(crate) struct PreparedRoute {
+    route: ProposedRoute,
+    conditions: tt_routing::RouteConditions,
+}
+
+impl PreparedRoute {
+    pub(crate) fn route(&self) -> &ProposedRoute {
+        &self.route
+    }
+}
+
+pub(crate) fn prepare_routes(routes: Vec<ProposedRoute>) -> Result<Vec<PreparedRoute>, PlanError> {
+    routes
+        .into_iter()
+        .map(|route| {
+            let encoded = serde_json::to_value(&route.when).map_err(|error| {
+                PlanError::RouteConditionContract {
+                    route_id: route.id,
+                    message: error.to_string(),
+                }
+            })?;
+            let conditions = serde_json::from_value(encoded).map_err(|error| {
+                PlanError::RouteConditionContract {
+                    route_id: route.id,
+                    message: error.to_string(),
+                }
+            })?;
+            Ok(PreparedRoute { route, conditions })
+        })
+        .collect()
+}
 
 /// Match a request against routes in priority order. First match wins.
 ///
@@ -10,81 +46,126 @@ use crate::types::{ProposedRoute, RequestLog, RouteConditions};
 /// routes are skipped.
 #[must_use]
 pub fn match_route<'a>(req: &RequestLog, routes: &'a [ProposedRoute]) -> Option<&'a ProposedRoute> {
-    routes
-        .iter()
-        .find(|r| r.enabled && matches_conditions(req, &r.when))
+    let snapshot = historical_snapshot(req);
+    routes.iter().find(|route| {
+        route.enabled
+            && gateway_conditions(&route.when)
+                .is_some_and(|conditions| route_conditions_match(&conditions, &snapshot))
+    })
 }
 
-fn matches_conditions(req: &RequestLog, c: &RouteConditions) -> bool {
-    if !c.model_in.is_empty() && !c.model_in.iter().any(|m| m == &req.model) {
-        return false;
+pub(crate) fn match_prepared_route<'a>(
+    req: &RequestLog,
+    routes: &'a [PreparedRoute],
+) -> Option<&'a ProposedRoute> {
+    let snapshot = historical_snapshot(req);
+    routes.iter().find_map(|prepared| {
+        let route = prepared.route();
+        (route.enabled && route_conditions_match(&prepared.conditions, &snapshot)).then_some(route)
+    })
+}
+
+fn historical_snapshot(req: &RequestLog) -> RouteFeatureSnapshot {
+    let snapshot = RouteFeatureSnapshot::from_partial_retained_features(
+        req.requested_model.clone(),
+        req.input_tokens,
+        req.tag.clone(),
+    );
+    if req.baseline_cost_usd.is_finite() && req.baseline_cost_usd >= 0.0 {
+        snapshot.with_approximate_estimated_cost_usd(req.baseline_cost_usd)
+    } else {
+        snapshot
     }
-    if let Some(t) = c.input_tokens_lt {
-        if req.input_tokens >= t {
-            return false;
+}
+
+fn gateway_conditions(c: &RouteConditions) -> Option<tt_routing::RouteConditions> {
+    serde_json::to_value(c)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+pub(crate) fn ambiguous_equal_priority_pair(
+    routes: &[ProposedRoute],
+) -> Option<(&ProposedRoute, &ProposedRoute)> {
+    for (index, left) in routes.iter().enumerate() {
+        if !left.enabled {
+            continue;
+        }
+        for right in routes.iter().skip(index + 1) {
+            if right.enabled
+                && left.priority == right.priority
+                && conditions_may_overlap(&left.when, &right.when)
+            {
+                return Some((left, right));
+            }
         }
     }
-    if let Some(t) = c.input_tokens_gt {
-        if req.input_tokens <= t {
-            return false;
-        }
-    }
-    // Cost is a logged field, so cost conditions project accurately (no caveat).
-    if let Some(t) = c.estimated_cost_gt {
-        if req.baseline_cost_usd <= t {
-            return false;
-        }
-    }
-    if let Some(t) = c.estimated_cost_lt {
-        if req.baseline_cost_usd >= t {
-            return false;
-        }
-    }
-    if let Some(tag) = &c.tag_equals {
-        if req.tag.as_deref() != Some(tag.as_str()) {
-            return false;
-        }
-    }
-    // Modality conditions cannot be evaluated against historical RequestLog rows
-    // (no modality recorded). Treat ANY modality requirement as a non-match so
-    // Plan never over-projects savings. Follow-up: capture had_images/had_audio
-    // on request_logs to enable modality projection.
-    if c.has_images.is_some() || c.has_audio.is_some() || c.has_documents.is_some() {
-        return false;
-    }
-    // content_type needs the gateway's live content classifier over the request
-    // body, unavailable in Plan replay — conservative non-match so Plan never
-    // over-projects savings on a content-type route.
-    if c.content_type.is_some() {
-        return false;
-    }
-    // The live p95-latency condition is backed by the gateway's in-process
-    // rolling window, which does not exist for historical rows. Like modality,
-    // a route carrying it is a conservative non-match in replay — Plan never
-    // over-projects savings on a latency-gated route.
-    if c.upstream_latency_ms_p95_gt.is_some() {
-        return false;
-    }
-    // not_reasoning_class requires the gateway's reasoning-class classifier,
-    // which is not available in Plan replay. Conservative non-match: Plan
-    // never over-projects savings on a catalog route.
-    if c.not_reasoning_class {
-        return false;
-    }
-    if !c.prompt_contains_any_of.is_empty() {
-        let Some(body) = &req.body else {
-            return false;
-        };
-        let text = body.to_lowercase();
-        if !c
-            .prompt_contains_any_of
+    None
+}
+
+fn conditions_may_overlap(left: &RouteConditions, right: &RouteConditions) -> bool {
+    !route_is_impossible(left)
+        && !route_is_impossible(right)
+        && !model_sets_are_disjoint(&left.model_in, &right.model_in)
+        && !different_values(left.tag_equals.as_ref(), right.tag_equals.as_ref())
+        && !different_values(left.has_images.as_ref(), right.has_images.as_ref())
+        && !different_values(left.has_audio.as_ref(), right.has_audio.as_ref())
+        && !different_values(left.has_documents.as_ref(), right.has_documents.as_ref())
+        && !different_values(left.content_type.as_ref(), right.content_type.as_ref())
+        && input_intervals_overlap(left, right)
+        && cost_intervals_overlap(left, right)
+}
+
+fn route_is_impossible(conditions: &RouteConditions) -> bool {
+    input_interval(conditions).is_none() || cost_interval(conditions).is_none()
+}
+
+fn model_sets_are_disjoint(left: &[String], right: &[String]) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && !left
             .iter()
-            .any(|kw| text.contains(&kw.to_lowercase()))
-        {
-            return false;
+            .any(|model| right.iter().any(|candidate| candidate == model))
+}
+
+fn different_values<T: PartialEq>(left: Option<&T>, right: Option<&T>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left != right)
+}
+
+fn input_interval(conditions: &RouteConditions) -> Option<(u64, u64)> {
+    let lower = conditions
+        .input_tokens_gt
+        .map_or(0, |value| u64::from(value) + 1);
+    let upper = match conditions.input_tokens_lt {
+        Some(0) => return None,
+        Some(value) => u64::from(value - 1),
+        None => u64::from(u32::MAX),
+    };
+    (lower <= upper).then_some((lower, upper))
+}
+
+fn input_intervals_overlap(left: &RouteConditions, right: &RouteConditions) -> bool {
+    match (input_interval(left), input_interval(right)) {
+        (Some((left_min, left_max)), Some((right_min, right_max))) => {
+            left_min.max(right_min) <= left_max.min(right_max)
         }
+        _ => false,
     }
-    true
+}
+
+fn cost_interval(conditions: &RouteConditions) -> Option<(f64, f64)> {
+    let lower = conditions.estimated_cost_gt.unwrap_or(0.0);
+    let upper = conditions.estimated_cost_lt.unwrap_or(f64::INFINITY);
+    (lower.is_finite() && !upper.is_nan() && lower < upper).then_some((lower, upper))
+}
+
+fn cost_intervals_overlap(left: &RouteConditions, right: &RouteConditions) -> bool {
+    match (cost_interval(left), cost_interval(right)) {
+        (Some((left_min, left_max)), Some((right_min, right_max))) => {
+            left_min.max(right_min) < left_max.min(right_max)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +182,7 @@ mod tests {
             ts: Utc::now(),
             provider: "anthropic".into(),
             model: model.into(),
+            requested_model: Some(model.into()),
             input_tokens,
             output_tokens: 0,
             cached_tokens: 0,
@@ -293,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_contains_matches_body_else_no_match() {
+    fn prompt_contains_never_infers_matcher_text_from_quality_body() {
         let r = route(
             "topic",
             10,
@@ -305,10 +387,28 @@ mod tests {
         );
         // No body → conservative no-match.
         assert!(match_route(&req("m", 1, None), &[r.clone()]).is_none());
-        // Body containing the keyword (case-insensitive) → match.
+        // A quality-judge body is not proven to be the exact user/system text
+        // observed by the live matcher, so it remains unavailable too.
         let mut with_body = req("m", 1, None);
         with_body.body = Some("This is CONFIDENTIAL".into());
-        assert!(match_route(&with_body, &[r]).is_some());
+        assert!(match_route(&with_body, &[r]).is_none());
+    }
+
+    #[test]
+    fn model_condition_never_substitutes_final_served_model() {
+        let route = route(
+            "requested-only",
+            10,
+            true,
+            RouteConditions {
+                model_in: vec!["served-model".into()],
+                ..Default::default()
+            },
+        );
+        let mut legacy = req("served-model", 1, None);
+        legacy.requested_model = None;
+
+        assert!(match_route(&legacy, &[route]).is_none());
     }
 
     #[test]

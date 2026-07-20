@@ -14,6 +14,7 @@
         "ts": "2026-05-01T12:00:00Z",
         "provider": "anthropic",
         "model": "claude-3-5-sonnet",
+        "requested_model": "claude-3-5-sonnet",
         "input_tokens": 1000,
         "output_tokens": 100,
         "cached_tokens": 0,

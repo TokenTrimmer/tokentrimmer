@@ -28,8 +28,9 @@ pub use contract::{
 };
 pub use latency::{LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
 pub use matcher::{
-    evaluate_route_conditions, RouteConditionDecision, RouteConditionEvaluation,
-    RouteConditionField, RouteConditionOutcome, RouteFeatureEvidence, RouteFeatureSnapshot,
+    evaluate_route_conditions, route_conditions_match, RouteConditionDecision,
+    RouteConditionEvaluation, RouteConditionField, RouteConditionOutcome, RouteFeatureEvidence,
+    RouteFeatureSnapshot,
 };
 #[cfg(feature = "postgres")]
 pub use store::PostgresRoutingStore;

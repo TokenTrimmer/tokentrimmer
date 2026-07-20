@@ -22,6 +22,7 @@ struct WindowRow {
     ts: DateTime<Utc>,
     provider: String,
     model: String,
+    requested_model: Option<String>,
     input_tokens: i32,
     output_tokens: i32,
     cached_tokens: i32,
@@ -44,6 +45,7 @@ impl WindowRow {
             ts: self.ts,
             provider: self.provider,
             model: self.model,
+            requested_model: self.requested_model,
             input_tokens: self.input_tokens.max(0) as u32,
             output_tokens: self.output_tokens.max(0) as u32,
             cached_tokens: self.cached_tokens.max(0) as u32,
@@ -88,7 +90,7 @@ pub async fn fetch_window(
     };
 
     let rows = sqlx::query_as::<_, WindowRow>(
-        "SELECT id, org_id, ts, provider, model, input_tokens, output_tokens, \
+        "SELECT id, org_id, ts, provider, model, requested_model, input_tokens, output_tokens, \
                 cached_tokens, cost_usd::float8 AS cost_usd, \
                 baseline_cost_usd::float8 AS baseline_cost_usd, cached, cache_layer, \
                 route_id, latency_ms, upstream_latency_ms, status, tag \

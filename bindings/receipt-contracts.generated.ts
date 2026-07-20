@@ -167,6 +167,7 @@ export type RequestLog = {
   org_id: string;
   output_tokens: number;
   provider: string;
+  requested_model?: string | null;
   response_body?: string | null;
   status: number;
   tag?: string | null;

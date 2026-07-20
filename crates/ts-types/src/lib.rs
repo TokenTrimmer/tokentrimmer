@@ -331,6 +331,7 @@ fn deterministic_bundle() -> Result<SavingsBundle> {
         ts: timestamp("2026-05-01T12:00:00Z")?,
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet".into(),
+        requested_model: Some("claude-3-5-sonnet".into()),
         input_tokens: 1_000,
         output_tokens: 100,
         cached_tokens: 0,

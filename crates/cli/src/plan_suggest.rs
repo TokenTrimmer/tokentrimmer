@@ -366,6 +366,7 @@ mod tests {
             ts: Utc::now(),
             provider: "openai".into(),
             model: "gpt-4o".into(),
+            requested_model: Some("gpt-4o".into()),
             input_tokens: 1000,
             output_tokens: 500,
             cached_tokens: 0,

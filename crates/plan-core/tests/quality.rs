@@ -46,6 +46,7 @@ fn req(
         ts: ts(id_seed as i64),
         provider: "anthropic".into(),
         model: "claude-3-5-sonnet".into(),
+        requested_model: None,
         input_tokens,
         output_tokens: 100,
         cached_tokens: 0,

@@ -388,6 +388,7 @@ mod tests {
             ts: Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap(),
             provider: "anthropic".into(),
             model: "claude-3-5-sonnet".into(),
+            requested_model: Some("claude-3-5-sonnet".into()),
             input_tokens: 1000,
             output_tokens: 100,
             cached_tokens: 0,

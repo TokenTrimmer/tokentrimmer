@@ -25,7 +25,7 @@ This file is the human-curated counterpart to `.claude/INDEX.md` (auto-generated
 | API surface decisions | `docs/04-gateway-api-reference.md` | The public contract — request/response shapes, headers, error codes. |
 | Cache (L1 exact-match) | `crates/cache/src/lib.rs` | Trait only at this stage; Redis impl lands in `w1-redis-l1`. |
 | Cache (L2 semantic) | `crates/core/src/cache_l2.rs` (TBD, Week 8-9) | pgvector HNSW lookup. |
-| Routing rules and value-free decision traces | `crates/routing/src/matcher.rs`, `crates/routing/src/lib.rs`, `crates/routing/src/store.rs`, `crates/plan-core/src/{routing,replay}.rs` | Canonical feature/condition evaluation lives in `matcher.rs`; live priority ties preserve store creation order, while historical Plan currently uses UUID order and must not be called canonical until that provenance mismatch is resolved. |
+| Routing rules and value-free decision traces | `crates/routing/src/matcher.rs`, `crates/routing/src/lib.rs`, `crates/routing/src/store.rs`, `crates/plan-core/src/{routing,replay}.rs` | Canonical feature/condition evaluation lives in `matcher.rs`; live priority ties preserve store creation order. Historical Plan shares that matcher with explicit exact/approximate/unavailable feature provenance and rejects potentially overlapping equal-priority routes because it cannot reproduce the live tie order. |
 | Auth (API keys) | `crates/auth/src/lib.rs` | `tt_live_*` validation; argon2 hash; Redis 60s cache. |
 | Provider registry | `crates/core/src/registry.rs` | `by_id`, `by_model`, `iter`. |
 

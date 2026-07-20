@@ -1034,6 +1034,13 @@
           "description": "Upstream provider name (e.g. `\"anthropic\"`).",
           "type": "string"
         },
+        "requested_model": {
+          "description": "Exact model ID the caller supplied before routing and failover.\n\n`request_logs.model` is the final served model and cannot satisfy a historical `model_in` predicate. `None` marks a legacy/uncovered row; replay fails model-gated routes closed instead of substituting `model`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "response_body": {
           "description": "Raw response text from the original baseline run. Pairs with `body` for Tier 3 quality scoring. Same opt-in + back-compat constraints.",
           "type": [
@@ -1234,17 +1241,17 @@
       "type": "object"
     },
     "RouteConditions": {
-      "description": "Match conditions for a [`ProposedRoute`]. v1 supports: `model_in`, `input_tokens_lt`, `input_tokens_gt`, `tag_equals`. Empty / `None` fields match anything; all non-empty fields are AND-ed.",
+      "description": "Match conditions for a [`ProposedRoute`], wire-identical to the gateway's 13-field route condition contract. Empty / `None` fields match anything; all active fields are AND-ed through the canonical gateway evaluator.",
       "properties": {
         "content_type": {
-          "description": "Mirror of `tt_routing::RouteConditions::content_type` (content-aware compression, P1a). Carried for lossless wire round-trip only — NOT projectable in replay (Plan has no live content classifier over the historical `RequestLog` row), so a route carrying it is a conservative non-match in `routing::matches_conditions`, keeping Plan from over-projecting savings on a content-type route.",
+          "description": "Mirror of `tt_routing::RouteConditions::content_type` (content-aware compression, P1a). Carried for lossless wire round-trip only — NOT projectable in replay (Plan has no live content classifier over the historical `RequestLog` row), so a route carrying it fails closed in the canonical matcher and cannot over-project Plan savings.",
           "type": [
             "string",
             "null"
           ]
         },
         "estimated_cost_gt": {
-          "description": "Mirror of `tt_routing::RouteConditions::estimated_cost_gt`. Evaluated against `RequestLog.baseline_cost_usd` (the request's logged cost on its original model) — accurately projectable, unlike modality/topic.",
+          "description": "Mirror of `tt_routing::RouteConditions::estimated_cost_gt`. Historical replay uses realized `RequestLog.baseline_cost_usd` only as an explicitly approximate proxy for the live pre-dispatch estimate.",
           "format": "double",
           "type": [
             "number",
@@ -1267,14 +1274,14 @@
           ]
         },
         "has_documents": {
-          "description": "Mirror of `tt_routing::RouteConditions::has_documents` (Document Lane D4a). Like the other modality mirrors, not evaluable in replay (RequestLog records no modality) — a conservative non-match in `routing::matches_conditions`.",
+          "description": "Mirror of `tt_routing::RouteConditions::has_documents` (Document Lane D4a). Like the other modality mirrors, not evaluable in replay (RequestLog records no modality), so the canonical matcher fails the condition closed.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "has_images": {
-          "description": "Mirror of `tt_routing::RouteConditions::has_images`. Not evaluable in replay (RequestLog records no modality) — see `routing::matches_conditions`.",
+          "description": "Mirror of `tt_routing::RouteConditions::has_images`. Not evaluable in replay (RequestLog records no modality), so the canonical matcher fails the condition closed against the historical feature snapshot.",
           "type": [
             "boolean",
             "null"
@@ -1282,7 +1289,7 @@
         },
         "input_tokens_gt": {
           "default": null,
-          "description": "Match only if `req.input_tokens > this`.",
+          "description": "Match only if realized `req.input_tokens > this`; see `input_tokens_lt`.",
           "format": "uint32",
           "minimum": 0.0,
           "type": [
@@ -1292,7 +1299,7 @@
         },
         "input_tokens_lt": {
           "default": null,
-          "description": "Match only if `req.input_tokens < this`.",
+          "description": "Match only if realized `req.input_tokens < this`. Historical provider tokens are an approximate proxy for the live pre-dispatch estimate.",
           "format": "uint32",
           "minimum": 0.0,
           "type": [
@@ -1302,18 +1309,18 @@
         },
         "model_in": {
           "default": [],
-          "description": "Match only if `req.model` is in this list. Empty list matches any model.",
+          "description": "Match only if `req.requested_model` is in this list. A missing legacy snapshot fails closed; the final served `req.model` is never substituted.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "not_reasoning_class": {
-          "description": "Mirror of `tt_routing::RouteConditions::not_reasoning_class`. Carried for lossless wire round-trip only — NOT evaluable in replay (Plan has no reasoning-class classifier). A route carrying this condition is treated as a conservative non-match in `routing::matches_conditions`, so Plan never over-projects savings on a catalog route.",
+          "description": "Mirror of `tt_routing::RouteConditions::not_reasoning_class`. Carried for lossless wire round-trip only — NOT evaluable in replay (Plan has no reasoning-class classifier). The canonical matcher therefore fails this condition closed and Plan cannot over-project savings on a catalog route.",
           "type": "boolean"
         },
         "prompt_contains_any_of": {
-          "description": "Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. Replay matches against `RequestLog.body` when present, else conservative no-match.",
+          "description": "Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. `RequestLog.body` is a quality-judge payload, not a proven capture of the gateway matcher's exact user/system text; historical replay therefore treats this feature as unavailable and fails the route closed.",
           "items": {
             "type": "string"
           },
@@ -1328,7 +1335,7 @@
           ]
         },
         "upstream_latency_ms_p95_gt": {
-          "description": "Mirror of `tt_routing::RouteConditions::upstream_latency_ms_p95_gt`. Carried for lossless wire round-trip only — NOT projectable in replay: the gateway's live in-process p95 window does not exist for historical `RequestLog` rows. Like the modality mirrors, a route carrying this condition is treated as a conservative non-match in `routing::matches_conditions`, so Plan never over-projects savings on a latency route.",
+          "description": "Mirror of `tt_routing::RouteConditions::upstream_latency_ms_p95_gt`. Carried for lossless wire round-trip only — NOT projectable in replay: the gateway's live in-process p95 window does not exist for historical `RequestLog` rows. The feature is unavailable in the historical snapshot, so the canonical matcher fails it closed and Plan cannot over-project savings on a latency route.",
           "format": "uint32",
           "minimum": 0.0,
           "type": [

@@ -353,8 +353,23 @@ impl RouteFeatureSnapshot {
     /// and reasoning classification remain unavailable until explicitly added.
     #[must_use]
     pub fn from_retained_features(model: String, input_tokens: u32, tag: Option<String>) -> Self {
+        Self::from_partial_retained_features(Some(model), input_tokens, tag)
+    }
+
+    /// Build a conservative snapshot from a partially covered historical row.
+    ///
+    /// `requested_model` must be the exact pre-routing caller model snapshot;
+    /// pass `None` for legacy rows instead of substituting a served model.
+    /// Realized provider input tokens remain an approximate proxy for the
+    /// gateway's pre-dispatch estimate. Features not named here are unavailable.
+    #[must_use]
+    pub fn from_partial_retained_features(
+        requested_model: Option<String>,
+        input_tokens: u32,
+        tag: Option<String>,
+    ) -> Self {
         Self {
-            model: Observation::exact(model),
+            model: requested_model.map_or(Observation::Unavailable, Observation::exact),
             // Request logs retain realized provider tokens, while live routing
             // compares its pre-dispatch tokenizer estimate.
             input_tokens: Observation::approximate(input_tokens),
@@ -449,7 +464,13 @@ pub fn evaluate_route_conditions(
     }
 }
 
-pub(crate) fn route_conditions_match(
+/// Match one route condition set against the canonical feature snapshot.
+///
+/// This is the same allocation-free condition routine used by
+/// [`crate::RoutingEngine`]. Active conditions with unavailable features fail
+/// closed rather than being ignored or inferred from another retained field.
+#[must_use]
+pub fn route_conditions_match(
     conditions: &RouteConditions,
     features: &RouteFeatureSnapshot,
 ) -> bool {
@@ -637,5 +658,24 @@ mod tests {
             .find(|decision| decision.field == RouteConditionField::InputTokensLt)
             .unwrap();
         assert_eq!(input_decision.evidence, RouteFeatureEvidence::Approximate);
+    }
+
+    #[test]
+    fn missing_requested_model_is_unavailable_not_served_model_inference() {
+        let conditions = RouteConditions {
+            model_in: vec!["served-model".into()],
+            ..Default::default()
+        };
+        let snapshot = RouteFeatureSnapshot::from_partial_retained_features(None, 100, None);
+        let evaluation = evaluate_route_conditions(&conditions, &snapshot);
+
+        assert!(!evaluation.matches());
+        let model = evaluation
+            .decisions
+            .iter()
+            .find(|decision| decision.field == RouteConditionField::ModelIn)
+            .unwrap();
+        assert_eq!(model.outcome, RouteConditionOutcome::Unavailable);
+        assert_eq!(model.evidence, RouteFeatureEvidence::Unavailable);
     }
 }

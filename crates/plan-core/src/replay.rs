@@ -2,7 +2,7 @@
 //! function of the input. Determinism is the contract enforced by
 //! `tests/replay.rs`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use uuid::Uuid;
 
@@ -24,22 +24,22 @@ use crate::{
 ///
 /// # Errors
 ///
-/// Returns [`PlanError::InvalidWindow`] when `window_end <= window_start`
-/// and [`PlanError::ZeroBootstrapIterations`] when the caller passes
-/// `bootstrap_iterations = 0` (every CI would be `(0, 0)`, almost
-/// certainly a mistake).
+/// Returns [`PlanError::InvalidWindow`] when `window_end <= window_start`,
+/// [`PlanError::ZeroBootstrapIterations`] when the caller passes zero
+/// iterations, and [`PlanError::AmbiguousRoutePriority`] when equal-priority
+/// route conditions may overlap but the live store tie order is unavailable.
 pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     validate(&input)?;
+    let condition_caveats = replay_condition_caveats(&input.requests, &input.proposed_routes);
 
-    // Sort routes by priority descending — first match wins. Tie-break on
-    // the route's `id` (ascending) so equal-priority routes have a stable,
-    // config-intrinsic order independent of the caller's input array order.
-    // Without this, two logically-identical configs that differ only in the
-    // ordering of two equal-priority matching routes could resolve to
-    // different winners and thus different projected savings — violating the
-    // replay's "same config → bit-identical result" determinism contract.
+    // Sort routes by priority descending. Validation has already proved that
+    // every enabled equal-priority pair is condition-disjoint, so the UUID
+    // suffix is only a deterministic iteration order and can never select a
+    // different winner. Plan fails closed instead of fabricating the live
+    // store's creation-order tie break for a potentially overlapping pair.
     let mut routes = input.proposed_routes.clone();
     routes.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
+    let routes = routing::prepare_routes(routes)?;
 
     // Walk requests in deterministic order (by id).
     let mut requests = input.requests.clone();
@@ -80,11 +80,10 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     let per_route_breakdown = build_per_route(projection.per_route);
 
     // Carry the proposed routes through to the result so the apply path can
-    // persist them. We move the *original* (unsorted) input vec rather than
-    // the priority-sorted `routes` clone above — apply re-sorts at write time
-    // and we want to preserve the caller's authored ordering for round-trip
-    // fidelity. This is a partial move out of `input`; the remaining fields
-    // read below (`plan_id`, `org_id`, the window bounds) are all `Copy`.
+    // persist them. We move the *original* (unsorted) input vec and preserve
+    // the caller's authored ordering for round-trip fidelity. This is a
+    // partial move out of `input`; the remaining fields read below (`plan_id`,
+    // `org_id`, the window bounds) are all `Copy`.
     let proposed_routes = input.proposed_routes;
 
     let mut caveats = build_caveats(
@@ -101,6 +100,7 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         projection.minify_estimated_count,
         projection.minify_estimated_usd,
     );
+    caveats.extend(condition_caveats);
     caveats.extend(wide_ci_caveats(&aggregates, &confidence_intervals));
 
     Ok(PlanResult {
@@ -180,6 +180,13 @@ fn validate(input: &PlanInput) -> Result<(), PlanError> {
     if input.bootstrap_iterations == 0 {
         return Err(PlanError::ZeroBootstrapIterations);
     }
+    if let Some((first, second)) = routing::ambiguous_equal_priority_pair(&input.proposed_routes) {
+        return Err(PlanError::AmbiguousRoutePriority {
+            priority: first.priority,
+            first_route_id: first.id,
+            second_route_id: second.id,
+        });
+    }
     Ok(())
 }
 
@@ -253,7 +260,7 @@ struct Projection {
 
 fn project_requests(
     requests: &[RequestLog],
-    routes: &[ProposedRoute],
+    routes: &[routing::PreparedRoute],
     pricing: &crate::types::PricingTable,
     cache_hit_ids: &std::collections::HashSet<Uuid>,
 ) -> Projection {
@@ -307,7 +314,7 @@ fn project_requests(
         // routing, so its projected cost is 0.
         let is_cache_hit = cache_hit_ids.contains(&req.id);
 
-        let matched = routing::match_route(req, routes);
+        let matched = routing::match_prepared_route(req, routes);
         match matched {
             Some(route) => {
                 // Resolve the effective served model ONCE, mirroring the
@@ -320,11 +327,9 @@ fn project_requests(
                 // minify, …) project. A `Some` target behaves exactly as before
                 // (rewrite to that model), so existing routes project
                 // byte-identically.
-                let effective_target = route
-                    .then
-                    .target_model
-                    .as_deref()
-                    .unwrap_or(req.model.as_str());
+                let effective_target = route.then.target_model.as_deref().unwrap_or_else(|| {
+                    req.requested_model.as_deref().unwrap_or(req.model.as_str())
+                });
                 // Prefer the same-provider key (keeps same-provider replays
                 // byte-identical); else resolve the target's own provider so a
                 // cross-provider route is priced correctly.
@@ -651,6 +656,77 @@ fn build_per_route(buckets: HashMap<Uuid, PerRouteBucket>) -> Vec<PerRouteBreakd
     // and would break the snapshot test on slight float drift.
     rows.sort_by_key(|r| r.route_id);
     rows
+}
+
+fn replay_condition_caveats(requests: &[RequestLog], routes: &[ProposedRoute]) -> Vec<String> {
+    let enabled = routes
+        .iter()
+        .filter(|route| route.enabled)
+        .collect::<Vec<_>>();
+    let uses_model = enabled.iter().any(|route| !route.when.model_in.is_empty());
+    let uses_tokens = enabled
+        .iter()
+        .any(|route| route.when.input_tokens_lt.is_some() || route.when.input_tokens_gt.is_some());
+    let uses_cost = enabled.iter().any(|route| {
+        route.when.estimated_cost_gt.is_some() || route.when.estimated_cost_lt.is_some()
+    });
+    let mut unavailable = BTreeSet::new();
+    for route in enabled {
+        let conditions = &route.when;
+        if conditions.has_images.is_some() {
+            unavailable.insert("has_images");
+        }
+        if conditions.has_audio.is_some() {
+            unavailable.insert("has_audio");
+        }
+        if conditions.has_documents.is_some() {
+            unavailable.insert("has_documents");
+        }
+        if conditions.content_type.is_some() {
+            unavailable.insert("content_type");
+        }
+        if !conditions.prompt_contains_any_of.is_empty() {
+            unavailable.insert("prompt_contains_any_of");
+        }
+        if conditions.upstream_latency_ms_p95_gt.is_some() {
+            unavailable.insert("upstream_latency_ms_p95_gt");
+        }
+        if conditions.not_reasoning_class {
+            unavailable.insert("not_reasoning_class");
+        }
+    }
+
+    let mut caveats = Vec::new();
+    if uses_model {
+        let missing = requests
+            .iter()
+            .filter(|request| request.requested_model.is_none())
+            .count();
+        if missing > 0 {
+            caveats.push(format!(
+                "{missing} request(s) lack the exact pre-routing requested_model snapshot — model_in routes fail closed for those rows; the final served model is not substituted."
+            ));
+        }
+    }
+    if uses_tokens {
+        caveats.push(
+            "Historical input-token route predicates use realized provider input_tokens as an APPROXIMATE proxy for the gateway's pre-dispatch estimate; boundary matches can differ."
+                .to_string(),
+        );
+    }
+    if uses_cost {
+        caveats.push(
+            "Historical estimated-cost route predicates use realized baseline_cost_usd as an APPROXIMATE proxy for the gateway's pre-dispatch estimate; boundary matches can differ."
+                .to_string(),
+        );
+    }
+    if !unavailable.is_empty() {
+        caveats.push(format!(
+            "Historical route replay has no canonical retained feature for {} — routes requiring any of those conditions fail closed and are not projected.",
+            unavailable.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    caveats
 }
 
 #[allow(clippy::too_many_arguments)]

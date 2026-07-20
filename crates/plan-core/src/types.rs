@@ -33,6 +33,13 @@ pub struct RequestLog {
     pub provider: String,
     /// Provider-side model id (e.g. `"claude-3-5-sonnet"`).
     pub model: String,
+    /// Exact model ID the caller supplied before routing and failover.
+    ///
+    /// `request_logs.model` is the final served model and cannot satisfy a
+    /// historical `model_in` predicate. `None` marks a legacy/uncovered row;
+    /// replay fails model-gated routes closed instead of substituting `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
     /// Input tokens charged on the baseline run.
     pub input_tokens: u32,
     /// Output tokens charged on the baseline run.
@@ -191,26 +198,29 @@ pub struct ProposedRoute {
     pub then: RouteAction,
 }
 
-/// Match conditions for a [`ProposedRoute`]. v1 supports: `model_in`,
-/// `input_tokens_lt`, `input_tokens_gt`, `tag_equals`. Empty / `None`
-/// fields match anything; all non-empty fields are AND-ed.
+/// Match conditions for a [`ProposedRoute`], wire-identical to the gateway's
+/// 13-field route condition contract. Empty / `None` fields match anything;
+/// all active fields are AND-ed through the canonical gateway evaluator.
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteConditions {
-    /// Match only if `req.model` is in this list. Empty list matches any model.
+    /// Match only if `req.requested_model` is in this list. A missing legacy
+    /// snapshot fails closed; the final served `req.model` is never substituted.
     #[serde(default)]
     pub model_in: Vec<String>,
-    /// Match only if `req.input_tokens < this`.
+    /// Match only if realized `req.input_tokens < this`. Historical provider
+    /// tokens are an approximate proxy for the live pre-dispatch estimate.
     #[serde(default)]
     pub input_tokens_lt: Option<u32>,
-    /// Match only if `req.input_tokens > this`.
+    /// Match only if realized `req.input_tokens > this`; see `input_tokens_lt`.
     #[serde(default)]
     pub input_tokens_gt: Option<u32>,
     /// Match only if `req.tag == Some(this)`.
     #[serde(default)]
     pub tag_equals: Option<String>,
     /// Mirror of `tt_routing::RouteConditions::has_images`. Not evaluable in
-    /// replay (RequestLog records no modality) — see `routing::matches_conditions`.
+    /// replay (RequestLog records no modality), so the canonical matcher fails
+    /// the condition closed against the historical feature snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_images: Option<bool>,
     /// Mirror of `tt_routing::RouteConditions::has_audio`. See `has_images`.
@@ -218,25 +228,26 @@ pub struct RouteConditions {
     pub has_audio: Option<bool>,
     /// Mirror of `tt_routing::RouteConditions::has_documents` (Document Lane
     /// D4a). Like the other modality mirrors, not evaluable in replay
-    /// (RequestLog records no modality) — a conservative non-match in
-    /// `routing::matches_conditions`.
+    /// (RequestLog records no modality), so the canonical matcher fails the
+    /// condition closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_documents: Option<bool>,
     /// Mirror of `tt_routing::RouteConditions::content_type` (content-aware
     /// compression, P1a). Carried for lossless wire round-trip only — NOT
     /// projectable in replay (Plan has no live content classifier over the
-    /// historical `RequestLog` row), so a route carrying it is a conservative
-    /// non-match in `routing::matches_conditions`, keeping Plan from
-    /// over-projecting savings on a content-type route.
+    /// historical `RequestLog` row), so a route carrying it fails closed in the
+    /// canonical matcher and cannot over-project Plan savings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    /// Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`. Replay
-    /// matches against `RequestLog.body` when present, else conservative no-match.
+    /// Mirror of `tt_routing::RouteConditions::prompt_contains_any_of`.
+    /// `RequestLog.body` is a quality-judge payload, not a proven capture of the
+    /// gateway matcher's exact user/system text; historical replay therefore
+    /// treats this feature as unavailable and fails the route closed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompt_contains_any_of: Vec<String>,
-    /// Mirror of `tt_routing::RouteConditions::estimated_cost_gt`. Evaluated
-    /// against `RequestLog.baseline_cost_usd` (the request's logged cost on its
-    /// original model) — accurately projectable, unlike modality/topic.
+    /// Mirror of `tt_routing::RouteConditions::estimated_cost_gt`. Historical
+    /// replay uses realized `RequestLog.baseline_cost_usd` only as an explicitly
+    /// approximate proxy for the live pre-dispatch estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_gt: Option<f64>,
     /// Mirror of `tt_routing::RouteConditions::estimated_cost_lt`.
@@ -245,17 +256,16 @@ pub struct RouteConditions {
     /// Mirror of `tt_routing::RouteConditions::upstream_latency_ms_p95_gt`.
     /// Carried for lossless wire round-trip only — NOT projectable in replay:
     /// the gateway's live in-process p95 window does not exist for historical
-    /// `RequestLog` rows. Like the modality mirrors, a route carrying this
-    /// condition is treated as a conservative non-match in
-    /// `routing::matches_conditions`, so Plan never over-projects savings on a
-    /// latency route.
+    /// `RequestLog` rows. The feature is unavailable in the historical snapshot,
+    /// so the canonical matcher fails it closed and Plan cannot over-project
+    /// savings on a latency route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_latency_ms_p95_gt: Option<u32>,
     /// Mirror of `tt_routing::RouteConditions::not_reasoning_class`. Carried
     /// for lossless wire round-trip only — NOT evaluable in replay (Plan has
-    /// no reasoning-class classifier). A route carrying this condition is
-    /// treated as a conservative non-match in `routing::matches_conditions`,
-    /// so Plan never over-projects savings on a catalog route.
+    /// no reasoning-class classifier). The canonical matcher therefore fails
+    /// this condition closed and Plan cannot over-project savings on a catalog
+    /// route.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub not_reasoning_class: bool,
 }

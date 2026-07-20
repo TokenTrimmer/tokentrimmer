@@ -37,6 +37,7 @@ fn make_req(
         ts: ts(secs),
         provider: "anthropic".into(),
         model: model.into(),
+        requested_model: Some(model.into()),
         input_tokens,
         output_tokens,
         cached_tokens: 0,
@@ -917,6 +918,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             ts: ts(i64::from(i) * 7),
             provider: "anthropic".into(),
             model: "claude-3-5-sonnet".into(),
+            requested_model: Some("claude-3-5-sonnet".into()),
             input_tokens,
             output_tokens,
             cached_tokens: 0,
@@ -1063,18 +1065,12 @@ fn snapshot_canned_replay() {
 }
 
 #[test]
-fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
-    // Two routes share priority 100 and BOTH match the same request (the
-    // request's model is in each route's `model_in`), but they reroute to
-    // DIFFERENT target models with different pricing — so which one wins is
-    // observable in the projected savings. Build two configs that are
-    // identical except for the order of these two routes in the input array.
-    // With a deterministic id-tiebreak the winner (and thus the result) must
-    // be identical across both orderings.
+fn equal_priority_overlapping_routes_fail_without_live_store_order() {
+    // Historical Plan inputs do not carry routes.created_at, while the live
+    // store uses creation order for equal priorities. Both routes can match,
+    // so UUID order would fabricate a winner and projected savings.
     let req = make_req(1, 0, "claude-3-5-sonnet", 1000, 100, 0.0045, false);
 
-    // route_a (lower id) -> haiku; route_b (higher id) -> a pricier target.
-    // The id-tiebreak picks the lower id, so route_a must always win.
     let route_a = ProposedRoute {
         id: det_uuid(100),
         name: "route-a".into(),
@@ -1134,58 +1130,92 @@ fn equal_priority_routes_resolve_deterministically_regardless_of_array_order() {
         },
     };
 
+    let input = input_with_routes(vec![req], vec![route_a, route_b], HashMap::new(), 100);
+
+    assert!(matches!(
+        replay(input),
+        Err(tt_plan_core::PlanError::AmbiguousRoutePriority {
+            priority: 100,
+            first_route_id,
+            second_route_id,
+        }) if first_route_id == det_uuid(100) && second_route_id == det_uuid(200)
+    ));
+}
+
+#[test]
+fn equal_priority_disjoint_model_routes_remain_projectable() {
+    let req = make_req(1, 0, "model-a", 1000, 100, 0.0045, false);
+    let route_a = batch_route("cheap-a", "model-a");
+    let route_b = batch_route("cheap-b", "model-b");
+    let route_a_id = route_a.id;
     let mut pricing = HashMap::new();
-    let (k1, v1) = pricing_with("anthropic", "claude-3-5-haiku", 0.25, 1.25);
-    let (k2, v2) = pricing_with("anthropic", "claude-3-haiku-pricier", 1.0, 5.0);
-    pricing.insert(k1, v1);
-    pricing.insert(k2, v2);
+    let (key, value) = pricing_with("anthropic", "cheap-a", 0.25, 1.25);
+    pricing.insert(key, value);
 
-    // Order 1: [route_a, route_b]
-    let input_ab = input_with_routes(
-        vec![req.clone()],
-        vec![route_a.clone(), route_b.clone()],
-        pricing.clone(),
+    let result = replay(input_with_routes(
+        vec![req],
+        vec![route_b, route_a],
+        pricing,
         100,
-    );
-    // Order 2: [route_b, route_a] — only the array order differs.
-    let input_ba = input_with_routes(vec![req], vec![route_b, route_a], pricing, 100);
-
-    let res_ab = replay(input_ab).expect("replay ab must succeed");
-    let res_ba = replay(input_ba).expect("replay ba must succeed");
-
-    // The determinism the review wants (§4.12): same config modulo array
-    // order -> bit-identical PROJECTION. We compare the projection outputs
-    // (aggregates + CIs + per-route breakdown) rather than the whole
-    // PlanResult because `proposed_routes` is deliberately echoed in the
-    // caller's authored (unsorted) order for apply-path round-trip fidelity —
-    // that field is the input document, not the projection. Before the
-    // tiebreak, the winner (and so these projection numbers) flipped with the
-    // array order; that is the bug being fixed.
-    let proj_ab = serde_json::to_string(&(
-        &res_ab.aggregates,
-        &res_ab.confidence_intervals,
-        &res_ab.per_route_breakdown,
     ))
-    .expect("serialize ab projection");
-    let proj_ba = serde_json::to_string(&(
-        &res_ba.aggregates,
-        &res_ba.confidence_intervals,
-        &res_ba.per_route_breakdown,
-    ))
-    .expect("serialize ba projection");
-    assert_eq!(
-        proj_ab, proj_ba,
-        "equal-priority route configs that differ only in array order must \
-         produce a bit-identical projection"
-    );
+    .expect("disjoint equal-priority routes do not need a tie winner");
 
-    // And specifically: the lower-id route (route_a -> haiku) wins in both,
-    // independent of which order it was authored in.
-    for res in [&res_ab, &res_ba] {
-        assert_eq!(res.aggregates.requests_rerouted, 1);
-        assert_eq!(res.per_route_breakdown.len(), 1);
-        assert_eq!(res.per_route_breakdown[0].route_id, det_uuid(100));
-    }
+    assert_eq!(result.aggregates.requests_rerouted, 1);
+    assert_eq!(result.per_route_breakdown[0].route_id, route_a_id);
+}
+
+#[test]
+fn missing_requested_model_fails_closed_and_is_counted_in_caveats() {
+    let mut req = make_req(1, 0, "served-model", 1000, 100, 0.0045, false);
+    req.requested_model = None;
+    let mut route = batch_route("cheap-model", "served-model");
+    route.then.batch = false;
+    let result = replay(input_with_routes(
+        vec![req],
+        vec![route],
+        HashMap::new(),
+        100,
+    ))
+    .expect("legacy model coverage must fail closed, not fail replay");
+
+    assert_eq!(result.aggregates.requests_rerouted, 0);
+    assert_eq!(result.aggregates.requests_unchanged, 1);
+    assert!(result.caveats.iter().any(|caveat| {
+        caveat.contains("1 request(s) lack the exact pre-routing requested_model")
+            && caveat.contains("final served model is not substituted")
+    }));
+}
+
+#[test]
+fn historical_condition_proxies_and_unavailable_features_are_explicit() {
+    let req = make_req(1, 0, "model-a", 1000, 100, 0.0045, false);
+    let mut route = batch_route("cheap-model", "model-a");
+    route.then.batch = false;
+    route.when.input_tokens_lt = Some(2_000);
+    route.when.estimated_cost_gt = Some(0.001);
+    route.when.has_images = Some(false);
+    route.when.prompt_contains_any_of = vec!["private".into()];
+
+    let result = replay(input_with_routes(
+        vec![req],
+        vec![route],
+        HashMap::new(),
+        100,
+    ))
+    .expect("unavailable features conservatively prevent only the route match");
+
+    assert_eq!(result.aggregates.requests_rerouted, 0);
+    assert!(result
+        .caveats
+        .iter()
+        .any(|caveat| caveat.contains("input_tokens as an APPROXIMATE proxy")));
+    assert!(result
+        .caveats
+        .iter()
+        .any(|caveat| caveat.contains("baseline_cost_usd as an APPROXIMATE proxy")));
+    assert!(result.caveats.iter().any(|caveat| {
+        caveat.contains("has_images, prompt_contains_any_of") && caveat.contains("fail closed")
+    }));
 }
 
 #[test]
