@@ -372,6 +372,7 @@ fn migrator_includes_versioned_workflow_environment_variables() {
     );
 
     let up = include_str!("../migrations/0045_workflow_environment_variables.up.sql");
+    let normalized_up = up.split_whitespace().collect::<Vec<_>>().join(" ");
     for fragment in [
         "CREATE TABLE IF NOT EXISTS workflow_environment_variable_sets",
         "CREATE TABLE IF NOT EXISTS workflow_environment_variable_state",
@@ -384,7 +385,7 @@ fn migrator_includes_versioned_workflow_environment_variables() {
         "workflow_runs_variables_scope_check",
     ] {
         assert!(
-            up.contains(fragment),
+            normalized_up.contains(fragment),
             "missing variables contract: {fragment}"
         );
     }
