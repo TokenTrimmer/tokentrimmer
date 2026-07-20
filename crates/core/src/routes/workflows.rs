@@ -659,6 +659,8 @@ async fn persist_run_results(
             entry.cost_usd,
             entry.model_used.as_deref(),
             entry.error.as_deref(),
+            entry.started_at,
+            entry.finished_at,
         )
         .await;
     }

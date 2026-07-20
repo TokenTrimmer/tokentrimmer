@@ -107,7 +107,7 @@ started by a human/API run. The two current invokers are:
 | `POST /v1/workflows/:id/runs` | Run synchronously (returns the run + the rolled-up `saved_usd`). |
 | `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
 | `GET /v1/workflows/runs/:run_id` | Read one org-scoped durable run and its immutable definition version. |
-| `GET /v1/workflows/runs/:run_id/nodes` | Read up to 500 best-effort node-journal rows, labeled from the exact executed definition. Persistence order is not provider timing or replay. |
+| `GET /v1/workflows/runs/:run_id/nodes` | Read up to 500 best-effort node-journal rows, labeled from the exact executed definition. New rows include gateway node-envelope timing; legacy rows expose only post-run persistence time. Neither is provider-attempt timing or replay. |
 
 ## SSE events (a run's streaming surface)
 

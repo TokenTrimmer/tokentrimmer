@@ -2493,18 +2493,27 @@ accepted run inputs with the contract/defaults that executed.
       "cost_usd": 0.00312,
       "model_used": "gpt-4o-mini",
       "error": null,
-      "recorded_at": "2026-07-20T10:00:00Z"
+      "timing_source": "gateway_node_envelope",
+      "started_at": "2026-07-20T10:00:00.000Z",
+      "finished_at": "2026-07-20T10:00:00.125Z",
+      "duration_ms": 125,
+      "legacy_recorded_at": null
     }
   ]
 }
 ```
 
 Node journaling is best-effort, so an empty list does not prove that no node
-executed. `journal_index` and `recorded_at` describe stable post-run
-persistence order, not provider start/end timing. One row is retained per
-engine node completion; internal provider retries, fallback attempts, and
-subworkflow identity are not reconstructed. This endpoint is read-only
-inspection, not a breakpoint or replay API.
+executed. For new rows, `started_at`, `finished_at`, and `duration_ms` describe
+the gateway workflow-node envelope; for Model/Agent nodes that spans the
+executor call, not individual provider attempts. Internal retries, fallback
+attempts, and provider timing are not reconstructed. Legacy rows instead use
+`timing_source: "legacy_post_run_persistence"`, set only
+`legacy_recorded_at`, and leave the three execution fields null.
+`journal_index` is stable for repeated reads, but is not a duration or a
+provider-attempt sequence. Trigger/Output nodes and some early guard failures
+do not produce rows, and subworkflow child identity is not reconstructed. This
+endpoint is read-only inspection, not a breakpoint or replay API.
 
 **`status` values:**
 

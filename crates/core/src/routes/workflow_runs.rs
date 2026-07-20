@@ -2,8 +2,8 @@
 //!
 //! The node journal is intentionally an inspection surface, not replay:
 //! labels and node kinds come from the exact immutable definition version the
-//! run executed, while row order reflects post-run journal persistence rather
-//! than provider timing.
+//! run executed. New rows carry gateway node-envelope timing; legacy rows carry
+//! only post-run persistence time. Neither form is provider-attempt timing.
 
 use axum::{
     extract::{Path, State},
@@ -87,7 +87,8 @@ pub struct ListWorkflowRunsResponse {
 
 /// One durable node-journal entry decorated from the exact executed
 /// definition. `journal_index` is stable for repeated reads of the persisted
-/// rows; it is not an execution-duration measurement.
+/// rows. New timing is the gateway workflow-node envelope, not provider-attempt
+/// timing; legacy rows expose only their post-run persistence timestamp.
 #[derive(Debug, Serialize)]
 pub struct WorkflowNodeRunView {
     pub id: Uuid,
@@ -102,7 +103,11 @@ pub struct WorkflowNodeRunView {
     pub cost_usd: f64,
     pub model_used: Option<String>,
     pub error: Option<String>,
-    pub recorded_at: chrono::DateTime<chrono::Utc>,
+    pub timing_source: &'static str,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub duration_ms: Option<i64>,
+    pub legacy_recorded_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,6 +261,29 @@ fn node_run_view(
     definition: &WorkflowDefinition,
 ) -> WorkflowNodeRunView {
     let (definition_position, node_type, label) = node_descriptor(definition, &record.node_id);
+    let (timing_source, started_at, finished_at, duration_ms, legacy_recorded_at) =
+        match record.finished_at {
+            Some(finished_at) => {
+                let duration_ms = finished_at
+                    .signed_duration_since(record.started_at)
+                    .num_milliseconds()
+                    .max(0);
+                (
+                    "gateway_node_envelope",
+                    Some(record.started_at),
+                    Some(finished_at),
+                    Some(duration_ms),
+                    None,
+                )
+            }
+            None => (
+                "legacy_post_run_persistence",
+                None,
+                None,
+                None,
+                Some(record.started_at),
+            ),
+        };
     WorkflowNodeRunView {
         id: record.id,
         journal_index,
@@ -269,16 +297,22 @@ fn node_run_view(
         cost_usd: record.cost_usd,
         model_used: record.model_used,
         error: record.error,
-        recorded_at: record.recorded_at,
+        timing_source,
+        started_at,
+        finished_at,
+        duration_ms,
+        legacy_recorded_at,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::node_descriptor;
+    use super::{node_descriptor, node_run_view};
+    use crate::workflow::node_run_store::WorkflowNodeRunRecord;
     use crate::workflow::types::{
         BudgetPolicy, ModelSelection, Node, NodeKind, WorkflowDefinition,
     };
+    use chrono::{Duration, Utc};
     use uuid::Uuid;
 
     fn definition() -> WorkflowDefinition {
@@ -327,5 +361,43 @@ mod tests {
             node_descriptor(&definition, "child-node"),
             (None, None, "unmapped journal node · child-node".into())
         );
+    }
+
+    #[test]
+    fn timing_distinguishes_engine_envelopes_from_legacy_persistence() {
+        let definition = definition();
+        let started_at = Utc::now();
+        let record = WorkflowNodeRunRecord {
+            id: Uuid::new_v4(),
+            node_id: "answer".into(),
+            attempt: 1,
+            status: "completed".into(),
+            output: Some(serde_json::json!({"text": "ok"})),
+            cost_usd: 0.01,
+            model_used: Some("gpt-4o-mini".into()),
+            error: None,
+            started_at,
+            finished_at: Some(started_at + Duration::milliseconds(125)),
+        };
+
+        let timed = node_run_view(1, record.clone(), &definition);
+        assert_eq!(timed.timing_source, "gateway_node_envelope");
+        assert_eq!(timed.started_at, Some(started_at));
+        assert_eq!(timed.duration_ms, Some(125));
+        assert_eq!(timed.legacy_recorded_at, None);
+
+        let legacy = node_run_view(
+            1,
+            WorkflowNodeRunRecord {
+                finished_at: None,
+                ..record
+            },
+            &definition,
+        );
+        assert_eq!(legacy.timing_source, "legacy_post_run_persistence");
+        assert_eq!(legacy.started_at, None);
+        assert_eq!(legacy.finished_at, None);
+        assert_eq!(legacy.duration_ms, None);
+        assert_eq!(legacy.legacy_recorded_at, Some(started_at));
     }
 }

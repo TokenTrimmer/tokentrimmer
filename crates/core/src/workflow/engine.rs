@@ -116,6 +116,10 @@ pub(crate) struct NodeJournalEntry {
     pub cost_usd: f64,
     pub model_used: Option<String>,
     pub error: Option<String>,
+    /// Gateway workflow-node envelope timing. For intelligence nodes this
+    /// spans the executor call, not individual provider attempts.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: chrono::DateTime<chrono::Utc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -480,13 +484,17 @@ fn run_workflow_boxed<'a>(
                         emit(WfEvent::NodeStart {
                             node_id: node_id.clone(),
                         });
+                        let started_at = chrono::Utc::now();
                         let outcome = executor.run_intelligence(node_id, &launch_spec).await;
+                        let finished_at = chrono::Utc::now();
                         let failed = outcome.is_err();
                         if let Ok(out) = &outcome {
                             settled_for_launch += out.cost_usd;
                         }
                         sequential.push(schedule::ConcurrentNodeResult {
                             node_id: node_id.clone(),
+                            started_at,
+                            finished_at,
                             outcome,
                         });
                         if failed {
@@ -515,11 +523,28 @@ fn run_workflow_boxed<'a>(
                 // attribute the failure to the offending node (red badge) before
                 // the terminal run.done — instead of leaving the node at "…" forever.
                 let mut wave_error: Option<(String, String)> = None;
-                for schedule::ConcurrentNodeResult { node_id, outcome } in results {
+                for schedule::ConcurrentNodeResult {
+                    node_id,
+                    started_at,
+                    finished_at,
+                    outcome,
+                } in results
+                {
                     match outcome {
                         Err(e) => {
+                            let message = format!("{e}");
+                            journal(NodeJournalEntry {
+                                node_id: node_id.clone(),
+                                status: "failed".into(),
+                                output: None,
+                                cost_usd: 0.0,
+                                model_used: None,
+                                error: Some(message.clone()),
+                                started_at,
+                                finished_at,
+                            });
                             if wave_error.is_none() {
-                                wave_error = Some((node_id.clone(), format!("{e}")));
+                                wave_error = Some((node_id.clone(), message));
                             }
                         }
                         Ok(out) => {
@@ -533,6 +558,8 @@ fn run_workflow_boxed<'a>(
                                 cost_usd: out.cost_usd,
                                 model_used: out.model_used.clone(),
                                 error: None,
+                                started_at,
+                                finished_at,
                             });
                             outputs.insert(node_id.clone(), out);
                             propagate_edges(&node_id, def, &mut reachable);
@@ -630,6 +657,7 @@ fn run_workflow_boxed<'a>(
                 emit(WfEvent::NodeStart {
                     node_id: node_id.clone(),
                 });
+                let node_started_at = chrono::Utc::now();
 
                 match &node.kind {
                     // ---------------------------------------------------------------
@@ -671,6 +699,8 @@ fn run_workflow_boxed<'a>(
                             cost_usd: 0.0,
                             model_used: None,
                             error: None,
+                            started_at: node_started_at,
+                            finished_at: chrono::Utc::now(),
                         });
                         outputs.insert(node_id.clone(), out);
                         propagate_edges(node_id, def, &mut reachable);
@@ -702,6 +732,8 @@ fn run_workflow_boxed<'a>(
                             cost_usd: 0.0,
                             model_used: None,
                             error: None,
+                            started_at: node_started_at,
+                            finished_at: chrono::Utc::now(),
                         });
                         // Chosen arm + any unconditional explicit edges from this node.
                         reachable.insert(taken.clone());
@@ -808,6 +840,8 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: None,
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
                                 });
                                 outputs.insert(node_id.clone(), out);
                                 propagate_edges(node_id, def, &mut reachable);
@@ -823,11 +857,22 @@ fn run_workflow_boxed<'a>(
                             Err(e) => {
                                 // SECURITY: HttpError strings are sanitized (no url/headers/secrets).
                                 let saved_usd = (accrued_baseline - accrued).max(0.0);
+                                let message = format!("http error: {e}");
+                                journal(NodeJournalEntry {
+                                    node_id: node_id.clone(),
+                                    status: "failed".into(),
+                                    output: None,
+                                    cost_usd: 0.0,
+                                    model_used: None,
+                                    error: Some(message.clone()),
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
+                                });
                                 // WF-9: attribute the Http-node failure to the node
                                 // before the terminal run.done.
                                 emit(WfEvent::NodeError {
                                     node_id: node_id.clone(),
-                                    message: format!("http error: {e}"),
+                                    message: message.clone(),
                                 });
                                 emit(WfEvent::RunDone {
                                     status: "failed".to_string(),
@@ -841,7 +886,7 @@ fn run_workflow_boxed<'a>(
                                     baseline_cost_usd: accrued_baseline,
                                     saved_usd,
                                     node_outputs: collected_outputs,
-                                    error: Some(format!("node \"{node_id}\": http error: {e}")),
+                                    error: Some(format!("node \"{node_id}\": {message}")),
                                 };
                             }
                         }
@@ -1016,6 +1061,8 @@ fn run_workflow_boxed<'a>(
                             cost_usd: loop_cost,
                             model_used: None,
                             error: None,
+                            started_at: node_started_at,
+                            finished_at: chrono::Utc::now(),
                         });
                         propagate_edges(node_id, def, &mut reachable);
                         emit(WfEvent::NodeDone {
@@ -1183,6 +1230,8 @@ fn run_workflow_boxed<'a>(
                             cost_usd: out.cost_usd,
                             model_used: None,
                             error: None,
+                            started_at: node_started_at,
+                            finished_at: chrono::Utc::now(),
                         });
                         outputs.insert(node_id.clone(), out);
                         propagate_edges(node_id, def, &mut reachable);
@@ -1225,6 +1274,8 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: Some(err.to_string()),
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
                                 });
                                 let out = NodeOutput {
                                     content: serde_json::Value::Null,
@@ -1272,6 +1323,8 @@ fn run_workflow_boxed<'a>(
                                 cost_usd: 0.0,
                                 model_used: None,
                                 error: None,
+                                started_at: node_started_at,
+                                finished_at: chrono::Utc::now(),
                             });
                             let out = NodeOutput {
                                 content,
@@ -1333,6 +1386,8 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: None,
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
                                 });
                                 NodeOutput {
                                     content,
@@ -1352,6 +1407,8 @@ fn run_workflow_boxed<'a>(
                                     cost_usd: 0.0,
                                     model_used: None,
                                     error: Some(err.to_string()),
+                                    started_at: node_started_at,
+                                    finished_at: chrono::Utc::now(),
                                 });
                                 NodeOutput {
                                     content: serde_json::Value::Null,
@@ -1990,6 +2047,9 @@ mod tests {
         // m1 and m2 each emit one journal entry (Trigger and Output do not).
         let node_ids: Vec<_> = journal_entries.iter().map(|e| e.node_id.as_str()).collect();
         assert_eq!(node_ids, vec!["m1", "m2"]);
+        assert!(journal_entries
+            .iter()
+            .all(|entry| entry.finished_at >= entry.started_at));
     }
 
     #[tokio::test]
@@ -3755,6 +3815,10 @@ mod tests {
             WfStatus::Failed,
             "run should fail due to HostNotAllowed"
         );
+        assert_eq!(journal_entries.len(), 1);
+        assert_eq!(journal_entries[0].node_id, "h");
+        assert_eq!(journal_entries[0].status, "failed");
+        assert!(journal_entries[0].finished_at >= journal_entries[0].started_at);
 
         // ---- SECURITY INVARIANT: "sekret-value" must NOT appear anywhere ----
 

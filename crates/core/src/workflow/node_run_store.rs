@@ -2,8 +2,9 @@
 //!
 //! Node rows do not carry an org id, so every read joins through the owning
 //! `workflow_runs` row and scopes that join to the authenticated org. The
-//! timestamps are persistence timestamps: the synchronous engine journal is
-//! flushed after execution, so callers must not present them as provider timing.
+//! New rows carry the gateway workflow-node envelope captured by the engine.
+//! Legacy rows have a null `finished_at`; their `started_at` is only the old
+//! post-run persistence timestamp. Neither form is provider-attempt timing.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row as _};
@@ -20,7 +21,8 @@ pub(crate) struct WorkflowNodeRunRecord {
     pub cost_usd: f64,
     pub model_used: Option<String>,
     pub error: Option<String>,
-    pub recorded_at: DateTime<Utc>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 /// Insert one terminal journal entry. A fresh UUID keeps retries idempotent only
@@ -28,20 +30,20 @@ pub(crate) struct WorkflowNodeRunRecord {
 /// completed node execution.
 pub(crate) const INSERT_NODE_RUN_SQL: &str = "\
 INSERT INTO workflow_node_runs \
-  (id, run_id, node_id, attempt, status, output, cost_usd, model_used, error) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+  (id, run_id, node_id, attempt, status, output, cost_usd, model_used, error, started_at, finished_at) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
 ON CONFLICT (id) DO NOTHING";
 
 /// List a bounded journal for one run.
 ///
 /// The join is the tenant boundary: `workflow_node_runs` predates an `org_id`
 /// column. Stable tie-breaking by row id makes repeated reads deterministic,
-/// while `started_at` preserves the order in which the post-run journal flush
-/// inserted the rows.
+/// while `started_at` preserves engine start order for new rows and post-run
+/// persistence order for legacy rows.
 pub(crate) const LIST_NODE_RUNS_FOR_RUN_SQL: &str = "\
 SELECT nr.id, nr.node_id, nr.attempt, nr.status, nr.output, \
        nr.cost_usd::float8 AS cost_usd, nr.model_used, nr.error, \
-       nr.started_at AS recorded_at \
+       nr.started_at, nr.finished_at \
 FROM workflow_node_runs AS nr \
 INNER JOIN workflow_runs AS wr ON wr.id = nr.run_id \
 WHERE nr.run_id = $1 AND wr.org_id = $2 \
@@ -58,7 +60,8 @@ fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowNodeRunRecord,
         cost_usd: row.try_get("cost_usd")?,
         model_used: row.try_get("model_used")?,
         error: row.try_get("error")?,
-        recorded_at: row.try_get("recorded_at")?,
+        started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
     })
 }
 
@@ -74,6 +77,8 @@ pub(crate) async fn insert_node_run(
     cost_usd: f64,
     model_used: Option<&str>,
     error: Option<&str>,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
 ) {
     let id = Uuid::new_v4();
     let result = sqlx::query(INSERT_NODE_RUN_SQL)
@@ -86,6 +91,8 @@ pub(crate) async fn insert_node_run(
         .bind(cost_usd)
         .bind(model_used)
         .bind(error)
+        .bind(started_at)
+        .bind(finished_at)
         .execute(pool)
         .await;
     if let Err(error) = result {
@@ -123,6 +130,7 @@ mod tests {
     #[test]
     fn insert_node_run_sql_has_conflict_guard() {
         assert!(INSERT_NODE_RUN_SQL.contains("INSERT INTO workflow_node_runs"));
+        assert!(INSERT_NODE_RUN_SQL.contains("started_at, finished_at"));
         assert!(INSERT_NODE_RUN_SQL.contains("ON CONFLICT (id) DO NOTHING"));
     }
 
@@ -134,5 +142,6 @@ mod tests {
         assert!(LIST_NODE_RUNS_FOR_RUN_SQL.contains("ORDER BY nr.started_at ASC, nr.id ASC"));
         assert!(LIST_NODE_RUNS_FOR_RUN_SQL.contains("LIMIT $3"));
         assert!(LIST_NODE_RUNS_FOR_RUN_SQL.contains("nr.cost_usd::float8"));
+        assert!(LIST_NODE_RUNS_FOR_RUN_SQL.contains("nr.started_at, nr.finished_at"));
     }
 }
