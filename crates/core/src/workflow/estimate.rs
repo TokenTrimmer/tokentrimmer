@@ -10,7 +10,10 @@
 //! - Route / Auto selections cannot be resolved statically; those nodes
 //!   contribute `None` + a warning.
 //! - Only `{{input}}` is substituted into prompts at estimate time (no prior
-//!   node outputs are available before the run).
+//!   node outputs are available before the run). Environment-bound estimates
+//!   also substitute their exact accepted `{{variables.NAME}}` snapshot.
+
+use std::collections::BTreeMap;
 
 use crate::routes::agent_run_budget::estimate_next_turn_cost;
 use crate::workflow::types::{ModelSelection, NodeKind, WorkflowDefinition};
@@ -62,7 +65,7 @@ impl std::fmt::Display for WorkflowBudgetAdmissionError {
             ),
             Self::DynamicPromptNodes { node_ids } => write!(
                 f,
-                "workflow budget preflight only supports {{{{input}}}} prompt references; node(s) use other template references: {}",
+                "workflow budget preflight supports only {{{{input}}}} and accepted {{{{variables.NAME}}}} prompt references; node(s) use other template references: {}",
                 node_ids.join(", ")
             ),
             Self::ToolBearingAgentNodes { node_ids } => write!(
@@ -99,6 +102,15 @@ impl std::fmt::Display for WorkflowBudgetAdmissionError {
 pub(crate) fn admit_budgeted_workflow(
     def: &WorkflowDefinition,
     inputs: &serde_json::Value,
+    max_cost_usd: Option<f64>,
+) -> Result<(), WorkflowBudgetAdmissionError> {
+    admit_budgeted_workflow_with_variables(def, inputs, &BTreeMap::new(), max_cost_usd)
+}
+
+pub(crate) fn admit_budgeted_workflow_with_variables(
+    def: &WorkflowDefinition,
+    inputs: &serde_json::Value,
+    variables: &BTreeMap<String, String>,
     max_cost_usd: Option<f64>,
 ) -> Result<(), WorkflowBudgetAdmissionError> {
     let Some(max_cost_usd) = max_cost_usd else {
@@ -142,7 +154,7 @@ pub(crate) fn admit_budgeted_workflow(
         .iter()
         .filter_map(|node| match &node.kind {
             NodeKind::Model { prompt, .. } | NodeKind::Agent { prompt, .. }
-                if has_non_input_template_ref(prompt) =>
+                if has_dynamic_template_ref(prompt, variables) =>
             {
                 Some(node.id.clone())
             }
@@ -189,7 +201,7 @@ pub(crate) fn admit_budgeted_workflow(
         })
         .collect();
 
-    let estimate = estimate_workflow(def, inputs);
+    let estimate = estimate_workflow_with_variables(def, inputs, variables);
     for node_id in estimate
         .per_node
         .iter()
@@ -255,6 +267,14 @@ pub struct WorkflowEstimate {
 ///
 /// Trigger / Transform / Branch / Output nodes are skipped (zero model cost).
 pub fn estimate_workflow(def: &WorkflowDefinition, inputs: &serde_json::Value) -> WorkflowEstimate {
+    estimate_workflow_with_variables(def, inputs, &BTreeMap::new())
+}
+
+pub fn estimate_workflow_with_variables(
+    def: &WorkflowDefinition,
+    inputs: &serde_json::Value,
+    variables: &BTreeMap<String, String>,
+) -> WorkflowEstimate {
     let mut per_node: Vec<NodeEstimate> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut projected_cost_usd = 0.0f64;
@@ -279,7 +299,7 @@ pub fn estimate_workflow(def: &WorkflowDefinition, inputs: &serde_json::Value) -
 
         match selection {
             ModelSelection::Model { model } => {
-                let subst = substitute_input(prompt, inputs);
+                let subst = substitute_static(prompt, inputs, variables);
                 let msg = Message::User {
                     content: MessageContent::Text(subst),
                     name: None,
@@ -334,7 +354,16 @@ pub fn estimate_workflow(def: &WorkflowDefinition, inputs: &serde_json::Value) -
 /// Replace `{{input}}` with the string representation of `inputs`.
 /// All other `{{ref}}` tokens resolve to `""` (no prior outputs available at
 /// estimate time).
+#[cfg(test)]
 fn substitute_input(template: &str, inputs: &serde_json::Value) -> String {
+    substitute_static(template, inputs, &BTreeMap::new())
+}
+
+fn substitute_static(
+    template: &str,
+    inputs: &serde_json::Value,
+    variables: &BTreeMap<String, String>,
+) -> String {
     let input_str = match inputs {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Null => String::new(),
@@ -352,6 +381,8 @@ fn substitute_input(template: &str, inputs: &serde_json::Value) -> String {
             let ref_str = remaining[..close].trim();
             let resolved = if ref_str == "input" {
                 input_str.clone()
+            } else if let Some(name) = ref_str.strip_prefix("variables.") {
+                variables.get(name).cloned().unwrap_or_default()
             } else {
                 String::new()
             };
@@ -371,14 +402,24 @@ fn substitute_input(template: &str, inputs: &serde_json::Value) -> String {
 /// than the sole supported static input reference. This deliberately mirrors
 /// [`substitute_input`]'s minimal scanner: an unclosed opener is literal text,
 /// and whitespace around `input` is accepted by both paths.
+#[cfg(test)]
 fn has_non_input_template_ref(template: &str) -> bool {
+    has_dynamic_template_ref(template, &BTreeMap::new())
+}
+
+fn has_dynamic_template_ref(template: &str, variables: &BTreeMap<String, String>) -> bool {
     let mut remaining = template;
     while let Some(open) = remaining.find("{{") {
         remaining = &remaining[open + 2..];
         let Some(close) = remaining.find("}}") else {
             return false;
         };
-        if remaining[..close].trim() != "input" {
+        let reference = remaining[..close].trim();
+        if reference != "input"
+            && !reference
+                .strip_prefix("variables.")
+                .is_some_and(|name| variables.contains_key(name))
+        {
             return true;
         }
         remaining = &remaining[close + 2..];
@@ -869,6 +910,27 @@ mod tests {
     fn substitute_input_unknown_ref_is_empty() {
         let result = substitute_input("{{other_node}} text", &json!("x"));
         assert_eq!(result, " text");
+    }
+
+    #[test]
+    fn environment_variables_are_static_for_estimation_and_budget_admission() {
+        let variables = BTreeMap::from([("REGION".into(), "us-east".into())]);
+        assert_eq!(
+            substitute_static(
+                "{{input}} in {{variables.REGION}}",
+                &json!("deploy"),
+                &variables,
+            ),
+            "deploy in us-east"
+        );
+        assert!(!has_dynamic_template_ref(
+            "{{input}} {{variables.REGION}}",
+            &variables,
+        ));
+        assert!(has_dynamic_template_ref(
+            "{{variables.MISSING}}",
+            &variables,
+        ));
     }
 
     #[test]

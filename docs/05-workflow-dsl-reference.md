@@ -9,7 +9,7 @@ run. Eligible terminal records can be minted on demand as signed estimates;
 they are not automatic per-step receipts or provider-invoice reconciliation.
 
 This page documents the DSL (the node types, the `ModelSelection`, edges,
-`allowed_hosts`, `secrets`), the CRUD + run API, and the SSE event shape. It's
+`allowed_hosts`, `secrets`, environment variables), the CRUD + run API, and the SSE event shape. It's
 grounded in `crates/core/src/workflow/types.rs` + `routes/workflows.rs`.
 
 ## The workflow definition
@@ -103,6 +103,14 @@ started by a human/API run. The two current invokers are:
   checks all of its references, and freezes those exact definitions for the
   run. A later child save therefore cannot swap an unchecked definition into
   the already-admitted run.
+- **Environment variables**: bounded, versioned, explicitly non-secret maps
+  managed separately for development, staging, and production. Use
+  `{{variables.NAME}}` in executable template fields. A direct
+  environment-bound run accepts one exact snapshot and passes it to the root
+  and all nested workflows; latest-version and exact-version runs have no map.
+  Missing or malformed references fail the whole frozen tree before the root
+  Trigger. Values are returned by the management API, so credentials must use
+  the encrypted `secrets` surface instead.
 
 ## API surface
 
@@ -116,11 +124,13 @@ started by a human/API run. The two current invokers are:
 | `GET /v1/workflows/:id/versions/:from/compare/:to` | Compare two exact versions as at most 256 deterministic value-free JSON Pointer changes, with explicit truncation and `private, no-store`. |
 | `GET /v1/workflows/:id/release-state` | Read the latest draft metadata plus at most one current value-free release pointer for each of development, staging, and production. |
 | `GET /v1/workflows/:id/environments/:environment/releases` | List at most 100 newest-first value-free release ledger rows for one environment, with explicit truncation. |
+| `GET /v1/workflows/:id/environments/:environment/variables` | Read the current versioned non-secret map; an unset environment is revision `0` with an empty map. |
+| `PUT /v1/workflows/:id/environments/:environment/variables` | Replace the complete bounded non-secret map under `expected_revision`; stale writers receive `409`. |
 | `POST /v1/workflows/:id/environments/development/publish` | Optimistically publish one exact retained draft version to development. |
 | `POST /v1/workflows/:id/environments/:environment/promote` | Optimistically copy the exact current development release to staging, or staging release to production. |
 | `POST /v1/workflows/:id/environments/:environment/rollback` | Optimistically append a rollback to a version previously released in that same environment. |
-| `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls). Mutually exclusive `workflow_version` and `workflow_environment` selectors choose an exact retained definition or exact current development/staging/production release; omission preserves latest-version behavior. |
-| `POST /v1/workflows/:id/runs` | Run synchronously. The same mutually exclusive version/environment selectors apply; environment-bound runs persist exact release revision provenance, while omission preserves latest-version behavior. Returns the run plus rolled-up `saved_usd`. |
+| `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls). Mutually exclusive `workflow_version` and `workflow_environment` selectors choose an exact retained definition or exact current development/staging/production release; environment selection also reports and applies the accepted variables revision. Omission preserves latest-version behavior. |
+| `POST /v1/workflows/:id/runs` | Run synchronously. The same mutually exclusive version/environment selectors apply; environment-bound runs persist exact release and variables revision provenance, while omission preserves latest-version behavior. Returns the run plus rolled-up `saved_usd`. |
 | `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
 | `GET /v1/workflows/runs/:run_id` | Read one org-scoped durable run, its immutable definition version, and optional exact environment/release-revision provenance. |
 | `GET /v1/workflows/runs/:run_id/nodes` | Read up to 500 best-effort node-journal rows, labeled from the exact executed definition. New rows include gateway node-envelope timing; legacy rows expose only post-run persistence time. Neither is provider-attempt timing or replay. |
@@ -137,6 +147,12 @@ selects an exact newer version, staging/production can only copy the exact curre
 lower environment, and rollback can only restore a version already present in
 that environment's history. These transitions do not imply human approval and
 do not silently alter legacy latest-version execution.
+
+Environment configuration is a second revisioned pointer rather than part of
+the immutable definition or release ledger. This lets an accepted run retain
+both the exact code release and exact non-secret configuration revision without
+rewriting either history. Streaming `run.start`, synchronous responses,
+idempotent replays, and durable run reads expose the paired revisions.
 
 ## SSE events (a run's streaming surface)
 

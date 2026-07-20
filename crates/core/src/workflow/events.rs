@@ -21,6 +21,7 @@ pub(crate) enum WorkflowRunStartEnvironment {
 pub(crate) struct WorkflowRunStartRelease {
     pub(crate) environment: WorkflowRunStartEnvironment,
     pub(crate) revision: i32,
+    pub(crate) variables_revision: i32,
 }
 
 /// One server-sent event from a streaming workflow run.
@@ -158,6 +159,7 @@ mod tests {
             workflow_release: Some(WorkflowRunStartRelease {
                 environment: WorkflowRunStartEnvironment::Production,
                 revision: 3,
+                variables_revision: 2,
             }),
         };
         let val = serde_json::to_value(&ev).unwrap();
@@ -166,6 +168,7 @@ mod tests {
         assert_eq!(val["workflow_version"], 7);
         assert_eq!(val["workflow_release"]["environment"], "production");
         assert_eq!(val["workflow_release"]["revision"], 3);
+        assert_eq!(val["workflow_release"]["variables_revision"], 2);
         let _ = ev.to_sse();
 
         let stored = WfEvent::RunStart {

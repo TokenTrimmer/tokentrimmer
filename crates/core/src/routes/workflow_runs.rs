@@ -51,6 +51,7 @@ pub struct WorkflowRunView {
     pub version: i32,
     pub workflow_environment: Option<&'static str>,
     pub release_revision: Option<i32>,
+    pub variables_revision: Option<i32>,
     pub status: String,
     pub inputs: Option<serde_json::Value>,
     pub cost_usd: f64,
@@ -71,6 +72,7 @@ impl From<WorkflowRunRecord> for WorkflowRunView {
             version: record.version,
             workflow_environment: release.map(|release| release.environment.as_str()),
             release_revision: release.map(|release| release.revision),
+            variables_revision: release.map(|release| release.variables_revision),
             status: record.status,
             inputs: record.inputs,
             cost_usd: record.cost_usd,
@@ -418,6 +420,7 @@ mod tests {
             release: Some(WorkflowRunReleaseProvenance {
                 environment: WorkflowEnvironment::Production,
                 revision: 3,
+                variables_revision: 2,
             }),
             status: "completed".into(),
             inputs: Some(serde_json::json!({})),
@@ -433,5 +436,6 @@ mod tests {
         assert_eq!(view.version, 7);
         assert_eq!(view.workflow_environment, Some("production"));
         assert_eq!(view.release_revision, Some(3));
+        assert_eq!(view.variables_revision, Some(2));
     }
 }

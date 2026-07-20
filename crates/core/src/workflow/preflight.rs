@@ -5,7 +5,7 @@
 //! exact definitions prevents a latest-version change between preflight and
 //! execution from bypassing the check.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use sqlx::{PgPool, Row as _};
 use tt_shared::context::SecretString;
@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 
 use super::{
+    environment_variables::required_variable_names,
     executor::NodeExecutor,
     secrets::required_secret_names,
     types::{NodeKind, WorkflowDefinition},
@@ -91,11 +92,13 @@ pub(crate) async fn prepare_workflow_tree(
     executor: &dyn NodeExecutor,
     root: &WorkflowDefinition,
     secrets: &HashMap<String, SecretString>,
+    variables: &BTreeMap<String, String>,
     root_depth: u32,
     max_depth: u32,
 ) -> Result<PreparedWorkflowTree, String> {
-    let mut required = BTreeSet::new();
-    collect_required_names(root, &mut required)?;
+    let mut required_secrets = BTreeSet::new();
+    let mut required_variables = BTreeSet::new();
+    collect_required_names(root, &mut required_secrets, &mut required_variables)?;
 
     let mut definitions = HashMap::new();
     let mut seen = HashSet::from([root.id]);
@@ -133,7 +136,7 @@ pub(crate) async fn prepare_workflow_tree(
             if definition.id != id {
                 return Err("workflow secret preflight failed: nested workflow id mismatch".into());
             }
-            collect_required_names(&definition, &mut required)?;
+            collect_required_names(&definition, &mut required_secrets, &mut required_variables)?;
             if child_depth < max_depth {
                 next.extend(referenced_workflow_ids(&definition));
             }
@@ -143,7 +146,7 @@ pub(crate) async fn prepare_workflow_tree(
         child_depth = child_depth.saturating_add(1);
     }
 
-    let missing = required
+    let missing = required_secrets
         .into_iter()
         .filter(|name| !secrets.contains_key(name))
         .collect::<Vec<_>>();
@@ -154,20 +157,43 @@ pub(crate) async fn prepare_workflow_tree(
         ));
     }
 
+    let missing = required_variables
+        .into_iter()
+        .filter(|name| !variables.contains_key(name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "workflow variable preflight failed: missing environment variable(s): {}",
+            missing.join(", ")
+        ));
+    }
+
     Ok(PreparedWorkflowTree { definitions })
 }
 
 fn collect_required_names(
     definition: &WorkflowDefinition,
-    required: &mut BTreeSet<String>,
+    required_secrets: &mut BTreeSet<String>,
+    required_variables: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     match required_secret_names(definition) {
         Ok(names) => {
-            required.extend(names);
+            required_secrets.extend(names);
+        }
+        Err(errors) => {
+            return Err(format!(
+                "workflow secret preflight failed: {}",
+                errors.join("; ")
+            ));
+        }
+    }
+    match required_variable_names(definition) {
+        Ok(names) => {
+            required_variables.extend(names);
             Ok(())
         }
         Err(errors) => Err(format!(
-            "workflow secret preflight failed: {}",
+            "workflow variable preflight failed: {}",
             errors.join("; ")
         )),
     }
@@ -380,6 +406,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recursive_missing_variable_fails_before_parent_intelligence() {
+        let root_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let child = definition(
+            child_id,
+            vec![
+                Node {
+                    id: "trigger".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "transform".into(),
+                    kind: NodeKind::Transform {
+                        expr: "{{variables.NESTED_REGION}}".into(),
+                    },
+                },
+            ],
+            vec![Edge {
+                from: "trigger".into(),
+                to: "transform".into(),
+                map: None,
+            }],
+        );
+        let root = definition(
+            root_id,
+            vec![
+                Node {
+                    id: "trigger".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "parent_model".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "stub".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_output_tokens: None,
+                        max_cost_usd: None,
+                    },
+                },
+                Node {
+                    id: "child".into(),
+                    kind: NodeKind::SubWorkflow {
+                        workflow_id: child_id,
+                        version: None,
+                    },
+                },
+            ],
+            vec![
+                Edge {
+                    from: "trigger".into(),
+                    to: "parent_model".into(),
+                    map: None,
+                },
+                Edge {
+                    from: "parent_model".into(),
+                    to: "child".into(),
+                    map: None,
+                },
+            ],
+        );
+        let executor = RecordingExecutor {
+            definitions: HashMap::from([(child_id, child)]),
+            loads: AtomicUsize::new(0),
+            intelligence_calls: AtomicUsize::new(0),
+        };
+
+        let result = run_workflow(
+            &executor,
+            &root,
+            &json!("input"),
+            None,
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Failed);
+        assert_eq!(result.cost_usd, 0.0);
+        assert_eq!(executor.intelligence_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.loads.load(Ordering::SeqCst), 1);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("NESTED_REGION")));
+    }
+
+    #[tokio::test]
     async fn prepared_child_definition_is_loaded_once_and_reused() {
         let root_id = Uuid::new_v4();
         let child_id = Uuid::new_v4();
@@ -475,10 +594,13 @@ mod tests {
             intelligence_calls: AtomicUsize::new(0),
         };
 
-        let error = match prepare_workflow_tree(&executor, &root, &HashMap::new(), 0, 5).await {
-            Ok(_) => panic!("fan-out beyond the preparation bound must fail"),
-            Err(error) => error,
-        };
+        let error =
+            match prepare_workflow_tree(&executor, &root, &HashMap::new(), &BTreeMap::new(), 0, 5)
+                .await
+            {
+                Ok(_) => panic!("fan-out beyond the preparation bound must fail"),
+                Err(error) => error,
+            };
 
         assert!(error.contains("nested definition limit exceeded (256)"));
         assert_eq!(executor.loads.load(Ordering::SeqCst), 0);

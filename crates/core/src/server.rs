@@ -265,6 +265,11 @@ pub fn build_router_with_retrieval(
             get(routes::workflow_releases::list_release_history),
         )
         .route(
+            "/v1/workflows/:id/environments/:environment/variables",
+            get(routes::workflow_variables::get_environment_variables)
+                .put(routes::workflow_variables::replace_environment_variables),
+        )
+        .route(
             "/v1/workflows/:id/environments/development/publish",
             post(routes::workflow_releases::publish_development),
         )

@@ -58,10 +58,10 @@
 //! - The topo order is defensive: if validate somehow missed a cycle the engine
 //!   returns `WfStatus::Failed` rather than looping.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc,
+    Arc, LazyLock,
 };
 
 use futures::future::BoxFuture;
@@ -71,6 +71,7 @@ use uuid::Uuid;
 use crate::routes::agent_run_budget::budget_reached;
 use crate::workflow::distill_cache::{CachedDistill, DistillCacheKey};
 pub(crate) use crate::workflow::distill_cache::{DistillCacheStore, FlowDocDistillCache, NoCache};
+use crate::workflow::environment_variables::required_variable_names;
 use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{reservation_cost_usd, IntelligenceSpec, NodeExecutor};
 use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
@@ -140,12 +141,45 @@ const MAX_SUBWORKFLOW_DEPTH: u32 = 5;
 /// 50-node, depth-3, 10-iter workflow uses ≤ 5 050 nodes. Adjust upward if
 /// product requirements change.
 const MAX_TOTAL_NODE_EXECUTIONS: u32 = 10_000;
+static EMPTY_WORKFLOW_VARIABLES: LazyLock<BTreeMap<String, String>> = LazyLock::new(BTreeMap::new);
 
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
-/// Run a validated [`WorkflowDefinition`] to completion.
+/// Run a validated [`WorkflowDefinition`] without environment variables.
+/// Environment-bound callers use [`run_workflow_with_variables`] so an exact
+/// accepted configuration snapshot is threaded through the whole run tree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_workflow<'a>(
+    executor: &'a dyn NodeExecutor,
+    def: &'a WorkflowDefinition,
+    inputs: &'a serde_json::Value,
+    run_max_cost_usd: Option<f64>,
+    journal: impl FnMut(NodeJournalEntry) + Send + 'a,
+    events: Option<&'a tokio::sync::mpsc::UnboundedSender<WfEvent>>,
+    secrets: &'a HashMap<String, SecretString>,
+    depth: u32,
+    ancestors: &'a [Uuid],
+    cache: &'a dyn DistillCacheStore,
+) -> BoxFuture<'a, WorkflowRunResult> {
+    run_workflow_with_variables(
+        executor,
+        def,
+        inputs,
+        run_max_cost_usd,
+        journal,
+        events,
+        secrets,
+        &EMPTY_WORKFLOW_VARIABLES,
+        depth,
+        ancestors,
+        cache,
+    )
+}
+
+/// Run a validated [`WorkflowDefinition`] to completion with an immutable map
+/// of non-secret environment variables accepted by the route.
 ///
 /// `executor` provides the Model/Agent node bridge to the gateway.
 /// `inputs` is the workflow's trigger payload.
@@ -161,7 +195,7 @@ const MAX_TOTAL_NODE_EXECUTIONS: u32 = 10_000;
 /// Boxes the journal to type-erase it before delegating to
 /// [`run_workflow_boxed`], which is the concrete (non-generic) recursive impl.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_workflow<'a>(
+pub(crate) fn run_workflow_with_variables<'a>(
     executor: &'a dyn NodeExecutor,
     def: &'a WorkflowDefinition,
     inputs: &'a serde_json::Value,
@@ -169,6 +203,7 @@ pub(crate) fn run_workflow<'a>(
     journal: impl FnMut(NodeJournalEntry) + Send + 'a,
     events: Option<&'a tokio::sync::mpsc::UnboundedSender<WfEvent>>,
     secrets: &'a HashMap<String, SecretString>,
+    variables: &'a BTreeMap<String, String>,
     depth: u32,
     ancestors: &'a [Uuid],
     cache: &'a dyn DistillCacheStore,
@@ -177,29 +212,36 @@ pub(crate) fn run_workflow<'a>(
         // Load, secret-check, and freeze every nested definition before the
         // root Trigger or any parent work. Runtime recursion reuses this exact
         // tree, avoiding a latest-version race after preflight.
-        let prepared =
-            match prepare_workflow_tree(executor, def, secrets, depth, MAX_SUBWORKFLOW_DEPTH).await
-            {
-                Ok(tree) => Arc::new(tree),
-                Err(error) => {
-                    if let Some(tx) = events {
-                        let _ = tx.send(WfEvent::RunDone {
-                            status: "failed".to_string(),
-                            cost_usd: 0.0,
-                            baseline_cost_usd: 0.0,
-                            saved_usd: 0.0,
-                        });
-                    }
-                    return WorkflowRunResult {
-                        status: WfStatus::Failed,
+        let prepared = match prepare_workflow_tree(
+            executor,
+            def,
+            secrets,
+            variables,
+            depth,
+            MAX_SUBWORKFLOW_DEPTH,
+        )
+        .await
+        {
+            Ok(tree) => Arc::new(tree),
+            Err(error) => {
+                if let Some(tx) = events {
+                    let _ = tx.send(WfEvent::RunDone {
+                        status: "failed".to_string(),
                         cost_usd: 0.0,
                         baseline_cost_usd: 0.0,
                         saved_usd: 0.0,
-                        node_outputs: vec![],
-                        error: Some(error),
-                    };
+                    });
                 }
-            };
+                return WorkflowRunResult {
+                    status: WfStatus::Failed,
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                    node_outputs: vec![],
+                    error: Some(error),
+                };
+            }
+        };
 
         // Seed a fresh execution counter at the root. The Arc is cloned into
         // every recursive call so all nested loops and sub-workflows draw from
@@ -213,6 +255,7 @@ pub(crate) fn run_workflow<'a>(
             Box::new(journal),
             events,
             secrets,
+            variables,
             prepared,
             depth,
             ancestors,
@@ -237,6 +280,7 @@ fn run_workflow_boxed<'a>(
     journal: Box<dyn FnMut(NodeJournalEntry) + Send + 'a>,
     events: Option<&'a tokio::sync::mpsc::UnboundedSender<WfEvent>>,
     secrets: &'a HashMap<String, SecretString>,
+    variables: &'a BTreeMap<String, String>,
     prepared: Arc<PreparedWorkflowTree>,
     depth: u32,
     ancestors: &'a [Uuid],
@@ -298,6 +342,53 @@ fn run_workflow_boxed<'a>(
                 error: Some(format!(
                     "workflow secret preflight failed: missing or unusable secret(s): {}",
                     missing_secrets.join(", ")
+                )),
+            };
+        }
+
+        // ---- 1b. Defense-in-depth local variable preflight -----------------
+        let required_variables = match required_variable_names(def) {
+            Ok(names) => names,
+            Err(errors) => {
+                emit(WfEvent::RunDone {
+                    status: "failed".to_string(),
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                });
+                return WorkflowRunResult {
+                    status: WfStatus::Failed,
+                    cost_usd: 0.0,
+                    baseline_cost_usd: 0.0,
+                    saved_usd: 0.0,
+                    node_outputs: vec![],
+                    error: Some(format!(
+                        "workflow variable preflight failed: {}",
+                        errors.join("; ")
+                    )),
+                };
+            }
+        };
+        let missing_variables = required_variables
+            .into_iter()
+            .filter(|name| !variables.contains_key(name))
+            .collect::<Vec<_>>();
+        if !missing_variables.is_empty() {
+            emit(WfEvent::RunDone {
+                status: "failed".to_string(),
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+            });
+            return WorkflowRunResult {
+                status: WfStatus::Failed,
+                cost_usd: 0.0,
+                baseline_cost_usd: 0.0,
+                saved_usd: 0.0,
+                node_outputs: vec![],
+                error: Some(format!(
+                    "workflow variable preflight failed: missing environment variable(s): {}",
+                    missing_variables.join(", ")
                 )),
             };
         }
@@ -487,7 +578,7 @@ fn run_workflow_boxed<'a>(
                                 node_id.clone(),
                                 IntelligenceSpec {
                                     selection: selection.clone(),
-                                    prompt: substitute(prompt, &trigger_id, &outputs),
+                                    prompt: substitute(prompt, &trigger_id, &outputs, variables),
                                     tools: vec![],
                                     max_turns: 1,
                                     max_output_tokens: *max_output_tokens,
@@ -528,7 +619,7 @@ fn run_workflow_boxed<'a>(
                                 node_id.clone(),
                                 IntelligenceSpec {
                                     selection: selection.clone(),
-                                    prompt: substitute(prompt, &trigger_id, &outputs),
+                                    prompt: substitute(prompt, &trigger_id, &outputs, variables),
                                     tools: tools.clone(),
                                     max_turns: max_turns.unwrap_or(DEFAULT_MAX_TURNS),
                                     max_output_tokens: *max_output_tokens,
@@ -769,7 +860,7 @@ fn run_workflow_boxed<'a>(
 
                     // ---------------------------------------------------------------
                     NodeKind::Transform { expr } => {
-                        let value = substitute(expr, &trigger_id, &outputs);
+                        let value = substitute(expr, &trigger_id, &outputs, variables);
                         let out = NodeOutput {
                             content: serde_json::Value::String(value.clone()),
                             cost_usd: 0.0,
@@ -805,7 +896,7 @@ fn run_workflow_boxed<'a>(
                         when_true,
                         when_false,
                     } => {
-                        let taken = if eval_cond(cond, &trigger_id, &outputs) {
+                        let taken = if eval_cond(cond, &trigger_id, &outputs, variables) {
                             when_true.clone()
                         } else {
                             when_false.clone()
@@ -872,8 +963,13 @@ fn run_workflow_boxed<'a>(
                         // {{secrets.NAME}} refs resolve to real values on the wire spec.
                         // The resulting HttpReqSpec may contain secret values and MUST NOT
                         // be written to any journal, NodeOutput.content, or error string.
-                        let sub_url =
-                            wf_http::substitute_with_secrets(url, &trigger_id, &outputs, secrets);
+                        let sub_url = wf_http::substitute_with_secrets(
+                            url,
+                            &trigger_id,
+                            &outputs,
+                            secrets,
+                            variables,
+                        );
                         let sub_headers: Vec<(String, String)> = headers
                             .iter()
                             .map(|(k, v)| {
@@ -884,12 +980,19 @@ fn run_workflow_boxed<'a>(
                                         &trigger_id,
                                         &outputs,
                                         secrets,
+                                        variables,
                                     ),
                                 )
                             })
                             .collect();
                         let sub_body = body.as_ref().map(|b| {
-                            wf_http::substitute_with_secrets(b, &trigger_id, &outputs, secrets)
+                            wf_http::substitute_with_secrets(
+                                b,
+                                &trigger_id,
+                                &outputs,
+                                secrets,
+                                variables,
+                            )
                         });
 
                         let spec = HttpReqSpec {
@@ -1060,7 +1163,7 @@ fn run_workflow_boxed<'a>(
                                 break;
                             }
                             // Cond checked BEFORE body (while-semantics).
-                            if !eval_cond(cond, &trigger_id, &outputs) {
+                            if !eval_cond(cond, &trigger_id, &outputs, variables) {
                                 break;
                             }
                             let remaining =
@@ -1075,6 +1178,7 @@ fn run_workflow_boxed<'a>(
                                 Box::new(|e: NodeJournalEntry| journal(e)),
                                 None,
                                 secrets,
+                                variables,
                                 Arc::clone(&child_prepared),
                                 depth + 1,
                                 &child_ancestors,
@@ -1262,6 +1366,7 @@ fn run_workflow_boxed<'a>(
                             Box::new(|e: NodeJournalEntry| journal(e)),
                             events,
                             secrets,
+                            variables,
                             child_prepared,
                             depth + 1,
                             &child_ancestors,
@@ -1393,7 +1498,7 @@ fn run_workflow_boxed<'a>(
                         // the org_id + scopes its get/upsert to that org.
                         let caller_key = cache_key
                             .as_ref()
-                            .map(|k| substitute(k, &trigger_id, &outputs));
+                            .map(|k| substitute(k, &trigger_id, &outputs, variables));
                         let content_hash = blake3::hash(data_b64.as_bytes()).to_hex().to_string();
                         let key = DistillCacheKey {
                             content_hash,
@@ -1650,7 +1755,12 @@ fn propagate_edges(node_id: &str, def: &WorkflowDefinition, reachable: &mut Hash
 
 /// Substitute `{{...}}` references in `template` using the accumulated node
 /// outputs.  `trigger_id` is the canonical name for the `{{input}}` alias.
-fn substitute(template: &str, trigger_id: &str, outputs: &HashMap<String, NodeOutput>) -> String {
+fn substitute(
+    template: &str,
+    trigger_id: &str,
+    outputs: &HashMap<String, NodeOutput>,
+    variables: &BTreeMap<String, String>,
+) -> String {
     let mut result = String::with_capacity(template.len() + 16);
     let mut remaining = template;
 
@@ -1660,7 +1770,7 @@ fn substitute(template: &str, trigger_id: &str, outputs: &HashMap<String, NodeOu
 
         if let Some(close) = remaining.find("}}") {
             let ref_str = remaining[..close].trim();
-            let resolved = resolve_ref(ref_str, trigger_id, outputs);
+            let resolved = resolve_ref(ref_str, trigger_id, outputs, variables);
             result.push_str(&resolved);
             remaining = &remaining[close + 2..];
         } else {
@@ -1682,7 +1792,12 @@ fn substitute(template: &str, trigger_id: &str, outputs: &HashMap<String, NodeOu
 ///   Secrets are resolved exclusively in `wf_http::substitute_with_secrets` so
 ///   that Model/Agent prompts, Transform exprs, and Branch conditions are always
 ///   secret-free.
-fn resolve_ref(ref_str: &str, trigger_id: &str, outputs: &HashMap<String, NodeOutput>) -> String {
+fn resolve_ref(
+    ref_str: &str,
+    trigger_id: &str,
+    outputs: &HashMap<String, NodeOutput>,
+    variables: &BTreeMap<String, String>,
+) -> String {
     // Split on the first `.` to allow `node.field`.
     let (node_part, field_part) = match ref_str.find('.') {
         Some(pos) => (&ref_str[..pos], Some(&ref_str[pos + 1..])),
@@ -1695,6 +1810,12 @@ fn resolve_ref(ref_str: &str, trigger_id: &str, outputs: &HashMap<String, NodeOu
     // "the secret is an empty string").
     if node_part == "secrets" {
         return "***".to_string();
+    }
+    if node_part == "variables" {
+        return field_part
+            .and_then(|name| variables.get(name))
+            .cloned()
+            .unwrap_or_default();
     }
 
     // `{{input}}` is an alias for the Trigger node.
@@ -1741,23 +1862,28 @@ fn json_to_string(v: &serde_json::Value) -> String {
 /// - `{{ref}} != "literal"` — string inequality.
 /// - `{{ref}}` — truthiness: non-empty / non-`"false"` / non-`"null"` /
 ///   non-`"0"` string.
-fn eval_cond(cond: &str, trigger_id: &str, outputs: &HashMap<String, NodeOutput>) -> bool {
+fn eval_cond(
+    cond: &str,
+    trigger_id: &str,
+    outputs: &HashMap<String, NodeOutput>,
+    variables: &BTreeMap<String, String>,
+) -> bool {
     let cond = cond.trim();
 
     if let Some((lhs, rhs)) = cond.split_once(" == ") {
-        let lhs_val = substitute(lhs.trim(), trigger_id, outputs);
+        let lhs_val = substitute(lhs.trim(), trigger_id, outputs, variables);
         let rhs_val = strip_quotes(rhs.trim());
         return lhs_val == rhs_val;
     }
 
     if let Some((lhs, rhs)) = cond.split_once(" != ") {
-        let lhs_val = substitute(lhs.trim(), trigger_id, outputs);
+        let lhs_val = substitute(lhs.trim(), trigger_id, outputs, variables);
         let rhs_val = strip_quotes(rhs.trim());
         return lhs_val != rhs_val;
     }
 
     // Truthiness fallback.
-    let resolved = substitute(cond, trigger_id, outputs);
+    let resolved = substitute(cond, trigger_id, outputs, variables);
     is_truthy(&resolved)
 }
 
@@ -2371,7 +2497,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(substitute("hello {{input}}", "t", &outputs), "hello world");
+        assert_eq!(
+            substitute("hello {{input}}", "t", &outputs, &BTreeMap::new()),
+            "hello world"
+        );
     }
 
     #[test]
@@ -2384,13 +2513,37 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(substitute("{{n1.answer}}", "t", &outputs), "42");
+        assert_eq!(
+            substitute("{{n1.answer}}", "t", &outputs, &BTreeMap::new()),
+            "42"
+        );
     }
 
     #[test]
     fn substitute_missing_ref_is_empty() {
         let outputs = HashMap::new();
-        assert_eq!(substitute("{{missing}}", "t", &outputs), "");
+        assert_eq!(
+            substitute("{{missing}}", "t", &outputs, &BTreeMap::new()),
+            ""
+        );
+    }
+
+    #[test]
+    fn substitute_resolves_exact_environment_variable() {
+        let variables = BTreeMap::from([("REGION".into(), "us-east".into())]);
+        assert_eq!(
+            substitute(
+                "deploy {{variables.REGION}}",
+                "t",
+                &HashMap::new(),
+                &variables,
+            ),
+            "deploy us-east"
+        );
+        assert_eq!(
+            substitute("{{variables.MISSING}}", "t", &HashMap::new(), &variables,),
+            ""
+        );
     }
 
     #[test]
@@ -2403,7 +2556,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(eval_cond(r#"{{input}} == "yes""#, "t", &outputs));
+        assert!(eval_cond(
+            r#"{{input}} == "yes""#,
+            "t",
+            &outputs,
+            &BTreeMap::new()
+        ));
     }
 
     #[test]
@@ -2416,7 +2574,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!eval_cond(r#"{{input}} == "yes""#, "t", &outputs));
+        assert!(!eval_cond(
+            r#"{{input}} == "yes""#,
+            "t",
+            &outputs,
+            &BTreeMap::new()
+        ));
     }
 
     #[test]
@@ -2429,7 +2592,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(eval_cond("{{input}}", "t", &outputs));
+        assert!(eval_cond("{{input}}", "t", &outputs, &BTreeMap::new()));
     }
 
     #[test]
@@ -2442,7 +2605,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!eval_cond("{{input}}", "t", &outputs));
+        assert!(!eval_cond("{{input}}", "t", &outputs, &BTreeMap::new()));
     }
 
     // ---- Task 4: engine sums baseline + computes saved ----------------------
@@ -3813,14 +3976,14 @@ mod tests {
         let outputs = HashMap::new();
 
         // `{{secrets.K}}` → "***" (explicit redaction marker, not the secret).
-        let result = substitute("text {{secrets.K}} more", "t", &outputs);
+        let result = substitute("text {{secrets.K}} more", "t", &outputs, &BTreeMap::new());
         assert_eq!(
             result, "text *** more",
             "shared substitute must redact secrets.* refs; got: {result}"
         );
 
         // `{{secrets}}` (no dot) → "***".
-        let result2 = substitute("{{secrets}}", "t", &outputs);
+        let result2 = substitute("{{secrets}}", "t", &outputs, &BTreeMap::new());
         assert_eq!(
             result2, "***",
             "shared substitute must redact bare {{secrets}}; got: {result2}"

@@ -2528,6 +2528,57 @@ automatic trigger activation and attributable approval remain separate gates.
 
 ---
 
+#### Workflow environment variables — versioned non-secret configuration
+
+`GET` and `PUT /v1/workflows/:id/environments/:environment/variables` manage
+one independently versioned configuration map for `development`, `staging`,
+or `production`. This is explicitly a **non-secret** surface: management reads
+return the values. Credentials belong in the encrypted workflow-secrets API.
+Responses use `Cache-Control: private, no-store`.
+
+An environment without a stored snapshot returns the implicit empty revision:
+
+```json
+{
+  "object": "workflow_environment_variables",
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "environment": "production",
+  "revision": 0,
+  "variables": {},
+  "updated_at": null
+}
+```
+
+`PUT` replaces the complete map under an optimistic `expected_revision`:
+
+```json
+{
+  "expected_revision": 0,
+  "variables": {
+    "API_BASE": "https://api.example.com/v2",
+    "REGION": "us-east"
+  }
+}
+```
+
+Names must match `^[A-Z0-9_]{1,64}$`. A set contains at most 100 entries,
+each value at most 4,096 UTF-8 bytes, and at most 65,536 encoded bytes in
+total. Unknown request fields and unknown environments are rejected. A stale
+revision returns `409`; an exact retry of the current value is idempotent.
+Each successful change appends an immutable snapshot and advances only the
+selected environment's current pointer.
+
+Executable template fields may bind `{{variables.NAME}}`. An environment-bound
+Estimate/Run accepts the current immutable variable snapshot independently of
+the release pointer and reports its exact revision. Before an execution starts,
+the gateway validates every variable reference in the bounded, frozen nested
+workflow tree and fails at zero cost if a required name is absent. A latest- or
+exact-version run has no environment snapshot, so definitions containing these
+references fail closed on those execution paths. The accepted map applies to
+the root and every nested workflow in that run.
+
+---
+
 #### `POST /v1/workflows/:id/estimate` — pre-run cost projection
 
 Returns a static cost projection without making model calls. By default it
@@ -2558,6 +2609,7 @@ execution.
   "workflow_version": 3,
   "workflow_environment": "production",
   "release_revision": 2,
+  "variables_revision": 4,
   "projected_cost_usd": 0.0012,
   "per_node": [
     { "node_id": "summarise", "model": "claude-3-5-haiku-20241022", "cost_usd": 0.0008 },
@@ -2581,7 +2633,8 @@ key). The first accepted request binds the key to its immutable workflow
 version, canonical JSON inputs, max_cost_usd request option, and explicit
 environment selector when supplied. A retry with changed inputs, cost, explicit
 version, or environment receives 409. Repeating the same environment selector
-reuses the version accepted first even if that pointer has since advanced.
+reuses the release and variables revisions accepted first even if either current
+pointer has since advanced.
 Legacy retries without `workflow_environment` preserve their pre-existing
 fingerprint and behavior. Clients without Idempotency-Key retain the historical
 behavior: every request creates a fresh run.
@@ -2616,6 +2669,7 @@ without starting a second run.
   "workflow_version": 3,
   "workflow_environment": "production",
   "release_revision": 2,
+  "variables_revision": 4,
   "status": "completed",
   "cost_usd": 0.00312,
   "baseline_cost_usd": 0.00480,
@@ -2636,6 +2690,7 @@ without starting a second run.
 | `workflow_version` | integer | Exact immutable definition version that executed. |
 | `workflow_environment` | string | Present only when the caller selected an environment; the closed development/staging/production value resolved before execution. |
 | `release_revision` | integer | Present with `workflow_environment`; exact immutable release-ledger revision bound to the run. |
+| `variables_revision` | integer | Present with `workflow_environment`; exact immutable non-secret configuration snapshot accepted by the run. `0` is the implicit empty set. |
 | `status` | string | Terminal status of the run (see values below). |
 | `cost_usd` | number | Total served cost (USD) across all nodes in this run. |
 | `baseline_cost_usd` | number | What the run would have cost without routing — sum of per-node baseline costs (the default/first-ranked model's price). Zero when no model nodes executed. |
@@ -2645,12 +2700,12 @@ without starting a second run.
 With `"stream": true`, the response is a named SSE stream. Before any node
 event or provider work, `run.start` carries the run id and exact accepted
 immutable definition version. An environment-bound run additionally carries a
-single nested `workflow_release` object, so environment and release revision
-cannot be separated on the wire:
+single nested `workflow_release` object, so environment plus release and
+variables revisions cannot be separated on the wire:
 
 ```text
 event: run.start
-data: {"type":"run.start","run_id":"550e8400-e29b-41d4-a716-446655440000","workflow_version":3,"workflow_release":{"environment":"production","revision":2}}
+data: {"type":"run.start","run_id":"550e8400-e29b-41d4-a716-446655440000","workflow_version":3,"workflow_release":{"environment":"production","revision":2,"variables_revision":4}}
 ```
 
 Selector-free and exact-version streams omit `workflow_release`. Clients should
@@ -2664,7 +2719,8 @@ Idempotent-Replay: true header and a replayed: true response field. It is a
 status/reconciliation response, so node_outputs is empty; use
 GET /v1/workflows/runs/:run_id for the durable run status. It never executes
 the graph again. Recent-run and single-run reads likewise expose
-`workflow_environment` plus `release_revision` only for environment-bound runs;
+`workflow_environment`, `release_revision`, and `variables_revision` only for
+environment-bound runs;
 legacy latest/exact-version rows retain null provenance.
 
 #### `GET /v1/workflows/runs/:run_id/nodes` — inspect the retained node journal
@@ -2872,7 +2928,7 @@ Deleting a referenced name takes effect immediately. Every retained workflow
 version and durable trigger that starts a run loads and checks the complete
 executable nested-definition tree before the root Trigger or any parent node.
 The run fails at zero cost if any checked definition has a malformed, missing,
-or unusable reference. The preparation is bounded to 256 nested definitions
+or unusable secret or environment-variable reference. The preparation is bounded to 256 nested definitions
 through the five supported depth levels, uses org-scoped depth-batch reads, and
 reuses those exact loaded definitions during execution so a newer saved child
 cannot bypass the check. Recreate the same name with `POST` to restore future

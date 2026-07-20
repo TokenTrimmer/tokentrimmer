@@ -32,6 +32,7 @@ use axum::{
 };
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tt_auth::ApiKeyContext;
 use uuid::Uuid;
 
@@ -41,6 +42,7 @@ use crate::{
     workflow::{
         self,
         engine::{self, WfStatus},
+        environment_variables::get_current_variables,
         estimate,
         events::{WfEvent, WorkflowRunStartEnvironment, WorkflowRunStartRelease},
         executor::GatewayNodeExecutor,
@@ -106,6 +108,23 @@ fn admit_workflow_budget_before_dispatch(
     estimate::admit_budgeted_workflow(def, inputs, max_cost_usd).map_err(|error| {
         format!("workflow budget admission rejected {subject} before dispatch: {error}")
     })
+}
+
+fn admit_workflow_budget_before_dispatch_with_variables(
+    path: WorkflowBudgetAdmissionPath,
+    def: &workflow::types::WorkflowDefinition,
+    inputs: &serde_json::Value,
+    variables: &BTreeMap<String, String>,
+    max_cost_usd: Option<f64>,
+) -> Result<(), String> {
+    let subject = match path {
+        WorkflowBudgetAdmissionPath::Direct => "this run",
+        WorkflowBudgetAdmissionPath::Detour => "this route",
+        WorkflowBudgetAdmissionPath::Shadow => "shadow run",
+    };
+    estimate::admit_budgeted_workflow_with_variables(def, inputs, variables, max_cost_usd).map_err(
+        |error| format!("workflow budget admission rejected {subject} before dispatch: {error}"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +260,7 @@ impl WorkflowExecutionEnvironment {
 struct ResolvedWorkflowRelease {
     environment: WorkflowExecutionEnvironment,
     revision: i32,
+    variables_revision: i32,
 }
 
 /// `POST /v1/workflows/:id/estimate` request body.
@@ -266,6 +286,8 @@ pub struct EstimateResponse {
     pub workflow_environment: Option<WorkflowExecutionEnvironment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_revision: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables_revision: Option<i32>,
     pub projected_cost_usd: f64,
     pub per_node: Vec<NodeEstimateView>,
     pub warnings: Vec<String>,
@@ -312,6 +334,8 @@ pub struct CreateRunResponse {
     pub workflow_environment: Option<WorkflowExecutionEnvironment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_revision: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables_revision: Option<i32>,
     pub status: String,
     pub cost_usd: f64,
     pub baseline_cost_usd: f64,
@@ -394,6 +418,7 @@ async fn resolve_workflow_execution_definition(
     workflow::types::WorkflowDefinition,
     i32,
     Option<ResolvedWorkflowRelease>,
+    BTreeMap<String, String>,
 )> {
     validate_workflow_execution_selector(version, environment)?;
     if let Some(environment) = environment {
@@ -440,13 +465,28 @@ async fn resolve_workflow_execution_definition(
                 "workflow release definition metadata is inconsistent".into(),
             ));
         }
+        let variables = get_current_variables(pool, org, workflow_id, environment.as_store())
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    %workflow_id,
+                    workflow_environment = environment.as_str(),
+                    %error,
+                    "workflow environment variables execution selector lookup failed"
+                );
+                ApiError::ServiceUnavailable(
+                    "workflow environment variables are temporarily unavailable".into(),
+                )
+            })?;
         return Ok((
             record.definition,
             record.version,
             Some(ResolvedWorkflowRelease {
                 environment,
                 revision: release.revision,
+                variables_revision: variables.revision,
             }),
+            variables.variables,
         ));
     }
 
@@ -462,7 +502,7 @@ async fn resolve_workflow_execution_definition(
             .await
             .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {workflow_id}")))?,
     };
-    Ok((selected.0, selected.1, None))
+    Ok((selected.0, selected.1, None, BTreeMap::new()))
 }
 
 /// A duplicate logical invocation is a status/reconciliation response, never
@@ -485,6 +525,7 @@ fn workflow_run_replay_response(run: WorkflowRunRecord) -> Response {
                 workflow_environment: selected_release
                     .map(|release| WorkflowExecutionEnvironment::from_store(release.environment)),
                 release_revision: selected_release.map(|release| release.revision),
+                variables_revision: selected_release.map(|release| release.variables_revision),
                 status: run.status,
                 cost_usd: run.cost_usd,
                 baseline_cost_usd: run.baseline_cost_usd,
@@ -824,7 +865,7 @@ pub async fn estimate(
     let org = require_org(ctx)?;
     let pool = db_pool(&state)?;
 
-    let (def, version, release) = resolve_workflow_execution_definition(
+    let (def, version, release, variables) = resolve_workflow_execution_definition(
         pool,
         org,
         id,
@@ -833,12 +874,13 @@ pub async fn estimate(
     )
     .await?;
 
-    let est = estimate::estimate_workflow(&def, &body.inputs);
+    let est = estimate::estimate_workflow_with_variables(&def, &body.inputs, &variables);
 
     Ok(Json(EstimateResponse {
         workflow_version: version,
         workflow_environment: release.map(|release| release.environment),
         release_revision: release.map(|release| release.revision),
+        variables_revision: release.map(|release| release.variables_revision),
         projected_cost_usd: est.projected_cost_usd,
         per_node: est
             .per_node
@@ -1149,7 +1191,7 @@ pub async fn create_run(
     }
 
     // --- Load the accepted immutable version + defense-in-depth validate ----
-    let (def, version, release) = resolve_workflow_execution_definition(
+    let (def, version, release, variables) = resolve_workflow_execution_definition(
         pool,
         org,
         id,
@@ -1166,10 +1208,11 @@ pub async fn create_run(
 
     // --- Atomically claim a stable key + insert initial running record -------
     let run_max_cost = def.budget.max_cost_usd.or(max_cost_usd);
-    admit_workflow_budget_before_dispatch(
+    admit_workflow_budget_before_dispatch_with_variables(
         WorkflowBudgetAdmissionPath::Direct,
         &def,
         &inputs,
+        &variables,
         run_max_cost,
     )
     .map_err(ApiError::InvalidRequest)?;
@@ -1181,6 +1224,7 @@ pub async fn create_run(
         release: release.map(|release| WorkflowRunReleaseProvenance {
             environment: release.environment.as_store(),
             revision: release.revision,
+            variables_revision: release.variables_revision,
         }),
         status: "running".to_string(),
         inputs: Some(inputs.clone()),
@@ -1259,7 +1303,7 @@ pub async fn create_run(
         };
         let mut journal_entries: Vec<engine::NodeJournalEntry> = Vec::new();
         let cache = engine::FlowDocDistillCache { org_id: org, pool };
-        let result = engine::run_workflow(
+        let result = engine::run_workflow_with_variables(
             &executor,
             &def,
             &inputs,
@@ -1267,6 +1311,7 @@ pub async fn create_run(
             |entry| journal_entries.push(entry),
             None,
             &secrets,
+            &variables,
             0,
             &[],
             &cache,
@@ -1296,6 +1341,7 @@ pub async fn create_run(
             workflow_version: version,
             workflow_environment: release.map(|release| release.environment),
             release_revision: release.map(|release| release.revision),
+            variables_revision: release.map(|release| release.variables_revision),
             status: status_str.to_string(),
             cost_usd: result.cost_usd,
             baseline_cost_usd: result.baseline_cost_usd,
@@ -1332,6 +1378,7 @@ pub async fn create_run(
                 WorkflowExecutionEnvironment::Production => WorkflowRunStartEnvironment::Production,
             },
             revision: release.revision,
+            variables_revision: release.variables_revision,
         });
         let _ = tx.send(WfEvent::RunStart {
             run_id,
@@ -1362,7 +1409,7 @@ pub async fn create_run(
                 Some(c) => c,
                 None => &no_cache,
             };
-            let result = engine::run_workflow(
+            let result = engine::run_workflow_with_variables(
                 &executor,
                 &def,
                 &inputs,
@@ -1370,6 +1417,7 @@ pub async fn create_run(
                 |entry| journal_entries.push(entry),
                 Some(&tx),
                 &secrets,
+                &variables,
                 0,
                 &[],
                 cache,
@@ -2182,7 +2230,7 @@ mod tests {
         ] {
             let error = assert_rejected_before_dispatch(path, &def);
             assert!(
-                error.contains("only supports {{input}} prompt references"),
+                error.contains("supports only {{input}} and accepted {{variables.NAME}}"),
                 "unexpected admission error: {error}"
             );
         }

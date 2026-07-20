@@ -56,6 +56,9 @@ pub(crate) struct WorkflowRunRecord {
 pub(crate) struct WorkflowRunReleaseProvenance {
     pub environment: WorkflowEnvironment,
     pub revision: i32,
+    /// Exact immutable non-secret environment-variable snapshot accepted by
+    /// the run. Revision `0` is the implicit empty set.
+    pub variables_revision: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,8 +203,8 @@ LIMIT $2";
 pub(crate) const INSERT_RUN_SQL: &str = "\
 INSERT INTO workflow_runs \
   (id, workflow_id, version, org_id, status, inputs, cost_usd, max_cost_usd, \
-   release_environment, release_revision) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+   release_environment, release_revision, variables_revision) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
 ON CONFLICT (id) DO NOTHING";
 
 /// UPDATE a run to its terminal state (`finished_at = now()`).
@@ -231,7 +234,7 @@ SELECT id, workflow_id, version, org_id, status, inputs, \
        cost_usd::float8 AS cost_usd, max_cost_usd::float8 AS max_cost_usd, \
        baseline_cost_usd::float8 AS baseline_cost_usd, \
        saved_usd::float8 AS saved_usd, \
-       release_environment, release_revision, error, started_at, finished_at \
+       release_environment, release_revision, variables_revision, error, started_at, finished_at \
 FROM workflow_runs \
 WHERE id = $1 AND org_id = $2";
 
@@ -244,7 +247,7 @@ SELECT id, workflow_id, version, org_id, status, inputs, \
        cost_usd::float8 AS cost_usd, max_cost_usd::float8 AS max_cost_usd, \
        baseline_cost_usd::float8 AS baseline_cost_usd, \
        saved_usd::float8 AS saved_usd, \
-       release_environment, release_revision, error, started_at, finished_at \
+       release_environment, release_revision, variables_revision, error, started_at, finished_at \
 FROM workflow_runs \
 WHERE org_id = $1 AND workflow_id = $2 \
 ORDER BY started_at DESC \
@@ -271,8 +274,8 @@ RETURNING run_id";
 pub(crate) const INSERT_IDEMPOTENT_RUN_SQL: &str = "\
 INSERT INTO workflow_runs \
   (id, workflow_id, version, org_id, status, inputs, cost_usd, max_cost_usd, \
-   release_environment, release_revision) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+   release_environment, release_revision, variables_revision) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
 
 /// Read a mapping by its opaque, org/workflow-scoped stable-key digest.
 pub(crate) const GET_WORKFLOW_RUN_IDEMPOTENCY_SQL: &str = "\
@@ -290,12 +293,16 @@ fn run_release_from_row(
     use sqlx::Row;
     let environment = row.try_get::<Option<String>, _>("release_environment")?;
     let revision = row.try_get::<Option<i32>, _>("release_revision")?;
-    match (environment, revision) {
-        (None, None) => Ok(None),
-        (Some(environment), Some(revision)) if revision > 0 => {
+    let variables_revision = row.try_get::<Option<i32>, _>("variables_revision")?;
+    match (environment, revision, variables_revision) {
+        (None, None, None) => Ok(None),
+        (Some(environment), Some(revision), variables_revision)
+            if revision > 0 && variables_revision.is_none_or(|revision| revision >= 0) =>
+        {
             Ok(Some(WorkflowRunReleaseProvenance {
                 environment: WorkflowEnvironment::parse(&environment)?,
                 revision,
+                variables_revision: variables_revision.unwrap_or(0),
             }))
         }
         _ => Err(sqlx::Error::Protocol(
@@ -629,6 +636,7 @@ pub(crate) async fn insert_run(pool: &PgPool, rec: &WorkflowRunRecord) {
         .bind(rec.max_cost_usd) // $8 max_cost_usd NUMERIC
         .bind(rec.release.map(|release| release.environment.as_str())) // $9 closed environment
         .bind(rec.release.map(|release| release.revision)) // $10 exact release revision
+        .bind(rec.release.map(|release| release.variables_revision)) // $11 exact variables revision
         .execute(pool)
         .await;
     if let Err(e) = result {
@@ -706,6 +714,7 @@ pub(crate) async fn create_or_reuse_idempotent_run(
             .bind(rec.max_cost_usd) // $8 max_cost_usd NUMERIC
             .bind(rec.release.map(|release| release.environment.as_str())) // $9 closed environment
             .bind(rec.release.map(|release| release.revision)) // $10 exact release revision
+            .bind(rec.release.map(|release| release.variables_revision)) // $11 exact variables revision
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -1314,9 +1323,13 @@ mod tests {
         }
         assert!(INSERT_RUN_SQL.contains("release_environment"));
         assert!(INSERT_RUN_SQL.contains("release_revision"));
+        assert!(INSERT_RUN_SQL.contains("variables_revision"));
         assert!(INSERT_IDEMPOTENT_RUN_SQL.contains("release_environment"));
+        assert!(INSERT_IDEMPOTENT_RUN_SQL.contains("variables_revision"));
         assert!(GET_RUN_SQL.contains("release_environment"));
+        assert!(GET_RUN_SQL.contains("variables_revision"));
         assert!(LIST_WORKFLOW_RUNS_SQL.contains("release_revision"));
+        assert!(LIST_WORKFLOW_RUNS_SQL.contains("variables_revision"));
     }
 
     /// DB-gated regression for the timeout/retry boundary: two callers claiming
@@ -1683,6 +1696,7 @@ mod tests {
             release: Some(WorkflowRunReleaseProvenance {
                 environment: exact_production.environment,
                 revision: exact_production.revision,
+                variables_revision: 0,
             }),
             status: "running".to_owned(),
             inputs: Some(serde_json::json!({})),
@@ -1701,12 +1715,19 @@ mod tests {
             .expect("environment-bound run persists");
         assert_eq!(persisted_release_run.version, 2);
         assert_eq!(persisted_release_run.release, release_run.release);
+        assert_eq!(
+            persisted_release_run
+                .release
+                .expect("release provenance")
+                .variables_revision,
+            0,
+        );
 
         let mismatched_release_run = sqlx::query(
             "INSERT INTO workflow_runs \
              (id, workflow_id, version, org_id, status, inputs, cost_usd, \
-              release_environment, release_revision) \
-             VALUES ($1, $2, 1, $3, 'running', '{}'::jsonb, 0, 'production', 1)",
+              release_environment, release_revision, variables_revision) \
+             VALUES ($1, $2, 1, $3, 'running', '{}'::jsonb, 0, 'production', 1, 0)",
         )
         .bind(Uuid::new_v4())
         .bind(guarded_workflow_id)

@@ -6,6 +6,7 @@
 
 pub mod distill_cache;
 pub mod engine;
+pub(crate) mod environment_variables;
 pub mod estimate;
 pub(crate) mod events;
 pub mod executor;

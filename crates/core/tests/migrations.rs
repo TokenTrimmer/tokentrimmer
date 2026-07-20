@@ -355,6 +355,41 @@ fn migrator_includes_workflow_run_release_provenance() {
     assert!(up.contains("workflow_version"));
 }
 
+#[test]
+fn migrator_includes_versioned_workflow_environment_variables() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_fifth = migrations
+        .iter()
+        .find(|migration| migration.version == 45)
+        .expect("migration version 45 not found");
+    let description = forty_fifth.description.to_lowercase();
+    assert!(
+        description.contains("workflow")
+            && description.contains("environment")
+            && description.contains("variable"),
+        "migration 0045 description is '{}', expected workflow environment variables",
+        forty_fifth.description,
+    );
+
+    let up = include_str!("../migrations/0045_workflow_environment_variables.up.sql");
+    for fragment in [
+        "CREATE TABLE IF NOT EXISTS workflow_environment_variable_sets",
+        "CREATE TABLE IF NOT EXISTS workflow_environment_variable_state",
+        "PRIMARY KEY (org_id, workflow_id, environment, revision)",
+        "REFERENCES workflow_environment_variable_sets",
+        "variables JSONB NOT NULL",
+        "ADD COLUMN variables_revision INT",
+        "SET variables_revision = 0",
+        "workflow_runs_variables_revision_check",
+        "workflow_runs_variables_scope_check",
+    ] {
+        assert!(
+            up.contains(fragment),
+            "missing variables contract: {fragment}"
+        );
+    }
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]

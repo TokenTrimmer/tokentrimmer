@@ -22,6 +22,7 @@ pub mod spend_api;
 pub mod sse;
 pub mod workflow_releases;
 pub mod workflow_runs;
+pub mod workflow_variables;
 pub mod workflow_versions;
 pub mod workflows;
 

@@ -8,8 +8,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::secrets::required_secret_names;
 use super::types::{ModelSelection, NodeKind, WorkflowDefinition, WorkflowTrigger};
+use super::{environment_variables::required_variable_names, secrets::required_secret_names};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -282,6 +282,9 @@ fn validate_with_schedule_floor(
     // runtime preflight because secrets rotate independently of definitions.
     if let Err(secret_errors) = required_secret_names(def) {
         errors.extend(secret_errors);
+    }
+    if let Err(variable_errors) = required_variable_names(def) {
+        errors.extend(variable_errors);
     }
 
     // ------------------------------------------------------------------
