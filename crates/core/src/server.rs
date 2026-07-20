@@ -248,11 +248,15 @@ pub fn build_router_with_retrieval(
         // HTTP route, so runs + receipts vanished on navigation. Both org-scoped.
         .route(
             "/v1/workflows/:id/runs",
-            get(routes::workflows::list_workflow_runs),
+            get(routes::workflow_runs::list_workflow_runs),
+        )
+        .route(
+            "/v1/workflows/runs/:run_id/nodes",
+            get(routes::workflow_runs::list_workflow_node_runs),
         )
         .route(
             "/v1/workflows/runs/:run_id",
-            get(routes::workflows::get_workflow_run),
+            get(routes::workflow_runs::get_workflow_run),
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,

@@ -105,7 +105,9 @@ started by a human/API run. The two current invokers are:
 | `GET /v1/workflows` | List workflow definitions (metadata). |
 | `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls; computes the projected cost from the graph + pricing). |
 | `POST /v1/workflows/:id/runs` | Run synchronously (returns the run + the rolled-up `saved_usd`). |
-| `GET /v1/workflows/:id/...` | (Run status / receipt endpoints — see `routes/workflows.rs`.) |
+| `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
+| `GET /v1/workflows/runs/:run_id` | Read one org-scoped durable run and its immutable definition version. |
+| `GET /v1/workflows/runs/:run_id/nodes` | Read up to 500 best-effort node-journal rows, labeled from the exact executed definition. Persistence order is not provider timing or replay. |
 
 ## SSE events (a run's streaming surface)
 

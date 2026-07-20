@@ -1,0 +1,331 @@
+//! Durable workflow-run history and the read-only node journal.
+//!
+//! The node journal is intentionally an inspection surface, not replay:
+//! labels and node kinds come from the exact immutable definition version the
+//! run executed, while row order reflects post-run journal persistence rather
+//! than provider timing.
+
+use axum::{
+    extract::{Path, State},
+    http::{header::CACHE_CONTROL, HeaderValue},
+    response::{IntoResponse, Response},
+    Extension, Json,
+};
+use serde::Serialize;
+use tt_auth::ApiKeyContext;
+use uuid::Uuid;
+
+use crate::{
+    error::{ApiError, ApiResult},
+    workflow::{
+        node_run_store::{self, WorkflowNodeRunRecord},
+        store::{self, WorkflowRunRecord},
+        types::{NodeKind, WorkflowDefinition},
+    },
+    AppState, DOGFOOD_ORG_ID,
+};
+
+const NODE_JOURNAL_LIMIT: usize = 500;
+
+fn require_org(ctx: Option<Extension<ApiKeyContext>>) -> Result<Uuid, ApiError> {
+    match ctx {
+        Some(Extension(context)) if context.org_id != DOGFOOD_ORG_ID => Ok(context.org_id),
+        _ => Err(ApiError::Unauthorized),
+    }
+}
+
+fn db_pool(state: &AppState) -> ApiResult<&sqlx::PgPool> {
+    state.db_pool.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "workflow storage requires a Postgres pool (none configured)".into(),
+        )
+    })
+}
+
+/// A durable workflow-run summary. The immutable `version` is the definition
+/// version that executed, not the latest definition at read time.
+#[derive(Debug, Serialize)]
+pub struct WorkflowRunView {
+    pub id: Uuid,
+    pub workflow_id: Uuid,
+    pub version: i32,
+    pub status: String,
+    pub inputs: Option<serde_json::Value>,
+    pub cost_usd: f64,
+    pub max_cost_usd: Option<f64>,
+    pub baseline_cost_usd: f64,
+    pub saved_usd: f64,
+    pub error: Option<String>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<WorkflowRunRecord> for WorkflowRunView {
+    fn from(record: WorkflowRunRecord) -> Self {
+        Self {
+            id: record.id,
+            workflow_id: record.workflow_id,
+            version: record.version,
+            status: record.status,
+            inputs: record.inputs,
+            cost_usd: record.cost_usd,
+            max_cost_usd: record.max_cost_usd,
+            baseline_cost_usd: record.baseline_cost_usd,
+            saved_usd: record.saved_usd,
+            error: record.error,
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListWorkflowRunsResponse {
+    pub object: &'static str,
+    pub data: Vec<WorkflowRunView>,
+}
+
+/// One durable node-journal entry decorated from the exact executed
+/// definition. `journal_index` is stable for repeated reads of the persisted
+/// rows; it is not an execution-duration measurement.
+#[derive(Debug, Serialize)]
+pub struct WorkflowNodeRunView {
+    pub id: Uuid,
+    pub journal_index: usize,
+    pub node_id: String,
+    pub definition_position: Option<usize>,
+    pub node_type: Option<&'static str>,
+    pub label: String,
+    pub attempt: i32,
+    pub status: String,
+    pub output: Option<serde_json::Value>,
+    pub cost_usd: f64,
+    pub model_used: Option<String>,
+    pub error: Option<String>,
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowNodeRunsResponse {
+    pub object: &'static str,
+    pub run_id: Uuid,
+    pub workflow_id: Uuid,
+    pub workflow_version: i32,
+    pub workflow_name: String,
+    pub workflow_inputs_schema: serde_json::Value,
+    pub truncated: bool,
+    pub data: Vec<WorkflowNodeRunView>,
+}
+
+fn node_kind_name(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Trigger => "trigger",
+        NodeKind::Model { .. } => "model",
+        NodeKind::Agent { .. } => "agent",
+        NodeKind::Transform { .. } => "transform",
+        NodeKind::Branch { .. } => "branch",
+        NodeKind::Output => "output",
+        NodeKind::Http { .. } => "http",
+        NodeKind::SubWorkflow { .. } => "sub_workflow",
+        NodeKind::Loop { .. } => "loop",
+        NodeKind::Document { .. } => "document",
+    }
+}
+
+fn node_descriptor(
+    definition: &WorkflowDefinition,
+    node_id: &str,
+) -> (Option<usize>, Option<&'static str>, String) {
+    let Some((index, node)) = definition
+        .nodes
+        .iter()
+        .enumerate()
+        .find(|(_, node)| node.id == node_id)
+    else {
+        return (None, None, format!("unmapped journal node · {node_id}"));
+    };
+    let position = index + 1;
+    let kind = node_kind_name(&node.kind);
+    (
+        Some(position),
+        Some(kind),
+        format!("{position:02}. {kind} · {node_id}"),
+    )
+}
+
+/// `GET /v1/workflows/:id/runs` — recent runs for exactly one org-owned
+/// workflow. A foreign workflow id returns 404.
+pub async fn list_workflow_runs(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ListWorkflowRunsResponse>> {
+    let org = require_org(ctx)?;
+    let pool = db_pool(&state)?;
+    if store::get_definition(pool, org, id).await.is_none() {
+        return Err(ApiError::NotFound(format!("no workflow with id {id}")));
+    }
+    let data = store::list_workflow_runs(pool, org, id, 50)
+        .await
+        .into_iter()
+        .map(WorkflowRunView::from)
+        .collect();
+    Ok(Json(ListWorkflowRunsResponse {
+        object: "list",
+        data,
+    }))
+}
+
+/// `GET /v1/workflows/runs/:run_id` — one org-scoped durable run.
+pub async fn get_workflow_run(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Path(run_id): Path<Uuid>,
+) -> ApiResult<Json<WorkflowRunView>> {
+    let org = require_org(ctx)?;
+    let pool = db_pool(&state)?;
+    let run = store::get_run(pool, run_id, org)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("no workflow run with id {run_id}")))?;
+    Ok(Json(WorkflowRunView::from(run)))
+}
+
+/// `GET /v1/workflows/runs/:run_id/nodes` — a bounded node journal decorated
+/// with the exact immutable definition version that executed.
+pub async fn list_workflow_node_runs(
+    State(state): State<AppState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Path(run_id): Path<Uuid>,
+) -> ApiResult<Response> {
+    let org = require_org(ctx)?;
+    let pool = db_pool(&state)?;
+    let run = store::get_run_strict(pool, run_id, org)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%run_id, %error, "workflow run node-journal owner lookup failed");
+            ApiError::ServiceUnavailable("workflow run journal is temporarily unavailable".into())
+        })?
+        .ok_or_else(|| ApiError::NotFound(format!("no workflow run with id {run_id}")))?;
+    let (definition, version) =
+        store::get_definition_version(pool, org, run.workflow_id, run.version)
+            .await
+            .ok_or_else(|| {
+                ApiError::Internal(
+                    "workflow run references an unavailable immutable definition".into(),
+                )
+            })?;
+
+    let mut records =
+        node_run_store::list_node_runs_for_run(pool, run_id, org, (NODE_JOURNAL_LIMIT + 1) as i64)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%run_id, %error, "workflow node-journal read failed");
+                ApiError::ServiceUnavailable(
+                    "workflow run journal is temporarily unavailable".into(),
+                )
+            })?;
+    let truncated = records.len() > NODE_JOURNAL_LIMIT;
+    records.truncate(NODE_JOURNAL_LIMIT);
+
+    let data = records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| node_run_view(index + 1, record, &definition))
+        .collect();
+
+    let mut response = Json(WorkflowNodeRunsResponse {
+        object: "list",
+        run_id,
+        workflow_id: run.workflow_id,
+        workflow_version: version,
+        workflow_name: definition.name,
+        workflow_inputs_schema: definition.inputs,
+        truncated,
+        data,
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    Ok(response)
+}
+
+fn node_run_view(
+    journal_index: usize,
+    record: WorkflowNodeRunRecord,
+    definition: &WorkflowDefinition,
+) -> WorkflowNodeRunView {
+    let (definition_position, node_type, label) = node_descriptor(definition, &record.node_id);
+    WorkflowNodeRunView {
+        id: record.id,
+        journal_index,
+        node_id: record.node_id,
+        definition_position,
+        node_type,
+        label,
+        attempt: record.attempt,
+        status: record.status,
+        output: record.output,
+        cost_usd: record.cost_usd,
+        model_used: record.model_used,
+        error: record.error,
+        recorded_at: record.recorded_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::node_descriptor;
+    use crate::workflow::types::{
+        BudgetPolicy, ModelSelection, Node, NodeKind, WorkflowDefinition,
+    };
+    use uuid::Uuid;
+
+    fn definition() -> WorkflowDefinition {
+        WorkflowDefinition {
+            id: Uuid::nil(),
+            version: 7,
+            name: "debug fixture".into(),
+            nodes: vec![
+                Node {
+                    id: "start".into(),
+                    kind: NodeKind::Trigger,
+                },
+                Node {
+                    id: "answer".into(),
+                    kind: NodeKind::Model {
+                        selection: ModelSelection::Model {
+                            model: "gpt-4o-mini".into(),
+                        },
+                        prompt: "{{input}}".into(),
+                        max_output_tokens: Some(64),
+                        max_cost_usd: None,
+                    },
+                },
+            ],
+            edges: vec![],
+            inputs: serde_json::json!({"prompt": {"type": "string"}}),
+            budget: BudgetPolicy::default(),
+            allowed_hosts: vec![],
+            metadata: serde_json::Value::Null,
+            triggers: vec![],
+        }
+    }
+
+    #[test]
+    fn labels_are_stable_and_derive_from_immutable_definition_order() {
+        let definition = definition();
+        assert_eq!(
+            node_descriptor(&definition, "start"),
+            (Some(1), Some("trigger"), "01. trigger · start".into())
+        );
+        assert_eq!(
+            node_descriptor(&definition, "answer"),
+            (Some(2), Some("model"), "02. model · answer".into())
+        );
+        assert_eq!(
+            node_descriptor(&definition, "child-node"),
+            (None, None, "unmapped journal node · child-node".into())
+        );
+    }
+}

@@ -2457,6 +2457,55 @@ status/reconciliation response, so node_outputs is empty; use
 GET /v1/workflows/runs/:run_id for the durable run status. It never executes
 the graph again.
 
+#### `GET /v1/workflows/runs/:run_id/nodes` — inspect the retained node journal
+
+Returns at most 500 persisted node-journal rows for one org-owned run. The
+gateway first resolves the run under the authenticated org, then joins the
+node rows through that owned run; a foreign run id returns 404. Labels,
+`node_type`, and `definition_position` are derived from the exact immutable
+workflow version recorded on the run, not from the latest editor definition.
+Successful responses include `Cache-Control: private, no-store`.
+
+The response also includes `workflow_version`, `workflow_name`, and the
+definition's freeform `workflow_inputs_schema` so an inspector can compare the
+accepted run inputs with the contract/defaults that executed.
+
+```json
+{
+  "object": "list",
+  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "workflow_id": "8aa43e0d-f318-4d3c-bb52-7ed725a4fb51",
+  "workflow_version": 3,
+  "workflow_name": "Summarise and score",
+  "workflow_inputs_schema": { "text": { "type": "string" } },
+  "truncated": false,
+  "data": [
+    {
+      "id": "ab21f7aa-c0e7-44aa-8601-03a44fedf860",
+      "journal_index": 1,
+      "node_id": "summarise",
+      "definition_position": 2,
+      "node_type": "model",
+      "label": "02. model · summarise",
+      "attempt": 1,
+      "status": "completed",
+      "output": { "content": "The document discusses…" },
+      "cost_usd": 0.00312,
+      "model_used": "gpt-4o-mini",
+      "error": null,
+      "recorded_at": "2026-07-20T10:00:00Z"
+    }
+  ]
+}
+```
+
+Node journaling is best-effort, so an empty list does not prove that no node
+executed. `journal_index` and `recorded_at` describe stable post-run
+persistence order, not provider start/end timing. One row is retained per
+engine node completion; internal provider retries, fallback attempts, and
+subworkflow identity are not reconstructed. This endpoint is read-only
+inspection, not a breakpoint or replay API.
+
 **`status` values:**
 
 | Value | Meaning |

@@ -194,20 +194,20 @@ SELECT id, workflow_id, version, org_id, status, inputs, \
 FROM workflow_runs \
 WHERE id = $1 AND org_id = $2";
 
-/// SELECT recent runs for an org, ordered most-recent first.
+/// SELECT recent runs for one org-owned workflow, ordered most-recent first.
 ///
 /// `NUMERIC(12,6)` columns are cast to `::float8` for the same reason as
 /// [`GET_RUN_SQL`].
-pub(crate) const LIST_RUNS_SQL: &str = "\
+pub(crate) const LIST_WORKFLOW_RUNS_SQL: &str = "\
 SELECT id, workflow_id, version, org_id, status, inputs, \
        cost_usd::float8 AS cost_usd, max_cost_usd::float8 AS max_cost_usd, \
        baseline_cost_usd::float8 AS baseline_cost_usd, \
        saved_usd::float8 AS saved_usd, \
        error, started_at, finished_at \
 FROM workflow_runs \
-WHERE org_id = $1 \
+WHERE org_id = $1 AND workflow_id = $2 \
 ORDER BY started_at DESC \
-LIMIT $2";
+LIMIT $3";
 
 // ---------------------------------------------------------------------------
 // SQL constants — durable run-idempotency mappings
@@ -237,18 +237,6 @@ pub(crate) const GET_WORKFLOW_RUN_IDEMPOTENCY_SQL: &str = "\
 SELECT run_id, workflow_version, input_hash, request_options_hash \
 FROM workflow_run_idempotency \
 WHERE org_id = $1 AND workflow_id = $2 AND invocation_key_hash = $3";
-
-// ---------------------------------------------------------------------------
-// SQL constants — node runs
-// ---------------------------------------------------------------------------
-
-/// INSERT a workflow node run. `ON CONFLICT (id) DO NOTHING`.
-/// Called best-effort from the engine — errors are warn-and-swallowed.
-pub(crate) const INSERT_NODE_RUN_SQL: &str = "\
-INSERT INTO workflow_node_runs \
-  (id, run_id, node_id, attempt, status, output, cost_usd, model_used, error) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-ON CONFLICT (id) DO NOTHING";
 
 // ---------------------------------------------------------------------------
 // Row mapping helpers
@@ -691,15 +679,21 @@ pub(crate) async fn get_run_strict(
     result.map(|row| run_record_from_row(&row)).transpose()
 }
 
-/// Return up to `limit` runs for `org_id`, ordered most-recent first.
+/// Return up to `limit` runs for one org-owned workflow, newest first.
 /// Returns an empty `Vec` on DB error (best-effort).
 ///
-/// Wired in W1c dashboard (GET /v1/workflows/runs or per-workflow run history).
+/// Wired in W1c dashboard (`GET /v1/workflows/:id/runs`).
 #[allow(dead_code)]
-pub(crate) async fn list_runs(pool: &PgPool, org_id: Uuid, limit: i64) -> Vec<WorkflowRunRecord> {
-    let result = sqlx::query(LIST_RUNS_SQL)
+pub(crate) async fn list_workflow_runs(
+    pool: &PgPool,
+    org_id: Uuid,
+    workflow_id: Uuid,
+    limit: i64,
+) -> Vec<WorkflowRunRecord> {
+    let result = sqlx::query(LIST_WORKFLOW_RUNS_SQL)
         .bind(org_id) // $1 org_id UUID
-        .bind(limit) // $2 limit  BIGINT
+        .bind(workflow_id) // $2 workflow_id UUID
+        .bind(limit) // $3 limit BIGINT
         .fetch_all(pool)
         .await;
     match result {
@@ -719,47 +713,6 @@ pub(crate) async fn list_runs(pool: &PgPool, org_id: Uuid, limit: i64) -> Vec<Wo
 }
 
 // ---------------------------------------------------------------------------
-// Node run store function (best-effort)
-// ---------------------------------------------------------------------------
-
-/// Insert a workflow node run. **Best-effort**: DB errors are logged at WARN
-/// and swallowed so a Postgres outage never fails the engine loop.
-/// A fresh UUIDv4 is minted for each call (attempt counter defaults to 1).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn insert_node_run(
-    pool: &PgPool,
-    run_id: Uuid,
-    node_id: &str,
-    status: &str,
-    output: Option<serde_json::Value>,
-    cost_usd: f64,
-    model_used: Option<&str>,
-    error: Option<&str>,
-) {
-    let id = Uuid::new_v4();
-    let result = sqlx::query(INSERT_NODE_RUN_SQL)
-        .bind(id) // $1 id         UUID
-        .bind(run_id) // $2 run_id     UUID
-        .bind(node_id) // $3 node_id    TEXT
-        .bind(1_i32) // $4 attempt    INT (default 1)
-        .bind(status) // $5 status     TEXT
-        .bind(output) // $6 output     JSONB
-        .bind(cost_usd) // $7 cost_usd   NUMERIC
-        .bind(model_used) // $8 model_used TEXT
-        .bind(error) // $9 error      TEXT
-        .execute(pool)
-        .await;
-    if let Err(e) = result {
-        tracing::warn!(
-            %run_id,
-            %node_id,
-            error = %e,
-            "workflow_node_runs INSERT failed (best-effort, run not affected)"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Unit tests — pure (no DB required)
 // ---------------------------------------------------------------------------
 
@@ -774,8 +727,8 @@ mod tests {
         workflow_run_request_options_hash, CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency,
         WorkflowRunRecord, FINISH_RUN_SQL, GET_DEFINITION_SQL, GET_DEFINITION_VERSION_SQL,
         GET_RUN_SQL, GET_WORKFLOW_RUN_IDEMPOTENCY_SQL, INSERT_DEFINITION_SQL,
-        INSERT_IDEMPOTENT_RUN_SQL, INSERT_NODE_RUN_SQL, INSERT_RUN_SQL,
-        INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL, LIST_DEFINITIONS_SQL, LIST_RUNS_SQL,
+        INSERT_IDEMPOTENT_RUN_SQL, INSERT_RUN_SQL, INSERT_WORKFLOW_RUN_IDEMPOTENCY_SQL,
+        LIST_DEFINITIONS_SQL, LIST_WORKFLOW_RUNS_SQL,
     };
 
     // ------------------------------------------------------------------
@@ -971,22 +924,22 @@ mod tests {
     }
 
     #[test]
-    fn list_runs_sql_contains_expected_clauses() {
+    fn list_workflow_runs_sql_contains_expected_clauses() {
         assert!(
-            LIST_RUNS_SQL.contains("WHERE org_id = $1"),
-            "LIST_RUNS_SQL must filter by org_id"
+            LIST_WORKFLOW_RUNS_SQL.contains("WHERE org_id = $1 AND workflow_id = $2"),
+            "LIST_WORKFLOW_RUNS_SQL must filter by org and workflow"
         );
         assert!(
-            LIST_RUNS_SQL.contains("ORDER BY started_at DESC"),
-            "LIST_RUNS_SQL must order by started_at DESC"
+            LIST_WORKFLOW_RUNS_SQL.contains("ORDER BY started_at DESC"),
+            "LIST_WORKFLOW_RUNS_SQL must order by started_at DESC"
         );
         assert!(
-            LIST_RUNS_SQL.contains("LIMIT $2"),
-            "LIST_RUNS_SQL must apply a LIMIT parameter"
+            LIST_WORKFLOW_RUNS_SQL.contains("LIMIT $3"),
+            "LIST_WORKFLOW_RUNS_SQL must apply a LIMIT parameter"
         );
         assert!(
-            LIST_RUNS_SQL.contains("FROM workflow_runs"),
-            "LIST_RUNS_SQL must query the workflow_runs table"
+            LIST_WORKFLOW_RUNS_SQL.contains("FROM workflow_runs"),
+            "LIST_WORKFLOW_RUNS_SQL must query the workflow_runs table"
         );
     }
 
@@ -1011,20 +964,20 @@ mod tests {
             "GET_RUN_SQL must cast saved_usd to float8"
         );
         assert!(
-            LIST_RUNS_SQL.contains("cost_usd::float8"),
-            "LIST_RUNS_SQL must cast cost_usd to float8"
+            LIST_WORKFLOW_RUNS_SQL.contains("cost_usd::float8"),
+            "LIST_WORKFLOW_RUNS_SQL must cast cost_usd to float8"
         );
         assert!(
-            LIST_RUNS_SQL.contains("max_cost_usd::float8"),
-            "LIST_RUNS_SQL must cast max_cost_usd to float8"
+            LIST_WORKFLOW_RUNS_SQL.contains("max_cost_usd::float8"),
+            "LIST_WORKFLOW_RUNS_SQL must cast max_cost_usd to float8"
         );
         assert!(
-            LIST_RUNS_SQL.contains("baseline_cost_usd::float8"),
-            "LIST_RUNS_SQL must cast baseline_cost_usd to float8"
+            LIST_WORKFLOW_RUNS_SQL.contains("baseline_cost_usd::float8"),
+            "LIST_WORKFLOW_RUNS_SQL must cast baseline_cost_usd to float8"
         );
         assert!(
-            LIST_RUNS_SQL.contains("saved_usd::float8"),
-            "LIST_RUNS_SQL must cast saved_usd to float8"
+            LIST_WORKFLOW_RUNS_SQL.contains("saved_usd::float8"),
+            "LIST_WORKFLOW_RUNS_SQL must cast saved_usd to float8"
         );
     }
 
@@ -1250,21 +1203,5 @@ mod tests {
         .execute(&pool)
         .await
         .expect("cleanup definition");
-    }
-
-    // ------------------------------------------------------------------
-    // SQL shape tests — node runs
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn insert_node_run_sql_has_conflict_guard() {
-        assert!(
-            INSERT_NODE_RUN_SQL.contains("INSERT INTO workflow_node_runs"),
-            "INSERT_NODE_RUN_SQL must target workflow_node_runs table"
-        );
-        assert!(
-            INSERT_NODE_RUN_SQL.contains("ON CONFLICT (id) DO NOTHING"),
-            "INSERT_NODE_RUN_SQL must guard against duplicate node run ids"
-        );
     }
 }

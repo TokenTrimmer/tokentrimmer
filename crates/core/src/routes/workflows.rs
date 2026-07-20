@@ -15,7 +15,7 @@
 //!
 //! `engine::run_workflow` accepts a *synchronous* `FnMut(NodeJournalEntry)` so
 //! it can be called from a normal `async fn` without the async-closure complexity.
-//! `store::insert_node_run` is async. Solution: collect journal entries into a
+//! `node_run_store::insert_node_run` is async. Solution: collect journal entries into a
 //! `Vec` inside the sync closure, then loop + `await` each one **after**
 //! `run_workflow` returns. Best-effort: a DB error never fails the run response.
 //!
@@ -44,6 +44,7 @@ use crate::{
         estimate,
         events::WfEvent,
         executor::GatewayNodeExecutor,
+        node_run_store,
         secrets::{is_valid_secret_name, load_secrets, master_key_from_env, store_secret},
         store::{self, WorkflowRunRecord},
         types::content_hash,
@@ -649,7 +650,7 @@ async fn persist_run_results(
     result: &engine::WorkflowRunResult,
 ) -> &'static str {
     for entry in journal {
-        store::insert_node_run(
+        node_run_store::insert_node_run(
             pool,
             run_id,
             &entry.node_id,
@@ -1448,98 +1449,6 @@ pub(crate) async fn run_workflow_shadow(
     // to after this returns records its OWN spend separately — that's correct
     // (shadow mode doubles upstream spend by design, gated on max_cost_usd).
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// GET /v1/workflows/:id/runs + GET /v1/workflows/runs/:run_id (WF-6)
-// ---------------------------------------------------------------------------
-// The run rows are persisted by `create_run`/`persist_run_results`
-// (`workflow_runs` + `workflow_node_runs`); this exposes them over HTTP so a run
-// that spent real dollars doesn't vanish on navigation. Org-scoped: a run is
-// only ever returned to its owning org (`require_org` + the SQL's org_id filter).
-
-/// A single workflow run row as returned to API clients. Mirrors
-/// [`store::WorkflowRunRecord`] minus the org_id (never echoed) + with the
-/// timestamps as RFC 3339 (JSON-friendly).
-#[derive(Debug, Serialize)]
-pub struct WorkflowRunView {
-    pub id: Uuid,
-    pub workflow_id: Uuid,
-    pub version: i32,
-    /// `"running"` / `"completed"` / `"failed"`.
-    pub status: String,
-    pub inputs: Option<serde_json::Value>,
-    pub cost_usd: f64,
-    pub max_cost_usd: Option<f64>,
-    pub baseline_cost_usd: f64,
-    pub saved_usd: f64,
-    pub error: Option<String>,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-impl WorkflowRunView {
-    fn from_record(r: store::WorkflowRunRecord) -> Self {
-        Self {
-            id: r.id,
-            workflow_id: r.workflow_id,
-            version: r.version,
-            status: r.status,
-            inputs: r.inputs,
-            cost_usd: r.cost_usd,
-            max_cost_usd: r.max_cost_usd,
-            baseline_cost_usd: r.baseline_cost_usd,
-            saved_usd: r.saved_usd,
-            error: r.error,
-            started_at: r.started_at,
-            finished_at: r.finished_at,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListWorkflowRunsResponse {
-    pub object: &'static str,
-    pub data: Vec<WorkflowRunView>,
-}
-
-/// `GET /v1/workflows/:id/runs` — list recent runs of a workflow, scoped to the
-/// caller's org. The workflow id is validated as org-owned the same way
-/// `create_run` does (store::get_definition returns None for a foreign-org id).
-pub async fn list_workflow_runs(
-    State(state): State<AppState>,
-    ctx: Option<Extension<ApiKeyContext>>,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<ListWorkflowRunsResponse>> {
-    let org = require_org(ctx)?;
-    let pool = db_pool(&state)?;
-    // Defense-in-depth: confirm the workflow exists + is org-scoped before
-    // listing its runs (a foreign org id → 404, not an empty list that might
-    // imply the workflow exists).
-    if store::get_definition(pool, org, id).await.is_none() {
-        return Err(ApiError::NotFound(format!("no workflow with id {id}")));
-    }
-    let runs = store::list_runs(pool, org, 50).await;
-    let data = runs.into_iter().map(WorkflowRunView::from_record).collect();
-    Ok(Json(ListWorkflowRunsResponse {
-        object: "list",
-        data,
-    }))
-}
-
-/// `GET /v1/workflows/runs/:run_id` — fetch a single run by id (org-scoped via
-/// the SQL's `WHERE id AND org_id`, so a foreign-org run id → 404).
-pub async fn get_workflow_run(
-    State(state): State<AppState>,
-    ctx: Option<Extension<ApiKeyContext>>,
-    Path(run_id): Path<Uuid>,
-) -> ApiResult<Json<WorkflowRunView>> {
-    let org = require_org(ctx)?;
-    let pool = db_pool(&state)?;
-    let run = store::get_run(pool, run_id, org)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("no workflow run with id {run_id}")))?;
-    Ok(Json(WorkflowRunView::from_record(run)))
 }
 
 /// `POST /v1/workflows/secrets` — encrypt and upsert a named secret for the
