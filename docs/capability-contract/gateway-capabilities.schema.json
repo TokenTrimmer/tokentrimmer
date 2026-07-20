@@ -1,0 +1,313 @@
+{
+  "$comment": "Structural GET /v1/capabilities response generated from the exact tt_core::routes::capabilities::GatewayCapabilitiesDocument output type. Runtime semantic validation, authorization, readiness, and execution remain separate gates.",
+  "$defs": {
+    "AccessEvidence": {
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "state": {
+          "enum": [
+            "available",
+            "unavailable"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "state"
+      ],
+      "type": "object"
+    },
+    "CapabilityReason": {
+      "properties": {
+        "code": {
+          "maxLength": 96,
+          "minLength": 1,
+          "pattern": "^[a-z0-9_:-]+$",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 600,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "EnabledEvidence": {
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "gateway_runtime"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "enabled",
+            "disabled"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "source",
+        "state"
+      ],
+      "type": "object"
+    },
+    "FusionCapability": {
+      "properties": {
+        "access": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/AccessEvidence"
+            }
+          ],
+          "description": "Result of this responder's Fusion kill-switch + tier gate only."
+        },
+        "current_tier": {
+          "$ref": "#/$defs/TierEvidence"
+        },
+        "enabled": {
+          "$ref": "#/$defs/EnabledEvidence"
+        },
+        "limits": {
+          "$ref": "#/$defs/FusionLimits"
+        },
+        "minimum_tier": {
+          "$ref": "#/$defs/TierEvidence"
+        }
+      },
+      "required": [
+        "access",
+        "current_tier",
+        "enabled",
+        "limits",
+        "minimum_tier"
+      ],
+      "type": "object"
+    },
+    "FusionLimits": {
+      "properties": {
+        "member_models_max": {
+          "$ref": "#/$defs/NumericLimit"
+        }
+      },
+      "required": [
+        "member_models_max"
+      ],
+      "type": "object"
+    },
+    "GatewayFeatures": {
+      "properties": {
+        "fusion": {
+          "$ref": "#/$defs/FusionCapability"
+        }
+      },
+      "required": [
+        "fusion"
+      ],
+      "type": "object"
+    },
+    "NumericLimit": {
+      "properties": {
+        "enforcement": {
+          "enum": [
+            "gateway_runtime"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "value": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enforcement",
+        "reason",
+        "value"
+      ],
+      "type": "object"
+    },
+    "SchemaVersionEvidence": {
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "gateway_runtime"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "known",
+            "unversioned"
+          ],
+          "type": "string"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "reason",
+        "source",
+        "state"
+      ],
+      "type": "object"
+    },
+    "SchemaVersions": {
+      "properties": {
+        "capabilities_document": {
+          "$ref": "#/$defs/SchemaVersionEvidence"
+        },
+        "fusion_request": {
+          "$ref": "#/$defs/SchemaVersionEvidence"
+        }
+      },
+      "required": [
+        "capabilities_document",
+        "fusion_request"
+      ],
+      "type": "object"
+    },
+    "TierEvidence": {
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "authenticated_api_key",
+            "gateway_free_default",
+            "gateway_runtime"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "known"
+          ],
+          "type": "string"
+        },
+        "value": {
+          "enum": [
+            "free",
+            "pro",
+            "team",
+            "scale"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "source",
+        "state",
+        "value"
+      ],
+      "type": "object"
+    },
+    "UnknownEvidence": {
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/CapabilityReason"
+        },
+        "source": {
+          "enum": [
+            "not_negotiated"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "source",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:tokentrimmer:gateway-capabilities:response-schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "features": {
+      "$ref": "#/$defs/GatewayFeatures"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "modality_support": {
+      "$ref": "#/$defs/UnknownEvidence"
+    },
+    "model_support": {
+      "$ref": "#/$defs/UnknownEvidence"
+    },
+    "provider_credentials": {
+      "$ref": "#/$defs/UnknownEvidence"
+    },
+    "provider_health": {
+      "$ref": "#/$defs/UnknownEvidence"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "schema_versions": {
+      "$ref": "#/$defs/SchemaVersions"
+    },
+    "scope": {
+      "const": "gateway_runtime",
+      "type": "string"
+    },
+    "snapshot_scope": {
+      "const": "responding_process",
+      "type": "string"
+    }
+  },
+  "required": [
+    "features",
+    "generated_at",
+    "modality_support",
+    "model_support",
+    "provider_credentials",
+    "provider_health",
+    "schema_version",
+    "schema_versions",
+    "scope",
+    "snapshot_scope"
+  ],
+  "title": "TokenTrimmer gateway runtime capabilities",
+  "type": "object"
+}

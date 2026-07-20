@@ -23,7 +23,7 @@ pub mod validate;
 pub use cache::CachingRoutingStore;
 pub use contract::{
     canonicalize_route_parts, canonicalize_route_value, CanonicalRoute, RouteValidationIssue,
-    ROUTE_SCHEMA_ID, ROUTE_SCHEMA_VERSION,
+    RouteWriteRequest, ROUTE_SCHEMA_ID, ROUTE_SCHEMA_VERSION,
 };
 pub use latency::{LatencyTracker, MIN_SAMPLES as LATENCY_MIN_SAMPLES};
 #[cfg(feature = "postgres")]
@@ -103,6 +103,7 @@ impl RuntimeRoute {
 /// alongside `tt_plan_core::types::RouteConditions` so Plan and Gateway stay
 /// in lockstep.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RouteConditions {
     /// Match only if `req.model` is in this list. Empty list matches any model.
@@ -187,6 +188,7 @@ pub struct RouteConditions {
 
 /// What a matching [`Route`] does to the request before dispatch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RouteAction {
     /// Rewrite to this model. May target a different provider than the request
@@ -458,6 +460,7 @@ pub struct RouteAction {
 /// seam: a self-contained config that detours dispatch. No competitor gateway
 /// has "routing rules that detour into governed, receipted multi-step workflows."
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RouteWorkflow {
     /// The workflow definition id to trigger (a UUID string in the workflow
@@ -483,6 +486,7 @@ pub struct RouteWorkflow {
 /// of tt_shared PanelExtras) to keep the routing wire contract explicit and
 /// avoid a tt_shared coupling in this crate — mirrors the AgenticBudget pattern.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RoutePanel {
     /// "synthesize" | "best-of-n" (or "best_of_n") | "majority". Validated at
@@ -510,6 +514,7 @@ pub struct RoutePanel {
 /// no new headers, no behavior change). The levers do NOT stack at face value —
 /// the planner (`tt_core::passes::agentic_budget`) nets them per request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AgenticBudget {
     /// Sub-lever 1 (lossless): annotate cache_control breakpoints the caller

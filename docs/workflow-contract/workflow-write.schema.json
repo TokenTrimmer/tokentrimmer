@@ -1,0 +1,645 @@
+{
+  "$comment": "Structural POST /v1/workflows request generated from the exact tt_core::routes::workflows::CreateWorkflowRequest parser. Runtime semantic validation, authorization, readiness, and execution remain separate gates.",
+  "$defs": {
+    "BudgetPolicy": {
+      "properties": {
+        "max_cost_usd": {
+          "default": null,
+          "description": "Hard USD cap for the entire workflow run.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "on_exceed": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/OnExceed"
+            }
+          ],
+          "default": "Stop",
+          "description": "What to do when the cap is exceeded."
+        }
+      },
+      "type": "object"
+    },
+    "DocumentSource": {
+      "description": "Where a [`DocumentPart`]'s bytes come from: a remote/`data:` URL or inline base64. Serializes to Anthropic's source convention (`{\"type\":\"url\",...}` / `{\"type\":\"base64\",\"media_type\":...,\"data\":...}`).",
+      "oneOf": [
+        {
+          "description": "Remote document URL (or an unparsed `data:` URL).",
+          "properties": {
+            "type": {
+              "enum": [
+                "url"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Inline base64-encoded document bytes with their media type.",
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "base64"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "media_type",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Edge": {
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "map": {
+          "default": null,
+          "description": "Optional jq/expression to map the source output before passing it on.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "ModelSelection": {
+      "description": "Determines which model (or routing rule) a `Model`/`Agent` node uses. Serialised with a `\"type\"` discriminant matching the variant name in snake_case.",
+      "oneOf": [
+        {
+          "description": "A specific model id (e.g. `\"claude-3-5-haiku-20241022\"`).",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "model"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "model",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A named TokenTrimmer route (resolved at runtime).",
+          "properties": {
+            "route_ref": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "route"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "route_ref",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Let the gateway pick the best model automatically.",
+          "properties": {
+            "type": {
+              "enum": [
+                "auto"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Node": {
+      "description": "A single DAG node.  The `id` field lives in the wrapper so every node kind shares a common identifier without repetition.\n\n# Serde approach `#[serde(flatten)]` spreads `NodeKind`'s fields (including the `\"type\"` tag) into the parent JSON object.  Combined with the internally-tagged `NodeKind`, this round-trips cleanly for JSON.\n\nNOTE: #[serde(flatten)] + internal tag works only with self-describing formats (JSON); do not serialize with CBOR/MessagePack.",
+      "oneOf": [
+        {
+          "description": "Entry-point node; receives the workflow's external input.",
+          "properties": {
+            "type": {
+              "enum": [
+                "trigger"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Single LLM call.",
+          "properties": {
+            "max_cost_usd": {
+              "default": null,
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "max_output_tokens": {
+              "description": "Optional per-call output-token ceiling.  Omitted definitions retain legacy provider-default behavior; capped workflow admission requires this to be explicitly set.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "selection": {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            "type": {
+              "enum": [
+                "model"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompt",
+            "selection",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Agentic multi-turn loop with tool access.",
+          "properties": {
+            "max_cost_usd": {
+              "default": null,
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "max_output_tokens": {
+              "description": "Optional ceiling for each model turn's completion.  It does not bound the number of turns; see `max_turns`.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_turns": {
+              "default": null,
+              "description": "Turn cap for the agent loop; None => the engine's default (DEFAULT_MAX_TURNS = 8, matching CreateRunRequest).",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "selection": {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            "tools": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/Tool"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "agent"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompt",
+            "selection",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Deterministic expression transform (no LLM call).",
+          "properties": {
+            "expr": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "transform"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "expr",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Conditional branch; exactly one outgoing edge is followed at runtime.",
+          "properties": {
+            "cond": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "branch"
+              ],
+              "type": "string"
+            },
+            "when_false": {
+              "type": "string"
+            },
+            "when_true": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cond",
+            "type",
+            "when_false",
+            "when_true"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Terminal output-collection node.",
+          "properties": {
+            "type": {
+              "enum": [
+                "output"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Outbound HTTP call to an allowlisted external API.\n\nThe `url` host must be a literal hostname that appears in `WorkflowDefinition::allowed_hosts` (default-deny).  Only the path, query-string, headers, and body may contain `{{template}}` tokens; the host must be a static literal so the allowlist is unambiguous.",
+          "properties": {
+            "body": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "headers": {
+              "default": [],
+              "items": {
+                "items": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "maxItems": 2,
+                "minItems": 2,
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "max_response_bytes": {
+              "default": null,
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "method": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "http"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "method",
+            "type",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Execute another stored workflow as a nested child (W3a-3).\n\n`version` is accepted for forward-compatibility but UNUSED at MVP — `load_subworkflow` always returns the latest version. The parent's remaining budget cap is passed to the child; cost and baseline roll up into the parent totals so `saved_usd` derives correctly without double-counting.",
+          "properties": {
+            "type": {
+              "enum": [
+                "sub_workflow"
+              ],
+              "type": "string"
+            },
+            "version": {
+              "default": null,
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workflow_id": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Bounded loop — runs the body sub-workflow up to `max_iters` times, re-checking `cond` (Branch syntax) before each iteration. Termination GUARANTEED by `max_iters`; `cond` is early-exit.",
+          "properties": {
+            "body_workflow_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "cond": {
+              "type": "string"
+            },
+            "max_iters": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "loop"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "body_workflow_id",
+            "cond",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "D6 — distill a document's text layer to text the downstream nodes can use.\n\nReuses the gateway's Document Lane seam (`document_lane::seam`) — the same extraction the gateway runs on a routed request — so the workflow + the gateway agree byte-for-byte on what a doc distills to. The node hashes the source bytes (blake3) + checks a per-org content-addressed distillation reuse cache (`flow_doc_distill_cache`): a hit returns the cached text ($0, no sidecar call); a miss calls the sidecar, stores the result, + returns it. Fail-loud: a cache-miss with the sidecar unreachable/erroring emits an error `NodeOutput` (no distilled text) — the node never silently emits raw bytes.\n\nv1 scope: `source` must be a `DocumentSource::Base64` (inline bytes). URLs are rejected (the seam's v1 doesn't fetch — same posture). `cache_key`, if `Some`, is an optional caller-supplied key (e.g. `\"{{trigger.input_id}}\"`) composed into the cache key for explicit reuse control; `None` keys on the content hash alone.",
+          "properties": {
+            "cache_key": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "$ref": "#/$defs/DocumentSource"
+            },
+            "type": {
+              "enum": [
+                "document"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "type"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "OnExceed": {
+      "description": "Action taken when a budget limit is hit.  Only `Stop` is implemented in W1a; warn/throttle/etc. are deferred.",
+      "enum": [
+        "Stop"
+      ],
+      "type": "string"
+    },
+    "Tool": {
+      "properties": {
+        "function": {
+          "$ref": "#/$defs/ToolFunction"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "function",
+        "type"
+      ],
+      "type": "object"
+    },
+    "ToolFunction": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "parameters": true
+      },
+      "required": [
+        "name",
+        "parameters"
+      ],
+      "type": "object"
+    },
+    "WorkflowTrigger": {
+      "description": "A workflow invoker (CO-2). Distinct from `NodeKind::Trigger` (the passive entry-point node that echoes the run's `inputs`); these are OUT-OF-BAND invokers the cloud surfaces — a schedule a sweep fires, or a signed webhook an external caller POSTs. The engine never reads them; the cloud's `workflow_schedule` sweep + the `/v1/workflows/:id/webhooks/:token` endpoint are the consumers.",
+      "oneOf": [
+        {
+          "description": "Fire on a fixed interval. `interval` is a duration string (`\"1h\"` / `\"6h\"` / `\"1d\"`) and new definitions must be at least one hour. The cloud dispatcher picks due work up on an approximate hourly sweep, not at an exact wall-clock time. No real-cron expressions in v1 (no cron crate dep — the cloud sweeps are fixed-`Duration` sleeps; mirroring that keeps the cadence discipline uniform).",
+          "properties": {
+            "interval": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "schedule"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "interval",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Fire via a signed webhook URL. `token_id` is the public trigger identifier embedded in the v2 capability path (`POST /v1/workflows/:id/webhooks/{org_uuid}.{token_id}.{hex_sig}`); the HMAC secret is derived server-side under a `wfwh2|{org_id}|{workflow_id}|{token_id}` domain. Binding the tenant is required because workflow ids are tenant-scoped. This reuses the badge-HMAC key + the `verify_receipt_share_url` idiom.",
+          "properties": {
+            "token_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "webhook"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "token_id",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "urn:tokentrimmer:workflow:write-schema:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "`POST /v1/workflows` request body.  Both `id` and `version` are optional: if `id` is absent a new `UUIDv4` is generated; `version` is ignored (the store computes the next version atomically via `MAX(version)+1`).",
+  "properties": {
+    "allowed_hosts": {
+      "default": [],
+      "description": "Per-workflow egress allowlist forwarded to `WorkflowDefinition::allowed_hosts`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "budget": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/BudgetPolicy"
+        }
+      ],
+      "default": {
+        "max_cost_usd": null,
+        "on_exceed": "Stop"
+      }
+    },
+    "edges": {
+      "items": {
+        "$ref": "#/$defs/Edge"
+      },
+      "type": "array"
+    },
+    "id": {
+      "format": "uuid",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "inputs": {
+      "default": null
+    },
+    "metadata": {
+      "default": null,
+      "description": "Freeform editor metadata forwarded to `WorkflowDefinition::metadata` (WF-3: canvas node positions, previously localStorage-only). Optional + defaulted so a save without it (an older editor) is unchanged."
+    },
+    "name": {
+      "type": "string"
+    },
+    "nodes": {
+      "items": {
+        "$ref": "#/$defs/Node"
+      },
+      "type": "array"
+    },
+    "triggers": {
+      "default": [],
+      "description": "Out-of-band workflow invokers (schedule and signed webhook).  These must round-trip on every definition update: dropping them silently disables production automations.",
+      "items": {
+        "$ref": "#/$defs/WorkflowTrigger"
+      },
+      "type": "array"
+    },
+    "version": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "edges",
+    "name",
+    "nodes"
+  ],
+  "title": "TokenTrimmer workflow write request",
+  "type": "object"
+}

@@ -110,6 +110,7 @@ fn admit_workflow_budget_before_dispatch(
 /// if `id` is absent a new `UUIDv4` is generated; `version` is ignored (the
 /// store computes the next version atomically via `MAX(version)+1`).
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkflowRequest {
     pub id: Option<Uuid>,

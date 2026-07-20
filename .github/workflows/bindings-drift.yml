@@ -24,9 +24,11 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Check generated schemas, TypeScript, vectors, and manifest
+      - name: Check generated product/proof schemas, TypeScript, vectors, and manifests
         run: cargo run --locked -p tt-ts-types -- check
       - name: Verify fixed signatures and forged fixtures independently
         run: node scripts/verify-receipt-contracts.mjs
+      - name: Verify product manifests, schemas, vectors, and TypeScript independently
+        run: node scripts/verify-product-contracts.mjs
       - name: Test the Rust generator and production verifiers
         run: cargo test --locked -p tt-ts-types

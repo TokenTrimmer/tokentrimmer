@@ -248,6 +248,7 @@ fn unknown_fact(code: &'static str, message: &'static str) -> UnknownEvidence {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct GatewayCapabilitiesDocument {
     pub schema_version: u32,
     pub scope: &'static str,
@@ -262,11 +263,13 @@ pub struct GatewayCapabilitiesDocument {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct GatewayFeatures {
     pub fusion: FusionCapability,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct FusionCapability {
     pub enabled: EnabledEvidence,
     /// Result of this responder's Fusion kill-switch + tier gate only.
@@ -277,6 +280,7 @@ pub struct FusionCapability {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct EnabledEvidence {
     pub state: &'static str,
     pub source: &'static str,
@@ -284,12 +288,14 @@ pub struct EnabledEvidence {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct AccessEvidence {
     pub state: &'static str,
     pub reason: CapabilityReason,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct TierEvidence {
     pub state: &'static str,
     pub value: &'static str,
@@ -298,11 +304,13 @@ pub struct TierEvidence {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct FusionLimits {
     pub member_models_max: NumericLimit,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct NumericLimit {
     pub value: usize,
     pub enforcement: &'static str,
@@ -310,6 +318,7 @@ pub struct NumericLimit {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct UnknownEvidence {
     pub state: &'static str,
     pub source: &'static str,
@@ -317,12 +326,14 @@ pub struct UnknownEvidence {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct SchemaVersions {
     pub capabilities_document: SchemaVersionEvidence,
     pub fusion_request: SchemaVersionEvidence,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct SchemaVersionEvidence {
     pub state: &'static str,
     pub version: Option<u32>,
@@ -331,6 +342,7 @@ pub struct SchemaVersionEvidence {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct CapabilityReason {
     pub code: &'static str,
     pub message: &'static str,

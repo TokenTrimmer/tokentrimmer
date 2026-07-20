@@ -20,6 +20,7 @@ use crate::{
 
 /// Fields needed to create a route; the store assigns the `id`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct NewRoute {
     pub name: String,

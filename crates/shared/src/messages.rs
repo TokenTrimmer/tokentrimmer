@@ -441,7 +441,7 @@ impl<'de> Deserialize<'de> for DocumentPart {
 /// Where a [`DocumentPart`]'s bytes come from: a remote/`data:` URL or inline
 /// base64. Serializes to Anthropic's source convention
 /// (`{"type":"url",...}` / `{"type":"base64","media_type":...,"data":...}`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DocumentSource {
     /// Remote document URL (or an unparsed `data:` URL).
@@ -450,14 +450,14 @@ pub enum DocumentSource {
     Base64 { media_type: String, data: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Tool {
     #[serde(rename = "type")]
     pub r#type: String,
     pub function: ToolFunction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ToolFunction {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

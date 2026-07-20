@@ -1,11 +1,19 @@
 # Route contract corpus
 
-`tokentrimmer.route.v1.corpus.json` is the versioned, machine-readable
-compatibility corpus for the route-definition contract. It is intentionally a
-small golden corpus, not a generated JSON Schema or a second runtime
-validator. The public routing crate's corpus test consumes the authoritative
-copy; hosted consumers should vendor the exact bytes that match their pinned
-public gateway revision and compare the copies in cross-repository CI.
+This directory publishes two complementary artifacts for
+`tokentrimmer.route.v1`:
+
+- `route-write.schema.json` is generated from the exact Rust
+  `tt_routing::RouteWriteRequest` parser and its nested live-routing types; the
+  matching TypeScript is in `bindings/product-contracts.generated.ts`.
+- `tokentrimmer.route.v1.corpus.json` is the versioned semantic compatibility
+  corpus consumed by the real canonicalizer and its control-plane adapter.
+
+The generated schema is structural, not a second semantic validator: route
+effect, exclusivity, finite-money, catalog, capability, and activation rules
+remain in the Rust canonicalizer. Hosted consumers must vendor the artifacts
+from the same immutable public revision and compare exact bytes in
+cross-repository CI.
 
 ## Format v1
 

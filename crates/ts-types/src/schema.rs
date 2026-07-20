@@ -5,7 +5,7 @@ use schemars::schema::RootSchema;
 use serde_json::{json, Map, Value};
 
 pub(crate) struct ContractSchema {
-    pub(crate) file_name: &'static str,
+    pub(crate) relative_path: &'static str,
     pub(crate) ts_name: &'static str,
     pub(crate) value: Value,
 }
@@ -76,29 +76,94 @@ pub(crate) fn generate_schemas() -> Result<Vec<ContractSchema>> {
 
     Ok(vec![
         ContractSchema {
-            file_name: "vcr-receipt.schema.json",
+            relative_path: "docs/receipt-spec/vcr-receipt.schema.json",
             ts_name: "VcrReceipt",
             value: vcr,
         },
         ContractSchema {
-            file_name: "l2-receipt.schema.json",
+            relative_path: "docs/receipt-spec/l2-receipt.schema.json",
             ts_name: "L2Receipt",
             value: l2,
         },
         ContractSchema {
-            file_name: "wfr-receipt.schema.json",
+            relative_path: "docs/receipt-spec/wfr-receipt.schema.json",
             ts_name: "WfrReceipt",
             value: wfr,
         },
         ContractSchema {
-            file_name: "arr-receipt.schema.json",
+            relative_path: "docs/receipt-spec/arr-receipt.schema.json",
             ts_name: "AgentRunReceipt",
             value: arr,
         },
         ContractSchema {
-            file_name: "savings-bundle.schema.json",
+            relative_path: "docs/receipt-spec/savings-bundle.schema.json",
             ts_name: "SavingsBundle",
             value: bundle,
+        },
+    ])
+}
+
+pub(crate) fn generate_product_schemas() -> Result<Vec<ContractSchema>> {
+    let mut route = root_value(schemars::schema_for!(tt_routing::RouteWriteRequest))?;
+    prepare_product_root(
+        &mut route,
+        "urn:tokentrimmer:route:write-schema:v1",
+        "TokenTrimmer route write contract",
+        "Structural route-write contract generated from the exact tt_routing::RouteWriteRequest parser and its nested live-routing types.",
+    )?;
+    set_enum_values(&mut route, "schema_version", &[json!(1), Value::Null])?;
+
+    let mut workflow_definition = root_value(schemars::schema_for!(
+        tt_core::workflow::types::WorkflowDefinition
+    ))?;
+    prepare_product_root(
+        &mut workflow_definition,
+        "urn:tokentrimmer:workflow:definition-schema:v1",
+        "TokenTrimmer workflow definition",
+        "Structural workflow definition generated from the exact tt_core::workflow::types::WorkflowDefinition persisted and returned by the gateway.",
+    )?;
+
+    let mut workflow_write = root_value(schemars::schema_for!(
+        tt_core::routes::workflows::CreateWorkflowRequest
+    ))?;
+    prepare_product_root(
+        &mut workflow_write,
+        "urn:tokentrimmer:workflow:write-schema:v1",
+        "TokenTrimmer workflow write request",
+        "Structural POST /v1/workflows request generated from the exact tt_core::routes::workflows::CreateWorkflowRequest parser.",
+    )?;
+
+    let mut capabilities = root_value(schemars::schema_for!(
+        tt_core::routes::capabilities::GatewayCapabilitiesDocument
+    ))?;
+    prepare_product_root(
+        &mut capabilities,
+        "urn:tokentrimmer:gateway-capabilities:response-schema:v1",
+        "TokenTrimmer gateway runtime capabilities",
+        "Structural GET /v1/capabilities response generated from the exact tt_core::routes::capabilities::GatewayCapabilitiesDocument output type.",
+    )?;
+    strengthen_capabilities(&mut capabilities)?;
+
+    Ok(vec![
+        ContractSchema {
+            relative_path: "docs/route-contract/route-write.schema.json",
+            ts_name: "RouteWriteRequest",
+            value: route,
+        },
+        ContractSchema {
+            relative_path: "docs/workflow-contract/workflow-definition.schema.json",
+            ts_name: "WorkflowDefinition",
+            value: workflow_definition,
+        },
+        ContractSchema {
+            relative_path: "docs/workflow-contract/workflow-write.schema.json",
+            ts_name: "WorkflowWriteRequest",
+            value: workflow_write,
+        },
+        ContractSchema {
+            relative_path: "docs/capability-contract/gateway-capabilities.schema.json",
+            ts_name: "GatewayCapabilitiesDocument",
+            value: capabilities,
         },
     ])
 }
@@ -122,6 +187,26 @@ fn prepare_root(value: &mut Value, id: &str, title: &str, comment: &str) -> Resu
         "{comment} Structure alone does not prove signature integrity, issuer identity, math replay, provider usage, or invoice reconciliation."
     )));
     root.insert("additionalProperties".into(), Value::Bool(true));
+    Ok(())
+}
+
+fn prepare_product_root(value: &mut Value, id: &str, title: &str, comment: &str) -> Result<()> {
+    normalize_draft_2020_12(value);
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("generated schema root is not an object"))?;
+    root.insert(
+        "$schema".into(),
+        Value::String("https://json-schema.org/draft/2020-12/schema".into()),
+    );
+    root.insert("$id".into(), Value::String(id.into()));
+    root.insert("title".into(), Value::String(title.into()));
+    root.insert(
+        "$comment".into(),
+        Value::String(format!(
+            "{comment} Runtime semantic validation, authorization, readiness, and execution remain separate gates."
+        )),
+    );
     Ok(())
 }
 
@@ -165,6 +250,98 @@ fn set_const(schema: &mut Value, name: &str, value: Value) -> Result<()> {
 
 fn set_enum(schema: &mut Value, name: &str, values: &[&str]) -> Result<()> {
     property_mut(schema, name)?.insert("enum".into(), json!(values));
+    Ok(())
+}
+
+fn set_enum_values(schema: &mut Value, name: &str, values: &[Value]) -> Result<()> {
+    property_mut(schema, name)?.insert("enum".into(), Value::Array(values.to_vec()));
+    Ok(())
+}
+
+fn definition_property_mut<'a>(
+    schema: &'a mut Value,
+    definition: &str,
+    property: &str,
+) -> Result<&'a mut Map<String, Value>> {
+    schema
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .and_then(|definitions| definitions.get_mut(definition))
+        .and_then(|definition| definition.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut(property))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            anyhow!("generated schema is missing $defs.{definition}.properties.{property}")
+        })
+}
+
+fn strengthen_capabilities(schema: &mut Value) -> Result<()> {
+    set_const(
+        schema,
+        "schema_version",
+        json!(tt_core::routes::capabilities::CAPABILITIES_SCHEMA_VERSION),
+    )?;
+    set_const(schema, "scope", json!("gateway_runtime"))?;
+    set_const(schema, "snapshot_scope", json!("responding_process"))?;
+    set_format(schema, "generated_at", "date-time")?;
+
+    for (definition, property, values) in [
+        (
+            "EnabledEvidence",
+            "state",
+            vec![json!("enabled"), json!("disabled")],
+        ),
+        ("EnabledEvidence", "source", vec![json!("gateway_runtime")]),
+        (
+            "AccessEvidence",
+            "state",
+            vec![json!("available"), json!("unavailable")],
+        ),
+        ("TierEvidence", "state", vec![json!("known")]),
+        (
+            "TierEvidence",
+            "value",
+            vec![json!("free"), json!("pro"), json!("team"), json!("scale")],
+        ),
+        (
+            "TierEvidence",
+            "source",
+            vec![
+                json!("authenticated_api_key"),
+                json!("gateway_free_default"),
+                json!("gateway_runtime"),
+            ],
+        ),
+        ("UnknownEvidence", "state", vec![json!("unknown")]),
+        ("UnknownEvidence", "source", vec![json!("not_negotiated")]),
+        (
+            "NumericLimit",
+            "enforcement",
+            vec![json!("gateway_runtime")],
+        ),
+        (
+            "SchemaVersionEvidence",
+            "state",
+            vec![json!("known"), json!("unversioned")],
+        ),
+        (
+            "SchemaVersionEvidence",
+            "source",
+            vec![json!("gateway_runtime")],
+        ),
+    ] {
+        definition_property_mut(schema, definition, property)?
+            .insert("enum".into(), Value::Array(values));
+    }
+    definition_property_mut(schema, "NumericLimit", "value")?.insert("minimum".into(), json!(1));
+    let code = definition_property_mut(schema, "CapabilityReason", "code")?;
+    code.insert("minLength".into(), json!(1));
+    code.insert("maxLength".into(), json!(96));
+    code.insert("pattern".into(), json!("^[a-z0-9_:-]+$"));
+    let message = definition_property_mut(schema, "CapabilityReason", "message")?;
+    message.insert("minLength".into(), json!(1));
+    message.insert("maxLength".into(), json!(600));
     Ok(())
 }
 
@@ -270,6 +447,30 @@ fn strict_request_delta_rule(versions: &[&str]) -> Value {
 }
 
 pub(crate) fn render_typescript(schemas: &[ContractSchema]) -> Result<String> {
+    render_typescript_with_footer(
+        schemas,
+        "// @generated by `cargo run -p tt-ts-types -- write`; DO NOT EDIT.\n\
+         // JSON integer fields are `number` here. Runtime consumers must retain their\n\
+         // existing Number.isSafeInteger checks before cryptographic verification.\n\n",
+        "export type SignedReceipt = VcrReceipt | L2Receipt | WfrReceipt | AgentRunReceipt;\n",
+    )
+}
+
+pub(crate) fn render_product_typescript(schemas: &[ContractSchema]) -> Result<String> {
+    render_typescript_with_footer(
+        schemas,
+        "// @generated by `cargo run -p tt-ts-types -- write`; DO NOT EDIT.\n\
+         // These are structural Rust wire types. Runtime semantic validation, safe-integer\n\
+         // checks, authorization, readiness, and execution remain separate gates.\n\n",
+        "",
+    )
+}
+
+fn render_typescript_with_footer(
+    schemas: &[ContractSchema],
+    header: &str,
+    footer: &str,
+) -> Result<String> {
     let mut definitions = BTreeMap::<String, Value>::new();
     for contract in schemas {
         if let Some(items) = contract.value.get("$defs").and_then(Value::as_object) {
@@ -283,11 +484,7 @@ pub(crate) fn render_typescript(schemas: &[ContractSchema]) -> Result<String> {
         }
     }
 
-    let mut output = String::from(
-        "// @generated by `cargo run -p tt-ts-types -- write`; DO NOT EDIT.\n\
-         // JSON integer fields are `number` here. Runtime consumers must retain their\n\
-         // existing Number.isSafeInteger checks before cryptographic verification.\n\n",
-    );
+    let mut output = String::from(header);
     for (name, definition) in definitions {
         output.push_str(&format!(
             "export type {name} = {};\n\n",
@@ -301,9 +498,14 @@ pub(crate) fn render_typescript(schemas: &[ContractSchema]) -> Result<String> {
             ts_type(&contract.value, 0)?
         ));
     }
-    output.push_str(
-        "export type SignedReceipt = VcrReceipt | L2Receipt | WfrReceipt | AgentRunReceipt;\n",
-    );
+    if footer.is_empty() {
+        // A generated module without a footer should end with the final type's
+        // newline, not an additional blank line (keeps git diff --check clean).
+        let removed = output.pop();
+        debug_assert_eq!(removed, Some('\n'));
+    } else {
+        output.push_str(footer);
+    }
     Ok(output)
 }
 
@@ -338,19 +540,27 @@ fn ts_type(schema: &Value, depth: usize) -> Result<String> {
                 .iter()
                 .map(|item| ts_type(item, depth))
                 .collect::<Result<Vec<_>>>()?;
-            return Ok(rendered.join(" | "));
+            let union = rendered.join(" | ");
+            if schema.get("properties").is_some() {
+                return Ok(format!("{} & ({union})", ts_object(schema, depth)?));
+            }
+            return Ok(union);
         }
     }
-    if schema.get("properties").is_none() {
-        if let Some(items) = schema.get("allOf").and_then(Value::as_array) {
-            let rendered = items
+    if let Some(items) = schema.get("allOf").and_then(Value::as_array) {
+        let mut rendered = Vec::new();
+        if schema.get("properties").is_some() {
+            rendered.push(ts_object(schema, depth)?);
+        }
+        rendered.extend(
+            items
                 .iter()
                 .filter(|item| item.get("if").is_none())
                 .map(|item| ts_type(item, depth))
-                .collect::<Result<Vec<_>>>()?;
-            if !rendered.is_empty() {
-                return Ok(rendered.join(" & "));
-            }
+                .collect::<Result<Vec<_>>>()?,
+        );
+        if !rendered.is_empty() {
+            return Ok(rendered.join(" & "));
         }
     }
 

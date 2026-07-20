@@ -13,6 +13,8 @@ publish = false
 tt-shared.workspace = true
 tt-telemetry = { workspace = true, features = ["contract-schema"] }
 tt-plan-core = { workspace = true, features = ["contract-schema"] }
+tt-routing = { workspace = true, features = ["contract-schema"] }
+tt-core = { workspace = true, features = ["contract-schema"] }
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

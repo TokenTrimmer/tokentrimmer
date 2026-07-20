@@ -1,0 +1,74 @@
+{
+  "contract": "tokentrimmer.product-contracts.v1",
+  "contracts": [
+    {
+      "compatibility_corpus": "docs/route-contract/tokentrimmer.route.v1.corpus.json",
+      "family": "route",
+      "id": "tokentrimmer.route.v1",
+      "schema": "docs/route-contract/route-write.schema.json",
+      "versions": [
+        1
+      ],
+      "write": "POST /v1/routes"
+    },
+    {
+      "family": "workflow_definition",
+      "id": "tokentrimmer.workflow-definition.v1",
+      "read": "GET /v1/workflows/{id}",
+      "schema": "docs/workflow-contract/workflow-definition.schema.json",
+      "vectors": [
+        "docs/workflow-contract/workflow-definition-v1.golden.json"
+      ],
+      "versions": [
+        1
+      ]
+    },
+    {
+      "family": "workflow_write",
+      "id": "tokentrimmer.workflow-write.v1",
+      "schema": "docs/workflow-contract/workflow-write.schema.json",
+      "versions": [
+        1
+      ],
+      "write": "POST /v1/workflows"
+    },
+    {
+      "compatibility_corpus": "docs/capability-contract/tokentrimmer.gateway-capabilities.v1.corpus.json",
+      "family": "gateway_capabilities",
+      "id": "tokentrimmer.gateway-capabilities.v1",
+      "read": "GET /v1/capabilities",
+      "schema": "docs/capability-contract/gateway-capabilities.schema.json",
+      "versions": [
+        1
+      ]
+    }
+  ],
+  "files": [
+    {
+      "path": "bindings/product-contracts.generated.ts",
+      "sha256": "ff0f752791cc68eee29b44f54da9d75815fc7d3d2676874ae86dab04ad2a62b3"
+    },
+    {
+      "path": "docs/capability-contract/gateway-capabilities.schema.json",
+      "sha256": "273191038c0c39dc72626a787f37649495b4a20426c2416fccf7cdfdfe31a783"
+    },
+    {
+      "path": "docs/route-contract/route-write.schema.json",
+      "sha256": "9cdfb331ddca915d5ec7042c84eb166c8588e9299964b64aa4af47a35dbf33d8"
+    },
+    {
+      "path": "docs/workflow-contract/workflow-definition-v1.golden.json",
+      "sha256": "abf86966f51a0e2080d19c8407904f5910162ec818603218bac6b8539923f45a"
+    },
+    {
+      "path": "docs/workflow-contract/workflow-definition.schema.json",
+      "sha256": "2a15d289ff2e24b47a097b3370aaab864e3f6d9c178c61361a484f7228fb7e30"
+    },
+    {
+      "path": "docs/workflow-contract/workflow-write.schema.json",
+      "sha256": "fbf5d47faf86b82b200bb161d6a7a715fb1a9a62c484025a91604f73ab7d573e"
+    }
+  ],
+  "generated_from": "Authoritative Rust route parser, workflow definition/write types, and gateway capability response type",
+  "typescript": "bindings/product-contracts.generated.ts"
+}

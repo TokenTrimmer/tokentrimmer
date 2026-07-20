@@ -64,18 +64,19 @@ pub struct CanonicalRoute {
 /// v1 backward compatibility; absent is interpreted as v1. A writer that sends
 /// any other explicit version receives a field-addressed validation error.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
-struct RouteEnvelope {
+pub struct RouteWriteRequest {
     #[serde(default)]
-    schema_version: Option<u32>,
-    name: String,
+    pub schema_version: Option<u32>,
+    pub name: String,
     #[serde(default = "default_priority")]
-    priority: u32,
+    pub priority: u32,
     #[serde(default = "default_enabled")]
-    enabled: bool,
+    pub enabled: bool,
     #[serde(default = "default_conditions")]
-    when: Value,
-    then: Value,
+    pub when: RouteConditions,
+    pub then: RouteAction,
 }
 
 fn default_priority() -> u32 {
@@ -86,8 +87,8 @@ fn default_enabled() -> bool {
     true
 }
 
-fn default_conditions() -> Value {
-    serde_json::json!({})
+fn default_conditions() -> RouteConditions {
+    RouteConditions::default()
 }
 
 /// Canonicalize a gateway-shaped route object:
@@ -97,7 +98,7 @@ fn default_conditions() -> Value {
 /// precise field path for type, unknown-field, legacy-version, and semantic
 /// errors instead of accepting a partially-deserialized object.
 pub fn canonicalize_route_value(value: Value) -> Result<CanonicalRoute, Vec<RouteValidationIssue>> {
-    let envelope: RouteEnvelope = match deserialize_with_path(value) {
+    let envelope: RouteWriteRequest = match deserialize_with_path(value) {
         Ok(envelope) => envelope,
         Err(issue) => return Err(vec![issue]),
     };
@@ -118,16 +119,12 @@ pub fn canonicalize_route_value(value: Value) -> Result<CanonicalRoute, Vec<Rout
         )]);
     }
 
-    let raw_route = serde_json::json!({
-        "name": envelope.name,
-        "priority": envelope.priority,
-        "enabled": envelope.enabled,
-        "when": envelope.when,
-        "then": envelope.then,
-    });
-    let route: NewRoute = match deserialize_with_path(raw_route) {
-        Ok(route) => route,
-        Err(issue) => return Err(vec![issue]),
+    let route = NewRoute {
+        name: envelope.name,
+        priority: envelope.priority,
+        enabled: envelope.enabled,
+        when: envelope.when,
+        then: envelope.then,
     };
 
     let issues = validate_route_semantics(&route);

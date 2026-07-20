@@ -1,9 +1,14 @@
 # Gateway capabilities contract corpus
 
-`tokentrimmer.gateway-capabilities.v1.corpus.json` is a small, versioned
+This directory publishes a generated structural schema plus a small versioned
 compatibility corpus for the public gateway's authenticated
-`GET /v1/capabilities` document. It is intentionally a golden drift guard, not
-generated JSON Schema, a second runtime validator, or readiness evidence.
+`GET /v1/capabilities` document. `gateway-capabilities.schema.json` comes from
+the exact Rust `GatewayCapabilitiesDocument` response type; its matching
+TypeScript is in `bindings/product-contracts.generated.ts`.
+
+`tokentrimmer.gateway-capabilities.v1.corpus.json` remains the semantic parser
+drift guard. Neither artifact is a second runtime validator or readiness
+evidence.
 
 The public CLI test consumes the authoritative copy. Hosted consumers should
 vendor its exact bytes with the public revision they pin, then run their own

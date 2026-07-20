@@ -12,6 +12,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct WorkflowDefinition {
     pub id: Uuid,
     pub version: u32,
@@ -66,6 +67,7 @@ pub struct WorkflowDefinition {
 /// `workflow_schedule` sweep + the `/v1/workflows/:id/webhooks/:token` endpoint
 /// are the consumers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowTrigger {
     /// Fire on a fixed interval. `interval` is a duration string (`"1h"` /
@@ -99,6 +101,7 @@ pub enum WorkflowTrigger {
 ///
 /// NOTE: #[serde(flatten)] + internal tag works only with self-describing formats (JSON); do not serialize with CBOR/MessagePack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct Node {
     pub id: String,
     #[serde(flatten)]
@@ -109,6 +112,7 @@ pub struct Node {
 /// variant-specific fields are inlined into the same JSON object via the
 /// internal-tag mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeKind {
     /// Entry-point node; receives the workflow's external input.
@@ -230,6 +234,7 @@ pub enum NodeKind {
 /// Serialised with a `"type"` discriminant matching the variant name in
 /// snake_case.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelSelection {
     /// A specific model id (e.g. `"claude-3-5-haiku-20241022"`).
@@ -245,6 +250,7 @@ pub enum ModelSelection {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct Edge {
     pub from: String,
     pub to: String,
@@ -258,6 +264,7 @@ pub struct Edge {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub struct BudgetPolicy {
     /// Hard USD cap for the entire workflow run.
     #[serde(default)]
@@ -270,6 +277,7 @@ pub struct BudgetPolicy {
 /// Action taken when a budget limit is hit.  Only `Stop` is implemented in
 /// W1a; warn/throttle/etc. are deferred.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub enum OnExceed {
     #[default]
     Stop,

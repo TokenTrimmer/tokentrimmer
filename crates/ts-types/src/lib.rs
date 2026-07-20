@@ -1,4 +1,4 @@
-//! Generated public contract artifacts for TokenTrimmer proof surfaces.
+//! Generated public contract artifacts for TokenTrimmer wire and proof surfaces.
 //!
 //! The actual Rust wire types and canonicalizers remain authoritative. This
 //! crate derives JSON Schema from those types, derives TypeScript from those
@@ -26,6 +26,8 @@ use uuid::Uuid;
 
 const GENERATED_TS_PATH: &str = "bindings/receipt-contracts.generated.ts";
 const MANIFEST_PATH: &str = "docs/receipt-spec/receipt-contracts.manifest.json";
+const PRODUCT_TS_PATH: &str = "bindings/product-contracts.generated.ts";
+const PRODUCT_MANIFEST_PATH: &str = "docs/contracts/product-contracts.manifest.json";
 const FIXED_KEY_BYTES: [u8; 32] = [7; 32];
 const FIXED_KEY_HEX: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
 
@@ -43,21 +45,40 @@ pub fn repository_root() -> PathBuf {
 
 /// Regenerate every published proof contract in memory.
 pub fn generate_artifacts() -> Result<Vec<GeneratedArtifact>> {
-    let schemas = schema::generate_schemas()?;
-    let mut artifacts = Vec::new();
-    for contract in &schemas {
-        artifacts.push(json_artifact(
-            &format!("docs/receipt-spec/{}", contract.file_name),
-            &contract.value,
-        )?);
+    let receipt_schemas = schema::generate_schemas()?;
+    let mut receipt_artifacts = Vec::new();
+    for contract in &receipt_schemas {
+        receipt_artifacts.push(json_artifact(contract.relative_path, &contract.value)?);
     }
-    artifacts.push(GeneratedArtifact {
+    receipt_artifacts.push(GeneratedArtifact {
         relative_path: GENERATED_TS_PATH.into(),
-        bytes: schema::render_typescript(&schemas)?.into_bytes(),
+        bytes: schema::render_typescript(&receipt_schemas)?.into_bytes(),
     });
-    artifacts.extend(generate_vectors()?);
+    receipt_artifacts.extend(generate_vectors()?);
+    receipt_artifacts.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let receipt_manifest = manifest_artifact(&receipt_artifacts)?;
+
+    let product_schemas = schema::generate_product_schemas()?;
+    let mut product_artifacts = Vec::new();
+    for contract in &product_schemas {
+        product_artifacts.push(json_artifact(contract.relative_path, &contract.value)?);
+    }
+    product_artifacts.push(GeneratedArtifact {
+        relative_path: PRODUCT_TS_PATH.into(),
+        bytes: schema::render_product_typescript(&product_schemas)?.into_bytes(),
+    });
+    product_artifacts.push(typed_json_artifact(
+        "docs/workflow-contract/workflow-definition-v1.golden.json",
+        &workflow_definition_vector(),
+    )?);
+    product_artifacts.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let product_manifest = product_manifest_artifact(&product_artifacts)?;
+
+    let mut artifacts = receipt_artifacts;
+    artifacts.push(receipt_manifest);
+    artifacts.extend(product_artifacts);
+    artifacts.push(product_manifest);
     artifacts.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    artifacts.push(manifest_artifact(&artifacts)?);
     Ok(artifacts)
 }
 
@@ -386,6 +407,66 @@ fn timestamp(value: &str) -> Result<DateTime<Utc>> {
         .with_timezone(&Utc))
 }
 
+fn workflow_definition_vector() -> tt_core::workflow::types::WorkflowDefinition {
+    use tt_core::workflow::types::{
+        BudgetPolicy, Edge, ModelSelection, Node, NodeKind, OnExceed, WorkflowDefinition,
+        WorkflowTrigger,
+    };
+
+    WorkflowDefinition {
+        id: Uuid::from_u128(0xc1),
+        version: 1,
+        name: "generated-contract-smoke".into(),
+        nodes: vec![
+            Node {
+                id: "input".into(),
+                kind: NodeKind::Trigger,
+            },
+            Node {
+                id: "answer".into(),
+                kind: NodeKind::Model {
+                    selection: ModelSelection::Model {
+                        model: "gpt-4o-mini".into(),
+                    },
+                    prompt: "Answer {{input}}".into(),
+                    max_output_tokens: Some(256),
+                    max_cost_usd: Some(0.02),
+                },
+            },
+            Node {
+                id: "output".into(),
+                kind: NodeKind::Output,
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "input".into(),
+                to: "answer".into(),
+                map: None,
+            },
+            Edge {
+                from: "answer".into(),
+                to: "output".into(),
+                map: None,
+            },
+        ],
+        inputs: json!({"question": "Why is exact wire generation useful?"}),
+        budget: BudgetPolicy {
+            max_cost_usd: Some(0.05),
+            on_exceed: OnExceed::Stop,
+        },
+        allowed_hosts: Vec::new(),
+        metadata: json!({"canvas_positions": {
+            "input": {"x": 0, "y": 0},
+            "answer": {"x": 240, "y": 0},
+            "output": {"x": 480, "y": 0}
+        }}),
+        triggers: vec![WorkflowTrigger::Schedule {
+            interval: "1d".into(),
+        }],
+    }
+}
+
 fn manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<GeneratedArtifact> {
     let files = artifacts
         .iter()
@@ -466,6 +547,58 @@ fn manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<GeneratedArtifac
     json_artifact(MANIFEST_PATH, &manifest)
 }
 
+fn product_manifest_artifact(artifacts: &[GeneratedArtifact]) -> Result<GeneratedArtifact> {
+    let files = artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "path": artifact.relative_path,
+                "sha256": hex::encode(Sha256::digest(&artifact.bytes)),
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = json!({
+        "contract": "tokentrimmer.product-contracts.v1",
+        "generated_from": "Authoritative Rust route parser, workflow definition/write types, and gateway capability response type",
+        "typescript": PRODUCT_TS_PATH,
+        "contracts": [
+            {
+                "family": "route",
+                "id": tt_routing::ROUTE_SCHEMA_ID,
+                "versions": [tt_routing::ROUTE_SCHEMA_VERSION],
+                "schema": "docs/route-contract/route-write.schema.json",
+                "compatibility_corpus": "docs/route-contract/tokentrimmer.route.v1.corpus.json",
+                "write": "POST /v1/routes"
+            },
+            {
+                "family": "workflow_definition",
+                "id": "tokentrimmer.workflow-definition.v1",
+                "versions": [1],
+                "schema": "docs/workflow-contract/workflow-definition.schema.json",
+                "vectors": ["docs/workflow-contract/workflow-definition-v1.golden.json"],
+                "read": "GET /v1/workflows/{id}"
+            },
+            {
+                "family": "workflow_write",
+                "id": "tokentrimmer.workflow-write.v1",
+                "versions": [1],
+                "schema": "docs/workflow-contract/workflow-write.schema.json",
+                "write": "POST /v1/workflows"
+            },
+            {
+                "family": "gateway_capabilities",
+                "id": "tokentrimmer.gateway-capabilities.v1",
+                "versions": [tt_core::routes::capabilities::CAPABILITIES_SCHEMA_VERSION],
+                "schema": "docs/capability-contract/gateway-capabilities.schema.json",
+                "compatibility_corpus": "docs/capability-contract/tokentrimmer.gateway-capabilities.v1.corpus.json",
+                "read": "GET /v1/capabilities"
+            }
+        ],
+        "files": files
+    });
+    json_artifact(PRODUCT_MANIFEST_PATH, &manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +655,19 @@ mod tests {
             serde_json::to_value(recomputed).expect("serialize replay"),
             serde_json::to_value(bundle.expected_result).expect("serialize expected result")
         );
+
+        let workflow: tt_core::workflow::types::WorkflowDefinition = serde_json::from_slice(get(
+            "docs/workflow-contract/workflow-definition-v1.golden.json",
+        ))
+        .expect("parse workflow definition vector");
+        assert_eq!(workflow.version, 1);
+        assert_eq!(workflow.nodes.len(), 3);
+        assert_eq!(workflow.triggers.len(), 1);
+
+        let product_types = std::str::from_utf8(get(PRODUCT_TS_PATH)).expect("product TypeScript");
+        assert!(product_types.contains("export type Node = {\n  id: string;\n} & ("));
+        assert!(product_types.contains("max_output_tokens?: number | null;"));
+        assert!(product_types.contains("export type RouteWriteRequest ="));
+        assert!(product_types.contains("export type GatewayCapabilitiesDocument ="));
     }
 }

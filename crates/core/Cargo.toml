@@ -11,6 +11,7 @@ description = "Axum HTTP server, routing engine, middleware, and provider regist
 # Phase-2b learned-compression scorer (OFF by default — the public/Fly builds
 # stay ML-dep-free; only the owner's M4 Max gateway build enables this).
 ml-scoring = ["dep:tt-ml-scoring"]
+contract-schema = ["dep:schemars", "tt-routing/contract-schema"]
 
 [dependencies]
 tt-shared.workspace = true
@@ -73,6 +74,7 @@ tokio-util.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars = { workspace = true, optional = true }
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
