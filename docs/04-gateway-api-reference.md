@@ -2449,10 +2449,14 @@ state, promote an environment, approve a change, or perform a rollback.
 
 Returns a static cost projection for the workflow's latest definition. No model calls are made.
 
+Set optional positive `workflow_version` (legacy alias: `version`) to estimate
+that exact retained org-owned definition instead of latest. An absent version
+returns `404`; zero or a negative version returns `400` before storage access.
+
 **Request body:**
 
 ```json
-{ "inputs": {} }
+{ "inputs": {}, "workflow_version": 3 }
 ```
 
 **Response:**

@@ -210,6 +210,10 @@ pub struct WorkflowDefMetaView {
 pub struct EstimateRequest {
     #[serde(default)]
     pub inputs: serde_json::Value,
+    /// Optional immutable definition version to estimate. When omitted, the
+    /// latest version is used for backward compatibility.
+    #[serde(default, alias = "version")]
+    pub workflow_version: Option<i32>,
 }
 
 /// `POST /v1/workflows/:id/estimate` response.
@@ -654,7 +658,8 @@ pub async fn get(
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/workflows/:id/estimate` — return a static pre-run cost projection
-/// for the workflow's latest definition.  No model calls are made.
+/// for an exact requested version, or latest when omitted. No model calls are
+/// made.
 pub async fn estimate(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,
@@ -662,11 +667,19 @@ pub async fn estimate(
     Json(body): Json<EstimateRequest>,
 ) -> ApiResult<Json<EstimateResponse>> {
     let org = require_org(ctx)?;
+    validate_requested_workflow_version(body.workflow_version)?;
     let pool = db_pool(&state)?;
 
-    let (def, _version) = store::get_definition(pool, org, id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))?;
+    let (def, _version) = match body.workflow_version {
+        Some(version) => store::get_definition_version(pool, org, id, version)
+            .await
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("no workflow with id {id} at version {version}"))
+            })?,
+        None => store::get_definition(pool, org, id)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))?,
+    };
 
     let est = estimate::estimate_workflow(&def, &body.inputs);
 
@@ -1905,6 +1918,22 @@ mod tests {
     }
 
     #[test]
+    fn estimate_request_accepts_exact_version_and_legacy_alias() {
+        let exact: EstimateRequest = serde_json::from_value(serde_json::json!({
+            "inputs": { "topic": "safe" },
+            "workflow_version": 7
+        }))
+        .expect("exact estimate request");
+        assert_eq!(exact.workflow_version, Some(7));
+
+        let legacy: EstimateRequest = serde_json::from_value(serde_json::json!({
+            "version": 6
+        }))
+        .expect("legacy estimate version alias");
+        assert_eq!(legacy.workflow_version, Some(6));
+    }
+
+    #[test]
     fn direct_detour_and_shadow_reject_missing_output_caps_before_execution() {
         let def = budget_admission_def(None, "Summarize {{input}}");
         for path in [
@@ -2074,6 +2103,7 @@ mod tests {
     async fn estimate_anon_returns_unauthorized() {
         let body = EstimateRequest {
             inputs: serde_json::Value::Null,
+            workflow_version: None,
         };
         let result = estimate(State(test_state()), None, Path(Uuid::nil()), Json(body)).await;
         assert!(

@@ -114,7 +114,7 @@ started by a human/API run. The two current invokers are:
 | `GET /v1/workflows/:id/versions` | List at most 100 newest-first immutable version metadata rows, with explicit truncation and `private, no-store`. |
 | `GET /v1/workflows/:id/versions/:version` | Read one exact retained definition plus authoritative hash/timestamp metadata with `private, no-store`. |
 | `GET /v1/workflows/:id/versions/:from/compare/:to` | Compare two exact versions as at most 256 deterministic value-free JSON Pointer changes, with explicit truncation and `private, no-store`. |
-| `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls; computes the projected cost from the graph + pricing). |
+| `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls; optional positive `workflow_version` selects an exact retained definition, otherwise latest). |
 | `POST /v1/workflows/:id/runs` | Run synchronously (returns the run + the rolled-up `saved_usd`). |
 | `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
 | `GET /v1/workflows/runs/:run_id` | Read one org-scoped durable run and its immutable definition version. |
