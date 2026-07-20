@@ -153,8 +153,9 @@ jobs:
       # is itself one of the ignored tests we want covered, and it's idempotent.
       - name: Apply migrations (tt-core migrate_only)
         run: cargo test -p tt-core --test migrations -- --include-ignored migrate_only_applies_schema
-      # Exact retained-definition reads and newest-first history must stay
-      # bounded and tenant-scoped against the migrated production schema.
+      # Exact retained-definition reads, newest-first history, and value-free
+      # comparison inputs must stay bounded and tenant-scoped against the
+      # migrated production schema.
       - name: tt-core workflow version history (ignored)
         run: >-
           cargo test -p tt-core --lib

@@ -1370,6 +1370,15 @@ mod tests {
         assert_eq!(exact.version, 1);
         assert_eq!(exact.content_hash, "hash-a1");
         assert_eq!(exact.definition.name, "org-a-v1");
+        let exact_to = get_definition_version_record(&pool, org_a, workflow_id, 2)
+            .await
+            .expect("read exact org A comparison target")
+            .expect("org A comparison target exists");
+        let diff = crate::routes::workflow_versions::diff_version_records(&exact, &exact_to)
+            .expect("compare exact org A versions");
+        assert_eq!(diff.data.len(), 1);
+        assert_eq!(diff.data[0].path, "/name");
+        assert!(!diff.truncated);
         assert!(get_definition_version_record(&pool, org_a, workflow_id, 3)
             .await
             .expect("read absent version")

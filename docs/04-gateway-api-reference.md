@@ -2397,9 +2397,44 @@ The definition's embedded `version` is patched from the database row, and the
 response is `Cache-Control: private, no-store`. An absent, unowned, or
 non-retained version returns `404`.
 
-These endpoints are a read-only history/diff foundation. They do not define a
-draft/published state, promote an environment, approve a change, or perform a
-rollback.
+#### `GET /v1/workflows/:id/versions/:from/compare/:to` — compare two immutable versions
+
+Returns a deterministic, value-free structural comparison of two positive
+org-owned versions. `from` and `to` metadata include each authoritative
+version, content hash, and creation timestamp. `data` contains only RFC 6901
+JSON Pointer paths and one of `added`, `removed`, or `modified`; neither
+definition's values are echoed. The server-owned embedded `version` field is
+excluded from authored changes.
+
+At most 256 entries are returned. The walker stops at 64 nested levels, reports
+that subtree as one modified path, and fetches one further detected change only
+to set `truncated`. The response is `Cache-Control: private, no-store`.
+
+```json
+{
+  "object": "workflow_definition_version_diff",
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "from": {
+    "version": 2,
+    "content_hash": "0a1b2c3d...",
+    "created_at": "2026-06-27T12:00:00Z"
+  },
+  "to": {
+    "version": 3,
+    "content_hash": "a1b2c3d4...",
+    "created_at": "2026-06-28T12:00:00Z"
+  },
+  "changed": true,
+  "data": [
+    { "path": "/name", "kind": "modified" },
+    { "path": "/metadata/canvas_positions/new-node", "kind": "added" }
+  ],
+  "truncated": false
+}
+```
+
+The immutable history/read/compare endpoints do not define a draft/published
+state, promote an environment, approve a change, or perform a rollback.
 
 ---
 

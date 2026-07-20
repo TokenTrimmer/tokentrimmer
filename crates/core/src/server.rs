@@ -252,6 +252,10 @@ pub fn build_router_with_retrieval(
             "/v1/workflows/:id/versions/:version",
             get(routes::workflow_versions::get_version),
         )
+        .route(
+            "/v1/workflows/:id/versions/:from_version/compare/:to_version",
+            get(routes::workflow_versions::compare_versions),
+        )
         .route("/v1/workflows/:id", get(routes::workflows::get))
         .route(
             "/v1/workflows/:id/estimate",
