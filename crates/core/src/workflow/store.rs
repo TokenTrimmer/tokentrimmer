@@ -1484,6 +1484,143 @@ mod tests {
             vec![2, 1]
         );
 
+        // Release-state transitions use the same retained records but keep a
+        // separate append-only environment ledger. Both the source and target
+        // revisions are compare-and-swap boundaries.
+        use crate::workflow::release_store::{self, WorkflowEnvironment, WorkflowReleaseAction};
+        let development_v1 =
+            release_store::publish_development(&pool, org_a, guarded_workflow_id, 1, 0)
+                .await
+                .expect("publish version 1 to development")
+                .expect("initial development release");
+        assert_eq!(development_v1.revision, 1);
+        assert_eq!(development_v1.workflow_version, 1);
+        assert_eq!(development_v1.action, WorkflowReleaseAction::Publish);
+        assert!(
+            release_store::publish_development(&pool, org_a, guarded_workflow_id, 2, 0,)
+                .await
+                .expect("stale initial publication")
+                .is_none()
+        );
+        let development_v2 =
+            release_store::publish_development(&pool, org_a, guarded_workflow_id, 2, 1)
+                .await
+                .expect("publish version 2 to development")
+                .expect("second development release");
+        assert_eq!(development_v2.revision, 2);
+        assert_eq!(development_v2.workflow_version, 2);
+        assert!(
+            release_store::publish_development(&pool, org_a, guarded_workflow_id, 1, 2)
+                .await
+                .expect("backward development publication")
+                .is_none(),
+            "an older version must use same-environment release history rollback"
+        );
+
+        let staging = release_store::promote_environment(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Development,
+            WorkflowEnvironment::Staging,
+            0,
+            2,
+        )
+        .await
+        .expect("promote development to staging")
+        .expect("initial staging release");
+        assert_eq!(staging.revision, 1);
+        assert_eq!(staging.workflow_version, 2);
+        assert_eq!(staging.action, WorkflowReleaseAction::Promote);
+        assert_eq!(
+            staging.source_environment,
+            Some(WorkflowEnvironment::Development)
+        );
+        assert_eq!(staging.source_revision, Some(2));
+
+        let production = release_store::promote_environment(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Staging,
+            WorkflowEnvironment::Production,
+            0,
+            1,
+        )
+        .await
+        .expect("promote staging to production")
+        .expect("initial production release");
+        assert_eq!(production.workflow_version, 2);
+        assert_eq!(production.source_revision, Some(1));
+
+        let current = release_store::list_current_releases(&pool, org_a, guarded_workflow_id)
+            .await
+            .expect("list environment releases");
+        assert_eq!(current.len(), 3);
+        assert!(current.iter().all(|release| release.workflow_version == 2));
+        assert!(
+            release_store::list_current_releases(&pool, org_b, guarded_workflow_id,)
+                .await
+                .expect("list other-org releases")
+                .is_empty()
+        );
+
+        let rollback = release_store::rollback_environment(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Development,
+            1,
+            2,
+        )
+        .await
+        .expect("roll back development")
+        .expect("development rollback release");
+        assert_eq!(rollback.revision, 3);
+        assert_eq!(rollback.workflow_version, 1);
+        assert_eq!(rollback.action, WorkflowReleaseAction::Rollback);
+        assert_eq!(
+            rollback.source_environment,
+            Some(WorkflowEnvironment::Development)
+        );
+        assert_eq!(rollback.source_revision, Some(1));
+        let development_history = release_store::list_release_history(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Development,
+            101,
+        )
+        .await
+        .expect("list development release history");
+        assert_eq!(
+            development_history
+                .iter()
+                .map(|release| (
+                    release.revision,
+                    release.workflow_version,
+                    release.action,
+                    release.source_revision,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (3, 1, WorkflowReleaseAction::Rollback, Some(1)),
+                (2, 2, WorkflowReleaseAction::Publish, None),
+                (1, 1, WorkflowReleaseAction::Publish, None),
+            ]
+        );
+        assert!(release_store::rollback_environment(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Development,
+            2,
+            2,
+        )
+        .await
+        .expect("stale rollback")
+        .is_none());
+
         for org in [org_a, org_b] {
             sqlx::query("DELETE FROM workflow_definitions WHERE org_id = $1 AND id = $2")
                 .bind(org)

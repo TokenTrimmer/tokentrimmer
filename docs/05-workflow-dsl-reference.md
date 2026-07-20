@@ -114,6 +114,11 @@ started by a human/API run. The two current invokers are:
 | `GET /v1/workflows/:id/versions` | List at most 100 newest-first immutable version metadata rows, with explicit truncation and `private, no-store`. |
 | `GET /v1/workflows/:id/versions/:version` | Read one exact retained definition plus authoritative hash/timestamp metadata with `private, no-store`. |
 | `GET /v1/workflows/:id/versions/:from/compare/:to` | Compare two exact versions as at most 256 deterministic value-free JSON Pointer changes, with explicit truncation and `private, no-store`. |
+| `GET /v1/workflows/:id/release-state` | Read the latest draft metadata plus at most one current value-free release pointer for each of development, staging, and production. |
+| `GET /v1/workflows/:id/environments/:environment/releases` | List at most 100 newest-first value-free release ledger rows for one environment, with explicit truncation. |
+| `POST /v1/workflows/:id/environments/development/publish` | Optimistically publish one exact retained draft version to development. |
+| `POST /v1/workflows/:id/environments/:environment/promote` | Optimistically copy the exact current development release to staging, or staging release to production. |
+| `POST /v1/workflows/:id/environments/:environment/rollback` | Optimistically append a rollback to a version previously released in that same environment. |
 | `POST /v1/workflows/:id/estimate` | Offline cost preview (no LLM calls; optional positive `workflow_version` selects an exact retained definition, otherwise latest). |
 | `POST /v1/workflows/:id/runs` | Run synchronously (returns the run + the rolled-up `saved_usd`). |
 | `GET /v1/workflows/:id/runs` | List recent durable runs for exactly that org-owned workflow. |
@@ -126,8 +131,12 @@ started by a human/API run. The two current invokers are:
 The immutable version reads and comparison support bounded history inspection.
 Comparison returns only RFC 6901 paths plus `added`, `removed`, or `modified`;
 it never echoes either side's values and omits the server-owned embedded
-`version` field. These surfaces do not create draft/published semantics,
-environment promotion, approval, or a rollback mutation.
+`version` field. Release state is a separate compare-and-swap pointer plus an
+append-only metadata ledger: saves remain drafts, development publication
+selects an exact newer version, staging/production can only copy the exact current
+lower environment, and rollback can only restore a version already present in
+that environment's history. These transitions do not imply human approval and
+do not silently alter legacy latest-version execution.
 
 ## SSE events (a run's streaming surface)
 

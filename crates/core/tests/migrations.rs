@@ -298,6 +298,35 @@ fn migrator_includes_requested_model_snapshot_provenance() {
     );
 }
 
+#[test]
+fn migrator_includes_workflow_environment_release_ledger() {
+    let migrations = tt_core::db::MIGRATOR.iter().collect::<Vec<_>>();
+    let forty_third = migrations
+        .iter()
+        .find(|migration| migration.version == 43)
+        .expect("migration version 43 not found");
+    let description = forty_third.description.to_lowercase();
+    assert!(
+        description.contains("workflow")
+            && description.contains("environment")
+            && description.contains("release"),
+        "migration 0043 description is '{}', expected workflow environment release semantics",
+        forty_third.description,
+    );
+
+    let up = include_str!("../migrations/0043_workflow_environment_releases.up.sql");
+    assert!(up.contains("CREATE TABLE IF NOT EXISTS workflow_environment_state"));
+    assert!(up.contains("CREATE TABLE IF NOT EXISTS workflow_environment_releases"));
+    assert!(up.contains("PRIMARY KEY (org_id, workflow_id, environment, revision)"));
+    assert!(up.contains("REFERENCES workflow_definitions (org_id, id, version)"));
+    assert!(up.contains("action IN ('publish', 'promote', 'rollback')"));
+    assert!(up.contains("environment IN ('development', 'staging', 'production')"));
+    assert!(
+        !up.to_ascii_lowercase().contains("definition json"),
+        "release ledger must not duplicate definition values"
+    );
+}
+
 /// Strict migrate-only path: connects to a real DB, applies all migrations,
 /// returns Ok, and the schema is queryable.
 #[tokio::test]

@@ -2440,8 +2440,91 @@ to set `truncated`. The response is `Cache-Control: private, no-store`.
 }
 ```
 
-The immutable history/read/compare endpoints do not define a draft/published
-state, promote an environment, approve a change, or perform a rollback.
+The immutable history/read/compare endpoints do not mutate release state.
+
+#### Workflow release state — explicit publish, promotion, and rollback pointers
+
+Every immutable version starts as a draft. Release state is separate metadata:
+one compare-and-swap current pointer per `development`, `staging`, and
+`production` environment, backed by an append-only release ledger. Release
+responses include versions, hashes, revisions, transition provenance, and
+timestamps only—never definitions or secret values—and are
+`Cache-Control: private, no-store`.
+
+`GET /v1/workflows/:id/release-state` returns the newest saved version plus the
+current pointer for each environment that has a release. `data` is always in
+development → staging → production order and contains at most three entries.
+
+```json
+{
+  "object": "workflow_release_state",
+  "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+  "latest": {
+    "version": 4,
+    "content_hash": "draft-hash...",
+    "created_at": "2026-07-20T18:00:00Z"
+  },
+  "data": [
+    {
+      "environment": "development",
+      "revision": 2,
+      "workflow_version": 3,
+      "content_hash": "released-hash...",
+      "action": "publish",
+      "source_environment": null,
+      "source_revision": null,
+      "created_at": "2026-07-20T17:00:00Z"
+    }
+  ]
+}
+```
+
+`GET /v1/workflows/:id/environments/:environment/releases` returns at most 100
+newest-first immutable release records for one environment and an explicit
+`truncated` flag. This history supplies the exact `release_revision` accepted
+by rollback without exposing a retained definition.
+
+`POST /v1/workflows/:id/environments/development/publish` points development
+at one exact retained version. `expected_release_revision` is `0` only when no
+development release exists; otherwise it must match the current revision and
+the target workflow version must be newer than development's current version.
+Restoring an older version uses the rollback endpoint and same-environment
+release history.
+
+```json
+{ "workflow_version": 4, "expected_release_revision": 2 }
+```
+
+`POST /v1/workflows/:id/environments/:environment/promote` accepts only
+`staging` or `production`. Staging copies the exact current development
+version; production copies the exact current staging version. Both source and
+target revisions are required optimistic preconditions, and the caller cannot
+substitute a different version.
+
+```json
+{ "expected_source_revision": 2, "expected_release_revision": 0 }
+```
+
+`POST /v1/workflows/:id/environments/:environment/rollback` appends a new
+current release that restores the workflow version recorded by an earlier
+release revision in that same environment. It cannot target an arbitrary saved
+draft or another environment's history.
+
+```json
+{ "release_revision": 1, "expected_release_revision": 2 }
+```
+
+All three mutations return `409` for a stale revision, concurrent winner,
+missing source transition, same-version no-op, or otherwise invalid current
+state, with no partial pointer/ledger update. A missing publish target returns
+`404`; malformed/nonpositive/out-of-range inputs return `400`. Because a
+successful transition increments the target revision, its expected revision
+must be at most 2,147,483,646.
+
+This contract does not constitute human approval, and it does not silently
+change legacy latest-version Estimate/Run or durable-trigger behavior.
+Environment-aware execution selection and attributable approval/audit remain
+separate gates.
 
 ---
 

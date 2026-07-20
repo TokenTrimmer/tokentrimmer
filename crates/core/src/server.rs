@@ -256,6 +256,26 @@ pub fn build_router_with_retrieval(
             "/v1/workflows/:id/versions/:from_version/compare/:to_version",
             get(routes::workflow_versions::compare_versions),
         )
+        .route(
+            "/v1/workflows/:id/release-state",
+            get(routes::workflow_releases::get_release_state),
+        )
+        .route(
+            "/v1/workflows/:id/environments/:environment/releases",
+            get(routes::workflow_releases::list_release_history),
+        )
+        .route(
+            "/v1/workflows/:id/environments/development/publish",
+            post(routes::workflow_releases::publish_development),
+        )
+        .route(
+            "/v1/workflows/:id/environments/:environment/promote",
+            post(routes::workflow_releases::promote_environment),
+        )
+        .route(
+            "/v1/workflows/:id/environments/:environment/rollback",
+            post(routes::workflow_releases::rollback_environment),
+        )
         .route("/v1/workflows/:id", get(routes::workflows::get))
         .route(
             "/v1/workflows/:id/estimate",
