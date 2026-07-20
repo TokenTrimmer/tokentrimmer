@@ -650,6 +650,24 @@ pub enum RouteCandidateOutcome {
     Selected,
     /// The conditions matched, but a higher-priority candidate already won.
     ShadowedByHigherPriority,
+    /// This enabled candidate was not named by a forced-route override.
+    /// Conditions were deliberately not evaluated because forced routing
+    /// bypasses them.
+    NotNamedByForcedRoute,
+    /// This enabled candidate was selected by an exact forced-route name.
+    /// Conditions were deliberately not evaluated because forced routing
+    /// bypasses them.
+    SelectedByForcedRoute,
+}
+
+/// Selection mechanism used for one routing decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteSelectionMode {
+    /// Normal enabled-route condition evaluation in canonical priority order.
+    ConditionPriority,
+    /// Exact enabled-route name selected by the caller's forced-route override.
+    ForcedRouteName,
 }
 
 /// Value-free condition and priority decision for one route candidate.
@@ -661,15 +679,20 @@ pub struct RouteCandidateDecision {
     pub route_version_id: Option<i64>,
     /// Priority value used for winner order.
     pub priority: u32,
-    /// Candidate disposition after condition and priority evaluation.
+    /// Candidate disposition under this trace's selection mode.
     pub outcome: RouteCandidateOutcome,
     /// Every canonical condition decision, without observed feature values.
-    pub conditions: RouteConditionEvaluation,
+    /// Absent only when [`RouteSelectionMode::ForcedRouteName`] bypassed
+    /// condition evaluation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<RouteConditionEvaluation>,
 }
 
 /// Canonical condition/priority trace for one route selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouteDecisionTrace {
+    /// Whether conditions/priority or an exact forced name selected the route.
+    pub selection_mode: RouteSelectionMode,
     /// Candidates in the exact order evaluated by the live engine.
     pub candidates: Vec<RouteCandidateDecision>,
     /// Winning route, or `None` when no enabled candidate matched.
@@ -842,6 +865,30 @@ impl RoutingEngine {
         self.evaluate_snapshot(&snapshot)
     }
 
+    /// Like [`Self::evaluate_with_signals`], but retains the value-free
+    /// condition/priority trace from the exact same feature snapshot.
+    #[must_use]
+    pub fn evaluate_with_signals_and_trace(
+        &self,
+        req: &ChatCompletionRequest,
+        ctx: &RequestContext,
+        input_tokens_estimate: u32,
+        estimated_cost_usd: Option<f64>,
+        observed_p95_ms: Option<u32>,
+        is_reasoning_class: bool,
+    ) -> RoutingEvaluation<'_> {
+        let snapshot = RouteFeatureSnapshot::for_engine(
+            &self.routes,
+            req,
+            ctx,
+            input_tokens_estimate,
+            estimated_cost_usd,
+            observed_p95_ms,
+            is_reasoning_class,
+        );
+        self.evaluate_snapshot_with_trace(&snapshot)
+    }
+
     /// Select the first enabled route matching one canonical feature snapshot.
     ///
     /// Retained/partial callers can construct a conservative snapshot with
@@ -881,7 +928,7 @@ impl RoutingEngine {
                 route_version_id: self.route_version_id(route.id),
                 priority: route.priority,
                 outcome,
-                conditions,
+                conditions: Some(conditions),
             });
         }
 
@@ -891,6 +938,51 @@ impl RoutingEngine {
         RoutingEvaluation {
             matched_route,
             trace: RouteDecisionTrace {
+                selection_mode: RouteSelectionMode::ConditionPriority,
+                candidates,
+                selected_route_id,
+                selected_route_version_id,
+            },
+        }
+    }
+
+    /// Select an enabled route by exact name and retain an explicit trace of
+    /// the forced-route bypass. Candidate conditions are not evaluated and are
+    /// omitted from the trace so the payload cannot imply they affected this
+    /// decision.
+    #[must_use]
+    pub fn evaluate_forced_route_with_trace(&self, name: &str) -> RoutingEvaluation<'_> {
+        let selected_index = self
+            .routes
+            .iter()
+            .position(|route| route.enabled && route.name == name);
+        let matched_route = selected_index.map(|index| &self.routes[index]);
+        let selected_route_id = matched_route.map(|route| route.id);
+        let selected_route_version_id =
+            selected_route_id.and_then(|route_id| self.route_version_id(route_id));
+        let candidates = self
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(index, route)| RouteCandidateDecision {
+                route_id: route.id,
+                route_version_id: self.route_version_id(route.id),
+                priority: route.priority,
+                outcome: if !route.enabled {
+                    RouteCandidateOutcome::Disabled
+                } else if Some(index) == selected_index {
+                    RouteCandidateOutcome::SelectedByForcedRoute
+                } else {
+                    RouteCandidateOutcome::NotNamedByForcedRoute
+                },
+                conditions: None,
+            })
+            .collect();
+
+        RoutingEvaluation {
+            matched_route,
+            trace: RouteDecisionTrace {
+                selection_mode: RouteSelectionMode::ForcedRouteName,
                 candidates,
                 selected_route_id,
                 selected_route_version_id,
@@ -1316,6 +1408,10 @@ mod tests {
 
         assert_eq!(direct, Some(ids[2]));
         assert_eq!(evaluated.matched_route.map(|route| route.id), direct);
+        assert_eq!(
+            evaluated.trace.selection_mode,
+            RouteSelectionMode::ConditionPriority
+        );
         assert_eq!(evaluated.trace.selected_route_id, direct);
         assert_eq!(evaluated.trace.selected_route_version_id, Some(803));
         assert_eq!(
@@ -1345,7 +1441,9 @@ mod tests {
             ]
         );
         assert!(evaluated.trace.candidates.iter().all(|candidate| {
-            candidate.conditions.decisions.len() == RouteConditionField::ALL.len()
+            candidate.conditions.as_ref().is_some_and(|conditions| {
+                conditions.decisions.len() == RouteConditionField::ALL.len()
+            })
         }));
 
         let serialized = serde_json::to_string(&evaluated.trace).unwrap();
@@ -1361,6 +1459,117 @@ mod tests {
         ] {
             assert!(!serialized.contains(private_value), "{serialized}");
         }
+
+        let missed = engine.evaluate_forced_route_with_trace("private-missing-route");
+        assert!(missed.matched_route.is_none());
+        assert_eq!(missed.trace.selected_route_id, None);
+        assert_eq!(missed.trace.selected_route_version_id, None);
+        assert!(missed.trace.candidates.iter().all(|candidate| {
+            candidate.outcome == RouteCandidateOutcome::Disabled
+                || candidate.outcome == RouteCandidateOutcome::NotNamedByForcedRoute
+        }));
+        assert!(!serde_json::to_string(&missed.trace)
+            .unwrap()
+            .contains("private-missing-route"));
+    }
+
+    #[test]
+    fn forced_route_trace_names_the_bypass_without_conditions_or_private_values() {
+        let disabled = Route {
+            enabled: false,
+            ..make_route(
+                "private-disabled-route",
+                100,
+                vec!["private-disabled-model"],
+                "never",
+            )
+        };
+        let ordinary = make_route(
+            "private-ordinary-route",
+            90,
+            vec!["private-ordinary-model"],
+            "ordinary",
+        );
+        let forced = make_route(
+            "private-forced-route",
+            10,
+            vec!["private-forced-condition-model"],
+            "forced",
+        );
+        let ids = [disabled.id, ordinary.id, forced.id];
+        let engine = RoutingEngine::with_runtime_routes([
+            RuntimeRoute {
+                route: forced,
+                route_version_id: Some(103),
+            },
+            RuntimeRoute {
+                route: ordinary,
+                route_version_id: Some(102),
+            },
+            RuntimeRoute {
+                route: disabled,
+                route_version_id: Some(101),
+            },
+        ]);
+
+        let evaluated = engine.evaluate_forced_route_with_trace("private-forced-route");
+
+        assert_eq!(
+            evaluated.trace.selection_mode,
+            RouteSelectionMode::ForcedRouteName
+        );
+        assert_eq!(evaluated.matched_route.map(|route| route.id), Some(ids[2]));
+        assert_eq!(evaluated.trace.selected_route_id, Some(ids[2]));
+        assert_eq!(evaluated.trace.selected_route_version_id, Some(103));
+        assert_eq!(
+            evaluated
+                .trace
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.route_id, candidate.outcome))
+                .collect::<Vec<_>>(),
+            vec![
+                (ids[0], RouteCandidateOutcome::Disabled),
+                (ids[1], RouteCandidateOutcome::NotNamedByForcedRoute),
+                (ids[2], RouteCandidateOutcome::SelectedByForcedRoute),
+            ]
+        );
+        assert!(evaluated
+            .trace
+            .candidates
+            .iter()
+            .all(|candidate| candidate.conditions.is_none()));
+
+        let serialized = serde_json::to_string(&evaluated.trace).unwrap();
+        assert!(!serialized.contains("conditions"), "{serialized}");
+        for private_value in [
+            "private-disabled-route",
+            "private-ordinary-route",
+            "private-forced-route",
+            "private-disabled-model",
+            "private-ordinary-model",
+            "private-forced-condition-model",
+        ] {
+            assert!(!serialized.contains(private_value), "{serialized}");
+        }
+    }
+
+    #[test]
+    fn traced_live_signal_entrypoint_has_the_same_winner_as_normal_evaluation() {
+        let mut route = make_route("live", 10, vec!["gpt-4o"], "gpt-4o-mini");
+        route.when.not_reasoning_class = true;
+        let engine = RoutingEngine::with_routes([route]);
+        let request = make_req("gpt-4o");
+        let context = make_ctx(None);
+
+        let direct = engine
+            .evaluate_with_signals(&request, &context, 100, None, None, false)
+            .map(|route| route.id);
+        let traced =
+            engine.evaluate_with_signals_and_trace(&request, &context, 100, None, None, false);
+
+        assert_eq!(traced.matched_route.map(|route| route.id), direct);
+        assert_eq!(traced.trace.selected_route_id, direct);
     }
 
     #[test]

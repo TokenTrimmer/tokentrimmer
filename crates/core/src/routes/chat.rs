@@ -7465,6 +7465,57 @@ pub(crate) struct RouteMatch {
     pub(crate) workflow: Option<tt_routing::RouteWorkflow>,
 }
 
+/// Post-selection boundary reached by the live gateway routing seam.
+///
+/// This deliberately stops before canary assignment and the downstream action
+/// pipeline. It is operational explanation, not an assertion that every
+/// configured action executed.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RouteApplicationOutcome {
+    NoMatch,
+    ForcedRouteNotFound,
+    CapabilitySuppressed,
+    Paused,
+    AcceptedForActionPipeline,
+}
+
+#[derive(serde::Serialize)]
+struct RouteApplicationTrace<'a> {
+    application_outcome: RouteApplicationOutcome,
+    decision: &'a tt_routing::RouteDecisionTrace,
+}
+
+/// Emit the value-free live trace only at debug level. This is intentionally
+/// not request-log persistence, a customer API, or a complete action trace.
+/// Keeping the organization identifier outside the serialized payload also
+/// makes the payload itself safe to inspect for accidental request values.
+fn record_route_application_trace(
+    org_id: Uuid,
+    outcome: RouteApplicationOutcome,
+    decision: &tt_routing::RouteDecisionTrace,
+) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let trace = RouteApplicationTrace {
+        application_outcome: outcome,
+        decision,
+    };
+    match serde_json::to_string(&trace) {
+        Ok(trace) => tracing::debug!(
+            %org_id,
+            route_application_trace = %trace,
+            "route application trace"
+        ),
+        Err(error) => tracing::debug!(
+            %org_id,
+            %error,
+            "route application trace serialization failed"
+        ),
+    }
+}
+
 /// A forced route that can't be honored is a `400`; absence of routing is fine
 /// for an unforced request.
 fn forced_miss(forced: Option<&str>) -> ApiResult<Option<RouteMatch>> {
@@ -7541,12 +7592,12 @@ pub(crate) async fn apply_routing(
         state.latency_tracker.p95(provider_id, &req.model)
     };
 
-    // `m` is `&Route` (inferred from the engine accessors below) regardless of arm.
-    let m = match forced_route {
-        Some(name) => engine
-            .find_by_name(name)
-            .ok_or_else(|| ApiError::InvalidRequest(format!("unknown route: {name}")))?,
-        None => match engine.evaluate_with_signals(
+    // Forced routing has its own trace mode: it does not evaluate conditions or
+    // imply that condition/priority selected the named route. Normal routing
+    // prepares one snapshot and uses the canonical traced matcher directly.
+    let evaluation = match forced_route {
+        Some(name) => engine.evaluate_forced_route_with_trace(name),
+        None => engine.evaluate_with_signals_and_trace(
             req,
             ctx,
             input_tokens,
@@ -7558,10 +7609,23 @@ pub(crate) async fn apply_routing(
             // already built for token estimation above.
             engine.uses_reasoning_class()
                 && crate::reasoning_class::classify(&combined.to_lowercase()).is_some(),
-        ) {
-            Some(r) => r,
-            None => return Ok(None),
-        },
+        ),
+    };
+    let tt_routing::RoutingEvaluation {
+        matched_route,
+        trace,
+    } = evaluation;
+    let Some(m) = matched_route else {
+        if let Some(name) = forced_route {
+            record_route_application_trace(
+                ctx.org_id,
+                RouteApplicationOutcome::ForcedRouteNotFound,
+                &trace,
+            );
+            return Err(ApiError::InvalidRequest(format!("unknown route: {name}")));
+        }
+        record_route_application_trace(ctx.org_id, RouteApplicationOutcome::NoMatch, &trace);
+        return Ok(None);
     };
     // The cached engine preserves the ledger ID that the store captured in the
     // same database snapshot as `m`. Missing ledger provenance stays NULL; a
@@ -7580,6 +7644,7 @@ pub(crate) async fn apply_routing(
     // pause is naturally sticky (plus the durable route_pauses row) until an
     // explicit POST /v1/routes/:id/resume?expected_revision=N.
     if m.paused {
+        record_route_application_trace(ctx.org_id, RouteApplicationOutcome::Paused, &trace);
         tracing::info!(
             org_id = %ctx.org_id,
             route_id = %m.id,
@@ -7684,6 +7749,11 @@ pub(crate) async fn apply_routing(
                 reasons = ?reasons,
                 "route_skipped_capability: rewrite target lacks required capabilities, passing through unchanged"
             );
+            record_route_application_trace(
+                ctx.org_id,
+                RouteApplicationOutcome::CapabilitySuppressed,
+                &trace,
+            );
             // Do not rewrite req.model — return None so the request
             // continues with the original model.
             return Ok(None);
@@ -7707,6 +7777,11 @@ pub(crate) async fn apply_routing(
         modifier_only = !is_model_rewrite,
         fallbacks = ?fallbacks,
         "routing rewrite"
+    );
+    record_route_application_trace(
+        ctx.org_id,
+        RouteApplicationOutcome::AcceptedForActionPipeline,
+        &trace,
     );
     Ok(Some(RouteMatch {
         route_id,
