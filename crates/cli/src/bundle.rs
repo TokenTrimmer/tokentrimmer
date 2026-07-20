@@ -436,6 +436,7 @@ mod tests {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                ..Default::default()
             },
         };
         let mut pricing = HashMap::new();

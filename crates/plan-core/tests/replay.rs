@@ -229,6 +229,7 @@ fn single_request_route_match_cheaper_model_produces_savings() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
     let mut pricing = HashMap::new();
@@ -272,6 +273,7 @@ fn conservative_when_pricing_missing() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
     let input = input_with_routes(vec![req], vec![route], HashMap::new(), 100);
@@ -319,6 +321,7 @@ fn cross_provider_route_prices_target_by_its_own_provider() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
     let mut pricing = HashMap::new();
@@ -363,6 +366,7 @@ fn cross_provider_target_absent_is_conservative() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
     let result = replay(input_with_routes(
@@ -406,6 +410,7 @@ fn route_over_ceiling_is_blocked_not_saved() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
     let mut pricing = HashMap::new();
@@ -447,8 +452,119 @@ fn batch_route(target: &str, model_in: &str) -> ProposedRoute {
             redact: false,
             traffic_pct: None,
             shadow_model: None,
+            ..Default::default()
         },
     }
+}
+
+#[test]
+fn dispatch_actions_without_retained_runtime_evidence_fail_projection_closed() {
+    let base = batch_route("cheap-model", "source-model");
+    let cases = vec![
+        (
+            "traffic_pct",
+            RouteAction {
+                traffic_pct: Some(50),
+                ..base.then.clone()
+            },
+        ),
+        (
+            "shadow_model",
+            RouteAction {
+                shadow_model: Some("shadow-model".into()),
+                ..base.then.clone()
+            },
+        ),
+        (
+            "auto_pause",
+            RouteAction {
+                auto_pause: true,
+                ..base.then.clone()
+            },
+        ),
+        (
+            "agentic_budget",
+            RouteAction {
+                agentic_budget: Some(tt_routing::AgenticBudget::default()),
+                ..base.then.clone()
+            },
+        ),
+        (
+            "panel",
+            RouteAction {
+                panel: Some(tt_routing::RoutePanel {
+                    strategy: "majority".into(),
+                    ..Default::default()
+                }),
+                ..base.then.clone()
+            },
+        ),
+        (
+            "workflow",
+            RouteAction {
+                workflow: Some(tt_routing::RouteWorkflow {
+                    workflow_id: "00000000-0000-0000-0000-000000000001".into(),
+                    ..Default::default()
+                }),
+                ..base.then.clone()
+            },
+        ),
+    ];
+
+    for (field, action) in cases {
+        let first = make_req(1, 0, "source-model", 1_000, 100, 0.0045, false);
+        let second = make_req(2, 30, "source-model", 1_000, 100, 0.0045, false);
+        let mut route = base.clone();
+        route.then = action;
+        let mut pricing = HashMap::new();
+        let (key, value) = pricing_with("anthropic", "cheap-model", 0.25, 1.25);
+        pricing.insert(key, value);
+        let mut input = input_with_routes(vec![first, second], vec![route], pricing, 100);
+        input.config.l1_ttl_seconds = Some(60);
+
+        let result = replay(input)
+            .expect("unsupported effective action must fail only its projection closed");
+        assert_eq!(result.aggregates.requests_rerouted, 0, "{field}");
+        assert_eq!(result.aggregates.requests_unchanged, 2, "{field}");
+        assert_eq!(result.aggregates.projected_savings_usd, 0.0, "{field}");
+        assert!(
+            (result.aggregates.total_projected_cost_usd - 0.009).abs() < 1e-12,
+            "{field}"
+        );
+        assert!(
+            result.caveats.iter().any(|caveat| {
+                caveat.contains(field) && caveat.contains("fail cost/latency projection closed")
+            }),
+            "missing {field} caveat: {:?}",
+            result.caveats
+        );
+        assert!(
+            result.caveats.iter().any(|caveat| {
+                caveat.contains("2 request(s)") && caveat.contains("counted unchanged")
+            }),
+            "missing suppressed-request caveat for {field}: {:?}",
+            result.caveats
+        );
+    }
+}
+
+#[test]
+fn disable_cache_action_prevents_projected_route_cache_savings() {
+    let first = make_req(1, 0, "source-model", 1_000, 100, 0.0045, false);
+    let second = make_req(2, 30, "source-model", 1_000, 100, 0.0045, false);
+    let mut route = batch_route("source-model", "source-model");
+    route.then.batch = false;
+    route.then.disable_cache = true;
+    let mut pricing = HashMap::new();
+    let (key, value) = pricing_with("anthropic", "source-model", 3.0, 15.0);
+    pricing.insert(key, value);
+    let mut input = input_with_routes(vec![first, second], vec![route], pricing, 100);
+    input.config.l1_ttl_seconds = Some(60);
+
+    let result = replay(input).expect("disable_cache is exactly projectable");
+    assert_eq!(result.aggregates.requests_rerouted, 2);
+    assert_eq!(result.aggregates.projected_savings_usd, 0.0);
+    assert!((result.aggregates.total_projected_cost_usd - 0.009).abs() < 1e-12);
 }
 
 /// A `batch: true` route whose target carries catalog batch rates projects the
@@ -878,6 +994,7 @@ fn rerouted_latency_projected_from_target_model_history() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
     let mut pricing = HashMap::new();
@@ -974,6 +1091,7 @@ fn deterministic_input(n: u32, iterations: u32) -> PlanInput {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
 
@@ -1098,6 +1216,7 @@ fn equal_priority_overlapping_routes_fail_without_live_store_order() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
     let route_b = ProposedRoute {
@@ -1127,6 +1246,7 @@ fn equal_priority_overlapping_routes_fail_without_live_store_order() {
             minify_json: false,
             reasoning_max_effort: None,
             reasoning_budget_tokens: None,
+            ..Default::default()
         },
     };
 

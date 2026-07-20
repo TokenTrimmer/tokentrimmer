@@ -26,11 +26,14 @@ use crate::{
 ///
 /// Returns [`PlanError::InvalidWindow`] when `window_end <= window_start`,
 /// [`PlanError::ZeroBootstrapIterations`] when the caller passes zero
-/// iterations, and [`PlanError::AmbiguousRoutePriority`] when equal-priority
-/// route conditions may overlap but the live store tie order is unavailable.
+/// iterations, [`PlanError::AmbiguousRoutePriority`] when equal-priority route
+/// conditions may overlap but the live store tie order is unavailable, or a
+/// route condition/action contract error when a proposed route cannot cross
+/// the canonical gateway wire boundary.
 pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
     validate(&input)?;
     let condition_caveats = replay_condition_caveats(&input.requests, &input.proposed_routes);
+    let action_caveats = replay_action_caveats(&input.proposed_routes);
 
     // Sort routes by priority descending. Validation has already proved that
     // every enabled equal-priority pair is condition-disjoint, so the UUID
@@ -91,6 +94,7 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         aggregates.requests_unprice_able,
         projection.latency_unprojected,
         projection.would_block,
+        projection.action_projection_unavailable,
         projection.batch_deferred,
         projection.batch_unpriced,
         projection.flex_applied,
@@ -101,6 +105,7 @@ pub fn replay(input: PlanInput) -> Result<PlanResult, PlanError> {
         projection.minify_estimated_usd,
     );
     caveats.extend(condition_caveats);
+    caveats.extend(action_caveats);
     caveats.extend(wide_ci_caveats(&aggregates, &confidence_intervals));
 
     Ok(PlanResult {
@@ -256,6 +261,9 @@ struct Projection {
     /// contract).
     minify_estimated_count: u32,
     minify_estimated_usd: f64,
+    /// Matched requests whose configured action can change dispatch/cost but
+    /// lacks the retained runtime evidence required for honest projection.
+    action_projection_unavailable: u32,
 }
 
 fn project_requests(
@@ -283,6 +291,7 @@ fn project_requests(
     let mut diff_realized_usd: f64 = 0.0;
     let mut minify_estimated_count: u32 = 0;
     let mut minify_estimated_usd: f64 = 0.0;
+    let mut action_projection_unavailable: u32 = 0;
 
     // Median latency per model across the window — used to project a rerouted
     // request's latency from its TARGET model's history rather than echoing the
@@ -310,13 +319,29 @@ fn project_requests(
         per_request_baseline.push(req.baseline_cost_usd);
         per_request_cache_hit.push(if req.cached { 1.0 } else { 0.0 });
 
-        // A projected cache hit serves the response for free regardless of
-        // routing, so its projected cost is 0.
-        let is_cache_hit = cache_hit_ids.contains(&req.id);
+        // A projected cache hit serves the response for free unless the matched
+        // canonical action disables cache. Keep the pre-route answer separate
+        // so an unavailable action projection can conservatively retain the
+        // historical row instead of partially applying its modifiers.
+        let projected_cache_hit = cache_hit_ids.contains(&req.id);
 
         let matched = routing::match_prepared_route(req, routes);
         match matched {
-            Some(route) => {
+            Some(prepared) => {
+                let route = prepared.route();
+                let action = prepared.action();
+                if action_projection_blocked(action) {
+                    // Preserve the historical row as a whole. Applying even an
+                    // independently projected cache hit here would contradict
+                    // the fail-closed "counted unchanged" contract and could
+                    // overstate savings for an action that changes dispatch.
+                    per_request_projected.push(req.cost_usd);
+                    per_request_latency.push(f64::from(req.latency_ms));
+                    requests_unchanged += 1;
+                    action_projection_unavailable += 1;
+                    continue;
+                }
+                let is_cache_hit = projected_cache_hit && !action.disable_cache;
                 // Resolve the effective served model ONCE, mirroring the
                 // gateway's `effective_target =
                 // target_model.unwrap_or_else(|| req.model)`. A modifier-only
@@ -327,7 +352,7 @@ fn project_requests(
                 // minify, …) project. A `Some` target behaves exactly as before
                 // (rewrite to that model), so existing routes project
                 // byte-identically.
-                let effective_target = route.then.target_model.as_deref().unwrap_or_else(|| {
+                let effective_target = action.target_model.as_deref().unwrap_or_else(|| {
                     req.requested_model.as_deref().unwrap_or(req.model.as_str())
                 });
                 // Prefer the same-provider key (keeps same-provider replays
@@ -357,10 +382,7 @@ fn project_requests(
                     // the runtime ceiling check prices the synchronous dispatch,
                     // never a batch discount that is not realized today.
                     let blocked = !is_cache_hit
-                        && route
-                            .then
-                            .max_cost_usd
-                            .is_some_and(|c| projected.cost_usd > c);
+                        && action.max_cost_usd.is_some_and(|c| projected.cost_usd > c);
                     if blocked {
                         projected_cost = req.cost_usd;
                         would_block += 1;
@@ -378,7 +400,7 @@ fn project_requests(
                     // figure stands and the request is not claimed as
                     // batch-discounted (no negative "savings", no inflated
                     // caveat count).
-                    if route.then.batch && !is_cache_hit && !blocked {
+                    if action.batch && !is_cache_hit && !blocked {
                         match cost::project_batch_cost(req, p) {
                             Some(b) if b.cost_usd < projected_cost => {
                                 projected_cost = b.cost_usd;
@@ -403,7 +425,7 @@ fn project_requests(
                     // catalog Flex rate projects nothing and is counted
                     // inapplicable (mirrors the gateway leaving an ineligible
                     // model on the standard tier).
-                    if route.then.flex && !is_cache_hit && !blocked {
+                    if action.flex && !is_cache_hit && !blocked {
                         match cost::project_flex_cost(req, p) {
                             Some(f) if f.cost_usd < projected_cost => {
                                 projected_cost = f.cost_usd;
@@ -425,7 +447,7 @@ fn project_requests(
                     // minify is a labeled estimate the gateway never
                     // invoice-reconciles. Gated like `batch` on the route
                     // enabling the lever and the request actually being served.
-                    if route.then.diff && !is_cache_hit && !blocked {
+                    if action.diff && !is_cache_hit && !blocked {
                         if let Some(saved) = req.diff_saved_usd {
                             if saved > 0.0 {
                                 diff_realized_count += 1;
@@ -433,7 +455,7 @@ fn project_requests(
                             }
                         }
                     }
-                    if route.then.minify_json && !is_cache_hit && !blocked {
+                    if action.minify_json && !is_cache_hit && !blocked {
                         if let Some(est) = req.minify_saved_est_usd {
                             if est > 0.0 {
                                 minify_estimated_count += 1;
@@ -472,7 +494,11 @@ fn project_requests(
                 }
             }
             None => {
-                per_request_projected.push(if is_cache_hit { 0.0 } else { req.cost_usd });
+                per_request_projected.push(if projected_cache_hit {
+                    0.0
+                } else {
+                    req.cost_usd
+                });
                 per_request_latency.push(f64::from(req.latency_ms));
                 requests_unchanged += 1;
             }
@@ -498,6 +524,7 @@ fn project_requests(
         diff_realized_usd,
         minify_estimated_count,
         minify_estimated_usd,
+        action_projection_unavailable,
     }
 }
 
@@ -729,12 +756,114 @@ fn replay_condition_caveats(requests: &[RequestLog], routes: &[ProposedRoute]) -
     caveats
 }
 
+fn action_projection_blocked(action: &tt_routing::RouteAction) -> bool {
+    action.traffic_pct.is_some_and(|percent| percent != 100)
+        || action.shadow_model.is_some()
+        || action.auto_pause
+        || action.pause_floor_pass_rate.is_some()
+        || action.pause_min_verdicts.is_some()
+        || action.agentic_budget.is_some()
+        || action.panel.is_some()
+        || action.workflow.is_some()
+}
+
+fn replay_action_caveats(routes: &[ProposedRoute]) -> Vec<String> {
+    let mut blocked = BTreeSet::new();
+    let mut retained_only = BTreeSet::new();
+    let mut uses_approximate_cost_ceiling = false;
+
+    for action in routes
+        .iter()
+        .filter(|route| route.enabled)
+        .map(|route| &route.then)
+    {
+        if action.traffic_pct.is_some_and(|percent| percent != 100) {
+            blocked.insert("traffic_pct");
+        }
+        if action.shadow_model.is_some() {
+            blocked.insert("shadow_model");
+        }
+        if action.auto_pause
+            || action.pause_floor_pass_rate.is_some()
+            || action.pause_min_verdicts.is_some()
+        {
+            blocked.insert("auto_pause");
+        }
+        if action.agentic_budget.is_some() {
+            blocked.insert("agentic_budget");
+        }
+        if action.panel.is_some() {
+            blocked.insert("panel");
+        }
+        if action.workflow.is_some() {
+            blocked.insert("workflow");
+        }
+
+        if !action.fallbacks.is_empty() {
+            retained_only.insert("fallbacks");
+        }
+        if action.compress {
+            retained_only.insert("compress");
+        }
+        if action.doc_compaction {
+            retained_only.insert("doc_compaction");
+        }
+        if action.document_lane {
+            retained_only.insert("document_lane");
+        }
+        if action.content_compress {
+            retained_only.insert("content_compress");
+        }
+        if action.redact {
+            retained_only.insert("redact");
+        }
+        if action.format_switch.is_some() {
+            retained_only.insert("format_switch");
+        }
+        if action.diff {
+            retained_only.insert("diff");
+        }
+        if action.minify_json {
+            retained_only.insert("minify_json");
+        }
+        if action.reasoning_max_effort.is_some() {
+            retained_only.insert("reasoning_max_effort");
+        }
+        if action.reasoning_budget_tokens.is_some() {
+            retained_only.insert("reasoning_budget_tokens");
+        }
+        uses_approximate_cost_ceiling |= action.max_cost_usd.is_some();
+    }
+
+    let mut caveats = Vec::new();
+    if !blocked.is_empty() {
+        caveats.push(format!(
+            "Historical action replay lacks canonical runtime evidence for {} — matched routes carrying any of those configured actions fail cost/latency projection closed and are counted unchanged.",
+            blocked.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !retained_only.is_empty() {
+        caveats.push(format!(
+            "Configured action fields {} round-trip to the gateway but their incremental runtime effects are not re-executed from condensed request logs; target-model projection excludes those effects.",
+            retained_only.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if uses_approximate_cost_ceiling {
+        caveats.push(
+            "Historical max_cost_usd admission uses target cost reconstructed from realized token counts as an APPROXIMATE proxy for the live pre-dispatch estimate; boundary outcomes can differ."
+                .to_string(),
+        );
+    }
+    caveats
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_caveats(
     sample_size: usize,
     requests_unprice_able: u32,
     latency_unprojected: u32,
     would_block: u32,
+    action_projection_unavailable: u32,
     batch_deferred: u32,
     batch_unpriced: u32,
     flex_applied: u32,
@@ -763,6 +892,11 @@ fn build_caveats(
     if would_block > 0 {
         caveats.push(format!(
             "{would_block} request(s) would be rejected by a max_cost_usd ceiling — counted unchanged, not as savings."
+        ));
+    }
+    if action_projection_unavailable > 0 {
+        caveats.push(format!(
+            "{action_projection_unavailable} request(s) matched a route whose configured dispatch action cannot be reconstructed from retained runtime evidence — counted unchanged, not as savings."
         ));
     }
     if batch_deferred > 0 {

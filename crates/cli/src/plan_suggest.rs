@@ -69,6 +69,7 @@ pub fn suggestions_to_proposed_routes(
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                ..Default::default()
             },
         })
         .collect()

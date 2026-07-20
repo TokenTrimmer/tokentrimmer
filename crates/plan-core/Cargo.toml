@@ -34,7 +34,11 @@ rand_chacha = "=0.3.1"
 
 [features]
 default = []
-contract-schema = ["dep:schemars", "tt-telemetry/contract-schema"]
+contract-schema = [
+    "dep:schemars",
+    "tt-routing/contract-schema",
+    "tt-telemetry/contract-schema",
+]
 
 [dev-dependencies]
 insta.workspace = true

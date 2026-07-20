@@ -14,6 +14,15 @@ export type Actor = {
   type: "anonymous";
 };
 
+export type AgenticBudget = {
+  cache_prefix?: boolean;
+  clear_at_least_tokens?: number;
+  elide_stale_tools?: boolean;
+  keep_recent_pairs?: number;
+  route_mechanical_to?: string | null;
+  semantic_substep_cache?: boolean;
+};
+
 export type Aggregates = {
   cache_hit_rate_projected: number;
   l2_per_class?: Array<PerClassL2Metrics>;
@@ -179,15 +188,21 @@ export type RequestLog = {
 export type RiskBand = "low" | "medium" | "high";
 
 export type RouteAction = {
+  agentic_budget?: AgenticBudget | null;
   auto_pause?: boolean;
   batch?: boolean;
+  compress?: boolean;
+  content_compress?: boolean;
   diff?: boolean;
   disable_cache?: boolean;
+  doc_compaction?: boolean;
+  document_lane?: boolean;
   fallbacks?: Array<string>;
   flex?: boolean;
   format_switch?: string | null;
   max_cost_usd?: number | null;
   minify_json?: boolean;
+  panel?: RoutePanel | null;
   pause_floor_pass_rate?: number | null;
   pause_min_verdicts?: number | null;
   reasoning_budget_tokens?: number | null;
@@ -196,6 +211,7 @@ export type RouteAction = {
   shadow_model?: string | null;
   target_model?: string | null;
   traffic_pct?: number | null;
+  workflow?: RouteWorkflow | null;
 };
 
 export type RouteConditions = {
@@ -212,6 +228,20 @@ export type RouteConditions = {
   prompt_contains_any_of?: Array<string>;
   tag_equals?: string | null;
   upstream_latency_ms_p95_gt?: number | null;
+};
+
+export type RoutePanel = {
+  arbiter?: string | null;
+  max_cost_usd?: number | null;
+  members?: Array<string>;
+  quorum?: number | null;
+  strategy: string;
+};
+
+export type RouteWorkflow = {
+  max_cost_usd?: number | null;
+  mode?: string | null;
+  workflow_id: string;
 };
 
 export type SampleScore = {

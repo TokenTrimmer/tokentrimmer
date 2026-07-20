@@ -306,6 +306,10 @@ mod tests {
                 max_cost_usd: None,
                 flex: false,
                 batch: false,
+                compress: true,
+                doc_compaction: true,
+                document_lane: true,
+                content_compress: true,
                 redact: false,
                 traffic_pct: None,
                 shadow_model: None,
@@ -315,6 +319,9 @@ mod tests {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                agentic_budget: Some(tt_routing::AgenticBudget::default()),
+                panel: None,
+                workflow: None,
             },
         }]
     }
@@ -386,6 +393,11 @@ mod tests {
             Some("claude-haiku-4-5")
         );
         assert_eq!(written[0].name, "haiku-for-cheap-classification");
+        assert!(written[0].then.compress);
+        assert!(written[0].then.doc_compaction);
+        assert!(written[0].then.document_lane);
+        assert!(written[0].then.content_compress);
+        assert!(written[0].then.agentic_budget.is_some());
 
         let entries = audit.list(org_id).await.expect("list ok");
         assert_eq!(entries.len(), 1);

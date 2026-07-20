@@ -76,6 +76,49 @@
         }
       ]
     },
+    "AgenticBudget": {
+      "additionalProperties": false,
+      "description": "Route-grained agentic context budget — the opt-in shaping mode that brings the CLI's loop-aware levers server-side. Every lever is OFF by default; the whole struct is `Option<AgenticBudget>` on [`RouteAction`], serde-omitted when `None`, so the default request path is byte-identical (no new tokens, no new headers, no behavior change). The levers do NOT stack at face value — the planner (`tt_core::passes::agentic_budget`) nets them per request.",
+      "properties": {
+        "cache_prefix": {
+          "default": false,
+          "description": "Sub-lever 1 (lossless): annotate cache_control breakpoints the caller forgot + restructure static-first. Default true when the mode is set.",
+          "type": "boolean"
+        },
+        "clear_at_least_tokens": {
+          "default": 0,
+          "description": "Each elision must free at least this many tokens to justify the re-cache it forces (R1 cache-thrash guard). Default 0 = off.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "elide_stale_tools": {
+          "default": false,
+          "description": "Sub-lever 2: field-drop (lossless, token-true-gated) + summarize (lossy, judge-gated) stale tool results.",
+          "type": "boolean"
+        },
+        "keep_recent_pairs": {
+          "default": 3,
+          "description": "Keep the last N tool-result pairs VERBATIM (caveat C1 blast-radius bound). Default 3 (mirrors Anthropic `keep=3`).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "route_mechanical_to": {
+          "description": "Sub-lever 3: down-route mechanical sub-steps to this model in a CACHE-ISOLATED subagent lane. `None` = no routing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "semantic_substep_cache": {
+          "default": false,
+          "description": "Sub-lever 4 (expectation-value, caveat C2): semantic sub-step cache for READ-ONLY/idempotent sub-steps only.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "Aggregates": {
       "description": "Point-estimate aggregates the replay produces.",
       "properties": {
@@ -1129,14 +1172,33 @@
       ]
     },
     "RouteAction": {
-      "description": "What a matching [`ProposedRoute`] does.\n\nField order matches `tt_routing::RouteAction` so the two types produce identical JSON for the same logical value — a requirement for the Plan apply round-trip (a `ProposedRoute` serialized by the Plan engine and then deserialized by the Gateway must carry all fields without loss or reordering). The `flex` flag IS mirrored (COST-7) — it is a real ~50% rate cut the replay PROJECTS (see [`crate::cost::project_flex_cost`]), so it must round-trip. KNOWN EXCEPTION: the gateway's `compress` flag is still not mirrored here (pre-existing drift; it is false-omitted on the wire, so identity holds whenever it is unset). The `route_action_cross_type_lockstep_guard` test below fails to compile when `tt_routing::RouteAction` grows a field, so any future addition must explicitly decide the mirror question.",
+      "description": "What a matching [`ProposedRoute`] does.\n\nField order matches `tt_routing::RouteAction` so the two types produce identical JSON for the same logical value — a requirement for the Plan apply round-trip (a `ProposedRoute` serialized by the Plan engine and then deserialized by the Gateway must carry every configured field without loss or reordering). Projection support is deliberately narrower than configured action preservation; unsupported effective actions are called out in replay caveats and dispatch-changing actions fail projection closed. The `route_action_cross_type_lockstep_guard` test below fails to compile when `tt_routing::RouteAction` grows a field, forcing an explicit mirror decision.",
       "properties": {
+        "agentic_budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgenticBudget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Mirror of `tt_routing::RouteAction::agentic_budget`. The configured versioned structure round-trips exactly, but historical replay has no retained loop/tool transcript from which to reconstruct its effects, so the matched route's cost/latency projection fails closed."
+        },
         "auto_pause": {
-          "description": "Mirror of `tt_routing::RouteAction::auto_pause`. The quality circuit breaker is a runtime-only guardrail (the gateway sticky-pauses the route when its live paired-judge pass-rate regresses below the floor); replay has no live verdict stream, so the engine does not simulate pauses — it treats the route as always active and projects the route's FULL savings (the same not-yet-modeled assumption it already makes for `traffic_pct`; a real pause can only shrink realized savings, never change quality). Present so a `tt_routing::RouteAction` carrying `auto_pause` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping it on read. Omitted from JSON when false (back-compat).",
+          "description": "Mirror of `tt_routing::RouteAction::auto_pause`. The quality circuit breaker is a runtime-only guardrail (the gateway sticky-pauses the route when its live paired-judge pass-rate regresses below the floor); replay has no live verdict stream, so the engine does not simulate pauses. Because a real pause can shrink realized savings, the matched route's cost/latency projection fails closed instead of being treated as always active. Present so a `tt_routing::RouteAction` carrying `auto_pause` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping it on read. Omitted from JSON when false (back-compat).",
           "type": "boolean"
         },
         "batch": {
           "description": "Mirror of `tt_routing::RouteAction::batch`. Replay PROJECTS the discount the Batch Lane would deliver (target priced at its catalog batch rate — see [`crate::cost::project_batch_cost`]) and surfaces a per-run caveat counting the affected requests — the live gateway is synchronous today and does NOT realize this discount (advisory marker; the async Batch Lane is a later phase). Same serde gating as the gateway side (omitted when false).",
+          "type": "boolean"
+        },
+        "compress": {
+          "description": "Mirror of `tt_routing::RouteAction::compress`. Historical replay cannot reconstruct the exact request-pass token reduction, so the configured flag is retained but its incremental effect is not projected.",
+          "type": "boolean"
+        },
+        "content_compress": {
+          "description": "Mirror of `tt_routing::RouteAction::content_compress`. Retained for exact configured-action round-trip; replay cannot reconstruct content blocks and therefore does not project its isolated estimate.",
           "type": "boolean"
         },
         "diff": {
@@ -1144,7 +1206,15 @@
           "type": "boolean"
         },
         "disable_cache": {
-          "description": "Mirror of `tt_routing::RouteAction::disable_cache`. The replay engine does not yet model cache opt-out (follow-up); present for lossless round-trip.",
+          "description": "Mirror of `tt_routing::RouteAction::disable_cache`. Replay suppresses projected cache hits for matching routes so an opt-out cannot fabricate cache savings; present as well for lossless configured-action round-trip.",
+          "type": "boolean"
+        },
+        "doc_compaction": {
+          "description": "Mirror of `tt_routing::RouteAction::doc_compaction`. Retained for exact configured-action round-trip; historical replay cannot re-run the source document compaction from a condensed request-log row.",
+          "type": "boolean"
+        },
+        "document_lane": {
+          "description": "Mirror of `tt_routing::RouteAction::document_lane`. Retained for exact configured-action round-trip; replay has no retained source media or distillation result and therefore does not project this effect.",
           "type": "boolean"
         },
         "fallbacks": {
@@ -1176,6 +1246,17 @@
         "minify_json": {
           "description": "Mirror of `tt_routing::RouteAction::minify_json`. Carried, NOT modeled: the per-request minify saving is a runtime ESTIMATE grounded in the actual emitted JSON (pretty re-render re-tokenized with the served model's tokenizer), which is not derivable from a historical `RequestLog` row — so replay projects nothing for it (like `redact`/`shadow_model`). Present so a `tt_routing::RouteAction` carrying `minify_json` round-trips losslessly. Omitted from JSON when false (back-compat).",
           "type": "boolean"
+        },
+        "panel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoutePanel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Mirror of `tt_routing::RouteAction::panel`. A panel changes dispatch and output generation fundamentally; replay retains the configuration but fails the route's cost projection closed until panel-leg evidence exists."
         },
         "pause_floor_pass_rate": {
           "description": "Mirror of `tt_routing::RouteAction::pause_floor_pass_rate`. See `auto_pause`. Omitted from JSON when `None` (back-compat).",
@@ -1215,7 +1296,7 @@
           "type": "boolean"
         },
         "shadow_model": {
-          "description": "Mirror of `tt_routing::RouteAction::shadow_model`. Shadow mode is a runtime-only side-channel (the gateway dispatches the candidate, discards its response, and records its cost separately); it never changes the served response, so the replay engine does not model it. Present so a `tt_routing::RouteAction` carrying `shadow_model` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping it on read. Omitted from JSON when `None` (back-compat).",
+          "description": "Mirror of `tt_routing::RouteAction::shadow_model`. Shadow mode is a runtime-only side-channel (the gateway dispatches the candidate, discards its response, and records its cost separately). Condensed Plan rows cannot reconstruct that additional spend, so the matched route's cost/latency projection fails closed. Present so a `tt_routing::RouteAction` carrying `shadow_model` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping it on read. Omitted from JSON when `None` (back-compat).",
           "type": [
             "string",
             "null"
@@ -1229,13 +1310,24 @@
           ]
         },
         "traffic_pct": {
-          "description": "Mirror of `tt_routing::RouteAction::traffic_pct`. A canary split — when `Some(pct)`, only a deterministic `pct`% of matched requests take the rewrite at runtime (chosen by `tt_routing::sticky_traffic_split`); the rest pass through unchanged. The replay engine does not yet model the split (a follow-up would re-derive the per-request arm via the same sticky hash from the logged idempotency key, so projected savings match the fraction that actually routed); the field is present so a `tt_routing::RouteAction` carrying `traffic_pct` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping the split on read. Omitted from JSON when `None` (back-compat).",
+          "description": "Mirror of `tt_routing::RouteAction::traffic_pct`. A canary split — when `Some(pct)`, only a deterministic `pct`% of matched requests take the rewrite at runtime (chosen by `tt_routing::sticky_traffic_split`); the rest pass through unchanged. Request logs do not retain the gateway's idempotency key, so a configured percentage other than 100 fails that route's cost/latency projection closed rather than assuming every row took the canary arm. The field is present so a `tt_routing::RouteAction` carrying `traffic_pct` round-trips losslessly to a `tt_plan_core::RouteAction` without dropping the split on read. Omitted from JSON when `None` (back-compat).",
           "format": "uint32",
           "minimum": 0.0,
           "type": [
             "integer",
             "null"
           ]
+        },
+        "workflow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RouteWorkflow"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Mirror of `tt_routing::RouteAction::workflow`. A workflow detour/shadow is retained without fabricating node execution or workflow cost; the matched route's cost/latency projection fails closed."
         }
       },
       "type": "object"
@@ -1344,6 +1436,79 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "RoutePanel": {
+      "additionalProperties": false,
+      "description": "Fusion panel config for a route-triggered panel (the same panel engine as the X-TokenTrimmer-Panel header). Self-contained (not a re-export of tt_shared PanelExtras) to keep the routing wire contract explicit and avoid a tt_shared coupling in this crate — mirrors the AgenticBudget pattern.",
+      "properties": {
+        "arbiter": {
+          "description": "Arbiter model id; None ⇒ env TT_PANEL_DEFAULT_ARBITER.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_cost_usd": {
+          "description": "Fusion pre-dispatch admission budget (USD) for the static fan-out and arbitration estimate. This is not a runtime spending or invoice cap.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "members": {
+          "description": "Panel member model ids; empty ⇒ gateway env TT_PANEL_DEFAULT_MEMBERS.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "quorum": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "strategy": {
+          "description": "\"synthesize\" | \"best-of-n\" (or \"best_of_n\") | \"majority\". Validated at route creation against PANEL_STRATEGY_VALUES; parsed authoritatively at request time by tt_core's ArbiterStrategyKind::parse.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "strategy"
+      ],
+      "type": "object"
+    },
+    "RouteWorkflow": {
+      "additionalProperties": false,
+      "description": "Workflow-route config (CO-1) — an exact structural clone of the `RoutePanel` seam: a self-contained config that detours dispatch. No competitor gateway has \"routing rules that detour into governed, receipted multi-step workflows.\"",
+      "properties": {
+        "max_cost_usd": {
+          "description": "Pre-dispatch workflow admission budget (USD). The workflow engine uses it to admit a bounded static plan before dispatch; it is not a runtime spending reservation, settlement, or invoice ceiling. `None` falls back to the workflow definition's own budget.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "`\"detour\"` (default) = the workflow result REPLACES the upstream call. `\"shadow\"` = the workflow runs alongside; its result is compared + logged but the direct upstream call's answer is returned. Shadow mode is the safe rollout path: verify the workflow produces equivalent answers before flipping to detour.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_id": {
+          "description": "The workflow definition id to trigger (a UUID string in the workflow definitions table). Validated at route creation for existence + org scope.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id"
+      ],
       "type": "object"
     },
     "SampleScore": {

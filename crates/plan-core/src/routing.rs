@@ -11,11 +11,16 @@ use tt_routing::{route_conditions_match, RouteFeatureSnapshot};
 pub(crate) struct PreparedRoute {
     route: ProposedRoute,
     conditions: tt_routing::RouteConditions,
+    action: tt_routing::RouteAction,
 }
 
 impl PreparedRoute {
     pub(crate) fn route(&self) -> &ProposedRoute {
         &self.route
+    }
+
+    pub(crate) fn action(&self) -> &tt_routing::RouteAction {
+        &self.action
     }
 }
 
@@ -35,7 +40,23 @@ pub(crate) fn prepare_routes(routes: Vec<ProposedRoute>) -> Result<Vec<PreparedR
                     message: error.to_string(),
                 }
             })?;
-            Ok(PreparedRoute { route, conditions })
+            let encoded = serde_json::to_value(&route.then).map_err(|error| {
+                PlanError::RouteActionContract {
+                    route_id: route.id,
+                    message: error.to_string(),
+                }
+            })?;
+            let action = serde_json::from_value(encoded).map_err(|error| {
+                PlanError::RouteActionContract {
+                    route_id: route.id,
+                    message: error.to_string(),
+                }
+            })?;
+            Ok(PreparedRoute {
+                route,
+                conditions,
+                action,
+            })
         })
         .collect()
 }
@@ -57,11 +78,11 @@ pub fn match_route<'a>(req: &RequestLog, routes: &'a [ProposedRoute]) -> Option<
 pub(crate) fn match_prepared_route<'a>(
     req: &RequestLog,
     routes: &'a [PreparedRoute],
-) -> Option<&'a ProposedRoute> {
+) -> Option<&'a PreparedRoute> {
     let snapshot = historical_snapshot(req);
-    routes.iter().find_map(|prepared| {
+    routes.iter().find(|prepared| {
         let route = prepared.route();
-        (route.enabled && route_conditions_match(&prepared.conditions, &snapshot)).then_some(route)
+        route.enabled && route_conditions_match(&prepared.conditions, &snapshot)
     })
 }
 
@@ -230,6 +251,7 @@ mod tests {
                 minify_json: false,
                 reasoning_max_effort: None,
                 reasoning_budget_tokens: None,
+                ..Default::default()
             },
         }
     }

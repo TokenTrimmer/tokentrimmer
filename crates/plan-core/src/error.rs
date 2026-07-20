@@ -49,6 +49,16 @@ pub enum PlanError {
         message: String,
     },
 
+    /// A mirrored Plan action could not cross the canonical gateway route-action
+    /// wire boundary. Replay never projects an action it cannot preserve.
+    #[error("route {route_id} action contract is invalid: {message}")]
+    RouteActionContract {
+        /// Proposed route whose action could not be prepared.
+        route_id: Uuid,
+        /// Serialization or canonical decoder failure.
+        message: String,
+    },
+
     /// An internal invariant was violated (e.g., percentile computation on
     /// an empty slice). Holds a free-form description for the logs.
     #[error("plan replay internal invariant violated: {0}")]
