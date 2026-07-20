@@ -251,9 +251,12 @@ print(f"run saved ${logger.total_saved_usd:.4f}")
 LiteLLM only exposes the raw gateway response headers when
 `litellm.return_response_headers = True` — `install()` sets it for you (the
 counterpart to `include_response_headers=True` on the LangChain side). The logger
-reads them from `response._response_headers` / `response._hidden_params
-["additional_headers"]` on every success, so a response without them (self-hosted
-gateway, no pricing) simply records nothing.
+accounts for synchronous OpenAI-compatible responses from LiteLLM's post-API
+header metadata before `completion()` returns, then de-duplicates the later
+background success event. It also reads `response._response_headers` /
+`response._hidden_params["additional_headers"]` on ordinary success callbacks,
+so a response without TokenTrimmer headers (self-hosted gateway, no pricing)
+simply records nothing.
 
 **Budget stop.** LiteLLM's callbacks are post-hoc *logging* events — LiteLLM
 swallows exceptions raised inside them — so, unlike the LangChain callback's
@@ -261,6 +264,11 @@ inline `raise_error` stop, the budget is enforced at a **checkpoint**: crossing
 `max_cost_usd` flips `logger.budget_exceeded` and `logger.raise_if_exceeded()`
 raises `BudgetExceeded` (the same class both integrations share). Call it right
 after each `completion` to cap a multi-call loop.
+
+The immediate checkpoint is guaranteed for synchronous OpenAI-compatible
+`completion()` responses that expose the gateway headers. Async completion uses
+LiteLLM's asynchronous callback lifecycle; wait for that lifecycle before
+reading totals or enforcing a checkpoint.
 
 ## Batch (50% cheaper, async)
 

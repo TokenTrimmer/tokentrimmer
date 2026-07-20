@@ -59,11 +59,11 @@ doc-distill = ["pypdf>=4.0"]
 langgraph = ["langgraph>=0.2", "langchain-core>=0.3"]
 # LiteLLM cost logger (tokentrimmer.integrations.litellm). litellm is enough for
 # the CustomLogger; the logger reads the x-tokentrimmer-* response headers LiteLLM
-# surfaces when litellm.return_response_headers=True. LiteLLM 1.93.0 can return a
-# successful synchronous completion without dispatching the documented
-# `litellm.callbacks` CustomLogger on Linux, which makes the immediate budget
-# checkpoint falsely read zero. Keep the published compatibility boundary below
-# that release until the real end-to-end hook is reliable there.
+# surfaces when litellm.return_response_headers=True. LiteLLM runs the ordinary
+# sync success hook on an executor, so the integration also consumes its sync
+# post-API response-header metadata and de-duplicates the later success event.
+# Keep the published compatibility boundary below the first unverified 1.93
+# release until both hooks are rechecked there.
 litellm = ["litellm>=1.40,<1.93"]
 # OpenTelemetry span recording. The integrations record cost attributes onto the
 # current span when this is installed; without it, they still accumulate totals.
