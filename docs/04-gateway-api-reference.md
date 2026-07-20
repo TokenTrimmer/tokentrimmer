@@ -2662,11 +2662,14 @@ not require `TT_MASTER_KEY`, does not rewrite stored workflow versions, and
 does not disclose whether another org has the same name.
 
 Deleting a referenced name takes effect immediately. Every retained workflow
-version and durable trigger that later reaches that definition will fail its
-secret preflight before the current definition executes a node. A recursive
-child still preflights only when the child begins, so earlier parent work may
-already have run. Recreate the same name with `POST` to restore future runs;
-the previous value is not recoverable through this API.
+version and durable trigger that starts a run loads and checks the complete
+executable nested-definition tree before the root Trigger or any parent node.
+The run fails at zero cost if any checked definition has a malformed, missing,
+or unusable reference. The preparation is bounded to 256 nested definitions
+through the five supported depth levels, uses org-scoped depth-batch reads, and
+reuses those exact loaded definitions during execution so a newer saved child
+cannot bypass the check. Recreate the same name with `POST` to restore future
+runs; the previous value is not recoverable through this API.
 
 #### Using secrets in Http nodes
 
@@ -2682,9 +2685,9 @@ Reference a stored secret in any `headers` value or `body` string using
 
 At run time the gateway resolves `{{secrets.NAME}}` to the decrypted value
 before making the HTTP request. Missing, undecryptable, or unavailable
-references fail closed before the current workflow executes its Trigger or any
-provider/HTTP node. A recursively invoked child definition performs its own
-preflight when that child begins; earlier parent nodes may already have run.
+references anywhere in the bounded nested tree fail closed before the root
+workflow executes its Trigger or any provider/HTTP node. The exact definitions
+checked during preparation are the definitions reused by recursive execution.
 
 #### Security model
 

@@ -89,6 +89,20 @@ pub(crate) trait NodeExecutor: Send + Sync {
     /// [`ApiError::ServiceUnavailable`] if the backing store is unavailable.
     #[allow(dead_code)]
     async fn load_subworkflow(&self, id: uuid::Uuid) -> Result<WorkflowDefinition, ApiError>;
+
+    /// Load a bounded set of latest child definitions. The default preserves
+    /// simple test executors; the gateway implementation overrides it with one
+    /// org-scoped batch query for whole-tree preflight.
+    async fn load_subworkflows(
+        &self,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, WorkflowDefinition>, ApiError> {
+        let mut definitions = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            definitions.insert(*id, self.load_subworkflow(*id).await?);
+        }
+        Ok(definitions)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +155,18 @@ impl NodeExecutor for GatewayNodeExecutor<'_> {
             .await
             .map(|(def, _version)| def)
             .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {id}")))
+    }
+
+    async fn load_subworkflows(
+        &self,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, WorkflowDefinition>, ApiError> {
+        let pool = self
+            .state
+            .db_pool
+            .as_ref()
+            .ok_or_else(|| ApiError::ServiceUnavailable("workflow store unavailable".into()))?;
+        crate::workflow::preflight::load_latest_definitions(pool, self.org_id, ids).await
     }
 
     async fn run_intelligence(

@@ -97,8 +97,12 @@ started by a human/API run. The two current invokers are:
   `http` node headers/body. BYO-secrets (the gateway never has OAuth custody);
   see `workflow/secrets.rs` + the workflow-secrets migration. Invalid names are
   rejected with the definition; missing or unusable references fail closed
-  before the current definition executes any node. Recursive child definitions
-  preflight when the child begins, after any earlier parent work.
+  before the root definition executes any node. Before execution, the gateway
+  loads the complete nested-definition tree through the five supported depth
+  levels in org-scoped batches (maximum 256 distinct nested definitions),
+  checks all of its references, and freezes those exact definitions for the
+  run. A later child save therefore cannot swap an unchecked definition into
+  the already-admitted run.
 
 ## API surface
 

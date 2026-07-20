@@ -1581,7 +1581,8 @@ pub async fn set_workflow_secret(
 /// `DELETE /v1/workflows/secrets/:name` — idempotently remove one encrypted
 /// secret for the caller's org. A master key is not required to delete the
 /// ciphertext. Stored workflow versions are not rewritten: any retained
-/// reference fails closed at that definition's next preflight.
+/// reference fails the bounded whole-tree preflight before the next run's root
+/// definition executes a node.
 pub async fn delete_workflow_secret(
     State(state): State<AppState>,
     ctx: Option<Extension<ApiKeyContext>>,

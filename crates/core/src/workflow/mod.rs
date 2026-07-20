@@ -11,6 +11,7 @@ pub(crate) mod events;
 pub mod executor;
 pub(crate) mod http;
 pub(crate) mod node_run_store;
+pub(crate) mod preflight;
 pub mod quality_gate;
 pub(crate) mod schedule;
 pub(crate) mod secrets;

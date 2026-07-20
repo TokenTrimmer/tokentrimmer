@@ -74,6 +74,7 @@ pub(crate) use crate::workflow::distill_cache::{DistillCacheStore, FlowDocDistil
 use crate::workflow::events::WfEvent;
 use crate::workflow::executor::{reservation_cost_usd, IntelligenceSpec, NodeExecutor};
 use crate::workflow::http::{self as wf_http, HttpReqSpec, DEFAULT_MAX_RESPONSE_BYTES};
+use crate::workflow::preflight::{prepare_workflow_tree, PreparedWorkflowTree};
 use crate::workflow::schedule;
 use crate::workflow::secrets::required_secret_names;
 use crate::workflow::types::{ModelSelection, Node, NodeKind, NodeOutput, WorkflowDefinition};
@@ -172,23 +173,54 @@ pub(crate) fn run_workflow<'a>(
     ancestors: &'a [Uuid],
     cache: &'a dyn DistillCacheStore,
 ) -> BoxFuture<'a, WorkflowRunResult> {
-    // Seed a fresh execution counter at the root. The Arc is cloned into every
-    // recursive `run_workflow_boxed` call so all nested loops and sub-workflows
-    // draw from ONE shared budget.
-    let executions = Arc::new(AtomicU32::new(0));
-    run_workflow_boxed(
-        executor,
-        def,
-        inputs,
-        run_max_cost_usd,
-        Box::new(journal),
-        events,
-        secrets,
-        depth,
-        ancestors,
-        executions,
-        cache,
-    )
+    Box::pin(async move {
+        // Load, secret-check, and freeze every nested definition before the
+        // root Trigger or any parent work. Runtime recursion reuses this exact
+        // tree, avoiding a latest-version race after preflight.
+        let prepared =
+            match prepare_workflow_tree(executor, def, secrets, depth, MAX_SUBWORKFLOW_DEPTH).await
+            {
+                Ok(tree) => Arc::new(tree),
+                Err(error) => {
+                    if let Some(tx) = events {
+                        let _ = tx.send(WfEvent::RunDone {
+                            status: "failed".to_string(),
+                            cost_usd: 0.0,
+                            baseline_cost_usd: 0.0,
+                            saved_usd: 0.0,
+                        });
+                    }
+                    return WorkflowRunResult {
+                        status: WfStatus::Failed,
+                        cost_usd: 0.0,
+                        baseline_cost_usd: 0.0,
+                        saved_usd: 0.0,
+                        node_outputs: vec![],
+                        error: Some(error),
+                    };
+                }
+            };
+
+        // Seed a fresh execution counter at the root. The Arc is cloned into
+        // every recursive call so all nested loops and sub-workflows draw from
+        // ONE shared budget.
+        let executions = Arc::new(AtomicU32::new(0));
+        run_workflow_boxed(
+            executor,
+            def,
+            inputs,
+            run_max_cost_usd,
+            Box::new(journal),
+            events,
+            secrets,
+            prepared,
+            depth,
+            ancestors,
+            executions,
+            cache,
+        )
+        .await
+    })
 }
 
 /// Private recursive implementation.  Takes an OWNED `Box<dyn FnMut + Send + 'a>`
@@ -205,6 +237,7 @@ fn run_workflow_boxed<'a>(
     journal: Box<dyn FnMut(NodeJournalEntry) + Send + 'a>,
     events: Option<&'a tokio::sync::mpsc::UnboundedSender<WfEvent>>,
     secrets: &'a HashMap<String, SecretString>,
+    prepared: Arc<PreparedWorkflowTree>,
     depth: u32,
     ancestors: &'a [Uuid],
     executions: Arc<AtomicU32>,
@@ -219,9 +252,10 @@ fn run_workflow_boxed<'a>(
             }
         };
 
-        // ---- 1. Fail-closed Http secret preflight -----------------------------
-        // This runs before the Trigger or any provider/HTTP work. Recursive
-        // child definitions perform the same check when the child begins.
+        // ---- 1. Defense-in-depth local Http secret preflight -----------------
+        // Whole-tree preparation already checked and froze every definition
+        // before the root began. Retain the local check as an invariant at each
+        // recursive boundary.
         let required_secrets = match required_secret_names(def) {
             Ok(names) => names,
             Err(errors) => {
@@ -988,10 +1022,11 @@ fn run_workflow_boxed<'a>(
                                 error: Some("loop body cycle detected".into()),
                             };
                         }
-                        // c. Load body once (stable across iterations).
-                        let child_def = match executor.load_subworkflow(*body_workflow_id).await {
-                            Ok(d) => d,
-                            Err(e) => {
+                        // c. Reuse the exact body loaded during root preflight.
+                        let child_prepared = Arc::clone(&prepared);
+                        let child_def = match prepared.definition(body_workflow_id) {
+                            Some(definition) => definition,
+                            None => {
                                 let saved_usd = (accrued_baseline - accrued).max(0.0);
                                 emit(WfEvent::RunDone {
                                     status: "failed".to_string(),
@@ -1005,10 +1040,9 @@ fn run_workflow_boxed<'a>(
                                     baseline_cost_usd: accrued_baseline,
                                     saved_usd,
                                     node_outputs: collected_outputs,
-                                    error: Some(format!(
-                                        "node \"{node_id}\": \
-                                         load_subworkflow error: {e}"
-                                    )),
+                                    error: Some(
+                                        "loop body missing from prepared workflow tree".into(),
+                                    ),
                                 };
                             }
                         };
@@ -1035,12 +1069,13 @@ fn run_workflow_boxed<'a>(
                             // events must not flood the parent stream.
                             let child = run_workflow_boxed(
                                 executor,
-                                &child_def,
+                                child_def,
                                 &iter_input,
                                 remaining,
                                 Box::new(|e: NodeJournalEntry| journal(e)),
                                 None,
                                 secrets,
+                                Arc::clone(&child_prepared),
                                 depth + 1,
                                 &child_ancestors,
                                 Arc::clone(&executions),
@@ -1188,10 +1223,11 @@ fn run_workflow_boxed<'a>(
                                 error: Some("sub-workflow cycle detected".into()),
                             };
                         }
-                        // d. Load child definition.
-                        let child_def = match executor.load_subworkflow(*workflow_id).await {
-                            Ok(d) => d,
-                            Err(e) => {
+                        // d. Reuse the exact child loaded during root preflight.
+                        let child_prepared = Arc::clone(&prepared);
+                        let child_def = match prepared.definition(workflow_id) {
+                            Some(definition) => definition,
+                            None => {
                                 let saved_usd = (accrued_baseline - accrued).max(0.0);
                                 emit(WfEvent::RunDone {
                                     status: "failed".to_string(),
@@ -1205,10 +1241,9 @@ fn run_workflow_boxed<'a>(
                                     baseline_cost_usd: accrued_baseline,
                                     saved_usd,
                                     node_outputs: collected_outputs,
-                                    error: Some(format!(
-                                        "node \"{node_id}\": \
-                                     load_subworkflow error: {e}"
-                                    )),
+                                    error: Some(
+                                        "sub-workflow missing from prepared workflow tree".into(),
+                                    ),
                                 };
                             }
                         };
@@ -1221,12 +1256,13 @@ fn run_workflow_boxed<'a>(
                         // recursive call — no infinite instantiation.
                         let child = run_workflow_boxed(
                             executor,
-                            &child_def,
+                            child_def,
                             inputs,
                             remaining,
                             Box::new(|e: NodeJournalEntry| journal(e)),
                             events,
                             secrets,
+                            child_prepared,
                             depth + 1,
                             &child_ancestors,
                             Arc::clone(&executions),
