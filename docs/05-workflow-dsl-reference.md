@@ -167,10 +167,15 @@ After admission, ready `model`/`agent` siblings in a capped wave run in stable
 sequence rather than concurrently. Before each launch, the engine reserves its
 priceable single-turn preview against the budget remaining after prior actual
 node cost, then settles that reservation to the returned cost before considering
-the next sibling. This is an in-memory directional reservation, not a hard
+the next sibling. The node receives the lesser of its own cap and the run value
+remaining. After normal route selection and request shaping, the gateway prices
+that final request again and fails closed before provider work if it is unknown
+or no longer fits. Capped workflow nodes make one provider attempt: route
+fallbacks, retries, shadow/panel/workflow fan-out, quality judging, and diff
+re-emission are disabled because they are not represented by the single-turn
+reservation. This remains an in-memory directional reservation, not a hard
 runtime or provider-invoice ceiling: a provider call already started can settle
-above its estimate, including route-selected work not represented by the static
-node preview. Uncapped waves retain concurrent execution.
+above its estimate. Uncapped waves retain concurrent execution.
 
 ### Verifying a workflow receipt
 

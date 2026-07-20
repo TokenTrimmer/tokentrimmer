@@ -2503,10 +2503,14 @@ The `budget` field asks the gateway to perform bounded static budget admission
 before it creates a run record or dispatches a provider request. An admitted
 capped wave then runs priceable single-turn nodes sequentially: each directional
 preview is reserved against the remaining value and settled to actual node cost
-before the next sibling can launch. This in-memory reservation is not a hard
-runtime cost ceiling or provider-invoice guarantee: a started provider turn can
-settle differently from its estimate, including route-selected work not
-represented by the static node preview.
+before the next sibling can launch. Immediately before dispatch, the final
+routed/shaped request is priced again against that node's effective remaining
+value. A capped workflow node allows one provider attempt: route fallbacks,
+retries, shadow/panel/workflow fan-out, quality-judge work, and diff re-emission
+are suppressed because those extra legs are not included in the reservation.
+This in-memory reservation is not a hard runtime cost ceiling or
+provider-invoice guarantee: a started provider turn can still settle
+differently from its directional estimate.
 
 ```json
 { "max_cost_usd": 0.10, "on_exceed": "stop" }

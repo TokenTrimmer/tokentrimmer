@@ -465,17 +465,22 @@ fn run_workflow_boxed<'a>(
                             reservation_blocked = true;
                             break;
                         }
+                        let remaining = (cap - settled_for_launch).max(0.0);
+                        let dispatch_cap = spec
+                            .max_cost_usd
+                            .map_or(remaining, |node_cap| node_cap.min(remaining));
                         if let Some(reserved) = reservation_cost_usd(spec) {
-                            let remaining = (cap - settled_for_launch).max(0.0);
-                            if !reserved.is_finite() || reserved < 0.0 || reserved > remaining {
+                            if !reserved.is_finite() || reserved < 0.0 || reserved > dispatch_cap {
                                 reservation_blocked = true;
                                 break;
                             }
                         }
+                        let mut launch_spec = spec.clone();
+                        launch_spec.max_cost_usd = Some(dispatch_cap);
                         emit(WfEvent::NodeStart {
                             node_id: node_id.clone(),
                         });
-                        let outcome = executor.run_intelligence(node_id, spec).await;
+                        let outcome = executor.run_intelligence(node_id, &launch_spec).await;
                         let failed = outcome.is_err();
                         if let Ok(out) = &outcome {
                             settled_for_launch += out.cost_usd;
@@ -1656,6 +1661,9 @@ mod tests {
         /// Per-node completion caps captured from the engine's intelligence
         /// specs before an executor/provider path sees them.
         output_caps: std::sync::Mutex<Vec<(String, Option<u32>)>>,
+        /// Effective per-node cost caps after the engine applies remaining run
+        /// budget. This is the value the gateway dispatch guard receives.
+        cost_caps: std::sync::Mutex<Vec<(String, Option<f64>)>>,
         /// workflow_id → WorkflowDefinition registry for sub-workflow loading tests.
         subworkflows: HashMap<Uuid, WorkflowDefinition>,
     }
@@ -1669,6 +1677,7 @@ mod tests {
                     .collect(),
                 calls: std::sync::Mutex::new(Vec::new()),
                 output_caps: std::sync::Mutex::new(Vec::new()),
+                cost_caps: std::sync::Mutex::new(Vec::new()),
                 subworkflows: HashMap::new(),
             }
         }
@@ -1689,6 +1698,10 @@ mod tests {
         fn output_caps(&self) -> Vec<(String, Option<u32>)> {
             self.output_caps.lock().unwrap().clone()
         }
+
+        fn cost_caps(&self) -> Vec<(String, Option<f64>)> {
+            self.cost_caps.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -1706,6 +1719,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((node_id.to_string(), spec.max_output_tokens));
+            self.cost_caps
+                .lock()
+                .unwrap()
+                .push((node_id.to_string(), spec.max_cost_usd));
             self.responses
                 .get(node_id)
                 .cloned()
@@ -3060,6 +3077,108 @@ mod tests {
             vec!["mb"],
             "mc must not launch after mb settlement leaves too little for its reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn capped_wave_passes_each_node_the_actual_remaining_run_value() {
+        let mut def = make_diamond_def();
+        for node in &mut def.nodes {
+            if let NodeKind::Model {
+                selection,
+                max_output_tokens,
+                ..
+            } = &mut node.kind
+            {
+                *selection = ModelSelection::Model {
+                    model: "gpt-4o-mini".into(),
+                };
+                *max_output_tokens = Some(64);
+            }
+        }
+        let stub = StubExecutor::new(vec![
+            (
+                "mb",
+                NodeOutput {
+                    content: json!("b"),
+                    cost_usd: 0.25,
+                    baseline_cost_usd: 0.25,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+            (
+                "mc",
+                NodeOutput {
+                    content: json!("c"),
+                    cost_usd: 0.10,
+                    baseline_cost_usd: 0.10,
+                    model_used: None,
+                    doc_vision_saved_est_usd: 0.0,
+                },
+            ),
+        ]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            Some(0.5),
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::Succeeded);
+        assert_eq!(stub.called_nodes(), vec!["mb", "mc"]);
+        assert_eq!(
+            stub.cost_caps(),
+            vec![
+                ("mb".to_string(), Some(0.5)),
+                ("mc".to_string(), Some(0.25)),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_wave_does_not_launch_a_node_whose_own_cap_cannot_fit_it() {
+        let mut def = make_sequential_def();
+        for node in &mut def.nodes {
+            if let NodeKind::Model {
+                selection,
+                max_output_tokens,
+                max_cost_usd,
+                ..
+            } = &mut node.kind
+            {
+                *selection = ModelSelection::Model {
+                    model: "gpt-4o-mini".into(),
+                };
+                *max_output_tokens = Some(64);
+                *max_cost_usd = Some(0.000_000_001);
+            }
+        }
+        let stub = StubExecutor::new(vec![]);
+
+        let result = run_workflow(
+            &stub,
+            &def,
+            &json!("go"),
+            Some(1.0),
+            |_| {},
+            None,
+            &HashMap::new(),
+            0,
+            &[],
+            &NoCache,
+        )
+        .await;
+
+        assert_eq!(result.status, WfStatus::BudgetExhausted);
+        assert!(stub.called_nodes().is_empty());
     }
 
     /// Hard-budget gate before a capped wave.

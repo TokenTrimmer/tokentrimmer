@@ -1022,6 +1022,9 @@ struct GatewayCompleter<'a> {
     /// cross-provider / provider-pin credential rebind from one turn can never
     /// leak into the next turn's routing.
     identity: RunIdentity,
+    /// Effective remaining cap for a workflow node's one allowed provider
+    /// dispatch. Public agent runs retain their existing retry/failover policy.
+    workflow_dispatch_cap_usd: Option<f64>,
 }
 
 impl GatewayCompleter<'_> {
@@ -1131,7 +1134,11 @@ impl TurnCompleter for GatewayCompleter<'_> {
         // boundary), not per turn, so the free monthly cap is best-effort across
         // a multi-turn run and may overshoot WITHIN one run; it is re-enforced on
         // the next request once the per-turn settles have advanced the counter.
-        match chat::complete_once(self.state, &ctx, prep).await? {
+        let completion = match self.workflow_dispatch_cap_usd {
+            Some(cap) => chat::complete_once_budgeted_workflow(self.state, &ctx, prep, cap).await?,
+            None => chat::complete_once(self.state, &ctx, prep).await?,
+        };
+        match completion {
             CompletionOutcome::Dispatched { response, headers } => {
                 let usage = RunUsage {
                     prompt_tokens: response.usage.prompt_tokens,
@@ -1214,6 +1221,7 @@ async fn drive_run_loop(
         max_turns,
         None,
         max_cost_usd,
+        None,
         summarize_cfg,
         events,
     )
@@ -1234,6 +1242,7 @@ async fn drive_run_loop_with_output_cap(
     max_turns: u32,
     max_output_tokens: Option<u32>,
     max_cost_usd: Option<f64>,
+    workflow_dispatch_cap_usd: Option<f64>,
     summarize_cfg: Option<SummarizeConfig>,
     events: Option<&tokio::sync::mpsc::UnboundedSender<RunEvent>>,
 ) -> LoopOutcome {
@@ -1255,7 +1264,11 @@ async fn drive_run_loop_with_output_cap(
     let summ_ref: Option<&dyn TranscriptSummarizer> = summarizer_obj
         .as_ref()
         .map(|s| s as &dyn TranscriptSummarizer);
-    let completer = GatewayCompleter { state, identity };
+    let completer = GatewayCompleter {
+        state,
+        identity,
+        workflow_dispatch_cap_usd,
+    };
     run_loop_core_with_output_cap(
         &completer,
         id,
@@ -1342,6 +1355,7 @@ pub(crate) async fn drive_workflow_node(
         tools,
         max_turns,
         max_output_tokens,
+        max_cost_usd,
         max_cost_usd,
         None, // no summarizer in W1a workflow nodes
         None, // no SSE event sink
@@ -1851,6 +1865,7 @@ pub async fn submit_tool_outputs(
     let completer = GatewayCompleter {
         state: &state,
         identity,
+        workflow_dispatch_cap_usd: None,
     };
     let summ_ref: Option<&dyn TranscriptSummarizer> =
         summ_obj.as_ref().map(|s| s as &dyn TranscriptSummarizer);

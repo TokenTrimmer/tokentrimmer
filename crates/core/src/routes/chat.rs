@@ -1148,7 +1148,111 @@ pub(crate) fn attribute_run(row: &mut RequestLogRow, ctx: &tt_shared::RequestCon
 pub(crate) async fn complete_once(
     state: &AppState,
     ctx: &RequestContext,
+    prep: Prepared,
+) -> ApiResult<CompletionOutcome> {
+    let retry = RetryPolicy::default();
+    complete_once_with_retry_policy(state, ctx, prep, &retry).await
+}
+
+/// Execute one capped workflow turn after the shared route/action preparation.
+///
+/// A numeric workflow reservation covers one priceable provider turn. Route
+/// rewrites remain available, but work that can add an unreserved upstream leg
+/// is removed: retries, failover, shadow/panel/workflow fan-out, quality judging,
+/// and diff re-emission. The final routed/shaped request is re-priced against
+/// the node's effective remaining cap before the one allowed attempt.
+pub(crate) async fn complete_once_budgeted_workflow(
+    state: &AppState,
+    ctx: &RequestContext,
     mut prep: Prepared,
+    max_cost_usd: f64,
+) -> ApiResult<CompletionOutcome> {
+    prep.panel = None;
+    prep.panel_admission = None;
+    prep.panel_creds.clear();
+    prep.workflow = None;
+    prep.route_shadow_model = None;
+    prep.route_fallbacks.clear();
+    prep.failover_candidates.clear();
+    prep.failover_creds.clear();
+    prep.failover_cost_check = None;
+    prep.judge_source_provider = None;
+    prep.judge_source_ctx = None;
+    prep.judge_original_req = None;
+    if let Some(plan) = prep.diff_plan.take() {
+        crate::shaping::diff::unapply_diff_request(&mut prep.req, &plan);
+    }
+    prep.warnings
+        .push("workflow_budget_single_dispatch".to_string());
+
+    admit_budgeted_workflow_dispatch(&prep.req, max_cost_usd)?;
+
+    let retry = RetryPolicy::default().capped(1);
+    complete_once_with_retry_policy(state, ctx, prep, &retry).await
+}
+
+fn admit_budgeted_workflow_dispatch(
+    req: &ChatCompletionRequest,
+    max_cost_usd: f64,
+) -> ApiResult<()> {
+    let routed_estimate = crate::routes::agent_run_budget::estimate_next_turn_cost(
+        &req.model,
+        &req.messages,
+        req.max_tokens,
+    )
+    .filter(|estimate| estimate.is_finite() && *estimate >= 0.0)
+    .ok_or_else(|| {
+        ApiError::InvalidRequest(
+            "workflow budget dispatch could not price the final routed request".into(),
+        )
+    })?;
+    if crate::routes::agent_run_budget::would_exceed(0.0, Some(routed_estimate), Some(max_cost_usd))
+    {
+        return Err(ApiError::InvalidRequest(
+            "workflow budget dispatch rejected the final routed request before provider work"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod workflow_budget_dispatch_tests {
+    use super::*;
+
+    fn request(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
+            messages: vec![Message::User {
+                content: MessageContent::Text("hello".into()),
+                name: None,
+            }],
+            max_tokens: Some(64),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn final_routed_request_must_be_priceable_and_fit_the_effective_cap() {
+        let known = request("gpt-4o-mini");
+        let estimate = crate::routes::agent_run_budget::estimate_next_turn_cost(
+            &known.model,
+            &known.messages,
+            known.max_tokens,
+        )
+        .expect("catalog model");
+
+        assert!(admit_budgeted_workflow_dispatch(&known, estimate).is_ok());
+        assert!(admit_budgeted_workflow_dispatch(&known, estimate / 2.0).is_err());
+        assert!(admit_budgeted_workflow_dispatch(&request("unknown-model"), 1.0).is_err());
+    }
+}
+
+async fn complete_once_with_retry_policy(
+    state: &AppState,
+    ctx: &RequestContext,
+    mut prep: Prepared,
+    retry_policy: &RetryPolicy,
 ) -> ApiResult<CompletionOutcome> {
     // Fusion panel branch — FIRST, before any cache /
     // single-flight check. Panels are non-deterministic (two same-model legs
@@ -1480,10 +1584,8 @@ pub(crate) async fn complete_once(
     let primary_dispatch = with_request_timeout(request_timeout, async {
         if route_fallbacks.is_empty() {
             let __started = std::time::Instant::now();
-            let __dispatch = with_retry(&RetryPolicy::default(), || {
-                provider.chat_completion(req.clone(), ctx)
-            })
-            .await;
+            let __dispatch =
+                with_retry(retry_policy, || provider.chat_completion(req.clone(), ctx)).await;
             let __elapsed = __started.elapsed();
             crate::metrics::record_provider_latency(provider.id(), "chat", __elapsed);
             // Feed the rolling p95 window (the live signal behind the
@@ -1509,7 +1611,7 @@ pub(crate) async fn complete_once(
             crate::failover::dispatch_with_failover(
                 &state.registry,
                 &state.breaker,
-                &RetryPolicy::default(),
+                retry_policy,
                 &failover_candidates,
                 &req,
                 ctx,
@@ -1751,7 +1853,7 @@ pub(crate) async fn complete_once(
                 // Single provider, no failover chain — the chain already
                 // chose this provider for the patch dispatch.
                 let reemit = with_request_timeout(request_timeout, async {
-                    with_retry(&RetryPolicy::default(), || {
+                    with_retry(retry_policy, || {
                         provider.chat_completion(reemit_req.clone(), ctx)
                     })
                     .await

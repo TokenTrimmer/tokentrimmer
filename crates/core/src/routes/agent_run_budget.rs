@@ -92,12 +92,18 @@ pub(crate) fn budget_reached(accrued_usd: f64, cap: Option<f64>) -> bool {
     would_exceed(accrued_usd, None, cap)
 }
 
-/// True iff a cap is set and `accrued + best-effort next-turn estimate` reaches
-/// it. When no estimate is available (`est_next_usd == None`), this reduces to the pure `accrued >= cap` check.
+/// True iff a cap is set and `accrued + best-effort next-turn estimate`
+/// exceeds it. An estimate exactly equal to the remaining cap is admissible,
+/// matching workflow static admission and reservation. When no estimate is
+/// available (`est_next_usd == None`), this reduces to the pure
+/// `accrued >= cap` check.
 pub(crate) fn would_exceed(accrued_usd: f64, est_next_usd: Option<f64>, cap: Option<f64>) -> bool {
     match cap {
         None => false,
-        Some(c) => accrued_usd + est_next_usd.unwrap_or(0.0) >= c,
+        Some(c) => match est_next_usd {
+            Some(estimate) => accrued_usd + estimate > c,
+            None => accrued_usd >= c,
+        },
     }
 }
 
@@ -164,10 +170,12 @@ mod tests {
 
     #[test]
     fn would_exceed_uses_accrued_plus_estimate_when_estimate_present() {
-        // accrued 0.30 + est 0.15 = 0.45 >= cap 0.40 -> would exceed
+        // accrued 0.30 + est 0.15 = 0.45 > cap 0.40 -> would exceed
         assert!(would_exceed(0.30, Some(0.15), Some(0.40)));
         // accrued 0.30 + est 0.05 = 0.35 < cap 0.40 -> would not
         assert!(!would_exceed(0.30, Some(0.05), Some(0.40)));
+        // An exact-fit directional reservation is allowed.
+        assert!(!would_exceed(0.30, Some(0.10), Some(0.40)));
     }
 
     #[test]
