@@ -455,7 +455,7 @@ fn validate_triggers(
     let mut schedule_count = 0;
     for t in &def.triggers {
         match t {
-            WorkflowTrigger::Schedule { interval } => {
+            WorkflowTrigger::Schedule { interval, .. } => {
                 schedule_count += 1;
                 match parse_interval(interval) {
                     Some(d) => {
@@ -480,7 +480,7 @@ fn validate_triggers(
                     )),
                 }
             }
-            WorkflowTrigger::Webhook { token_id } => {
+            WorkflowTrigger::Webhook { token_id, .. } => {
                 if token_id.is_empty() {
                     errors.push("webhook trigger token_id must not be empty".to_string());
                 } else if !token_id
@@ -1808,9 +1808,11 @@ mod tests {
         def.triggers = vec![
             WorkflowTrigger::Schedule {
                 interval: "6h".into(),
+                environment: None,
             },
             WorkflowTrigger::Webhook {
                 token_id: "t-1_a".into(),
+                environment: None,
             },
         ];
         assert!(validate(&def, &any_model).is_ok());
@@ -1821,6 +1823,7 @@ mod tests {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
             interval: "1h".into(),
+            environment: None,
         }];
         assert!(validate(&def, &any_model).is_ok());
     }
@@ -1830,6 +1833,7 @@ mod tests {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
             interval: "soon".into(),
+            environment: None,
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(
@@ -1843,6 +1847,7 @@ mod tests {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
             interval: "30m".into(),
+            environment: None,
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(
@@ -1858,6 +1863,7 @@ mod tests {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
             interval: "30m".into(),
+            environment: None,
         }];
         assert!(validate_for_execution(&def, &any_model).is_ok());
     }
@@ -1867,6 +1873,7 @@ mod tests {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Schedule {
             interval: "1m".into(),
+            environment: None,
         }];
         let errs = validate_for_execution(&def, &any_model).unwrap_err();
         assert!(
@@ -1882,9 +1889,11 @@ mod tests {
         def.triggers = vec![
             WorkflowTrigger::Schedule {
                 interval: "6h".into(),
+                environment: None,
             },
             WorkflowTrigger::Schedule {
                 interval: "12h".into(),
+                environment: None,
             },
         ];
         let errs = validate(&def, &any_model).unwrap_err();
@@ -1899,6 +1908,7 @@ mod tests {
         let mut def = linear_def("m");
         def.triggers = vec![WorkflowTrigger::Webhook {
             token_id: "".into(),
+            environment: None,
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(
@@ -1908,6 +1918,7 @@ mod tests {
 
         def.triggers = vec![WorkflowTrigger::Webhook {
             token_id: "bad token!".into(),
+            environment: None,
         }];
         let errs = validate(&def, &any_model).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("URL-safe")), "{errs:?}");

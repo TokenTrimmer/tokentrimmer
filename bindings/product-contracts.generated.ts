@@ -228,12 +228,16 @@ export type UnknownEvidence = {
 };
 
 export type WorkflowTrigger = {
+  environment?: WorkflowTriggerEnvironment | null;
   interval: string;
   type: "schedule";
 } | {
+  environment?: WorkflowTriggerEnvironment | null;
   token_id: string;
   type: "webhook";
 };
+
+export type WorkflowTriggerEnvironment = "development" | "staging" | "production";
 
 export type RouteWriteRequest = {
   enabled?: boolean;

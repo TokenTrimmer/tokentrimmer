@@ -122,6 +122,15 @@ JOIN workflow_environment_releases r \
  AND r.environment = s.environment AND r.revision = s.revision \
 WHERE s.org_id = $1 AND s.workflow_id = $2 AND s.environment = $3";
 
+pub(crate) const GET_RELEASE_REVISION_SQL: &str = "\
+SELECT r.environment, r.revision, r.workflow_version, d.content_hash, \
+       r.action, r.source_environment, r.source_revision, r.created_at \
+FROM workflow_environment_releases r \
+JOIN workflow_definitions d \
+  ON d.org_id = r.org_id AND d.id = r.workflow_id AND d.version = r.workflow_version \
+WHERE r.org_id = $1 AND r.workflow_id = $2 \
+  AND r.environment = $3 AND r.revision = $4";
+
 pub(crate) const LIST_RELEASE_HISTORY_SQL: &str = "\
 SELECT r.environment, r.revision, r.workflow_version, d.content_hash, \
        r.action, r.source_environment, r.source_revision, r.created_at \
@@ -310,6 +319,40 @@ pub(crate) async fn get_current_release(
         .transpose()
 }
 
+/// Load one immutable release-ledger entry exactly. Automatic invocation
+/// queues use this instead of a current pointer so a delayed or retried
+/// dispatch cannot drift after promotion or rollback.
+pub(crate) async fn get_release_revision(
+    pool: &PgPool,
+    org_id: Uuid,
+    workflow_id: Uuid,
+    environment: WorkflowEnvironment,
+    revision: i32,
+) -> Result<Option<WorkflowEnvironmentRelease>, sqlx::Error> {
+    sqlx::query(GET_RELEASE_REVISION_SQL)
+        .bind(org_id)
+        .bind(workflow_id)
+        .bind(environment.as_str())
+        .bind(revision)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(|row| {
+            let mutation = mutation_from_row(row)?;
+            Ok(WorkflowEnvironmentRelease {
+                environment: mutation.environment,
+                revision: mutation.revision,
+                workflow_version: mutation.workflow_version,
+                content_hash: mutation.content_hash,
+                action: mutation.action,
+                source_environment: mutation.source_environment,
+                source_revision: mutation.source_revision,
+                created_at: mutation.created_at,
+            })
+        })
+        .transpose()
+}
+
 pub(crate) async fn list_release_history(
     pool: &PgPool,
     org_id: Uuid,
@@ -462,6 +505,20 @@ mod tests {
         }
         assert!(!GET_CURRENT_RELEASE_SQL.contains("ORDER BY"));
         assert!(!GET_CURRENT_RELEASE_SQL.contains("LIMIT"));
+
+        for fragment in [
+            "r.org_id = $1",
+            "r.workflow_id = $2",
+            "r.environment = $3",
+            "r.revision = $4",
+            "d.version = r.workflow_version",
+        ] {
+            assert!(
+                GET_RELEASE_REVISION_SQL.contains(fragment),
+                "immutable release lookup missing {fragment}"
+            );
+        }
+        assert!(!GET_RELEASE_REVISION_SQL.contains("workflow_environment_state"));
     }
 
     #[test]

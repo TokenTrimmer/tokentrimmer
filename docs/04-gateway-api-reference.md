@@ -2066,8 +2066,8 @@ preserve every returned top-level field, including `metadata` and `triggers`.
 
 ```json
 "triggers": [
-  { "type": "schedule", "interval": "6h" },
-  { "type": "webhook", "token_id": "ops_sync_1" }
+  { "type": "schedule", "interval": "6h", "environment": "staging" },
+  { "type": "webhook", "token_id": "ops_sync_1", "environment": "production" }
 ]
 ```
 
@@ -2079,6 +2079,14 @@ not at an exact wall-clock time; startup, leader acquisition, and the configured
 sweep profile can add pickup jitter. A webhook `token_id` must be a non-empty
 URL-safe identifier (`A-Z`, `a-z`, `0-9`, `_`, `-`). The signing key and final
 URL are managed server-side; do not place a webhook secret in the definition.
+
+Each trigger may optionally select `development`, `staging`, or `production`.
+The hosted control plane resolves that environment once when it durably queues
+an occurrence, persists the exact workflow version, release revision, and
+non-secret variable revision, and replays that tuple unchanged after pointer
+movement. Omit `environment` to preserve the legacy latest-saved-definition
+behavior. A missing release or positive variable snapshot fails before gateway
+provider work; it never falls back to latest or to the current variable set.
 
 Definitions persisted before the one-hour validation floor are not rewritten or
 disabled by this change. Operators must inventory and explicitly migrate any
@@ -2663,8 +2671,9 @@ For durable callers, send a stable Idempotency-Key header. The gateway hashes
 that value before storage and creates or reuses one run per (org, workflow,
 key). The first accepted request binds the key to its immutable workflow
 version, canonical JSON inputs, max_cost_usd request option, and explicit
-environment selector when supplied. A retry with changed inputs, cost, explicit
-version, or environment receives 409. Repeating the same environment selector
+environment or frozen release selector when supplied. A retry with changed
+inputs, cost, version, environment, release revision, or variable revision
+receives 409. Repeating the same current-environment selector
 reuses the release and variables revisions accepted first even if either current
 pointer has since advanced.
 Legacy retries without `workflow_environment` preserve their pre-existing
@@ -2685,13 +2694,34 @@ behavior: every request creates a fresh run.
 |---|---|---|---|
 | `inputs` | object | no | Input values passed to the trigger node. |
 | `workflow_version` | integer | no | Exact immutable definition version to execute. Omit for the latest version on a new invocation. `version` is accepted as a compatibility alias. |
-| `workflow_environment` | string | no | Exact current `development`, `staging`, or `production` release to resolve before execution. Mutually exclusive with `workflow_version`; it does not change schedule/webhook defaults. Route detours have a separate optional `then.workflow.environment` selector (§10.7). |
+| `workflow_environment` | string | no | Current `development`, `staging`, or `production` release to resolve before execution. Normally mutually exclusive with `workflow_version`; durable automatic delivery uses the complete four-field frozen tuple described below. Route detours have a separate optional `then.workflow.environment` selector (§10.7). |
+| `release_revision` | integer | no | Positive immutable release-ledger revision. Valid only with all of `workflow_version`, `workflow_environment`, and `variables_revision`. |
+| `variables_revision` | integer | no | Nonnegative immutable non-secret variable revision; `0` is the implicit empty set. Valid only as part of the complete frozen tuple. |
 | `max_cost_usd` | number | no | Run-level USD cap. Superseded by `def.budget.max_cost_usd` when that is set. |
 
 Idempotency-Key is optional, must be 1–256 visible bytes, and is never
 returned or stored in raw form. stream is deliberately not part of the logical
 invocation binding: a retry may request status JSON after a lost SSE connection
 without starting a second run.
+
+Schedule/webhook bridges use a complete frozen selector:
+
+```json
+{
+  "inputs": {},
+  "workflow_version": 3,
+  "workflow_environment": "production",
+  "release_revision": 2,
+  "variables_revision": 4,
+  "stream": false
+}
+```
+
+That four-field shape requires `Idempotency-Key`. Any partial tuple, unknown
+environment, nonpositive workflow/release revision, negative variable revision,
+missing immutable ledger row, or release/version mismatch fails closed. The
+gateway reads the exact release and variable ledgers and does not consult either
+current pointer for this request shape.
 
 **Response:**
 

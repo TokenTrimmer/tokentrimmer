@@ -76,7 +76,14 @@ pub enum WorkflowTrigger {
     /// at an exact wall-clock time. No real-cron expressions in v1 (no cron
     /// crate dep — the cloud sweeps are fixed-`Duration` sleeps; mirroring that
     /// keeps the cadence discipline uniform).
-    Schedule { interval: String },
+    Schedule {
+        interval: String,
+        /// Optional immutable release environment resolved when this trigger
+        /// occurrence is durably accepted. Omission preserves the historical
+        /// latest-saved-definition behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<WorkflowTriggerEnvironment>,
+    },
     /// Fire via a signed webhook URL. `token_id` is the public trigger
     /// identifier embedded in the v2 capability path
     /// (`POST /v1/workflows/:id/webhooks/{org_uuid}.{token_id}.{hex_sig}`); the
@@ -84,7 +91,26 @@ pub enum WorkflowTrigger {
     /// `wfwh2|{org_id}|{workflow_id}|{token_id}` domain. Binding the tenant is
     /// required because workflow ids are tenant-scoped. This reuses the
     /// badge-HMAC key + the `verify_receipt_share_url` idiom.
-    Webhook { token_id: String },
+    Webhook {
+        token_id: String,
+        /// Optional immutable release environment resolved when this trigger
+        /// occurrence is durably accepted. Omission preserves the historical
+        /// latest-saved-definition behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<WorkflowTriggerEnvironment>,
+    },
+}
+
+/// Closed release selector available to automatic workflow triggers. This is
+/// deliberately the same three-value wire vocabulary as direct and route
+/// execution, while remaining in the pure definition model consumed by Cloud.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowTriggerEnvironment {
+    Development,
+    Staging,
+    Production,
 }
 
 // ---------------------------------------------------------------------------
@@ -415,8 +441,8 @@ mod tests {
           "nodes":[{"id":"t","type":"trigger"},{"id":"o","type":"output"}],
           "edges":[{"from":"t","to":"o"}],
           "triggers":[
-            {"type":"schedule","interval":"6h"},
-            {"type":"webhook","token_id":"ops_sync_1"}
+            {"type":"schedule","interval":"6h","environment":"staging"},
+            {"type":"webhook","token_id":"ops_sync_1","environment":"production"}
           ]}"#;
         let def: WorkflowDefinition = serde_json::from_str(json).unwrap();
         assert_eq!(
@@ -424,9 +450,11 @@ mod tests {
             vec![
                 WorkflowTrigger::Schedule {
                     interval: "6h".to_string(),
+                    environment: Some(WorkflowTriggerEnvironment::Staging),
                 },
                 WorkflowTrigger::Webhook {
                     token_id: "ops_sync_1".to_string(),
+                    environment: Some(WorkflowTriggerEnvironment::Production),
                 },
             ]
         );
@@ -434,6 +462,7 @@ mod tests {
         let hash = content_hash(&def);
         let serialized = serde_json::to_string(&def).unwrap();
         assert!(serialized.contains("\"triggers\""));
+        assert!(serialized.contains("\"environment\":\"staging\""));
         let reparsed: WorkflowDefinition = serde_json::from_str(&serialized).unwrap();
         assert_eq!(reparsed.triggers, def.triggers);
         assert_eq!(content_hash(&reparsed), hash);
@@ -444,6 +473,34 @@ mod tests {
             content_hash(&human_run_only),
             hash,
             "trigger changes must create a distinct immutable definition version"
+        );
+
+        let legacy_json = r#"{"id":"00000000-0000-0000-0000-000000000000","version":1,"name":"legacy","nodes":[],"edges":[],"triggers":[{"type":"schedule","interval":"1h"}]}"#;
+        let legacy: WorkflowDefinition = serde_json::from_str(legacy_json).unwrap();
+        let legacy_serialized = serde_json::to_value(legacy).unwrap();
+        assert!(legacy_serialized["triggers"][0]
+            .get("environment")
+            .is_none());
+
+        for environment in ["development", "staging", "production"] {
+            let trigger: WorkflowTrigger = serde_json::from_value(serde_json::json!({
+                "type": "webhook",
+                "token_id": "closed",
+                "environment": environment,
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(trigger).unwrap()["environment"],
+                environment
+            );
+        }
+        assert!(
+            serde_json::from_value::<WorkflowTrigger>(serde_json::json!({
+                "type": "schedule",
+                "interval": "1h",
+                "environment": "preview",
+            }))
+            .is_err()
         );
     }
 

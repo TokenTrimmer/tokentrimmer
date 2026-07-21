@@ -407,6 +407,26 @@ pub(crate) fn workflow_run_request_options_hash(
     Ok(Sha256::digest(canonical).into())
 }
 
+/// Fingerprint the fully frozen automatic-activation tuple. This deliberately
+/// has a distinct object shape from current-environment selection so the same
+/// idempotency key cannot drift between "resolve now" and "replay exactly".
+pub(crate) fn workflow_run_exact_activation_options_hash(
+    max_cost_usd: Option<f64>,
+    workflow_version: i32,
+    release: WorkflowRunReleaseProvenance,
+) -> Result<[u8; 32], serde_json::Error> {
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "max_cost_usd": max_cost_usd,
+        "exact_workflow_activation": {
+            "workflow_version": workflow_version,
+            "workflow_environment": release.environment.as_str(),
+            "release_revision": release.revision,
+            "variables_revision": release.variables_revision,
+        },
+    }))?;
+    Ok(Sha256::digest(canonical).into())
+}
+
 // ---------------------------------------------------------------------------
 // Definition store functions
 // ---------------------------------------------------------------------------
@@ -893,7 +913,8 @@ mod tests {
     use super::{
         create_or_reuse_idempotent_run, get_definition_version_record, get_run_strict,
         get_workflow_run_idempotency, insert_definition, insert_run_required,
-        list_definition_versions, workflow_run_input_hash, workflow_run_invocation_key_hash,
+        list_definition_versions, workflow_run_exact_activation_options_hash,
+        workflow_run_input_hash, workflow_run_invocation_key_hash,
         workflow_run_request_options_hash, CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency,
         WorkflowRunRecord, WorkflowRunReleaseProvenance, FINISH_RUN_SQL, GET_DEFINITION_SQL,
         GET_DEFINITION_VERSION_SQL, GET_RUN_SQL, GET_WORKFLOW_RUN_IDEMPOTENCY_SQL,
@@ -1245,6 +1266,39 @@ mod tests {
             workflow_run_request_options_hash(Some(0.05), Some(WorkflowEnvironment::Production))
                 .expect("environment options serialize");
         assert_ne!(capped, production, "the release selector must be bound");
+
+        let frozen = workflow_run_exact_activation_options_hash(
+            Some(0.05),
+            4,
+            WorkflowRunReleaseProvenance {
+                environment: WorkflowEnvironment::Production,
+                revision: 7,
+                variables_revision: 2,
+            },
+        )
+        .expect("frozen activation options serialize");
+        assert_ne!(
+            production, frozen,
+            "current and frozen selectors must differ"
+        );
+        for changed in [
+            (5, WorkflowEnvironment::Production, 7, 2),
+            (4, WorkflowEnvironment::Staging, 7, 2),
+            (4, WorkflowEnvironment::Production, 8, 2),
+            (4, WorkflowEnvironment::Production, 7, 3),
+        ] {
+            let changed = workflow_run_exact_activation_options_hash(
+                Some(0.05),
+                changed.0,
+                WorkflowRunReleaseProvenance {
+                    environment: changed.1,
+                    revision: changed.2,
+                    variables_revision: changed.3,
+                },
+            )
+            .expect("changed activation options serialize");
+            assert_ne!(frozen, changed, "every frozen tuple field must be bound");
+        }
 
         let legacy_bytes = serde_json::to_vec(&serde_json::json!({
             "max_cost_usd": 0.05,
@@ -1702,6 +1756,86 @@ mod tests {
         assert_eq!(exact_production.revision, 1);
         assert_eq!(exact_production.workflow_version, 2);
 
+        use crate::workflow::environment_variables::{
+            get_variables_revision, replace_current_variables,
+        };
+        let variables_v1 =
+            std::collections::BTreeMap::from([("REGION".to_owned(), "us-east-1".to_owned())]);
+        let variables_v2 =
+            std::collections::BTreeMap::from([("REGION".to_owned(), "us-west-2".to_owned())]);
+        assert_eq!(
+            replace_current_variables(
+                &pool,
+                org_a,
+                guarded_workflow_id,
+                WorkflowEnvironment::Production,
+                0,
+                &variables_v1,
+            )
+            .await
+            .expect("write production variables revision 1")
+            .expect("production variables revision 1")
+            .revision,
+            1,
+        );
+        assert_eq!(
+            replace_current_variables(
+                &pool,
+                org_a,
+                guarded_workflow_id,
+                WorkflowEnvironment::Production,
+                1,
+                &variables_v2,
+            )
+            .await
+            .expect("write production variables revision 2")
+            .expect("production variables revision 2")
+            .revision,
+            2,
+        );
+        let exact_variables_v1 = get_variables_revision(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Production,
+            1,
+        )
+        .await
+        .expect("read immutable production variables revision 1")
+        .expect("production variables revision 1 remains retained");
+        assert_eq!(exact_variables_v1.variables, variables_v1);
+        assert!(get_variables_revision(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Production,
+            99,
+        )
+        .await
+        .expect("read missing immutable variables revision")
+        .is_none());
+        assert!(get_variables_revision(
+            &pool,
+            org_b,
+            guarded_workflow_id,
+            WorkflowEnvironment::Production,
+            1,
+        )
+        .await
+        .expect("read other-org immutable variables revision")
+        .is_none());
+        let implicit_empty_variables = get_variables_revision(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Production,
+            0,
+        )
+        .await
+        .expect("read implicit empty variables revision")
+        .expect("revision zero always resolves to the empty set");
+        assert!(implicit_empty_variables.variables.is_empty());
+
         let release_run_id = Uuid::new_v4();
         let release_run = WorkflowRunRecord {
             id: release_run_id,
@@ -1775,6 +1909,31 @@ mod tests {
             Some(WorkflowEnvironment::Development)
         );
         assert_eq!(rollback.source_revision, Some(1));
+        let retained_development_v2 = release_store::get_release_revision(
+            &pool,
+            org_a,
+            guarded_workflow_id,
+            WorkflowEnvironment::Development,
+            2,
+        )
+        .await
+        .expect("read retained development release revision 2")
+        .expect("development release revision 2 remains retained after rollback");
+        assert_eq!(retained_development_v2.workflow_version, 2);
+        assert_eq!(
+            retained_development_v2.action,
+            WorkflowReleaseAction::Publish
+        );
+        assert!(release_store::get_release_revision(
+            &pool,
+            org_b,
+            guarded_workflow_id,
+            WorkflowEnvironment::Development,
+            2,
+        )
+        .await
+        .expect("read other-org retained release")
+        .is_none());
         let development_history = release_store::list_release_history(
             &pool,
             org_a,

@@ -58,7 +58,7 @@
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "fb8189416885112b39ad6ff81e117a101bc9774b4d559bdeaaf75739aebffe93"
+      "sha256": "22726bc1dddad42d4c1bd10325e88fd8207876c8c170d734adcf96882a5432c2"
     },
     {
       "path": "docs/capability-contract/gateway-capabilities.schema.json",
@@ -74,15 +74,15 @@
     },
     {
       "path": "docs/workflow-contract/workflow-definition-v1.golden.json",
-      "sha256": "abf86966f51a0e2080d19c8407904f5910162ec818603218bac6b8539923f45a"
+      "sha256": "f35e4caf3f15f7e04ff0a30f23a39450b82639a78462047a6c20eb6d8481c616"
     },
     {
       "path": "docs/workflow-contract/workflow-definition.schema.json",
-      "sha256": "2a15d289ff2e24b47a097b3370aaab864e3f6d9c178c61361a484f7228fb7e30"
+      "sha256": "385615922b7dd35057b3acf72f61ad1f2bea1da7794e2415a613f18443d7074e"
     },
     {
       "path": "docs/workflow-contract/workflow-write.schema.json",
-      "sha256": "6263646bc1c186474d6fa3c3cd005b45498e20e5d3c2cbfc6b58e40c357651f4"
+      "sha256": "411dd9deae0591ff7b80d48cefb875e7208e01ec594a368402d3ba79f8c8016e"
     }
   ],
   "generated_from": "Authoritative Rust route parser, route-preview coverage decision, workflow definition/write types, and gateway capability response type",

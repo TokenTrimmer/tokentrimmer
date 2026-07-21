@@ -527,6 +527,17 @@
         {
           "description": "Fire on a fixed interval. `interval` is a duration string (`\"1h\"` / `\"6h\"` / `\"1d\"`) and new definitions must be at least one hour. The cloud dispatcher picks due work up on an approximate hourly sweep, not at an exact wall-clock time. No real-cron expressions in v1 (no cron crate dep — the cloud sweeps are fixed-`Duration` sleeps; mirroring that keeps the cadence discipline uniform).",
           "properties": {
+            "environment": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowTriggerEnvironment"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional immutable release environment resolved when this trigger occurrence is durably accepted. Omission preserves the historical latest-saved-definition behavior."
+            },
             "interval": {
               "type": "string"
             },
@@ -546,6 +557,17 @@
         {
           "description": "Fire via a signed webhook URL. `token_id` is the public trigger identifier embedded in the v2 capability path (`POST /v1/workflows/:id/webhooks/{org_uuid}.{token_id}.{hex_sig}`); the HMAC secret is derived server-side under a `wfwh2|{org_id}|{workflow_id}|{token_id}` domain. Binding the tenant is required because workflow ids are tenant-scoped. This reuses the badge-HMAC key + the `verify_receipt_share_url` idiom.",
           "properties": {
+            "environment": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowTriggerEnvironment"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional immutable release environment resolved when this trigger occurrence is durably accepted. Omission preserves the historical latest-saved-definition behavior."
+            },
             "token_id": {
               "type": "string"
             },
@@ -563,6 +585,15 @@
           "type": "object"
         }
       ]
+    },
+    "WorkflowTriggerEnvironment": {
+      "description": "Closed release selector available to automatic workflow triggers. This is deliberately the same three-value wire vocabulary as direct and route execution, while remaining in the pure definition model consumed by Cloud.",
+      "enum": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "type": "string"
     }
   },
   "$id": "urn:tokentrimmer:workflow:write-schema:v1",

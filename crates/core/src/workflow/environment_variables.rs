@@ -38,6 +38,12 @@ JOIN workflow_environment_variable_sets v \
  AND v.environment = s.environment AND v.revision = s.revision \
 WHERE s.org_id = $1 AND s.workflow_id = $2 AND s.environment = $3";
 
+const GET_VARIABLES_REVISION_SQL: &str = "\
+SELECT v.revision, v.variables, v.created_at \
+FROM workflow_environment_variable_sets v \
+WHERE v.org_id = $1 AND v.workflow_id = $2 \
+  AND v.environment = $3 AND v.revision = $4";
+
 const INSERT_VARIABLE_SET_SQL: &str = "\
 INSERT INTO workflow_environment_variable_sets \
   (org_id, workflow_id, environment, revision, variables) \
@@ -238,6 +244,41 @@ pub(crate) async fn get_current_variables(
         })
 }
 
+/// Load one immutable variable snapshot exactly. Revision `0` is the
+/// intentionally unpersisted empty set accepted before any environment values
+/// exist; positive missing revisions remain distinguishable from that legacy
+/// value and fail closed at the execution boundary.
+pub(crate) async fn get_variables_revision(
+    pool: &PgPool,
+    org_id: Uuid,
+    workflow_id: Uuid,
+    environment: WorkflowEnvironment,
+    revision: i32,
+) -> Result<Option<WorkflowEnvironmentVariables>, sqlx::Error> {
+    if revision < 0 {
+        return Err(sqlx::Error::Protocol(
+            "workflow environment variables revision must be nonnegative".into(),
+        ));
+    }
+    if revision == 0 {
+        return Ok(Some(WorkflowEnvironmentVariables {
+            revision: 0,
+            variables: BTreeMap::new(),
+            created_at: None,
+        }));
+    }
+    sqlx::query(GET_VARIABLES_REVISION_SQL)
+        .bind(org_id)
+        .bind(workflow_id)
+        .bind(environment.as_str())
+        .bind(revision)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(snapshot_from_row)
+        .transpose()
+}
+
 pub(crate) async fn workflow_exists(
     pool: &PgPool,
     org_id: Uuid,
@@ -359,6 +400,15 @@ mod tests {
         assert!(INSERT_VARIABLE_SET_SQL.contains("INSERT INTO workflow_environment_variable_sets"));
         assert!(!INSERT_VARIABLE_SET_SQL.contains("UPDATE workflow_environment_variable_sets"));
         assert!(UPSERT_VARIABLE_STATE_SQL.contains("updated_at = now()"));
+        for fragment in [
+            "v.org_id = $1",
+            "v.workflow_id = $2",
+            "v.environment = $3",
+            "v.revision = $4",
+        ] {
+            assert!(GET_VARIABLES_REVISION_SQL.contains(fragment));
+        }
+        assert!(!GET_VARIABLES_REVISION_SQL.contains("variable_state"));
     }
 
     #[test]

@@ -479,6 +479,7 @@ fn workflow_definition_vector() -> tt_core::workflow::types::WorkflowDefinition 
         }}),
         triggers: vec![WorkflowTrigger::Schedule {
             interval: "1d".into(),
+            environment: Some(tt_core::workflow::types::WorkflowTriggerEnvironment::Production),
         }],
     }
 }

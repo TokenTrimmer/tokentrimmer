@@ -41,13 +41,15 @@ use crate::{
     routes::chat::{CompletionHeaders, CompletionOutcome, CostBreakdown, Prepared},
     workflow::{
         self,
+        activation::{
+            resolve_workflow_execution_definition, workflow_execution_selector,
+            ResolvedWorkflowRelease, WorkflowExecutionEnvironment,
+        },
         engine::{self, WfStatus},
-        environment_variables::get_current_variables,
         estimate,
         events::{WfEvent, WorkflowRunStartEnvironment, WorkflowRunStartRelease},
         executor::GatewayNodeExecutor,
         node_run_store,
-        release_store::{self, WorkflowEnvironment},
         secrets::{
             delete_secret, is_valid_secret_name, list_secret_rows, load_secrets,
             master_key_from_env, store_secret,
@@ -209,54 +211,6 @@ pub struct WorkflowDefMetaView {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Closed environment selector for one explicit Estimate or Run request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowExecutionEnvironment {
-    Development,
-    Staging,
-    Production,
-}
-
-impl WorkflowExecutionEnvironment {
-    const fn as_store(self) -> WorkflowEnvironment {
-        match self {
-            Self::Development => WorkflowEnvironment::Development,
-            Self::Staging => WorkflowEnvironment::Staging,
-            Self::Production => WorkflowEnvironment::Production,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        self.as_store().as_str()
-    }
-
-    const fn from_store(environment: WorkflowEnvironment) -> Self {
-        match environment {
-            WorkflowEnvironment::Development => Self::Development,
-            WorkflowEnvironment::Staging => Self::Staging,
-            WorkflowEnvironment::Production => Self::Production,
-        }
-    }
-}
-
-impl From<tt_routing::RouteWorkflowEnvironment> for WorkflowExecutionEnvironment {
-    fn from(environment: tt_routing::RouteWorkflowEnvironment) -> Self {
-        match environment {
-            tt_routing::RouteWorkflowEnvironment::Development => Self::Development,
-            tt_routing::RouteWorkflowEnvironment::Staging => Self::Staging,
-            tt_routing::RouteWorkflowEnvironment::Production => Self::Production,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResolvedWorkflowRelease {
-    environment: WorkflowExecutionEnvironment,
-    revision: i32,
-    variables_revision: i32,
-}
-
 struct LoadedRouteWorkflow {
     definition: workflow::types::WorkflowDefinition,
     version: i32,
@@ -312,10 +266,22 @@ pub struct CreateRunRequest {
     /// the version accepted by the original request.
     #[serde(default, alias = "version")]
     pub workflow_version: Option<i32>,
-    /// Optional current environment release to execute. This is mutually
-    /// exclusive with `workflow_version` and does not change trigger defaults.
+    /// Optional current environment release to execute when supplied alone.
+    /// Durable automatic delivery combines it with the complete frozen
+    /// version/release/variables tuple; it does not change trigger defaults.
     #[serde(default)]
     pub workflow_environment: Option<WorkflowExecutionEnvironment>,
+    /// Exact immutable release revision for a durably accepted automatic
+    /// invocation. This is valid only as part of the complete frozen selector
+    /// with `workflow_version`, `workflow_environment`, and
+    /// `variables_revision`.
+    #[serde(default)]
+    pub release_revision: Option<i32>,
+    /// Exact immutable non-secret variable snapshot for a durably accepted
+    /// automatic invocation. Revision `0` is the implicit empty set. This is
+    /// valid only as part of the complete frozen selector.
+    #[serde(default)]
+    pub variables_revision: Option<i32>,
     /// Optional run-level USD budget cap. Superseded by
     /// `def.budget.max_cost_usd` when that is set.
     #[serde(default)]
@@ -385,125 +351,6 @@ fn workflow_run_idempotency_key(headers: &HeaderMap) -> ApiResult<Option<String>
         )));
     }
     Ok(Some(value.to_owned()))
-}
-
-fn validate_requested_workflow_version(version: Option<i32>) -> ApiResult<()> {
-    if version.is_some_and(|version| version <= 0) {
-        return Err(ApiError::InvalidRequest(
-            "workflow_version must be a positive immutable definition version".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_workflow_execution_selector(
-    version: Option<i32>,
-    environment: Option<WorkflowExecutionEnvironment>,
-) -> ApiResult<()> {
-    validate_requested_workflow_version(version)?;
-    if version.is_some() && environment.is_some() {
-        return Err(ApiError::InvalidRequest(
-            "workflow_version and workflow_environment are mutually exclusive".into(),
-        ));
-    }
-    Ok(())
-}
-
-async fn resolve_workflow_execution_definition(
-    pool: &sqlx::PgPool,
-    org: Uuid,
-    workflow_id: Uuid,
-    version: Option<i32>,
-    environment: Option<WorkflowExecutionEnvironment>,
-) -> ApiResult<(
-    workflow::types::WorkflowDefinition,
-    i32,
-    Option<ResolvedWorkflowRelease>,
-    BTreeMap<String, String>,
-)> {
-    validate_workflow_execution_selector(version, environment)?;
-    if let Some(environment) = environment {
-        let release =
-            release_store::get_current_release(pool, org, workflow_id, environment.as_store())
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        %workflow_id,
-                        workflow_environment = environment.as_str(),
-                        %error,
-                        "workflow environment execution selector lookup failed"
-                    );
-                    ApiError::ServiceUnavailable(
-                        "workflow release state is temporarily unavailable".into(),
-                    )
-                })?
-                .ok_or_else(|| {
-                    ApiError::NotFound(format!(
-                        "no {environment_name} release for workflow {workflow_id}",
-                        environment_name = environment.as_str()
-                    ))
-                })?;
-        let record =
-            store::get_definition_version_record(pool, org, workflow_id, release.workflow_version)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        %workflow_id,
-                        workflow_environment = environment.as_str(),
-                        workflow_version = release.workflow_version,
-                        %error,
-                        "released workflow definition lookup failed"
-                    );
-                    ApiError::ServiceUnavailable(
-                        "released workflow definition is temporarily unavailable".into(),
-                    )
-                })?
-                .ok_or_else(|| {
-                    ApiError::Internal("workflow release references a missing definition".into())
-                })?;
-        if record.content_hash != release.content_hash {
-            return Err(ApiError::Internal(
-                "workflow release definition metadata is inconsistent".into(),
-            ));
-        }
-        let variables = get_current_variables(pool, org, workflow_id, environment.as_store())
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    %workflow_id,
-                    workflow_environment = environment.as_str(),
-                    %error,
-                    "workflow environment variables execution selector lookup failed"
-                );
-                ApiError::ServiceUnavailable(
-                    "workflow environment variables are temporarily unavailable".into(),
-                )
-            })?;
-        return Ok((
-            record.definition,
-            record.version,
-            Some(ResolvedWorkflowRelease {
-                environment,
-                revision: release.revision,
-                variables_revision: variables.revision,
-            }),
-            variables.variables,
-        ));
-    }
-
-    let selected = match version {
-        Some(version) => store::get_definition_version(pool, org, workflow_id, version)
-            .await
-            .ok_or_else(|| {
-                ApiError::NotFound(format!(
-                    "no workflow with id {workflow_id} at version {version}"
-                ))
-            })?,
-        None => store::get_definition(pool, org, workflow_id)
-            .await
-            .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {workflow_id}")))?,
-    };
-    Ok((selected.0, selected.1, None, BTreeMap::new()))
 }
 
 /// A duplicate logical invocation is a status/reconciliation response, never
@@ -690,10 +537,10 @@ mod workflow_run_idempotency_contract_tests {
 
     #[test]
     fn workflow_version_must_be_positive_when_present() {
-        assert!(validate_requested_workflow_version(None).is_ok());
-        assert!(validate_requested_workflow_version(Some(1)).is_ok());
+        assert!(workflow_execution_selector(None, None, None, None).is_ok());
+        assert!(workflow_execution_selector(Some(1), None, None, None).is_ok());
         assert!(matches!(
-            validate_requested_workflow_version(Some(0)),
+            workflow_execution_selector(Some(0), None, None, None),
             Err(ApiError::InvalidRequest(_))
         ));
     }
@@ -866,14 +713,10 @@ pub async fn estimate(
     let org = require_org(ctx)?;
     let pool = db_pool(&state)?;
 
-    let (def, version, release, variables) = resolve_workflow_execution_definition(
-        pool,
-        org,
-        id,
-        body.workflow_version,
-        body.workflow_environment,
-    )
-    .await?;
+    let selector =
+        workflow_execution_selector(body.workflow_version, body.workflow_environment, None, None)?;
+    let (def, version, release, variables) =
+        resolve_workflow_execution_definition(pool, org, id, selector).await?;
 
     let est = estimate::estimate_workflow_with_variables(&def, &body.inputs, &variables);
 
@@ -1139,25 +982,41 @@ pub async fn create_run(
         inputs,
         workflow_version: requested_workflow_version,
         workflow_environment: requested_workflow_environment,
+        release_revision: requested_release_revision,
+        variables_revision: requested_variables_revision,
         max_cost_usd,
         stream,
     } = body;
-    validate_workflow_execution_selector(
+    let selector = workflow_execution_selector(
         requested_workflow_version,
         requested_workflow_environment,
+        requested_release_revision,
+        requested_variables_revision,
     )?;
 
     // A supplied key is resolved before reading the latest definition. That is
     // what lets a lost response safely reconcile to its original immutable
     // version after an editor has saved a newer one.
     let idempotency_key = workflow_run_idempotency_key(&headers)?;
+    if selector.frozen_release().is_some() && idempotency_key.is_none() {
+        return Err(ApiError::InvalidRequest(
+            "a frozen workflow release invocation requires Idempotency-Key".into(),
+        ));
+    }
     let input_hash = store::workflow_run_input_hash(&inputs).map_err(|error| {
         ApiError::InvalidRequest(format!("workflow inputs cannot be canonicalized: {error}"))
     })?;
-    let request_options_hash = store::workflow_run_request_options_hash(
-        max_cost_usd,
-        requested_workflow_environment.map(WorkflowExecutionEnvironment::as_store),
-    )
+    let request_options_hash = match selector.frozen_release() {
+        Some((workflow_version, release)) => store::workflow_run_exact_activation_options_hash(
+            max_cost_usd,
+            workflow_version,
+            release,
+        ),
+        None => store::workflow_run_request_options_hash(
+            max_cost_usd,
+            requested_workflow_environment.map(WorkflowExecutionEnvironment::as_store),
+        ),
+    }
     .map_err(|error| {
         ApiError::InvalidRequest(format!(
             "workflow execution options cannot be canonicalized: {error}"
@@ -1183,7 +1042,7 @@ pub async fn create_run(
         if let Some(existing) = existing {
             validate_workflow_run_idempotency_binding(
                 &existing,
-                requested_workflow_version,
+                selector.requested_version(),
                 &input_hash,
                 &request_options_hash,
             )?;
@@ -1192,14 +1051,8 @@ pub async fn create_run(
     }
 
     // --- Load the accepted immutable version + defense-in-depth validate ----
-    let (def, version, release, variables) = resolve_workflow_execution_definition(
-        pool,
-        org,
-        id,
-        requested_workflow_version,
-        requested_workflow_environment,
-    )
-    .await?;
+    let (def, version, release, variables) =
+        resolve_workflow_execution_definition(pool, org, id, selector).await?;
 
     {
         let registry = state.registry.clone();
@@ -1265,7 +1118,7 @@ pub async fn create_run(
                 // an explicit different version is a conflict.
                 validate_workflow_run_idempotency_binding(
                     &existing,
-                    requested_workflow_version,
+                    selector.requested_version(),
                     &input_hash,
                     &request_options_hash,
                 )?;
@@ -1523,14 +1376,14 @@ async fn load_route_workflow(
     let workflow_id = cfg.workflow_id.parse::<Uuid>().map_err(|_| {
         ApiError::InvalidRequest(format!("invalid workflow_id: {}", cfg.workflow_id))
     })?;
-    let (definition, version, release, variables) = resolve_workflow_execution_definition(
-        pool,
-        ctx.org_id,
-        workflow_id,
+    let selector = workflow_execution_selector(
         None,
         cfg.environment.map(WorkflowExecutionEnvironment::from),
-    )
-    .await?;
+        None,
+        None,
+    )?;
+    let (definition, version, release, variables) =
+        resolve_workflow_execution_definition(pool, ctx.org_id, workflow_id, selector).await?;
     {
         let registry = state.registry.clone();
         validate::validate_for_execution(&definition, &|m| registry.resolve(m).is_some())
@@ -1970,6 +1823,7 @@ pub async fn delete_workflow_secret(
 mod tests {
     use super::*;
     use crate::registry::ProviderRegistry;
+    use crate::workflow::activation::WorkflowExecutionSelector;
     use crate::workflow::types::{
         BudgetPolicy, Edge, ModelSelection, Node, NodeKind, WorkflowDefinition, WorkflowTrigger,
     };
@@ -2188,9 +2042,11 @@ mod tests {
             vec![
                 WorkflowTrigger::Schedule {
                     interval: "6h".to_string(),
+                    environment: None,
                 },
                 WorkflowTrigger::Webhook {
                     token_id: "billing_sync_1".to_string(),
+                    environment: None,
                 },
             ]
         );
@@ -2286,21 +2142,52 @@ mod tests {
             WorkflowExecutionEnvironment::Staging,
             WorkflowExecutionEnvironment::Production,
         ] {
-            assert!(validate_workflow_execution_selector(None, Some(environment)).is_ok());
+            assert_eq!(
+                workflow_execution_selector(None, Some(environment), None, None).unwrap(),
+                WorkflowExecutionSelector::CurrentEnvironment(environment)
+            );
             assert_eq!(
                 WorkflowExecutionEnvironment::from_store(environment.as_store()),
                 environment
             );
         }
-        assert!(validate_workflow_execution_selector(Some(4), None).is_ok());
-        assert!(matches!(
-            validate_workflow_execution_selector(
+        assert_eq!(
+            workflow_execution_selector(Some(4), None, None, None).unwrap(),
+            WorkflowExecutionSelector::Version(4)
+        );
+        assert_eq!(
+            workflow_execution_selector(
                 Some(4),
-                Some(WorkflowExecutionEnvironment::Production)
+                Some(WorkflowExecutionEnvironment::Production),
+                Some(7),
+                Some(0),
+            )
+            .unwrap(),
+            WorkflowExecutionSelector::FrozenRelease {
+                workflow_version: 4,
+                environment: WorkflowExecutionEnvironment::Production,
+                release_revision: 7,
+                variables_revision: 0,
+            }
+        );
+        assert!(matches!(
+            workflow_execution_selector(
+                Some(4),
+                Some(WorkflowExecutionEnvironment::Production),
+                None,
+                None,
             ),
             Err(ApiError::InvalidRequest(message))
-                if message.contains("mutually exclusive")
+                if message.contains("complete")
         ));
+        assert!(workflow_execution_selector(None, None, Some(1), Some(0)).is_err());
+        assert!(workflow_execution_selector(
+            Some(4),
+            Some(WorkflowExecutionEnvironment::Production),
+            Some(0),
+            Some(0),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2413,6 +2300,7 @@ mod tests {
         let mut def = valid_def();
         def.triggers = vec![WorkflowTrigger::Schedule {
             interval: "30m".to_string(),
+            environment: None,
         }];
 
         let result = create(State(test_state()), real_org_ctx(org), Json(def)).await;
@@ -2637,6 +2525,8 @@ mod tests {
             inputs: serde_json::Value::Null,
             workflow_version: None,
             workflow_environment: None,
+            release_revision: None,
+            variables_revision: None,
             max_cost_usd: None,
             stream: false,
         };

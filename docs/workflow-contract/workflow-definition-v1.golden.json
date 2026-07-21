@@ -62,7 +62,8 @@
   "triggers": [
     {
       "type": "schedule",
-      "interval": "1d"
+      "interval": "1d",
+      "environment": "production"
     }
   ]
 }

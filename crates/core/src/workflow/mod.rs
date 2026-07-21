@@ -4,6 +4,7 @@
 //! tasks (W1a Tasks 3–9) will add validate, store, engine, and route
 //! submodules.
 
+pub(crate) mod activation;
 pub mod distill_cache;
 pub mod engine;
 pub(crate) mod environment_variables;
@@ -21,7 +22,8 @@ pub mod store;
 pub mod types;
 pub mod validate;
 
+pub use activation::WorkflowExecutionEnvironment;
 pub use types::{
     content_hash, BudgetPolicy, Edge, ModelSelection, Node, NodeKind, NodeOutput, OnExceed,
-    WorkflowDefinition,
+    WorkflowDefinition, WorkflowTriggerEnvironment,
 };
