@@ -1100,6 +1100,7 @@ mod tests {
             workflow: Some(tt_routing::RouteWorkflow {
                 workflow_id: "00000000-0000-0000-0000-000000000001".into(),
                 max_cost_usd: Some(0.4),
+                environment: Some(tt_routing::RouteWorkflowEnvironment::Production),
                 mode: Some("shadow".into()),
             }),
             batch: false,

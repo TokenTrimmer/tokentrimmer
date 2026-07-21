@@ -10253,6 +10253,7 @@ mod output_shaping_tests {
         tt_routing::RouteWorkflow {
             workflow_id: "00000000-0000-0000-0000-000000000001".into(),
             max_cost_usd: None,
+            environment: None,
             mode: mode.map(str::to_string),
         }
     }

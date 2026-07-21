@@ -94,22 +94,6 @@ enum WorkflowBudgetAdmissionPath {
     Shadow,
 }
 
-fn admit_workflow_budget_before_dispatch(
-    path: WorkflowBudgetAdmissionPath,
-    def: &workflow::types::WorkflowDefinition,
-    inputs: &serde_json::Value,
-    max_cost_usd: Option<f64>,
-) -> Result<(), String> {
-    let subject = match path {
-        WorkflowBudgetAdmissionPath::Direct => "this run",
-        WorkflowBudgetAdmissionPath::Detour => "this route",
-        WorkflowBudgetAdmissionPath::Shadow => "shadow run",
-    };
-    estimate::admit_budgeted_workflow(def, inputs, max_cost_usd).map_err(|error| {
-        format!("workflow budget admission rejected {subject} before dispatch: {error}")
-    })
-}
-
 fn admit_workflow_budget_before_dispatch_with_variables(
     path: WorkflowBudgetAdmissionPath,
     def: &workflow::types::WorkflowDefinition,
@@ -256,11 +240,28 @@ impl WorkflowExecutionEnvironment {
     }
 }
 
+impl From<tt_routing::RouteWorkflowEnvironment> for WorkflowExecutionEnvironment {
+    fn from(environment: tt_routing::RouteWorkflowEnvironment) -> Self {
+        match environment {
+            tt_routing::RouteWorkflowEnvironment::Development => Self::Development,
+            tt_routing::RouteWorkflowEnvironment::Staging => Self::Staging,
+            tt_routing::RouteWorkflowEnvironment::Production => Self::Production,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResolvedWorkflowRelease {
     environment: WorkflowExecutionEnvironment,
     revision: i32,
     variables_revision: i32,
+}
+
+struct LoadedRouteWorkflow {
+    definition: workflow::types::WorkflowDefinition,
+    version: i32,
+    release: Option<ResolvedWorkflowRelease>,
+    variables: BTreeMap<String, String>,
 }
 
 /// `POST /v1/workflows/:id/estimate` request body.
@@ -1509,26 +1510,84 @@ fn last_user_message_text(req: &tt_shared::ChatCompletionRequest) -> serde_json:
     serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null)
 }
 
-/// Resolve identity + load + validate a workflow definition for a route detour.
-/// Shared by detour + shadow. Returns `(def, version)`.
+/// Resolve identity plus the exact accepted definition/configuration snapshot
+/// for a route detour. Shared by detour + shadow. An omitted environment keeps
+/// the legacy latest-definition behavior; an explicit environment resolves its
+/// current immutable release and variables before validation or provider work.
 async fn load_route_workflow(
     state: &AppState,
     ctx: &tt_shared::RequestContext,
     cfg: &tt_routing::RouteWorkflow,
-) -> ApiResult<(workflow::types::WorkflowDefinition, i32)> {
+) -> ApiResult<LoadedRouteWorkflow> {
     let pool = db_pool(state)?;
     let workflow_id = cfg.workflow_id.parse::<Uuid>().map_err(|_| {
         ApiError::InvalidRequest(format!("invalid workflow_id: {}", cfg.workflow_id))
     })?;
-    let (def, version) = store::get_definition(pool, ctx.org_id, workflow_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("no workflow with id {workflow_id}")))?;
+    let (definition, version, release, variables) = resolve_workflow_execution_definition(
+        pool,
+        ctx.org_id,
+        workflow_id,
+        None,
+        cfg.environment.map(WorkflowExecutionEnvironment::from),
+    )
+    .await?;
     {
         let registry = state.registry.clone();
-        validate::validate_for_execution(&def, &|m| registry.resolve(m).is_some())
+        validate::validate_for_execution(&definition, &|m| registry.resolve(m).is_some())
             .map_err(|errors| ApiError::InvalidRequest(errors.join("; ")))?;
     }
-    Ok((def, version))
+    Ok(LoadedRouteWorkflow {
+        definition,
+        version,
+        release,
+        variables,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_route_workflow_run(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    org_id: Uuid,
+    definition: &workflow::types::WorkflowDefinition,
+    version: i32,
+    release: Option<ResolvedWorkflowRelease>,
+    inputs: &serde_json::Value,
+    max_cost_usd: Option<f64>,
+) -> ApiResult<()> {
+    let record = WorkflowRunRecord {
+        id: run_id,
+        workflow_id: definition.id,
+        version,
+        org_id,
+        release: release.map(|release| WorkflowRunReleaseProvenance {
+            environment: release.environment.as_store(),
+            revision: release.revision,
+            variables_revision: release.variables_revision,
+        }),
+        status: "running".to_string(),
+        inputs: Some(inputs.clone()),
+        cost_usd: 0.0,
+        max_cost_usd,
+        baseline_cost_usd: 0.0,
+        saved_usd: 0.0,
+        error: None,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+    };
+    store::insert_run_required(pool, &record)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                %run_id,
+                workflow_id = %definition.id,
+                %error,
+                "route workflow run provenance insert failed; refusing dispatch"
+            );
+            ApiError::ServiceUnavailable(
+                "workflow run provenance is temporarily unavailable".into(),
+            )
+        })
 }
 
 /// Run a route-detour workflow in DETOUR mode: the workflow's final synthesized
@@ -1541,7 +1600,13 @@ pub(crate) async fn complete_workflow(
     prep: Prepared,
     cfg: tt_routing::RouteWorkflow,
 ) -> ApiResult<CompletionOutcome> {
-    let (def, _version) = load_route_workflow(state, ctx, &cfg).await?;
+    let loaded = load_route_workflow(state, ctx, &cfg).await?;
+    let LoadedRouteWorkflow {
+        definition: def,
+        version,
+        release,
+        variables,
+    } = loaded;
     let pool = db_pool(state)?;
 
     // Inputs = the last user message text (the workflow's trigger node echoes
@@ -1555,15 +1620,27 @@ pub(crate) async fn complete_workflow(
     // intelligence nodes and reserves their directional estimates, but a
     // started node's routed provider work can still settle above that estimate.
     let run_max_cost = cfg.max_cost_usd.or(def.budget.max_cost_usd);
-    admit_workflow_budget_before_dispatch(
+    admit_workflow_budget_before_dispatch_with_variables(
         WorkflowBudgetAdmissionPath::Detour,
         &def,
         &inputs,
+        &variables,
         run_max_cost,
     )
     .map_err(ApiError::InvalidRequest)?;
 
     let run_id = Uuid::new_v4();
+    insert_route_workflow_run(
+        pool,
+        run_id,
+        ctx.org_id,
+        &def,
+        version,
+        release,
+        &inputs,
+        run_max_cost,
+    )
+    .await?;
     let secrets = match master_key_from_env() {
         Some(master) => load_secrets(pool, ctx.org_id, &master).await,
         None => std::collections::HashMap::new(),
@@ -1582,7 +1659,7 @@ pub(crate) async fn complete_workflow(
         org_id: ctx.org_id,
         pool,
     };
-    let result = engine::run_workflow(
+    let result = engine::run_workflow_with_variables(
         &executor,
         &def,
         &inputs,
@@ -1590,6 +1667,7 @@ pub(crate) async fn complete_workflow(
         |entry| journal.push(entry),
         None,
         &secrets,
+        &variables,
         0,
         &[],
         &cache,
@@ -1689,19 +1767,38 @@ pub(crate) async fn run_workflow_shadow(
     prep: &Prepared,
     cfg: &tt_routing::RouteWorkflow,
 ) -> Result<(), String> {
-    let (def, _version) = load_route_workflow(state, ctx, cfg)
+    let loaded = load_route_workflow(state, ctx, cfg)
         .await
         .map_err(|e| format!("load: {e}"))?;
+    let LoadedRouteWorkflow {
+        definition: def,
+        version,
+        release,
+        variables,
+    } = loaded;
     let pool = db_pool(state).map_err(|e| format!("pool: {e}"))?;
     let inputs = last_user_message_text(&prep.req);
     let run_max_cost = cfg.max_cost_usd.or(def.budget.max_cost_usd);
-    admit_workflow_budget_before_dispatch(
+    admit_workflow_budget_before_dispatch_with_variables(
         WorkflowBudgetAdmissionPath::Shadow,
         &def,
         &inputs,
+        &variables,
         run_max_cost,
     )?;
     let run_id = Uuid::new_v4();
+    insert_route_workflow_run(
+        pool,
+        run_id,
+        ctx.org_id,
+        &def,
+        version,
+        release,
+        &inputs,
+        run_max_cost,
+    )
+    .await
+    .map_err(|e| format!("journal: {e}"))?;
     let secrets = match master_key_from_env() {
         Some(master) => load_secrets(pool, ctx.org_id, &master).await,
         None => std::collections::HashMap::new(),
@@ -1720,7 +1817,7 @@ pub(crate) async fn run_workflow_shadow(
         org_id: ctx.org_id,
         pool,
     };
-    let result = engine::run_workflow(
+    let result = engine::run_workflow_with_variables(
         &executor,
         &def,
         &inputs,
@@ -1728,6 +1825,7 @@ pub(crate) async fn run_workflow_shadow(
         |entry| journal.push(entry),
         None,
         &secrets,
+        &variables,
         0,
         &[],
         &cache,
@@ -2038,10 +2136,11 @@ mod tests {
 
         let executions = AtomicUsize::new(0);
         let result = (|| -> Result<(), String> {
-            admit_workflow_budget_before_dispatch(
+            admit_workflow_budget_before_dispatch_with_variables(
                 path,
                 def,
                 &serde_json::json!("input"),
+                &BTreeMap::new(),
                 Some(1.0),
             )?;
             executions.fetch_add(1, Ordering::SeqCst);

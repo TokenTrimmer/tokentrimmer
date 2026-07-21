@@ -59,9 +59,11 @@
 //!   returns `WfStatus::Failed` rather than looping.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc, LazyLock,
+    Arc,
 };
 
 use futures::future::BoxFuture;
@@ -92,7 +94,7 @@ pub(crate) enum WfStatus {
     BudgetExhausted,
 }
 
-/// Returned by [`run_workflow`].
+/// Returned by [`run_workflow_with_variables`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WorkflowRunResult {
     pub status: WfStatus,
@@ -141,6 +143,7 @@ const MAX_SUBWORKFLOW_DEPTH: u32 = 5;
 /// 50-node, depth-3, 10-iter workflow uses ≤ 5 050 nodes. Adjust upward if
 /// product requirements change.
 const MAX_TOTAL_NODE_EXECUTIONS: u32 = 10_000;
+#[cfg(test)]
 static EMPTY_WORKFLOW_VARIABLES: LazyLock<BTreeMap<String, String>> = LazyLock::new(BTreeMap::new);
 
 // ---------------------------------------------------------------------------
@@ -151,6 +154,7 @@ static EMPTY_WORKFLOW_VARIABLES: LazyLock<BTreeMap<String, String>> = LazyLock::
 /// Environment-bound callers use [`run_workflow_with_variables`] so an exact
 /// accepted configuration snapshot is threaded through the whole run tree.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn run_workflow<'a>(
     executor: &'a dyn NodeExecutor,
     def: &'a WorkflowDefinition,

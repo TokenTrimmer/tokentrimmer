@@ -183,10 +183,13 @@ export type RoutePanel = {
 };
 
 export type RouteWorkflow = {
+  environment?: RouteWorkflowEnvironment | null;
   max_cost_usd?: number | null;
   mode?: string | null;
   workflow_id: string;
 };
+
+export type RouteWorkflowEnvironment = "development" | "staging" | "production";
 
 export type SchemaVersionEvidence = {
   reason: CapabilityReason;

@@ -58,7 +58,7 @@
   "files": [
     {
       "path": "bindings/product-contracts.generated.ts",
-      "sha256": "822501da8a255f3361cd42a1fd53e112c6b5f9174586b97d358b5501aca78d37"
+      "sha256": "fb8189416885112b39ad6ff81e117a101bc9774b4d559bdeaaf75739aebffe93"
     },
     {
       "path": "docs/capability-contract/gateway-capabilities.schema.json",
@@ -66,7 +66,7 @@
     },
     {
       "path": "docs/route-contract/route-write.schema.json",
-      "sha256": "610731d29f7c559d9d80012c2ebc31eabbb8c4d0e0751aa7ac1f130a8a195a6d"
+      "sha256": "e2f2c6d224350fe17cf15b91e6ca56c63947fbb30ba422b55d5662392cf25a09"
     },
     {
       "path": "docs/route-preview-contract/tokentrimmer.route-preview-coverage.v2.corpus.json",

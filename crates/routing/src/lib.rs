@@ -477,6 +477,12 @@ pub struct RouteWorkflow {
     /// to the workflow definition's own budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+    /// Optional release environment resolved when the matched request is
+    /// accepted. The gateway executes that environment's exact current
+    /// immutable workflow version and non-secret variable snapshot. `None`
+    /// preserves the legacy latest-saved-definition behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<RouteWorkflowEnvironment>,
     /// `"detour"` (default) = the workflow result REPLACES the upstream call.
     /// `"shadow"` = the workflow runs alongside; its result is compared + logged
     /// but the direct upstream call's answer is returned. Shadow mode is the
@@ -484,6 +490,16 @@ pub struct RouteWorkflow {
     /// flipping to detour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+}
+
+/// Closed release selector for a route-triggered workflow invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RouteWorkflowEnvironment {
+    Development,
+    Staging,
+    Production,
 }
 
 /// Fusion panel config for a route-triggered panel (the same panel

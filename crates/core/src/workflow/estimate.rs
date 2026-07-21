@@ -99,6 +99,7 @@ impl std::fmt::Display for WorkflowBudgetAdmissionError {
 /// A missing cap retains the legacy execution behavior. A successful result
 /// only means the present estimator could admit the requested static graph; it
 /// does **not** reserve provider spend or make a runtime ceiling claim.
+#[cfg(test)]
 pub(crate) fn admit_budgeted_workflow(
     def: &WorkflowDefinition,
     inputs: &serde_json::Value,

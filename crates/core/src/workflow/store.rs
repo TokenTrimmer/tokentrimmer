@@ -625,6 +625,22 @@ pub(crate) async fn list_definitions(
 /// the run row present before the first node executes). Errors are warn-and-
 /// swallowed so a DB outage never fails the run request.
 pub(crate) async fn insert_run(pool: &PgPool, rec: &WorkflowRunRecord) {
+    let result = insert_run_required(pool, rec).await;
+    if let Err(e) = result {
+        tracing::warn!(
+            run_id = %rec.id,
+            error = %e,
+            "workflow_runs INSERT failed (best-effort, run not affected)"
+        );
+    }
+}
+
+/// Insert the initial durable run row and return storage failures to callers
+/// that must not dispatch provider work without retained provenance.
+pub(crate) async fn insert_run_required(
+    pool: &PgPool,
+    rec: &WorkflowRunRecord,
+) -> Result<(), sqlx::Error> {
     let result = sqlx::query(INSERT_RUN_SQL)
         .bind(rec.id) // $1 id           UUID
         .bind(rec.workflow_id) // $2 workflow_id  UUID
@@ -638,14 +654,13 @@ pub(crate) async fn insert_run(pool: &PgPool, rec: &WorkflowRunRecord) {
         .bind(rec.release.map(|release| release.revision)) // $10 exact release revision
         .bind(rec.release.map(|release| release.variables_revision)) // $11 exact variables revision
         .execute(pool)
-        .await;
-    if let Err(e) = result {
-        tracing::warn!(
-            run_id = %rec.id,
-            error = %e,
-            "workflow_runs INSERT failed (best-effort, run not affected)"
-        );
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "workflow run id already exists; refusing ambiguous execution".into(),
+        ));
     }
+    Ok(())
 }
 
 /// Look up a stable invocation mapping.  This is intentionally strict rather
@@ -877,8 +892,8 @@ mod tests {
 
     use super::{
         create_or_reuse_idempotent_run, get_definition_version_record, get_run_strict,
-        get_workflow_run_idempotency, insert_definition, insert_run, list_definition_versions,
-        workflow_run_input_hash, workflow_run_invocation_key_hash,
+        get_workflow_run_idempotency, insert_definition, insert_run_required,
+        list_definition_versions, workflow_run_input_hash, workflow_run_invocation_key_hash,
         workflow_run_request_options_hash, CreateOrReuseWorkflowRun, NewWorkflowRunIdempotency,
         WorkflowRunRecord, WorkflowRunReleaseProvenance, FINISH_RUN_SQL, GET_DEFINITION_SQL,
         GET_DEFINITION_VERSION_SQL, GET_RUN_SQL, GET_WORKFLOW_RUN_IDEMPOTENCY_SQL,
@@ -1708,7 +1723,9 @@ mod tests {
             started_at: Utc::now(),
             finished_at: None,
         };
-        insert_run(&pool, &release_run).await;
+        insert_run_required(&pool, &release_run)
+            .await
+            .expect("insert environment-bound run with required provenance");
         let persisted_release_run = get_run_strict(&pool, release_run_id, org_a)
             .await
             .expect("read environment-bound run")

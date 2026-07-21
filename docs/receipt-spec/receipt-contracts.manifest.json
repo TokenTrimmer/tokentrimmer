@@ -96,7 +96,7 @@
   "files": [
     {
       "path": "bindings/receipt-contracts.generated.ts",
-      "sha256": "6ffbb6755c00ac0d1884fd2f15e750ff6cd32b6493731cb53f37eda4c4f7d62f"
+      "sha256": "aaaac57e1551af217c4757523183c7e7cc4cb723ab379dca9653df3e60d054c2"
     },
     {
       "path": "docs/receipt-spec/arr-receipt.schema.json",
@@ -124,7 +124,7 @@
     },
     {
       "path": "docs/receipt-spec/savings-bundle.schema.json",
-      "sha256": "7d55c5becf916b524bdb7dd658dcd3f9280e7de99f42562302e46c531ebe105b"
+      "sha256": "05785e0d9da60295f88943b6ba2f1a6aaf0ea8f35dc2130433af4460d3f8ef04"
     },
     {
       "path": "docs/receipt-spec/vcr-receipt.schema.json",

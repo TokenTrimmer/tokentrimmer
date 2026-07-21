@@ -285,7 +285,10 @@ pub fn validate_route_has_effect(then: &RouteAction) -> Result<(), ValidationErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgenticBudget, RouteAction, RouteConditions, RoutePanel, RouteWorkflow};
+    use crate::{
+        AgenticBudget, RouteAction, RouteConditions, RoutePanel, RouteWorkflow,
+        RouteWorkflowEnvironment,
+    };
     use tt_shared::pricing::{Capability, ModelInfo};
 
     fn action(target: &str) -> RouteAction {
@@ -697,6 +700,7 @@ mod tests {
             a.workflow = Some(RouteWorkflow {
                 workflow_id: "00000000-0000-0000-0000-000000000000".into(),
                 max_cost_usd: Some(1.0),
+                environment: None,
                 mode: mode.map(str::to_string),
             });
             assert!(
@@ -709,6 +713,7 @@ mod tests {
         bad.workflow = Some(RouteWorkflow {
             workflow_id: "00000000-0000-0000-0000-000000000000".into(),
             max_cost_usd: None,
+            environment: None,
             mode: Some("canary".into()),
         });
         assert!(
@@ -718,6 +723,35 @@ mod tests {
             ),
             "mode 'canary' must be rejected with InvalidWorkflowMode"
         );
+    }
+
+    #[test]
+    fn route_workflow_environment_is_closed_and_omitted_by_default() {
+        let legacy = RouteWorkflow {
+            workflow_id: "00000000-0000-0000-0000-000000000000".into(),
+            ..Default::default()
+        };
+        let legacy_json = serde_json::to_value(&legacy).expect("serialize legacy route workflow");
+        assert!(legacy_json.get("environment").is_none());
+
+        for (environment, wire) in [
+            (RouteWorkflowEnvironment::Development, "development"),
+            (RouteWorkflowEnvironment::Staging, "staging"),
+            (RouteWorkflowEnvironment::Production, "production"),
+        ] {
+            let configured = RouteWorkflow {
+                environment: Some(environment),
+                ..legacy.clone()
+            };
+            let value = serde_json::to_value(configured).expect("serialize route environment");
+            assert_eq!(value["environment"], wire);
+        }
+
+        assert!(serde_json::from_value::<RouteWorkflow>(serde_json::json!({
+            "workflow_id": "00000000-0000-0000-0000-000000000000",
+            "environment": "preview"
+        }))
+        .is_err());
     }
 
     /// No workflow on the route → `validate_workflow` is a trivial no-op.

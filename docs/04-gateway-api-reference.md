@@ -1007,6 +1007,38 @@ POST   /v1/routes/:id/resume?expected_revision=N
 GET    /v1/routes/:id/savings  → windowed netted savings (see below)
 ```
 
+#### Route-triggered workflow releases
+
+A route can opt into automatic execution of a current workflow release by
+setting the closed `then.workflow.environment` selector. Omit `environment` to
+preserve the legacy behavior of executing the latest saved definition.
+
+```json
+{
+  "name": "production-support-flow",
+  "when": { "models": ["gpt-4o"] },
+  "then": {
+    "target_model": null,
+    "workflow": {
+      "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
+      "environment": "production",
+      "mode": "detour",
+      "max_cost_usd": 0.05
+    }
+  }
+}
+```
+
+`environment` accepts only `development`, `staging`, or `production`. For each
+matched request, the gateway resolves the selected environment before provider
+work, executes its exact immutable workflow version with its exact current
+non-secret variable snapshot, and records workflow version, release revision,
+and variables revision on the durable workflow run. A missing release, missing
+required variable, inconsistent retained release, or unavailable run-provenance
+store fails the detour before spend. Shadow mode skips the workflow and surfaces
+a warning while the direct request continues. Advancing the environment affects
+only later matched requests; an already accepted run keeps its recorded tuple.
+
 #### Activation evidence and legacy-row recovery
 
 `GET /v1/routes` and `GET /v1/routes/:id` are **management reads**. They
@@ -2653,7 +2685,7 @@ behavior: every request creates a fresh run.
 |---|---|---|---|
 | `inputs` | object | no | Input values passed to the trigger node. |
 | `workflow_version` | integer | no | Exact immutable definition version to execute. Omit for the latest version on a new invocation. `version` is accepted as a compatibility alias. |
-| `workflow_environment` | string | no | Exact current `development`, `staging`, or `production` release to resolve before execution. Mutually exclusive with `workflow_version`; it does not change schedule/webhook or route-detour defaults. |
+| `workflow_environment` | string | no | Exact current `development`, `staging`, or `production` release to resolve before execution. Mutually exclusive with `workflow_version`; it does not change schedule/webhook defaults. Route detours have a separate optional `then.workflow.environment` selector (§10.7). |
 | `max_cost_usd` | number | no | Run-level USD cap. Superseded by `def.budget.max_cost_usd` when that is set. |
 
 Idempotency-Key is optional, must be 1–256 visible bytes, and is never

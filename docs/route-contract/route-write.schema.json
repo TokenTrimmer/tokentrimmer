@@ -361,6 +361,17 @@
       "additionalProperties": false,
       "description": "Workflow-route config (CO-1) — an exact structural clone of the `RoutePanel` seam: a self-contained config that detours dispatch. No competitor gateway has \"routing rules that detour into governed, receipted multi-step workflows.\"",
       "properties": {
+        "environment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RouteWorkflowEnvironment"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional release environment resolved when the matched request is accepted. The gateway executes that environment's exact current immutable workflow version and non-secret variable snapshot. `None` preserves the legacy latest-saved-definition behavior."
+        },
         "max_cost_usd": {
           "description": "Pre-dispatch workflow admission budget (USD). The workflow engine uses it to admit a bounded static plan before dispatch; it is not a runtime spending reservation, settlement, or invoice ceiling. `None` falls back to the workflow definition's own budget.",
           "format": "double",
@@ -385,6 +396,15 @@
         "workflow_id"
       ],
       "type": "object"
+    },
+    "RouteWorkflowEnvironment": {
+      "description": "Closed release selector for a route-triggered workflow invocation.",
+      "enum": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "type": "string"
     }
   },
   "$id": "urn:tokentrimmer:route:write-schema:v1",
