@@ -46,7 +46,7 @@ pdf-extract = "0.12"
 # workspace MSRV moves to >= 1.89.
 image = { version = "0.25", optional = true }
 ocrs = { version = "=0.10.0", optional = true }
-rten = { version = "=0.16.0", optional = true }
+rten = { version = "=0.24.0", optional = true }
 
 [features]
 default = []
